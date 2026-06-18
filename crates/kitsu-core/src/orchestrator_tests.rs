@@ -277,3 +277,56 @@ async fn test_loop_tool_error_fed_back() {
         "round 2 must include the serialized tool error fed back to the model"
     );
 }
+
+/// Fix #4: a `FinishReason::Length` (model hit its output cap) must be surfaced
+/// to the caller, not silently treated as a clean stop. The returned text keeps
+/// the partial content and gains a visible truncation marker.
+#[tokio::test]
+async fn test_loop_length_finish_is_surfaced() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("partial answer that got cut o".to_string()),
+        ChatDelta::Done(FinishReason::Length),
+    ]]);
+    let tools = Registry::new();
+
+    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+        .await
+        .expect("length-truncated turn should still return Ok with the partial text");
+
+    assert!(
+        out.contains("partial answer that got cut o"),
+        "partial content should be preserved, got: {out}"
+    );
+    assert!(
+        out.contains("truncated"),
+        "truncation should be surfaced to the caller, got: {out}"
+    );
+    assert_eq!(provider.call_count(), 1);
+}
+
+/// Fix #4 (edge case): a `Length` finish during a TOOL-CALL round must not be
+/// silently ignored. The loop still runs the tool (so a recoverable round can
+/// proceed) but the truncation is logged; here we assert the loop continues to
+/// a second round and completes rather than mishandling the truncated round.
+#[tokio::test]
+async fn test_loop_length_during_tool_call_round() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("get_time", "call_1", "{}")),
+            ChatDelta::Done(FinishReason::Length),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register("get_time", ok_handler(r#"{"time":"noon"}"#));
+
+    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+        .await
+        .expect("truncated tool-call round should still proceed");
+
+    assert!(out.contains("done"), "should reach the second round, got: {out}");
+    assert_eq!(provider.call_count(), 2, "should run two rounds");
+}

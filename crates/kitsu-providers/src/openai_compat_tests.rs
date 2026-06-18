@@ -309,3 +309,23 @@ async fn test_chat_stream_tool_calls() {
         "stream should end Done(ToolCalls)"
     );
 }
+
+/// Regression: backoff must never panic, even for absurd attempt counts (the
+/// old `1 << (attempt-1)` could overflow-shift). Caps at 200ms * 64.
+#[test]
+fn test_backoff_delay_never_panics_and_is_capped() {
+    use super::backoff_delay;
+    use std::time::Duration;
+
+    // First retry is 200ms.
+    assert_eq!(backoff_delay(1), Duration::from_millis(200));
+    // Grows exponentially then saturates — no panic at extreme values.
+    let capped = Duration::from_millis(200 * 64);
+    for attempt in [7u32, 8, 50, 1000, u32::MAX] {
+        assert_eq!(
+            backoff_delay(attempt),
+            capped,
+            "attempt {attempt} should clamp to the cap, not overflow"
+        );
+    }
+}

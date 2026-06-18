@@ -113,10 +113,27 @@ where
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
             match finish {
-                FinishReason::Stop | FinishReason::Length => return Ok(assistant_text),
+                FinishReason::Stop => return Ok(assistant_text),
+                // Truncated by the model's output cap — surface it instead of
+                // letting a cut-off answer masquerade as a complete one.
+                FinishReason::Length => {
+                    tracing::warn!("response truncated: model hit its output length limit");
+                    assistant_text.push_str("\n[truncated: model output length limit reached]");
+                    return Ok(assistant_text);
+                }
                 // No tool calls but ToolCalls finish reason: nothing to run, end.
                 FinishReason::ToolCalls => return Ok(assistant_text),
             }
+        }
+
+        // Tool calls present but the response was length-truncated: the tool
+        // arguments may be cut off (invalid JSON). Surface it rather than running
+        // them blindly — the tool's own arg validation will then fail loudly.
+        if finish == FinishReason::Length {
+            tracing::warn!(
+                "tool-call round truncated by the model's output length limit; \
+                 tool arguments may be incomplete"
+            );
         }
 
         // Tool calls present: run each, feed result (or error) back as a tool msg.
