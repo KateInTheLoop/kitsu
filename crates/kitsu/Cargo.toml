@@ -1,0 +1,33 @@
+[package]
+name = "kitsu"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "kitsu"
+path = "src/main.rs"
+
+[dependencies]
+kitsu-core = { workspace = true }
+kitsu-providers = { workspace = true }
+kitsu-tools = { workspace = true }
+kitsu-render = { workspace = true }
+tokio = { workspace = true }
+clap = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+toml = { workspace = true }
+anyhow = { workspace = true }
+tracing = { workspace = true }
+tracing-subscriber = { workspace = true }
+chrono = { workspace = true }
+
+[dev-dependencies]
+assert_cmd = { workspace = true }
+predicates = { workspace = true }
+tempfile = { workspace = true }
+wiremock = { workspace = true }
+tokio = { workspace = true }
+serial_test = { workspace = true }

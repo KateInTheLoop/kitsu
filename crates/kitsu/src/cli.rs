@@ -1,0 +1,44 @@
+//! CLI surface (clap derive). MVP: global `--gateway`, `--model`, `--config`,
+//! and the `ask` subcommand (docs/architecture.md §6).
+
+use clap::{Parser, Subcommand};
+
+#[derive(Debug, Parser)]
+#[command(name = "kitsu", version, about = "kitsu — multi-gateway model CLI")]
+pub struct Cli {
+    /// Gateway profile to use (from [gateways.<name>] in the config).
+    #[arg(long, global = true)]
+    pub gateway: Option<String>,
+
+    /// Override the model id (takes precedence over the gateway's default).
+    #[arg(long, global = true)]
+    pub model: Option<String>,
+
+    /// Path to the config file. Falls back to $KITSU_CONFIG, then
+    /// ~/.kitsu/config.toml.
+    #[arg(long, global = true)]
+    pub config: Option<String>,
+
+    /// Disable streaming (request a single non-streamed completion).
+    #[arg(long, global = true)]
+    pub no_stream: bool,
+
+    /// Sampling temperature. Omitted from the request unless set — some models
+    /// (e.g. newer Anthropic models on Bedrock) reject a `temperature` field.
+    #[arg(long, global = true)]
+    pub temperature: Option<f32>,
+
+    #[command(subcommand)]
+    pub command: Command,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum Command {
+    /// Ask a single question and stream the answer (one user turn).
+    Ask {
+        /// The prompt to send.
+        prompt: String,
+    },
+    /// Interactive chat (stub for MVP).
+    Chat,
+}
