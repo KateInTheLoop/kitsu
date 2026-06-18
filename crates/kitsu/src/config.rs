@@ -36,7 +36,11 @@ fn default_chat_path() -> String {
 }
 
 /// Auth block within a gateway profile.
-#[derive(Debug, Clone, Deserialize)]
+///
+/// `Debug` is implemented manually to redact `token` — an inline static token
+/// must never leak via `{:?}` / `debug!(?config)`. `Gateway` and `Config` derive
+/// `Debug` and delegate here, so the whole config tree is safe to debug-print.
+#[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     #[serde(default = "default_auth_method")]
     pub method: String,
@@ -66,6 +70,26 @@ impl Default for AuthConfig {
             scheme: default_scheme(),
             token: None,
         }
+    }
+}
+
+impl std::fmt::Debug for AuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Redact the static token: show only whether one is present, never its
+        // value. All other fields are non-sensitive (env var *names*, not values).
+        let token = match &self.token {
+            Some(_) => "Some(\"<redacted>\")",
+            None => "None",
+        };
+        f.debug_struct("AuthConfig")
+            .field("method", &self.method)
+            .field("env", &self.env)
+            .field("expires_env", &self.expires_env)
+            .field("refresh_hint", &self.refresh_hint)
+            .field("header", &self.header)
+            .field("scheme", &self.scheme)
+            .field("token", &format_args!("{token}"))
+            .finish()
     }
 }
 
@@ -207,5 +231,40 @@ impl Gateway {
             .clone()
             .filter(|m| !m.is_empty())
             .ok_or(ConfigError::ModelRequired)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Regression: a debug-print of config must never expose a static token.
+    #[test]
+    fn debug_redacts_static_token() {
+        let auth = AuthConfig {
+            method: "static".to_string(),
+            token: Some("super-secret-token-value".to_string()),
+            ..AuthConfig::default()
+        };
+        let dbg = format!("{auth:?}");
+        assert!(
+            !dbg.contains("super-secret-token-value"),
+            "token value leaked in Debug output: {dbg}"
+        );
+        assert!(dbg.contains("<redacted>"), "expected redaction marker: {dbg}");
+
+        // And via the enclosing Gateway/Config (which derive Debug).
+        let gw = Gateway {
+            flavor: "openai".to_string(),
+            base_url: "https://x".to_string(),
+            chat_path: default_chat_path(),
+            models_path: None,
+            model: None,
+            auth,
+        };
+        assert!(
+            !format!("{gw:?}").contains("super-secret-token-value"),
+            "token leaked through Gateway Debug"
+        );
     }
 }

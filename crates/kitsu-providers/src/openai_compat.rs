@@ -289,31 +289,56 @@ impl ToolCallAcc {
     }
 }
 
-/// Parse a full SSE body into a vec of ChatDelta. We buffer the whole body
-/// (wiremock returns it at once; real gateways stream it) then split on lines.
-fn parse_sse(body: &str) -> Vec<ChatDelta> {
-    let mut out: Vec<ChatDelta> = Vec::new();
-    let mut accs: Vec<ToolCallAcc> = Vec::new();
-    let mut finish: Option<FinishReason> = None;
+/// Incremental SSE decoder. Fed raw byte chunks as they arrive off the wire
+/// (any chunk boundary — mid-line or mid-UTF8 is fine: we buffer bytes and only
+/// decode complete `\n`-terminated lines). Text deltas are emitted as soon as
+/// their line completes; tool-call fragments accumulate and flush at stream end.
+#[derive(Default)]
+struct SseDecoder {
+    /// Raw byte buffer; complete lines are drained as `\n` is seen.
+    buf: Vec<u8>,
+    accs: Vec<ToolCallAcc>,
+    finish: Option<FinishReason>,
+    /// Set once `data: [DONE]` is seen; later lines are ignored.
+    saw_done: bool,
+}
 
-    for raw_line in body.lines() {
-        let line = raw_line.trim();
+impl SseDecoder {
+    /// Feed a chunk of bytes; return any deltas that became ready (text only —
+    /// tool calls + the terminal `Done` are emitted by [`Self::finalize`]).
+    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<ChatDelta> {
+        let mut out = Vec::new();
+        self.buf.extend_from_slice(bytes);
+        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
+            let line: Vec<u8> = self.buf.drain(..=pos).collect();
+            let line = String::from_utf8_lossy(&line);
+            self.process_line(line.trim(), &mut out);
+        }
+        out
+    }
+
+    /// Parse one SSE line, pushing any ready text delta and updating accumulators.
+    fn process_line(&mut self, line: &str, out: &mut Vec<ChatDelta>) {
+        if self.saw_done {
+            return;
+        }
         let Some(data) = line.strip_prefix("data:") else {
-            continue;
+            return;
         };
         let data = data.trim();
         if data == "[DONE]" {
-            break;
+            self.saw_done = true;
+            return;
         }
         if data.is_empty() {
-            continue;
+            return;
         }
         let chunk: StreamChunk = match serde_json::from_str(data) {
             Ok(c) => c,
-            Err(_) => continue, // tolerate keep-alives / non-JSON comments
+            Err(_) => return, // tolerate keep-alives / non-JSON comments
         };
         let Some(choice) = chunk.choices.into_iter().next() else {
-            continue;
+            return;
         };
         if let Some(text) = choice.delta.content {
             if !text.is_empty() {
@@ -321,10 +346,10 @@ fn parse_sse(body: &str) -> Vec<ChatDelta> {
             }
         }
         for dtc in choice.delta.tool_calls {
-            if accs.len() <= dtc.index {
-                accs.resize_with(dtc.index + 1, ToolCallAcc::default);
+            if self.accs.len() <= dtc.index {
+                self.accs.resize_with(dtc.index + 1, ToolCallAcc::default);
             }
-            let acc = &mut accs[dtc.index];
+            let acc = &mut self.accs[dtc.index];
             if let Some(id) = dtc.id {
                 if !id.is_empty() {
                     acc.id = id;
@@ -342,17 +367,45 @@ fn parse_sse(body: &str) -> Vec<ChatDelta> {
             }
         }
         if let Some(fr) = choice.finish_reason {
-            finish = Some(finish_from_str(&fr));
+            self.finish = Some(finish_from_str(&fr));
         }
     }
 
-    for acc in accs {
-        if !acc.name.is_empty() || !acc.id.is_empty() {
-            out.push(ChatDelta::ToolCall(acc.into_tool_call()));
+    /// Stream ended: flush any trailing partial line, then emit accumulated
+    /// tool calls and the terminal `Done`.
+    fn finalize(mut self) -> Vec<ChatDelta> {
+        let mut out = Vec::new();
+        if !self.buf.is_empty() {
+            let rest = std::mem::take(&mut self.buf);
+            let line = String::from_utf8_lossy(&rest).to_string();
+            self.process_line(line.trim(), &mut out);
         }
+        for acc in std::mem::take(&mut self.accs) {
+            if !acc.name.is_empty() || !acc.id.is_empty() {
+                out.push(ChatDelta::ToolCall(acc.into_tool_call()));
+            }
+        }
+        out.push(ChatDelta::Done(self.finish.unwrap_or(FinishReason::Stop)));
+        out
     }
-    out.push(ChatDelta::Done(finish.unwrap_or(FinishReason::Stop)));
-    out
+}
+
+/// Byte stream off the wire, normalized to owned `Vec<u8>` chunks so we never
+/// need to name `bytes::Bytes` (avoids a direct dependency).
+type ByteStream =
+    std::pin::Pin<Box<dyn futures::Stream<Item = Result<Vec<u8>, reqwest::Error>> + Send>>;
+
+/// Drives [`SseDecoder`] across an async byte stream for `stream::unfold`.
+enum SseState {
+    Reading {
+        stream: ByteStream,
+        dec: SseDecoder,
+        queue: std::collections::VecDeque<ChatDelta>,
+    },
+    Draining {
+        queue: std::collections::VecDeque<ChatDelta>,
+    },
+    Done,
 }
 
 /// Parse a non-streaming completion JSON into a vec of ChatDelta.
@@ -395,6 +448,64 @@ fn map_send_error(e: reqwest::Error) -> ProviderError {
         ProviderError::Timeout
     } else {
         ProviderError::Connection(e.to_string())
+    }
+}
+
+/// Exponential backoff for retry `attempt` (1-based): 200ms, 400ms, 800ms, …
+/// The shift exponent is clamped to 6 BEFORE shifting, so the multiplier maxes
+/// at 64 (~12.8s) and can never overflow regardless of how large `retries` is
+/// configured — avoids the panic the naive `1 << (attempt-1)` risked.
+fn backoff_delay(attempt: u32) -> Duration {
+    let exp = attempt.saturating_sub(1).min(6);
+    let mult = 1u64 << exp; // exp ≤ 6 ⇒ at most 64, never overflows
+    Duration::from_millis(200 * mult)
+}
+
+/// One step of the streaming SSE state machine for `stream::unfold`. Yields the
+/// next `ChatDelta` (or a `ProviderError` for a mid-stream wire failure), or
+/// `None` when fully drained.
+async fn sse_step(
+    state: SseState,
+) -> Option<(Result<ChatDelta, ProviderError>, SseState)> {
+    match state {
+        SseState::Reading {
+            mut stream,
+            mut dec,
+            mut queue,
+        } => {
+            // Drain anything already decoded before reading more bytes.
+            if let Some(d) = queue.pop_front() {
+                return Some((Ok(d), SseState::Reading { stream, dec, queue }));
+            }
+            loop {
+                match stream.next().await {
+                    Some(Ok(bytes)) => {
+                        for d in dec.push_bytes(&bytes) {
+                            queue.push_back(d);
+                        }
+                        if let Some(d) = queue.pop_front() {
+                            return Some((Ok(d), SseState::Reading { stream, dec, queue }));
+                        }
+                        // No complete line yet — keep reading.
+                    }
+                    Some(Err(e)) => {
+                        return Some((Err(map_send_error(e)), SseState::Done));
+                    }
+                    None => {
+                        // Wire closed: flush trailing line + tool calls + Done.
+                        let mut rest: std::collections::VecDeque<ChatDelta> =
+                            dec.finalize().into();
+                        return rest
+                            .pop_front()
+                            .map(|d| (Ok(d), SseState::Draining { queue: rest }));
+                    }
+                }
+            }
+        }
+        SseState::Draining { mut queue } => queue
+            .pop_front()
+            .map(|d| (Ok(d), SseState::Draining { queue })),
+        SseState::Done => None,
     }
 }
 
@@ -441,8 +552,7 @@ impl Provider for OpenAICompatProvider {
                         && attempt < self.retries
                     {
                         attempt += 1;
-                        let backoff = Duration::from_millis(200 * (1 << (attempt - 1)).min(8));
-                        tokio::time::sleep(backoff).await;
+                        tokio::time::sleep(backoff_delay(attempt)).await;
                         continue;
                     }
                     break resp;
@@ -473,16 +583,26 @@ impl Provider for OpenAICompatProvider {
             });
         }
 
-        let text = response.text().await.map_err(map_send_error)?;
-
-        let deltas = if req.stream {
-            parse_sse(&text)
+        if req.stream {
+            // Real streaming: drive the SSE decoder across wire chunks so text
+            // deltas surface as they arrive (no whole-body buffering).
+            let byte_stream: ByteStream = response
+                .bytes_stream()
+                .map(|r| r.map(|b| b.to_vec()))
+                .boxed();
+            let init = SseState::Reading {
+                stream: byte_stream,
+                dec: SseDecoder::default(),
+                queue: std::collections::VecDeque::new(),
+            };
+            let s = stream::unfold(init, sse_step);
+            Ok(s.boxed())
         } else {
-            parse_completion(&text)?
-        };
-
-        let s = stream::iter(deltas.into_iter().map(Ok));
-        Ok(s.boxed())
+            let text = response.text().await.map_err(map_send_error)?;
+            let deltas = parse_completion(&text)?;
+            let s = stream::iter(deltas.into_iter().map(Ok));
+            Ok(s.boxed())
+        }
     }
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
