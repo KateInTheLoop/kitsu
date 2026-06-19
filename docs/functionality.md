@@ -15,7 +15,7 @@ Claude, and any OpenAI-compatible endpoint with no code changes — only config/
 | Command | What it does | Status |
 |---|---|---|
 | `kitsu ask <prompt>` | Single-turn question; streams the answer to stdout | ✅ Working |
-| `kitsu chat` | Interactive REPL | ⏳ Stub only (prints a placeholder) |
+| `kitsu chat` | Interactive REPL (multi-turn, slash commands, optional tools) | ✅ Working |
 | `kitsu --help` / `kitsu <cmd> --help` | Usage | ✅ Working |
 | `kitsu --version` | Version | ✅ Working |
 
@@ -28,10 +28,30 @@ Claude, and any OpenAI-compatible endpoint with no code changes — only config/
 | `--config <path>` | Config file location | `$KITSU_CONFIG`, then `~/.kitsu/config.toml` |
 | `--no-stream` | Request a single non-streamed completion | streaming on |
 | `--temperature <f>` | Sampling temperature. **Omitted from the request unless set** | unset (not sent) |
+| `--allow-path <p>` | (`chat`) Allow read-only fs tools under this path (repeatable) | none (tools disabled) |
 
 > **Why `--temperature` is off by default:** newer Anthropic models on Bedrock reject a
 > `temperature` field (`HTTP 400: temperature is deprecated for this model`). Omitting it by
 > default keeps kitsu compatible across all models; pass `--temperature 0.2` when a model accepts it.
+
+---
+
+## Interactive chat (`kitsu chat`)
+
+A line-based REPL that prints to the terminal's normal scrollback, so **copy-paste and
+scroll-wheel work natively** (no alt-screen TUI). Powered by `rustyline`: history (persisted to
+`~/.kitsu/history`), arrow keys, Ctrl+A/E/W, and bracketed multi-line paste.
+
+- **Multi-turn**: conversation history is retained across turns.
+- **Slash commands**: `/model <name>` (switch model, keep history), `/clear` (reset to system
+  prompt), `/help`, `/quit`.
+- **Ctrl+C** cancels the in-flight streaming response and returns to the prompt; **Ctrl+D** (or
+  Ctrl+C at an empty prompt) exits.
+- **Non-TTY stdin** (`echo "hi" | kitsu chat`) runs a single turn and exits — same shape as `ask`.
+- **Tools**: pass `--allow-path <dir>` to enable read-only filesystem tools (`fs_read_file`,
+  `fs_list_dir`, and `repo_grep` if `rg` is installed). The model can call them during a turn;
+  every access is checked against the allowlist (deny-by-default, `..`/symlink-safe). Tool names
+  use underscores (not dots) so they pass Bedrock's `[a-zA-Z0-9_-]+` constraint across all gateways.
 
 ---
 

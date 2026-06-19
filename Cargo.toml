@@ -37,6 +37,9 @@ chrono = { version = "0.4", default-features = false, features = ["clock", "std"
 # Terminal / rendering
 owo-colors = "4"
 
+# Interactive REPL input (history, arrow keys, Ctrl+A/E/W, bracketed paste)
+rustyline = "14"
+
 # Internal crates
 kitsu-core = { path = "crates/kitsu-core" }
 kitsu-providers = { path = "crates/kitsu-providers" }

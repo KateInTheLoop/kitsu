@@ -32,6 +32,9 @@ struct MockProvider {
     scripts: Arc<Vec<Script>>,
     calls: Arc<AtomicUsize>,
     seen_messages: Arc<Mutex<Vec<Vec<kitsu_providers::ChatMessage>>>>,
+    /// Records the `tools` field of every request so tests can assert what was
+    /// advertised to the model.
+    seen_tools: Arc<Mutex<Vec<Option<Vec<kitsu_providers::ToolDescriptor>>>>>,
 }
 
 impl MockProvider {
@@ -40,6 +43,7 @@ impl MockProvider {
             scripts: Arc::new(scripts),
             calls: Arc::new(AtomicUsize::new(0)),
             seen_messages: Arc::new(Mutex::new(Vec::new())),
+            seen_tools: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -59,6 +63,7 @@ impl Provider for MockProvider {
             .lock()
             .unwrap()
             .push(req.messages.clone());
+        self.seen_tools.lock().unwrap().push(req.tools.clone());
 
         let script = self
             .scripts
@@ -132,7 +137,7 @@ async fn test_loop_single_round_no_tools() {
     ]]);
     let tools = Registry::new();
 
-    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .expect("single-round turn should succeed");
 
@@ -170,7 +175,7 @@ async fn test_loop_native_single_tool_round() {
     let mut tools = Registry::new();
     tools.register("get_time", ok_handler(r#"{"time":"12:00"}"#));
 
-    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .expect("tool round should succeed");
 
@@ -211,7 +216,7 @@ async fn test_loop_max_rounds_cap() {
     let mut tools = Registry::new();
     tools.register("loop_tool", ok_handler(r#"{"ok":true}"#));
 
-    let result = run_agent_turn(&provider, &tools, initial_messages(), &cfg(3)).await;
+    let result = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(3)).await;
 
     assert!(
         result.is_ok(),
@@ -248,7 +253,7 @@ async fn test_loop_tool_error_fed_back() {
     let mut tools = Registry::new();
     tools.register("bad_tool", err_handler(ran.clone()));
 
-    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .expect("a failing tool must not abort the loop");
 
@@ -289,7 +294,7 @@ async fn test_loop_length_finish_is_surfaced() {
     ]]);
     let tools = Registry::new();
 
-    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .expect("length-truncated turn should still return Ok with the partial text");
 
@@ -323,10 +328,103 @@ async fn test_loop_length_during_tool_call_round() {
     let mut tools = Registry::new();
     tools.register("get_time", ok_handler(r#"{"time":"noon"}"#));
 
-    let out = run_agent_turn(&provider, &tools, initial_messages(), &cfg(10))
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .expect("truncated tool-call round should still proceed");
 
     assert!(out.contains("done"), "should reach the second round, got: {out}");
     assert_eq!(provider.call_count(), 2, "should run two rounds");
+}
+
+// --- tool descriptor advertising + multi-turn threading ---------------------
+
+/// A registry with one descriptor-carrying tool advertises it to the model.
+#[tokio::test]
+async fn test_descriptors_advertised_to_model() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "fs.read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    let mut messages = initial_messages();
+    let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
+        .await
+        .expect("turn ok");
+
+    let seen = provider.seen_tools.lock().unwrap();
+    let first = seen.first().expect("one call");
+    let advertised = first.as_ref().expect("tools should be advertised");
+    assert!(advertised.iter().any(|d| d.name == "fs.read_file"));
+}
+
+/// A registry built only with the legacy `register` (no descriptor) advertises
+/// nothing — guards the descriptor-free `ask` path.
+#[tokio::test]
+async fn test_no_descriptors_means_no_tools_field() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut tools = Registry::new();
+    tools.register("legacy_tool", ok_handler("{}"));
+
+    let mut messages = initial_messages();
+    let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
+        .await
+        .expect("turn ok");
+
+    let seen = provider.seen_tools.lock().unwrap();
+    assert!(seen.first().expect("one call").is_none(), "no tools field");
+}
+
+/// Multi-turn: calling run_agent_turn twice with the same &mut Vec accumulates
+/// history — the second call's request includes the first turn's messages.
+#[tokio::test]
+async fn test_multi_turn_history_accumulates() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text("first reply".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("second reply".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let tools = Registry::new();
+    let mut messages = initial_messages();
+
+    let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
+        .await
+        .expect("turn 1");
+    // Simulate the chat loop pushing the next user message.
+    messages.push(kitsu_providers::ChatMessage::user("second question"));
+    let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
+        .await
+        .expect("turn 2");
+
+    // The second request must carry the first turn's assistant reply.
+    let seen = provider.seen_messages.lock().unwrap();
+    let second_req = &seen[1];
+    assert!(
+        second_req
+            .iter()
+            .any(|m| m.content.contains("first reply")),
+        "second turn should include first turn's assistant message"
+    );
+    assert!(
+        second_req
+            .iter()
+            .any(|m| m.content.contains("second question")),
+        "second turn should include the new user message"
+    );
 }

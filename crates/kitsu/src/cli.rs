@@ -39,6 +39,16 @@ pub enum Command {
         /// The prompt to send.
         prompt: String,
     },
-    /// Interactive chat (stub for MVP).
-    Chat,
+    /// Interactive chat REPL with multi-turn history and optional tools.
+    Chat {
+        /// Optional first prompt; queued as the first turn. In non-TTY mode
+        /// (piped stdin) this (or stdin) is the single turn.
+        prompt: Option<String>,
+
+        /// Allow filesystem tools to read under this path (repeatable). Passing
+        /// at least one implicitly enables the read-only fs tool set; without
+        /// it, fs tools are not registered or advertised.
+        #[arg(long = "allow-path", value_name = "PATH")]
+        allow_paths: Vec<String>,
+    },
 }
