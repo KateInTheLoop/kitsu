@@ -54,7 +54,7 @@ pub enum AgentError {
 pub async fn run_agent_turn<P>(
     provider: &P,
     tools: &Registry,
-    mut messages: Vec<ChatMessage>,
+    messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
 ) -> Result<String, AgentError>
 where
@@ -71,7 +71,7 @@ where
             return Ok(last_assistant_text);
         }
 
-        enforce_context_budget(&mut messages, cfg.max_context_bytes);
+        enforce_context_budget(messages, cfg.max_context_bytes);
 
         let req = ChatRequest {
             model: cfg.model.clone(),
@@ -151,11 +151,16 @@ where
     }
 }
 
-/// Build the tool descriptor list advertised to the model. The MVP registry
-/// does not carry descriptors (only handlers), so when empty we advertise no
-/// `tools` field at all (`None`); future phases can surface real descriptors.
-fn tool_descriptors(_tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
-    None
+/// Build the tool descriptor list advertised to the model. Tools registered
+/// with a descriptor are surfaced; an empty set means no `tools` field is sent
+/// at all (`None`), preserving the descriptor-free `ask` path.
+fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
+    let d = tools.descriptors();
+    if d.is_empty() {
+        None
+    } else {
+        Some(d.to_vec())
+    }
 }
 
 /// Enforce the context byte budget by truncating the oldest tool-result

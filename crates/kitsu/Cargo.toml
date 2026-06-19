@@ -23,6 +23,7 @@ anyhow = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
 chrono = { workspace = true }
+rustyline = { workspace = true }
 
 [dev-dependencies]
 assert_cmd = { workspace = true }

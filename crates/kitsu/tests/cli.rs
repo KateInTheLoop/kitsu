@@ -130,3 +130,132 @@ async fn test_ask_against_mock() {
     .await
     .expect("spawned kitsu process should join");
 }
+
+// --- chat: piped-stdin one-shot ---------------------------------------------
+
+/// `echo "hi" | kitsu chat` (stdin not a TTY) runs one turn and exits 0,
+/// printing the model text; the token is never echoed.
+#[tokio::test]
+#[serial]
+async fn test_chat_piped_stdin_one_shot() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"hi from chat"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["chat", "--gateway", "example"]);
+        cmd.write_stdin("hello\n"); // piped → non-TTY → one-shot
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("hi from chat"))
+            .stdout(predicate::str::contains(TOKEN).not());
+    })
+    .await
+    .expect("spawned kitsu chat should join");
+}
+
+// --- chat: end-to-end tool round --------------------------------------------
+
+/// With `--allow-path` set, the model can request `fs.read_file` and the tool
+/// loop runs it: round 1 returns a tool_calls SSE, round 2 returns text. The
+/// file content (read from the allowed temp dir) reaches the second request.
+#[tokio::test]
+#[serial]
+async fn test_chat_tool_round_reads_file() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    // A temp dir we will allow, containing a file with a known marker.
+    let work = TempDir::new().expect("work dir");
+    let file = work.path().join("note.txt");
+    fs::write(&file, "SECRET_MARKER_42").expect("write note");
+    let file_str = file.to_string_lossy().to_string();
+
+    // Round 1: model asks to read the file (only matches the FIRST request,
+    // which has no tool result yet).
+    let tool_args = format!(r#"{{\"path\":\"{}\"}}"#, file_str.replace('\\', "\\\\"));
+    let sse_round1 = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"fs.read_file","arguments":"{tool_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        "".to_string(),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_round1),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    // Round 2: any later request (which now carries the tool result) → final text.
+    let sse_round2 = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the file says SECRET_MARKER_42"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_round2),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let home_path = home.path().to_path_buf();
+    let allow = work.path().to_string_lossy().to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["chat", "--gateway", "example", "--allow-path", &allow]);
+        cmd.write_stdin("read the note\n");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("SECRET_MARKER_42"));
+    })
+    .await
+    .expect("spawned kitsu chat tool round should join");
+    // keep `work` alive until the process has run
+    drop(work);
+}
