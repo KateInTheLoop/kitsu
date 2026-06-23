@@ -141,7 +141,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     let tools = Registry::new();
     let agent_cfg = AgentConfig {
         model: setup.model.clone(),
-        max_rounds: 10,
+        max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         stream: !cli.no_stream,
         temperature: cli.temperature,
@@ -219,7 +219,7 @@ async fn run_chat(
     let mut model = setup.model.clone();
     let base_cfg = |model: String, cli: &Cli| AgentConfig {
         model,
-        max_rounds: 10,
+        max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         stream: !cli.no_stream,
         temperature: cli.temperature,

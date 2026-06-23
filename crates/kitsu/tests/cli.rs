@@ -259,3 +259,56 @@ async fn test_chat_tool_round_reads_file() {
     // keep `work` alive until the process has run
     drop(work);
 }
+
+// --- --max-rounds flag + usage surfacing ------------------------------------
+
+/// The global `--max-rounds` flag parses and a normal turn completes under it,
+/// and the gateway-reported usage is surfaced on stderr as the `kitsu-usage:`
+/// line (cost reporting). The usage rides the final
+/// SSE chunk via stream_options.include_usage.
+#[tokio::test]
+#[serial]
+async fn test_max_rounds_flag_and_usage_line() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"answer"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":11,"completion_tokens":3,"total_tokens":14}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        // --max-rounds is global; placed before the subcommand.
+        cmd.args(["--max-rounds", "40", "ask", "--gateway", "example", "hello"]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("answer"))
+            // usage surfaced to stderr, never stdout
+            .stderr(predicate::str::contains("kitsu-usage:"))
+            .stderr(predicate::str::contains("\"total_tokens\":14"))
+            .stdout(predicate::str::contains("kitsu-usage:").not());
+    })
+    .await
+    .expect("spawned kitsu --max-rounds process should join");
+}

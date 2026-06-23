@@ -104,10 +104,30 @@ where
 
         enforce_context_budget(messages, cfg.max_context_bytes);
 
+        // On the FINAL permitted round, withhold tools and inject a nudge so the
+        // model must produce its final answer instead of emitting yet another
+        // tool call that we'd truncate to "[stopped: max tool rounds reached]".
+        // This is what turned tool-aware reviews of large repos from 36-byte
+        // stubs into real reviews (robustness fix). A round budget of
+        // 1 has no "earlier" round to nudge from, so only applies when >1.
+        let is_final_round = round == cfg.max_rounds && cfg.max_rounds > 1;
+        let offered_tools = if is_final_round {
+            None
+        } else {
+            tool_descriptors(tools)
+        };
+        if is_final_round && tool_descriptors(tools).is_some() {
+            messages.push(ChatMessage::user(
+                "You have reached the final step and may not call any more tools. \
+                 Produce your complete final answer now using what you have already \
+                 gathered.",
+            ));
+        }
+
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
-            tools: tool_descriptors(tools),
+            tools: offered_tools,
             stream: cfg.stream,
             temperature: cfg.temperature,
             max_tokens: None,
