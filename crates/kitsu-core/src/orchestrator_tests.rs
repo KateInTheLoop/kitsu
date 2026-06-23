@@ -35,6 +35,8 @@ struct MockProvider {
     /// Records the `tools` field of every request so tests can assert what was
     /// advertised to the model.
     seen_tools: Arc<Mutex<Vec<Option<Vec<kitsu_providers::ToolDescriptor>>>>>,
+    /// Records the `max_tokens` field of every request.
+    seen_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
 }
 
 impl MockProvider {
@@ -44,6 +46,7 @@ impl MockProvider {
             calls: Arc::new(AtomicUsize::new(0)),
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             seen_tools: Arc::new(Mutex::new(Vec::new())),
+            seen_max_tokens: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -64,6 +67,7 @@ impl Provider for MockProvider {
             .unwrap()
             .push(req.messages.clone());
         self.seen_tools.lock().unwrap().push(req.tools.clone());
+        self.seen_max_tokens.lock().unwrap().push(req.max_tokens);
 
         let script = self
             .scripts
@@ -97,6 +101,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         max_context_bytes: 128 * 1024,
         stream: false,
         temperature: None,
+        max_tokens: None,
     }
 }
 
@@ -513,4 +518,37 @@ async fn test_multi_turn_history_accumulates() {
             .any(|m| m.content.contains("second question")),
         "second turn should include the new user message"
     );
+}
+
+/// max_tokens from AgentConfig must propagate onto every ChatRequest
+/// (robustness fix: None lets the gateway cap output at ~4096, truncating
+/// long reviews). When set, the request carries it.
+#[tokio::test]
+async fn test_max_tokens_propagates_to_request() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(5);
+    c.max_tokens = Some(16000);
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &c)
+        .await
+        .expect("ok");
+    let seen = provider.seen_max_tokens.lock().unwrap();
+    assert_eq!(seen[0], Some(16000), "max_tokens must reach the request");
+}
+
+/// Default (None) is preserved — we don't silently force a cap.
+#[tokio::test]
+async fn test_max_tokens_default_is_none() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(5))
+        .await
+        .expect("ok");
+    assert_eq!(provider.seen_max_tokens.lock().unwrap()[0], None);
 }

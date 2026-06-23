@@ -41,6 +41,12 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 60)]
     pub timeout_secs: u64,
 
+    /// Max output tokens per response. Unset lets the gateway apply its own cap
+    /// (often 4096), which silently truncates long outputs like code reviews.
+    /// Raise it (e.g. 16000) for long-form generation.
+    #[arg(long, global = true)]
+    pub max_output_tokens: Option<u32>,
+
     #[command(subcommand)]
     pub command: Command,
 }

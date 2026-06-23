@@ -145,6 +145,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         max_context_bytes: 128 * 1024,
         stream: !cli.no_stream,
         temperature: cli.temperature,
+        max_tokens: cli.max_output_tokens,
     };
 
     match run_agent_turn(&setup.provider, &tools, &mut messages, &agent_cfg).await {
@@ -223,6 +224,7 @@ async fn run_chat(
         max_context_bytes: 128 * 1024,
         stream: !cli.no_stream,
         temperature: cli.temperature,
+        max_tokens: cli.max_output_tokens,
     };
 
     let mut messages = vec![ChatMessage::system(chat_system_prompt(&tool_names))];
