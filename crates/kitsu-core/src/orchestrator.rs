@@ -23,6 +23,10 @@ pub struct AgentConfig {
     pub max_context_bytes: usize,
     pub stream: bool,
     pub temperature: Option<f32>,
+    /// Max output tokens per response. `None` lets the gateway apply its own
+    /// (often small, e.g. 4096) default — which silently truncates long outputs
+    /// like code reviews. Set this to lift the cap.
+    pub max_tokens: Option<u32>,
 }
 
 impl Default for AgentConfig {
@@ -33,6 +37,7 @@ impl Default for AgentConfig {
             max_context_bytes: 128 * 1024,
             stream: true,
             temperature: None,
+            max_tokens: None,
         }
     }
 }
@@ -130,7 +135,7 @@ where
             tools: offered_tools,
             stream: cfg.stream,
             temperature: cfg.temperature,
-            max_tokens: None,
+            max_tokens: cfg.max_tokens,
         };
 
         // 401/403 surface here (or as the first stream item) as a hard error.
