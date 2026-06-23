@@ -229,6 +229,92 @@ async fn test_loop_max_rounds_cap() {
     );
 }
 
+/// Robustness (robustness fix): on the FINAL permitted round the loop
+/// must withhold tools so the model is forced to produce a final answer, rather
+/// than emitting another tool call that gets truncated to the stop-marker.
+/// Here the provider always tool-calls when tools are offered, and returns real
+/// text when they are not. With max_rounds=3 we expect: rounds 1-2 offer tools,
+/// round 3 offers none → a real answer, NOT the "[stopped...]" marker.
+#[tokio::test]
+async fn test_final_round_withholds_tools_and_forces_answer() {
+    let provider = MockProvider::new(vec![
+        // rounds 1 & 2: tool-call (tools were offered)
+        vec![
+            ChatDelta::ToolCall(tc("loop_tool", "c1", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::ToolCall(tc("loop_tool", "c2", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        // round 3 (final): the model produces its real answer
+        vec![
+            ChatDelta::Text("FINAL REVIEW BODY".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "loop_tool".to_string(),
+            description: "loops".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"ok":true}"#),
+    );
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(3))
+        .await
+        .expect("should produce a final answer, not error");
+
+    assert_eq!(out, "FINAL REVIEW BODY", "final round must return real text");
+    assert!(
+        !out.contains("max tool rounds reached"),
+        "forcing a final answer must avoid the truncation stop-marker"
+    );
+
+    // Tools offered on rounds 1 & 2, withheld (None) on the final round 3.
+    let seen = provider.seen_tools.lock().unwrap();
+    assert_eq!(seen.len(), 3);
+    assert!(seen[0].is_some(), "round 1 should offer tools");
+    assert!(seen[1].is_some(), "round 2 should offer tools");
+    assert!(
+        seen[2].is_none(),
+        "final round must withhold tools to force a final answer"
+    );
+}
+
+/// The force-final-answer logic must NOT trigger for a single-round budget
+/// (max_rounds=1): there is no earlier round to have gathered context, so a
+/// 1-round turn should behave exactly as before (tools offered, normal stop).
+#[tokio::test]
+async fn test_single_round_budget_still_offers_tools() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("answer".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "loop_tool".to_string(),
+            description: "loops".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"ok":true}"#),
+    );
+
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(1))
+        .await
+        .expect("ok");
+
+    let seen = provider.seen_tools.lock().unwrap();
+    assert_eq!(seen.len(), 1);
+    assert!(
+        seen[0].is_some(),
+        "a 1-round budget must still offer tools (no force-final special-case)"
+    );
+}
+
 // --- tool error fed back ----------------------------------------------------
 
 /// design §5 error-as-tool-result: a tool that returns Err does NOT abort the

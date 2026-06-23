@@ -28,6 +28,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub temperature: Option<f32>,
 
+    /// Maximum agent tool-call rounds per turn before the loop stops. Tool-aware
+    /// reviews of large repos need many rounds to read files THEN write the
+    /// answer; the default 10 truncates them ("[stopped: max tool rounds
+    /// reached]"). Raise it (e.g. 40) for tool-heavy work.
+    #[arg(long, global = true, default_value_t = 10)]
+    pub max_rounds: u32,
+
     #[command(subcommand)]
     pub command: Command,
 }
