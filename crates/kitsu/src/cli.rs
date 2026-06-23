@@ -35,6 +35,12 @@ pub struct Cli {
     #[arg(long, global = true, default_value_t = 10)]
     pub max_rounds: u32,
 
+    /// Per-request HTTP timeout in seconds. A heavy tool-aware round on a slower
+    /// model can exceed the default 60s and fail the whole turn; raise it (e.g.
+    /// 300) for tool-heavy review work.
+    #[arg(long, global = true, default_value_t = 60)]
+    pub timeout_secs: u64,
+
     #[command(subcommand)]
     pub command: Command,
 }

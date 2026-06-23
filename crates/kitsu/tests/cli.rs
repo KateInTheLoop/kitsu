@@ -312,3 +312,47 @@ async fn test_max_rounds_flag_and_usage_line() {
     .await
     .expect("spawned kitsu --max-rounds process should join");
 }
+
+/// The global `--timeout-secs` flag parses and a normal turn completes under it
+/// (robustness fix). We only assert the flag is accepted and the turn runs;
+/// exercising an actual timeout would require a deliberately-slow mock.
+#[tokio::test]
+#[serial]
+async fn test_timeout_secs_flag_parses() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--timeout-secs", "300", "ask", "--gateway", "example", "hi"]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("ok"));
+    })
+    .await
+    .expect("spawned kitsu --timeout-secs process should join");
+}

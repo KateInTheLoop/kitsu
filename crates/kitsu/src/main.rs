@@ -118,7 +118,7 @@ fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             chat_path: gateway.chat_path.clone(),
             models_path,
             retries: 2,
-            timeout: Duration::from_secs(60),
+            timeout: Duration::from_secs(cli.timeout_secs),
         },
         auth.clone(),
     );
