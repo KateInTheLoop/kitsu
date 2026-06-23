@@ -113,6 +113,7 @@ async fn collect_stream(
         match item.expect("stream item should be Ok in the happy path") {
             ChatDelta::Text(t) => text.push_str(&t),
             ChatDelta::ToolCall(tc) => tool_calls.push(tc),
+            ChatDelta::Usage(_) => {}
             ChatDelta::Done(reason) => finish = Some(reason),
         }
     }
@@ -328,4 +329,59 @@ fn test_backoff_delay_never_panics_and_is_capped() {
             "attempt {attempt} should clamp to the cap, not overflow"
         );
     }
+}
+
+#[test]
+fn test_parse_completion_surfaces_usage() {
+    use super::parse_completion;
+    use crate::types::ChatDelta;
+    let body = r#"{
+        "choices":[{"message":{"role":"assistant","content":"hi"},"finish_reason":"stop"}],
+        "usage":{"prompt_tokens":21,"completion_tokens":9,"total_tokens":30}
+    }"#;
+    let deltas = parse_completion(body).expect("parse ok");
+    let usage = deltas.iter().find_map(|d| match d {
+        ChatDelta::Usage(u) => Some(*u),
+        _ => None,
+    });
+    let u = usage.expect("usage delta present");
+    assert_eq!(u.prompt_tokens, 21);
+    assert_eq!(u.completion_tokens, 9);
+    assert_eq!(u.total_tokens, 30);
+    // Usage must come before the terminal Done.
+    let pos_usage = deltas.iter().position(|d| matches!(d, ChatDelta::Usage(_)));
+    let pos_done = deltas.iter().position(|d| matches!(d, ChatDelta::Done(_)));
+    assert!(pos_usage < pos_done);
+}
+
+#[test]
+fn test_parse_completion_without_usage_emits_no_usage_delta() {
+    use super::parse_completion;
+    use crate::types::ChatDelta;
+    let body = r#"{"choices":[{"message":{"content":"hi"},"finish_reason":"stop"}]}"#;
+    let deltas = parse_completion(body).expect("parse ok");
+    assert!(!deltas.iter().any(|d| matches!(d, ChatDelta::Usage(_))));
+}
+
+#[test]
+fn test_sse_decoder_surfaces_trailing_usage_chunk() {
+    use super::SseDecoder;
+    use crate::types::ChatDelta;
+    // Final chunk carries usage with empty choices (OpenAI include_usage shape).
+    let mut dec = SseDecoder::default();
+    let mut out = dec.push_bytes(
+        b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
+          data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\
+          data: [DONE]\n",
+    );
+    out.extend(dec.finalize());
+    let u = out
+        .iter()
+        .find_map(|d| match d {
+            ChatDelta::Usage(u) => Some(*u),
+            _ => None,
+        })
+        .expect("usage surfaced from stream");
+    assert_eq!(u.total_tokens, 7);
+    assert_eq!(u.prompt_tokens, 5);
 }

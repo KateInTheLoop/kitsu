@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use crate::auth::AuthProvider;
 use crate::error::{AuthError, ProviderError};
 use crate::types::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor,
+    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
 };
 use crate::{ChatStream, Provider};
 
@@ -84,10 +84,19 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     tools: Option<Vec<WireTool<'a>>>,
     stream: bool,
+    // Ask the gateway to include a final usage chunk when streaming. Harmless
+    // when unsupported (extra field ignored); only sent for stream requests.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    stream_options: Option<StreamOptions>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+}
+
+#[derive(Serialize)]
+struct StreamOptions {
+    include_usage: bool,
 }
 
 #[derive(Serialize)]
@@ -186,6 +195,13 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         messages,
         tools,
         stream: req.stream,
+        stream_options: if req.stream {
+            Some(StreamOptions {
+                include_usage: true,
+            })
+        } else {
+            None
+        },
         temperature: req.temperature,
         max_tokens: req.max_tokens,
     }
@@ -197,6 +213,11 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
 struct StreamChunk {
     #[serde(default)]
     choices: Vec<StreamChoice>,
+    // Most gateways emit `usage` only on the final chunk (and only when
+    // stream_options.include_usage is set); tolerate it being absent on every
+    // chunk. When present we surface it as a ChatDelta::Usage.
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -237,6 +258,8 @@ struct DeltaToolCallFn {
 struct CompletionResponse {
     #[serde(default)]
     choices: Vec<CompletionChoice>,
+    #[serde(default)]
+    usage: Option<Usage>,
 }
 
 #[derive(Deserialize)]
@@ -299,6 +322,8 @@ struct SseDecoder {
     buf: Vec<u8>,
     accs: Vec<ToolCallAcc>,
     finish: Option<FinishReason>,
+    /// Usage from the final chunk, if the gateway reported it.
+    usage: Option<Usage>,
     /// Set once `data: [DONE]` is seen; later lines are ignored.
     saw_done: bool,
 }
@@ -337,6 +362,13 @@ impl SseDecoder {
             Ok(c) => c,
             Err(_) => return, // tolerate keep-alives / non-JSON comments
         };
+        // Usage typically rides the final chunk (which often has empty choices);
+        // capture it regardless of whether this chunk also carries a delta.
+        if let Some(u) = chunk.usage {
+            if !u.is_empty() {
+                self.usage = Some(u);
+            }
+        }
         let Some(choice) = chunk.choices.into_iter().next() else {
             return;
         };
@@ -384,6 +416,9 @@ impl SseDecoder {
             if !acc.name.is_empty() || !acc.id.is_empty() {
                 out.push(ChatDelta::ToolCall(acc.into_tool_call()));
             }
+        }
+        if let Some(usage) = self.usage.take() {
+            out.push(ChatDelta::Usage(usage));
         }
         out.push(ChatDelta::Done(self.finish.unwrap_or(FinishReason::Stop)));
         out
@@ -439,6 +474,12 @@ fn parse_completion(body: &str) -> Result<Vec<ChatDelta>, ProviderError> {
         }
         None => FinishReason::Stop,
     };
+    // Surface usage (if reported) just before the terminal marker.
+    if let Some(usage) = resp.usage {
+        if !usage.is_empty() {
+            out.push(ChatDelta::Usage(usage));
+        }
+    }
     out.push(ChatDelta::Done(finish));
     Ok(out)
 }
