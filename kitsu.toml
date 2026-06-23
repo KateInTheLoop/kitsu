@@ -7,3 +7,16 @@ chat_path   = "/v1/chat/completions"
 models_path = ""
 model       = "example-model-v1"
 auth        = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
+
+# The unified gateway also fronts Anthropic (Bedrock) models on the SAME
+# OpenAI-compatible endpoint — verified to accept a 396k-token prompt (well
+# past the 200k standard window) with NO special beta header, and to stream.
+# Same base_url/chat_path as `example`; only the default model differs. A separate
+# profile gives an independently rate-poolable name + a 1M-context default.
+[gateways.anthropic1m]
+flavor      = "openai"
+base_url    = "https://gateway.example.com"
+chat_path   = "/v1/chat/completions"
+models_path = ""
+model       = "claude-opus-4-8"
+auth        = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
