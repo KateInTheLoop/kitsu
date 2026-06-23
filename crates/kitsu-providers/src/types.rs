@@ -112,6 +112,34 @@ pub enum FinishReason {
     ToolCalls,
 }
 
+/// Token usage reported by the gateway for one completion. Anthropic (and most
+/// OpenAI-compat) responses carry this in a `usage` object; some gateways/models
+/// omit it, so every field defaults to 0 and callers should treat an all-zero
+/// `Usage` as "not reported".
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+
+impl Usage {
+    /// True when the gateway reported nothing usable (all fields zero).
+    pub fn is_empty(&self) -> bool {
+        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.total_tokens == 0
+    }
+
+    /// Merge another usage into this one (summed across multi-round turns).
+    pub fn add(&mut self, other: Usage) {
+        self.prompt_tokens += other.prompt_tokens;
+        self.completion_tokens += other.completion_tokens;
+        self.total_tokens += other.total_tokens;
+    }
+}
+
 /// One incremental piece of a streamed response.
 #[derive(Debug, Clone, PartialEq)]
 pub enum ChatDelta {
@@ -119,6 +147,9 @@ pub enum ChatDelta {
     Text(String),
     /// A (possibly partial, accumulated) tool call surfaced when complete.
     ToolCall(ToolCall),
+    /// Token usage for this completion, surfaced before `Done` when the gateway
+    /// reports it. May appear at most once per response.
+    Usage(Usage),
     /// Terminal marker for the stream.
     Done(FinishReason),
 }

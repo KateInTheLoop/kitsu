@@ -8,7 +8,7 @@ pub mod types;
 
 pub use error::{AuthError, ExpiryStatus, ProviderError};
 pub use types::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor,
+    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
 };
 
 use futures::stream::BoxStream;

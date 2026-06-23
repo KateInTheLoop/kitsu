@@ -37,3 +37,19 @@ pub fn finish_line() {
     let _ = out.write_all(b"\n");
     let _ = out.flush();
 }
+
+/// Emit a single machine-readable token-usage line to **stderr** (never stdout,
+/// which carries only assistant text). Format is a stable, greppable prefix
+/// followed by compact JSON so external consumers can parse it:
+///
+/// ```text
+/// kitsu-usage: {"prompt_tokens":21,"completion_tokens":9,"total_tokens":30}
+/// ```
+pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) {
+    let mut err = io::stderr();
+    let _ = writeln!(
+        err,
+        "kitsu-usage: {{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{total_tokens}}}"
+    );
+    let _ = err.flush();
+}

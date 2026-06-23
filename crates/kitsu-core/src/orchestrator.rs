@@ -51,11 +51,42 @@ pub enum AgentError {
 /// text. Tools may be empty (degenerates to a single round — the MVP `ask` path).
 ///
 /// Generic over `P: Provider` so tests can pass a mock provider.
+///
+/// As a side effect, when the gateway reported token usage, a single machine-
+/// readable `kitsu-usage: {...}` line is written to stderr after the turn — used
+/// by external consumers for cost reporting. Never on
+/// stdout, which carries only the assistant text.
 pub async fn run_agent_turn<P>(
     provider: &P,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
+) -> Result<String, AgentError>
+where
+    P: Provider,
+{
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage).await;
+    // Emit usage regardless of Ok/Err — partial turns still cost tokens. Only
+    // when the gateway actually reported something.
+    if !turn_usage.is_empty() {
+        kitsu_render::emit_usage(
+            turn_usage.prompt_tokens,
+            turn_usage.completion_tokens,
+            turn_usage.total_tokens,
+        );
+    }
+    result
+}
+
+/// The agent loop proper. Accumulates per-round token usage into `turn_usage`
+/// so the public wrapper can emit it once after the turn ends (success or error).
+async fn run_agent_turn_inner<P>(
+    provider: &P,
+    tools: &Registry,
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    turn_usage: &mut kitsu_providers::Usage,
 ) -> Result<String, AgentError>
 where
     P: Provider,
@@ -98,6 +129,7 @@ where
                     assistant_text.push_str(&t);
                 }
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
+                ChatDelta::Usage(u) => turn_usage.add(u),
                 ChatDelta::Done(reason) => finish = reason,
             }
         }
