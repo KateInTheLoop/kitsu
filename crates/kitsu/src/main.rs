@@ -430,6 +430,11 @@ async fn run_chat(
         if line.is_empty() {
             continue;
         }
+        // A multi-line line came from a bracketed paste — acknowledge it so the
+        // user sees the block landed as one turn.
+        if line.contains('\n') {
+            eprintln!("[pasted {} lines]", line.lines().count());
+        }
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
