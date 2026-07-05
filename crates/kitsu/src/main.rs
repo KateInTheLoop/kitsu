@@ -205,6 +205,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         context_window: setup.context_window,
+        offload_dir: None,
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
@@ -252,6 +253,7 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
 /// A `<<<` line begins a MULTI-LINE turn (a pasted code block or stack trace),
 /// preserved verbatim with its newlines until a closing `>>>` line — the scripted
 /// equivalent of a bracketed paste in the interactive REPL.
+#[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
     tools: &Registry,
@@ -260,6 +262,7 @@ async fn run_scripted(
     cli: &Cli,
     path: &str,
     perms: &Permissions,
+    offload_dir: &Option<std::path::PathBuf>,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
@@ -278,7 +281,8 @@ async fn run_scripted(
                 idx += 1;
             }
             idx += 1; // consume the closing ">>>" (if present)
-            run_scripted_turn(setup, tools, messages, model, cli, &block.join("\n")).await;
+            run_scripted_turn(setup, tools, messages, model, cli, &block.join("\n"), offload_dir)
+                .await;
             continue;
         }
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -290,13 +294,14 @@ async fn run_scripted(
                 SlashResult::Quit => break,
             }
         }
-        run_scripted_turn(setup, tools, messages, model, cli, trimmed).await;
+        run_scripted_turn(setup, tools, messages, model, cli, trimmed, offload_dir).await;
     }
     Ok(())
 }
 
 /// Send one scripted user turn and render the response (errors are printed, not
 /// propagated — a bad turn shouldn't abort the rest of the script).
+#[allow(clippy::too_many_arguments)]
 async fn run_scripted_turn(
     setup: &ChatSetup,
     tools: &Registry,
@@ -304,6 +309,7 @@ async fn run_scripted_turn(
     model: &str,
     cli: &Cli,
     input: &str,
+    offload_dir: &Option<std::path::PathBuf>,
 ) {
     println!("user> {input}");
     messages.push(ChatMessage::user(input));
@@ -312,6 +318,7 @@ async fn run_scripted_turn(
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         context_window: setup.context_window,
+        offload_dir: offload_dir.clone(),
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
@@ -404,13 +411,30 @@ async fn run_chat(
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
+    // A per-session scratch dir for offloading large tool results (Stage 2). Only
+    // when tools can run; granted read access so the model can re-read offloaded
+    // results. Best-effort — offloading is skipped if it can't be created.
+    let offload_dir = if tool_names.is_empty() {
+        None
+    } else {
+        let dir = std::env::temp_dir().join(format!("kitsu-offload-{}", std::process::id()));
+        if std::fs::create_dir_all(&dir).is_ok() {
+            let _ = perms.grant_read_root(&dir.to_string_lossy());
+            Some(dir)
+        } else {
+            None
+        }
+    };
+
     let mut model = setup.model.clone();
     let context_window = setup.context_window;
+    let base_offload = offload_dir.clone();
     let base_cfg = move |model: String, cli: &Cli| AgentConfig {
         model,
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         context_window,
+        offload_dir: base_offload.clone(),
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
@@ -421,7 +445,10 @@ async fn run_chat(
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.
     if let Some(path) = script {
-        return run_scripted(&setup, &tools, &mut messages, &mut model, cli, path, &perms).await;
+        return run_scripted(
+            &setup, &tools, &mut messages, &mut model, cli, path, &perms, &offload_dir,
+        )
+        .await;
     }
 
     // Non-TTY stdin → one-shot, no interactive loop (development_plan.md).
