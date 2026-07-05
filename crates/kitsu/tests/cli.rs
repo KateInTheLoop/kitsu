@@ -50,6 +50,8 @@ fn base_cmd(home: &Path) -> Command {
     cmd.env("HOME", home);
     // Ensure no ambient expiry interferes.
     cmd.env_remove("ANTHROPIC_TOKEN_EXPIRES");
+    // Don't auto-load the repo's own llms.txt into test system prompts.
+    cmd.env("KITSU_NO_PROJECT_CONTEXT", "1");
     cmd
 }
 
