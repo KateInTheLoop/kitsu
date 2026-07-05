@@ -3,6 +3,7 @@
 
 mod cli;
 mod config;
+mod llms;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -440,7 +441,22 @@ async fn run_chat(
         max_tokens: cli.max_output_tokens,
     };
 
-    let mut messages = vec![ChatMessage::system(chat_system_prompt(&tool_names))];
+    // Load curated project context from an llms.txt (or AGENTS.md/CLAUDE.md) in
+    // the launch dir / project root, budget-gated against the window (Stage 4).
+    // Injected into the (protected) system prompt. Disable with
+    // KITSU_NO_PROJECT_CONTEXT (used by tests for determinism).
+    let mut system = chat_system_prompt(&tool_names);
+    if std::env::var_os("KITSU_NO_PROJECT_CONTEXT").is_none() {
+        if let Some((ctx, tokens)) = std::env::current_dir()
+            .ok()
+            .and_then(|cwd| llms::load(&cwd, None, setup.context_window))
+        {
+            system.push_str("\n\n---\nProject context (from llms.txt):\n");
+            system.push_str(&ctx);
+            eprintln!("~ loaded project context ({tokens} tokens)");
+        }
+    }
+    let mut messages = vec![ChatMessage::system(system)];
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.

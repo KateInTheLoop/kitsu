@@ -530,9 +530,21 @@ sessions don't overflow it — important for small local models.
   `kitsu-context: {"used":…,"effective":…,"window":…}` line is written to stderr
   each turn (companion to `kitsu-usage:`).
 
-Richer, reversible trimming — offloading large tool results to disk, dropping old
-turns, and summarizing compaction — is planned; see
+Summarizing compaction (an LLM-written summary when trimming would evict the
+active task) is planned; see
 [docs/context-management-design.md](docs/context-management-design.md).
+
+### Project context (`llms.txt`)
+
+On `chat` start, kitsu loads curated project context from an
+[`llms.txt`](https://llmstxt.org/) — the open standard for LLM-friendly project
+context — found in the launch directory or up at the project root, and injects it
+into the system prompt. So the model knows what your project *is* without you
+pasting docs, and without slurping every markdown file. The `## Optional` section
+is loaded only when the window has room (it's the first thing skipped on small
+models). If there's no `llms.txt`, kitsu falls back to an `AGENTS.md`/`CLAUDE.md`.
+Set `KITSU_NO_PROJECT_CONTEXT=1` to disable. kitsu ships its own `llms.txt`, so any
+`llms.txt`-aware tool — including kitsu — can understand the repo.
 
 ---
 

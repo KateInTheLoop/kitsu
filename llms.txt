@@ -1,0 +1,38 @@
+# kitsu 狐
+
+> A multi-gateway LLM CLI written in Rust. Talk to any OpenAI-compatible endpoint
+> — OpenAI, Anthropic, Hugging Face, Ollama, vLLM, or a custom gateway — through
+> one configurable interface, with an agent tool-loop, a Claude-Code-style
+> permission model for filesystem tools, and model-aware context management.
+
+kitsu is a Cargo workspace of five crates:
+
+- `kitsu` — the CLI binary: `ask` (one-shot) and `chat` (interactive REPL), config
+  and gateway-profile resolution, the permission prompt, and project-context
+  loading.
+- `kitsu-core` — the agent orchestrator loop (call model → run tools → repeat) and
+  context management (token budgeting, trimming cascade).
+- `kitsu-providers` — the `Provider` trait and the OpenAI-compatible streaming
+  client shared by every gateway.
+- `kitsu-tools` — the tool registry, runtime `Permissions`, and built-in
+  filesystem tools (`fs_read_file`, `fs_list_dir`, `repo_grep`, `fs_write_file`).
+- `kitsu-render` — terminal rendering (banner, spinner, streamed output).
+
+## Docs
+
+- [README](README.md): install, gateway profiles, per-provider recipes, auth, the
+  CLI reference, chat tools, and the context-window model
+- [Architecture](docs/architecture.md): design and component overview
+
+## Context management
+
+- [Design](docs/context-management-design.md): the token-budget trimming cascade
+  (offload → elide → drop turns → summarize) and llms.txt ingestion
+- [Development stages](docs/context-management-stages.md): the staged plan
+
+## Optional
+
+- [Functionality notes](docs/functionality.md): feature notes
+- [UI guidelines](docs/ui_guidelines.md): terminal UX conventions
+- [Claude Code comparison](docs/claude-code-comparison.md): how kitsu relates to
+  Claude Code
