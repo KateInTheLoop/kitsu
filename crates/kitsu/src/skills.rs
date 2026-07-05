@@ -15,7 +15,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kitsu_providers::ToolDescriptor;
-use kitsu_tools::{HandlerFn, ToolError};
+use kitsu_tools::{HandlerFn, Permissions, ToolError};
 
 /// A parsed skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -26,6 +26,8 @@ pub struct Skill {
     /// Load the body up front rather than on demand (use sparingly).
     pub always: bool,
     pub body: String,
+    /// Declared reference links — surfaced to the user, never auto-fetched.
+    pub links: Vec<String>,
     /// The skill's directory (its bundled resources live here — Stage S2).
     pub dir: PathBuf,
 }
@@ -137,6 +139,7 @@ pub fn parse(content: &str, dir: &Path) -> Skill {
         when_to_use: String::new(),
         always: false,
         body: String::new(),
+        links: Vec::new(),
         dir: dir.to_path_buf(),
     };
 
@@ -164,6 +167,14 @@ pub fn parse(content: &str, dir: &Path) -> Skill {
                     "description" => skill.description = v,
                     "when_to_use" => skill.when_to_use = v,
                     "always" => skill.always = v.eq_ignore_ascii_case("true"),
+                    "links" => {
+                        skill.links = v
+                            .split([',', ' '])
+                            .map(str::trim)
+                            .filter(|s| !s.is_empty())
+                            .map(str::to_string)
+                            .collect()
+                    }
                     _ => {}
                 }
             }
@@ -182,14 +193,52 @@ struct SkillArgs {
     name: String,
 }
 
-/// Build the `skill` tool: `skill(name)` returns that skill's full body so the
-/// model can load it on demand. Registered only when skills exist.
-pub fn skill_tool(skills: Arc<SkillSet>) -> (ToolDescriptor, HandlerFn) {
+/// Grant read access to `skill`'s directory (so its bundled files are reachable
+/// via `fs_read_file` without a broad `--allow-path`) and render its body plus a
+/// list of bundled files and declared links. Shared by the `skill` tool,
+/// `/skill`, and `--skill` (Stage S2). Links are surfaced, never fetched.
+pub fn load_skill(skill: &Skill, perms: &Permissions) -> String {
+    let _ = perms.grant_read_root(&skill.dir.to_string_lossy());
+    let mut out = format!("# Skill: {}\n{}", skill.name, skill.body);
+    let files = bundled_files(&skill.dir);
+    if !files.is_empty() {
+        out.push_str("\n\nBundled files (read with fs_read_file):\n");
+        for f in &files {
+            out.push_str(&format!("- {f}\n"));
+        }
+    }
+    if !skill.links.is_empty() {
+        out.push_str("\nReference links (open manually — NOT fetched by kitsu):\n");
+        for l in &skill.links {
+            out.push_str(&format!("- {l}\n"));
+        }
+    }
+    out
+}
+
+/// The skill's bundled resource files (everything in its dir except `SKILL.md`).
+fn bundled_files(dir: &Path) -> Vec<String> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut files: Vec<String> = entries
+        .flatten()
+        .filter(|e| e.file_name() != "SKILL.md")
+        .filter(|e| e.path().is_file())
+        .map(|e| e.path().to_string_lossy().to_string())
+        .collect();
+    files.sort();
+    files
+}
+
+/// Build the `skill` tool: `skill(name)` loads a skill's instructions (and grants
+/// read to its dir for bundled files) on demand. Registered only when skills exist.
+pub fn skill_tool(skills: Arc<SkillSet>, perms: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "skill".to_string(),
         description: "Load a named skill's full instructions into context. Call this when a task \
                       matches a skill's description (skills are listed in the system prompt). \
-                      Returns the skill's instructions."
+                      Returns the instructions and any bundled files you may then read."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -199,11 +248,12 @@ pub fn skill_tool(skills: Arc<SkillSet>) -> (ToolDescriptor, HandlerFn) {
     };
     let handler: HandlerFn = Box::new(move |args: String| {
         let skills = skills.clone();
+        let perms = perms.clone();
         Box::pin(async move {
             let a: SkillArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
             match skills.get(&a.name) {
-                Some(s) => Ok(format!("# Skill: {}\n{}", s.name, s.body)),
+                Some(s) => Ok(load_skill(s, &perms)),
                 None => Err(ToolError::ExecError(format!(
                     "no skill named '{}'; available: {}",
                     a.name,
@@ -259,6 +309,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                     when_to_use: String::new(),
                     always: false,
                     body: String::new(),
+                    links: Vec::new(),
                     dir: PathBuf::new(),
                 },
                 Skill {
@@ -267,6 +318,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                     when_to_use: String::new(),
                     always: false,
                     body: String::new(),
+                    links: Vec::new(),
                     dir: PathBuf::new(),
                 },
             ],
@@ -334,14 +386,46 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                 when_to_use: String::new(),
                 always: false,
                 body: "Say hello warmly.".into(),
+                links: Vec::new(),
                 dir: PathBuf::new(),
             }],
         });
-        let (desc, handler) = skill_tool(set);
+        let perms = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let (desc, handler) = skill_tool(set, perms);
         assert_eq!(desc.name, "skill");
         let ok = handler(r#"{"name":"greet"}"#.to_string()).await.unwrap();
         assert!(ok.contains("Say hello warmly."));
         assert!(handler(r#"{"name":"nope"}"#.to_string()).await.is_err());
         assert!(handler("not json".to_string()).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn load_skill_grants_read_lists_files_and_surfaces_links_without_fetching() {
+        let dir = tempfile::tempdir().unwrap();
+        let skdir = dir.path().join("cr");
+        std::fs::create_dir_all(&skdir).unwrap();
+        std::fs::write(
+            skdir.join("SKILL.md"),
+            "---\nname: cr\nlinks: https://example.com/spec\n---\nbody",
+        )
+        .unwrap();
+        std::fs::write(skdir.join("checklist.md"), "1. check").unwrap();
+        let skill = parse(
+            &std::fs::read_to_string(skdir.join("SKILL.md")).unwrap(),
+            &skdir,
+        );
+        assert_eq!(skill.links, vec!["https://example.com/spec"]);
+
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        let checklist = skdir.join("checklist.md");
+        // Before loading, the bundled file is NOT readable (deny-by-default).
+        assert!(perms.check_read(&checklist).await.is_err());
+
+        let out = load_skill(&skill, &perms);
+        assert!(out.contains("checklist.md"), "bundled file is listed");
+        assert!(out.contains("https://example.com/spec"), "link surfaced");
+        assert!(out.contains("NOT fetched"), "links are not fetched");
+        // Loading granted read to the skill dir, so now it's readable.
+        assert!(perms.check_read(&checklist).await.is_ok());
     }
 }

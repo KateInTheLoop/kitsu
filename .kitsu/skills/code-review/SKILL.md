@@ -6,6 +6,8 @@ always: false
 ---
 # Code review
 
+First read the bundled checklist.md (its path is provided when the skill loads) and apply it.
+
 1. Read the target file(s) with fs_read_file (ask for the path if unclear).
 2. Look for: correctness bugs, edge cases, resource/error handling, security, and
    unclear naming. Prefer concrete failure scenarios over style nits.
