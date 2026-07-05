@@ -532,3 +532,44 @@ auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
     .await
     .expect("join");
 }
+
+/// `/context` prints the model, resolved window, and a per-category breakdown —
+/// no gateway call is needed for a context-only script.
+#[tokio::test]
+#[serial]
+async fn test_context_slash_command_shows_utilization() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+model = "test-model"
+context_window = 8000
+auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
+"#,
+    )
+    .unwrap();
+
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, "/context\n").unwrap();
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("window: 8000"))
+            .stderr(predicate::str::contains("system prompt"))
+            .stderr(predicate::str::contains("effective"));
+    })
+    .await
+    .expect("join");
+}
