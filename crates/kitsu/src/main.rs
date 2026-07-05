@@ -82,7 +82,15 @@ fn run() -> Result<(), CliError> {
         Command::Chat {
             prompt,
             allow_paths,
-        } => runtime.block_on(run_chat(&cli, prompt.as_deref(), allow_paths)),
+            allow_write,
+            script,
+        } => runtime.block_on(run_chat(
+            &cli,
+            prompt.as_deref(),
+            allow_paths,
+            allow_write,
+            script.as_deref(),
+        )),
     }
 }
 
@@ -171,11 +179,63 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
         "You are kitsu, a concise, helpful CLI assistant.".to_string()
     } else {
         format!(
-            "You are kitsu, a concise, helpful CLI assistant. You can call these read-only \
-             tools when useful: {}. Only read paths the user has allowed.",
+            "You are kitsu, a concise, helpful CLI assistant. You can call these tools when \
+             useful: {}. Only touch paths the user has allowed. When asked to generate code or \
+             files, use fs_write_file if it is available.",
             tool_names.join(", ")
         )
     }
+}
+
+/// Run turns from a script file non-interactively: one turn per line, threading
+/// multi-turn history, printing a readable transcript (`user> …` then the
+/// response). Blank lines and `#` comments are skipped; `/slash` commands work.
+async fn run_scripted(
+    setup: &ChatSetup,
+    tools: &Registry,
+    messages: &mut Vec<ChatMessage>,
+    model: &mut String,
+    cli: &Cli,
+    path: &str,
+) -> Result<(), CliError> {
+    let content = std::fs::read_to_string(path)
+        .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
+    for raw in content.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = line.strip_prefix('/') {
+            match handle_slash(rest, messages, model) {
+                SlashResult::Continue => continue,
+                SlashResult::Quit => break,
+            }
+        }
+        println!("user> {line}");
+        messages.push(ChatMessage::user(line));
+        let cfg = AgentConfig {
+            model: model.clone(),
+            max_rounds: cli.max_rounds,
+            max_context_bytes: 128 * 1024,
+            stream: !cli.no_stream,
+            temperature: cli.temperature,
+            max_tokens: cli.max_output_tokens,
+        };
+        match run_agent_turn(&setup.provider, tools, messages, &cfg).await {
+            Ok(text) => {
+                if cli.no_stream {
+                    println!("{text}");
+                } else {
+                    kitsu_render::finish_line();
+                }
+            }
+            Err(e) => {
+                kitsu_render::finish_line();
+                eprintln!("{}", map_agent_error(e));
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Outcome of a single (cancellable) turn.
@@ -205,15 +265,26 @@ async fn run_chat(
     cli: &Cli,
     first_prompt: Option<&str>,
     allow_paths: &[String],
+    allow_write: &[String],
+    script: Option<&str>,
 ) -> Result<(), CliError> {
     let setup = build_setup(cli)?;
 
-    // Build the tool registry from the allowlist. No --allow-path ⇒ no tools.
+    // Build the tool registry from the allowlists. Read tools require
+    // --allow-path; the write (file-generation) tool requires --allow-write.
+    // The two allowlists are independent and deny-by-default.
     let mut tools = Registry::new();
-    if !allow_paths.is_empty() {
-        let policy =
-            Policy::from_roots(allow_paths).map_err(|e| CliError::user(e.to_string()))?;
-        builtins::register_fs_tools(&mut tools, Arc::new(policy));
+    if !allow_paths.is_empty() || !allow_write.is_empty() {
+        let policy = Policy::from_roots(allow_paths)
+            .and_then(|p| p.with_write_roots(allow_write))
+            .map_err(|e| CliError::user(e.to_string()))?;
+        let policy = Arc::new(policy);
+        if !allow_paths.is_empty() {
+            builtins::register_fs_tools(&mut tools, policy.clone());
+        }
+        if !allow_write.is_empty() {
+            builtins::register_write_tools(&mut tools, policy.clone());
+        }
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
@@ -228,6 +299,12 @@ async fn run_chat(
     };
 
     let mut messages = vec![ChatMessage::system(chat_system_prompt(&tool_names))];
+
+    // Scripted mode: run turns from a file non-interactively, then exit. Works
+    // regardless of TTY, so it's the deterministic multi-turn driver.
+    if let Some(path) = script {
+        return run_scripted(&setup, &tools, &mut messages, &mut model, cli, path).await;
+    }
 
     // Non-TTY stdin → one-shot, no interactive loop (development_plan.md).
     if !kitsu_render::stdin_is_tty() {
@@ -341,10 +418,31 @@ fn handle_slash(cmd: &str, messages: &mut Vec<ChatMessage>, model: &mut String) 
         "quit" | "exit" => return SlashResult::Quit,
         "help" => {
             eprintln!(
-                "commands:\n  /model <name>  switch model (keeps history)\n  /clear         \
+                "commands:\n  /model <name>  switch model (keeps history)\n  /save <file>   \
+                 write the last response to <file> (code blocks if present)\n  /clear         \
                  clear conversation (keeps system prompt)\n  /help          this help\n  \
                  /quit          exit\ncurrent model: {model}"
             );
+        }
+        "save" => {
+            if arg.is_empty() {
+                eprintln!("usage: /save <file> (writes the last response; code blocks if present)");
+            } else {
+                match messages
+                    .iter()
+                    .rev()
+                    .find(|m| matches!(m.role, kitsu_providers::Role::Assistant))
+                {
+                    Some(m) => {
+                        let body = extract_code_or_text(&m.content);
+                        match std::fs::write(arg, body.as_bytes()) {
+                            Ok(()) => eprintln!("~ saved {} bytes to {arg}", body.len()),
+                            Err(e) => eprintln!("save failed: {e}"),
+                        }
+                    }
+                    None => eprintln!("nothing to save yet"),
+                }
+            }
         }
         "clear" => {
             // Keep only a leading system message, if present.
@@ -371,6 +469,34 @@ fn handle_slash(cmd: &str, messages: &mut Vec<ChatMessage>, model: &mut String) 
         }
     }
     SlashResult::Continue
+}
+
+/// For `/save`: if the text contains fenced ``` code blocks, return the
+/// concatenation of their contents (so a `.rs`/`.py` file gets just the code);
+/// otherwise return the whole text. Useful for the "ask for code, then save it"
+/// coding workflow — a lightweight bridge between paste and file generation.
+fn extract_code_or_text(text: &str) -> String {
+    let mut blocks: Vec<String> = Vec::new();
+    let mut cur = String::new();
+    let mut in_block = false;
+    for line in text.lines() {
+        if line.trim_start().starts_with("```") {
+            if in_block {
+                blocks.push(std::mem::take(&mut cur));
+            }
+            in_block = !in_block;
+            continue;
+        }
+        if in_block {
+            cur.push_str(line);
+            cur.push('\n');
+        }
+    }
+    if blocks.is_empty() {
+        text.to_string()
+    } else {
+        blocks.join("\n")
+    }
 }
 
 /// Build the appropriate AuthProvider from the profile's auth block.
