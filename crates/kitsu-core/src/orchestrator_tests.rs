@@ -988,3 +988,88 @@ fn enforce_budget_byte_path_when_window_unset() {
     enforce_context_budget(&mut msgs, &cfg, &meter);
     assert!(msgs[1].content.contains("elided"), "byte path should still trim");
 }
+
+// --- turn-dropping (Stage 2) -------------------------------------------------
+
+#[test]
+fn drop_old_exchanges_keeps_system_and_recent_no_orphans() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::drop_old_exchanges;
+    use kitsu_providers::{ChatMessage, Role};
+
+    // system + 4 exchanges: user + assistant(tool_call) + tool + assistant(text).
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..4 {
+        msgs.push(ChatMessage::user(
+            format!("question {k} {}", "x".repeat(200)).as_str(),
+        ));
+        msgs.push(ChatMessage::assistant("", vec![tc("t", &format!("c{k}"), "{}")]));
+        msgs.push(ChatMessage::tool(format!("c{k}").as_str(), "some result"));
+        msgs.push(ChatMessage::assistant(format!("answer {k}").as_str(), vec![]));
+    }
+    drop_old_exchanges(&mut msgs, 100, message_tokens);
+
+    assert_eq!(msgs[0].content, "sys", "system prompt preserved");
+    assert!(
+        msgs.iter().any(|m| m.content.contains("trimmed to fit")),
+        "a drop marker is inserted"
+    );
+    assert!(
+        msgs.iter().any(|m| m.content.contains("question 3")),
+        "the most recent exchange is kept"
+    );
+    assert!(
+        !msgs.iter().any(|m| m.content.contains("question 0")),
+        "the oldest exchange is dropped"
+    );
+    // No orphaned tool_result at the cut: after system, the next message is the
+    // user marker (a valid exchange boundary), not a dangling tool/assistant.
+    assert_eq!(msgs[1].role, Role::User);
+}
+
+#[test]
+fn drop_old_exchanges_noop_with_few_exchanges() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::drop_old_exchanges;
+    use kitsu_providers::ChatMessage;
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("only question"),
+        ChatMessage::assistant("only answer", vec![]),
+    ];
+    let before = msgs.len();
+    drop_old_exchanges(&mut msgs, 1, message_tokens); // target tiny, but nothing safely droppable
+    assert_eq!(msgs.len(), before, "must not drop the only/recent exchanges");
+}
+
+#[test]
+fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
+    use crate::context::{message_tokens, ContextMeter};
+    use crate::orchestrator::enforce_context_budget;
+    use kitsu_providers::ChatMessage;
+
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(400);
+    cfg.max_tokens = Some(64);
+    let meter = ContextMeter::new();
+
+    // Many big NON-tool turns (elision can't help) across several exchanges.
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..5 {
+        msgs.push(ChatMessage::user(
+            format!("q{k} {}", "y".repeat(300)).as_str(),
+        ));
+        msgs.push(ChatMessage::assistant(
+            format!("a{k} {}", "z".repeat(300)).as_str(),
+            vec![],
+        ));
+    }
+    let before: u64 = msgs.iter().map(message_tokens).sum();
+    enforce_context_budget(&mut msgs, &cfg, &meter);
+    let after: u64 = msgs.iter().map(message_tokens).sum();
+    assert!(after < before, "cascade must shrink the conversation ({before} -> {after})");
+    assert_eq!(msgs[0].content, "sys");
+    // Most recent exchange survives.
+    assert!(msgs.iter().any(|m| m.content.contains("q4")));
+}
