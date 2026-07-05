@@ -14,7 +14,7 @@ use config::{Config, Gateway};
 use kitsu_core::{run_agent_turn, AgentConfig};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
-use kitsu_providers::{ChatMessage, ProviderError};
+use kitsu_providers::{ChatMessage, Provider, ProviderError};
 use kitsu_tools::{builtins, Policy, Registry};
 
 /// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
@@ -225,7 +225,7 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(rest, messages, model) {
+            match handle_slash(rest, messages, model, &setup.provider).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -414,7 +414,7 @@ async fn run_chat(
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
-            match handle_slash(rest, &mut messages, &mut model) {
+            match handle_slash(rest, &mut messages, &mut model, &setup.provider).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -445,7 +445,12 @@ enum SlashResult {
 }
 
 /// Handle a slash command (the leading `/` already stripped).
-fn handle_slash(cmd: &str, messages: &mut Vec<ChatMessage>, model: &mut String) -> SlashResult {
+async fn handle_slash(
+    cmd: &str,
+    messages: &mut Vec<ChatMessage>,
+    model: &mut String,
+    provider: &OpenAICompatProvider,
+) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
     let arg = parts.next().unwrap_or("").trim();
@@ -454,12 +459,14 @@ fn handle_slash(cmd: &str, messages: &mut Vec<ChatMessage>, model: &mut String) 
         "quit" | "exit" => return SlashResult::Quit,
         "help" => {
             eprintln!(
-                "commands:\n  /model <name>  switch model (keeps history)\n  /save <file>   \
+                "commands:\n  /model <name>  switch model (keeps history)\n  /models [filter]  \
+                 list models the gateway offers (optionally filtered)\n  /save <file>   \
                  write the last response to <file> (code blocks if present)\n  /clear         \
                  clear conversation (keeps system prompt)\n  /help          this help\n  \
                  /quit          exit\ncurrent model: {model}"
             );
         }
+        "models" => list_models_and_print(provider, arg).await,
         "save" => {
             if arg.is_empty() {
                 eprintln!("usage: /save <file> (writes the last response; code blocks if present)");
@@ -493,7 +500,11 @@ fn handle_slash(cmd: &str, messages: &mut Vec<ChatMessage>, model: &mut String) 
         }
         "model" => {
             if arg.is_empty() {
-                eprintln!("usage: /model <name> (current: {model})");
+                eprintln!("usage: /model <name> (current: {model}); /models to list available");
+            } else if arg == "list" || arg.starts_with("list ") {
+                // Alias: `/model list [filter]` → same as `/models [filter]`.
+                let filter = arg.strip_prefix("list").unwrap_or("").trim();
+                list_models_and_print(provider, filter).await;
             } else {
                 // Model validity is gateway-defined; accept any non-empty id.
                 *model = arg.to_string();
@@ -532,6 +543,45 @@ fn extract_code_or_text(text: &str) -> String {
         text.to_string()
     } else {
         blocks.join("\n")
+    }
+}
+
+/// Fetch and print the models the gateway advertises (via its `models_path`),
+/// optionally filtered by a case-insensitive substring. Output goes to stderr
+/// like other slash commands. The listed IDs are what you pass to `/model <id>`
+/// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
+async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) {
+    match provider.list_models().await {
+        Ok(Some(models)) => {
+            let filter = filter.trim().to_lowercase();
+            let matched: Vec<&String> = models
+                .iter()
+                .filter(|m| filter.is_empty() || m.to_lowercase().contains(&filter))
+                .collect();
+            let total = matched.len();
+            if filter.is_empty() {
+                eprintln!("~ {total} model(s) available:");
+            } else {
+                eprintln!("~ {total} model(s) matching '{filter}':");
+            }
+            const CAP: usize = 40;
+            for m in matched.iter().take(CAP) {
+                eprintln!("  {m}");
+            }
+            if total > CAP {
+                eprintln!(
+                    "  … and {} more — narrow with `/models <substring>`",
+                    total - CAP
+                );
+            }
+            if total > 0 {
+                eprintln!("switch with: /model <id>");
+            }
+        }
+        Ok(None) => {
+            eprintln!("this gateway does not expose a model list (its models_path is empty)")
+        }
+        Err(e) => eprintln!("could not fetch models: {e}"),
     }
 }
 

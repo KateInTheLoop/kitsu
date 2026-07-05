@@ -464,3 +464,63 @@ async fn test_invalid_model_friendly_error() {
     .await
     .expect("spawned kitsu process should join");
 }
+
+// --- /models command --------------------------------------------------------
+
+/// `/models` lists the models the gateway's models endpoint returns.
+#[tokio::test]
+#[serial]
+async fn test_models_slash_command_lists_models() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // /v1/models catalog
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"object":"list","data":[{"id":"alpha-model"},{"id":"beta-model"}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    // Config with a real models_path so list_models() hits the endpoint.
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{base_url}"
+chat_path = "{CHAT_PATH}"
+models_path = "/v1/models"
+model = "alpha-model"
+auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    let script = "/models\n/quit\n";
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, script).unwrap();
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("alpha-model"))
+            .stderr(predicate::str::contains("beta-model"))
+            .stderr(predicate::str::contains("2 model(s)"));
+    })
+    .await
+    .expect("join");
+}
