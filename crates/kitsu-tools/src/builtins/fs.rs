@@ -1,5 +1,5 @@
 //! Read-only filesystem tools: `fs.read_file`, `fs.list_dir`, `repo.grep`.
-//! Each validates its path through the [`Policy`] before touching disk and runs
+//! Each validates its path through the [`Permissions`] before touching disk and runs
 //! the blocking IO on a blocking thread. Errors are returned as [`ToolError`]
 //! and serialized back to the model as a tool result by the orchestrator.
 
@@ -11,7 +11,7 @@ use std::time::Duration;
 use serde::Deserialize;
 
 use crate::error::ToolError;
-use crate::policy::Policy;
+use crate::permissions::Permissions;
 use crate::HandlerFn;
 use kitsu_providers::ToolDescriptor;
 
@@ -27,7 +27,7 @@ struct ReadFileArgs {
     end_line: Option<usize>,
 }
 
-pub fn read_file_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
+pub fn read_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_read_file".to_string(),
         description: "Read a UTF-8 text file from an allowed path. Optionally restrict to a \
@@ -50,10 +50,10 @@ pub fn read_file_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
     (descriptor, handler)
 }
 
-async fn read_file_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
+async fn read_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
     let a: ReadFileArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-    let canon = policy.check_read(Path::new(&a.path))?;
+    let canon = policy.check_read(Path::new(&a.path)).await?;
     let content = tokio::task::spawn_blocking(move || std::fs::read_to_string(&canon))
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
@@ -86,7 +86,7 @@ struct ListDirArgs {
     path: String,
 }
 
-pub fn list_dir_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
+pub fn list_dir_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_list_dir".to_string(),
         description: "List the entries (depth 1) of a directory at an allowed path. Directories \
@@ -107,10 +107,10 @@ pub fn list_dir_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
     (descriptor, handler)
 }
 
-async fn list_dir_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
+async fn list_dir_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
     let a: ListDirArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-    let canon = policy.check_read(Path::new(&a.path))?;
+    let canon = policy.check_read(Path::new(&a.path)).await?;
     let listing = tokio::task::spawn_blocking(move || -> Result<String, std::io::Error> {
         let mut entries = Vec::new();
         for entry in std::fs::read_dir(&canon)? {
@@ -145,7 +145,7 @@ struct GrepArgs {
 const GREP_TIMEOUT: Duration = Duration::from_secs(10);
 const GREP_DEFAULT_MAX: usize = 100;
 
-pub fn grep_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
+pub fn grep_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "repo_grep".to_string(),
         description: "Search file contents under an allowed path using ripgrep. Returns matching \
@@ -168,10 +168,10 @@ pub fn grep_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
     (descriptor, handler)
 }
 
-async fn grep_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
+async fn grep_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
     let a: GrepArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-    let canon = policy.check_read(Path::new(&a.path))?;
+    let canon = policy.check_read(Path::new(&a.path)).await?;
     let max = a.max_count.unwrap_or(GREP_DEFAULT_MAX);
     let pattern = a.pattern.clone();
 
@@ -210,7 +210,7 @@ struct WriteFileArgs {
     content: String,
 }
 
-pub fn write_file_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
+pub fn write_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_write_file".to_string(),
         description: "Create or overwrite a UTF-8 text file at a write-allowed path with the given \
@@ -233,11 +233,11 @@ pub fn write_file_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
     (descriptor, handler)
 }
 
-async fn write_file_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
+async fn write_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
     let a: WriteFileArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
     policy.check_write_size(a.content.len())?;
-    let target = policy.check_write(Path::new(&a.path))?;
+    let target = policy.check_write(Path::new(&a.path)).await?;
     let bytes = a.content.len();
     let display = target.display().to_string();
     let content = a.content;
@@ -266,7 +266,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_reads_allowed_and_rejects_outside() {
         let (dir, root) = temp_with_file("a.txt", "line1\nline2\nline3\n");
-        let policy = Policy::from_roots(&[root]).expect("policy");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
         let path = dir.path().join("a.txt");
         let args = serde_json::json!({"path": path.to_string_lossy()}).to_string();
         let out = read_file_run(&policy, &args).await.expect("read ok");
@@ -286,7 +286,7 @@ mod tests {
     #[tokio::test]
     async fn read_file_line_range() {
         let (dir, root) = temp_with_file("a.txt", "l1\nl2\nl3\nl4\n");
-        let policy = Policy::from_roots(&[root]).expect("policy");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
         let path = dir.path().join("a.txt");
         let args =
             serde_json::json!({"path": path.to_string_lossy(), "start_line": 2, "end_line": 3})
@@ -297,7 +297,7 @@ mod tests {
 
     #[tokio::test]
     async fn read_file_bad_args_is_invalid() {
-        let policy = Policy::from_roots(&[]).expect("policy");
+        let policy = Permissions::for_roots(&[], &[]).expect("perms");
         assert!(matches!(
             read_file_run(&policy, "not json").await,
             Err(ToolError::InvalidArgs(_))
@@ -308,7 +308,7 @@ mod tests {
     async fn list_dir_lists_entries() {
         let (dir, root) = temp_with_file("a.txt", "x");
         std::fs::create_dir(dir.path().join("sub")).expect("mk sub");
-        let policy = Policy::from_roots(&[root.clone()]).expect("policy");
+        let policy = Permissions::for_roots(&[root.clone()], &[]).expect("perms");
         let args = serde_json::json!({"path": root}).to_string();
         let out = list_dir_run(&policy, &args).await.expect("list ok");
         assert!(out.contains("a.txt"));
@@ -319,10 +319,7 @@ mod tests {
     async fn write_file_creates_in_write_root() {
         let dir = tempfile::tempdir().expect("tempdir");
         let root = dir.path().to_string_lossy().to_string();
-        let policy = Policy::from_roots(&[])
-            .expect("policy")
-            .with_write_roots(&[root])
-            .expect("write roots");
+        let policy = Permissions::for_roots(&[], &[root]).expect("perms");
         let target = dir.path().join("out.rs");
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
@@ -338,10 +335,8 @@ mod tests {
     async fn write_file_rejects_outside_write_root() {
         let allowed = tempfile::tempdir().expect("allowed");
         let other = tempfile::tempdir().expect("other");
-        let policy = Policy::from_roots(&[])
-            .expect("policy")
-            .with_write_roots(&[allowed.path().to_string_lossy().to_string()])
-            .expect("write roots");
+        let policy = Permissions::for_roots(&[], &[allowed.path().to_string_lossy().to_string()])
+            .expect("perms");
         let bad = other.path().join("evil.rs");
         let args =
             serde_json::json!({"path": bad.to_string_lossy(), "content": "x"}).to_string();
@@ -357,7 +352,7 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         // Read allowed, but no write roots configured → writes denied.
         let policy =
-            Policy::from_roots(&[dir.path().to_string_lossy().to_string()]).expect("policy");
+            Permissions::for_roots(&[dir.path().to_string_lossy().to_string()], &[]).expect("perms");
         let target = dir.path().join("x.rs");
         let args =
             serde_json::json!({"path": target.to_string_lossy(), "content": "x"}).to_string();
@@ -374,10 +369,8 @@ mod tests {
         let sibling = base.path().join("sibling");
         std::fs::create_dir_all(&allowed).expect("mk allowed");
         std::fs::create_dir_all(&sibling).expect("mk sibling");
-        let policy = Policy::from_roots(&[])
-            .expect("policy")
-            .with_write_roots(&[allowed.to_string_lossy().to_string()])
-            .expect("write roots");
+        let policy =
+            Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).expect("perms");
         // Escape via the allowed root's parent into the sibling dir.
         let escape = allowed.join("..").join("sibling").join("pwned.rs");
         let args =

@@ -15,7 +15,7 @@ use kitsu_core::{run_agent_turn, AgentConfig};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{ChatMessage, Provider, ProviderError};
-use kitsu_tools::{builtins, Policy, Registry};
+use kitsu_tools::{builtins, Decision, Mode, PermissionRequest, Permissions, Prompter, Registry};
 
 /// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
 const EXIT_USER: i32 = 1;
@@ -201,6 +201,7 @@ async fn run_scripted(
     model: &mut String,
     cli: &Cli,
     path: &str,
+    perms: &Permissions,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
@@ -225,7 +226,7 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(rest, messages, model, &setup.provider).await {
+            match handle_slash(rest, messages, model, &setup.provider, perms).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -302,21 +303,39 @@ async fn run_chat(
 ) -> Result<(), CliError> {
     let setup = build_setup(cli)?;
 
-    // Build the tool registry from the allowlists. Read tools require
-    // --allow-path; the write (file-generation) tool requires --allow-write.
-    // The two allowlists are independent and deny-by-default.
+    // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode (prompt
+    // on demand) with read access to the launch directory by default; scripted /
+    // piped runs are deny-by-default (or --yes to auto-approve). --allow-path /
+    // --allow-write pre-grant paths so those never prompt.
+    let scripted = script.is_some();
+    let interactive = kitsu_render::stdin_is_tty() && !scripted;
+    let mode = if cli.yes {
+        Mode::AutoAllow
+    } else if interactive {
+        Mode::Ask
+    } else {
+        Mode::Deny
+    };
+    let mut read_roots: Vec<String> = allow_paths.to_vec();
+    if interactive {
+        if let Ok(cwd) = std::env::current_dir() {
+            read_roots.push(cwd.to_string_lossy().to_string());
+        }
+    }
+    let mut perms =
+        Permissions::new(&read_roots, allow_write, mode).map_err(|e| CliError::user(e.to_string()))?;
+    if mode == Mode::Ask {
+        perms = perms.with_prompter(Arc::new(CliPrompter));
+    }
+    let perms = Arc::new(perms);
+
+    // In interactive chat the tools are always available (permissions gate access
+    // at call time). Non-interactively, register them only when some access is
+    // pre-granted, so scripted runs with no flags advertise no tools.
     let mut tools = Registry::new();
-    if !allow_paths.is_empty() || !allow_write.is_empty() {
-        let policy = Policy::from_roots(allow_paths)
-            .and_then(|p| p.with_write_roots(allow_write))
-            .map_err(|e| CliError::user(e.to_string()))?;
-        let policy = Arc::new(policy);
-        if !allow_paths.is_empty() {
-            builtins::register_fs_tools(&mut tools, policy.clone());
-        }
-        if !allow_write.is_empty() {
-            builtins::register_write_tools(&mut tools, policy.clone());
-        }
+    if interactive || cli.yes || !allow_paths.is_empty() || !allow_write.is_empty() {
+        builtins::register_fs_tools(&mut tools, perms.clone());
+        builtins::register_write_tools(&mut tools, perms.clone());
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
@@ -335,7 +354,7 @@ async fn run_chat(
     // Scripted mode: run turns from a file non-interactively, then exit. Works
     // regardless of TTY, so it's the deterministic multi-turn driver.
     if let Some(path) = script {
-        return run_scripted(&setup, &tools, &mut messages, &mut model, cli, path).await;
+        return run_scripted(&setup, &tools, &mut messages, &mut model, cli, path, &perms).await;
     }
 
     // Non-TTY stdin → one-shot, no interactive loop (development_plan.md).
@@ -414,7 +433,7 @@ async fn run_chat(
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
-            match handle_slash(rest, &mut messages, &mut model, &setup.provider).await {
+            match handle_slash(rest, &mut messages, &mut model, &setup.provider, &perms).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -450,6 +469,7 @@ async fn handle_slash(
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
     provider: &OpenAICompatProvider,
+    perms: &Permissions,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -460,13 +480,34 @@ async fn handle_slash(
         "help" => {
             eprintln!(
                 "commands:\n  /model <name>  switch model (keeps history)\n  /models [filter]  \
-                 list models the gateway offers (optionally filtered)\n  /save <file>   \
-                 write the last response to <file> (code blocks if present)\n  /clear         \
-                 clear conversation (keeps system prompt)\n  /help          this help\n  \
-                 /quit          exit\ncurrent model: {model}"
+                 list models the gateway offers (optionally filtered)\n  /allow <path>  grant \
+                 read access to a path (no more prompts there)\n  /allow-write <path>  grant \
+                 write access to a path\n  /save <file>   write the last response to <file> \
+                 (code blocks if present)\n  /clear         clear conversation (keeps system \
+                 prompt)\n  /help          this help\n  /quit          exit\ncurrent model: {model}"
             );
         }
         "models" => list_models_and_print(provider, arg).await,
+        "allow" => {
+            if arg.is_empty() {
+                eprintln!("usage: /allow <path> (grant read access to a directory/file)");
+            } else {
+                match perms.grant_read_root(arg) {
+                    Ok(p) => eprintln!("~ read access granted: {}", p.display()),
+                    Err(e) => eprintln!("{e}"),
+                }
+            }
+        }
+        "allow-write" => {
+            if arg.is_empty() {
+                eprintln!("usage: /allow-write <path> (grant write access to a directory)");
+            } else {
+                match perms.grant_write_root(arg) {
+                    Ok(p) => eprintln!("~ write access granted: {}", p.display()),
+                    Err(e) => eprintln!("{e}"),
+                }
+            }
+        }
         "save" => {
             if arg.is_empty() {
                 eprintln!("usage: /save <file> (writes the last response; code blocks if present)");
@@ -582,6 +623,34 @@ async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) {
             eprintln!("this gateway does not expose a model list (its models_path is empty)")
         }
         Err(e) => eprintln!("could not fetch models: {e}"),
+    }
+}
+
+/// Prints a permission prompt to stderr and reads the user's choice from stdin.
+/// Used only in interactive `Mode::Ask`; the prompt fires mid-turn while
+/// rustyline is idle, so a plain blocking stdin read is safe. Anything other
+/// than `y`/`a` (including empty input or EOF) denies — safe default.
+struct CliPrompter;
+
+impl Prompter for CliPrompter {
+    fn ask(&self, req: &PermissionRequest) -> Decision {
+        use std::io::Write;
+        eprint!(
+            "\n\u{23fa} kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
+            req.action.verb(),
+            req.path,
+            req.grant_dir
+        );
+        let _ = std::io::stderr().flush();
+        let mut line = String::new();
+        if std::io::stdin().read_line(&mut line).is_err() {
+            return Decision::Deny;
+        }
+        match line.trim().to_ascii_lowercase().as_str() {
+            "y" | "yes" => Decision::AllowOnce,
+            "a" | "always" => Decision::AllowAlways,
+            _ => Decision::Deny,
+        }
     }
 }
 
