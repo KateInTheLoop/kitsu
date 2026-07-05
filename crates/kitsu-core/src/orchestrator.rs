@@ -105,6 +105,14 @@ where
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
 
+    // ISSUE-007 loop-breaker: track consecutive identical tool-call failures so a
+    // model that fixates on a failing call (e.g. a denied path) is forced to a
+    // final answer instead of burning every round. Signature = tool_name + args.
+    let mut consecutive_failures: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
+    let mut force_final_next = false;
+    const REPEAT_FAIL_LIMIT: u32 = 2;
+
     loop {
         round += 1;
         if round > cfg.max_rounds {
@@ -121,18 +129,26 @@ where
         // This is what turned tool-aware reviews of large repos from 36-byte
         // stubs into real reviews (robustness fix). A round budget of
         // 1 has no "earlier" round to nudge from, so only applies when >1.
-        let is_final_round = round == cfg.max_rounds && cfg.max_rounds > 1;
+        // Final round when: the round budget is exhausted, OR a tool call has
+        // failed identically REPEAT_FAIL_LIMIT times (ISSUE-007 loop-breaker).
+        let is_final_round =
+            (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
         let offered_tools = if is_final_round {
             None
         } else {
             tool_descriptors(tools)
         };
         if is_final_round && tool_descriptors(tools).is_some() {
-            messages.push(ChatMessage::user(
+            let nudge = if force_final_next {
+                "A tool call kept failing the same way. Stop retrying it — produce your \
+                 complete final answer now using what you already have, or explain what \
+                 you could not do."
+            } else {
                 "You have reached the final step and may not call any more tools. \
                  Produce your complete final answer now using what you have already \
-                 gathered.",
-            ));
+                 gathered."
+            };
+            messages.push(ChatMessage::user(nudge));
         }
         // Captured before `offered_tools` is moved into the request; drives the
         // text-protocol fallback below.
@@ -232,10 +248,21 @@ where
 
         // Tool calls present: run each, feed result (or error) back as a tool msg.
         for tc in tool_calls {
+            let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
             let content = match tools.run(&tc.tool_name, tc.args.clone()).await {
-                Ok(out) => out,
+                Ok(out) => {
+                    consecutive_failures.remove(&sig); // a success resets the streak
+                    out
+                }
                 Err(e) => {
-                    // error-as-tool-result: serialize and continue (design §5).
+                    // error-as-tool-result: serialize and continue (design §5). Also
+                    // count identical consecutive failures so the loop-breaker can
+                    // force a final answer instead of looping (ISSUE-007).
+                    let n = consecutive_failures.entry(sig).or_insert(0);
+                    *n += 1;
+                    if *n >= REPEAT_FAIL_LIMIT {
+                        force_final_next = true;
+                    }
                     serde_json::json!({ "error": e.kind(), "detail": e.to_string() }).to_string()
                 }
             };
