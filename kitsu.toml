@@ -30,3 +30,24 @@ chat_path   = "/v1/chat/completions"
 models_path = "/v1/models"
 model       = "claude-opus-4-8"
 auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "", refresh_hint = "create a key at https://console.anthropic.com/settings/keys and `export ANTHROPIC_API_KEY=sk-ant-...`" }
+
+# Hugging Face Inference Providers router — an OpenAI-compatible endpoint that
+# fans out to third-party inference providers (Together, Novita, Fireworks,
+# Cerebras, SambaNova, ...) and HF's own inference. kitsu speaks this natively.
+#
+# Requires an HF access token (`hf_...`) from huggingface.co/settings/tokens with
+# the "Make calls to Inference Providers" permission. An HF PRO subscription adds
+# monthly Inference-Providers credits + higher limits, spent via that token.
+#
+#   export HF_TOKEN=hf_...
+#   kitsu --gateway huggingface ask --max-output-tokens 512 "hello"
+#
+# Model = "<org>/<model>", optionally pinning a provider: "<org>/<model>:together".
+# Only models with a live provider are callable (see GET /v1/models).
+[gateways.huggingface]
+flavor      = "openai"
+base_url    = "https://router.huggingface.co"
+chat_path   = "/v1/chat/completions"
+models_path = "/v1/models"
+model       = "meta-llama/Llama-3.3-70B-Instruct"
+auth        = { method = "bearer-env", env = "HF_TOKEN", expires_env = "", refresh_hint = "create a token at https://huggingface.co/settings/tokens and `export HF_TOKEN=hf_...`" }
