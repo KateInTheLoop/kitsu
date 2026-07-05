@@ -569,8 +569,11 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
         cmd.assert()
             .success()
             .stderr(predicate::str::contains("window: 8000"))
-            .stderr(predicate::str::contains("system prompt"))
-            .stderr(predicate::str::contains("effective"));
+            .stderr(predicate::str::contains("effective"))
+            // provenance table: source/policy/why columns + the base prompt row.
+            .stderr(predicate::str::contains("base prompt"))
+            .stderr(predicate::str::contains("policy"))
+            .stderr(predicate::str::contains("why"));
     })
     .await
     .expect("join");

@@ -200,13 +200,17 @@ pub fn emit_context(used: u64, effective: u64, window: u64) {
 /// Render the `/context` breakdown to stderr: model · window · a used/effective
 /// bar with headroom · per-category token counts. `note` annotates how the
 /// window was resolved (empty to omit).
+///
+/// Each `rows` entry is `(source, tokens, policy, why)` — the provenance of one
+/// context contribution, so the breakdown is honest about *what* is loaded and
+/// *why*, not just totals.
 pub fn render_context(
     model: &str,
     window: u64,
     note: &str,
     effective: u64,
     used: u64,
-    categories: &[(&str, u64)],
+    rows: &[(&str, u64, &str, &str)],
 ) {
     let (r, g, b) = FOX;
     let pct = if effective > 0 {
@@ -236,9 +240,18 @@ pub fn render_context(
         bar
     };
     eprintln!("used {used} / {effective} effective  [{bar_disp}]  {pct}%   headroom: {headroom}");
-    for (label, tokens) in categories {
-        if *tokens > 0 {
-            eprintln!("  {label:<18} {tokens}");
+    let header = format!(
+        "  {:<20} {:>7}  {:<10}  {}",
+        "source", "tokens", "policy", "why"
+    );
+    if is_tty() {
+        eprintln!("{}", header.dimmed());
+    } else {
+        eprintln!("{header}");
+    }
+    for (label, tokens, policy, why) in rows {
+        if *tokens > 0 || !why.is_empty() {
+            eprintln!("  {label:<20} {tokens:>7}  {policy:<10}  {why}");
         }
     }
 }

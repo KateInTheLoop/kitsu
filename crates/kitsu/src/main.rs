@@ -147,44 +147,80 @@ impl Drop for OffloadDirGuard {
     }
 }
 
-/// Context-window info for the `/context` command, assembled once per session.
-struct CtxInfo {
-    window: Option<u64>,
-    max_tokens: Option<u32>,
-    tool_schema_tokens: u64,
+/// A provenance entry: a static context source, why it's loaded, its estimated
+/// token cost, and the governing policy — honest accounting (design §3).
+struct CtxEntry {
+    label: String,
+    tokens: u64,
+    policy: &'static str,
+    why: String,
 }
 
-fn ctx_info(setup: &ChatSetup, cli: &Cli, tools: &Registry) -> CtxInfo {
-    let tool_schema_tokens =
-        estimate_str(&serde_json::to_string(tools.descriptors()).unwrap_or_default());
-    CtxInfo {
-        window: setup.context_window,
-        max_tokens: cli.max_output_tokens,
-        tool_schema_tokens,
+impl CtxEntry {
+    fn new(
+        label: impl Into<String>,
+        tokens: u64,
+        policy: &'static str,
+        why: impl Into<String>,
+    ) -> Self {
+        Self {
+            label: label.into(),
+            tokens,
+            policy,
+            why: why.into(),
+        }
     }
 }
 
-/// Render the `/context` breakdown for the current conversation. Uses an
-/// anchor-free estimate of the live messages plus the advertised tool-schema
-/// tokens; the per-turn `kitsu-context:` line carries the usage-anchored number.
+/// Context-window info for `/context`, assembled once per session. `provenance`
+/// records how the static context (system prompt sources + tool schemas) was
+/// built, so `/context` can show WHAT loaded, WHY, its tokens, and the policy.
+struct CtxInfo {
+    window: Option<u64>,
+    max_tokens: Option<u32>,
+    provenance: Vec<CtxEntry>,
+}
+
+fn ctx_info(setup: &ChatSetup, cli: &Cli, provenance: Vec<CtxEntry>) -> CtxInfo {
+    CtxInfo {
+        window: setup.context_window,
+        max_tokens: cli.max_output_tokens,
+        provenance,
+    }
+}
+
+/// Render `/context`: the static provenance rows (what loaded and why) plus the
+/// live conversation, with token cost and policy per source. The per-turn
+/// `kitsu-context:` line carries the usage-anchored number; this is an estimate.
 fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) {
     let b = ContextMeter::new().breakdown(messages);
     let window = ctx.window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let budget = ContextBudget::new(window, ctx.max_tokens);
-    let used = b.total() + ctx.tool_schema_tokens;
     let note = if ctx.window.is_some() {
         ""
     } else {
         "default — set context_window or --context-window"
     };
-    let cats = [
-        ("system prompt", b.system),
-        ("tool schemas", ctx.tool_schema_tokens),
-        ("user turns", b.user),
-        ("assistant turns", b.assistant),
-        ("tool results", b.tool_results),
-    ];
-    kitsu_render::render_context(model, window, note, budget.effective, used, &cats);
+    // Static provenance (system prompt sources + tool schemas) then the live
+    // conversation. breakdown.system is already covered by the provenance rows.
+    let rows: Vec<(&str, u64, &str, &str)> = ctx
+        .provenance
+        .iter()
+        .map(|e| (e.label.as_str(), e.tokens, e.policy, e.why.as_str()))
+        .chain([
+            ("user turns", b.user, "admitted", "your messages"),
+            ("assistant turns", b.assistant, "admitted", "model replies"),
+            (
+                "tool results",
+                b.tool_results,
+                "admitted",
+                "tool outputs (offloaded → pointers)",
+            ),
+        ])
+        .collect();
+    let prov_total: u64 = ctx.provenance.iter().map(|e| e.tokens).sum();
+    let used = prov_total + b.user + b.assistant + b.tool_results;
+    kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
 }
 
 /// Resolve config + gateway profile and build the provider/auth/model. Emits the
@@ -321,10 +357,10 @@ async fn run_scripted(
     perms: &Permissions,
     offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
+    ctx: &CtxInfo,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
-    let ctx = ctx_info(setup, cli, tools);
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
     while idx < lines.len() {
@@ -355,17 +391,7 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(
-                rest,
-                messages,
-                model,
-                &setup.provider,
-                perms,
-                &ctx,
-                skillset,
-            )
-            .await
-            {
+            match handle_slash(rest, messages, model, &setup.provider, perms, ctx, skillset).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -535,41 +561,83 @@ async fn run_chat(
         compaction: compaction_mode(cli),
     };
 
-    // Load curated project context from an llms.txt (or AGENTS.md/CLAUDE.md) in
-    // the launch dir / project root, budget-gated against the window (Stage 4).
-    // Injected into the (protected) system prompt. Disable with
-    // KITSU_NO_PROJECT_CONTEXT (used by tests for determinism).
-    let mut system = chat_system_prompt(&tool_names);
+    // Assemble the system prompt while recording provenance (design §3): each
+    // static context source with its token cost, policy, and reason, so `/context`
+    // is honest about what loaded and why. Each source is pushed as a chunk so its
+    // estimate (headers included) sums to the whole system-message estimate.
+    let mut provenance: Vec<CtxEntry> = Vec::new();
+    let base = chat_system_prompt(&tool_names);
+    provenance.push(CtxEntry::new(
+        "base prompt",
+        estimate_str(&base),
+        "always",
+        "core assistant instructions",
+    ));
+    let mut system = base;
+
+    // Project context (llms.txt / AGENTS.md), budget-gated (Stage 4).
     if std::env::var_os("KITSU_NO_PROJECT_CONTEXT").is_none() {
-        if let Some((ctx, tokens)) = std::env::current_dir()
+        if let Some((ctx, _)) = std::env::current_dir()
             .ok()
             .and_then(|cwd| llms::load(&cwd, None, setup.context_window))
         {
-            system.push_str("\n\n---\nProject context (from llms.txt):\n");
-            system.push_str(&ctx);
+            let chunk = format!("\n\n---\nProject context (from llms.txt):\n{ctx}");
+            let tokens = estimate_str(&chunk);
+            system.push_str(&chunk);
             eprintln!("~ loaded project context ({tokens} tokens)");
+            provenance.push(CtxEntry::new(
+                "project (llms.txt)",
+                tokens,
+                "loaded",
+                "curated project context",
+            ));
         }
     }
-    // Skill index (always-on): names + descriptions so the model knows what it can
-    // load via the `skill` tool. `always: true` skill bodies load up front.
+    // Skill index (always-on): names + descriptions; bodies load on demand.
     if !skillset.is_empty() {
-        system.push_str(
+        let mut chunk = String::from(
             "\n\n---\nAvailable skills — call the `skill` tool with the name to load full \
              instructions when a task matches:\n",
         );
-        system.push_str(&skillset.index(""));
+        chunk.push_str(&skillset.index(""));
         let always = skillset.always_bodies();
         if !always.is_empty() {
-            system.push('\n');
-            system.push_str(&always);
+            chunk.push('\n');
+            chunk.push_str(&always);
         }
+        system.push_str(&chunk);
         eprintln!("~ {} skill(s) available", skillset.names().len());
+        provenance.push(CtxEntry::new(
+            format!("skill index ({})", skillset.names().len()),
+            estimate_str(&chunk),
+            "always",
+            "names + descriptions (bodies load on demand)",
+        ));
     }
     // --skill preloads named skills up front (in addition to on-demand loading).
     if let Some(pre) = preload_skills(cli, &skillset) {
-        system.push_str("\n\n---\nPreloaded skills (follow these):\n");
-        system.push_str(&pre);
+        let chunk = format!("\n\n---\nPreloaded skills (follow these):\n{pre}");
+        system.push_str(&chunk);
+        provenance.push(CtxEntry::new(
+            format!("skills (--skill ×{})", cli.skill.len()),
+            estimate_str(&chunk),
+            "preloaded",
+            "--skill flag",
+        ));
     }
+    // Tool schemas ride the request's `tools` field, not the system message.
+    if !tool_names.is_empty() {
+        let schema_tokens =
+            estimate_str(&serde_json::to_string(tools.descriptors()).unwrap_or_default());
+        provenance.push(CtxEntry::new(
+            format!("tool schemas ({})", tool_names.len()),
+            schema_tokens,
+            "admitted",
+            tool_names.join(", "),
+        ));
+    }
+    let ctx = ctx_info(&setup, cli, provenance);
+
     let mut messages = vec![ChatMessage::system(system)];
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
@@ -585,6 +653,7 @@ async fn run_chat(
             &perms,
             &offload_dir,
             &skillset,
+            &ctx,
         )
         .await;
     }
@@ -648,7 +717,6 @@ async fn run_chat(
     // If a first prompt was given, queue it as the first turn.
     let mut queued = first_prompt.map(|s| s.to_string());
     let prompt = kitsu_render::prompt_string();
-    let ctx = ctx_info(&setup, cli, &tools);
 
     loop {
         let line = match queued.take() {
