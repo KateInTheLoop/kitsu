@@ -265,7 +265,7 @@ async fn run_scripted_turn(
         }
         Err(e) => {
             kitsu_render::finish_line();
-            eprintln!("{}", map_agent_error(e));
+            eprintln!("{}", chat_error_message(e, model));
         }
     }
 }
@@ -426,7 +426,7 @@ async fn run_chat(
             TurnOutcome::Completed(Ok(_)) => kitsu_render::finish_line(),
             TurnOutcome::Completed(Err(e)) => {
                 kitsu_render::finish_line();
-                eprintln!("{}", map_agent_error(e));
+                eprintln!("{}", chat_error_message(e, &model));
             }
             TurnOutcome::Cancelled => {
                 kitsu_render::finish_line();
@@ -557,6 +557,24 @@ fn build_auth(gateway: &Gateway) -> Arc<dyn AuthProvider> {
             refresh_hint: auth.refresh_hint.clone(),
         }),
     }
+}
+
+/// Render an agent error for the interactive/scripted chat loop. When the
+/// gateway rejected the model id (ISSUE-004: a `/model` typo, or a model the
+/// gateway doesn't serve), add an actionable hint naming the model and pointing
+/// at `/model`, instead of dumping the raw HTTP 404 JSON.
+fn chat_error_message(e: kitsu_core::AgentError, model: &str) -> String {
+    if let kitsu_core::AgentError::Provider(ProviderError::Http { status, body }) = &e {
+        let looks_like_bad_model = *status == 404
+            || (body.contains("model") && body.to_lowercase().contains("not found"));
+        if looks_like_bad_model {
+            return format!(
+                "gateway rejected model '{model}' (HTTP {status}) — run /model <valid-id> and \
+                 check the gateway's available models.\n  detail: {body}"
+            );
+        }
+    }
+    map_agent_error(e).to_string()
 }
 
 /// Map an agent/provider error to the right exit code (design §6).

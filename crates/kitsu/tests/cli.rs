@@ -420,3 +420,47 @@ async fn test_script_multiline_block_is_one_turn() {
         "the block should be one user message with an embedded newline: {body}"
     );
 }
+
+// --- ISSUE-004: friendly error when the gateway rejects the model -----------
+
+/// A gateway 404 (model not found) must render an actionable hint naming the
+/// model and pointing at /model, not the raw HTTP JSON.
+#[tokio::test]
+#[serial]
+async fn test_invalid_model_friendly_error() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(404).set_body_string(
+            r#"{"error":{"message":"model 'tiny-fast-thing' not found","type":"api_error"}}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let script = "hello\n";
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, script).expect("write script");
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway", "example", "--model", "tiny-fast-thing",
+            "chat", "--script", &script_str,
+        ]);
+        cmd.assert()
+            .success() // scripted mode prints the error and continues
+            .stderr(predicate::str::contains("run /model"))
+            .stderr(predicate::str::contains("tiny-fast-thing"));
+    })
+    .await
+    .expect("spawned kitsu process should join");
+}
