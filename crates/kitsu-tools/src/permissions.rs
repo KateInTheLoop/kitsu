@@ -105,7 +105,10 @@ fn grant_dir_for(canon: &Path) -> PathBuf {
     if canon.is_dir() {
         canon.to_path_buf()
     } else {
-        canon.parent().map(Path::to_path_buf).unwrap_or_else(|| canon.to_path_buf())
+        canon
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| canon.to_path_buf())
     }
 }
 
@@ -144,16 +147,18 @@ impl Permissions {
 
     /// Add a read-allowed root at runtime (e.g. the `/allow` command).
     pub fn grant_read_root(&self, path: &str) -> Result<PathBuf, ToolError> {
-        let canon = std::fs::canonicalize(path)
-            .map_err(|e| ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}")))?;
+        let canon = std::fs::canonicalize(path).map_err(|e| {
+            ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
+        })?;
         self.read_roots.write().unwrap().push(canon.clone());
         Ok(canon)
     }
 
     /// Add a write-allowed root at runtime (e.g. the `/allow-write` command).
     pub fn grant_write_root(&self, path: &str) -> Result<PathBuf, ToolError> {
-        let canon = std::fs::canonicalize(path)
-            .map_err(|e| ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}")))?;
+        let canon = std::fs::canonicalize(path).map_err(|e| {
+            ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
+        })?;
         self.write_roots.write().unwrap().push(canon.clone());
         Ok(canon)
     }
@@ -200,12 +205,22 @@ impl Permissions {
             ))
         })?;
         let target = canon_parent.join(file_name);
+        // If the target already exists as a SYMLINK, a write follows it — so
+        // containment must hold for the link's REAL destination, not the link
+        // path (which is trivially inside the allowed parent). Resolve it and
+        // check that; unresolvable/escaping symlinks fall through to deny/prompt.
+        let contained_as = match std::fs::symlink_metadata(&target) {
+            Ok(m) if m.file_type().is_symlink() => {
+                std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone())
+            }
+            _ => target.clone(),
+        };
         if self
             .write_roots
             .read()
             .unwrap()
             .iter()
-            .any(|r| target.starts_with(r))
+            .any(|r| contained_as.starts_with(r))
         {
             return Ok(target);
         }
@@ -337,8 +352,7 @@ mod tests {
         let sibling = base.path().join("sibling");
         std::fs::create_dir_all(&allowed).unwrap();
         std::fs::create_dir_all(&sibling).unwrap();
-        let perms =
-            Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
+        let perms = Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
         let escape = allowed.join("..").join("sibling").join("pwned.rs");
         assert!(matches!(
             perms.check_write(&escape).await,
@@ -394,5 +408,45 @@ mod tests {
             perms.check_read(&f).await,
             Err(ToolError::PolicyDenied(_))
         ));
+    }
+}
+
+#[cfg(test)]
+#[cfg(unix)]
+mod symlink_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn symlink_final_component_write_escape_is_denied() {
+        let base = tempfile::tempdir().unwrap();
+        let allowed = base.path().join("allowed");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let secret = outside.join("secret.txt");
+        std::fs::write(&secret, "orig").unwrap();
+        // A symlink INSIDE the allowed write root pointing OUTSIDE it.
+        let link = allowed.join("link.txt");
+        std::os::unix::fs::symlink(&secret, &link).unwrap();
+        let perms = Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
+        // Writing through the in-allowlist symlink must be denied (resolves outside).
+        assert!(matches!(
+            perms.check_write(&link).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert_eq!(std::fs::read_to_string(&secret).unwrap(), "orig");
+    }
+
+    #[tokio::test]
+    async fn symlink_within_write_root_is_allowed() {
+        let base = tempfile::tempdir().unwrap();
+        let allowed = base.path().join("allowed");
+        std::fs::create_dir_all(&allowed).unwrap();
+        let real = allowed.join("real.txt");
+        std::fs::write(&real, "x").unwrap();
+        let link = allowed.join("link.txt");
+        std::os::unix::fs::symlink(&real, &link).unwrap(); // link stays inside root
+        let perms = Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
+        assert!(perms.check_write(&link).await.is_ok());
     }
 }

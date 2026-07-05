@@ -253,7 +253,10 @@ mod tests {
             !dbg.contains("super-secret-token-value"),
             "token value leaked in Debug output: {dbg}"
         );
-        assert!(dbg.contains("<redacted>"), "expected redaction marker: {dbg}");
+        assert!(
+            dbg.contains("<redacted>"),
+            "expected redaction marker: {dbg}"
+        );
 
         // And via the enclosing Gateway/Config (which derive Debug).
         let gw = Gateway {

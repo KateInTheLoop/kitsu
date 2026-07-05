@@ -505,9 +505,7 @@ fn backoff_delay(attempt: u32) -> Duration {
 /// One step of the streaming SSE state machine for `stream::unfold`. Yields the
 /// next `ChatDelta` (or a `ProviderError` for a mid-stream wire failure), or
 /// `None` when fully drained.
-async fn sse_step(
-    state: SseState,
-) -> Option<(Result<ChatDelta, ProviderError>, SseState)> {
+async fn sse_step(state: SseState) -> Option<(Result<ChatDelta, ProviderError>, SseState)> {
     match state {
         SseState::Reading {
             mut stream,
@@ -534,8 +532,7 @@ async fn sse_step(
                     }
                     None => {
                         // Wire closed: flush trailing line + tool calls + Done.
-                        let mut rest: std::collections::VecDeque<ChatDelta> =
-                            dec.finalize().into();
+                        let mut rest: std::collections::VecDeque<ChatDelta> = dec.finalize().into();
                         return rest
                             .pop_front()
                             .map(|d| (Ok(d), SseState::Draining { queue: rest }));

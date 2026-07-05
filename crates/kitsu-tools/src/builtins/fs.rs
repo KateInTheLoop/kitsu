@@ -213,10 +213,11 @@ struct WriteFileArgs {
 pub fn write_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_write_file".to_string(),
-        description: "Create or overwrite a UTF-8 text file at a write-allowed path with the given \
+        description:
+            "Create or overwrite a UTF-8 text file at a write-allowed path with the given \
                       content. Use this to generate code or other files. The parent directory must \
                       already exist. Returns the path written and byte count."
-            .to_string(),
+                .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -308,7 +309,7 @@ mod tests {
     async fn list_dir_lists_entries() {
         let (dir, root) = temp_with_file("a.txt", "x");
         std::fs::create_dir(dir.path().join("sub")).expect("mk sub");
-        let policy = Permissions::for_roots(&[root.clone()], &[]).expect("perms");
+        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).expect("perms");
         let args = serde_json::json!({"path": root}).to_string();
         let out = list_dir_run(&policy, &args).await.expect("list ok");
         assert!(out.contains("a.txt"));
@@ -338,21 +339,23 @@ mod tests {
         let policy = Permissions::for_roots(&[], &[allowed.path().to_string_lossy().to_string()])
             .expect("perms");
         let bad = other.path().join("evil.rs");
-        let args =
-            serde_json::json!({"path": bad.to_string_lossy(), "content": "x"}).to_string();
+        let args = serde_json::json!({"path": bad.to_string_lossy(), "content": "x"}).to_string();
         assert!(matches!(
             write_file_run(&policy, &args).await,
             Err(ToolError::PolicyDenied(_))
         ));
-        assert!(!bad.exists(), "must not have written outside the write root");
+        assert!(
+            !bad.exists(),
+            "must not have written outside the write root"
+        );
     }
 
     #[tokio::test]
     async fn write_file_denied_when_no_write_roots() {
         let dir = tempfile::tempdir().expect("tempdir");
         // Read allowed, but no write roots configured → writes denied.
-        let policy =
-            Permissions::for_roots(&[dir.path().to_string_lossy().to_string()], &[]).expect("perms");
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().to_string()], &[])
+            .expect("perms");
         let target = dir.path().join("x.rs");
         let args =
             serde_json::json!({"path": target.to_string_lossy(), "content": "x"}).to_string();
