@@ -9,3 +9,5 @@
 .DS_Store
 *.swp
 /tests/dogfood/results/
+/history
+.kitsu_history

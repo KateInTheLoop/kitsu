@@ -423,6 +423,7 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn. Raise (e.g. `40`) for tool-heavy work. |
 | `--timeout-secs <n>` | `60` | Per-request HTTP timeout. Raise (e.g. `300`) for slow/heavy calls. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
+| `--yes` | off | Auto-approve all tool file access without prompting (for scripts/CI). Equivalent to answering "yes" to every permission prompt — use with care. |
 
 **Chat-only flags**
 
@@ -445,22 +446,30 @@ kitsu --gateway ollama chat "let's pair on a bug"              # interactive
 
 ## Tools in chat
 
-`chat` can grant the model **read-only** filesystem tools, scoped to paths you
-explicitly allow:
+In an interactive `chat` the model always has filesystem tools (`fs_read_file`,
+`fs_list_dir`, `repo_grep`, `fs_write_file`), gated by a **permission model**
+similar to Claude Code — it asks before touching paths you haven't allowed:
 
-```bash
-kitsu --gateway ollama chat --allow-path ./src --allow-path ./docs
+```
+⏺ kitsu wants to write /home/you/project/notes.md
+  [y] allow once   [a] always (this dir)   [n] deny
+>
 ```
 
-- `--allow-path` enables the **read** tools (`fs_read_file`, `fs_list_dir`,
-  `repo_grep`); `--allow-write` enables the **write** tool (`fs_write_file`) so
-  the model can generate files. Without a flag, that tool set isn't advertised.
-- Access is **deny-by-default** and the read/write allowlists are independent —
-  e.g. read a whole repo but confine generated files to one scratch dir. Paths
-  are canonicalized (writes canonicalize the parent), so `..`/symlink traversal
-  out of the allowlist is rejected. Generated files are capped at 1 MiB.
-- `repo_grep` is registered only when `rg` (ripgrep) is on your `PATH`; without
-  it, the other tools still work.
+**Default posture (Balanced):** reads inside the directory you launched from are
+allowed automatically (explore freely); reads *outside* it, and *all* writes,
+prompt for approval. `a` (always) adds that directory to the session allowlist so
+it won't ask again.
+
+- **Pre-grant** paths so they never prompt: `--allow-path <dir>` (reads),
+  `--allow-write <dir>` (writes). Both repeatable and independent — e.g. read a
+  whole repo but confine generated files to one scratch dir.
+- **In-session grants:** `/allow <path>` and `/allow-write <path>`.
+- **Non-interactive** (`--script`/piped): deny-by-default (no one to prompt) —
+  pass `--yes` to auto-approve everything, or pre-grant with the flags.
+- Access is **deny-by-default** at the boundary; paths are canonicalized (writes
+  canonicalize the parent), so `..`/symlink traversal is rejected. Generated
+  files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
 
 Slash commands inside the REPL:
 
@@ -468,6 +477,8 @@ Slash commands inside the REPL:
 |---|---|
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
+| `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
+| `/allow-write <path>` | Grant write access to a path for the rest of the session. |
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |

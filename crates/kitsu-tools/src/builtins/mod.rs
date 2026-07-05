@@ -1,16 +1,16 @@
-//! Built-in tools. Read-only filesystem helpers, gated by a [`Policy`].
+//! Built-in tools. Filesystem helpers, gated by runtime [`Permissions`].
 
 pub mod fs;
 
 use std::sync::Arc;
 
-use crate::policy::Policy;
+use crate::permissions::Permissions;
 use crate::Registry;
 
-/// Register the available read-only fs tools against `registry`, bound to
-/// `policy`. `repo.grep` is registered only when `rg` is on PATH; otherwise it
-/// is simply not advertised (design Gap 7).
-pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Policy>) {
+/// Register the read fs tools against `registry`, bound to `permissions`.
+/// `repo_grep` is registered only when `rg` is on PATH; otherwise it is simply
+/// not advertised (design Gap 7).
+pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_file_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
@@ -24,9 +24,9 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Policy>) {
 }
 
 /// Register the write-capable fs tool (`fs_write_file`) against `registry`,
-/// gated by `policy`'s write allowlist. Call this only when write paths are
-/// configured; the model is then told it can generate files.
-pub fn register_write_tools(registry: &mut Registry, policy: Arc<Policy>) {
+/// gated by `permissions`. The model is told it can generate files; writes to
+/// not-yet-allowed paths are resolved at runtime by the permission mode.
+pub fn register_write_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::write_file_tool(policy);
     registry.register_with_descriptor(d, h);
 }

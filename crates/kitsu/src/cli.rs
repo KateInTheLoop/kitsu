@@ -47,6 +47,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub max_output_tokens: Option<u32>,
 
+    /// Auto-approve all tool file access without prompting (for non-interactive
+    /// or scripted runs). Equivalent to answering "yes" to every permission
+    /// prompt — use with care.
+    #[arg(long, global = true)]
+    pub yes: bool,
+
     #[command(subcommand)]
     pub command: Command,
 }

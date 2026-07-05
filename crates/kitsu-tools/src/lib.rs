@@ -4,10 +4,10 @@
 
 pub mod builtins;
 pub mod error;
-pub mod policy;
+pub mod permissions;
 
 pub use error::ToolError;
-pub use policy::Policy;
+pub use permissions::{Action, Decision, Mode, PermissionRequest, Permissions, Prompter};
 
 use std::collections::HashMap;
 use std::future::Future;
