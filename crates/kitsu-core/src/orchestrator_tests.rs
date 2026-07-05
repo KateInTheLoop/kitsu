@@ -749,3 +749,83 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
         .count();
     assert_eq!(tool_msgs, 3, "three tool results must be fed back on round 2");
 }
+
+// --- ISSUE-007: loop-breaker on repeated identical failures -----------------
+
+/// A provider that ALWAYS emits the same failing tool call while tools are
+/// offered, and produces a final text answer once tools are withheld — models
+/// the "fixated on a denied call" pattern.
+#[derive(Clone)]
+struct FixatedProvider {
+    calls: Arc<AtomicUsize>,
+}
+
+impl Provider for FixatedProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        self.calls.fetch_add(1, Ordering::SeqCst);
+        let deltas = if req.tools.is_some() {
+            vec![
+                ChatDelta::ToolCall(tc("bad_tool", "c", "{}")),
+                ChatDelta::Done(FinishReason::ToolCalls),
+            ]
+        } else {
+            vec![
+                ChatDelta::Text("giving up on that tool; here is my answer".to_string()),
+                ChatDelta::Done(FinishReason::Stop),
+            ]
+        };
+        Ok(Box::pin(stream::iter(
+            deltas.into_iter().map(Ok::<ChatDelta, ProviderError>),
+        )))
+    }
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
+/// The loop-breaker must force a final answer after REPEAT_FAIL_LIMIT identical
+/// failures — well before the (generous) max_rounds cap — instead of looping.
+#[tokio::test]
+async fn test_loop_breaker_on_repeated_failure() {
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "bad_tool".to_string(),
+            description: "always fails".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        err_handler(ran.clone()),
+    );
+    let calls = Arc::new(AtomicUsize::new(0));
+    let provider = FixatedProvider {
+        calls: calls.clone(),
+    };
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .expect("must return gracefully, not error");
+
+    // 2 failing rounds trip the breaker; round 3 withholds tools → final answer.
+    assert!(
+        calls.load(Ordering::SeqCst) <= 4,
+        "loop-breaker should force-final well before max_rounds=10, got {} calls",
+        calls.load(Ordering::SeqCst)
+    );
+    assert!(
+        ran.load(Ordering::SeqCst) <= 3,
+        "the failing tool must not run all 10 rounds, ran {}",
+        ran.load(Ordering::SeqCst)
+    );
+    assert!(
+        out.contains("giving up"),
+        "should reach the forced final answer, got: {out}"
+    );
+    assert!(
+        !out.contains("max tool rounds reached"),
+        "must not hit the max-rounds stop marker"
+    );
+}

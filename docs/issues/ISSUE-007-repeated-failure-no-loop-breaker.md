@@ -1,6 +1,6 @@
 # ISSUE-007 — Repeated identical failing tool calls burn all rounds (no loop-breaker)
 
-- **Status:** OPEN
+- **Status:** RESOLVED (loop-breaker + unit test)
 - **Severity:** Medium (robustness + latency; wastes rounds/tokens, causes timeouts under load)
 - **Found by:** dogfooding, full regression (persona `adversarial_02` timed out >150s)
 - **Area:** `kitsu-core` orchestrator loop
