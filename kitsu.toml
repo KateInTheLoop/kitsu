@@ -1,28 +1,79 @@
-default_gateway = "anthropic"
+# kitsu configuration — gateway profiles.
+#
+# kitsu talks to ANY endpoint that speaks the OpenAI chat/completions wire
+# protocol. That covers hosted APIs (OpenAI, Anthropic, Hugging Face, Mistral,
+# your own corporate gateway) and local servers (Ollama, vLLM). Nothing is
+# hardcoded in the binary — define one [gateways.<name>] block per endpoint and
+# select it with `--gateway <name>`, or set `default_gateway` below.
+#
+# Auth methods:
+#   { method = "none" }                                   # no token (local servers)
+#   { method = "bearer-env", env = "SOME_TOKEN" }         # Authorization: Bearer $SOME_TOKEN
+#   { method = "static", token = "..." }                  # inline token (discouraged)
+#
+# See README.md for the full guide and per-provider recipes.
 
-# Example OpenAI-compatible gateway profile. Works with any endpoint that speaks
-# the OpenAI chat/completions wire shape (OpenAI, vLLM, Mistral cloud, a corporate
-# AI gateway, ...). Point base_url/chat_path at your endpoint and set the token.
-[gateways.example]
+default_gateway = "ollama"
+
+# ── Local: Ollama ────────────────────────────────────────────────────────────
+# `ollama serve` then `ollama pull llama3.2`. No credentials required.
+[gateways.ollama]
 flavor      = "openai"
-base_url    = "https://gateway.example.com"
+base_url    = "http://localhost:11434"
 chat_path   = "/v1/chat/completions"
-models_path = ""
-model       = "example-model-v1"
-auth        = { method = "bearer-env", env = "GATEWAY_TOKEN", refresh_hint = "set GATEWAY_TOKEN to your gateway's bearer token" }
+models_path = "/v1/models"
+model       = "llama3.2"
+auth        = { method = "none" }
 
-# Anthropic direct, via Anthropic's OpenAI-compatible endpoint
-# (https://api.anthropic.com/v1/chat/completions). kitsu already speaks the
-# OpenAI wire shape, so this needs no code change — only a profile.
-#
-# Requires a developer API key (`sk-ant-...`) from console.anthropic.com, sent as
-# a bearer token. A claude.ai Pro/Max *subscription* login does NOT work here.
-#
-#   export ANTHROPIC_API_KEY=sk-ant-...
-#   kitsu --gateway anthropic ask --max-output-tokens 1024 "hello"
-#
-# Anthropic's compat endpoint requires a max_tokens; pass --max-output-tokens so
-# the request isn't rejected for omitting it.
+# ── Local: vLLM ──────────────────────────────────────────────────────────────
+# `vllm serve <model> --port 8000`  (add `--api-key <key>` to require a token).
+[gateways.vllm]
+flavor      = "openai"
+base_url    = "http://localhost:8000"
+chat_path   = "/v1/chat/completions"
+models_path = "/v1/models"
+model       = "meta-llama/Llama-3.1-8B-Instruct"
+auth        = { method = "none" }
+# To require auth instead:
+# auth = { method = "bearer-env", env = "VLLM_API_KEY", refresh_hint = "export VLLM_API_KEY=..." }
+
+# ── Custom gateway — the "plug anything in" template ─────────────────────────
+# Copy this block, rename it, point base_url/chat_path at your endpoint, set the
+# token env var (or method = "none"). Model IDs and paths are whatever your
+# endpoint expects.
+[gateways.custom]
+flavor      = "openai"
+base_url    = "https://your-gateway.example.com"
+chat_path   = "/v1/chat/completions"
+models_path = ""                          # set a path if your gateway lists models
+model       = "your-model-id"
+auth        = { method = "bearer-env", env = "CUSTOM_GATEWAY_TOKEN", refresh_hint = "export CUSTOM_GATEWAY_TOKEN=..." }
+
+# ── Hugging Face Inference Providers (hosted) ────────────────────────────────
+# Token: huggingface.co/settings/tokens ("Make calls to Inference Providers").
+# HF PRO adds monthly inference credits + higher limits, spent via the token.
+# Model = "<org>/<model>", optionally pin a provider: "<org>/<model>:together".
+[gateways.huggingface]
+flavor      = "openai"
+base_url    = "https://router.huggingface.co"
+chat_path   = "/v1/chat/completions"
+models_path = "/v1/models"
+model       = "meta-llama/Llama-3.3-70B-Instruct"
+auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a token at https://huggingface.co/settings/tokens and `export HF_TOKEN=hf_...`" }
+
+# ── OpenAI (hosted) ──────────────────────────────────────────────────────────
+[gateways.openai]
+flavor      = "openai"
+base_url    = "https://api.openai.com"
+chat_path   = "/v1/chat/completions"
+models_path = "/v1/models"
+model       = "gpt-4o-mini"
+auth        = { method = "bearer-env", env = "OPENAI_API_KEY", refresh_hint = "create a key at https://platform.openai.com/api-keys and `export OPENAI_API_KEY=sk-...`" }
+
+# ── Anthropic direct, via its OpenAI-compatible endpoint (hosted) ────────────
+# Requires a developer API key (sk-ant-...) from console.anthropic.com — a
+# claude.ai Pro/Max subscription login does NOT work here. Anthropic requires a
+# max_tokens, so pass `--max-output-tokens N`.
 [gateways.anthropic]
 flavor      = "openai"
 base_url    = "https://api.anthropic.com"
@@ -30,24 +81,3 @@ chat_path   = "/v1/chat/completions"
 models_path = "/v1/models"
 model       = "claude-opus-4-8"
 auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "", refresh_hint = "create a key at https://console.anthropic.com/settings/keys and `export ANTHROPIC_API_KEY=sk-ant-...`" }
-
-# Hugging Face Inference Providers router — an OpenAI-compatible endpoint that
-# fans out to third-party inference providers (Together, Novita, Fireworks,
-# Cerebras, SambaNova, ...) and HF's own inference. kitsu speaks this natively.
-#
-# Requires an HF access token (`hf_...`) from huggingface.co/settings/tokens with
-# the "Make calls to Inference Providers" permission. An HF PRO subscription adds
-# monthly Inference-Providers credits + higher limits, spent via that token.
-#
-#   export HF_TOKEN=hf_...
-#   kitsu --gateway huggingface ask --max-output-tokens 512 "hello"
-#
-# Model = "<org>/<model>", optionally pinning a provider: "<org>/<model>:together".
-# Only models with a live provider are callable (see GET /v1/models).
-[gateways.huggingface]
-flavor      = "openai"
-base_url    = "https://router.huggingface.co"
-chat_path   = "/v1/chat/completions"
-models_path = "/v1/models"
-model       = "meta-llama/Llama-3.3-70B-Instruct"
-auth        = { method = "bearer-env", env = "HF_TOKEN", expires_env = "", refresh_hint = "create a token at https://huggingface.co/settings/tokens and `export HF_TOKEN=hf_...`" }
