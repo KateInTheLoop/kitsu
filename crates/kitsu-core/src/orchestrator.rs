@@ -251,11 +251,13 @@ where
 
         // Tool calls present: run each, feed result (or error) back as a tool msg.
         for tc in tool_calls {
+            // Narrate the action (Claude-Code-style), e.g. `⏺ Read(deck1.md)`.
+            kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
-            let content = match tools.run(&tc.tool_name, tc.args.clone()).await {
+            let (content, is_err) = match tools.run(&tc.tool_name, tc.args.clone()).await {
                 Ok(out) => {
                     consecutive_failures.remove(&sig); // a success resets the streak
-                    out
+                    (out, false)
                 }
                 Err(e) => {
                     // error-as-tool-result: serialize and continue (design §5). Also
@@ -266,9 +268,13 @@ where
                     if *n >= REPEAT_FAIL_LIMIT {
                         force_final_next = true;
                     }
-                    serde_json::json!({ "error": e.kind(), "detail": e.to_string() }).to_string()
+                    (
+                        serde_json::json!({ "error": e.kind(), "detail": e.to_string() }).to_string(),
+                        true,
+                    )
                 }
             };
+            kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
             messages.push(ChatMessage::tool(tc.call_id.clone(), content));
         }
         // continue to next round
@@ -379,6 +385,85 @@ fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
         }
     }
     None
+}
+
+/// Friendly, compact activity header for a tool call — e.g.
+/// `Read(deck1.md)`, `Write(fb.py)`, `Grep("TODO", src)`, `List(scratch)`.
+/// Falls back to the raw tool name if args don't parse.
+fn format_tool_header(name: &str, args: &str) -> String {
+    let friendly = match name {
+        "fs_read_file" => "Read",
+        "fs_list_dir" => "List",
+        "repo_grep" => "Grep",
+        "fs_write_file" => "Write",
+        other => other,
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
+        return friendly.to_string();
+    };
+    if name == "repo_grep" {
+        let pat = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("");
+        let path = v
+            .get("path")
+            .and_then(|x| x.as_str())
+            .map(short_path)
+            .unwrap_or_default();
+        return format!("{friendly}(\"{pat}\", {path})");
+    }
+    match v.get("path").and_then(|x| x.as_str()) {
+        Some(p) => format!("{friendly}({})", short_path(p)),
+        None => friendly.to_string(),
+    }
+}
+
+/// Result summary shown under a tool call — bytes for writes, matches for grep,
+/// lines otherwise; the error kind on failure.
+fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
+    if is_err {
+        if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
+            if let Some(kind) = v.get("error").and_then(|x| x.as_str()) {
+                return format!("error: {kind}");
+            }
+        }
+        return "error".to_string();
+    }
+    match name {
+        "fs_write_file" => serde_json::from_str::<serde_json::Value>(content)
+            .ok()
+            .and_then(|v| v.get("bytes").and_then(|b| b.as_u64()))
+            .map(|b| format!("{b} bytes written"))
+            .unwrap_or_else(|| "written".to_string()),
+        "repo_grep" => {
+            if content == "(no matches)" {
+                "no matches".to_string()
+            } else {
+                let n = content.lines().count();
+                format!("{n} match{}", if n == 1 { "" } else { "es" })
+            }
+        }
+        _ => {
+            let n = content.lines().count();
+            format!("{n} line{}", if n == 1 { "" } else { "s" })
+        }
+    }
+}
+
+/// Compact a path to at most its last two segments (with a leading `…` when more
+/// were dropped), so activity lines stay short.
+fn short_path(p: &str) -> String {
+    let parts: Vec<&str> = p.trim_end_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    match parts.as_slice() {
+        [] => p.to_string(),
+        [one] => (*one).to_string(),
+        [.., a, b] => {
+            let tail = format!("{a}/{b}");
+            if parts.len() > 2 {
+                format!("…/{tail}")
+            } else {
+                tail
+            }
+        }
+    }
 }
 
 /// Enforce the context byte budget by truncating the oldest tool-result

@@ -38,6 +38,27 @@ pub fn finish_line() {
     let _ = out.flush();
 }
 
+/// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
+/// friendly line — e.g. `⏺ Read(deck1.md)`. Fox-orange marker on a TTY.
+pub fn tool_activity(header: &str) {
+    if is_tty() {
+        eprintln!("{} {header}", "⏺".truecolor(255, 140, 0));
+    } else {
+        eprintln!("⏺ {header}");
+    }
+}
+
+/// The result summary line under a tool call — e.g. `  ⎿ 128 lines`. Dimmed on a
+/// TTY. Goes to stderr so stdout stays assistant-text only.
+pub fn tool_result(summary: &str) {
+    let line = format!("  ⎿ {summary}");
+    if is_tty() {
+        eprintln!("{}", line.dimmed());
+    } else {
+        eprintln!("{line}");
+    }
+}
+
 /// Emit a single machine-readable token-usage line to **stderr** (never stdout,
 /// which carries only assistant text). Format is a stable, greppable prefix
 /// followed by compact JSON so external consumers can parse it:

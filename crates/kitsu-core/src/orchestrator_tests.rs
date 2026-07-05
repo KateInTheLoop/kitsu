@@ -829,3 +829,41 @@ async fn test_loop_breaker_on_repeated_failure() {
         "must not hit the max-rounds stop marker"
     );
 }
+
+// --- tool-activity formatting -----------------------------------------------
+
+#[test]
+fn tool_activity_formatting() {
+    use crate::orchestrator::{format_tool_header, format_tool_result, short_path};
+
+    assert_eq!(short_path("/x/y/deck1.md"), "…/y/deck1.md");
+    assert_eq!(short_path("a/b"), "a/b");
+    assert_eq!(short_path("deck.md"), "deck.md");
+
+    assert_eq!(
+        format_tool_header("fs_read_file", r#"{"path":"/x/y/deck1.md"}"#),
+        "Read(…/y/deck1.md)"
+    );
+    assert_eq!(
+        format_tool_header("fs_write_file", r#"{"path":"out/fb.py","content":"x"}"#),
+        "Write(out/fb.py)"
+    );
+    assert_eq!(
+        format_tool_header("repo_grep", r#"{"pattern":"TODO","path":"/a/src"}"#),
+        "Grep(\"TODO\", a/src)"
+    );
+    // Unknown tool / unparseable args fall back to the raw name.
+    assert_eq!(format_tool_header("weird_tool", "not json"), "weird_tool");
+
+    assert_eq!(
+        format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
+        "42 bytes written"
+    );
+    assert_eq!(format_tool_result("repo_grep", "l1\nl2\nl3", false), "3 matches");
+    assert_eq!(format_tool_result("repo_grep", "(no matches)", false), "no matches");
+    assert_eq!(format_tool_result("fs_read_file", "a\nb", false), "2 lines");
+    assert_eq!(
+        format_tool_result("fs_read_file", r#"{"error":"PolicyDenied","detail":"nope"}"#, true),
+        "error: PolicyDenied"
+    );
+}
