@@ -203,6 +203,15 @@ where
             }
         }
 
+        // ISSUE-002 / ISSUE-008: this round's text was buffered (tools were
+        // offered). Print it now UNLESS it was a text-protocol tool call we
+        // synthesized — that text IS the raw JSON, so suppress it. A model's real
+        // reasoning before a STRUCTURED tool call, and terminal answers, print
+        // normally (previously over-suppressed, hiding read/grep output).
+        if cfg.stream && tools_were_offered && !synthesized_call {
+            kitsu_render::print_fragment(&assistant_text);
+        }
+
         last_assistant_text = assistant_text.clone();
 
         // Record the assistant turn. When we synthesized a call from text, store
@@ -215,12 +224,6 @@ where
         messages.push(ChatMessage::assistant(assistant_content, tool_calls.clone()));
 
         if tool_calls.is_empty() {
-            // This round was a real answer, not a tool call. If we buffered it
-            // (tools were offered, so live streaming was withheld to hide any
-            // tool-call JSON — ISSUE-002), emit the answer now.
-            if cfg.stream && tools_were_offered {
-                kitsu_render::print_fragment(&assistant_text);
-            }
             // (1) terminal: model stopped with no tool calls.
             match finish {
                 FinishReason::Stop => return Ok(assistant_text),
