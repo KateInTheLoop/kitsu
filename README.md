@@ -548,6 +548,39 @@ Set `KITSU_NO_PROJECT_CONTEXT=1` to disable. kitsu ships its own `llms.txt`, so 
 
 ---
 
+## Skills
+
+Skills are **local, opt-in** capability bundles — reusable instructions the model
+loads on demand. A skill is a directory with a `SKILL.md`:
+
+```markdown
+---
+name: code-review
+description: Review a file or diff for bugs and report findings by severity.
+when_to_use: When the user asks to review code.
+always: false
+---
+# Code review
+1. Read the target file(s) with fs_read_file.
+2. Report each finding as `file:line — [High|Med|Low] …`.
+...
+```
+
+- **Discovery:** `.kitsu/skills/*/SKILL.md` (project, walking up to the git root)
+  and `~/.kitsu/skills/*/SKILL.md` (user). kitsu ships a couple under
+  `.kitsu/skills/` as examples.
+- **On demand:** only the index (`name — description`) is always in context; the
+  model loads a skill's body by calling the `skill` tool when a task matches, or
+  you run `/skill <name>`. `/skills [filter]` lists them.
+- **Local only, by design:** skills are trusted because *you placed them there* —
+  kitsu never fetches them from the network (injecting internet instructions into
+  a tool-enabled agent is exactly what the permission model prevents). To use one
+  from GitHub, `git clone` it into `~/.kitsu/skills/`. A skill's text is context,
+  not privileged: every action it suggests still goes through permissions.
+- Disable auto-loading (skills + `llms.txt`) with `KITSU_NO_PROJECT_CONTEXT=1`.
+
+---
+
 ## Notes & gotchas
 
 - **`--max-output-tokens` for some gateways.** If a gateway requires `max_tokens`
