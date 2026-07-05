@@ -4,6 +4,7 @@
 mod cli;
 mod config;
 mod llms;
+mod skills;
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -283,6 +284,7 @@ async fn run_scripted(
     path: &str,
     perms: &Permissions,
     offload_dir: &Option<std::path::PathBuf>,
+    skillset: &skills::SkillSet,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
@@ -317,7 +319,17 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(rest, messages, model, &setup.provider, perms, &ctx).await {
+            match handle_slash(
+                rest,
+                messages,
+                model,
+                &setup.provider,
+                perms,
+                &ctx,
+                skillset,
+            )
+            .await
+            {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -438,6 +450,20 @@ async fn run_chat(
     if can_write {
         builtins::register_write_tools(&mut tools, perms.clone());
     }
+    // Discover LOCAL skills and register the `skill` tool so the model can load
+    // one on demand (Stage S1). Skills are budget-gated context, not privileged —
+    // suggested actions still go through the permission model. Disabled (with the
+    // project-context loader) via KITSU_NO_PROJECT_CONTEXT.
+    let no_project = std::env::var_os("KITSU_NO_PROJECT_CONTEXT").is_some();
+    let skillset = Arc::new(
+        std::env::current_dir()
+            .map(|cwd| skills::SkillSet::discover(&cwd, no_project))
+            .unwrap_or_default(),
+    );
+    if !skillset.is_empty() && (can_read || can_write) {
+        let (d, h) = skills::skill_tool(skillset.clone());
+        tools.register_with_descriptor(d, h);
+    }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
     // A per-session scratch dir for offloading large tool results (Stage 2). Only
@@ -488,6 +514,21 @@ async fn run_chat(
             eprintln!("~ loaded project context ({tokens} tokens)");
         }
     }
+    // Skill index (always-on): names + descriptions so the model knows what it can
+    // load via the `skill` tool. `always: true` skill bodies load up front.
+    if !skillset.is_empty() {
+        system.push_str(
+            "\n\n---\nAvailable skills — call the `skill` tool with the name to load full \
+             instructions when a task matches:\n",
+        );
+        system.push_str(&skillset.index(""));
+        let always = skillset.always_bodies();
+        if !always.is_empty() {
+            system.push('\n');
+            system.push_str(&always);
+        }
+        eprintln!("~ {} skill(s) available", skillset.names().len());
+    }
     let mut messages = vec![ChatMessage::system(system)];
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
@@ -502,6 +543,7 @@ async fn run_chat(
             path,
             &perms,
             &offload_dir,
+            &skillset,
         )
         .await;
     }
@@ -599,6 +641,7 @@ async fn run_chat(
                 &setup.provider,
                 &perms,
                 &ctx,
+                &skillset,
             )
             .await
             {
@@ -646,6 +689,7 @@ async fn handle_slash(
     provider: &OpenAICompatProvider,
     perms: &Permissions,
     ctx: &CtxInfo,
+    skillset: &skills::SkillSet,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -656,15 +700,42 @@ async fn handle_slash(
         "help" => {
             eprintln!(
                 "commands:\n  /model <name>  switch model (keeps history)\n  /models [filter]  \
-                 list models the gateway offers (optionally filtered)\n  /allow <path>  grant \
-                 read access to a path (no more prompts there)\n  /allow-write <path>  grant \
-                 write access to a path\n  /save <file>   write the last response to <file> \
-                 (code blocks if present)\n  /context       show context-window utilization\n  \
-                 /clear         clear conversation (keeps system prompt)\n  /help          this \
-                 help\n  /quit          exit\ncurrent model: {model}"
+                 list models the gateway offers (optionally filtered)\n  /skills [filter]  list \
+                 available skills\n  /skill <name>  load a skill's instructions into context\n  \
+                 /allow <path>  grant read access to a path (no more prompts there)\n  \
+                 /allow-write <path>  grant write access to a path\n  /save <file>   write the \
+                 last response to <file> (code blocks if present)\n  /context       show \
+                 context-window utilization\n  /clear         clear conversation (keeps system \
+                 prompt)\n  /help          this help\n  /quit          exit\ncurrent model: {model}"
             );
         }
         "context" => render_context_command(model, messages, ctx),
+        "skills" => {
+            if skillset.is_empty() {
+                eprintln!(
+                    "no skills found — add SKILL.md dirs under .kitsu/skills/ or ~/.kitsu/skills/"
+                );
+            } else {
+                eprintln!("skills:\n{}", skillset.index(arg));
+                eprintln!("load one with /skill <name>, or the model can call the `skill` tool");
+            }
+        }
+        "skill" => {
+            if arg.is_empty() {
+                eprintln!("usage: /skill <name> (loads the skill's instructions into context)");
+            } else {
+                match skillset.get(arg) {
+                    Some(s) => {
+                        messages.push(ChatMessage::user(format!(
+                            "[Loaded skill: {}]\n\n{}",
+                            s.name, s.body
+                        )));
+                        eprintln!("~ loaded skill '{}'", s.name);
+                    }
+                    None => eprintln!("no skill named '{arg}' — try /skills"),
+                }
+            }
+        }
         "models" => list_models_and_print(provider, arg).await,
         "allow" => {
             if arg.is_empty() {
