@@ -97,10 +97,12 @@ fn default_auth_method() -> String {
     "bearer-env".to_string()
 }
 fn default_auth_env() -> String {
-    "ANTHROPIC_AUTH_TOKEN".to_string()
+    // Neutral, provider-agnostic default. A profile overrides this with its own
+    // `env = "..."` (e.g. OPENAI_API_KEY, HF_TOKEN, ANTHROPIC_API_KEY).
+    "KITSU_TOKEN".to_string()
 }
 fn default_expires_env() -> Option<String> {
-    Some("ANTHROPIC_TOKEN_EXPIRES".to_string())
+    Some("KITSU_TOKEN_EXPIRES".to_string())
 }
 fn default_header() -> String {
     "Authorization".to_string()
