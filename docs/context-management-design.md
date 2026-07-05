@@ -139,6 +139,55 @@ Key design lessons we adopt:
 - **No per-model capability table.** kitsu must discover the window from
   `/v1/models` when possible and otherwise fall back to config/default.
 
+### 2.4 What gets *loaded* into context — the `llms.txt` standard
+
+Context pressure is not only about *trimming what accumulates*; it is equally
+about *what we inject in the first place*. Agentic CLIs tend to auto-load large
+amounts of project material at startup — Claude Code slurps `CLAUDE.md` files and
+memory directories, and projects can carry hundreds of markdown files. This makes
+the agent knowledgeable but **spends the window on material that is often
+irrelevant to the specific task**, and on small local models it can consume the
+entire budget before the user has said anything.
+
+There is an emerging open standard for exactly this problem:
+[**llms.txt**](https://llmstxt.org/). kitsu is open source and should be a good
+citizen of industry/open-source conventions, so we adopt it rather than invent a
+bespoke project-context format.
+
+**The standard (summary of the spec):**
+
+- A file at the project/site root path **`/llms.txt`** (a subpath is allowed) —
+  a curated, LLM-optimized index, designed precisely because "context windows are
+  too small to handle most websites/projects in their entirety."
+- **Format** (fixed enough for classical parsers/regex):
+  - An **H1** with the project/site name — *the only required element*.
+  - A **blockquote** short summary with key information.
+  - Zero or more markdown sections (any type except headings) for details.
+  - Zero or more **H2 sections** each containing a *file list*: markdown links
+    with optional `: description` suffixes.
+  - A special **`## Optional`** section whose links are **secondary and may be
+    skipped for shorter contexts**.
+- Companion conventions: a clean **`.md` version of each page** at the same URL +
+  `.md`; and expanded dumps **`llms-full.txt`** / `llms-ctx.txt` (URL-less) /
+  `llms-ctx-full.txt` for whole-project context.
+- Example shape:
+  ```
+  # Title
+  > Optional short summary
+  Optional details
+  ## Section name
+  - [Link title](url): optional description
+  ## Optional
+  - [Secondary doc](url): loaded only if there's budget
+  ```
+
+**Why this fits kitsu's context design.** The `Optional` section is a
+**budget-aware boundary baked into the standard**: required content (H1 + summary
++ non-optional sections) is always loaded; the `Optional` links are loaded only
+when the meter has headroom. That is the same cheap-first / degrade-gracefully
+principle as the trimming cascade, applied to *ingestion* instead of *eviction* —
+so the two mechanisms compose cleanly and use the same `ContextMeter`.
+
 ---
 
 ## 3. Target implementation
@@ -240,11 +289,12 @@ Sketch of the intended output:
 kitsu> /context
 model: qwen2.5-coder:latest   window: 32768 (from /v1/models)
 used 7,412 / 29,696 effective  [■■■■□□□□□□□□□□□□]  25%   headroom: 22,284
-  system prompt      412
-  tool schemas       690
-  user turns       1,240
-  assistant turns  1,180
-  tool results     3,890   (2 offloaded to disk)
+  system prompt        412
+  project (llms.txt)   980   (required 620 · optional 360)
+  tool schemas         690
+  user turns         1,240
+  assistant turns    1,180
+  tool results       2,910   (2 offloaded to disk)
 ```
 
 Because it is driven by the same accounting that drives trimming, `/context`
@@ -260,6 +310,44 @@ live meter, not a separate estimate.
   extended to surface a context length when the gateway provides one.
 - Orchestrator: record last `prompt_tokens`; replace the `enforce_context_budget`
   body with the cascade.
+
+### 3.6 Project context loading (`llms.txt`-compatible)
+
+kitsu should ingest project context in a **budget-aware, standards-compatible**
+way rather than slurping every markdown file.
+
+**kitsu as a consumer of `llms.txt`:**
+
+1. On `chat` start in a project directory (and on `/allow`-ed roots), look for
+   `llms.txt` — the launch dir, then the git/project root, then a path set in the
+   gateway/profile config.
+2. Parse it with a simple, spec-shaped parser (H1 name, blockquote summary,
+   sections, `## Optional`). Inject the **required** part (name + summary +
+   non-optional section text, and optionally the linked `.md` files) into the
+   session as project context.
+3. Treat the **`## Optional`** section as **budget-gated**: its linked content is
+   loaded only while the `ContextMeter` reports headroom under the trim target,
+   and it is the **first thing evicted** by the trimming cascade. This is a direct
+   use of the standard's own "may be skipped for shorter contexts" semantics.
+4. Prefer the `.md` version of a linked page when following links, per the
+   convention; support pointing kitsu at an `llms-full.txt` when the user wants
+   the whole project loaded.
+5. The loaded context is registered with the meter as its own `/context`
+   category ("project (llms.txt)"), so users can see and reason about its cost.
+
+**kitsu as a producer:** ship an `llms.txt` at the repository root describing
+kitsu (name, one-line summary, links to `README.md`, `docs/architecture.md`, the
+gateway recipes, and this design under `## Optional`). This makes kitsu itself
+consumable by any `llms.txt`-aware tool — including kitsu — and models the
+practice we're endorsing.
+
+**Ecosystem compatibility.** `llms.txt` is the primary target. kitsu should also
+degrade gracefully to, and interoperate with, adjacent conventions where trivial
+(e.g. an `AGENTS.md`/`CLAUDE.md` fallback for agent instructions when no
+`llms.txt` is present) — but those are additive; the curated, budget-aware
+`llms.txt` path is the canonical one. Being open source, kitsu favors these open
+conventions over any bespoke format so it composes with the wider tooling
+ecosystem.
 
 ---
 
@@ -286,3 +374,16 @@ live meter, not a separate estimate.
    results, to keep single results from dominating a small window?
 4. Whether to keep `max_context_bytes` as a coarse secondary guard for gateways
    that report no usage and no window.
+5. **`llms.txt` discovery scope** — only the launch/project root, or also walk up
+   to the git root and honor a configured path? And should link-following load
+   linked `.md` files eagerly or lazily (on model request)?
+
+---
+
+## 6. References
+
+- **llms.txt standard** — <https://llmstxt.org/> (curated, budget-aware project
+  context; the `## Optional` section is explicitly skippable for shorter
+  contexts). Adopted in §2.4 / §3.6 / Stage 4.
+- Claude Code context system (auto-compact, micro-compact, token budgeting) —
+  analyzed as the reference implementation for §2.2.

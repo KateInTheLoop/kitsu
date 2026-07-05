@@ -152,14 +152,63 @@ call costs latency/tokens; the trigger must be conservative so it fires rarely.
 
 ---
 
+## Stage 4 — `llms.txt`-compatible project context loading  *(Effort: M · Priority: high)*
+
+**Goal.** Ingest project context in a **budget-aware, standards-compatible** way
+instead of slurping every markdown file — adopting the open
+[llms.txt](https://llmstxt.org/) standard (design §2.4, §3.6). Addresses the other
+half of context pressure: *what we load*, not just *what we trim*.
+
+**Why.** Auto-loading large amounts of project docs is powerful but wastes the
+window on task-irrelevant material — fatal on small local models. `llms.txt` is an
+open, machine-parseable standard whose `## Optional` section is *designed* to be
+skipped under tight context, mapping directly onto kitsu's meter. Being open
+source, kitsu should speak the industry convention, not a bespoke format.
+
+**Scope / changes.**
+1. **Consumer.** On `chat` start, discover `llms.txt` (launch dir → project/git
+   root → configured path). Parse it (H1 name, blockquote summary, sections,
+   `## Optional`). Inject the required part as project context in the system
+   prompt; follow `.md` link versions per the convention.
+2. **Budget-gated `Optional`.** Load `## Optional` linked content only while the
+   `ContextMeter` (Stage 1) shows headroom under target; make it the **first**
+   thing the trimming cascade evicts. Register loaded context as a `/context`
+   category ("project (llms.txt)").
+3. **Producer.** Ship an `llms.txt` at the kitsu repo root (name, summary, links
+   to `README.md`, `docs/architecture.md`, gateway recipes; design docs under
+   `## Optional`).
+4. **Fallback.** If no `llms.txt`, optionally read an `AGENTS.md`/`CLAUDE.md`
+   equivalent for agent instructions — additive, `llms.txt` is canonical.
+
+**Files.** a new `llms_txt` module (parser + discovery + loader) in
+`crates/kitsu-core` or `crates/kitsu`, `crates/kitsu/src/main.rs` (load at chat
+start, register with meter, `/context` category), a new repo-root `llms.txt`.
+
+**Tests.**
+- Unit: parser extracts name/summary/sections/`Optional` from a sample; discovery
+  precedence; required-vs-optional partitioning; total registers with the meter.
+- Integration: a project dir with an `llms.txt` loads the summary into context and
+  the model can answer from it; under a tiny `--context-window`, the `Optional`
+  content is dropped first while required context survives.
+
+**Acceptance.** kitsu loads a curated `llms.txt` instead of arbitrary md files;
+required context is always present, `Optional` is budget-gated and evicted first;
+kitsu's own repo ships a valid `llms.txt`. `cargo test` + clippy green.
+
+**Risks.** Link-following must respect the read-permission model (only fetch files
+under allowed paths). Keep the parser tolerant — `llms.txt` files in the wild vary;
+only the H1 is guaranteed.
+
+---
+
 ## Sequencing & dependencies
 
 ```
-Stage 1  (token budget + window)      ← ships the fix; no dependencies
-   │
-Stage 2  (offload + turn trimming)    ← builds on Stage 1's meter/target
-   │
-Stage 3  (summarizing compaction)     ← builds on Stage 2's trimming as fallback
+Stage 1  (token budget + window + /context)   ← ships the fix; no dependencies
+   ├── Stage 2  (offload + turn trimming)      ← builds on Stage 1's meter/target
+   │      └── Stage 3  (summarizing compaction) ← uses Stage 2 trimming as fallback
+   └── Stage 4  (llms.txt project context)     ← needs only Stage 1's meter;
+                                                  parallel to Stage 2/3
 ```
 
 - **Stage 1 is independently valuable** and should ship first; it resolves the
@@ -168,6 +217,9 @@ Stage 3  (summarizing compaction)     ← builds on Stage 2's trimming as fallba
   heavy) and is reversible/lossless, so low-risk.
 - **Stage 3** is the biggest lift and the most model-dependent; defer until 1–2
   are proven, and keep it opt-in.
+- **Stage 4** depends only on Stage 1's meter and can be built in parallel with
+  Stage 2/3; it tackles context *ingestion* (what we load) versus the trimming
+  cascade's *eviction* (what we shed), and the two compose via the shared meter.
 
 ## Cross-cutting
 
@@ -175,8 +227,10 @@ Stage 3  (summarizing compaction)     ← builds on Stage 2's trimming as fallba
   that drives a long multi-turn session and asserts (a) no context-length
   failure and (b) `kitsu-context:` shows trimming/compaction firing.
 - **Docs.** Update `README.md` (a "Context window" section: how the budget is
-  derived, `context_window` config, the `/context` command, and `/compact`) and
-  `docs/architecture.md` as each stage lands.
+  derived, `context_window` config, the `/context` command, `/compact`, and
+  `llms.txt` project context) and `docs/architecture.md` as each stage lands. Ship
+  the repo's own `llms.txt` (Stage 4) so kitsu is consumable by `llms.txt`-aware
+  tooling, including kitsu itself.
 - **Backwards compatibility.** Keep a coarse byte guard as a last-resort fallback
   for gateways that report neither `usage` nor a window, so behavior never
   regresses for them.
