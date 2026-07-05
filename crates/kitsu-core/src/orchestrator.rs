@@ -168,6 +168,10 @@ where
             max_tokens: cfg.max_tokens,
         };
 
+        // "Vibing kitsu" while we wait for the model. No-op off a TTY; cleared on
+        // the first stream item (or on drop if the request errors).
+        let mut spinner = Some(kitsu_render::Spinner::start());
+
         // 401/403 surface here (or as the first stream item) as a hard error.
         let mut stream = provider.chat_stream(req).await?;
 
@@ -176,6 +180,9 @@ where
         let mut finish = FinishReason::Stop;
 
         while let Some(item) = stream.next().await {
+            if let Some(s) = spinner.take() {
+                s.stop();
+            }
             match item? {
                 ChatDelta::Text(t) => {
                     // ISSUE-002: when tools are advertised this round, DON'T stream

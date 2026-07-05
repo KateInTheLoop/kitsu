@@ -32,7 +32,7 @@ pub fn estimate_str(s: &str) -> u64 {
 
 /// Rough token estimate of one message: text at the prose rate, tool-call args
 /// at the denser JSON rate.
-fn estimate_message(m: &ChatMessage) -> u64 {
+pub fn message_tokens(m: &ChatMessage) -> u64 {
     let text = m.content.len() + m.tool_call_id.as_ref().map_or(0, String::len);
     let json: usize = m
         .tool_calls
@@ -86,10 +86,10 @@ impl ContextMeter {
                 tokens
                     + messages[sent_len..]
                         .iter()
-                        .map(estimate_message)
+                        .map(message_tokens)
                         .sum::<u64>()
             }
-            _ => messages.iter().map(estimate_message).sum(),
+            _ => messages.iter().map(message_tokens).sum(),
         }
     }
 
@@ -98,7 +98,7 @@ impl ContextMeter {
     pub fn breakdown(&self, messages: &[ChatMessage]) -> ContextBreakdown {
         let mut b = ContextBreakdown::default();
         for m in messages {
-            let t = estimate_message(m);
+            let t = message_tokens(m);
             match m.role {
                 Role::System => b.system += t,
                 Role::User => b.user += t,
@@ -246,10 +246,10 @@ mod tests {
                 args: "abcdef".to_string(),
             }],
         };
-        assert_eq!(estimate_message(&m), 4);
+        assert_eq!(message_tokens(&m), 4);
         // The same bytes as plain content would be ceil(10/4)=3 — JSON is denser.
         let as_text = msg(Role::Assistant, "abababcdef"); // 10 chars
-        assert_eq!(estimate_message(&as_text), 3);
+        assert_eq!(message_tokens(&as_text), 3);
     }
 
     #[test]

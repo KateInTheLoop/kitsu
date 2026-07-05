@@ -428,11 +428,12 @@ async fn run_chat(
         .unwrap_or_else(|| std::path::PathBuf::from(".kitsu_history"));
     let _ = rl.load_history(&history_path);
 
-    if !tool_names.is_empty() {
-        eprintln!("kitsu chat — tools enabled: {}", tool_names.join(", "));
-    } else {
-        eprintln!("kitsu chat — type /help for commands, Ctrl+D to exit");
-    }
+    let gateway_name = cli.gateway.clone().unwrap_or_else(|| "(default)".to_string());
+    let dir = std::env::current_dir()
+        .ok()
+        .map(|p| shorten_home(&p))
+        .unwrap_or_default();
+    kitsu_render::chat_banner(&gateway_name, &model, &dir, &tool_names);
 
     // If a first prompt was given, queue it as the first turn.
     let mut queued = first_prompt.map(|s| s.to_string());
@@ -724,6 +725,20 @@ fn drain_stdin() {
 
 #[cfg(not(unix))]
 fn drain_stdin() {}
+
+/// Replace the home-directory prefix with `~` for compact display in the banner.
+fn shorten_home(p: &std::path::Path) -> String {
+    let s = p.to_string_lossy().to_string();
+    if let Some(home) = std::env::var_os("HOME") {
+        let home = home.to_string_lossy();
+        if !home.is_empty() {
+            if let Some(rest) = s.strip_prefix(home.as_ref()) {
+                return format!("~{rest}");
+            }
+        }
+    }
+    s
+}
 
 /// Build the appropriate AuthProvider from the profile's auth block.
 fn build_auth(gateway: &Gateway) -> Arc<dyn AuthProvider> {
