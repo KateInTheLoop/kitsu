@@ -215,6 +215,42 @@ estimate is under target.
 - On Tier 3, print a visible boundary (e.g. `✻ context compacted`) as Claude Code
   does, so the user knows summarization happened.
 
+#### `/context` — first-class utilization command
+
+A REPL slash command (and a companion the agent can be asked to run) that shows,
+on demand, how the window is being used right now — kitsu's analogue of Claude
+Code's `/context`. It reuses the `ContextMeter` and `ContextWindow` from §3.1–3.2,
+so it costs nothing beyond a walk of the current message set.
+
+It reports:
+
+- The **model** and its resolved **window** (and how it was resolved: config /
+  `/v1/models` / default).
+- **Used vs effective vs raw** tokens, as a number and a bar, with the
+  **headroom** remaining before trimming/compaction fires.
+- A **breakdown by category**, each estimated via the meter:
+  - System prompt
+  - Tool schemas advertised to the model
+  - Messages, split by role: user turns · assistant turns · tool results
+  - (Later) offloaded/compacted savings, so the effect of the cascade is visible.
+
+Sketch of the intended output:
+
+```
+kitsu> /context
+model: qwen2.5-coder:latest   window: 32768 (from /v1/models)
+used 7,412 / 29,696 effective  [■■■■□□□□□□□□□□□□]  25%   headroom: 22,284
+  system prompt      412
+  tool schemas       690
+  user turns       1,240
+  assistant turns  1,180
+  tool results     3,890   (2 offloaded to disk)
+```
+
+Because it is driven by the same accounting that drives trimming, `/context`
+always agrees with what the budget will actually do — it is a window into the
+live meter, not a separate estimate.
+
 ### 3.5 Data-model touch points
 
 - `AgentConfig`: replace `max_context_bytes: usize` with a richer

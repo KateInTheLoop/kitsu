@@ -39,21 +39,30 @@ else is refinement.
 6. Add `context_window` to the gateway profile config (optional) and a
    `--context-window` CLI override.
 7. Emit a `kitsu-context: {used, effective, window, tier}` stderr line.
+8. **`/context` slash command** (first-class, see design §3.4): reads the live
+   `ContextMeter` and prints model · window (+ how resolved) · used/effective with
+   a bar and headroom · a per-category breakdown (system prompt, tool schemas,
+   user/assistant/tool-result tokens). Reuses the meter, so no extra cost.
 
-**Files.** `crates/kitsu-core/src/orchestrator.rs` (meter, budget rewrite),
-`crates/kitsu-providers/src/openai_compat.rs` (surface context length from
-`list_models`), `crates/kitsu/src/{cli,config,main}.rs` (flag + profile field +
-wiring), `crates/kitsu-render/src/lib.rs` (`emit_context`).
+**Files.** `crates/kitsu-core/src/orchestrator.rs` (meter, budget rewrite; expose
+the meter/breakdown so the CLI can render it), `crates/kitsu-providers/src/openai_compat.rs`
+(surface context length from `list_models`), `crates/kitsu/src/{cli,config,main}.rs`
+(flag + profile field + `/context` handler + wiring; add `/context` to `/help`),
+`crates/kitsu-render/src/lib.rs` (`emit_context`, the `/context` bar/breakdown
+renderer).
 
 **Tests.**
 - Unit: `ContextMeter` estimate with/without a usage anchor; window resolution
   precedence; `effective`/target math; trim stops at target and preserves
-  system + last user.
+  system + last user; the `/context` breakdown categorizes messages by role and
+  its total matches the meter.
 - Integration: a small `--context-window 2000` run trims and still succeeds
-  (wiremock or a small Ollama model); a `kitsu-context:` line is emitted.
+  (wiremock or a small Ollama model); a `kitsu-context:` line is emitted;
+  `/context` via `--script` prints the model, window, and a breakdown.
 
 **Acceptance.** A session that previously failed with a context-length error on a
 4 K model instead trims and completes. Budget scales with `--context-window`.
+`/context` shows accurate live utilization that agrees with the trimming budget.
 `cargo test` + clippy green.
 
 **Risks.** `/v1/models` context-length field is gateway-specific (parse
@@ -166,8 +175,8 @@ Stage 3  (summarizing compaction)     ← builds on Stage 2's trimming as fallba
   that drives a long multi-turn session and asserts (a) no context-length
   failure and (b) `kitsu-context:` shows trimming/compaction firing.
 - **Docs.** Update `README.md` (a "Context window" section: how the budget is
-  derived, `context_window` config, `/compact`) and `docs/architecture.md` as
-  each stage lands.
+  derived, `context_window` config, the `/context` command, and `/compact`) and
+  `docs/architecture.md` as each stage lands.
 - **Backwards compatibility.** Keep a coarse byte guard as a last-resort fallback
   for gateways that report neither `usage` nor a window, so behavior never
   regresses for them.
