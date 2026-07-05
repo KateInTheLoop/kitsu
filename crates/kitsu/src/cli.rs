@@ -67,6 +67,13 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "trim", value_parser = ["trim", "summarize"])]
     pub compaction: String,
 
+    /// Preload a named skill's instructions for this run (repeatable). Works for
+    /// `ask` and `chat` — the skill body is injected up front so it's available
+    /// immediately (and to spawned agents), not just discovered on demand. See
+    /// `/skills` for available names.
+    #[arg(long = "skill", value_name = "NAME")]
+    pub skill: Vec<String>,
+
     #[command(subcommand)]
     pub command: Command,
 }

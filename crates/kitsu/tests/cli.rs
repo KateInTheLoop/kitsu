@@ -679,3 +679,67 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
     .await
     .expect("join");
 }
+
+/// `ask --skill <name>` preloads the skill body into the request even on the
+/// tool-less `ask` path — and the body actually reaches the model.
+#[tokio::test]
+#[serial]
+async fn test_ask_skill_preloaded_reaches_request() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+
+    // Local project skill with a distinctive body marker.
+    let work = TempDir::new().expect("work dir");
+    fs::create_dir_all(work.path().join(".git")).unwrap();
+    let sk = work.path().join(".kitsu/skills/greet");
+    fs::create_dir_all(&sk).unwrap();
+    fs::write(
+        sk.join("SKILL.md"),
+        "---\nname: greet\ndescription: hi\n---\nSKILL_BODY_MARKER_greet",
+    )
+    .unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.env_remove("KITSU_NO_PROJECT_CONTEXT");
+        cmd.current_dir(&work_path);
+        cmd.args(["--gateway", "example", "--skill", "greet", "ask", "hello"]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("preloaded 1 skill(s)"));
+    })
+    .await
+    .expect("join");
+
+    // The skill body must have been sent in the request.
+    let reqs = server.received_requests().await.expect("recorded requests");
+    let body = String::from_utf8_lossy(&reqs[0].body);
+    assert!(
+        body.contains("SKILL_BODY_MARKER_greet"),
+        "the preloaded skill body must reach the model"
+    );
+}
