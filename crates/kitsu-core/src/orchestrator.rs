@@ -27,6 +27,10 @@ pub struct AgentConfig {
     /// gateway metadata). When set, token-based budgeting supersedes
     /// `max_context_bytes`. Consumed by the trimming cascade (Stage 1c+).
     pub context_window: Option<u64>,
+    /// Directory for offloading large tool results (Stage 2, Tier 0). When set,
+    /// a tool result over the size cap is written here and replaced in context by
+    /// a pointer + preview the model can re-read. Must be a model-readable path.
+    pub offload_dir: Option<std::path::PathBuf>,
     pub stream: bool,
     pub temperature: Option<f32>,
     /// Max output tokens per response. `None` lets the gateway apply its own
@@ -42,6 +46,7 @@ impl Default for AgentConfig {
             max_rounds: 10,
             max_context_bytes: 128 * 1024,
             context_window: None,
+            offload_dir: None,
             stream: true,
             temperature: None,
             max_tokens: None,
@@ -309,6 +314,13 @@ where
                 }
             };
             kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
+            // Offload a large successful result to disk, leaving a re-readable
+            // pointer, so one big result can't dominate a small window (Stage 2).
+            let content = if is_err {
+                content
+            } else {
+                maybe_offload(content, &tc.call_id, cfg.offload_dir.as_deref())
+            };
             messages.push(ChatMessage::tool(tc.call_id.clone(), content));
         }
         // continue to next round
@@ -569,6 +581,46 @@ fn trim_tool_results(
         i += 1;
     }
     total
+}
+
+/// Size (chars) above which a successful tool result is offloaded to disk
+/// instead of kept inline (Stage 2, Tier 0). ~2K tokens.
+const OFFLOAD_CHAR_CAP: usize = 8 * 1024;
+/// How much of an offloaded result to keep inline as a preview.
+const OFFLOAD_PREVIEW_CHARS: usize = 500;
+
+/// If `content` exceeds the cap and an offload `dir` is set, write the full
+/// result to `<dir>/<call_id>.txt` and return a pointer + preview the model can
+/// re-read via `fs_read_file`. Returns the content unchanged when there is no
+/// dir, it's under the cap, or the write fails (the trimming cascade still bounds
+/// it). The offload dir must be a model-readable path.
+fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) -> String {
+    let Some(dir) = dir else {
+        return content;
+    };
+    if content.len() <= OFFLOAD_CHAR_CAP {
+        return content;
+    }
+    let safe_id: String = call_id
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
+        .collect();
+    let name = if safe_id.is_empty() {
+        "result".to_string()
+    } else {
+        safe_id
+    };
+    let path = dir.join(format!("{name}.txt"));
+    if std::fs::write(&path, &content).is_err() {
+        return content;
+    }
+    let preview: String = content.chars().take(OFFLOAD_PREVIEW_CHARS).collect();
+    format!(
+        "[tool output {:.1} KB — full result saved to {}. Re-read it (or a line range) \
+         with fs_read_file on that path.]\n\nPreview:\n{preview}…",
+        content.len() as f64 / 1024.0,
+        path.display(),
+    )
 }
 
 /// How many recent user-delimited exchanges to always keep intact.

@@ -100,6 +100,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         max_rounds,
         max_context_bytes: 128 * 1024,
         context_window: None,
+        offload_dir: None,
         stream: false,
         temperature: None,
         max_tokens: None,
@@ -1072,4 +1073,35 @@ fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
     assert_eq!(msgs[0].content, "sys");
     // Most recent exchange survives.
     assert!(msgs.iter().any(|m| m.content.contains("q4")));
+}
+
+// --- tool-result offload (Stage 2, Tier 0) ----------------------------------
+
+#[test]
+fn maybe_offload_writes_large_result_and_returns_pointer() {
+    use crate::orchestrator::maybe_offload;
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(20_000);
+    let out = maybe_offload(big.clone(), "call-1", Some(dir.path()));
+    assert!(out.contains("saved to"), "returns a pointer");
+    assert!(out.contains("fs_read_file"), "tells the model how to re-read");
+    assert!(out.len() < big.len(), "pointer is much smaller than the result");
+    // Full content persisted and intact.
+    let path = dir.path().join("call-1.txt");
+    assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
+}
+
+#[test]
+fn maybe_offload_keeps_small_results_inline() {
+    use crate::orchestrator::maybe_offload;
+    let dir = tempfile::tempdir().unwrap();
+    let small = "hello".to_string();
+    assert_eq!(maybe_offload(small.clone(), "c", Some(dir.path())), small);
+}
+
+#[test]
+fn maybe_offload_is_noop_without_a_dir() {
+    use crate::orchestrator::maybe_offload;
+    let big = "x".repeat(20_000);
+    assert_eq!(maybe_offload(big.clone(), "c", None), big);
 }

@@ -516,12 +516,15 @@ sessions don't overflow it — important for small local models.
   does **not**, and its default is often 4096, so set it there. Unset everywhere →
   a conservative 8192 default.
 - **How the budget works:** `effective = window − reply reservation`
-  (from `--max-output-tokens`, clamped to leave room for the prompt). When history
-  exceeds the trim target (just under effective), kitsu elides the oldest
-  tool-result bodies first (`[older tool output elided]`), always preserving the
-  system prompt, recent turns, and the last user message. Token counts are
-  estimated but **anchored on each response's real `usage`**, so the estimate
-  stays accurate without a local tokenizer.
+  (from `--max-output-tokens`, clamped to leave room for the prompt). Large tool
+  results are **offloaded to a scratch file** as they arrive, leaving a small
+  pointer + preview the model can re-read with `fs_read_file` (so a single big
+  read can't blow the window, and nothing is lost). When history still exceeds the
+  trim target, kitsu **elides the oldest tool-result bodies**, then **drops the
+  oldest whole exchanges** — always preserving the system prompt, the most recent
+  turns, and the last user message, and never orphaning a tool result. Token
+  counts are estimated but **anchored on each response's real `usage`**, so the
+  estimate stays accurate without a local tokenizer.
 - **See utilization:** `/context` in the REPL prints model · window ·
   used/effective with a bar and headroom · a per-category breakdown. A machine
   `kitsu-context: {"used":…,"effective":…,"window":…}` line is written to stderr
