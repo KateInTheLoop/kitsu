@@ -1,5 +1,11 @@
 # ISSUE-001 — Tool calls emitted as text are not executed (breaks file generation with local models)
 
+- **Status:** RESOLVED — text-protocol fallback added in the orchestrator
+  (`parse_text_tool_call`). Verified live: the file-generation scenario against
+  local Ollama (`qwen2.5-coder`) now actually writes the file. Covered by 5
+  unit tests (bare / fenced / tagged JSON, prose-ignored, unknown-tool-ignored).
+  Follow-up (low): while streaming, the raw tool-call JSON is still echoed to the
+  transcript before it is recognized (cosmetic) — tracked as ISSUE-002.
 - **Severity:** High (blocks the file-generation / coding workflow on local models)
 - **Found by:** dogfooding smoke test, Stage 0 (`chat --allow-write --script` against local Ollama `qwen2.5-coder`)
 - **Area:** `kitsu-core` orchestrator / `kitsu-providers` tool-call handling
