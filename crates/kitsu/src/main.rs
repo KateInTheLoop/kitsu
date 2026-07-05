@@ -106,6 +106,15 @@ struct ChatSetup {
     context_window: Option<u64>,
 }
 
+/// Removes the per-session offload scratch dir (and its files) when the chat
+/// session ends, so we don't leak temp dirs into `/tmp`.
+struct OffloadDirGuard(std::path::PathBuf);
+impl Drop for OffloadDirGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
 /// Context-window info for the `/context` command, assembled once per session.
 struct CtxInfo {
     window: Option<u64>,
@@ -422,18 +431,21 @@ async fn run_chat(
 
     // A per-session scratch dir for offloading large tool results (Stage 2). Only
     // when tools can run; granted read access so the model can re-read offloaded
-    // results. Best-effort — offloading is skipped if it can't be created.
+    // results. If the grant fails the dir would yield dead pointers, so skip
+    // offloading entirely. A guard removes the dir (and its files) on exit.
     let offload_dir = if tool_names.is_empty() {
         None
     } else {
         let dir = std::env::temp_dir().join(format!("kitsu-offload-{}", std::process::id()));
-        if std::fs::create_dir_all(&dir).is_ok() {
-            let _ = perms.grant_read_root(&dir.to_string_lossy());
-            Some(dir)
-        } else {
-            None
+        match std::fs::create_dir_all(&dir).map(|_| perms.grant_read_root(&dir.to_string_lossy())) {
+            Ok(Ok(_)) => Some(dir),
+            _ => {
+                let _ = std::fs::remove_dir_all(&dir);
+                None
+            }
         }
     };
+    let _offload_guard = offload_dir.clone().map(OffloadDirGuard);
 
     let mut model = setup.model.clone();
     let context_window = setup.context_window;

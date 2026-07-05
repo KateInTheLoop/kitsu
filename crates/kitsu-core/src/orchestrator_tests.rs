@@ -1023,7 +1023,8 @@ fn drop_old_exchanges_keeps_system_and_recent_no_orphans() {
             vec![],
         ));
     }
-    drop_old_exchanges(&mut msgs, 100, message_tokens);
+    let total: u64 = msgs.iter().map(message_tokens).sum();
+    drop_old_exchanges(&mut msgs, total, 100, message_tokens);
 
     assert_eq!(msgs[0].content, "sys", "system prompt preserved");
     assert!(
@@ -1055,7 +1056,8 @@ fn drop_old_exchanges_noop_with_few_exchanges() {
         ChatMessage::assistant("only answer", vec![]),
     ];
     let before = msgs.len();
-    drop_old_exchanges(&mut msgs, 1, message_tokens); // target tiny, but nothing safely droppable
+    let total: u64 = msgs.iter().map(message_tokens).sum();
+    drop_old_exchanges(&mut msgs, total, 1, message_tokens); // target tiny, but nothing safely droppable
     assert_eq!(
         msgs.len(),
         before,
@@ -1114,9 +1116,14 @@ fn maybe_offload_writes_large_result_and_returns_pointer() {
         out.len() < big.len(),
         "pointer is much smaller than the result"
     );
-    // Full content persisted and intact.
-    let path = dir.path().join("call-1.txt");
-    assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
+    // Full content persisted and intact (filename carries a unique seq suffix).
+    let entry = std::fs::read_dir(dir.path())
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap();
+    assert!(entry.file_name().to_string_lossy().starts_with("call-1-"));
+    assert_eq!(std::fs::read_to_string(entry.path()).unwrap(), big);
 }
 
 #[test]

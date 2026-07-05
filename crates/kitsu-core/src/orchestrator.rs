@@ -536,7 +536,10 @@ fn enforce_context_budget(
             let used = meter.estimate(messages);
             let after_elide = trim_tool_results(messages, used, target, message_tokens);
             if after_elide > target {
-                drop_old_exchanges(messages, target, message_tokens);
+                // Continue the SAME anchored/relative accounting into turn-dropping
+                // so both stages agree on the scale (else a chars/4 recount could
+                // decline to drop when the real tokenizer says we're over).
+                drop_old_exchanges(messages, after_elide, target, message_tokens);
             }
         }
         None => {
@@ -610,7 +613,13 @@ fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) 
     } else {
         safe_id
     };
-    let path = dir.join(format!("{name}.txt"));
+    // A process-wide sequence keeps filenames unique even when call_ids repeat
+    // across rounds (e.g. text-protocol `textcall-0` resets each round), so an old
+    // pointer never resolves to a newer result.
+    use std::sync::atomic::{AtomicU64, Ordering};
+    static OFFLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
+    let seq = OFFLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
+    let path = dir.join(format!("{name}-{seq}.txt"));
     if std::fs::write(&path, &content).is_err() {
         return content;
     }
@@ -633,6 +642,7 @@ const KEEP_RECENT_EXCHANGES: usize = 2;
 /// [`KEEP_RECENT_EXCHANGES`] exchanges are always kept; a marker records the drop.
 fn drop_old_exchanges(
     messages: &mut Vec<ChatMessage>,
+    mut total: u64,
     target: u64,
     size: impl Fn(&ChatMessage) -> u64,
 ) {
@@ -648,7 +658,8 @@ fn drop_old_exchanges(
     }
     let max_drop = n - KEEP_RECENT_EXCHANGES; // leading exchanges we may drop
 
-    let mut total: u64 = messages.iter().map(&size).sum();
+    // `total` starts from the caller's running (anchored) estimate; decrement by
+    // what each dropped exchange frees, keeping both trim stages on one scale.
     let mut e = 0;
     while total > target && e < max_drop {
         let start = user_idxs[e];

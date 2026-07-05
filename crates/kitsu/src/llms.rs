@@ -61,6 +61,7 @@ pub fn parse(content: &str) -> LlmsTxt {
     let mut seen_h1 = false;
     let mut in_sections = false;
     let mut in_optional = false;
+    let mut summary_done = false;
     for raw in content.lines() {
         let line = raw.trim_end().trim_start_matches('\u{feff}');
         if !seen_h1 {
@@ -80,8 +81,15 @@ pub fn parse(content: &str) -> LlmsTxt {
         }
         if !in_sections {
             if let Some(q) = ls.strip_prefix("> ") {
-                summary.push(q.trim().to_string());
+                // Only the blockquote(s) right after the H1 are the summary; a
+                // blockquote after prose belongs to the body.
+                if summary_done {
+                    required.push(line.to_string());
+                } else {
+                    summary.push(q.trim().to_string());
+                }
             } else if !ls.is_empty() {
+                summary_done = true;
                 required.push(line.to_string());
             }
             continue;
@@ -134,14 +142,18 @@ pub fn discover(start: &Path, configured: Option<&Path>) -> Option<PathBuf> {
 /// Load project context: discover, then parse (`llms.txt`) or read raw
 /// (`AGENTS.md`/`CLAUDE.md`), rendering with the `## Optional` section included
 /// only if the whole thing fits within `window/4` tokens. The result is capped at
-/// `window/2` tokens so it can't swamp a small window (it lives in the protected
+/// `window/3` tokens so it can't swamp a small window (it lives in the protected
 /// system prompt and isn't trimmed). Returns `(rendered_context, token_estimate)`.
 pub fn load(start: &Path, configured: Option<&Path>, window: Option<u64>) -> Option<(String, u64)> {
     let path = discover(start, configured)?;
-    let content = std::fs::read_to_string(&path).ok()?;
+    // Bound the read so a pathologically large file can't blow up memory; the
+    // rendered context is capped again below.
+    let content = read_capped(&path, 256 * 1024)?;
     let is_llms = path.file_name().map(|n| n == "llms.txt").unwrap_or(false);
     let optional_cap = window.map(|w| w / 4).unwrap_or(2048);
-    let required_cap = window.map(|w| w / 2).unwrap_or(4096);
+    // Leave the rest of the window for the base prompt, tool schemas, and the
+    // conversation; project context is at most a third.
+    let required_cap = window.map(|w| w / 3).unwrap_or(4096);
 
     let rendered = if is_llms {
         let parsed = parse(&content);
@@ -164,6 +176,18 @@ pub fn load(start: &Path, configured: Option<&Path>, window: Option<u64>) -> Opt
     let rendered = cap_to_tokens(rendered, required_cap);
     let tokens = estimate_str(&rendered);
     Some((rendered, tokens))
+}
+
+/// Read at most `max` bytes of a file as (lossy) UTF-8.
+fn read_capped(path: &Path, max: u64) -> Option<String> {
+    use std::io::Read;
+    let mut buf = Vec::new();
+    std::fs::File::open(path)
+        .ok()?
+        .take(max)
+        .read_to_end(&mut buf)
+        .ok()?;
+    Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
 /// Truncate to at most `cap` tokens (~4 chars/token) on a char boundary.
@@ -251,5 +275,15 @@ mod tests {
         std::fs::write(root.path().join("AGENTS.md"), "agents").unwrap();
         let found = discover(root.path(), None).unwrap();
         assert_eq!(found.file_name().unwrap(), "AGENTS.md");
+    }
+    #[test]
+    fn blockquote_after_prose_is_not_summary() {
+        let t = parse("# N\n> real summary\nBody text.\n> an inline quote\n## Docs\n- [a](b)");
+        assert_eq!(t.summary, "real summary");
+        assert!(
+            t.required.contains("an inline quote"),
+            "post-prose quote goes to body"
+        );
+        assert!(t.required.contains("Body text."));
     }
 }
