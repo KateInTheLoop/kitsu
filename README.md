@@ -505,6 +505,34 @@ kitsu --gateway ollama chat --allow-write ./out --script gen.txt
 
 ---
 
+## Context window
+
+kitsu budgets the conversation against the model's **real context window** so long
+sessions don't overflow it — important for small local models.
+
+- **Set the window the model actually serves:** `context_window` on the gateway
+  profile, or `--context-window <tokens>` per run. kitsu also probes `/v1/models`
+  for gateways that report it (e.g. vLLM's `max_model_len`); Ollama's OpenAI route
+  does **not**, and its default is often 4096, so set it there. Unset everywhere →
+  a conservative 8192 default.
+- **How the budget works:** `effective = window − reply reservation`
+  (from `--max-output-tokens`, clamped to leave room for the prompt). When history
+  exceeds the trim target (just under effective), kitsu elides the oldest
+  tool-result bodies first (`[older tool output elided]`), always preserving the
+  system prompt, recent turns, and the last user message. Token counts are
+  estimated but **anchored on each response's real `usage`**, so the estimate
+  stays accurate without a local tokenizer.
+- **See utilization:** `/context` in the REPL prints model · window ·
+  used/effective with a bar and headroom · a per-category breakdown. A machine
+  `kitsu-context: {"used":…,"effective":…,"window":…}` line is written to stderr
+  each turn (companion to `kitsu-usage:`).
+
+Richer, reversible trimming — offloading large tool results to disk, dropping old
+turns, and summarizing compaction — is planned; see
+[docs/context-management-design.md](docs/context-management-design.md).
+
+---
+
 ## Notes & gotchas
 
 - **`--max-output-tokens` for some gateways.** If a gateway requires `max_tokens`
