@@ -302,4 +302,46 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         let root = tempfile::tempdir().unwrap();
         assert!(SkillSet::discover(root.path(), true).is_empty());
     }
+
+    #[test]
+    fn collect_from_first_wins_on_name_collision() {
+        // The first source collected (project, before user) wins a name clash.
+        let d1 = tempfile::tempdir().unwrap();
+        let d2 = tempfile::tempdir().unwrap();
+        for (d, desc) in [(&d1, "PROJECT"), (&d2, "USER")] {
+            let s = d.path().join("dup");
+            std::fs::create_dir_all(&s).unwrap();
+            std::fs::write(
+                s.join("SKILL.md"),
+                format!("---\nname: dup\ndescription: {desc}\n---\nb"),
+            )
+            .unwrap();
+        }
+        let mut skills = Vec::new();
+        let mut seen = HashSet::new();
+        collect_from(d1.path(), &mut skills, &mut seen);
+        collect_from(d2.path(), &mut skills, &mut seen);
+        assert_eq!(skills.len(), 1, "the duplicate name is collected once");
+        assert_eq!(skills[0].description, "PROJECT", "first source wins");
+    }
+
+    #[tokio::test]
+    async fn skill_tool_returns_body_and_errors_on_unknown() {
+        let set = Arc::new(SkillSet {
+            skills: vec![Skill {
+                name: "greet".into(),
+                description: "say hi".into(),
+                when_to_use: String::new(),
+                always: false,
+                body: "Say hello warmly.".into(),
+                dir: PathBuf::new(),
+            }],
+        });
+        let (desc, handler) = skill_tool(set);
+        assert_eq!(desc.name, "skill");
+        let ok = handler(r#"{"name":"greet"}"#.to_string()).await.unwrap();
+        assert!(ok.contains("Say hello warmly."));
+        assert!(handler(r#"{"name":"nope"}"#.to_string()).await.is_err());
+        assert!(handler("not json".to_string()).await.is_err());
+    }
 }

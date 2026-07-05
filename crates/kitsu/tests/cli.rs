@@ -575,3 +575,107 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
     .await
     .expect("join");
 }
+
+/// `/skills` discovers and lists a LOCAL project skill (index end-to-end). No
+/// gateway call needed for a skills-only script.
+#[tokio::test]
+#[serial]
+async fn test_skills_slash_lists_local_skills() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+model = "test-model"
+context_window = 8000
+auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
+"#,
+    )
+    .unwrap();
+
+    // A project dir (with .git so discovery stops there) holding a skill.
+    let work = TempDir::new().expect("work dir");
+    fs::create_dir_all(work.path().join(".git")).unwrap();
+    let sk = work.path().join(".kitsu/skills/greet");
+    fs::create_dir_all(&sk).unwrap();
+    fs::write(
+        sk.join("SKILL.md"),
+        "---\nname: greet\ndescription: say hello nicely\n---\nSay hello.",
+    )
+    .unwrap();
+
+    let script = work.path().join("s.txt");
+    fs::write(&script, "/skills\n").unwrap();
+    let script_str = script.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.env_remove("KITSU_NO_PROJECT_CONTEXT"); // allow skills to load
+        cmd.current_dir(&work_path);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("greet"))
+            .stderr(predicate::str::contains("say hello nicely"))
+            .stderr(predicate::str::contains("skill(s) available"));
+    })
+    .await
+    .expect("join");
+}
+
+/// `KITSU_NO_PROJECT_CONTEXT=1` (set by `base_cmd`) disables skill discovery.
+#[tokio::test]
+#[serial]
+async fn test_skills_disabled_by_env() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+model = "test-model"
+context_window = 8000
+auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
+"#,
+    )
+    .unwrap();
+
+    let work = TempDir::new().expect("work dir");
+    fs::create_dir_all(work.path().join(".git")).unwrap();
+    let sk = work.path().join(".kitsu/skills/greet");
+    fs::create_dir_all(&sk).unwrap();
+    fs::write(
+        sk.join("SKILL.md"),
+        "---\nname: greet\ndescription: hi\n---\nHi.",
+    )
+    .unwrap();
+
+    let script = work.path().join("s.txt");
+    fs::write(&script, "/skills\n").unwrap();
+    let script_str = script.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path); // sets KITSU_NO_PROJECT_CONTEXT=1
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.current_dir(&work_path);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("no skills found"));
+    })
+    .await
+    .expect("join");
+}
