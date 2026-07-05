@@ -467,6 +467,7 @@ Slash commands inside the REPL:
 | Command | Action |
 |---|---|
 | `/model <name>` | Switch model (keeps history). |
+| `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
