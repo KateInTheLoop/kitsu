@@ -1,6 +1,6 @@
 # ISSUE-002 — Raw tool-call JSON is echoed to the user before it's recognized
 
-- **Status:** OPEN
+- **Status:** RESOLVED (fixed + regression-tested; verified in loop iteration 1)
 - **Severity:** Medium (ugly in coding workflows; every tool-using turn on a
   text-protocol model shows raw JSON)
 - **Found by:** dogfooding, Stage 1 (scn_02/04/05/06 against local Ollama)

@@ -1,6 +1,6 @@
 # ISSUE-004 — Invalid model name yields repeated raw HTTP 404s with no guidance
 
-- **Status:** OPEN
+- **Status:** RESOLVED (fixed + regression-tested; verified in loop iteration 1)
 - **Severity:** Medium (bad UX; easy to hit via a `/model` typo)
 - **Found by:** dogfooding, Stage 1 (persona `novice_03`)
 - **Area:** `kitsu` CLI (`/model` + error rendering)

@@ -1,6 +1,6 @@
 # ISSUE-003 — Streamed answer runs into the `kitsu-usage` line (no separation)
 
-- **Status:** OPEN
+- **Status:** RESOLVED (fixed + regression-tested; verified in loop iteration 1)
 - **Severity:** Low (cosmetic; interactive only)
 - **Found by:** dogfooding, Stage 1 (every streamed turn)
 - **Area:** `kitsu-core` (usage emit ordering) + `kitsu-render`

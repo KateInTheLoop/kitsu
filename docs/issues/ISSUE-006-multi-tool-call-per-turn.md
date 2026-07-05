@@ -1,6 +1,6 @@
 # ISSUE-006 — Only the first text-protocol tool call in a turn is executed
 
-- **Status:** OPEN
+- **Status:** RESOLVED (fixed + regression-tested; verified in loop iteration 1)
 - **Severity:** Medium-High (breaks multi-file generation — a core coding workflow)
 - **Found by:** dogfooding, Stage 1 (persona `power_01`: "write 3 files")
 - **Area:** `kitsu-core` orchestrator (`parse_text_tool_call`)
