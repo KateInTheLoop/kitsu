@@ -23,6 +23,14 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Policy>) {
     }
 }
 
+/// Register the write-capable fs tool (`fs_write_file`) against `registry`,
+/// gated by `policy`'s write allowlist. Call this only when write paths are
+/// configured; the model is then told it can generate files.
+pub fn register_write_tools(registry: &mut Registry, policy: Arc<Policy>) {
+    let (d, h) = fs::write_file_tool(policy);
+    registry.register_with_descriptor(d, h);
+}
+
 /// Is ripgrep (`rg`) available on PATH?
 fn rg_available() -> bool {
     std::process::Command::new("rg")

@@ -202,6 +202,53 @@ async fn grep_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
     Ok(policy.cap_output(text))
 }
 
+// --- fs.write_file ----------------------------------------------------------
+
+#[derive(Deserialize)]
+struct WriteFileArgs {
+    path: String,
+    content: String,
+}
+
+pub fn write_file_tool(policy: Arc<Policy>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_write_file".to_string(),
+        description: "Create or overwrite a UTF-8 text file at a write-allowed path with the given \
+                      content. Use this to generate code or other files. The parent directory must \
+                      already exist. Returns the path written and byte count."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to write (created or overwritten)"},
+                "content": {"type": "string", "description": "Full UTF-8 file contents"}
+            },
+            "required": ["path", "content"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { write_file_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn write_file_run(policy: &Policy, args: &str) -> Result<String, ToolError> {
+    let a: WriteFileArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    policy.check_write_size(a.content.len())?;
+    let target = policy.check_write(Path::new(&a.path))?;
+    let bytes = a.content.len();
+    let display = target.display().to_string();
+    let content = a.content;
+    let written = target.clone();
+    tokio::task::spawn_blocking(move || std::fs::write(&written, content.as_bytes()))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("write failed: {e}")))?;
+    Ok(serde_json::json!({ "written": display, "bytes": bytes }).to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -266,5 +313,79 @@ mod tests {
         let out = list_dir_run(&policy, &args).await.expect("list ok");
         assert!(out.contains("a.txt"));
         assert!(out.contains("sub/"));
+    }
+
+    #[tokio::test]
+    async fn write_file_creates_in_write_root() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().to_string();
+        let policy = Policy::from_roots(&[])
+            .expect("policy")
+            .with_write_roots(&[root])
+            .expect("write roots");
+        let target = dir.path().join("out.rs");
+        let args = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": "fn main() {}\n"
+        })
+        .to_string();
+        let out = write_file_run(&policy, &args).await.expect("write ok");
+        assert!(out.contains("\"bytes\""));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
+    }
+
+    #[tokio::test]
+    async fn write_file_rejects_outside_write_root() {
+        let allowed = tempfile::tempdir().expect("allowed");
+        let other = tempfile::tempdir().expect("other");
+        let policy = Policy::from_roots(&[])
+            .expect("policy")
+            .with_write_roots(&[allowed.path().to_string_lossy().to_string()])
+            .expect("write roots");
+        let bad = other.path().join("evil.rs");
+        let args =
+            serde_json::json!({"path": bad.to_string_lossy(), "content": "x"}).to_string();
+        assert!(matches!(
+            write_file_run(&policy, &args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(!bad.exists(), "must not have written outside the write root");
+    }
+
+    #[tokio::test]
+    async fn write_file_denied_when_no_write_roots() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // Read allowed, but no write roots configured → writes denied.
+        let policy =
+            Policy::from_roots(&[dir.path().to_string_lossy().to_string()]).expect("policy");
+        let target = dir.path().join("x.rs");
+        let args =
+            serde_json::json!({"path": target.to_string_lossy(), "content": "x"}).to_string();
+        assert!(matches!(
+            write_file_run(&policy, &args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_file_dotdot_escape_is_denied() {
+        let base = tempfile::tempdir().expect("base");
+        let allowed = base.path().join("allowed");
+        let sibling = base.path().join("sibling");
+        std::fs::create_dir_all(&allowed).expect("mk allowed");
+        std::fs::create_dir_all(&sibling).expect("mk sibling");
+        let policy = Policy::from_roots(&[])
+            .expect("policy")
+            .with_write_roots(&[allowed.to_string_lossy().to_string()])
+            .expect("write roots");
+        // Escape via the allowed root's parent into the sibling dir.
+        let escape = allowed.join("..").join("sibling").join("pwned.rs");
+        let args =
+            serde_json::json!({"path": escape.to_string_lossy(), "content": "x"}).to_string();
+        assert!(matches!(
+            write_file_run(&policy, &args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(!sibling.join("pwned.rs").exists());
     }
 }

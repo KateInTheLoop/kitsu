@@ -10,28 +10,44 @@ use crate::error::ToolError;
 /// truncated with a marker so a huge file can't blow the context budget.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 
-/// A read-only filesystem policy: a set of allowed roots plus an output cap.
+/// Cap on a single generated file's size (bytes). A model-authored write larger
+/// than this is rejected rather than truncated — a truncated source file is
+/// worse than a clear error.
+pub const DEFAULT_MAX_WRITE_BYTES: usize = 1024 * 1024;
+
+/// A filesystem policy: a set of read-allowed roots and a (separate) set of
+/// write-allowed roots, both deny-by-default, plus an output cap. Reads and
+/// writes are gated independently so a caller can grant read of a whole repo
+/// while confining generated files to one scratch directory.
 #[derive(Debug, Clone)]
 pub struct Policy {
     allowed_roots: Vec<PathBuf>,
+    allowed_write_roots: Vec<PathBuf>,
     max_bytes: usize,
+    max_write_bytes: usize,
+}
+
+/// Canonicalize each root now so later `starts_with` checks compare real paths
+/// (defeats `..`/symlinks). A root that cannot be canonicalized is rejected.
+fn canonicalize_roots(roots: &[String], label: &str) -> Result<Vec<PathBuf>, ToolError> {
+    let mut out = Vec::with_capacity(roots.len());
+    for r in roots {
+        let canon = std::fs::canonicalize(r).map_err(|e| {
+            ToolError::PolicyDenied(format!("{label} '{r}' is not accessible: {e}"))
+        })?;
+        out.push(canon);
+    }
+    Ok(out)
 }
 
 impl Policy {
-    /// Build a policy from allow-path roots. Each root is canonicalized now so
-    /// later `starts_with` checks compare real paths (defeats `..`/symlinks).
-    /// A root that cannot be canonicalized (missing/invalid) is rejected.
+    /// Build a policy from read-allow roots (write roots empty — writes denied).
     pub fn new(roots: &[String], max_bytes: usize) -> Result<Self, ToolError> {
-        let mut allowed_roots = Vec::with_capacity(roots.len());
-        for r in roots {
-            let canon = std::fs::canonicalize(r).map_err(|e| {
-                ToolError::PolicyDenied(format!("allow-path '{r}' is not accessible: {e}"))
-            })?;
-            allowed_roots.push(canon);
-        }
         Ok(Self {
-            allowed_roots,
+            allowed_roots: canonicalize_roots(roots, "allow-path")?,
+            allowed_write_roots: Vec::new(),
             max_bytes,
+            max_write_bytes: DEFAULT_MAX_WRITE_BYTES,
         })
     }
 
@@ -40,12 +56,22 @@ impl Policy {
         Self::new(roots, DEFAULT_MAX_BYTES)
     }
 
+    /// Add write-allowed roots (deny-by-default; canonicalized like read roots).
+    pub fn with_write_roots(mut self, roots: &[String]) -> Result<Self, ToolError> {
+        self.allowed_write_roots = canonicalize_roots(roots, "allow-write")?;
+        Ok(self)
+    }
+
     pub fn max_bytes(&self) -> usize {
         self.max_bytes
     }
 
     pub fn is_empty(&self) -> bool {
         self.allowed_roots.is_empty()
+    }
+
+    pub fn write_is_empty(&self) -> bool {
+        self.allowed_write_roots.is_empty()
     }
 
     /// Check that `requested` resolves to a path under an allowed root. Returns
@@ -72,6 +98,62 @@ impl Policy {
                 requested.display()
             )))
         }
+    }
+
+    /// Check that `requested` resolves to a writable path under a write-allowed
+    /// root. The target file may not exist yet (we're creating it), so the
+    /// *parent* directory is canonicalized (it must exist) and the file name is
+    /// re-joined — this resolves `..`/symlinks in the parent before the
+    /// containment check. Returns the resolved absolute path on success. The
+    /// error names only the requested path, never the allowed roots (design §9).
+    pub fn check_write(&self, requested: &Path) -> Result<PathBuf, ToolError> {
+        if self.allowed_write_roots.is_empty() {
+            return Err(ToolError::PolicyDenied(format!(
+                "path '{}' is not writable (no write paths configured)",
+                requested.display()
+            )));
+        }
+        let file_name = requested.file_name().ok_or_else(|| {
+            ToolError::PolicyDenied(format!(
+                "path '{}' has no file name to write",
+                requested.display()
+            ))
+        })?;
+        let parent = requested.parent().filter(|p| !p.as_os_str().is_empty());
+        let canon_parent = match parent {
+            Some(p) => std::fs::canonicalize(p),
+            None => std::fs::canonicalize("."),
+        }
+        .map_err(|_| {
+            ToolError::PolicyDenied(format!(
+                "parent directory of '{}' is not accessible or does not exist",
+                requested.display()
+            ))
+        })?;
+        let target = canon_parent.join(file_name);
+        if self
+            .allowed_write_roots
+            .iter()
+            .any(|root| target.starts_with(root))
+        {
+            Ok(target)
+        } else {
+            Err(ToolError::PolicyDenied(format!(
+                "path '{}' is outside the allowed write paths",
+                requested.display()
+            )))
+        }
+    }
+
+    /// Reject a generated file that exceeds the write byte cap.
+    pub fn check_write_size(&self, len: usize) -> Result<(), ToolError> {
+        if len > self.max_write_bytes {
+            return Err(ToolError::PolicyDenied(format!(
+                "content is {len} bytes, exceeding the {} byte write cap",
+                self.max_write_bytes
+            )));
+        }
+        Ok(())
     }
 
     /// Truncate `content` to the byte cap, appending a marker if it was cut.

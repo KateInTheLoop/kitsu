@@ -69,5 +69,19 @@ pub enum Command {
         /// it, fs tools are not registered or advertised.
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<String>,
+
+        /// Allow the model to GENERATE/write files under this path (repeatable).
+        /// Enables the `fs_write_file` tool, gated by a deny-by-default write
+        /// allowlist separate from --allow-path. Without it, no write tool is
+        /// registered or advertised.
+        #[arg(long = "allow-write", value_name = "PATH")]
+        allow_write: Vec<String>,
+
+        /// Run turns from a FILE non-interactively (one turn per line; blank
+        /// lines and `#` comments are skipped; lines starting with `/` are slash
+        /// commands). Threads multi-turn history and prints a transcript. Works
+        /// with or without a TTY — used for scripted/replayable sessions.
+        #[arg(long, value_name = "FILE")]
+        script: Option<String>,
     },
 }
