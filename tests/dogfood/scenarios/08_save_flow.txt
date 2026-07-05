@@ -1,0 +1,4 @@
+# ask for code in a block, then /save just the code
+Write a Python function sq(n) that returns n*n. Put ONLY the function in a single code block.
+/save __GEN__/sq.py
+Reply DONE.

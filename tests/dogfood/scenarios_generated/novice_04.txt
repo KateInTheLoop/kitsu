@@ -1,0 +1,6 @@
+# Novice vague file request, forgets the path, clears history mid-task then references old context
+can u list the files here
+open the frist one and summerize it, only a code block
+/clear
+what was that file called again
+save a note about it to a file, i dont know the path just pick one

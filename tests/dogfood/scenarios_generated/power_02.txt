@@ -1,0 +1,13 @@
+# intent: paste a real multi-line Python stack trace and demand root cause in one line
+Root cause in ONE line only. Here is the traceback:
+<<<
+Traceback (most recent call last):
+  File "app.py", line 42, in <module>
+    main()
+  File "app.py", line 31, in main
+    total = sum(parse(x) for x in rows)
+  File "app.py", line 18, in parse
+    return int(row["amount"])
+KeyError: 'amount'
+>>>
+Which line number should I fix? Just the number.

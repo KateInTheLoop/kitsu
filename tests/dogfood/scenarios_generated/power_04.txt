@@ -1,0 +1,6 @@
+# intent: switch models mid-session, stress long output, then /clear and probe for history loss
+List the git subcommands you use most, one per line, terse.
+/model haiku
+Refactor: convert that list into a markdown table with columns Command | Purpose. Long form is fine, cover at least 15 rows.
+/clear
+What was in the first column of the table you just made? If history is gone, say "no history".

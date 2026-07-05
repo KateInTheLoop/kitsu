@@ -1,0 +1,7 @@
+# Novice mixes a slash command with a question, uses one-word turns, mangled model name
+/help what does model do
+/model tiny-fast-thing
+hi
+?
+read __READFILE__ and tell me what it is in one sentence
+thx

@@ -1,0 +1,2 @@
+# read tool: read an allowed file and report a fact about it
+Use the fs_read_file tool to read __READFILE__ and tell me its first line verbatim.
