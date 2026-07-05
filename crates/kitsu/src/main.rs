@@ -107,6 +107,28 @@ struct ChatSetup {
     context_window: Option<u64>,
 }
 
+/// Concatenate the bodies of the skills named via `--skill` into one context
+/// block (or `None` if none/unknown). Unknown names warn and are skipped.
+fn preload_skills(cli: &Cli, skillset: &skills::SkillSet) -> Option<String> {
+    if cli.skill.is_empty() {
+        return None;
+    }
+    let mut out = String::new();
+    for name in &cli.skill {
+        match skillset.get(name) {
+            Some(s) => out.push_str(&format!("# Skill: {}\n{}\n\n", s.name, s.body)),
+            None => eprintln!("~ no skill named '{name}' (skipped)"),
+        }
+    }
+    let out = out.trim().to_string();
+    if out.is_empty() {
+        None
+    } else {
+        eprintln!("~ preloaded {} skill(s)", cli.skill.len());
+        Some(out)
+    }
+}
+
 /// Parse the `--compaction` flag into the orchestrator's mode.
 fn compaction_mode(cli: &Cli) -> CompactionMode {
     if cli.compaction == "summarize" {
@@ -218,7 +240,21 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     let setup = build_setup(cli).await?;
 
-    let mut messages = vec![ChatMessage::user(prompt)];
+    let mut messages = Vec::new();
+    // Preloaded skills (--skill) work even in the tool-less `ask` path: inject the
+    // bodies as a leading system message.
+    if !cli.skill.is_empty() {
+        let no_project = std::env::var_os("KITSU_NO_PROJECT_CONTEXT").is_some();
+        let skillset = std::env::current_dir()
+            .map(|cwd| skills::SkillSet::discover(&cwd, no_project))
+            .unwrap_or_default();
+        if let Some(pre) = preload_skills(cli, &skillset) {
+            messages.push(ChatMessage::system(format!(
+                "Follow these skill instructions:\n\n{pre}"
+            )));
+        }
+    }
+    messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
     let agent_cfg = AgentConfig {
         model: setup.model.clone(),
@@ -528,6 +564,11 @@ async fn run_chat(
             system.push_str(&always);
         }
         eprintln!("~ {} skill(s) available", skillset.names().len());
+    }
+    // --skill preloads named skills up front (in addition to on-demand loading).
+    if let Some(pre) = preload_skills(cli, &skillset) {
+        system.push_str("\n\n---\nPreloaded skills (follow these):\n");
+        system.push_str(&pre);
     }
     let mut messages = vec![ChatMessage::system(system)];
 
