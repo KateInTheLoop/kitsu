@@ -523,7 +523,7 @@ async fn run_chat(
             .unwrap_or_default(),
     );
     if !skillset.is_empty() && (can_read || can_write) {
-        let (d, h) = skills::skill_tool(skillset.clone());
+        let (d, h) = skills::skill_tool(skillset.clone(), perms.clone());
         tools.register_with_descriptor(d, h);
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
@@ -616,6 +616,12 @@ async fn run_chat(
     }
     // --skill preloads named skills up front (in addition to on-demand loading).
     if let Some(pre) = preload_skills(cli, &skillset) {
+        // Grant read to each preloaded skill's dir so its bundled files are reachable.
+        for name in &cli.skill {
+            if let Some(s) = skillset.get(name) {
+                let _ = perms.grant_read_root(&s.dir.to_string_lossy());
+            }
+        }
         let chunk = format!("\n\n---\nPreloaded skills (follow these):\n{pre}");
         system.push_str(&chunk);
         provenance.push(CtxEntry::new(
@@ -835,10 +841,12 @@ async fn handle_slash(
             } else {
                 match skillset.get(arg) {
                     Some(s) => {
-                        messages.push(ChatMessage::user(format!(
-                            "[Loaded skill: {}]\n\n{}",
-                            s.name, s.body
-                        )));
+                        // Grants read to the skill's dir + lists bundled files/links.
+                        let loaded = skills::load_skill(s, perms);
+                        if !s.links.is_empty() {
+                            eprintln!("~ {} reference link(s) (not fetched)", s.links.len());
+                        }
+                        messages.push(ChatMessage::user(format!("[Loaded skill]\n\n{loaded}")));
                         eprintln!("~ loaded skill '{}'", s.name);
                     }
                     None => eprintln!("no skill named '{arg}' — try /skills"),

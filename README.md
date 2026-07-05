@@ -574,7 +574,12 @@ always: false
   `.kitsu/skills/` as examples.
 - **On demand:** only the index (`name — description`) is always in context; the
   model loads a skill's body by calling the `skill` tool when a task matches, or
-  you run `/skill <name>`. `/skills [filter]` lists them.
+  you run `/skill <name>`. `/skills [filter]` lists them. `--skill <name>`
+  preloads one up front (works for `ask` too, and for spawned agents).
+- **Bundled files & links:** a skill dir can ship resource files (checklists,
+  templates); loading the skill **grants read access to its own directory** so the
+  model can `fs_read_file` them — no broad `--allow-path` needed. A skill's
+  `links:` are surfaced to you but **never auto-fetched**.
 - **Local only, by design:** skills are trusted because *you placed them there* —
   kitsu never fetches them from the network (injecting internet instructions into
   a tool-enabled agent is exactly what the permission model prevents). To use one
