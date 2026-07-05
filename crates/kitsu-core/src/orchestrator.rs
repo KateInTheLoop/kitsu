@@ -75,6 +75,12 @@ where
     // Emit usage regardless of Ok/Err — partial turns still cost tokens. Only
     // when the gateway actually reported something.
     if !turn_usage.is_empty() {
+        // ISSUE-003: when streaming, the assistant text was written to stdout
+        // without a trailing newline. Terminate that line before the usage line
+        // (stderr) so the two don't run together (`OKkitsu-usage:` → `OK\nkitsu-usage:`).
+        if cfg.stream {
+            kitsu_render::finish_line();
+        }
         kitsu_render::emit_usage(
             turn_usage.prompt_tokens,
             turn_usage.completion_tokens,
