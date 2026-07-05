@@ -196,7 +196,10 @@ mod tests {
         assert!(t.required.contains("## Docs"));
         assert!(t.required.contains("[Readme](README.md)"));
         assert!(t.required.contains("Some details."));
-        assert!(!t.required.contains("Changelog"), "optional must be split out");
+        assert!(
+            !t.required.contains("Changelog"),
+            "optional must be split out"
+        );
         assert!(t.optional.contains("[Changelog](CHANGELOG.md)"));
     }
 
@@ -222,7 +225,10 @@ mod tests {
         // Small window → window/4 optional budget is tiny → optional dropped.
         let (rendered, _) = load(dir.path(), None, Some(2000)).unwrap();
         assert!(rendered.contains("# P"));
-        assert!(!rendered.contains("zzz"), "optional should be dropped under budget");
+        assert!(
+            !rendered.contains("zzz"),
+            "optional should be dropped under budget"
+        );
     }
 
     #[test]

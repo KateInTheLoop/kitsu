@@ -922,13 +922,19 @@ fn trim_elides_oldest_tool_results_first_and_preserves_turns() {
     trim_tool_results(&mut msgs, total, 100, message_tokens);
 
     // Big tool result elided to the stub; system/user/assistant untouched.
-    assert!(msgs[2].content.contains("elided"), "big tool result must be elided");
+    assert!(
+        msgs[2].content.contains("elided"),
+        "big tool result must be elided"
+    );
     assert_eq!(msgs[0].content, "sys");
     assert_eq!(msgs[1].content, "hello");
     assert_eq!(msgs[3].content, "thinking");
     // Now under target.
     let after: u64 = msgs.iter().map(message_tokens).sum();
-    assert!(after <= 100, "must be at/under target after trimming, was {after}");
+    assert!(
+        after <= 100,
+        "must be at/under target after trimming, was {after}"
+    );
 }
 
 #[test]
@@ -950,7 +956,7 @@ fn trim_is_a_noop_when_already_under_budget() {
 
 #[test]
 fn enforce_budget_token_path_elides_when_window_set() {
-    use crate::context::{ContextMeter, message_tokens};
+    use crate::context::{message_tokens, ContextMeter};
     use crate::orchestrator::enforce_context_budget;
     use kitsu_providers::ChatMessage;
 
@@ -973,8 +979,8 @@ fn enforce_budget_token_path_elides_when_window_set() {
 
 #[test]
 fn enforce_budget_byte_path_when_window_unset() {
-    use crate::orchestrator::enforce_context_budget;
     use crate::context::ContextMeter;
+    use crate::orchestrator::enforce_context_budget;
     use kitsu_providers::ChatMessage;
 
     let mut cfg = cfg(10);
@@ -987,7 +993,10 @@ fn enforce_budget_byte_path_when_window_unset() {
         ChatMessage::tool("id1", "b".repeat(500).as_str()),
     ];
     enforce_context_budget(&mut msgs, &cfg, &meter);
-    assert!(msgs[1].content.contains("elided"), "byte path should still trim");
+    assert!(
+        msgs[1].content.contains("elided"),
+        "byte path should still trim"
+    );
 }
 
 // --- turn-dropping (Stage 2) -------------------------------------------------
@@ -1004,9 +1013,15 @@ fn drop_old_exchanges_keeps_system_and_recent_no_orphans() {
         msgs.push(ChatMessage::user(
             format!("question {k} {}", "x".repeat(200)).as_str(),
         ));
-        msgs.push(ChatMessage::assistant("", vec![tc("t", &format!("c{k}"), "{}")]));
+        msgs.push(ChatMessage::assistant(
+            "",
+            vec![tc("t", &format!("c{k}"), "{}")],
+        ));
         msgs.push(ChatMessage::tool(format!("c{k}").as_str(), "some result"));
-        msgs.push(ChatMessage::assistant(format!("answer {k}").as_str(), vec![]));
+        msgs.push(ChatMessage::assistant(
+            format!("answer {k}").as_str(),
+            vec![],
+        ));
     }
     drop_old_exchanges(&mut msgs, 100, message_tokens);
 
@@ -1041,7 +1056,11 @@ fn drop_old_exchanges_noop_with_few_exchanges() {
     ];
     let before = msgs.len();
     drop_old_exchanges(&mut msgs, 1, message_tokens); // target tiny, but nothing safely droppable
-    assert_eq!(msgs.len(), before, "must not drop the only/recent exchanges");
+    assert_eq!(
+        msgs.len(),
+        before,
+        "must not drop the only/recent exchanges"
+    );
 }
 
 #[test]
@@ -1069,7 +1088,10 @@ fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
     let before: u64 = msgs.iter().map(message_tokens).sum();
     enforce_context_budget(&mut msgs, &cfg, &meter);
     let after: u64 = msgs.iter().map(message_tokens).sum();
-    assert!(after < before, "cascade must shrink the conversation ({before} -> {after})");
+    assert!(
+        after < before,
+        "cascade must shrink the conversation ({before} -> {after})"
+    );
     assert_eq!(msgs[0].content, "sys");
     // Most recent exchange survives.
     assert!(msgs.iter().any(|m| m.content.contains("q4")));
@@ -1084,8 +1106,14 @@ fn maybe_offload_writes_large_result_and_returns_pointer() {
     let big = "x".repeat(20_000);
     let out = maybe_offload(big.clone(), "call-1", Some(dir.path()));
     assert!(out.contains("saved to"), "returns a pointer");
-    assert!(out.contains("fs_read_file"), "tells the model how to re-read");
-    assert!(out.len() < big.len(), "pointer is much smaller than the result");
+    assert!(
+        out.contains("fs_read_file"),
+        "tells the model how to re-read"
+    );
+    assert!(
+        out.len() < big.len(),
+        "pointer is much smaller than the result"
+    );
     // Full content persisted and intact.
     let path = dir.path().join("call-1.txt");
     assert_eq!(std::fs::read_to_string(&path).unwrap(), big);
