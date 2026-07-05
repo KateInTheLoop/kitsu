@@ -1,0 +1,18 @@
+# Scenario: paste traceback -> root cause -> fix -> verify
+# Probe: does the multi-line paste arrive as ONE turn? does read->write->verify hold?
+
+Here is a crash from my script. Read it and tell me the root cause in ONE line.
+<<<
+Traceback (most recent call last):
+  File "app.py", line 12, in <module>
+    main()
+  File "app.py", line 8, in main
+    total = sum(prices) / len(items)
+  File "app.py", line 8, in main
+ZeroDivisionError: division by zero
+>>>
+Which single line number is the problem?
+The file is at __READFILE__ . Read it so you have the real context.
+Now write a corrected version to __GEN__/app_fixed.py that guards against an empty items list.
+Read __GEN__/app_fixed.py back and confirm the guard is present.
+Restate the original ZeroDivisionError root cause from the traceback I pasted earlier.

@@ -1,0 +1,9 @@
+# Iterative build-up of ONE file over several turns.
+# Probes: does history keep the model editing the same file, and does re-reading its own output survive round-trips?
+Keep replies terse: just the code block, no prose.
+Write a Python file to __GEN__/shapes.py with a function area_circle(r) returning pi*r*r. Use math.pi. Then save it with fs_write_file.
+Now read __GEN__/shapes.py back with fs_read_file and show me exactly what is there.
+Add a second function area_square(side) to that same file, keeping area_circle unchanged. Write the full updated file back to __GEN__/shapes.py.
+Read __GEN__/shapes.py again and confirm BOTH functions are present.
+There is a bug risk: area_circle should raise ValueError if r is negative. Add that guard, keep area_square, and write the whole file to __GEN__/shapes.py again.
+Read the file one final time and list the names of every function defined in it.

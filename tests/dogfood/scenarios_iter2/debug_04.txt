@@ -1,0 +1,20 @@
+# Scenario: interpreter error dump -> minimal diff -> save
+# Probe: does pasted context survive across the diff+save+verify turns?
+
+Here is an error dump from running my module. Read it all.
+<<<
+$ node index.js
+/home/dev/proj/index.js:5
+  const data = JSON.parse(raw)
+                    ^
+SyntaxError: Unexpected end of JSON input
+    at JSON.parse (<anonymous>)
+    at readConfig (/home/dev/proj/index.js:5:22)
+    at Object.<anonymous> (/home/dev/proj/index.js:11:1)
+>>>
+What is the root cause in one line?
+Give me the MINIMAL diff to fix it: wrap the parse in try/catch and default to {}.
+The current file is at __READFILE__ . Read it for context.
+Write the patched file to __GEN__/index_fixed.js applying that minimal diff.
+Read __GEN__/index_fixed.js back and confirm the try/catch is there.
+From the dump I pasted first: which file and line number threw the SyntaxError?

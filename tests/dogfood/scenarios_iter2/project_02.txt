@@ -1,0 +1,11 @@
+# Scenario 2: tiny CLI, main imports utils, then cross-file edit across turns
+<<<
+Create a tiny CLI under __GEN__ in ONE turn, both files under 12 lines:
+- utils.py: function greet(name) returning "hi " + name
+- main.py: import utils and print utils.greet("world")
+Write both files now.
+>>>
+List __GEN__ to confirm main.py and utils.py both exist.
+Add a new function bye(name) returning "bye " + name to __GEN__/utils.py. Keep the existing greet function.
+Now update __GEN__/main.py so it also prints utils.bye("world"). Keep the existing greet call.
+Read back both files so I can confirm main.py calls both greet and bye.

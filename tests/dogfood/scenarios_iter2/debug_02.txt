@@ -1,0 +1,19 @@
+# Scenario: write buggy fn -> fails on input X -> fix -> apply -> verify
+# Probe: fix loop across turns, does it keep the buggy source in context?
+
+Write this exact function to __GEN__/slug.py, no changes:
+<<<
+def slugify(s):
+    out = ""
+    for c in s:
+        if c == " ":
+            out += "-"
+        else:
+            out += c
+    return out.lower()
+>>>
+It fails on input "  Hello   World  ": leading/trailing and double dashes appear. What is the bug in one line?
+Give me the corrected slugify that collapses runs and strips ends.
+Apply it: overwrite __GEN__/slug.py with the corrected version.
+Read __GEN__/slug.py and show the return statement only.
+For input "  Hello   World  " what does the fixed function return? One line.

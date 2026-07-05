@@ -1,0 +1,10 @@
+# Scenario 3: generate small project, enumerate with fs_list_dir, count .py files
+<<<
+Create a small project under __GEN__ in ONE turn, each file tiny (under 12 lines):
+- app.py: a main() that prints "run"
+- config.py: a dict SETTINGS = {"debug": True}
+- README.md: two lines describing the app
+Write all three files now.
+>>>
+Now run fs_list_dir __GEN__ and enumerate every file you created.
+How many .py files did you create? Number only.

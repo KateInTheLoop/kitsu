@@ -1,0 +1,12 @@
+# save / edit / save loop using the /save slash command.
+# Probes: does /save clobber vs append, and does an improved version fully replace the old one?
+Terse replies. Emit only a fenced python code block unless I ask otherwise.
+Write a function slugify(text) that lowercases text and replaces spaces with hyphens. Just the code block.
+/save __GEN__/slug.py
+Read __GEN__/slug.py with fs_read_file and show it verbatim.
+Improve slugify: also strip leading/trailing whitespace and collapse multiple spaces into one hyphen. Give the full updated function only.
+/save __GEN__/slug.py
+Read __GEN__/slug.py again. It should be the IMPROVED version, and should NOT contain two copies of slugify. Confirm which version is on disk.
+Add a docstring one-liner to slugify, full function again.
+/save __GEN__/slug.py
+Read __GEN__/slug.py a final time and tell me how many times the word "def" appears.
