@@ -1,0 +1,12 @@
+# Scenario 1: 3-file package created in ONE turn, then verify all exist
+# Probes ISSUE-006: multiple fs_write_file calls in a single turn must all land.
+<<<
+Create a 3-file Python package under __GEN__ in ONE turn, all tiny (under 12 lines each):
+- module.py: one function add(a, b) that returns a+b
+- __init__.py: empty
+- test_module.py: import module and one assert add(2,3)==5
+Write all three files now. Keep them terse.
+>>>
+Now list __GEN__ and confirm all three files exist: fs_list_dir __GEN__
+Read back __GEN__/test_module.py and show it.
+Did you create exactly 3 files? Answer yes or no.

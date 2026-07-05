@@ -1,0 +1,9 @@
+# Two files that reference each other: a module plus a test that imports it.
+# Probes: cross-file consistency, importing the right names, writing to two distinct paths.
+Keep it terse: code blocks only, no explanation.
+Write a small module __GEN__/calc.py with two functions: add(a, b) and sub(a, b). Save it with fs_write_file.
+Read __GEN__/calc.py back and show it.
+Now write __GEN__/test_calc.py that does `from calc import add, sub` and defines test_add() and test_sub() using plain assert statements. Save it with fs_write_file.
+Read __GEN__/test_calc.py and verify it imports the exact function names that exist in calc.py.
+I want a mul(a, b) too. Add mul to __GEN__/calc.py (keep add and sub) and write the file back.
+Update __GEN__/test_calc.py to also import mul and add a test_mul(). Write the file back, then read it to confirm the import line lists add, sub, mul.

@@ -1,0 +1,9 @@
+# Progressive refinement: same function rewritten each turn as requirements grow.
+# Probes: does each rewrite carry forward prior constraints instead of regressing?
+Terse. Output only the full function each time, in one python code block.
+Write average(nums) that returns the mean of a list of numbers. Save to __GEN__/stats.py with fs_write_file.
+Read __GEN__/stats.py back and show it.
+Now make it handle the edge case of an empty list by returning 0.0 instead of dividing by zero. Rewrite the whole file to __GEN__/stats.py.
+Read __GEN__/stats.py and confirm the empty-list guard is present.
+Now add type hints: average(nums: list[float]) -> float. Keep the empty-list guard. Write the full file to __GEN__/stats.py.
+Read __GEN__/stats.py once more and check that BOTH the type hints AND the empty-list guard survived.

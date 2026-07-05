@@ -1,0 +1,22 @@
+# Scenario: large paste with subtle bug -> "which line is wrong, number only"
+# Probe: does a big multi-line block arrive intact as one turn?
+
+I will paste a function. Answer with the wrong line NUMBER only, nothing else.
+<<<
+1  def binary_search(arr, target):
+2      lo = 0
+3      hi = len(arr)
+4      while lo < hi:
+5          mid = (lo + hi) // 2
+6          if arr[mid] == target:
+7              return mid
+8          elif arr[mid] < target:
+9              lo = mid + 1
+10         else:
+11             hi = mid + 1
+12     return -1
+>>>
+Why is that line wrong? One sentence.
+Give the corrected line 11 only.
+Now write the full corrected function to __GEN__/bsearch.py.
+Read it back and confirm line 11 is fixed.
