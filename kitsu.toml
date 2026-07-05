@@ -1,22 +1,32 @@
-default_gateway = "example"
+default_gateway = "anthropic"
 
+# Example OpenAI-compatible gateway profile. Works with any endpoint that speaks
+# the OpenAI chat/completions wire shape (OpenAI, vLLM, Mistral cloud, a corporate
+# AI gateway, ...). Point base_url/chat_path at your endpoint and set the token.
 [gateways.example]
 flavor      = "openai"
 base_url    = "https://gateway.example.com"
 chat_path   = "/v1/chat/completions"
 models_path = ""
 model       = "example-model-v1"
-auth        = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
+auth        = { method = "bearer-env", env = "GATEWAY_TOKEN", refresh_hint = "set GATEWAY_TOKEN to your gateway's bearer token" }
 
-# The unified gateway also fronts Anthropic (Bedrock) models on the SAME
-# OpenAI-compatible endpoint — verified to accept a 396k-token prompt (well
-# past the 200k standard window) with NO special beta header, and to stream.
-# Same base_url/chat_path as `example`; only the default model differs. A separate
-# profile gives an independently rate-poolable name + a 1M-context default.
-[gateways.anthropic1m]
+# Anthropic direct, via Anthropic's OpenAI-compatible endpoint
+# (https://api.anthropic.com/v1/chat/completions). kitsu already speaks the
+# OpenAI wire shape, so this needs no code change — only a profile.
+#
+# Requires a developer API key (`sk-ant-...`) from console.anthropic.com, sent as
+# a bearer token. A claude.ai Pro/Max *subscription* login does NOT work here.
+#
+#   export ANTHROPIC_API_KEY=sk-ant-...
+#   kitsu --gateway anthropic ask --max-output-tokens 1024 "hello"
+#
+# Anthropic's compat endpoint requires a max_tokens; pass --max-output-tokens so
+# the request isn't rejected for omitting it.
+[gateways.anthropic]
 flavor      = "openai"
-base_url    = "https://gateway.example.com"
+base_url    = "https://api.anthropic.com"
 chat_path   = "/v1/chat/completions"
-models_path = ""
+models_path = "/v1/models"
 model       = "claude-opus-4-8"
-auth        = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
+auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "", refresh_hint = "create a key at https://console.anthropic.com/settings/keys and `export ANTHROPIC_API_KEY=sk-ant-...`" }
