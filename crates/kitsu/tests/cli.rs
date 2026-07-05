@@ -356,3 +356,67 @@ async fn test_timeout_secs_flag_parses() {
     .await
     .expect("spawned kitsu --timeout-secs process should join");
 }
+
+// --- copy-paste: multi-line block is one turn -------------------------------
+
+/// A `<<<` … `>>>` block in a `--script` must be sent as ONE user turn (the
+/// scripted equivalent of a bracketed multi-line paste), preserving newlines.
+#[tokio::test]
+#[serial]
+async fn test_script_multiline_block_is_one_turn() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+
+    // A pasted code block spanning multiple lines, wrapped in <<< / >>>.
+    let script = "<<<\ndef add(a, b):\n    return a + b\n>>>\n";
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, script).expect("write script");
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["chat", "--gateway", "example", "--script", &script_str]);
+        cmd.assert().success();
+    })
+    .await
+    .expect("spawned kitsu chat --script process should join");
+
+    // Exactly one request → the block was ONE turn, not three separate lines.
+    let reqs = server
+        .received_requests()
+        .await
+        .expect("recorded requests");
+    assert_eq!(reqs.len(), 1, "multi-line block must be a single turn");
+    let body = String::from_utf8_lossy(&reqs[0].body);
+    assert!(body.contains("def add(a, b):"), "body missing first line: {body}");
+    assert!(body.contains("return a + b"), "body missing second line: {body}");
+    // Both lines must live in the SAME user message (joined by an escaped \n).
+    assert!(
+        body.contains("def add(a, b):\\n    return a + b"),
+        "the block should be one user message with an embedded newline: {body}"
+    );
+}

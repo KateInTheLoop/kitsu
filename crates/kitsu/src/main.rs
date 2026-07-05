@@ -187,9 +187,13 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
     }
 }
 
-/// Run turns from a script file non-interactively: one turn per line, threading
-/// multi-turn history, printing a readable transcript (`user> …` then the
-/// response). Blank lines and `#` comments are skipped; `/slash` commands work.
+/// Run turns from a script file non-interactively, threading multi-turn history
+/// and printing a readable transcript (`user> …` then the response). Each line
+/// is one turn; blank lines and `#` comments are skipped; `/slash` commands work.
+///
+/// A `<<<` line begins a MULTI-LINE turn (a pasted code block or stack trace),
+/// preserved verbatim with its newlines until a closing `>>>` line — the scripted
+/// equivalent of a bracketed paste in the interactive REPL.
 async fn run_scripted(
     setup: &ChatSetup,
     tools: &Registry,
@@ -200,42 +204,70 @@ async fn run_scripted(
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
-    for raw in content.lines() {
-        let line = raw.trim();
-        if line.is_empty() || line.starts_with('#') {
+    let lines: Vec<&str> = content.lines().collect();
+    let mut idx = 0;
+    while idx < lines.len() {
+        let trimmed = lines[idx].trim();
+        idx += 1;
+
+        if trimmed == "<<<" {
+            // Collect a verbatim multi-line block until the closing ">>>".
+            let mut block: Vec<&str> = Vec::new();
+            while idx < lines.len() && lines[idx].trim() != ">>>" {
+                block.push(lines[idx]);
+                idx += 1;
+            }
+            idx += 1; // consume the closing ">>>" (if present)
+            run_scripted_turn(setup, tools, messages, model, cli, &block.join("\n")).await;
             continue;
         }
-        if let Some(rest) = line.strip_prefix('/') {
+        if trimmed.is_empty() || trimmed.starts_with('#') {
+            continue;
+        }
+        if let Some(rest) = trimmed.strip_prefix('/') {
             match handle_slash(rest, messages, model) {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
         }
-        println!("user> {line}");
-        messages.push(ChatMessage::user(line));
-        let cfg = AgentConfig {
-            model: model.clone(),
-            max_rounds: cli.max_rounds,
-            max_context_bytes: 128 * 1024,
-            stream: !cli.no_stream,
-            temperature: cli.temperature,
-            max_tokens: cli.max_output_tokens,
-        };
-        match run_agent_turn(&setup.provider, tools, messages, &cfg).await {
-            Ok(text) => {
-                if cli.no_stream {
-                    println!("{text}");
-                } else {
-                    kitsu_render::finish_line();
-                }
-            }
-            Err(e) => {
-                kitsu_render::finish_line();
-                eprintln!("{}", map_agent_error(e));
-            }
-        }
+        run_scripted_turn(setup, tools, messages, model, cli, trimmed).await;
     }
     Ok(())
+}
+
+/// Send one scripted user turn and render the response (errors are printed, not
+/// propagated — a bad turn shouldn't abort the rest of the script).
+async fn run_scripted_turn(
+    setup: &ChatSetup,
+    tools: &Registry,
+    messages: &mut Vec<ChatMessage>,
+    model: &str,
+    cli: &Cli,
+    input: &str,
+) {
+    println!("user> {input}");
+    messages.push(ChatMessage::user(input));
+    let cfg = AgentConfig {
+        model: model.to_string(),
+        max_rounds: cli.max_rounds,
+        max_context_bytes: 128 * 1024,
+        stream: !cli.no_stream,
+        temperature: cli.temperature,
+        max_tokens: cli.max_output_tokens,
+    };
+    match run_agent_turn(&setup.provider, tools, messages, &cfg).await {
+        Ok(text) => {
+            if cli.no_stream {
+                println!("{text}");
+            } else {
+                kitsu_render::finish_line();
+            }
+        }
+        Err(e) => {
+            kitsu_render::finish_line();
+            eprintln!("{}", map_agent_error(e));
+        }
+    }
 }
 
 /// Outcome of a single (cancellable) turn.
@@ -339,8 +371,12 @@ async fn run_chat(
         };
     }
 
-    // Interactive TTY loop.
-    let mut rl = rustyline::DefaultEditor::new()
+    // Interactive TTY loop. Explicitly enable bracketed paste so a pasted
+    // multi-line block (a code snippet or stack trace — the bread and butter of
+    // coding chats) is captured as ONE turn instead of each line submitting
+    // separately. It defaults on in rustyline 14, but we set it deliberately.
+    let rl_config = rustyline::Config::builder().bracketed_paste(true).build();
+    let mut rl = rustyline::DefaultEditor::with_config(rl_config)
         .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
     let history_path = Config::resolve_path(cli.config.as_deref())
         .parent()
