@@ -104,6 +104,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         stream: false,
         temperature: None,
         max_tokens: None,
+        compaction: crate::orchestrator::CompactionMode::Trim,
     }
 }
 
@@ -954,12 +955,13 @@ fn trim_is_a_noop_when_already_under_budget() {
     assert_eq!(before, after, "nothing should change under budget");
 }
 
-#[test]
-fn enforce_budget_token_path_elides_when_window_set() {
+#[tokio::test]
+async fn enforce_budget_token_path_elides_when_window_set() {
     use crate::context::{message_tokens, ContextMeter};
     use crate::orchestrator::enforce_context_budget;
     use kitsu_providers::ChatMessage;
 
+    let provider = MockProvider::new(vec![]);
     let mut cfg = cfg(10);
     cfg.context_window = Some(200); // effective ~100, target ~80
     cfg.max_tokens = Some(64);
@@ -970,19 +972,21 @@ fn enforce_budget_token_path_elides_when_window_set() {
         ChatMessage::user("q"),
         ChatMessage::tool("id1", "z".repeat(8000).as_str()), // huge
     ];
-    enforce_context_budget(&mut msgs, &cfg, &meter);
+    let mut failures = 0u32;
+    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
     assert!(msgs[2].content.contains("elided"));
     let total: u64 = msgs.iter().map(message_tokens).sum();
     let target = crate::context::ContextBudget::new(200, Some(64)).target;
     assert!(total <= target);
 }
 
-#[test]
-fn enforce_budget_byte_path_when_window_unset() {
+#[tokio::test]
+async fn enforce_budget_byte_path_when_window_unset() {
     use crate::context::ContextMeter;
     use crate::orchestrator::enforce_context_budget;
     use kitsu_providers::ChatMessage;
 
+    let provider = MockProvider::new(vec![]);
     let mut cfg = cfg(10);
     cfg.context_window = None; // byte fallback
     cfg.max_context_bytes = 100;
@@ -992,7 +996,8 @@ fn enforce_budget_byte_path_when_window_unset() {
         ChatMessage::system("sys"),
         ChatMessage::tool("id1", "b".repeat(500).as_str()),
     ];
-    enforce_context_budget(&mut msgs, &cfg, &meter);
+    let mut failures = 0u32;
+    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
     assert!(
         msgs[1].content.contains("elided"),
         "byte path should still trim"
@@ -1065,12 +1070,13 @@ fn drop_old_exchanges_noop_with_few_exchanges() {
     );
 }
 
-#[test]
-fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
+#[tokio::test]
+async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
     use crate::context::{message_tokens, ContextMeter};
     use crate::orchestrator::enforce_context_budget;
     use kitsu_providers::ChatMessage;
 
+    let provider = MockProvider::new(vec![]);
     let mut cfg = cfg(10);
     cfg.context_window = Some(400);
     cfg.max_tokens = Some(64);
@@ -1088,7 +1094,8 @@ fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
         ));
     }
     let before: u64 = msgs.iter().map(message_tokens).sum();
-    enforce_context_budget(&mut msgs, &cfg, &meter);
+    let mut failures = 0u32;
+    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
     let after: u64 = msgs.iter().map(message_tokens).sum();
     assert!(
         after < before,
@@ -1139,4 +1146,85 @@ fn maybe_offload_is_noop_without_a_dir() {
     use crate::orchestrator::maybe_offload;
     let big = "x".repeat(20_000);
     assert_eq!(maybe_offload(big.clone(), "c", None), big);
+}
+
+// --- summarizing compaction (Stage 3) ---------------------------------------
+
+#[tokio::test]
+async fn compaction_summarize_rebuilds_history_with_summary() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{enforce_context_budget, CompactionMode};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("SUMMARY: earlier work on foo.rs".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(400);
+    cfg.max_tokens = Some(64);
+    cfg.compaction = CompactionMode::Summarize;
+    let meter = ContextMeter::new();
+
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..5 {
+        msgs.push(ChatMessage::user(
+            format!("q{k} {}", "y".repeat(300)).as_str(),
+        ));
+        msgs.push(ChatMessage::assistant(
+            format!("a{k} {}", "z".repeat(300)).as_str(),
+            vec![],
+        ));
+    }
+    let mut failures = 0u32;
+    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+
+    assert_eq!(msgs[0].content, "sys", "system kept");
+    assert!(
+        msgs.iter()
+            .any(|m| m.content.contains("SUMMARY: earlier work on foo.rs")),
+        "the summary text is injected"
+    );
+    assert!(msgs.iter().any(|m| m.content.contains("q4")), "recent kept");
+    assert!(
+        !msgs.iter().any(|m| m.content.contains("q0")),
+        "oldest summarized away"
+    );
+    assert_eq!(failures, 0, "success resets the breaker");
+}
+
+#[tokio::test]
+async fn compaction_falls_back_to_drop_on_empty_summary() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{enforce_context_budget, CompactionMode};
+    use kitsu_providers::ChatMessage;
+
+    // Provider returns no text → summary fails → fall back to dropping.
+    let provider = MockProvider::new(vec![vec![ChatDelta::Done(FinishReason::Stop)]]);
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(400);
+    cfg.max_tokens = Some(64);
+    cfg.compaction = CompactionMode::Summarize;
+    let meter = ContextMeter::new();
+
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..5 {
+        msgs.push(ChatMessage::user(
+            format!("q{k} {}", "y".repeat(300)).as_str(),
+        ));
+        msgs.push(ChatMessage::assistant(
+            format!("a{k} {}", "z".repeat(300)).as_str(),
+            vec![],
+        ));
+    }
+    let before = msgs.len();
+    let mut failures = 0u32;
+    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+
+    assert_eq!(failures, 1, "empty summary trips the breaker once");
+    assert!(msgs.len() < before, "still shrank by dropping");
+    assert!(
+        msgs.iter().any(|m| m.content.contains("trimmed to fit")),
+        "drop marker present (fell back to drop)"
+    );
 }

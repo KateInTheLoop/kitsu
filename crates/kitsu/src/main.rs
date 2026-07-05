@@ -13,7 +13,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::{Config, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
-use kitsu_core::{run_agent_turn, AgentConfig};
+use kitsu_core::{run_agent_turn, AgentConfig, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{ChatMessage, Provider, ProviderError};
@@ -104,6 +104,15 @@ struct ChatSetup {
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
+}
+
+/// Parse the `--compaction` flag into the orchestrator's mode.
+fn compaction_mode(cli: &Cli) -> CompactionMode {
+    if cli.compaction == "summarize" {
+        CompactionMode::Summarize
+    } else {
+        CompactionMode::Trim
+    }
 }
 
 /// Removes the per-session offload scratch dir (and its files) when the chat
@@ -219,6 +228,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
+        compaction: compaction_mode(cli),
     };
 
     match run_agent_turn(&setup.provider, &tools, &mut messages, &agent_cfg).await {
@@ -340,6 +350,7 @@ async fn run_scripted_turn(
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
+        compaction: compaction_mode(cli),
     };
     match run_agent_turn(&setup.provider, tools, messages, &cfg).await {
         Ok(text) => {
@@ -459,6 +470,7 @@ async fn run_chat(
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
+        compaction: compaction_mode(cli),
     };
 
     // Load curated project context from an llms.txt (or AGENTS.md/CLAUDE.md) in
@@ -598,7 +610,14 @@ async fn run_chat(
         messages.push(ChatMessage::user(line));
         let cfg = base_cfg(model.clone(), cli);
         match run_turn_cancellable(&setup.provider, &tools, &mut messages, &cfg).await {
-            TurnOutcome::Completed(Ok(_)) => kitsu_render::finish_line(),
+            TurnOutcome::Completed(Ok(text)) => {
+                kitsu_render::finish_line();
+                // The model can return an empty completion for vague inputs;
+                // say so instead of looking hung.
+                if text.trim().is_empty() {
+                    eprintln!("(the model returned an empty response — try rephrasing)");
+                }
+            }
             TurnOutcome::Completed(Err(e)) => {
                 kitsu_render::finish_line();
                 eprintln!("{}", chat_error_message(e, &model));

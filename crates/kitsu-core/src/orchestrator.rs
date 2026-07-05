@@ -37,6 +37,21 @@ pub struct AgentConfig {
     /// (often small, e.g. 4096) default — which silently truncates long outputs
     /// like code reviews. Set this to lift the cap.
     pub max_tokens: Option<u32>,
+    /// What to do when cheap trimming (offload + elide) isn't enough to fit the
+    /// window (Stage 3). `Trim` drops the oldest whole exchanges; `Summarize`
+    /// replaces them with an LLM-written summary (opt-in — quality is model-
+    /// dependent). Falls back to `Trim` if summarization fails.
+    pub compaction: CompactionMode,
+}
+
+/// Strategy for reclaiming context when trimming tool results isn't enough.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum CompactionMode {
+    /// Drop the oldest whole exchanges (lossy but free). The safe default.
+    #[default]
+    Trim,
+    /// Summarize the oldest exchanges into a note via one LLM call (opt-in).
+    Summarize,
 }
 
 impl Default for AgentConfig {
@@ -50,6 +65,7 @@ impl Default for AgentConfig {
             stream: true,
             temperature: None,
             max_tokens: None,
+            compaction: CompactionMode::Trim,
         }
     }
 }
@@ -131,6 +147,8 @@ where
     let mut consecutive_failures: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut force_final_next = false;
+    // Circuit-breaker state for summarizing compaction (Stage 3).
+    let mut compact_failures: u32 = 0;
     const REPEAT_FAIL_LIMIT: u32 = 2;
 
     loop {
@@ -141,7 +159,7 @@ where
             return Ok(last_assistant_text);
         }
 
-        enforce_context_budget(messages, cfg, meter);
+        enforce_context_budget(provider, messages, cfg, meter, &mut compact_failures).await;
 
         // On the FINAL permitted round, withhold tools and inject a nudge so the
         // model must produce its final answer instead of emitting yet another
@@ -518,37 +536,140 @@ fn short_path(p: &str) -> String {
     }
 }
 
-/// Keep the conversation within budget before sending (design §3, Stage 1c/2).
-/// When the window is known, budget in **tokens**: first elide the oldest
-/// tool-result bodies, then — if still over — drop the oldest whole exchanges.
-/// Otherwise fall back to the coarse byte budget (elision only).
-fn enforce_context_budget(
+/// Keep the conversation within budget before sending (design §3, Stage 1c/2/3).
+/// When the window is known, budget in **tokens**: elide the oldest tool-result
+/// bodies, then — if still over — either drop the oldest whole exchanges (`Trim`)
+/// or summarize them (`Summarize`). Otherwise fall back to the coarse byte budget.
+async fn enforce_context_budget<P>(
+    provider: &P,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
     meter: &ContextMeter,
-) {
-    match cfg.context_window {
-        Some(window) => {
-            let target = ContextBudget::new(window, cfg.max_tokens).target;
-            // Start from the accurate usage-anchored estimate; the trimmer then
-            // does relative accounting (decrement by tokens actually freed), so
-            // an in-turn edit of an anchored message doesn't skew the count.
-            let used = meter.estimate(messages);
-            let after_elide = trim_tool_results(messages, used, target, message_tokens);
-            if after_elide > target {
-                // Continue the SAME anchored/relative accounting into turn-dropping
-                // so both stages agree on the scale (else a chars/4 recount could
-                // decline to drop when the real tokenizer says we're over).
-                drop_old_exchanges(messages, after_elide, target, message_tokens);
-            }
+    compact_failures: &mut u32,
+) where
+    P: Provider,
+{
+    let Some(window) = cfg.context_window else {
+        let total: u64 = messages.iter().map(|m| m.byte_size() as u64).sum();
+        trim_tool_results(messages, total, cfg.max_context_bytes as u64, |m| {
+            m.byte_size() as u64
+        });
+        return;
+    };
+    let target = ContextBudget::new(window, cfg.max_tokens).target;
+    // Start from the accurate usage-anchored estimate; the trimmer then does
+    // relative accounting (decrement by tokens actually freed), so an in-turn edit
+    // of an anchored message doesn't skew the count.
+    let used = meter.estimate(messages);
+    let after_elide = trim_tool_results(messages, used, target, message_tokens);
+    if after_elide <= target {
+        return;
+    }
+    // Same anchored/relative total flows into the next stage so both agree on scale.
+    match cfg.compaction {
+        CompactionMode::Trim => {
+            drop_old_exchanges(messages, after_elide, target, message_tokens);
         }
-        None => {
-            let total: u64 = messages.iter().map(|m| m.byte_size() as u64).sum();
-            trim_tool_results(messages, total, cfg.max_context_bytes as u64, |m| {
-                m.byte_size() as u64
-            });
+        CompactionMode::Summarize => {
+            compact_conversation(
+                provider,
+                messages,
+                cfg,
+                after_elide,
+                target,
+                compact_failures,
+            )
+            .await;
         }
     }
+}
+
+/// Consecutive failed compactions after which we stop trying and just drop
+/// (circuit breaker — a doomed summarize loop would burn API calls).
+const MAX_COMPACT_FAILURES: u32 = 3;
+
+const SUMMARY_PROMPT: &str = "Summarize the conversation above so it can continue after the \
+older messages are dropped. Be concise but preserve everything needed to keep working. Cover: \
+(1) the user's primary request and intent; (2) files and code touched — paths, what changed, and \
+why; (3) key decisions, errors, and their fixes; (4) pending tasks; (5) what was being worked on \
+most recently; (6) the exact next step. Output only the summary.";
+
+/// Replace the oldest exchanges with an LLM-written summary (Stage 3). On any
+/// failure it falls back to dropping them, and trips a circuit breaker after
+/// [`MAX_COMPACT_FAILURES`]. Rebuilds history as system prefix + summary + recent
+/// exchanges — recent starts at a user boundary, so no tool_result is orphaned.
+async fn compact_conversation<P>(
+    provider: &P,
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    total: u64,
+    target: u64,
+    failures: &mut u32,
+) where
+    P: Provider,
+{
+    let user_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
+    let n = user_idxs.len();
+    if n <= KEEP_RECENT_EXCHANGES {
+        return; // nothing older to compact
+    }
+    let prefix_end = user_idxs[0];
+    let recent_start = user_idxs[n - KEEP_RECENT_EXCHANGES];
+
+    // Circuit breaker: after repeated failures, just drop (don't keep burning calls).
+    if *failures >= MAX_COMPACT_FAILURES {
+        drop_old_exchanges(messages, total, target, message_tokens);
+        return;
+    }
+
+    // Summarize the old span [prefix_end, recent_start).
+    let mut req_msgs: Vec<ChatMessage> = messages[prefix_end..recent_start].to_vec();
+    req_msgs.push(ChatMessage::user(SUMMARY_PROMPT));
+    let req = ChatRequest {
+        model: cfg.model.clone(),
+        messages: req_msgs,
+        tools: None,
+        stream: false,
+        temperature: cfg.temperature,
+        max_tokens: Some(cfg.max_tokens.map_or(1024, |m| m.min(1024))),
+    };
+
+    match collect_text(provider, req).await {
+        Some(s) if !s.trim().is_empty() => {
+            *failures = 0;
+            let prefix: Vec<ChatMessage> = messages[..prefix_end].to_vec();
+            let recent: Vec<ChatMessage> = messages[recent_start..].to_vec();
+            let mut rebuilt = prefix;
+            rebuilt.push(ChatMessage::user(format!(
+                "[Summary of the earlier conversation, compacted to fit the context window]:\n\n{}",
+                s.trim()
+            )));
+            rebuilt.extend(recent);
+            *messages = rebuilt;
+            kitsu_render::compaction_boundary();
+        }
+        _ => {
+            *failures += 1;
+            drop_old_exchanges(messages, total, target, message_tokens);
+        }
+    }
+}
+
+/// Collect all streamed text from a non-tool request into a single string.
+async fn collect_text<P: Provider>(provider: &P, req: ChatRequest) -> Option<String> {
+    let mut stream = provider.chat_stream(req).await.ok()?;
+    let mut text = String::new();
+    while let Some(item) = stream.next().await {
+        if let Ok(ChatDelta::Text(t)) = item {
+            text.push_str(&t);
+        }
+    }
+    Some(text)
 }
 
 /// Elide the oldest tool-result bodies (replacing each with a short stub) until

@@ -173,6 +173,18 @@ pub fn tool_result(summary: &str) {
     }
 }
 
+/// Announce a summarizing compaction to stderr, like Claude Code's boundary, so
+/// the user knows older history was replaced by a summary.
+pub fn compaction_boundary() {
+    let line = "✻ context compacted (older turns summarized)";
+    if is_tty() {
+        let (r, g, b) = FOX;
+        eprintln!("{}", line.truecolor(r, g, b));
+    } else {
+        eprintln!("{line}");
+    }
+}
+
 /// Machine-readable context-utilization line to **stderr** (companion to
 /// `kitsu-usage:`), emitted per turn so sessions and the dogfood harness can see
 /// how full the window is and whether trimming is near.
