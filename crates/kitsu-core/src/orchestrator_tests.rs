@@ -690,3 +690,62 @@ async fn test_text_protocol_unknown_tool_ignored() {
     assert_eq!(ran.load(Ordering::SeqCst), 0, "unknown tool must not run");
     assert_eq!(provider.call_count(), 1);
 }
+
+/// ISSUE-006: a model may batch SEVERAL text-form tool calls in one message
+/// (e.g. writing multiple files). All of them must execute, not just the first.
+#[tokio::test]
+async fn test_text_protocol_multiple_calls_in_one_turn() {
+    let text = concat!(
+        r#"{"name": "fs_write_file", "arguments": {"path": "a.py"}}"#,
+        "\n",
+        r#"{"name": "fs_write_file", "arguments": {"path": "b.py"}}"#,
+        "\n",
+        r#"{"name": "fs_write_file", "arguments": {"path": "c.py"}}"#,
+    );
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(text.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    let ran2 = ran.clone();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "fs_write_file".to_string(),
+            description: "write a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let ran = ran2.clone();
+            Box::pin(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>("{}".to_string())
+            })
+        }),
+    );
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .expect("ok");
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        3,
+        "all three text-form calls in one turn should execute"
+    );
+    assert!(out.contains("done"));
+    let seen = provider.seen_messages.lock().unwrap();
+    let tool_msgs = seen
+        .last()
+        .unwrap()
+        .iter()
+        .filter(|m| m.role == kitsu_providers::Role::Tool)
+        .count();
+    assert_eq!(tool_msgs, 3, "three tool results must be fed back on round 2");
+}

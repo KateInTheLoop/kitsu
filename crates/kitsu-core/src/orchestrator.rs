@@ -168,9 +168,10 @@ where
         // came back structured, try to parse one from the text and execute it.
         let mut synthesized_call = false;
         if tool_calls.is_empty() && tools_were_offered {
-            if let Some(call) = parse_text_tool_call(&assistant_text, tools) {
-                tracing::debug!(tool = %call.tool_name, "recovered text-protocol tool call");
-                tool_calls.push(call);
+            let recovered = parse_text_tool_calls(&assistant_text, tools);
+            if !recovered.is_empty() {
+                tracing::debug!(count = recovered.len(), "recovered text-protocol tool call(s)");
+                tool_calls.extend(recovered);
                 synthesized_call = true;
             }
         }
@@ -239,49 +240,75 @@ fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescrip
     }
 }
 
-/// Text-protocol tool-call parser (ISSUE-001). Some models return a tool call as
-/// plain-text JSON in `content` (bare, in a ```` ```json ```` fence, or wrapped in
-/// `<tool_call>…</tool_call>`) instead of the structured `tool_calls` field. Parse
-/// the first balanced JSON object from `text`; if it has a `name` matching an
-/// advertised tool plus `arguments`/`parameters`, synthesize a [`ToolCall`].
-/// Returns `None` if nothing parseable/matching is found.
-fn parse_text_tool_call(text: &str, tools: &Registry) -> Option<ToolCall> {
+/// Text-protocol tool-call parser (ISSUE-001, ISSUE-006). Some models return tool
+/// calls as plain-text JSON in `content` (bare, in a ```` ```json ```` fence, or
+/// wrapped in `<tool_call>…</tool_call>`) instead of the structured `tool_calls`
+/// field — and a model may batch SEVERAL calls in one message (e.g. writing
+/// multiple files). Parse EVERY balanced JSON object from `text`; for each with a
+/// `name` matching an advertised tool plus `arguments`/`parameters`, synthesize a
+/// [`ToolCall`]. Returns them in order (empty if none parse/match).
+fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
     let descriptors = tools.descriptors();
+    let mut calls = Vec::new();
     if descriptors.is_empty() {
-        return None;
+        return calls;
     }
-    let candidate = extract_json_object(text)?;
-    let value: serde_json::Value = serde_json::from_str(&candidate).ok()?;
-    let obj = value.as_object()?;
-    let name = obj.get("name")?.as_str()?.to_string();
-    if !descriptors.iter().any(|d| d.name == name) {
-        return None;
+    for candidate in extract_json_objects(text) {
+        let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
+            continue;
+        };
+        let Some(obj) = value.as_object() else { continue };
+        let Some(name) = obj.get("name").and_then(|n| n.as_str()) else {
+            continue;
+        };
+        if !descriptors.iter().any(|d| d.name == name) {
+            continue;
+        }
+        // `arguments` may be an object or a JSON-encoded string; `parameters` is a
+        // common alias. Default to `{}` when the model omitted args entirely.
+        let args = match obj.get("arguments").or_else(|| obj.get("parameters")) {
+            Some(serde_json::Value::String(s)) => s.clone(),
+            Some(v) => v.to_string(),
+            None => "{}".to_string(),
+        };
+        let call_id = format!("textcall-{}", calls.len());
+        calls.push(ToolCall {
+            tool_name: name.to_string(),
+            args,
+            call_id,
+        });
     }
-    // `arguments` may be an object or a JSON-encoded string; `parameters` is a
-    // common alias. Default to `{}` when the model omitted args entirely.
-    let args = match obj.get("arguments").or_else(|| obj.get("parameters")) {
-        Some(serde_json::Value::String(s)) => s.clone(),
-        Some(v) => v.to_string(),
-        None => "{}".to_string(),
-    };
-    Some(ToolCall {
-        tool_name: name,
-        args,
-        call_id: "textcall-0".to_string(),
-    })
+    calls
 }
 
-/// Return the first balanced `{…}` JSON object substring in `text`, respecting
-/// string literals and escapes so braces inside strings don't miscount. Used to
-/// pull a tool-call object out of prose/fences/tags.
-fn extract_json_object(text: &str) -> Option<String> {
+/// Return every balanced top-level `{…}` JSON object substring in `text`,
+/// respecting string literals and escapes so braces inside strings don't
+/// miscount. Nested objects are part of their enclosing top-level object; only
+/// the outermost objects are returned.
+fn extract_json_objects(text: &str) -> Vec<String> {
     let bytes = text.as_bytes();
-    let start = text.find('{')?;
+    let mut out = Vec::new();
+    let mut i = 0;
+    while i < bytes.len() {
+        if bytes[i] == b'{' {
+            if let Some(end) = balanced_object_end(bytes, i) {
+                // i and end both index ASCII braces → valid char boundaries.
+                out.push(text[i..=end].to_string());
+                i = end + 1;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    out
+}
+
+/// Index of the `}` that closes the `{` at `start`, or `None` if unbalanced.
+fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
     let mut depth = 0usize;
     let mut in_str = false;
     let mut escaped = false;
-    for i in start..bytes.len() {
-        let c = bytes[i];
+    for (i, &c) in bytes.iter().enumerate().skip(start) {
         if in_str {
             if escaped {
                 escaped = false;
@@ -297,8 +324,7 @@ fn extract_json_object(text: &str) -> Option<String> {
                 b'}' => {
                     depth -= 1;
                     if depth == 0 {
-                        // start and i both index ASCII braces → valid boundaries.
-                        return Some(text[start..=i].to_string());
+                        return Some(i);
                     }
                 }
                 _ => {}
