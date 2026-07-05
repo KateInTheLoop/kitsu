@@ -506,12 +506,15 @@ fn short_path(p: &str) -> String {
     }
 }
 
-/// Keep the conversation within budget before sending (design §3.1–3.3, Stage
-/// 1c). When the model's context window is known, budget in **tokens** against
-/// the trim target derived from it; otherwise fall back to the coarse byte
-/// budget. Both elide the oldest tool-result bodies first — richer, reversible
-/// tiers (offload, turn-dropping) come in Stage 2.
-fn enforce_context_budget(messages: &mut [ChatMessage], cfg: &AgentConfig, meter: &ContextMeter) {
+/// Keep the conversation within budget before sending (design §3, Stage 1c/2).
+/// When the window is known, budget in **tokens**: first elide the oldest
+/// tool-result bodies, then — if still over — drop the oldest whole exchanges.
+/// Otherwise fall back to the coarse byte budget (elision only).
+fn enforce_context_budget(
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    meter: &ContextMeter,
+) {
     match cfg.context_window {
         Some(window) => {
             let target = ContextBudget::new(window, cfg.max_tokens).target;
@@ -519,7 +522,10 @@ fn enforce_context_budget(messages: &mut [ChatMessage], cfg: &AgentConfig, meter
             // does relative accounting (decrement by tokens actually freed), so
             // an in-turn edit of an anchored message doesn't skew the count.
             let used = meter.estimate(messages);
-            trim_tool_results(messages, used, target, message_tokens);
+            let after_elide = trim_tool_results(messages, used, target, message_tokens);
+            if after_elide > target {
+                drop_old_exchanges(messages, target, message_tokens);
+            }
         }
         None => {
             let total: u64 = messages.iter().map(|m| m.byte_size() as u64).sum();
@@ -533,15 +539,16 @@ fn enforce_context_budget(messages: &mut [ChatMessage], cfg: &AgentConfig, meter
 /// Elide the oldest tool-result bodies (replacing each with a short stub) until
 /// the running `total` — measured by `size` — is at or under `limit`,
 /// decrementing by the amount each elision actually frees. Never touches the
-/// system prompt, the last user message, or any non-tool message.
+/// system prompt, the last user message, or any non-tool message. Returns the
+/// resulting total.
 fn trim_tool_results(
     messages: &mut [ChatMessage],
     mut total: u64,
     limit: u64,
     size: impl Fn(&ChatMessage) -> u64,
-) {
+) -> u64 {
     if total <= limit {
-        return;
+        return total;
     }
     let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
     let mut i = 0;
@@ -561,4 +568,50 @@ fn trim_tool_results(
         }
         i += 1;
     }
+    total
+}
+
+/// How many recent user-delimited exchanges to always keep intact.
+const KEEP_RECENT_EXCHANGES: usize = 2;
+
+/// Drop the oldest whole exchanges (a user message and everything up to the next
+/// user message) when tool-result elision wasn't enough. Cutting only at user
+/// boundaries preserves API invariants — no tool_result is ever orphaned from its
+/// assistant tool_call. The leading system prefix and the most recent
+/// [`KEEP_RECENT_EXCHANGES`] exchanges are always kept; a marker records the drop.
+fn drop_old_exchanges(
+    messages: &mut Vec<ChatMessage>,
+    target: u64,
+    size: impl Fn(&ChatMessage) -> u64,
+) {
+    let user_idxs: Vec<usize> = messages
+        .iter()
+        .enumerate()
+        .filter(|(_, m)| m.role == Role::User)
+        .map(|(i, _)| i)
+        .collect();
+    let n = user_idxs.len();
+    if n <= KEEP_RECENT_EXCHANGES {
+        return; // nothing safely droppable
+    }
+    let max_drop = n - KEEP_RECENT_EXCHANGES; // leading exchanges we may drop
+
+    let mut total: u64 = messages.iter().map(&size).sum();
+    let mut e = 0;
+    while total > target && e < max_drop {
+        let start = user_idxs[e];
+        let end = user_idxs[e + 1];
+        total -= messages[start..end].iter().map(&size).sum::<u64>();
+        e += 1;
+    }
+    if e == 0 {
+        return;
+    }
+    let drop_start = user_idxs[0];
+    let drop_end = user_idxs[e];
+    messages.drain(drop_start..drop_end);
+    messages.insert(
+        drop_start,
+        ChatMessage::user("[earlier conversation trimmed to fit the context window]"),
+    );
 }
