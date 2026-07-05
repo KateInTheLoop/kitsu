@@ -29,6 +29,8 @@ select it at runtime.
   - [Hugging Face Inference Providers](#hugging-face-inference-providers)
   - [OpenAI](#openai)
   - [Anthropic](#anthropic)
+- [Hosted vs. local (Hugging Face vs Ollama/vLLM)](#hosted-hugging-face-vs-local-ollama--vllm)
+  - [Run Ollama in Docker](#run-ollama-in-docker)
 - [Authentication](#authentication)
 - [Credentials at a glance](#credentials-at-a-glance)
 - [CLI reference](#cli-reference)
@@ -292,6 +294,70 @@ kitsu --gateway anthropic ask --max-output-tokens 1024 "hi"
   **subscription** login does *not* grant API access — it's a separate system.
 - Anthropic's endpoint requires a `max_tokens`, so pass `--max-output-tokens N`
   or the request may be rejected.
+
+---
+
+## Hosted (Hugging Face) vs. local (Ollama / vLLM)
+
+kitsu treats both the same way — a gateway profile and a `--gateway` flag. The
+difference is where the model runs and what it costs.
+
+| | Hugging Face (hosted) | Local (Ollama / vLLM) |
+|---|---|---|
+| Runs on | HF's router + partner GPUs | your machine |
+| Credentials | `HF_TOKEN` required | none |
+| Cost | per-token (PRO credits or pay-as-you-go) | free (your hardware) |
+| Models | huge catalog of hosted models | whatever you pull / serve |
+| Speed & size | provider GPUs — large models, fast | bounded by your CPU/GPU |
+| Privacy | prompt leaves your machine | stays local |
+| Offline | no | yes |
+| Setup | paste a token | run a server (native or Docker) |
+
+**Use hosted (HF)** when you want a big model, no local GPU, or a model you
+haven't downloaded. **Use local (Ollama/vLLM)** for privacy, offline work, zero
+per-token cost, or fast iteration on a small model.
+
+Same prompt, two backends:
+
+```bash
+# Hosted — Hugging Face
+export HF_TOKEN=hf_...
+kitsu --gateway huggingface ask "what does a mutex do?"
+
+# Local — Ollama
+kitsu --gateway ollama --model "qwen2.5-coder:latest" ask "what does a mutex do?"
+```
+
+### Run Ollama in Docker
+
+If you have Docker, you don't need to install Ollama natively:
+
+```bash
+# Start Ollama in a container, published on the default port 11434
+docker run -d --name ollama -p 11434:11434 ollama/ollama
+
+# Pull a model INTO the container (small ones are great for CPU testing)
+docker exec ollama ollama pull qwen2.5-coder      # or: llama3.2, qwen2.5:0.5b, ...
+
+# See what's available (also at http://localhost:11434/v1/models)
+docker exec ollama ollama list
+
+# Point kitsu at it — no token needed (the `ollama` profile uses method = "none")
+kitsu --gateway ollama --model "qwen2.5-coder:latest" ask "Write a one-line Rust hello world."
+```
+
+Notes:
+
+- **Model names include a tag.** Ollama IDs look like `qwen2.5-coder:latest`.
+  Whatever `ollama list` / `/v1/models` shows is exactly what you pass to
+  `--model` (or set as the profile's `model`). The bundled profile defaults to
+  `llama3.2`; override per call with `--model`, or edit the `model =` line.
+- **GPU:** add `--gpus all` to `docker run` if you have an NVIDIA GPU + the
+  container toolkit; otherwise it runs on CPU (fine for small models).
+- **Persistence:** add `-v ollama:/root/.ollama` to keep pulled models across
+  container restarts.
+- kitsu reaches Ollama through its **OpenAI-compatible** route
+  (`/v1/chat/completions`), so nothing kitsu-specific runs in the container.
 
 ---
 
