@@ -60,6 +60,13 @@ pub struct Cli {
     #[arg(long, global = true, value_name = "TOKENS")]
     pub context_window: Option<u64>,
 
+    /// How to reclaim context when trimming tool results isn't enough: `trim`
+    /// drops the oldest exchanges; `summarize` replaces them with an LLM-written
+    /// summary (opt-in — quality depends on the model; falls back to trim on
+    /// failure).
+    #[arg(long, global = true, default_value = "trim", value_parser = ["trim", "summarize"])]
+    pub compaction: String,
+
     #[command(subcommand)]
     pub command: Command,
 }
