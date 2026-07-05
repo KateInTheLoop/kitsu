@@ -78,7 +78,9 @@ where
     P: Provider,
 {
     let mut turn_usage = kitsu_providers::Usage::default();
-    let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage).await;
+    let mut meter = ContextMeter::new();
+    let result =
+        run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, &mut meter).await;
     // Emit usage regardless of Ok/Err — partial turns still cost tokens. Only
     // when the gateway actually reported something.
     if !turn_usage.is_empty() {
@@ -94,6 +96,11 @@ where
             turn_usage.total_tokens,
         );
     }
+    // When the window is known, report context utilization for this turn.
+    if let Some(window) = cfg.context_window {
+        let budget = ContextBudget::new(window, cfg.max_tokens);
+        kitsu_render::emit_context(meter.estimate(messages), budget.effective, window);
+    }
     result
 }
 
@@ -105,6 +112,7 @@ async fn run_agent_turn_inner<P>(
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
     turn_usage: &mut kitsu_providers::Usage,
+    meter: &mut ContextMeter,
 ) -> Result<String, AgentError>
 where
     P: Provider,
@@ -120,10 +128,6 @@ where
     let mut force_final_next = false;
     const REPEAT_FAIL_LIMIT: u32 = 2;
 
-    // Token accounting, anchored on each response's real usage. Drives token-based
-    // context trimming when the model's window is known.
-    let mut meter = ContextMeter::new();
-
     loop {
         round += 1;
         if round > cfg.max_rounds {
@@ -132,7 +136,7 @@ where
             return Ok(last_assistant_text);
         }
 
-        enforce_context_budget(messages, cfg, &meter);
+        enforce_context_budget(messages, cfg, meter);
 
         // On the FINAL permitted round, withhold tools and inject a nudge so the
         // model must produce its final answer instead of emitting yet another

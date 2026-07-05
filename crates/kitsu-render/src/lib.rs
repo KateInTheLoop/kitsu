@@ -173,6 +173,64 @@ pub fn tool_result(summary: &str) {
     }
 }
 
+/// Machine-readable context-utilization line to **stderr** (companion to
+/// `kitsu-usage:`), emitted per turn so sessions and the dogfood harness can see
+/// how full the window is and whether trimming is near.
+pub fn emit_context(used: u64, effective: u64, window: u64) {
+    let mut err = io::stderr();
+    let _ = writeln!(
+        err,
+        "kitsu-context: {{\"used\":{used},\"effective\":{effective},\"window\":{window}}}"
+    );
+    let _ = err.flush();
+}
+
+/// Render the `/context` breakdown to stderr: model · window · a used/effective
+/// bar with headroom · per-category token counts. `note` annotates how the
+/// window was resolved (empty to omit).
+pub fn render_context(
+    model: &str,
+    window: u64,
+    note: &str,
+    effective: u64,
+    used: u64,
+    categories: &[(&str, u64)],
+) {
+    let (r, g, b) = FOX;
+    let pct = if effective > 0 {
+        (used.saturating_mul(100) / effective).min(999)
+    } else {
+        0
+    };
+    let headroom = effective.saturating_sub(used);
+    const CELLS: u64 = 16;
+    let filled = if effective > 0 {
+        (used.saturating_mul(CELLS) / effective).min(CELLS)
+    } else {
+        CELLS
+    };
+    let bar: String = (0..CELLS)
+        .map(|i| if i < filled { '■' } else { '□' })
+        .collect();
+    let win = if note.is_empty() {
+        format!("{window}")
+    } else {
+        format!("{window} ({note})")
+    };
+    eprintln!("model: {model}   window: {win}");
+    let bar_disp = if is_tty() {
+        format!("{}", bar.truecolor(r, g, b))
+    } else {
+        bar
+    };
+    eprintln!("used {used} / {effective} effective  [{bar_disp}]  {pct}%   headroom: {headroom}");
+    for (label, tokens) in categories {
+        if *tokens > 0 {
+            eprintln!("  {label:<18} {tokens}");
+        }
+    }
+}
+
 /// Emit a single machine-readable token-usage line to **stderr** (never stdout,
 /// which carries only assistant text). Format is a stable, greppable prefix
 /// followed by compact JSON so external consumers can parse it:

@@ -11,6 +11,7 @@ use clap::Parser;
 
 use cli::{Cli, Command};
 use config::{Config, Gateway};
+use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 use kitsu_core::{run_agent_turn, AgentConfig};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
@@ -102,6 +103,46 @@ struct ChatSetup {
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
+}
+
+/// Context-window info for the `/context` command, assembled once per session.
+struct CtxInfo {
+    window: Option<u64>,
+    max_tokens: Option<u32>,
+    tool_schema_tokens: u64,
+}
+
+fn ctx_info(setup: &ChatSetup, cli: &Cli, tools: &Registry) -> CtxInfo {
+    let tool_schema_tokens =
+        estimate_str(&serde_json::to_string(tools.descriptors()).unwrap_or_default());
+    CtxInfo {
+        window: setup.context_window,
+        max_tokens: cli.max_output_tokens,
+        tool_schema_tokens,
+    }
+}
+
+/// Render the `/context` breakdown for the current conversation. Uses an
+/// anchor-free estimate of the live messages plus the advertised tool-schema
+/// tokens; the per-turn `kitsu-context:` line carries the usage-anchored number.
+fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) {
+    let b = ContextMeter::new().breakdown(messages);
+    let window = ctx.window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let budget = ContextBudget::new(window, ctx.max_tokens);
+    let used = b.total() + ctx.tool_schema_tokens;
+    let note = if ctx.window.is_some() {
+        ""
+    } else {
+        "default — set context_window or --context-window"
+    };
+    let cats = [
+        ("system prompt", b.system),
+        ("tool schemas", ctx.tool_schema_tokens),
+        ("user turns", b.user),
+        ("assistant turns", b.assistant),
+        ("tool results", b.tool_results),
+    ];
+    kitsu_render::render_context(model, window, note, budget.effective, used, &cats);
 }
 
 /// Resolve config + gateway profile and build the provider/auth/model. Emits the
@@ -222,6 +263,7 @@ async fn run_scripted(
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
+    let ctx = ctx_info(setup, cli, tools);
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
     while idx < lines.len() {
@@ -243,7 +285,7 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(rest, messages, model, &setup.provider, perms).await {
+            match handle_slash(rest, messages, model, &setup.provider, perms, &ctx).await {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -438,6 +480,7 @@ async fn run_chat(
     // If a first prompt was given, queue it as the first turn.
     let mut queued = first_prompt.map(|s| s.to_string());
     let prompt = kitsu_render::prompt_string();
+    let ctx = ctx_info(&setup, cli, &tools);
 
     loop {
         let line = match queued.take() {
@@ -464,7 +507,8 @@ async fn run_chat(
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
-            match handle_slash(rest, &mut messages, &mut model, &setup.provider, &perms).await {
+            match handle_slash(rest, &mut messages, &mut model, &setup.provider, &perms, &ctx).await
+            {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -501,6 +545,7 @@ async fn handle_slash(
     model: &mut String,
     provider: &OpenAICompatProvider,
     perms: &Permissions,
+    ctx: &CtxInfo,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -514,10 +559,12 @@ async fn handle_slash(
                  list models the gateway offers (optionally filtered)\n  /allow <path>  grant \
                  read access to a path (no more prompts there)\n  /allow-write <path>  grant \
                  write access to a path\n  /save <file>   write the last response to <file> \
-                 (code blocks if present)\n  /clear         clear conversation (keeps system \
-                 prompt)\n  /help          this help\n  /quit          exit\ncurrent model: {model}"
+                 (code blocks if present)\n  /context       show context-window utilization\n  \
+                 /clear         clear conversation (keeps system prompt)\n  /help          this \
+                 help\n  /quit          exit\ncurrent model: {model}"
             );
         }
+        "context" => render_context_command(model, messages, ctx),
         "models" => list_models_and_print(provider, arg).await,
         "allow" => {
             if arg.is_empty() {
