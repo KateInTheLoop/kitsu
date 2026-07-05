@@ -424,11 +424,13 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--timeout-secs <n>` | `60` | Per-request HTTP timeout. Raise (e.g. `300`) for slow/heavy calls. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 
-**Chat-only flag**
+**Chat-only flags**
 
 | Flag | Description |
 |---|---|
 | `--allow-path <PATH>` | Allow read-only filesystem tools under `PATH` (repeatable). See [Tools in chat](#tools-in-chat). |
+| `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
+| `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
 
 Examples:
 
@@ -450,23 +452,42 @@ explicitly allow:
 kitsu --gateway ollama chat --allow-path ./src --allow-path ./docs
 ```
 
-- Passing at least one `--allow-path` enables the read-only tool set
-  (`fs_read_file`, `fs_list_dir`, `repo_grep`). Without it, no tools are
-  advertised.
-- Access is **deny-by-default**: reads are permitted only under an allowed root.
-  Paths are canonicalized, so `..`/symlink traversal out of the allowlist is
-  rejected.
+- `--allow-path` enables the **read** tools (`fs_read_file`, `fs_list_dir`,
+  `repo_grep`); `--allow-write` enables the **write** tool (`fs_write_file`) so
+  the model can generate files. Without a flag, that tool set isn't advertised.
+- Access is **deny-by-default** and the read/write allowlists are independent —
+  e.g. read a whole repo but confine generated files to one scratch dir. Paths
+  are canonicalized (writes canonicalize the parent), so `..`/symlink traversal
+  out of the allowlist is rejected. Generated files are capped at 1 MiB.
 - `repo_grep` is registered only when `rg` (ripgrep) is on your `PATH`; without
-  it, the file-read and list-dir tools still work.
+  it, the other tools still work.
 
 Slash commands inside the REPL:
 
 | Command | Action |
 |---|---|
 | `/model <name>` | Switch model (keeps history). |
+| `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
 | `/quit` (or `/exit`) | Exit. |
+
+### Coding workflows: paste & file generation
+
+- **Paste** a multi-line code block or stack trace straight into the prompt — it
+  is captured as one turn (bracketed paste). Non-interactively, a `<<< … >>>`
+  block in a `--script` file is the equivalent single multi-line turn.
+- **Generate files** two ways: let the model call `fs_write_file` (grant it with
+  `--allow-write <dir>`), or ask for code and run `/save out.rs` to write the
+  last response's code blocks yourself.
+- kitsu recovers tool calls that a model emits **as text** (common with local
+  models via Ollama), so file generation works even when the model doesn't use
+  the structured tool-call field.
+
+```bash
+# let the model write files into ./out, driven by a script
+kitsu --gateway ollama chat --allow-write ./out --script gen.txt
+```
 
 `Ctrl+C` cancels an in-flight response; `Ctrl+D` exits.
 
