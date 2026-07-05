@@ -282,8 +282,16 @@ async fn run_scripted(
                 idx += 1;
             }
             idx += 1; // consume the closing ">>>" (if present)
-            run_scripted_turn(setup, tools, messages, model, cli, &block.join("\n"), offload_dir)
-                .await;
+            run_scripted_turn(
+                setup,
+                tools,
+                messages,
+                model,
+                cli,
+                &block.join("\n"),
+                offload_dir,
+            )
+            .await;
             continue;
         }
         if trimmed.is_empty() || trimmed.starts_with('#') {
@@ -462,7 +470,14 @@ async fn run_chat(
     // regardless of TTY, so it's the deterministic multi-turn driver.
     if let Some(path) = script {
         return run_scripted(
-            &setup, &tools, &mut messages, &mut model, cli, path, &perms, &offload_dir,
+            &setup,
+            &tools,
+            &mut messages,
+            &mut model,
+            cli,
+            path,
+            &perms,
+            &offload_dir,
         )
         .await;
     }
@@ -513,7 +528,10 @@ async fn run_chat(
         .unwrap_or_else(|| std::path::PathBuf::from(".kitsu_history"));
     let _ = rl.load_history(&history_path);
 
-    let gateway_name = cli.gateway.clone().unwrap_or_else(|| "(default)".to_string());
+    let gateway_name = cli
+        .gateway
+        .clone()
+        .unwrap_or_else(|| "(default)".to_string());
     let dir = std::env::current_dir()
         .ok()
         .map(|p| shorten_home(&p))
@@ -550,7 +568,15 @@ async fn run_chat(
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
-            match handle_slash(rest, &mut messages, &mut model, &setup.provider, &perms, &ctx).await
+            match handle_slash(
+                rest,
+                &mut messages,
+                &mut model,
+                &setup.provider,
+                &perms,
+                &ctx,
+            )
+            .await
             {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,

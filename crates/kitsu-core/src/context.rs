@@ -83,11 +83,7 @@ impl ContextMeter {
     pub fn estimate(&self, messages: &[ChatMessage]) -> u64 {
         match self.anchor {
             Some((tokens, sent_len)) if sent_len <= messages.len() => {
-                tokens
-                    + messages[sent_len..]
-                        .iter()
-                        .map(message_tokens)
-                        .sum::<u64>()
+                tokens + messages[sent_len..].iter().map(message_tokens).sum::<u64>()
             }
             _ => messages.iter().map(message_tokens).sum(),
         }
@@ -196,9 +192,9 @@ mod tests {
     fn breakdown_by_role_totals_match() {
         let meter = ContextMeter::new();
         let msgs = vec![
-            msg(Role::System, "abcd"),      // 1
-            msg(Role::User, "abcdefgh"),    // 2
-            msg(Role::Assistant, "abcd"),   // 1
+            msg(Role::System, "abcd"),       // 1
+            msg(Role::User, "abcdefgh"),     // 2
+            msg(Role::Assistant, "abcd"),    // 1
             msg(Role::Tool, "abcdefghijkl"), // 3
         ];
         let b = meter.breakdown(&msgs);

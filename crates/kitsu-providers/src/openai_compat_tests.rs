@@ -427,9 +427,7 @@ async fn test_model_context_length_none_when_field_absent() {
     let _g = EnvGuard::set(TEST_ENV, "test-token");
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(
-            ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"my-model"}]}"#),
-        )
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"my-model"}]}"#))
         .mount(&server)
         .await;
     let provider = provider_with_models(server.uri());
@@ -444,9 +442,10 @@ async fn test_model_context_length_lone_entry_fallback() {
     let _g = EnvGuard::set(TEST_ENV, "test-token");
     Mock::given(method("GET"))
         .and(path("/v1/models"))
-        .respond_with(ResponseTemplate::new(200).set_body_string(
-            r#"{"data":[{"id":"served-model","context_length":16384}]}"#,
-        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"served-model","context_length":16384}]}"#),
+        )
         .mount(&server)
         .await;
     let provider = provider_with_models(server.uri());
