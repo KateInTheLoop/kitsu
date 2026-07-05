@@ -99,11 +99,14 @@ fn run() -> Result<(), CliError> {
 struct ChatSetup {
     provider: OpenAICompatProvider,
     model: String,
+    /// Resolved model context window in tokens, if known (design §3.2 order:
+    /// `--context-window` → profile `context_window` → `/v1/models` → unset).
+    context_window: Option<u64>,
 }
 
 /// Resolve config + gateway profile and build the provider/auth/model. Emits the
 /// best-effort token-expiry warning (warn-but-send, design §3).
-fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
+async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     let path = Config::resolve_path(cli.config.as_deref());
     let config = Config::load(&path).map_err(|e| CliError::user(e.to_string()))?;
 
@@ -136,11 +139,23 @@ fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         eprintln!("warning: gateway token expired (since {since}) — sending anyway. {hint}");
     }
 
-    Ok(ChatSetup { provider, model })
+    // Resolve the context window: explicit flag → profile → best-effort
+    // /v1/models discovery. Left None when nothing reports it (the orchestrator
+    // then falls back to the coarse byte budget).
+    let context_window = match cli.context_window.or(gateway.context_window) {
+        Some(w) => Some(w),
+        None => provider.model_context_length(&model).await,
+    };
+
+    Ok(ChatSetup {
+        provider,
+        model,
+        context_window,
+    })
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
-    let setup = build_setup(cli)?;
+    let setup = build_setup(cli).await?;
 
     let mut messages = vec![ChatMessage::user(prompt)];
     let tools = Registry::new();
@@ -148,6 +163,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         model: setup.model.clone(),
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
+        context_window: setup.context_window,
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
@@ -253,6 +269,7 @@ async fn run_scripted_turn(
         model: model.to_string(),
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
+        context_window: setup.context_window,
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
@@ -302,7 +319,7 @@ async fn run_chat(
     allow_write: &[String],
     script: Option<&str>,
 ) -> Result<(), CliError> {
-    let setup = build_setup(cli)?;
+    let setup = build_setup(cli).await?;
 
     // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode (prompt
     // on demand) with read access to the launch directory by default; scripted /
@@ -346,10 +363,12 @@ async fn run_chat(
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
     let mut model = setup.model.clone();
-    let base_cfg = |model: String, cli: &Cli| AgentConfig {
+    let context_window = setup.context_window;
+    let base_cfg = move |model: String, cli: &Cli| AgentConfig {
         model,
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
+        context_window,
         stream: !cli.no_stream,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,

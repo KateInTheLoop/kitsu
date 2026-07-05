@@ -3,6 +3,8 @@
 //! model stops or a cap is hit (design §5). Loop BODY is implemented by the
 //! Developer agent; the signature + config are pinned here as the contract.
 
+pub mod context;
 pub mod orchestrator;
 
+pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 pub use orchestrator::{run_agent_turn, AgentConfig, AgentError};

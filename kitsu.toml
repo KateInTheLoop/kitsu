@@ -24,6 +24,10 @@ chat_path   = "/v1/chat/completions"
 models_path = "/v1/models"
 model       = "llama3.2"
 auth        = { method = "none" }
+# Ollama serves a small default window (num_ctx, often 4096) regardless of the
+# model's max, and its /v1/models route doesn't report it — so set the real
+# window here (or per run with --context-window) to size context budgeting.
+context_window = 8192
 
 # ── Local: vLLM ──────────────────────────────────────────────────────────────
 # `vllm serve <model> --port 8000`  (add `--api-key <key>` to require a token).
