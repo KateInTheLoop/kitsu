@@ -99,6 +99,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         model: "example-model-v1".to_string(),
         max_rounds,
         max_context_bytes: 128 * 1024,
+        context_window: None,
         stream: false,
         temperature: None,
         max_tokens: None,

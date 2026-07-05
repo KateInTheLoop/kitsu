@@ -20,7 +20,12 @@ pub struct AgentConfig {
     /// Hard backstop against infinite tool loops (design §5). Default 10.
     pub max_rounds: u32,
     /// Context byte budget; oldest tool results truncated first. Default 128 KiB.
+    /// Coarse fallback used only when `context_window` is unknown (Stage 1).
     pub max_context_bytes: usize,
+    /// Resolved model context window in tokens, if known (from config / CLI /
+    /// gateway metadata). When set, token-based budgeting supersedes
+    /// `max_context_bytes`. Consumed by the trimming cascade (Stage 1c+).
+    pub context_window: Option<u64>,
     pub stream: bool,
     pub temperature: Option<f32>,
     /// Max output tokens per response. `None` lets the gateway apply its own
@@ -35,6 +40,7 @@ impl Default for AgentConfig {
             model: String::new(),
             max_rounds: 10,
             max_context_bytes: 128 * 1024,
+            context_window: None,
             stream: true,
             temperature: None,
             max_tokens: None,

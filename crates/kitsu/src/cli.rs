@@ -53,6 +53,13 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub yes: bool,
 
+    /// The model's context window in tokens. Overrides the gateway profile's
+    /// `context_window` and any value discovered from `/v1/models`. Set this for
+    /// small local models (e.g. Ollama's default 4096) so kitsu budgets context
+    /// against the real window instead of hard-failing.
+    #[arg(long, global = true, value_name = "TOKENS")]
+    pub context_window: Option<u64>,
+
     #[command(subcommand)]
     pub command: Command,
 }

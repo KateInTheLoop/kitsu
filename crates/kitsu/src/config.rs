@@ -27,6 +27,11 @@ pub struct Gateway {
     pub models_path: Option<String>,
     #[serde(default)]
     pub model: Option<String>,
+    /// The model's context window in tokens, if known. Lets kitsu budget context
+    /// against the real window. Overridden by `--context-window`; falls back to
+    /// `/v1/models` discovery then a conservative default when unset.
+    #[serde(default)]
+    pub context_window: Option<u64>,
     #[serde(default)]
     pub auth: AuthConfig,
 }
@@ -265,6 +270,7 @@ mod tests {
             chat_path: default_chat_path(),
             models_path: None,
             model: None,
+            context_window: None,
             auth,
         };
         assert!(

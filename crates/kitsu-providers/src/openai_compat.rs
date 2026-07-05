@@ -547,6 +547,52 @@ async fn sse_step(state: SseState) -> Option<(Result<ChatDelta, ProviderError>, 
     }
 }
 
+impl OpenAICompatProvider {
+    /// Best-effort discovery of a model's context length from `/v1/models`
+    /// metadata — e.g. vLLM's `max_model_len`, or a `context_length` /
+    /// `context_window` field. Returns `None` on any error or when the gateway
+    /// doesn't expose it (Ollama's OpenAI-compat route does not), so callers fall
+    /// back to config / a default. Never propagates errors — this is advisory.
+    pub async fn model_context_length(&self, model: &str) -> Option<u64> {
+        let path = self.models_path.as_deref().filter(|p| !p.is_empty())?;
+        let url = format!("{}{}", self.base_url, path);
+        let rb = self.http.get(&url).timeout(self.timeout);
+        let rb = self.attach_auth(rb).ok()?;
+        let resp = rb.send().await.ok()?;
+        if !resp.status().is_success() {
+            return None;
+        }
+        let text = resp.text().await.ok()?;
+        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
+        let entries = json.get("data")?.as_array()?;
+        // Prefer an exact id match, then a substring either way, then a lone entry.
+        let entry = entries
+            .iter()
+            .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model))
+            .or_else(|| {
+                entries.iter().find(|e| {
+                    e.get("id")
+                        .and_then(serde_json::Value::as_str)
+                        .is_some_and(|id| id.contains(model) || model.contains(id))
+                })
+            })
+            .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
+        for key in [
+            "max_model_len",
+            "context_length",
+            "context_window",
+            "max_context_length",
+            "max_input_tokens",
+        ] {
+            match entry.get(key).and_then(serde_json::Value::as_u64) {
+                Some(n) if n > 0 => return Some(n),
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
 impl Provider for OpenAICompatProvider {
     async fn healthcheck(&self) -> Result<(), ProviderError> {
         // Degrade when there is no /models endpoint: just verify an auth token
