@@ -2,6 +2,7 @@
 //! docs/architecture.md §5: call model → parse tool calls → run tools →
 //! append results → repeat until the model stops or a cap is hit.
 
+use crate::context::{message_tokens, ContextBudget, ContextMeter};
 use futures::StreamExt;
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderError, Role, ToolCall,
@@ -119,6 +120,10 @@ where
     let mut force_final_next = false;
     const REPEAT_FAIL_LIMIT: u32 = 2;
 
+    // Token accounting, anchored on each response's real usage. Drives token-based
+    // context trimming when the model's window is known.
+    let mut meter = ContextMeter::new();
+
     loop {
         round += 1;
         if round > cfg.max_rounds {
@@ -127,7 +132,7 @@ where
             return Ok(last_assistant_text);
         }
 
-        enforce_context_budget(messages, cfg.max_context_bytes);
+        enforce_context_budget(messages, cfg, &meter);
 
         // On the FINAL permitted round, withhold tools and inject a nudge so the
         // model must produce its final answer instead of emitting yet another
@@ -159,6 +164,8 @@ where
         // text-protocol fallback below.
         let tools_were_offered = offered_tools.is_some();
 
+        // Number of messages this request sends — the anchor point for the meter.
+        let sent_len = messages.len();
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
@@ -196,7 +203,11 @@ where
                     assistant_text.push_str(&t);
                 }
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
-                ChatDelta::Usage(u) => turn_usage.add(u),
+                ChatDelta::Usage(u) => {
+                    // Anchor the meter on this response's real prompt token count.
+                    meter.record(u.prompt_tokens, sent_len);
+                    turn_usage.add(u);
+                }
                 ChatDelta::Done(reason) => finish = reason,
             }
         }
@@ -491,32 +502,58 @@ fn short_path(p: &str) -> String {
     }
 }
 
-/// Enforce the context byte budget by truncating the oldest tool-result
-/// messages first. Never drops the system prompt or the last user message
-/// (design §5 context-growth management).
-fn enforce_context_budget(messages: &mut [ChatMessage], max_bytes: usize) {
-    let total: usize = messages.iter().map(|m| m.byte_size()).sum();
-    if total <= max_bytes {
+/// Keep the conversation within budget before sending (design §3.1–3.3, Stage
+/// 1c). When the model's context window is known, budget in **tokens** against
+/// the trim target derived from it; otherwise fall back to the coarse byte
+/// budget. Both elide the oldest tool-result bodies first — richer, reversible
+/// tiers (offload, turn-dropping) come in Stage 2.
+fn enforce_context_budget(messages: &mut [ChatMessage], cfg: &AgentConfig, meter: &ContextMeter) {
+    match cfg.context_window {
+        Some(window) => {
+            let target = ContextBudget::new(window, cfg.max_tokens).target;
+            // Start from the accurate usage-anchored estimate; the trimmer then
+            // does relative accounting (decrement by tokens actually freed), so
+            // an in-turn edit of an anchored message doesn't skew the count.
+            let used = meter.estimate(messages);
+            trim_tool_results(messages, used, target, message_tokens);
+        }
+        None => {
+            let total: u64 = messages.iter().map(|m| m.byte_size() as u64).sum();
+            trim_tool_results(messages, total, cfg.max_context_bytes as u64, |m| {
+                m.byte_size() as u64
+            });
+        }
+    }
+}
+
+/// Elide the oldest tool-result bodies (replacing each with a short stub) until
+/// the running `total` — measured by `size` — is at or under `limit`,
+/// decrementing by the amount each elision actually frees. Never touches the
+/// system prompt, the last user message, or any non-tool message.
+fn trim_tool_results(
+    messages: &mut [ChatMessage],
+    mut total: u64,
+    limit: u64,
+    size: impl Fn(&ChatMessage) -> u64,
+) {
+    if total <= limit {
         return;
     }
-
-    // Index of the last user message; it must be preserved.
     let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
-
-    let mut current = total;
     let mut i = 0;
-    while current > max_bytes && i < messages.len() {
-        let is_protected = messages[i].role == Role::System
-            || Some(i) == last_user_idx
-            || messages[i].role != Role::Tool;
-        if messages[i].role == Role::Tool && !is_protected {
-            let elided = ChatMessage::tool(
+    while total > limit && i < messages.len() {
+        // Only elide tool results (never system / last-user / assistant turns).
+        if messages[i].role == Role::Tool && Some(i) != last_user_idx {
+            let before = size(&messages[i]);
+            let stub = ChatMessage::tool(
                 messages[i].tool_call_id.clone().unwrap_or_default(),
                 "[older tool output elided]",
             );
-            current -= messages[i].byte_size();
-            current += elided.byte_size();
-            messages[i] = elided;
+            let after = size(&stub);
+            if after < before {
+                total = total.saturating_sub(before - after);
+                messages[i] = stub;
+            }
         }
         i += 1;
     }

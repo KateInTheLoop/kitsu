@@ -900,3 +900,91 @@ fn tool_activity_formatting() {
         "error: PolicyDenied"
     );
 }
+
+// --- context trimming (Stage 1c) --------------------------------------------
+
+#[test]
+fn trim_elides_oldest_tool_results_first_and_preserves_turns() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::trim_tool_results;
+    use kitsu_providers::ChatMessage;
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("hello"),
+        ChatMessage::tool("id1", "x".repeat(4000).as_str()), // big, ~1000 tokens
+        ChatMessage::assistant("thinking", vec![]),
+        ChatMessage::tool("id2", "recent small result"),
+    ];
+    let total: u64 = msgs.iter().map(message_tokens).sum();
+    assert!(total > 100);
+    trim_tool_results(&mut msgs, total, 100, message_tokens);
+
+    // Big tool result elided to the stub; system/user/assistant untouched.
+    assert!(msgs[2].content.contains("elided"), "big tool result must be elided");
+    assert_eq!(msgs[0].content, "sys");
+    assert_eq!(msgs[1].content, "hello");
+    assert_eq!(msgs[3].content, "thinking");
+    // Now under target.
+    let after: u64 = msgs.iter().map(message_tokens).sum();
+    assert!(after <= 100, "must be at/under target after trimming, was {after}");
+}
+
+#[test]
+fn trim_is_a_noop_when_already_under_budget() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::trim_tool_results;
+    use kitsu_providers::ChatMessage;
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::tool("id1", "small"),
+    ];
+    let before: Vec<String> = msgs.iter().map(|m| m.content.clone()).collect();
+    let total: u64 = msgs.iter().map(message_tokens).sum();
+    trim_tool_results(&mut msgs, total, 10_000, message_tokens);
+    let after: Vec<String> = msgs.iter().map(|m| m.content.clone()).collect();
+    assert_eq!(before, after, "nothing should change under budget");
+}
+
+#[test]
+fn enforce_budget_token_path_elides_when_window_set() {
+    use crate::context::{ContextMeter, message_tokens};
+    use crate::orchestrator::enforce_context_budget;
+    use kitsu_providers::ChatMessage;
+
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(200); // effective ~100, target ~80
+    cfg.max_tokens = Some(64);
+    let meter = ContextMeter::new(); // no anchor -> full estimate
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q"),
+        ChatMessage::tool("id1", "z".repeat(8000).as_str()), // huge
+    ];
+    enforce_context_budget(&mut msgs, &cfg, &meter);
+    assert!(msgs[2].content.contains("elided"));
+    let total: u64 = msgs.iter().map(message_tokens).sum();
+    let target = crate::context::ContextBudget::new(200, Some(64)).target;
+    assert!(total <= target);
+}
+
+#[test]
+fn enforce_budget_byte_path_when_window_unset() {
+    use crate::orchestrator::enforce_context_budget;
+    use crate::context::ContextMeter;
+    use kitsu_providers::ChatMessage;
+
+    let mut cfg = cfg(10);
+    cfg.context_window = None; // byte fallback
+    cfg.max_context_bytes = 100;
+    let meter = ContextMeter::new();
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::tool("id1", "b".repeat(500).as_str()),
+    ];
+    enforce_context_budget(&mut msgs, &cfg, &meter);
+    assert!(msgs[1].content.contains("elided"), "byte path should still trim");
+}
