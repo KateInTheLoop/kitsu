@@ -128,6 +128,9 @@ where
                  gathered.",
             ));
         }
+        // Captured before `offered_tools` is moved into the request; drives the
+        // text-protocol fallback below.
+        let tools_were_offered = offered_tools.is_some();
 
         let req = ChatRequest {
             model: cfg.model.clone(),
@@ -159,13 +162,29 @@ where
             }
         }
 
+        // Text-protocol fallback (ISSUE-001): some models — especially local ones
+        // via Ollama — emit a tool call as plain-text JSON in `content` instead of
+        // structured `tool_calls`. If tools were advertised this round and none
+        // came back structured, try to parse one from the text and execute it.
+        let mut synthesized_call = false;
+        if tool_calls.is_empty() && tools_were_offered {
+            if let Some(call) = parse_text_tool_call(&assistant_text, tools) {
+                tracing::debug!(tool = %call.tool_name, "recovered text-protocol tool call");
+                tool_calls.push(call);
+                synthesized_call = true;
+            }
+        }
+
         last_assistant_text = assistant_text.clone();
 
-        // Record the assistant turn (text + any requested tool calls).
-        messages.push(ChatMessage::assistant(
-            assistant_text.clone(),
-            tool_calls.clone(),
-        ));
+        // Record the assistant turn. When we synthesized a call from text, store
+        // empty content so the raw tool-call JSON doesn't pollute the history.
+        let assistant_content = if synthesized_call {
+            String::new()
+        } else {
+            assistant_text.clone()
+        };
+        messages.push(ChatMessage::assistant(assistant_content, tool_calls.clone()));
 
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
@@ -218,6 +237,75 @@ fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescrip
     } else {
         Some(d.to_vec())
     }
+}
+
+/// Text-protocol tool-call parser (ISSUE-001). Some models return a tool call as
+/// plain-text JSON in `content` (bare, in a ```` ```json ```` fence, or wrapped in
+/// `<tool_call>…</tool_call>`) instead of the structured `tool_calls` field. Parse
+/// the first balanced JSON object from `text`; if it has a `name` matching an
+/// advertised tool plus `arguments`/`parameters`, synthesize a [`ToolCall`].
+/// Returns `None` if nothing parseable/matching is found.
+fn parse_text_tool_call(text: &str, tools: &Registry) -> Option<ToolCall> {
+    let descriptors = tools.descriptors();
+    if descriptors.is_empty() {
+        return None;
+    }
+    let candidate = extract_json_object(text)?;
+    let value: serde_json::Value = serde_json::from_str(&candidate).ok()?;
+    let obj = value.as_object()?;
+    let name = obj.get("name")?.as_str()?.to_string();
+    if !descriptors.iter().any(|d| d.name == name) {
+        return None;
+    }
+    // `arguments` may be an object or a JSON-encoded string; `parameters` is a
+    // common alias. Default to `{}` when the model omitted args entirely.
+    let args = match obj.get("arguments").or_else(|| obj.get("parameters")) {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(v) => v.to_string(),
+        None => "{}".to_string(),
+    };
+    Some(ToolCall {
+        tool_name: name,
+        args,
+        call_id: "textcall-0".to_string(),
+    })
+}
+
+/// Return the first balanced `{…}` JSON object substring in `text`, respecting
+/// string literals and escapes so braces inside strings don't miscount. Used to
+/// pull a tool-call object out of prose/fences/tags.
+fn extract_json_object(text: &str) -> Option<String> {
+    let bytes = text.as_bytes();
+    let start = text.find('{')?;
+    let mut depth = 0usize;
+    let mut in_str = false;
+    let mut escaped = false;
+    for i in start..bytes.len() {
+        let c = bytes[i];
+        if in_str {
+            if escaped {
+                escaped = false;
+            } else if c == b'\\' {
+                escaped = true;
+            } else if c == b'"' {
+                in_str = false;
+            }
+        } else {
+            match c {
+                b'"' => in_str = true,
+                b'{' => depth += 1,
+                b'}' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        // start and i both index ASCII braces → valid boundaries.
+                        return Some(text[start..=i].to_string());
+                    }
+                }
+                _ => {}
+            }
+        }
+    }
+    None
 }
 
 /// Enforce the context byte budget by truncating the oldest tool-result

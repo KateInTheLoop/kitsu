@@ -552,3 +552,141 @@ async fn test_max_tokens_default_is_none() {
         .expect("ok");
     assert_eq!(provider.seen_max_tokens.lock().unwrap()[0], None);
 }
+
+// --- text-protocol tool calls (ISSUE-001) -----------------------------------
+
+/// A descriptor-carrying registry whose tool bumps `ran` if it is ever invoked
+/// (the negative tests assert it stays 0).
+fn writing_registry(ran: Arc<AtomicUsize>) -> Registry {
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "fs_write_file".to_string(),
+            description: "write a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let ran = ran.clone();
+            Box::pin(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>("{}".to_string())
+            })
+        }),
+    );
+    tools
+}
+
+/// Run one text-protocol case: round 1 returns `text` (a text-form tool call)
+/// with Done(Stop) — exactly how local models present it — round 2 finishes.
+/// Assert the tool ran and its result was fed back on round 2.
+async fn assert_text_protocol_executes(text: &str) {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(text.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    let ran2 = ran.clone();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "fs_write_file".to_string(),
+            description: "write a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let ran = ran2.clone();
+            Box::pin(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>(r#"{"written":"x.py","bytes":10}"#.to_string())
+            })
+        }),
+    );
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .expect("text-protocol turn should succeed");
+
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        1,
+        "the text-form tool call should have executed exactly once"
+    );
+    assert_eq!(provider.call_count(), 2, "one tool round then a final round");
+    assert!(out.contains("done"), "final answer should be returned: {out}");
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last()
+            .unwrap()
+            .iter()
+            .any(|m| m.role == kitsu_providers::Role::Tool && m.content.contains("written")),
+        "the tool result must be fed back on round 2"
+    );
+}
+
+#[tokio::test]
+async fn test_text_protocol_bare_json() {
+    assert_text_protocol_executes(
+        r#"{"name": "fs_write_file", "arguments": {"path": "x.py", "content": "print(1)"}}"#,
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_text_protocol_fenced_json() {
+    assert_text_protocol_executes(
+        "Sure, I'll write it:\n```json\n{\"name\": \"fs_write_file\", \"arguments\": {\"path\": \"x.py\"}}\n```",
+    )
+    .await;
+}
+
+#[tokio::test]
+async fn test_text_protocol_tagged() {
+    assert_text_protocol_executes(
+        "<tool_call>{\"name\": \"fs_write_file\", \"parameters\": {\"path\": \"x.py\"}}</tool_call>",
+    )
+    .await;
+}
+
+/// Plain prose (even with a stray brace) must NOT be treated as a tool call —
+/// it's a normal terminal answer, exactly one provider call.
+#[tokio::test]
+async fn test_text_protocol_ignores_prose() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("Use a HashMap { key: value } for this.".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .expect("ok");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "prose must not trigger a tool");
+    assert_eq!(provider.call_count(), 1, "no extra round for a plain answer");
+    assert!(out.contains("HashMap"));
+}
+
+/// A text-form call for an UNADVERTISED tool name is ignored (returned as text).
+#[tokio::test]
+async fn test_text_protocol_unknown_tool_ignored() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text(r#"{"name": "rm_rf", "arguments": {}}"#.to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .expect("ok");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "unknown tool must not run");
+    assert_eq!(provider.call_count(), 1);
+}
