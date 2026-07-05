@@ -385,3 +385,79 @@ fn test_sse_decoder_surfaces_trailing_usage_chunk() {
     assert_eq!(u.total_tokens, 7);
     assert_eq!(u.prompt_tokens, 5);
 }
+
+// --- model_context_length (Stage 1b window discovery) -----------------------
+
+fn provider_with_models(base_url: String) -> OpenAICompatProvider {
+    let auth = Arc::new(EnvBearerAuth::new(TEST_ENV, None, None));
+    OpenAICompatProvider::new(
+        OpenAICompatConfig {
+            base_url,
+            chat_path: CHAT_PATH.to_string(),
+            models_path: Some("/v1/models".to_string()),
+            retries: 0,
+            timeout: Duration::from_secs(5),
+        },
+        auth,
+    )
+}
+
+/// A gateway that reports `max_model_len` per model → discovered as the window.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_from_max_model_len() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"other","max_model_len":2048},{"id":"my-model","max_model_len":32768}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("my-model").await, Some(32768));
+}
+
+/// No context-length field (e.g. Ollama's OpenAI-compat route) → None.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_none_when_field_absent() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"my-model"}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("my-model").await, None);
+}
+
+/// A lone entry is used even if its id doesn't match exactly.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_lone_entry_fallback() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"served-model","context_length":16384}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("whatever").await, Some(16384));
+}
+
+/// No models_path configured → no request, None (never errors).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_none_without_models_path() {
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    let provider = provider_for("http://127.0.0.1:0".to_string());
+    assert_eq!(provider.model_context_length("m").await, None);
+}

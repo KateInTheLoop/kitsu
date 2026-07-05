@@ -232,4 +232,51 @@ mod tests {
         assert_eq!(b.effective, 8_192 - 8_192 / 2);
         assert!(b.target < b.effective);
     }
+
+    #[test]
+    fn tool_call_args_estimated_at_denser_json_rate() {
+        // content empty; json = tool_name(2)+args(6)+call_id(2) = 10 -> ceil(10/3)=4.
+        let m = ChatMessage {
+            role: Role::Assistant,
+            content: String::new(),
+            tool_call_id: None,
+            tool_calls: vec![kitsu_providers::ToolCall {
+                call_id: "cd".to_string(),
+                tool_name: "ab".to_string(),
+                args: "abcdef".to_string(),
+            }],
+        };
+        assert_eq!(estimate_message(&m), 4);
+        // The same bytes as plain content would be ceil(10/4)=3 — JSON is denser.
+        let as_text = msg(Role::Assistant, "abababcdef"); // 10 chars
+        assert_eq!(estimate_message(&as_text), 3);
+    }
+
+    #[test]
+    fn record_overwrites_the_previous_anchor() {
+        let mut meter = ContextMeter::new();
+        meter.record(100, 1);
+        meter.record(200, 2);
+        // Two messages, anchor covers both, no tail -> exactly the latest anchor.
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        assert_eq!(meter.estimate(&msgs), 200);
+    }
+
+    #[test]
+    fn anchor_only_when_no_new_messages() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, msgs.len());
+        assert_eq!(meter.estimate(&msgs), 500);
+    }
+
+    #[test]
+    fn budget_saturates_on_a_tiny_window() {
+        // window 100, no max_output -> reserve min(512,50)=50 -> effective 50;
+        // buffer min(10,2048)=10 -> target 40.
+        let b = ContextBudget::new(100, None);
+        assert_eq!(b.effective, 50);
+        assert_eq!(b.target, 40);
+        assert!(b.target <= b.effective && b.effective <= b.window);
+    }
 }
