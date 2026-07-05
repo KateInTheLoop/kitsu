@@ -525,8 +525,11 @@ sessions don't overflow it — important for small local models.
   turns, and the last user message, and never orphaning a tool result. Token
   counts are estimated but **anchored on each response's real `usage`**, so the
   estimate stays accurate without a local tokenizer.
-- **See utilization:** `/context` in the REPL prints model · window ·
-  used/effective with a bar and headroom · a per-category breakdown. A machine
+- **See utilization + provenance:** `/context` prints model · window ·
+  used/effective with a bar and headroom, then an honest **provenance table** —
+  every context source with its `tokens`, `policy`, and `why` (base prompt,
+  `project (llms.txt)`, `skill index`, `tool schemas`, and the conversation).
+  Nothing loads into your window without a line here. A machine
   `kitsu-context: {"used":…,"effective":…,"window":…}` line is written to stderr
   each turn (companion to `kitsu-usage:`).
 
