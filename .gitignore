@@ -8,3 +8,4 @@
 # OS / editor cruft
 .DS_Store
 *.swp
+/tests/dogfood/results/

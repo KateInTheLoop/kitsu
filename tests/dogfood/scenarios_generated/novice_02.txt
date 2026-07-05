@@ -1,0 +1,6 @@
+# Novice asks to "just fix it" with no file/context, then asks where the file went
+just fix it
+make me a hello world python file, save it somewhere
+where did you put it
+/save __GEN__/hello.py
+ok is it there now? just say yes or no

@@ -1,0 +1,3 @@
+# file generation via the write tool
+Use the fs_write_file tool to create the file __GEN__/greet.py whose entire contents are exactly: print("hi")
+After writing it, reply DONE.

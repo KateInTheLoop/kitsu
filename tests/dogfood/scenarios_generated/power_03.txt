@@ -1,0 +1,5 @@
+# intent: ask for code, /save only the code block, then have it read the saved file back and confirm integrity
+Write a Python function fizzbuzz(n) that prints 1..n with fizz/buzz rules. Just the code block, no prose.
+/save __GEN__/fizzbuzz.py
+Now fs_read_file __GEN__/fizzbuzz.py and confirm it is valid Python with no markdown fences leaking in. Answer: clean or dirty.
+Add a docstring to that function and rewrite the full file with fs_write_file.

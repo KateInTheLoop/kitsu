@@ -1,0 +1,10 @@
+# Novice pastes an error message and asks "what's wrong" with no context, plus typos
+whats rong with my code
+<<<
+Traceback (most recent call last):
+  File "app.py", line 12, in <module>
+    total = price * qty
+NameError: name 'qty' is not defined
+>>>
+so how do i fix it. one sentence pls
+is qty a keyword

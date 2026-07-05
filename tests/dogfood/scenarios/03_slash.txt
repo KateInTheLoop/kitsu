@@ -1,0 +1,5 @@
+# slash commands interleaved with turns
+/help
+Reply with the single word: alpha.
+/clear
+Reply with the single word: beta.

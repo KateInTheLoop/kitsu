@@ -1,0 +1,4 @@
+# intent: generate a 3-file mini project with fs_write_file, then read one back to verify round-trip
+Create a tiny Python CLI project. Write exactly 3 files with fs_write_file under __GEN__: main.py (argparse entrypoint), calc.py (add/sub functions), and test_calc.py (2 asserts). Keep each file under 15 lines. Terse.
+Now use fs_read_file to read back __GEN__/calc.py and show me its exact contents.
+Does the add function in what you just read handle floats? One word: yes or no.

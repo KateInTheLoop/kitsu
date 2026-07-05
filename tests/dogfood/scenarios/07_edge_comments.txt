@@ -1,0 +1,5 @@
+# mostly comments and blank lines, then one real turn
+
+
+# another comment line
+Reply with the single word: pong.
