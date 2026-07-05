@@ -272,7 +272,10 @@ async fn test_final_round_withholds_tools_and_forces_answer() {
         .await
         .expect("should produce a final answer, not error");
 
-    assert_eq!(out, "FINAL REVIEW BODY", "final round must return real text");
+    assert_eq!(
+        out, "FINAL REVIEW BODY",
+        "final round must return real text"
+    );
     assert!(
         !out.contains("max tool rounds reached"),
         "forcing a final answer must avoid the truncation stop-marker"
@@ -423,7 +426,10 @@ async fn test_loop_length_during_tool_call_round() {
         .await
         .expect("truncated tool-call round should still proceed");
 
-    assert!(out.contains("done"), "should reach the second round, got: {out}");
+    assert!(
+        out.contains("done"),
+        "should reach the second round, got: {out}"
+    );
     assert_eq!(provider.call_count(), 2, "should run two rounds");
 }
 
@@ -507,9 +513,7 @@ async fn test_multi_turn_history_accumulates() {
     let seen = provider.seen_messages.lock().unwrap();
     let second_req = &seen[1];
     assert!(
-        second_req
-            .iter()
-            .any(|m| m.content.contains("first reply")),
+        second_req.iter().any(|m| m.content.contains("first reply")),
         "second turn should include first turn's assistant message"
     );
     assert!(
@@ -617,8 +621,15 @@ async fn assert_text_protocol_executes(text: &str) {
         1,
         "the text-form tool call should have executed exactly once"
     );
-    assert_eq!(provider.call_count(), 2, "one tool round then a final round");
-    assert!(out.contains("done"), "final answer should be returned: {out}");
+    assert_eq!(
+        provider.call_count(),
+        2,
+        "one tool round then a final round"
+    );
+    assert!(
+        out.contains("done"),
+        "final answer should be returned: {out}"
+    );
     let seen = provider.seen_messages.lock().unwrap();
     assert!(
         seen.last()
@@ -668,8 +679,16 @@ async fn test_text_protocol_ignores_prose() {
         .await
         .expect("ok");
 
-    assert_eq!(ran.load(Ordering::SeqCst), 0, "prose must not trigger a tool");
-    assert_eq!(provider.call_count(), 1, "no extra round for a plain answer");
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        0,
+        "prose must not trigger a tool"
+    );
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "no extra round for a plain answer"
+    );
     assert!(out.contains("HashMap"));
 }
 
@@ -747,7 +766,10 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
         .iter()
         .filter(|m| m.role == kitsu_providers::Role::Tool)
         .count();
-    assert_eq!(tool_msgs, 3, "three tool results must be fed back on round 2");
+    assert_eq!(
+        tool_msgs, 3,
+        "three tool results must be fed back on round 2"
+    );
 }
 
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
@@ -859,11 +881,21 @@ fn tool_activity_formatting() {
         format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
         "42 bytes written"
     );
-    assert_eq!(format_tool_result("repo_grep", "l1\nl2\nl3", false), "3 matches");
-    assert_eq!(format_tool_result("repo_grep", "(no matches)", false), "no matches");
+    assert_eq!(
+        format_tool_result("repo_grep", "l1\nl2\nl3", false),
+        "3 matches"
+    );
+    assert_eq!(
+        format_tool_result("repo_grep", "(no matches)", false),
+        "no matches"
+    );
     assert_eq!(format_tool_result("fs_read_file", "a\nb", false), "2 lines");
     assert_eq!(
-        format_tool_result("fs_read_file", r#"{"error":"PolicyDenied","detail":"nope"}"#, true),
+        format_tool_result(
+            "fs_read_file",
+            r#"{"error":"PolicyDenied","detail":"nope"}"#,
+            true
+        ),
         "error: PolicyDenied"
     );
 }

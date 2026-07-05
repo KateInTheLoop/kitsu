@@ -406,14 +406,17 @@ async fn test_script_multiline_block_is_one_turn() {
     .expect("spawned kitsu chat --script process should join");
 
     // Exactly one request → the block was ONE turn, not three separate lines.
-    let reqs = server
-        .received_requests()
-        .await
-        .expect("recorded requests");
+    let reqs = server.received_requests().await.expect("recorded requests");
     assert_eq!(reqs.len(), 1, "multi-line block must be a single turn");
     let body = String::from_utf8_lossy(&reqs[0].body);
-    assert!(body.contains("def add(a, b):"), "body missing first line: {body}");
-    assert!(body.contains("return a + b"), "body missing second line: {body}");
+    assert!(
+        body.contains("def add(a, b):"),
+        "body missing first line: {body}"
+    );
+    assert!(
+        body.contains("return a + b"),
+        "body missing second line: {body}"
+    );
     // Both lines must live in the SAME user message (joined by an escaped \n).
     assert!(
         body.contains("def add(a, b):\\n    return a + b"),
@@ -453,8 +456,13 @@ async fn test_invalid_model_friendly_error() {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
         cmd.args([
-            "--gateway", "example", "--model", "tiny-fast-thing",
-            "chat", "--script", &script_str,
+            "--gateway",
+            "example",
+            "--model",
+            "tiny-fast-thing",
+            "chat",
+            "--script",
+            &script_str,
         ]);
         cmd.assert()
             .success() // scripted mode prints the error and continues

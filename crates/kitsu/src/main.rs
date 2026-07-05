@@ -136,10 +136,7 @@ fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         eprintln!("warning: gateway token expired (since {since}) — sending anyway. {hint}");
     }
 
-    Ok(ChatSetup {
-        provider,
-        model,
-    })
+    Ok(ChatSetup { provider, model })
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
@@ -179,9 +176,13 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
         "You are kitsu, a concise, helpful CLI assistant.".to_string()
     } else {
         format!(
-            "You are kitsu, a concise, helpful CLI assistant. You can call these tools when \
-             useful: {}. Only touch paths the user has allowed. When asked to generate code or \
-             files, use fs_write_file if it is available.",
+            "You are kitsu, a concise, helpful CLI assistant with these filesystem tools: {}. \
+             When the user refers to a local file or directory, USE these tools to inspect it \
+             directly — call fs_list_dir to see a directory's contents and fs_read_file to read a \
+             file. Do NOT ask the user to paste file contents or list filenames; read them \
+             yourself. Access is permission-gated, so simply attempt the tool call — the user is \
+             asked to approve paths as needed. When asked to generate or edit code or files, use \
+             fs_write_file.",
             tool_names.join(", ")
         )
     }
@@ -322,19 +323,24 @@ async fn run_chat(
             read_roots.push(cwd.to_string_lossy().to_string());
         }
     }
-    let mut perms =
-        Permissions::new(&read_roots, allow_write, mode).map_err(|e| CliError::user(e.to_string()))?;
+    let mut perms = Permissions::new(&read_roots, allow_write, mode)
+        .map_err(|e| CliError::user(e.to_string()))?;
     if mode == Mode::Ask {
         perms = perms.with_prompter(Arc::new(CliPrompter));
     }
     let perms = Arc::new(perms);
 
     // In interactive chat the tools are always available (permissions gate access
-    // at call time). Non-interactively, register them only when some access is
-    // pre-granted, so scripted runs with no flags advertise no tools.
+    // at call time). Non-interactively, register a tool only when it can actually
+    // succeed — so scripted runs with no flags advertise nothing, and a read-only
+    // grant doesn't advertise fs_write_file only to always deny it.
+    let can_read = interactive || cli.yes || !allow_paths.is_empty();
+    let can_write = interactive || cli.yes || !allow_write.is_empty();
     let mut tools = Registry::new();
-    if interactive || cli.yes || !allow_paths.is_empty() || !allow_write.is_empty() {
+    if can_read || can_write {
         builtins::register_fs_tools(&mut tools, perms.clone());
+    }
+    if can_write {
         builtins::register_write_tools(&mut tools, perms.clone());
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
@@ -535,9 +541,10 @@ async fn handle_slash(
         }
         "clear" => {
             // Keep only a leading system message, if present.
-            let system = messages.first().filter(|m| {
-                matches!(m.role, kitsu_providers::Role::System)
-            }).cloned();
+            let system = messages
+                .first()
+                .filter(|m| matches!(m.role, kitsu_providers::Role::System))
+                .cloned();
             messages.clear();
             if let Some(s) = system {
                 messages.push(s);
@@ -633,31 +640,71 @@ async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) {
 
 /// Prints a permission prompt to stderr and reads the user's choice from stdin.
 /// Used only in interactive `Mode::Ask`; the prompt fires mid-turn while
-/// rustyline is idle, so a plain blocking stdin read is safe. Anything other
-/// than `y`/`a` (including empty input or EOF) denies — safe default.
+/// rustyline is idle. Bracketed paste is disabled around the read so a stray
+/// paste can't inject `ESC[200~` markers, and any extra buffered input is
+/// drained afterward so leftover pasted lines don't leak into the next turn.
+/// Anything other than `y`/`a` (including empty input or EOF) denies.
 struct CliPrompter;
 
 impl Prompter for CliPrompter {
     fn ask(&self, req: &PermissionRequest) -> Decision {
         use std::io::Write;
+        // Disable bracketed paste (ESC[?2004l) for the raw read; rustyline
+        // re-enables it on the next prompt.
         eprint!(
-            "\n\u{23fa} kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
+            "\x1b[?2004l\n\u{23fa} kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
             req.action.verb(),
             req.path,
             req.grant_dir
         );
         let _ = std::io::stderr().flush();
         let mut line = String::new();
-        if std::io::stdin().read_line(&mut line).is_err() {
+        let read = std::io::stdin().read_line(&mut line);
+        // Drop any remaining buffered input (e.g. the rest of a pasted block) so
+        // it isn't picked up as the next turn.
+        drain_stdin();
+        if read.is_err() {
             return Decision::Deny;
         }
-        match line.trim().to_ascii_lowercase().as_str() {
-            "y" | "yes" => Decision::AllowOnce,
-            "a" | "always" => Decision::AllowAlways,
+        // Take the first meaningful character, tolerating a stray paste marker.
+        let ans = line.trim().trim_start_matches("\u{1b}[200~").trim_start();
+        match ans.chars().next().map(|c| c.to_ascii_lowercase()) {
+            Some('y') => Decision::AllowOnce,
+            Some('a') => Decision::AllowAlways,
             _ => Decision::Deny,
         }
     }
 }
+
+/// Discard any input currently buffered on stdin without blocking. Used after a
+/// permission prompt so leftover bytes from a multi-line paste don't spill into
+/// the next `readline`.
+#[cfg(unix)]
+fn drain_stdin() {
+    use std::io::Read;
+    use std::os::unix::io::AsRawFd;
+    let fd = std::io::stdin().as_raw_fd();
+    unsafe {
+        let flags = libc::fcntl(fd, libc::F_GETFL);
+        if flags < 0 {
+            return;
+        }
+        if libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) < 0 {
+            return;
+        }
+        let mut buf = [0u8; 4096];
+        let mut stdin = std::io::stdin();
+        while let Ok(n) = stdin.read(&mut buf) {
+            if n == 0 {
+                break;
+            }
+        }
+        libc::fcntl(fd, libc::F_SETFL, flags); // restore blocking
+    }
+}
+
+#[cfg(not(unix))]
+fn drain_stdin() {}
 
 /// Build the appropriate AuthProvider from the profile's auth block.
 fn build_auth(gateway: &Gateway) -> Arc<dyn AuthProvider> {
@@ -689,8 +736,8 @@ fn build_auth(gateway: &Gateway) -> Arc<dyn AuthProvider> {
 /// at `/model`, instead of dumping the raw HTTP 404 JSON.
 fn chat_error_message(e: kitsu_core::AgentError, model: &str) -> String {
     if let kitsu_core::AgentError::Provider(ProviderError::Http { status, body }) = &e {
-        let looks_like_bad_model = *status == 404
-            || (body.contains("model") && body.to_lowercase().contains("not found"));
+        let looks_like_bad_model =
+            *status == 404 || (body.contains("model") && body.to_lowercase().contains("not found"));
         if looks_like_bad_model {
             return format!(
                 "gateway rejected model '{model}' (HTTP {status}) — run /model <valid-id> and \

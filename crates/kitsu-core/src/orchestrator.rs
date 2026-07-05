@@ -131,8 +131,7 @@ where
         // 1 has no "earlier" round to nudge from, so only applies when >1.
         // Final round when: the round budget is exhausted, OR a tool call has
         // failed identically REPEAT_FAIL_LIMIT times (ISSUE-007 loop-breaker).
-        let is_final_round =
-            (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
+        let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
         let offered_tools = if is_final_round {
             None
         } else {
@@ -197,7 +196,10 @@ where
         if tool_calls.is_empty() && tools_were_offered {
             let recovered = parse_text_tool_calls(&assistant_text, tools);
             if !recovered.is_empty() {
-                tracing::debug!(count = recovered.len(), "recovered text-protocol tool call(s)");
+                tracing::debug!(
+                    count = recovered.len(),
+                    "recovered text-protocol tool call(s)"
+                );
                 tool_calls.extend(recovered);
                 synthesized_call = true;
             }
@@ -221,7 +223,10 @@ where
         } else {
             assistant_text.clone()
         };
-        messages.push(ChatMessage::assistant(assistant_content, tool_calls.clone()));
+        messages.push(ChatMessage::assistant(
+            assistant_content,
+            tool_calls.clone(),
+        ));
 
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
@@ -269,7 +274,8 @@ where
                         force_final_next = true;
                     }
                     (
-                        serde_json::json!({ "error": e.kind(), "detail": e.to_string() }).to_string(),
+                        serde_json::json!({ "error": e.kind(), "detail": e.to_string() })
+                            .to_string(),
                         true,
                     )
                 }
@@ -310,7 +316,9 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
         let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
             continue;
         };
-        let Some(obj) = value.as_object() else { continue };
+        let Some(obj) = value.as_object() else {
+            continue;
+        };
         let Some(name) = obj.get("name").and_then(|n| n.as_str()) else {
             continue;
         };
@@ -451,7 +459,11 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
 /// Compact a path to at most its last two segments (with a leading `…` when more
 /// were dropped), so activity lines stay short.
 fn short_path(p: &str) -> String {
-    let parts: Vec<&str> = p.trim_end_matches('/').split('/').filter(|s| !s.is_empty()).collect();
+    let parts: Vec<&str> = p
+        .trim_end_matches('/')
+        .split('/')
+        .filter(|s| !s.is_empty())
+        .collect();
     match parts.as_slice() {
         [] => p.to_string(),
         [one] => (*one).to_string(),

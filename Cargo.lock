@@ -814,6 +814,7 @@ dependencies = [
  "kitsu-providers",
  "kitsu-render",
  "kitsu-tools",
+ "libc",
  "predicates",
  "rustyline",
  "serde",
