@@ -157,7 +157,12 @@ where
         while let Some(item) = stream.next().await {
             match item? {
                 ChatDelta::Text(t) => {
-                    if cfg.stream {
+                    // ISSUE-002: when tools are advertised this round, DON'T stream
+                    // text live — buffer it. A text-protocol model may be emitting
+                    // a tool call as JSON; we suppress that and only print real
+                    // answers (below). The final round withholds tools, so final
+                    // answers still stream live.
+                    if cfg.stream && !tools_were_offered {
                         kitsu_render::print_fragment(&t);
                     }
                     assistant_text.push_str(&t);
@@ -194,6 +199,12 @@ where
         messages.push(ChatMessage::assistant(assistant_content, tool_calls.clone()));
 
         if tool_calls.is_empty() {
+            // This round was a real answer, not a tool call. If we buffered it
+            // (tools were offered, so live streaming was withheld to hide any
+            // tool-call JSON — ISSUE-002), emit the answer now.
+            if cfg.stream && tools_were_offered {
+                kitsu_render::print_fragment(&assistant_text);
+            }
             // (1) terminal: model stopped with no tool calls.
             match finish {
                 FinishReason::Stop => return Ok(assistant_text),
