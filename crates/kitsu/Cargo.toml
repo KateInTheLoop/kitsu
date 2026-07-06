@@ -33,3 +33,4 @@ tempfile = { workspace = true }
 wiremock = { workspace = true }
 tokio = { workspace = true }
 serial_test = { workspace = true }
+futures = { workspace = true }
