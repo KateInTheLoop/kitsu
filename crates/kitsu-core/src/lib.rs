@@ -7,4 +7,7 @@ pub mod context;
 pub mod orchestrator;
 
 pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
-pub use orchestrator::{run_agent_turn, AgentConfig, AgentError, CompactionMode};
+pub use orchestrator::{
+    run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentError, AgentSessionState,
+    CompactionMode,
+};

@@ -547,36 +547,97 @@ async fn sse_step(state: SseState) -> Option<(Result<ChatDelta, ProviderError>, 
     }
 }
 
+/// Does `id` loosely match `model` in a way safe enough to bind a context
+/// window to? Plain substring containment (`id.contains(model)`) is too loose:
+/// it would bind a configured model `"gpt-4"` to an unrelated, differently-sized
+/// `"gpt-4-turbo"` entry whenever no exact `"gpt-4"` entry exists. Require the
+/// shorter string to appear as a delimiter-bounded segment of the longer one
+/// (bounded by a non-alphanumeric character or a string edge), which at least
+/// rules out one id being an arbitrary mid-token substring of the other.
+fn loosely_matches(id: &str, model: &str) -> bool {
+    let (short, long) = if id.len() <= model.len() {
+        (id, model)
+    } else {
+        (model, id)
+    };
+    if short.is_empty() {
+        return false;
+    }
+    let Some(pos) = long.find(short) else {
+        return false;
+    };
+    let before_ok = pos == 0 || !long.as_bytes()[pos - 1].is_ascii_alphanumeric();
+    let end = pos + short.len();
+    let after_ok = end == long.len() || !long.as_bytes()[end].is_ascii_alphanumeric();
+    before_ok && after_ok
+}
+
 impl OpenAICompatProvider {
+    /// Shared GET-and-parse-as-JSON for `/models`-shaped endpoints, used by both
+    /// `list_models` and `model_context_length` so the request construction (URL,
+    /// auth, timeout) and response shape can't drift between the two. Returns the
+    /// status and raw body text; callers decide how to interpret non-success
+    /// statuses (`list_models` maps 401/403 to `Unauthorized` and anything else to
+    /// `Http`; `model_context_length` is advisory and gives up on any error).
+    async fn get_models_response(&self) -> Result<(StatusCode, String), ProviderError> {
+        let path = self
+            .models_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .ok_or_else(|| ProviderError::InvalidResponse("models_path not configured".into()))?;
+        let url = format!("{}{}", self.base_url, path);
+        let rb = self.http.get(&url).timeout(self.timeout);
+        let rb = self.attach_auth(rb)?;
+        let resp = rb.send().await.map_err(map_send_error)?;
+        let status = resp.status();
+        // On a non-success status, tolerate a body-read failure so the caller
+        // still gets the real status — the diagnostic body is best-effort, and
+        // losing it must not also lose the status that made the request fail in
+        // the first place. A body-read failure on success IS load-bearing (the
+        // caller needs that body to parse the actual data), so it still errors.
+        let text = if status.is_success() {
+            resp.text().await.map_err(map_send_error)?
+        } else {
+            resp.text().await.unwrap_or_default()
+        };
+        Ok((status, text))
+    }
+
     /// Best-effort discovery of a model's context length from `/v1/models`
     /// metadata — e.g. vLLM's `max_model_len`, or a `context_length` /
     /// `context_window` field. Returns `None` on any error or when the gateway
     /// doesn't expose it (Ollama's OpenAI-compat route does not), so callers fall
     /// back to config / a default. Never propagates errors — this is advisory.
     pub async fn model_context_length(&self, model: &str) -> Option<u64> {
-        let path = self.models_path.as_deref().filter(|p| !p.is_empty())?;
-        let url = format!("{}{}", self.base_url, path);
-        let rb = self.http.get(&url).timeout(self.timeout);
-        let rb = self.attach_auth(rb).ok()?;
-        let resp = rb.send().await.ok()?;
-        if !resp.status().is_success() {
+        // get_models_response already errors when models_path is unset/empty;
+        // `.ok()?` turns that into the same `None` a redundant check here would.
+        let (status, text) = self.get_models_response().await.ok()?;
+        if !status.is_success() {
             return None;
         }
-        let text = resp.text().await.ok()?;
         let json: serde_json::Value = serde_json::from_str(&text).ok()?;
         let entries = json.get("data")?.as_array()?;
-        // Prefer an exact id match, then a substring either way, then a lone entry.
-        let entry = entries
+        // Prefer an exact id match; then a loose match, but ONLY if it's unique —
+        // an ambiguous loose match (e.g. "gpt-4" loosely matching both
+        // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
+        // to the wrong entry silently budgets against the wrong window. Finally
+        // fall back to a lone entry, whatever its id.
+        let exact = entries
             .iter()
-            .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model))
-            .or_else(|| {
-                entries.iter().find(|e| {
-                    e.get("id")
-                        .and_then(serde_json::Value::as_str)
-                        .is_some_and(|id| id.contains(model) || model.contains(id))
-                })
-            })
-            .or_else(|| (entries.len() == 1).then(|| &entries[0]))?;
+            .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
+        let entry = if let Some(e) = exact {
+            e
+        } else {
+            let mut loose = entries.iter().filter(|e| {
+                e.get("id")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|id| loosely_matches(id, model))
+            });
+            match (loose.next(), loose.next()) {
+                (Some(only), None) => only,
+                _ => (entries.len() == 1).then(|| &entries[0])?,
+            }
+        };
         for key in [
             "max_model_len",
             "context_length",
@@ -690,14 +751,15 @@ impl Provider for OpenAICompatProvider {
     }
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        let Some(path) = self.models_path.as_deref().filter(|p| !p.is_empty()) else {
+        if self
+            .models_path
+            .as_deref()
+            .filter(|p| !p.is_empty())
+            .is_none()
+        {
             return Ok(None);
-        };
-        let url = format!("{}{}", self.base_url, path);
-        let rb = self.http.get(&url).timeout(self.timeout);
-        let rb = self.attach_auth(rb)?;
-        let resp = rb.send().await.map_err(map_send_error)?;
-        let status = resp.status();
+        }
+        let (status, text) = self.get_models_response().await?;
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(ProviderError::Unauthorized {
                 status: status.as_u16(),
@@ -705,10 +767,9 @@ impl Provider for OpenAICompatProvider {
             });
         }
         if !status.is_success() {
-            let body = resp.text().await.unwrap_or_default();
             return Err(ProviderError::Http {
                 status: status.as_u16(),
-                body,
+                body: text,
             });
         }
 
@@ -722,7 +783,6 @@ impl Provider for OpenAICompatProvider {
             id: String,
         }
 
-        let text = resp.text().await.map_err(map_send_error)?;
         let parsed: ModelsResponse = serde_json::from_str(&text)
             .map_err(|e| ProviderError::InvalidResponse(format!("malformed /models JSON: {e}")))?;
         Ok(Some(parsed.data.into_iter().map(|m| m.id).collect()))

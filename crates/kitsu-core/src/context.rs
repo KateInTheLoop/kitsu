@@ -60,8 +60,12 @@ impl ContextBreakdown {
 /// Estimates conversation token usage, anchored on the last real API usage.
 #[derive(Debug, Default, Clone)]
 pub struct ContextMeter {
-    /// `(prompt_tokens, number of leading messages that request covered)`.
-    anchor: Option<(u64, usize)>,
+    /// `(prompt_tokens, number of leading messages that request covered, whether
+    /// that request's `tools` field was present)`. The schema flag matters
+    /// because the final round of a turn withholds tools (forcing an answer),
+    /// so an anchor recorded there does NOT include schema overhead — a later
+    /// round that offers tools again must not assume it's already covered.
+    anchor: Option<(u64, usize, bool)>,
 }
 
 impl ContextMeter {
@@ -70,9 +74,22 @@ impl ContextMeter {
     }
 
     /// Record the authoritative `prompt_tokens` from a response, for a request
-    /// that sent `sent_len` leading messages.
-    pub fn record(&mut self, prompt_tokens: u64, sent_len: usize) {
-        self.anchor = Some((prompt_tokens, sent_len));
+    /// that sent `sent_len` leading messages and — per `had_schema` — did or
+    /// didn't include the tool schemas that round.
+    pub fn record(&mut self, prompt_tokens: u64, sent_len: usize, had_schema: bool) {
+        self.anchor = Some((prompt_tokens, sent_len, had_schema));
+    }
+
+    /// Clear the anchor. `sent_len` is a plain message COUNT, not an identity —
+    /// once something restructures `messages` (drops or summarizes whole
+    /// exchanges, `/clear`), a later, unrelated state of the conversation can
+    /// spuriously satisfy `sent_len <= messages.len()` again while no longer
+    /// describing an actual prefix of `messages`. Callers that reshape the
+    /// message list (as opposed to appending to it) must call this so the next
+    /// [`Self::estimate`] falls back to a full recompute instead of trusting a
+    /// stale anchor against content it never measured.
+    pub fn invalidate(&mut self) {
+        self.anchor = None;
     }
 
     /// Estimated prompt tokens for the current `messages`: the last real-usage
@@ -82,11 +99,28 @@ impl ContextMeter {
     /// `messages`), fall back to a full estimate.
     pub fn estimate(&self, messages: &[ChatMessage]) -> u64 {
         match self.anchor {
-            Some((tokens, sent_len)) if sent_len <= messages.len() => {
+            Some((tokens, sent_len, _)) if sent_len <= messages.len() => {
                 tokens + messages[sent_len..].iter().map(message_tokens).sum::<u64>()
             }
             _ => messages.iter().map(message_tokens).sum(),
         }
+    }
+
+    /// True when [`Self::estimate`] would use the real-usage anchor (rather than
+    /// a full chars/token re-tokenize) for `messages`.
+    pub fn anchored(&self, messages: &[ChatMessage]) -> bool {
+        matches!(self.anchor, Some((_, sent_len, _)) if sent_len <= messages.len())
+    }
+
+    /// True when the CURRENT anchor is valid for `messages` *and* the request
+    /// that produced it already included tool-schema tokens. Callers that need
+    /// to add static overhead not reflected in a plain chars/token estimate
+    /// (tool schema tokens) should only skip doing so when this is `true` — an
+    /// anchor from a schema-less request (e.g. a turn's final round, which
+    /// withholds tools) does NOT cover that overhead, so it must still be added
+    /// even though the meter is otherwise anchored.
+    pub fn anchor_includes_schema(&self, messages: &[ChatMessage]) -> bool {
+        matches!(self.anchor, Some((_, sent_len, had_schema)) if had_schema && sent_len <= messages.len())
     }
 
     /// Per-role breakdown (pure estimate; ignores the usage anchor so callers can
@@ -171,7 +205,7 @@ mod tests {
         let mut meter = ContextMeter::new();
         let mut msgs = vec![msg(Role::System, "x".repeat(40).as_str())];
         // Pretend the last request sent these 1 message(s) and cost 1000 tokens.
-        meter.record(1000, msgs.len());
+        meter.record(1000, msgs.len(), false);
         // Append an 8-char user turn: +2 tokens estimated on top of the anchor.
         msgs.push(msg(Role::User, "abcdefgh"));
         assert_eq!(meter.estimate(&msgs), 1002);
@@ -181,7 +215,7 @@ mod tests {
     fn falls_back_to_full_estimate_when_trimmed_below_anchor() {
         let mut meter = ContextMeter::new();
         // Anchor claims 3 leading messages were sent...
-        meter.record(1000, 3);
+        meter.record(1000, 3, false);
         // ...but history was trimmed to 1 message: anchor no longer describes a
         // prefix, so estimate ignores it and estimates the whole set.
         let msgs = vec![msg(Role::User, "abcd")];
@@ -251,8 +285,8 @@ mod tests {
     #[test]
     fn record_overwrites_the_previous_anchor() {
         let mut meter = ContextMeter::new();
-        meter.record(100, 1);
-        meter.record(200, 2);
+        meter.record(100, 1, false);
+        meter.record(200, 2, false);
         // Two messages, anchor covers both, no tail -> exactly the latest anchor.
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
         assert_eq!(meter.estimate(&msgs), 200);
@@ -262,8 +296,74 @@ mod tests {
     fn anchor_only_when_no_new_messages() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, msgs.len());
+        meter.record(500, msgs.len(), false);
         assert_eq!(meter.estimate(&msgs), 500);
+    }
+
+    /// Regression: a structural reshape (drop/summarize) can shrink the
+    /// conversation and then have it regrow past the OLD anchor's `sent_len` —
+    /// at which point the length-only validity check would wrongly treat the
+    /// stale anchor as still describing a prefix of the new messages.
+    /// `invalidate()` must be called by anything that reshapes `messages`, and
+    /// afterward `estimate` must fall back to a full recompute even once the
+    /// conversation regrows past the old `sent_len`.
+    #[test]
+    fn invalidate_forces_full_recompute_even_after_regrowth_past_old_sent_len() {
+        let mut meter = ContextMeter::new();
+        // Anchor claims a real API response covered 5 leading messages at a cost
+        // of 1000 tokens.
+        meter.record(1000, 5, false);
+        meter.invalidate();
+
+        // The conversation was reshaped (e.g. dropped/summarized) and then grew
+        // back to 5+ messages again — same length as the stale anchor claimed,
+        // which is exactly the scenario where a length-only check would wrongly
+        // trust it.
+        let msgs = vec![
+            msg(Role::System, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+        ];
+        assert!(
+            !meter.anchored(&msgs),
+            "an invalidated anchor must never report itself as anchored"
+        );
+        // Full recompute: 5 messages * 1 token each ("abcd" = 4 chars = 1 token) = 5.
+        assert_eq!(
+            meter.estimate(&msgs),
+            5,
+            "must fall back to a full recompute, not the stale 1000-token anchor"
+        );
+    }
+
+    /// Regression: a turn's final round withholds tools (forcing an answer), so
+    /// an anchor recorded from THAT round's real usage does NOT cover tool-schema
+    /// tokens. `anchored()` alone can't distinguish this from a normal, schema-
+    /// inclusive anchor — `anchor_includes_schema()` must say `false` here so the
+    /// caller still adds the schema estimate on the next round that offers tools.
+    #[test]
+    fn anchor_includes_schema_is_false_when_recorded_without_tools() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, msgs.len(), false); // that request had NO tools field
+        assert!(
+            meter.anchored(&msgs),
+            "sanity: anchor is structurally valid"
+        );
+        assert!(
+            !meter.anchor_includes_schema(&msgs),
+            "a schema-less anchor must not be reported as already covering schema tokens"
+        );
+    }
+
+    #[test]
+    fn anchor_includes_schema_is_true_when_recorded_with_tools() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, msgs.len(), true); // that request DID include tools
+        assert!(meter.anchor_includes_schema(&msgs));
     }
 
     #[test]
