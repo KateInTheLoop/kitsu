@@ -147,6 +147,40 @@ impl Drop for OffloadDirGuard {
     }
 }
 
+/// rustyline helper that collapses a pasted MULTI-LINE input to a compact chip
+/// (`<first line>… [pasted N lines]`) in the editor display — Codex-style — so a
+/// big paste doesn't flood the prompt. The full text is untouched in the buffer
+/// and returned verbatim on Enter; only the on-screen rendering is collapsed.
+struct PasteCollapse;
+
+impl rustyline::completion::Completer for PasteCollapse {
+    type Candidate = String;
+}
+impl rustyline::hint::Hinter for PasteCollapse {
+    type Hint = String;
+}
+impl rustyline::validate::Validator for PasteCollapse {}
+impl rustyline::Helper for PasteCollapse {}
+
+impl rustyline::highlight::Highlighter for PasteCollapse {
+    fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
+        match line.split_once('\n') {
+            Some((first, _)) => {
+                let n = line.split('\n').count();
+                let preview: String = first.chars().take(48).collect();
+                let ell = if first.chars().count() > 48 { "…" } else { "" };
+                std::borrow::Cow::Owned(format!("{preview}{ell} [pasted {n} lines]"))
+            }
+            None => std::borrow::Cow::Borrowed(line),
+        }
+    }
+    /// Only re-render through `highlight` when the buffer is multi-line (a paste);
+    /// normal single-line typing is shown as-is.
+    fn highlight_char(&self, line: &str, _pos: usize, _forced: bool) -> bool {
+        line.contains('\n')
+    }
+}
+
 /// A provenance entry: a static context source, why it's loaded, its estimated
 /// token cost, and the governing policy — honest accounting (design §3).
 struct CtxEntry {
@@ -702,8 +736,11 @@ async fn run_chat(
     // coding chats) is captured as ONE turn instead of each line submitting
     // separately. It defaults on in rustyline 14, but we set it deliberately.
     let rl_config = rustyline::Config::builder().bracketed_paste(true).build();
-    let mut rl = rustyline::DefaultEditor::with_config(rl_config)
-        .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
+    let mut rl: rustyline::Editor<PasteCollapse, rustyline::history::DefaultHistory> =
+        rustyline::Editor::with_config(rl_config)
+            .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
+    // Collapse pasted multi-line blocks to a chip in the editor display (#16).
+    rl.set_helper(Some(PasteCollapse));
     let history_path = Config::resolve_path(cli.config.as_deref())
         .parent()
         .map(|p| p.join("history"))
@@ -741,11 +778,8 @@ async fn run_chat(
         if line.is_empty() {
             continue;
         }
-        // A multi-line line came from a bracketed paste — acknowledge it so the
-        // user sees the block landed as one turn.
-        if line.contains('\n') {
-            eprintln!("[pasted {} lines]", line.lines().count());
-        }
+        // A multi-line paste is already shown collapsed as a chip by the
+        // PasteCollapse highlighter, so no extra acknowledgement is needed here.
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
@@ -1128,5 +1162,80 @@ fn map_agent_error(e: kitsu_core::AgentError) -> CliError {
             other => CliError::provider(other.to_string()),
         },
         kitsu_core::AgentError::Loop(msg) => CliError::provider(format!("agent loop error: {msg}")),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serial_test::serial;
+
+    #[test]
+    fn paste_collapse_chips_multiline_only() {
+        use rustyline::highlight::Highlighter;
+        let h = PasteCollapse;
+        // Single line: unchanged, and not re-highlighted.
+        assert_eq!(h.highlight("just one line", 0), "just one line");
+        assert!(!h.highlight_char("just one line", 0, false));
+        // Multi-line paste: collapsed to a chip; middle lines hidden.
+        let out = h.highlight("first line here\nsecond\nthird", 0);
+        assert!(out.contains("first line here"), "keeps a preview of line 1");
+        assert!(out.contains("[pasted 3 lines]"), "shows the count");
+        assert!(!out.contains("second"), "hides the pasted body");
+        assert!(h.highlight_char("a\nb", 0, false), "re-highlights when multi-line");
+    }
+
+    /// Regression: a sibling directory that merely SHARES the home dir as a
+    /// string prefix (no path-segment boundary) must NOT be corrupted by
+    /// `strip_prefix` — it must be left as the full, unshortened path.
+    #[test]
+    #[serial]
+    fn shorten_home_requires_a_path_segment_boundary() {
+        let _g_home = EnvVarGuard::set("HOME", "/home/mmpg");
+        assert_eq!(
+            shorten_home(std::path::Path::new("/home/mmpg2/project")),
+            "/home/mmpg2/project",
+            "a sibling dir sharing HOME as a bare string prefix must not become ~2/project"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn shorten_home_shortens_a_real_subdirectory() {
+        let _g_home = EnvVarGuard::set("HOME", "/home/mmpg");
+        assert_eq!(
+            shorten_home(std::path::Path::new("/home/mmpg/project")),
+            "~/project"
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn shorten_home_shortens_the_home_dir_itself() {
+        let _g_home = EnvVarGuard::set("HOME", "/home/mmpg");
+        assert_eq!(shorten_home(std::path::Path::new("/home/mmpg")), "~");
+    }
+
+    /// Scoped env-var guard; restores the prior value (or unsets) on drop.
+    struct EnvVarGuard {
+        key: &'static str,
+        prev: Option<String>,
+    }
+
+    impl EnvVarGuard {
+        fn set(key: &'static str, value: &str) -> Self {
+            let prev = std::env::var(key).ok();
+            std::env::set_var(key, value);
+            Self { key, prev }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(v) => std::env::set_var(self.key, v),
+                None => std::env::remove_var(self.key),
+            }
+        }
     }
 }
