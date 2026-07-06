@@ -30,3 +30,22 @@ pub trait Provider: Send + Sync {
         &self,
     ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send;
 }
+
+/// Share one provider across the main loop and spawned subagents: `Arc<P>` is a
+/// `Provider` that delegates to its inner `P`.
+impl<P: Provider> Provider for std::sync::Arc<P> {
+    fn healthcheck(&self) -> impl std::future::Future<Output = Result<(), ProviderError>> + Send {
+        (**self).healthcheck()
+    }
+    fn chat_stream(
+        &self,
+        req: ChatRequest,
+    ) -> impl std::future::Future<Output = Result<ChatStream, ProviderError>> + Send {
+        (**self).chat_stream(req)
+    }
+    fn list_models(
+        &self,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send {
+        (**self).list_models()
+    }
+}

@@ -5,6 +5,7 @@ mod cli;
 mod config;
 mod llms;
 mod skills;
+mod subagent;
 
 use std::cell::Cell;
 use std::rc::Rc;
@@ -102,7 +103,8 @@ fn run() -> Result<(), CliError> {
 /// Provider + model + auth resolved from config and CLI flags. Shared by the
 /// `ask` and `chat` commands so they construct the gateway connection identically.
 struct ChatSetup {
-    provider: OpenAICompatProvider,
+    /// `Arc` so the main loop and spawned subagents can share one connection.
+    provider: Arc<OpenAICompatProvider>,
     model: String,
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
@@ -134,6 +136,28 @@ fn preload_skills(cli: &Cli, skillset: &skills::SkillSet) -> Option<String> {
     } else {
         eprintln!("~ preloaded {} skill(s)", cli.skill.len());
         Some(out)
+    }
+}
+
+/// Register the base tool set (fs read/write, grep, skill) shared by the main
+/// agent and by subagents. `spawn_agent` is registered separately and only for
+/// the main agent, so subagents can't spawn further (depth-1).
+fn register_base_tools(
+    tools: &mut Registry,
+    perms: &Arc<Permissions>,
+    skillset: &Arc<skills::SkillSet>,
+    can_read: bool,
+    can_write: bool,
+) {
+    if can_read || can_write {
+        builtins::register_fs_tools(tools, perms.clone());
+    }
+    if can_write {
+        builtins::register_write_tools(tools, perms.clone());
+    }
+    if !skillset.is_empty() && (can_read || can_write) {
+        let (d, h) = skills::skill_tool(skillset.clone(), perms.clone());
+        tools.register_with_descriptor(d, h);
     }
 }
 
@@ -411,7 +435,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     };
 
     Ok(ChatSetup {
-        provider,
+        provider: Arc::new(provider),
         model,
         context_window,
         context_window_pinned,
@@ -670,25 +694,46 @@ async fn run_chat(
     // grant doesn't advertise fs_write_file only to always deny it.
     let can_read = interactive || cli.yes || !allow_paths.is_empty();
     let can_write = interactive || cli.yes || !allow_write.is_empty();
-    let mut tools = Registry::new();
-    if can_read || can_write {
-        builtins::register_fs_tools(&mut tools, perms.clone());
-    }
-    if can_write {
-        builtins::register_write_tools(&mut tools, perms.clone());
-    }
-    // Discover LOCAL skills and register the `skill` tool so the model can load
-    // one on demand (Stage S1). Skills are budget-gated context, not privileged —
-    // suggested actions still go through the permission model. Disabled (with the
-    // project-context loader) via KITSU_NO_PROJECT_CONTEXT.
+
+    // Discover LOCAL skills before building tool sets (they register the `skill`
+    // tool). Skills are budget-gated context, not privileged — suggested actions
+    // still go through the permission model. Disabled (with the project-context
+    // loader) via KITSU_NO_PROJECT_CONTEXT.
     let no_project = std::env::var_os("KITSU_NO_PROJECT_CONTEXT").is_some();
     let skillset = Arc::new(
         std::env::current_dir()
             .map(|cwd| skills::SkillSet::discover(&cwd, no_project))
             .unwrap_or_default(),
     );
-    if !skillset.is_empty() && (can_read || can_write) {
-        let (d, h) = skills::skill_tool(skillset.clone(), perms.clone());
+
+    // The subagent tool set: base tools ONLY (no `spawn_agent` → depth-1).
+    let sub_tools = {
+        let mut t = Registry::new();
+        register_base_tools(&mut t, &perms, &skillset, can_read, can_write);
+        Arc::new(t)
+    };
+
+    // The main tool set: base tools + `spawn_agent`, which delegates a task to a
+    // subagent running the base `sub_tools` in its own isolated context (Stage A).
+    let mut tools = Registry::new();
+    register_base_tools(&mut tools, &perms, &skillset, can_read, can_write);
+    if can_read || can_write {
+        let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
+        sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
+        let sub_system = if skillset.is_empty() {
+            String::new()
+        } else {
+            format!(
+                "You have these skills (call the `skill` tool to load one when a task matches):\n{}",
+                skillset.index("")
+            )
+        };
+        let (d, h) = subagent::spawn_agent_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
+            sub_cfg,
+            sub_system,
+        );
         tools.register_with_descriptor(d, h);
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
