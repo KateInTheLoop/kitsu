@@ -42,6 +42,11 @@ pub struct AgentConfig {
     /// replaces them with an LLM-written summary (opt-in — quality is model-
     /// dependent). Falls back to `Trim` if summarization fails.
     pub compaction: CompactionMode,
+    /// Suppress this turn's terminal narration (spinner, `⏺`/`⎿` tool activity,
+    /// and the `kitsu-usage:`/`kitsu-context:` lines). Set for BACKGROUND
+    /// subagents so their output doesn't corrupt the interactive prompt while
+    /// they run detached; their result is delivered via the agent registry.
+    pub quiet: bool,
 }
 
 /// Strategy for reclaiming context when trimming tool results isn't enough.
@@ -66,6 +71,7 @@ impl Default for AgentConfig {
             temperature: None,
             max_tokens: None,
             compaction: CompactionMode::Trim,
+            quiet: false,
         }
     }
 }
@@ -153,7 +159,7 @@ where
     .await;
     // Emit usage regardless of Ok/Err — partial turns still cost tokens. Only
     // when the gateway actually reported something.
-    if !turn_usage.is_empty() {
+    if !turn_usage.is_empty() && !cfg.quiet {
         // ISSUE-003: when streaming, the assistant text was written to stdout
         // without a trailing newline. Terminate that line before the usage line
         // (stderr) so the two don't run together (`OKkitsu-usage:` → `OK\nkitsu-usage:`).
@@ -167,9 +173,11 @@ where
         );
     }
     // When the window is known, report context utilization for this turn.
-    if let Some(window) = cfg.context_window {
-        let budget = ContextBudget::new(window, cfg.max_tokens);
-        kitsu_render::emit_context(state.meter.estimate(messages), budget.effective, window);
+    if !cfg.quiet {
+        if let Some(window) = cfg.context_window {
+            let budget = ContextBudget::new(window, cfg.max_tokens);
+            kitsu_render::emit_context(state.meter.estimate(messages), budget.effective, window);
+        }
     }
     result
 }
@@ -268,7 +276,11 @@ where
 
         // "Vibing kitsu" while we wait for the model. No-op off a TTY; cleared on
         // the first stream item (or on drop if the request errors).
-        let mut spinner = Some(kitsu_render::Spinner::start());
+        let mut spinner = if cfg.quiet {
+            None
+        } else {
+            Some(kitsu_render::Spinner::start())
+        };
 
         // 401/403 surface here (or as the first stream item) as a hard error.
         let mut stream = provider.chat_stream(req).await?;
@@ -376,7 +388,9 @@ where
         // Tool calls present: run each, feed result (or error) back as a tool msg.
         for tc in tool_calls {
             // Narrate the action (Claude-Code-style), e.g. `⏺ Read(deck1.md)`.
-            kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
+            if !cfg.quiet {
+                kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
+            }
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
             let (content, is_err) = match tools.run(&tc.tool_name, tc.args.clone()).await {
                 Ok(out) => {
@@ -399,7 +413,9 @@ where
                     )
                 }
             };
-            kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
+            if !cfg.quiet {
+                kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
+            }
             // Offload a large successful result to disk, leaving a re-readable
             // pointer, so one big result can't dominate a small window (Stage 2).
             let content = if is_err {
@@ -774,7 +790,9 @@ async fn compact_conversation<P>(
             // summary message — a structural reshape just like drop_old_exchanges,
             // so the anchor must not survive it either.
             meter.invalidate();
-            kitsu_render::compaction_boundary();
+            if !cfg.quiet {
+                kitsu_render::compaction_boundary();
+            }
         }
         Some((_, usage)) => {
             // Got a response (real API cost incurred) but unusable — still

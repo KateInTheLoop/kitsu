@@ -190,6 +190,7 @@ fn build_agent_config(
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
         compaction: compaction_mode(cli),
+        quiet: false,
     }
 }
 
@@ -519,6 +520,7 @@ async fn run_scripted(
     ctx: &CtxInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
+    registry: &Arc<subagent::AgentRegistry>,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
@@ -569,6 +571,7 @@ async fn run_scripted(
                 context_window,
                 setup.context_window_pinned,
                 &mut state,
+                registry,
             )
             .await;
             // Keep subagents in sync with any `/model` change in the script.
@@ -723,9 +726,12 @@ async fn run_chat(
         setup.model.clone(),
         setup.context_window,
     )));
+    // Registry of BACKGROUND subagents (Stage C), shared with the spawn_agent_bg /
+    // agent_result tools and the `/agents` command.
+    let agent_registry = subagent::AgentRegistry::new();
 
-    // The main tool set: base tools + `spawn_agent`, which delegates a task to a
-    // subagent running the base `sub_tools` in its own isolated context (Stage A).
+    // The main tool set: base tools + the spawn/agent tools, which delegate to
+    // subagents running the base `sub_tools` in their own isolated context.
     let mut tools = Registry::new();
     register_base_tools(&mut tools, &perms, &skillset, can_read, can_write);
     if can_read || can_write {
@@ -739,6 +745,7 @@ async fn run_chat(
                 skillset.index("")
             )
         };
+        // Stage A: synchronous single delegation.
         let (d, h) = subagent::spawn_agent_tool(
             setup.provider.clone(),
             sub_tools.clone(),
@@ -747,14 +754,29 @@ async fn run_chat(
             sub_system.clone(),
         );
         tools.register_with_descriptor(d, h);
-        // Batch form: fan several isolated subagents out in parallel (Stage B).
+        // Stage B: fan several isolated subagents out in parallel.
         let (d, h) = subagent::spawn_agents_tool(
             setup.provider.clone(),
             sub_tools.clone(),
-            sub_cfg,
+            sub_cfg.clone(),
+            live_mw.clone(),
+            sub_system.clone(),
+        );
+        tools.register_with_descriptor(d, h);
+        // Stage C: detached background subagent (runs quiet so it doesn't corrupt
+        // the prompt) + a tool to fetch its result by id.
+        let mut bg_cfg = sub_cfg;
+        bg_cfg.quiet = true;
+        let (d, h) = subagent::spawn_agent_bg_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
+            bg_cfg,
             live_mw.clone(),
             sub_system,
+            agent_registry.clone(),
         );
+        tools.register_with_descriptor(d, h);
+        let (d, h) = subagent::agent_result_tool(agent_registry.clone());
         tools.register_with_descriptor(d, h);
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
@@ -896,6 +918,7 @@ async fn run_chat(
             &ctx,
             &context_window,
             &live_mw,
+            &agent_registry,
         )
         .await;
     }
@@ -962,8 +985,20 @@ async fn run_chat(
     // If a first prompt was given, queue it as the first turn.
     let mut queued = first_prompt.map(|s| s.to_string());
     let prompt = kitsu_render::prompt_string();
+    // Report background-agent activity only when the running count changes, so
+    // the user notices work starting/finishing without a per-prompt spam line.
+    let mut last_running = 0usize;
 
     loop {
+        let running = agent_registry.running();
+        if running != last_running {
+            if running > 0 {
+                eprintln!("~ {running} background agent(s) running — /agents to check");
+            } else {
+                eprintln!("~ background agents finished — /agents for results");
+            }
+            last_running = running;
+        }
         let line = match queued.take() {
             Some(p) => p,
             None => match rl.readline(&prompt) {
@@ -996,6 +1031,7 @@ async fn run_chat(
                 &context_window,
                 setup.context_window_pinned,
                 &mut session_state,
+                &agent_registry,
             )
             .await;
             // Keep subagents in sync with any `/model` change (which may have
@@ -1059,6 +1095,7 @@ async fn handle_slash(
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
     state: &mut kitsu_core::AgentSessionState,
+    registry: &Arc<subagent::AgentRegistry>,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -1074,11 +1111,24 @@ async fn handle_slash(
                  /allow <path>  grant read access to a path (no more prompts there)\n  \
                  /allow-write <path>  grant write access to a path\n  /save <file>   write the \
                  last response to <file> (code blocks if present)\n  /context       show \
-                 context-window utilization\n  /clear         clear conversation (keeps system \
+                 context-window utilization\n  /agents [id]   list background agents (or one \
+                 result)\n  /clear         clear conversation (keeps system \
                  prompt)\n  /help          this help\n  /quit          exit\ncurrent model: {model}"
             );
         }
         "context" => render_context_command(model, messages, ctx),
+        "agents" => {
+            if arg.is_empty() {
+                eprintln!("{}", registry.list());
+            } else if let Ok(id) = arg.parse::<u64>() {
+                match registry.result(id) {
+                    Some(text) => eprintln!("#{id}:\n{text}"),
+                    None => eprintln!("no background agent #{id}"),
+                }
+            } else {
+                eprintln!("usage: /agents [id]");
+            }
+        }
         "skills" => {
             if skillset.is_empty() {
                 eprintln!(
