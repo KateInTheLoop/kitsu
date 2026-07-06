@@ -105,6 +105,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         temperature: None,
         max_tokens: None,
         compaction: crate::orchestrator::CompactionMode::Trim,
+        quiet: false,
     }
 }
 

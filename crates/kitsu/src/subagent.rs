@@ -7,6 +7,8 @@
 //! `spawn_agent` tool (depth-1), and its filesystem actions still go through the
 //! shared permission model — no privilege escalation.
 
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::StreamExt;
@@ -22,6 +24,11 @@ struct SpawnArgs {
 #[derive(serde::Deserialize)]
 struct SpawnManyArgs {
     tasks: Vec<String>,
+}
+
+#[derive(serde::Deserialize)]
+struct ResultArgs {
+    id: u64,
 }
 
 /// Cap on concurrent subagents in one `spawn_agents` call, so the model can't
@@ -40,6 +47,99 @@ const SUBAGENT_SYSTEM: &str = "You are a kitsu subagent handling ONE delegated t
 isolated context (you cannot see the parent conversation). Use your tools to complete it, then \
 reply with a concise, self-contained result the caller can use directly. Do not ask questions — \
 do the task with what you have.";
+
+/// Status of a background subagent (Stage C).
+pub enum AgentStatus {
+    Running,
+    Done(String),
+    Failed(String),
+}
+
+struct AgentRecord {
+    task: String,
+    status: AgentStatus,
+}
+
+/// Registry of background subagents, shared between `spawn_agent_bg`,
+/// `agent_result`, and the `/agents` command. Detached subagents update their
+/// record on completion; the user (via `/agents`) or the model (via
+/// `agent_result`) reads status/results back.
+#[derive(Default)]
+pub struct AgentRegistry {
+    agents: Mutex<HashMap<u64, AgentRecord>>,
+    next: AtomicU64,
+}
+
+impl AgentRegistry {
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self::default())
+    }
+
+    /// Register a new running agent, returning its id.
+    fn start(&self, task: String) -> u64 {
+        let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+        self.agents.lock().expect("agent registry").insert(
+            id,
+            AgentRecord {
+                task,
+                status: AgentStatus::Running,
+            },
+        );
+        id
+    }
+
+    /// Mark an agent done/failed with its result.
+    fn finish(&self, id: u64, result: Result<String, String>) {
+        if let Some(rec) = self.agents.lock().expect("agent registry").get_mut(&id) {
+            rec.status = match result {
+                Ok(r) => AgentStatus::Done(r),
+                Err(e) => AgentStatus::Failed(e),
+            };
+        }
+    }
+
+    /// Count of still-running background agents (for a prompt hint).
+    pub fn running(&self) -> usize {
+        self.agents
+            .lock()
+            .expect("agent registry")
+            .values()
+            .filter(|r| matches!(r.status, AgentStatus::Running))
+            .count()
+    }
+
+    /// One line per agent (`#id  [status]  task`), id-ordered, for `/agents`.
+    pub fn list(&self) -> String {
+        let g = self.agents.lock().expect("agent registry");
+        if g.is_empty() {
+            return "no background agents this session".to_string();
+        }
+        let mut ids: Vec<&u64> = g.keys().collect();
+        ids.sort();
+        ids.iter()
+            .map(|id| {
+                let rec = &g[id];
+                let tag = match &rec.status {
+                    AgentStatus::Running => "running",
+                    AgentStatus::Done(_) => "done",
+                    AgentStatus::Failed(_) => "failed",
+                };
+                format!("#{id}  [{tag}]  {}", rec.task)
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// The full result/status text for one agent, or `None` if unknown.
+    pub fn result(&self, id: u64) -> Option<String> {
+        let g = self.agents.lock().expect("agent registry");
+        g.get(&id).map(|rec| match &rec.status {
+            AgentStatus::Running => format!("agent #{id} is still running"),
+            AgentStatus::Done(r) => r.clone(),
+            AgentStatus::Failed(e) => format!("agent #{id} failed: {e}"),
+        })
+    }
+}
 
 /// Snapshot the current model + window into a runnable config (so a mid-session
 /// `/model` applies to every subagent spawned afterwards).
@@ -211,6 +311,90 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
     (descriptor, handler)
 }
 
+/// Build the `spawn_agent_bg` tool: start a subagent that runs DETACHED in the
+/// background and return its id immediately (Stage C). The subagent runs quiet
+/// (no terminal narration) so it doesn't corrupt the interactive prompt; its
+/// result is stored in `registry` and fetched later via `agent_result`/`/agents`.
+/// `sub_cfg` must already be quiet. Depth-1: the subagent's registry has no spawn
+/// tools.
+pub fn spawn_agent_bg_tool<P: Provider + 'static>(
+    provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    registry: Arc<AgentRegistry>,
+) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "spawn_agent_bg".to_string(),
+        description: "Start a subagent that runs in the BACKGROUND on a self-contained task and \
+                      return its id immediately (it does not block). Use it for long work the user \
+                      can keep chatting through; fetch the result later with agent_result(id), or \
+                      the user can run /agents. Give a complete, standalone task."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "task": {"type": "string", "description": "A complete, self-contained task for the background subagent"}
+            },
+            "required": ["task"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let provider = provider.clone();
+        let sub_tools = sub_tools.clone();
+        let sub_cfg = sub_cfg.clone();
+        let live = live.clone();
+        let extra_system = extra_system.clone();
+        let registry = registry.clone();
+        Box::pin(async move {
+            let a: SpawnArgs =
+                serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            let cfg = resolve_cfg(&sub_cfg, &live);
+            let id = registry.start(task_preview(&a.task));
+            // Detach: the subagent runs on the runtime while the parent continues.
+            tokio::spawn(async move {
+                let r = run_subagent(&provider, &sub_tools, &cfg, &extra_system, a.task).await;
+                registry.finish(id, r);
+            });
+            Ok(format!(
+                "Started background agent #{id}. It runs detached — fetch its result later with \
+                 agent_result({id}); the user can also run /agents to see status."
+            ))
+        })
+    });
+    (descriptor, handler)
+}
+
+/// Build the `agent_result` tool: fetch a background agent's status or result by
+/// id (returns "still running" until it finishes).
+pub fn agent_result_tool(registry: Arc<AgentRegistry>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "agent_result".to_string(),
+        description: "Fetch the status or result of a background subagent started with \
+                      spawn_agent_bg, by its id. Returns 'still running' until it finishes."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "id": {"type": "integer", "description": "The background agent id"}
+            },
+            "required": ["id"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let registry = registry.clone();
+        Box::pin(async move {
+            let a: ResultArgs =
+                serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            registry
+                .result(a.id)
+                .ok_or_else(|| ToolError::ExecError(format!("no background agent #{}", a.id)))
+        })
+    });
+    (descriptor, handler)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,6 +550,52 @@ mod tests {
             out.find("subagent 1").unwrap() < out.find("subagent 3").unwrap(),
             "stable task-order output"
         );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn spawn_agent_bg_registers_runs_detached_and_stores_result() {
+        use std::time::Duration;
+        let registry = AgentRegistry::new();
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let (desc, handler) = spawn_agent_bg_tool(
+            Arc::new(EchoProvider),
+            Arc::new(Registry::new()),
+            cfg,
+            live,
+            String::new(),
+            registry.clone(),
+        );
+        assert_eq!(desc.name, "spawn_agent_bg");
+        // Returns immediately with an id (does not block on the subagent).
+        let out = handler(r#"{"task":"do work"}"#.to_string())
+            .await
+            .expect("spawn should return an id");
+        assert!(out.contains("#1"), "returned the agent id: {out}");
+
+        // The detached subagent completes shortly; poll the registry for it.
+        let mut final_result = None;
+        for _ in 0..200 {
+            let r = registry.result(1).expect("agent #1 exists");
+            if !r.contains("still running") {
+                final_result = Some(r);
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let r = final_result.expect("background agent should finish");
+        assert!(r.contains("echo:do work"), "stored result: {r}");
+        assert_eq!(registry.running(), 0, "no agents still running");
+
+        // agent_result tool fetches it by id; unknown id errors.
+        let (_d, rh) = agent_result_tool(registry.clone());
+        let got = rh(r#"{"id":1}"#.to_string()).await.unwrap();
+        assert!(got.contains("echo:do work"));
+        assert!(rh(r#"{"id":999}"#.to_string()).await.is_err());
+        // /agents-style listing shows the finished agent.
+        assert!(registry.list().contains("#1"));
+        assert!(registry.list().contains("[done]"));
     }
 
     #[tokio::test]
