@@ -460,3 +460,46 @@ async fn test_model_context_length_none_without_models_path() {
     let provider = provider_for("http://127.0.0.1:0".to_string());
     assert_eq!(provider.model_context_length("m").await, None);
 }
+
+/// Regression: plain substring containment could bind a configured model to an
+/// unrelated, differently-sized entry (e.g. "gpt-4" matching "gpt-4-turbo").
+/// When more than one entry loosely matches, the ambiguity must NOT be resolved
+/// by picking the first — that's exactly the silent-wrong-window bug.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_ambiguous_loose_match_gives_up() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"gpt-4-turbo","context_length":128000},{"id":"gpt-4-mini","context_length":8192}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // "gpt-4" loosely matches BOTH entries (delimiter-bounded on '-' in each) —
+    // ambiguous, and there's more than one entry total, so must give up (None)
+    // rather than silently binding to whichever came first.
+    assert_eq!(provider.model_context_length("gpt-4").await, None);
+}
+
+/// A loose match that is uniquely resolvable (only one entry matches) is still
+/// useful — e.g. a configured short alias for one specific served model id.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_unique_loose_match_still_resolves() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"my-model-v2","context_length":32768},{"id":"other-model","context_length":4096}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // "my-model" is not an exact id, but loosely (delimiter-bounded) matches
+    // ONLY "my-model-v2" — unambiguous, so it should still resolve.
+    assert_eq!(provider.model_context_length("my-model").await, Some(32768));
+}

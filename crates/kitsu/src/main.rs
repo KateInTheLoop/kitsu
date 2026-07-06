@@ -6,6 +6,8 @@ mod config;
 mod llms;
 mod skills;
 
+use std::cell::Cell;
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -14,7 +16,7 @@ use clap::Parser;
 use cli::{Cli, Command};
 use config::{Config, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
-use kitsu_core::{run_agent_turn, AgentConfig, CompactionMode};
+use kitsu_core::{run_agent_turn, run_agent_turn_with_state, AgentConfig, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{ChatMessage, Provider, ProviderError};
@@ -105,6 +107,12 @@ struct ChatSetup {
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
+    /// True when `context_window` came from an explicit `--context-window` flag
+    /// or the gateway profile's `context_window`, rather than `/v1/models`
+    /// discovery. A pinned window is a user/config declaration that overrides
+    /// "any value discovered from `/v1/models`" (see the flag's doc comment) —
+    /// `/model` must not silently replace it with fresh auto-discovery.
+    context_window_pinned: bool,
 }
 
 /// Concatenate the bodies of the skills named via `--skill` into one context
@@ -138,6 +146,29 @@ fn compaction_mode(cli: &Cli) -> CompactionMode {
     }
 }
 
+/// Build the per-turn `AgentConfig` shared by `ask`, scripted runs, and
+/// interactive chat, from a single place — so a future field/default change
+/// can't silently apply to only some call sites (as `ask`'s hardcoded
+/// `offload_dir: None` very nearly diverged from the other two paths).
+fn build_agent_config(
+    model: String,
+    cli: &Cli,
+    context_window: Option<u64>,
+    offload_dir: Option<std::path::PathBuf>,
+) -> AgentConfig {
+    AgentConfig {
+        model,
+        max_rounds: cli.max_rounds,
+        max_context_bytes: 128 * 1024,
+        context_window,
+        offload_dir,
+        stream: !cli.no_stream,
+        temperature: cli.temperature,
+        max_tokens: cli.max_output_tokens,
+        compaction: compaction_mode(cli),
+    }
+}
+
 /// Removes the per-session offload scratch dir (and its files) when the chat
 /// session ends, so we don't leak temp dirs into `/tmp`.
 struct OffloadDirGuard(std::path::PathBuf);
@@ -168,7 +199,11 @@ impl rustyline::highlight::Highlighter for PasteCollapse {
             Some((first, _)) => {
                 let n = line.split('\n').count();
                 let preview: String = first.chars().take(48).collect();
-                let ell = if first.chars().count() > 48 { "…" } else { "" };
+                let ell = if first.chars().count() > 48 {
+                    "…"
+                } else {
+                    ""
+                };
                 std::borrow::Cow::Owned(format!("{preview}{ell} [pasted {n} lines]"))
             }
             None => std::borrow::Cow::Borrowed(line),
@@ -209,15 +244,21 @@ impl CtxEntry {
 /// Context-window info for `/context`, assembled once per session. `provenance`
 /// records how the static context (system prompt sources + tool schemas) was
 /// built, so `/context` can show WHAT loaded, WHY, its tokens, and the policy.
+/// `window` is shared with the `AgentConfig` builder (see `build_agent_config`
+/// call sites) via a `Cell` so `/model` can update it in place for both.
 struct CtxInfo {
-    window: Option<u64>,
+    window: Rc<Cell<Option<u64>>>,
     max_tokens: Option<u32>,
     provenance: Vec<CtxEntry>,
 }
 
-fn ctx_info(setup: &ChatSetup, cli: &Cli, provenance: Vec<CtxEntry>) -> CtxInfo {
+fn ctx_info(
+    context_window: Rc<Cell<Option<u64>>>,
+    cli: &Cli,
+    provenance: Vec<CtxEntry>,
+) -> CtxInfo {
     CtxInfo {
-        window: setup.context_window,
+        window: context_window,
         max_tokens: cli.max_output_tokens,
         provenance,
     }
@@ -228,9 +269,10 @@ fn ctx_info(setup: &ChatSetup, cli: &Cli, provenance: Vec<CtxEntry>) -> CtxInfo 
 /// `kitsu-context:` line carries the usage-anchored number; this is an estimate.
 fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) {
     let b = ContextMeter::new().breakdown(messages);
-    let window = ctx.window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let ctx_window = ctx.window.get();
+    let window = ctx_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
     let budget = ContextBudget::new(window, ctx.max_tokens);
-    let note = if ctx.window.is_some() {
+    let note = if ctx_window.is_some() {
         ""
     } else {
         "default — set context_window or --context-window"
@@ -255,6 +297,57 @@ fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) 
     let prov_total: u64 = ctx.provenance.iter().map(|e| e.tokens).sum();
     let used = prov_total + b.user + b.assistant + b.tool_results;
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
+}
+
+/// How long a discovered context window is trusted before re-discovering. A
+/// model's window essentially never changes, so this just spares every later
+/// invocation of the same gateway+model a `/v1/models` round-trip purely to
+/// re-learn a number we already know.
+const CONTEXT_WINDOW_CACHE_TTL_SECS: u64 = 24 * 60 * 60;
+
+/// On-disk cache for discovered context windows, keyed by `"<base_url>|<model>"`.
+/// Without this, `build_setup` paid a blocking `/v1/models` round-trip on
+/// *every single* `ask`/`chat` invocation whenever `context_window` wasn't
+/// pre-configured — doubling perceived startup latency on a slow gateway, even
+/// for one-off `ask` calls where the result is immediately thrown away.
+#[derive(serde::Serialize, serde::Deserialize, Default)]
+struct ContextWindowCache {
+    #[serde(default)]
+    entries: std::collections::BTreeMap<String, (u64, u64)>,
+}
+
+fn context_window_cache_path(cli: &Cli) -> Option<std::path::PathBuf> {
+    Config::resolve_path(cli.config.as_deref())
+        .parent()
+        .map(|p| p.join("context_window_cache.json"))
+}
+
+fn unix_now() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+fn read_cached_context_window(path: &std::path::Path, key: &str) -> Option<u64> {
+    let text = std::fs::read_to_string(path).ok()?;
+    let cache: ContextWindowCache = serde_json::from_str(&text).ok()?;
+    let (window, fetched_at) = cache.entries.get(key)?;
+    (unix_now().saturating_sub(*fetched_at) < CONTEXT_WINDOW_CACHE_TTL_SECS).then_some(*window)
+}
+
+fn write_cached_context_window(path: &std::path::Path, key: &str, window: u64) {
+    let mut cache: ContextWindowCache = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|t| serde_json::from_str(&t).ok())
+        .unwrap_or_default();
+    cache.entries.insert(key.to_string(), (window, unix_now()));
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    if let Ok(json) = serde_json::to_string(&cache) {
+        let _ = std::fs::write(path, json);
+    }
 }
 
 /// Resolve config + gateway profile and build the provider/auth/model. Emits the
@@ -292,18 +385,36 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         eprintln!("warning: gateway token expired (since {since}) — sending anyway. {hint}");
     }
 
-    // Resolve the context window: explicit flag → profile → best-effort
-    // /v1/models discovery. Left None when nothing reports it (the orchestrator
-    // then falls back to the coarse byte budget).
+    // Resolve the context window: explicit flag → profile → cached discovery →
+    // fresh /v1/models discovery. Left None when nothing reports it (the
+    // orchestrator then falls back to the coarse byte budget).
+    let context_window_pinned = cli.context_window.or(gateway.context_window).is_some();
     let context_window = match cli.context_window.or(gateway.context_window) {
         Some(w) => Some(w),
-        None => provider.model_context_length(&model).await,
+        None => {
+            let cache_key = format!("{}|{model}", gateway.base_url);
+            let cache_path = context_window_cache_path(cli);
+            let cached = cache_path
+                .as_deref()
+                .and_then(|p| read_cached_context_window(p, &cache_key));
+            match cached {
+                Some(w) => Some(w),
+                None => {
+                    let discovered = provider.model_context_length(&model).await;
+                    if let (Some(w), Some(path)) = (discovered, cache_path.as_deref()) {
+                        write_cached_context_window(path, &cache_key, w);
+                    }
+                    discovered
+                }
+            }
+        }
     };
 
     Ok(ChatSetup {
         provider,
         model,
         context_window,
+        context_window_pinned,
     })
 }
 
@@ -326,17 +437,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     }
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
-    let agent_cfg = AgentConfig {
-        model: setup.model.clone(),
-        max_rounds: cli.max_rounds,
-        max_context_bytes: 128 * 1024,
-        context_window: setup.context_window,
-        offload_dir: None,
-        stream: !cli.no_stream,
-        temperature: cli.temperature,
-        max_tokens: cli.max_output_tokens,
-        compaction: compaction_mode(cli),
-    };
+    let agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
 
     match run_agent_turn(&setup.provider, &tools, &mut messages, &agent_cfg).await {
         Ok(text) => {
@@ -392,9 +493,14 @@ async fn run_scripted(
     offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
     ctx: &CtxInfo,
+    context_window: &Rc<Cell<Option<u64>>>,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
+    // One session state for the whole script — the context-meter anchor and
+    // compaction circuit breaker persist across turns, matching interactive chat
+    // (a script is a multi-turn session, not a series of independent one-shots).
+    let mut state = kitsu_core::AgentSessionState::default();
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
     while idx < lines.len() {
@@ -417,6 +523,8 @@ async fn run_scripted(
                 cli,
                 &block.join("\n"),
                 offload_dir,
+                &mut state,
+                context_window,
             )
             .await;
             continue;
@@ -425,12 +533,36 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(rest, messages, model, &setup.provider, perms, ctx, skillset).await {
+            match handle_slash(
+                rest,
+                messages,
+                model,
+                &setup.provider,
+                perms,
+                ctx,
+                skillset,
+                context_window,
+                setup.context_window_pinned,
+                &mut state,
+            )
+            .await
+            {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
         }
-        run_scripted_turn(setup, tools, messages, model, cli, trimmed, offload_dir).await;
+        run_scripted_turn(
+            setup,
+            tools,
+            messages,
+            model,
+            cli,
+            trimmed,
+            offload_dir,
+            &mut state,
+            context_window,
+        )
+        .await;
     }
     Ok(())
 }
@@ -446,21 +578,18 @@ async fn run_scripted_turn(
     cli: &Cli,
     input: &str,
     offload_dir: &Option<std::path::PathBuf>,
+    state: &mut kitsu_core::AgentSessionState,
+    context_window: &Rc<Cell<Option<u64>>>,
 ) {
     println!("user> {input}");
     messages.push(ChatMessage::user(input));
-    let cfg = AgentConfig {
-        model: model.to_string(),
-        max_rounds: cli.max_rounds,
-        max_context_bytes: 128 * 1024,
-        context_window: setup.context_window,
-        offload_dir: offload_dir.clone(),
-        stream: !cli.no_stream,
-        temperature: cli.temperature,
-        max_tokens: cli.max_output_tokens,
-        compaction: compaction_mode(cli),
-    };
-    match run_agent_turn(&setup.provider, tools, messages, &cfg).await {
+    let cfg = build_agent_config(
+        model.to_string(),
+        cli,
+        context_window.get(),
+        offload_dir.clone(),
+    );
+    match run_agent_turn_with_state(&setup.provider, tools, messages, &cfg, state).await {
         Ok(text) => {
             if cli.no_stream {
                 println!("{text}");
@@ -483,14 +612,16 @@ enum TurnOutcome {
 
 /// Run one turn, racing it against Ctrl+C. The turn future is awaited directly
 /// (never spawned), so a Ctrl+C drops it — and with it the in-flight HTTP
-/// request — with no leaked task (design §10).
+/// request — with no leaked task (design §10). `state` persists the context-meter
+/// anchor and compaction circuit breaker across the session's turns.
 async fn run_turn_cancellable(
     provider: &OpenAICompatProvider,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
+    state: &mut kitsu_core::AgentSessionState,
 ) -> TurnOutcome {
-    let turn = run_agent_turn(provider, tools, messages, cfg);
+    let turn = run_agent_turn_with_state(provider, tools, messages, cfg, state);
     tokio::pin!(turn);
     tokio::select! {
         res = &mut turn => TurnOutcome::Completed(res),
@@ -581,19 +712,22 @@ async fn run_chat(
     let _offload_guard = offload_dir.clone().map(OffloadDirGuard);
 
     let mut model = setup.model.clone();
-    let context_window = setup.context_window;
+    // Shared with `ctx` (for `/context`) and updated in place by `/model`, so
+    // switching models doesn't leave every subsequent turn budgeting against
+    // the OLD model's window — a stale, larger window would under-trim and the
+    // gateway would reject the oversized request instead of kitsu proactively
+    // trimming to fit the new model's real limit.
+    let context_window = Rc::new(Cell::new(setup.context_window));
     let base_offload = offload_dir.clone();
-    let base_cfg = move |model: String, cli: &Cli| AgentConfig {
-        model,
-        max_rounds: cli.max_rounds,
-        max_context_bytes: 128 * 1024,
-        context_window,
-        offload_dir: base_offload.clone(),
-        stream: !cli.no_stream,
-        temperature: cli.temperature,
-        max_tokens: cli.max_output_tokens,
-        compaction: compaction_mode(cli),
+    let base_cfg = {
+        let context_window = context_window.clone();
+        move |model: String, cli: &Cli| {
+            build_agent_config(model, cli, context_window.get(), base_offload.clone())
+        }
     };
+    // Persists the context-meter anchor and compaction circuit breaker across
+    // every turn of this interactive/one-shot chat session.
+    let mut session_state = kitsu_core::AgentSessionState::default();
 
     // Assemble the system prompt while recording provenance (design §3): each
     // static context source with its token cost, policy, and reason, so `/context`
@@ -676,7 +810,7 @@ async fn run_chat(
             tool_names.join(", "),
         ));
     }
-    let ctx = ctx_info(&setup, cli, provenance);
+    let ctx = ctx_info(context_window.clone(), cli, provenance);
 
     let mut messages = vec![ChatMessage::system(system)];
 
@@ -694,6 +828,7 @@ async fn run_chat(
             &offload_dir,
             &skillset,
             &ctx,
+            &context_window,
         )
         .await;
     }
@@ -791,6 +926,9 @@ async fn run_chat(
                 &perms,
                 &ctx,
                 &skillset,
+                &context_window,
+                setup.context_window_pinned,
+                &mut session_state,
             )
             .await
             {
@@ -801,7 +939,15 @@ async fn run_chat(
 
         messages.push(ChatMessage::user(line));
         let cfg = base_cfg(model.clone(), cli);
-        match run_turn_cancellable(&setup.provider, &tools, &mut messages, &cfg).await {
+        match run_turn_cancellable(
+            &setup.provider,
+            &tools,
+            &mut messages,
+            &cfg,
+            &mut session_state,
+        )
+        .await
+        {
             TurnOutcome::Completed(Ok(text)) => {
                 kitsu_render::finish_line();
                 // The model can return an empty completion for vague inputs;
@@ -831,6 +977,7 @@ enum SlashResult {
 }
 
 /// Handle a slash command (the leading `/` already stripped).
+#[allow(clippy::too_many_arguments)]
 async fn handle_slash(
     cmd: &str,
     messages: &mut Vec<ChatMessage>,
@@ -839,6 +986,9 @@ async fn handle_slash(
     perms: &Permissions,
     ctx: &CtxInfo,
     skillset: &skills::SkillSet,
+    context_window: &Rc<Cell<Option<u64>>>,
+    context_window_pinned: bool,
+    state: &mut kitsu_core::AgentSessionState,
 ) -> SlashResult {
     let mut parts = cmd.splitn(2, char::is_whitespace);
     let name = parts.next().unwrap_or("");
@@ -938,6 +1088,13 @@ async fn handle_slash(
             if let Some(s) = system {
                 messages.push(s);
             }
+            // The context-meter anchor describes token cost for the messages we
+            // just wiped, and the summarize circuit breaker belongs to that old
+            // conversation too — starting fresh means both must reset, not carry
+            // over and silently mis-budget (or permanently skip Summarize for) an
+            // unrelated new conversation.
+            state.meter.invalidate();
+            state.compact_failures = 0;
             eprintln!("~ conversation cleared");
         }
         "model" => {
@@ -950,7 +1107,33 @@ async fn handle_slash(
             } else {
                 // Model validity is gateway-defined; accept any non-empty id.
                 *model = arg.to_string();
-                eprintln!("~ switched to {model}");
+                // The meter's anchor is a real `prompt_tokens` count measured
+                // under the OLD model's tokenizer; a different model can tokenize
+                // the same text differently, so that anchor must not be trusted
+                // for the new one (same reasoning as /clear, just below in this
+                // match). The summarize circuit breaker is also model-specific —
+                // don't let a different model inherit "summarization is broken".
+                state.meter.invalidate();
+                state.compact_failures = 0;
+                // An explicit --context-window flag or gateway-profile
+                // context_window is a user/config declaration that overrides
+                // discovery entirely (see the flag's doc comment) — switching
+                // models must not silently replace it with fresh auto-discovery.
+                // Only re-resolve when the window was never pinned in the first
+                // place: carrying over the OLD model's discovered window (or
+                // lack thereof) would otherwise budget against the wrong limit.
+                let note = if context_window_pinned {
+                    " (context window pinned by --context-window / config; unchanged)".to_string()
+                } else {
+                    let discovered = provider.model_context_length(model).await;
+                    context_window.set(discovered);
+                    match discovered {
+                        Some(w) => format!(" (context window: {w} tokens)"),
+                        None => " (context window unknown — falling back to the byte budget)"
+                            .to_string(),
+                    }
+                };
+                eprintln!("~ switched to {model}{note}");
             }
         }
         other => {
@@ -1100,9 +1283,19 @@ fn shorten_home(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().to_string();
     if let Some(home) = std::env::var_os("HOME") {
         let home = home.to_string_lossy();
+        let home = home.trim_end_matches('/');
         if !home.is_empty() {
-            if let Some(rest) = s.strip_prefix(home.as_ref()) {
-                return format!("~{rest}");
+            // Require a path-segment boundary after the home prefix (exact match,
+            // or followed by '/') so a sibling directory that merely SHARES the
+            // home dir as a string prefix (e.g. HOME=/home/mmpg and cwd
+            // /home/mmpg2/project) isn't corrupted into a bogus `~2/project`.
+            if let Some(rest) = s.strip_prefix(home) {
+                if rest.is_empty() {
+                    return "~".to_string();
+                }
+                if let Some(rest) = rest.strip_prefix('/') {
+                    return format!("~/{rest}");
+                }
             }
         }
     }
@@ -1182,7 +1375,10 @@ mod tests {
         assert!(out.contains("first line here"), "keeps a preview of line 1");
         assert!(out.contains("[pasted 3 lines]"), "shows the count");
         assert!(!out.contains("second"), "hides the pasted body");
-        assert!(h.highlight_char("a\nb", 0, false), "re-highlights when multi-line");
+        assert!(
+            h.highlight_char("a\nb", 0, false),
+            "re-highlights when multi-line"
+        );
     }
 
     /// Regression: a sibling directory that merely SHARES the home dir as a

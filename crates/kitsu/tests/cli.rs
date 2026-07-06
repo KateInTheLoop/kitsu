@@ -746,3 +746,131 @@ async fn test_ask_skill_preloaded_reaches_request() {
         "the preloaded skill body must reach the model"
     );
 }
+
+/// Regression: `/model <name>` must re-resolve the context window for the NEW
+/// model instead of keeping the OLD model's (session-start-discovered) window.
+/// A stale, larger window would under-trim relative to the new model's real
+/// limit and let the gateway reject an oversized request instead of kitsu
+/// proactively trimming to fit.
+#[tokio::test]
+#[serial]
+async fn test_model_switch_reresolves_context_window() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Both models are served by the SAME /v1/models catalog (typical of one
+    // gateway), with distinct context lengths — switching models must pick up
+    // the new entry, not keep reporting the old one.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"object":"list","data":[{"id":"alpha-model","context_length":4096},{"id":"beta-model","context_length":32768}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{base_url}"
+chat_path = "{CHAT_PATH}"
+models_path = "/v1/models"
+model = "alpha-model"
+auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    let script = "/model beta-model\n/context\n";
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, script).unwrap();
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            // The switch itself reports the freshly-discovered window...
+            .stderr(predicate::str::contains("switched to beta-model"))
+            .stderr(predicate::str::contains("context window: 32768"))
+            // ...and /context reflects it too, not the stale alpha-model window.
+            .stderr(predicate::str::contains("window: 32768"))
+            .stderr(predicate::str::contains("window: 4096").not());
+    })
+    .await
+    .expect("join");
+}
+
+/// Regression: an explicit `context_window` (equivalent to `--context-window`)
+/// is a user/config declaration that overrides discovery entirely — `/model`
+/// must NOT silently replace it with a freshly `/v1/models`-discovered value.
+#[tokio::test]
+#[serial]
+async fn test_model_switch_keeps_pinned_context_window() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // If the pin were ignored, /model would discover THIS (different) value.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"object":"list","data":[{"id":"alpha-model","context_length":4096},{"id":"beta-model","context_length":9999}]}"#,
+        ))
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{base_url}"
+chat_path = "{CHAT_PATH}"
+models_path = "/v1/models"
+model = "alpha-model"
+context_window = 1234
+auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    let script = "/model beta-model\n/context\n";
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, script).unwrap();
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("switched to beta-model"))
+            .stderr(predicate::str::contains("pinned"))
+            // /context must still show the pinned window, never the discovered one.
+            .stderr(predicate::str::contains("window: 1234"))
+            .stderr(predicate::str::contains("window: 9999").not());
+    })
+    .await
+    .expect("join");
+}

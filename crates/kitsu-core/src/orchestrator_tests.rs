@@ -965,7 +965,7 @@ async fn enforce_budget_token_path_elides_when_window_set() {
     let mut cfg = cfg(10);
     cfg.context_window = Some(200); // effective ~100, target ~80
     cfg.max_tokens = Some(64);
-    let meter = ContextMeter::new(); // no anchor -> full estimate
+    let mut meter = ContextMeter::new(); // no anchor -> full estimate
 
     let mut msgs = vec![
         ChatMessage::system("sys"),
@@ -973,7 +973,18 @@ async fn enforce_budget_token_path_elides_when_window_set() {
         ChatMessage::tool("id1", "z".repeat(8000).as_str()), // huge
     ];
     let mut failures = 0u32;
-    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
     assert!(msgs[2].content.contains("elided"));
     let total: u64 = msgs.iter().map(message_tokens).sum();
     let target = crate::context::ContextBudget::new(200, Some(64)).target;
@@ -990,14 +1001,25 @@ async fn enforce_budget_byte_path_when_window_unset() {
     let mut cfg = cfg(10);
     cfg.context_window = None; // byte fallback
     cfg.max_context_bytes = 100;
-    let meter = ContextMeter::new();
+    let mut meter = ContextMeter::new();
 
     let mut msgs = vec![
         ChatMessage::system("sys"),
         ChatMessage::tool("id1", "b".repeat(500).as_str()),
     ];
     let mut failures = 0u32;
-    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
     assert!(
         msgs[1].content.contains("elided"),
         "byte path should still trim"
@@ -1080,7 +1102,7 @@ async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
     let mut cfg = cfg(10);
     cfg.context_window = Some(400);
     cfg.max_tokens = Some(64);
-    let meter = ContextMeter::new();
+    let mut meter = ContextMeter::new();
 
     // Many big NON-tool turns (elision can't help) across several exchanges.
     let mut msgs = vec![ChatMessage::system("sys")];
@@ -1095,7 +1117,18 @@ async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
     }
     let before: u64 = msgs.iter().map(message_tokens).sum();
     let mut failures = 0u32;
-    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
     let after: u64 = msgs.iter().map(message_tokens).sum();
     assert!(
         after < before,
@@ -1164,7 +1197,7 @@ async fn compaction_summarize_rebuilds_history_with_summary() {
     cfg.context_window = Some(400);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
-    let meter = ContextMeter::new();
+    let mut meter = ContextMeter::new();
 
     let mut msgs = vec![ChatMessage::system("sys")];
     for k in 0..5 {
@@ -1177,7 +1210,18 @@ async fn compaction_summarize_rebuilds_history_with_summary() {
         ));
     }
     let mut failures = 0u32;
-    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
 
     assert_eq!(msgs[0].content, "sys", "system kept");
     assert!(
@@ -1205,7 +1249,7 @@ async fn compaction_falls_back_to_drop_on_empty_summary() {
     cfg.context_window = Some(400);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
-    let meter = ContextMeter::new();
+    let mut meter = ContextMeter::new();
 
     let mut msgs = vec![ChatMessage::system("sys")];
     for k in 0..5 {
@@ -1219,12 +1263,359 @@ async fn compaction_falls_back_to_drop_on_empty_summary() {
     }
     let before = msgs.len();
     let mut failures = 0u32;
-    enforce_context_budget(&provider, &mut msgs, &cfg, &meter, &mut failures).await;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
 
     assert_eq!(failures, 1, "empty summary trips the breaker once");
     assert!(msgs.len() < before, "still shrank by dropping");
     assert!(
         msgs.iter().any(|m| m.content.contains("trimmed to fit")),
         "drop marker present (fell back to drop)"
+    );
+}
+
+// --- regressions: drop_old_exchanges underflow, offload-pointer survival,
+// tool-schema token accounting -----------------------------------------------
+
+/// `total` starts far smaller than a single exchange's naive `size` estimate —
+/// mirrors the real bug: an anchored `total` (real API `prompt_tokens`) can be
+/// smaller than what the per-message heuristic computes for a dense exchange.
+/// A plain `total -= sum` would panic (debug, overflow checks on) or wrap to
+/// u64::MAX (release), which would then keep the `while total > target` loop
+/// running and drop every droppable exchange instead of stopping cleanly.
+#[test]
+fn drop_old_exchanges_does_not_underflow_when_per_exchange_estimate_exceeds_total() {
+    use crate::orchestrator::drop_old_exchanges;
+    use kitsu_providers::ChatMessage;
+
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..6 {
+        msgs.push(ChatMessage::user(format!("q{k}").as_str()));
+        msgs.push(ChatMessage::assistant(format!("a{k}").as_str(), vec![]));
+    }
+    // Deliberately dwarfs the tiny starting `total` of 10.
+    let huge_size = |_: &ChatMessage| 1_000_000u64;
+    drop_old_exchanges(&mut msgs, 10, 5, huge_size); // must not panic
+
+    assert!(
+        msgs.iter().any(|m| m.content.contains("trimmed to fit")),
+        "should still drop at least the oldest exchange"
+    );
+    assert!(
+        msgs.iter().any(|m| m.content.contains("q5")),
+        "the most recent exchange must survive, not be wiped out by an underflow-driven over-drop"
+    );
+    assert!(
+        msgs.iter().any(|m| m.content.contains("q4")),
+        "KEEP_RECENT_EXCHANGES must still be honored"
+    );
+}
+
+/// An already-offloaded tool result (a `maybe_offload` pointer) must keep its
+/// on-disk path when it needs to be elided further — replacing it with the
+/// generic "[older tool output elided]" stub would strand the file: the model
+/// can no longer `fs_read_file` a path it can't see anymore.
+#[test]
+fn trim_tool_results_preserves_offload_pointer_but_drops_preview() {
+    use crate::orchestrator::{maybe_offload, trim_tool_results};
+    use kitsu_providers::ChatMessage;
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(20_000);
+    let pointer = maybe_offload(big, "call-1", Some(dir.path()));
+    assert!(
+        pointer.contains("saved to"),
+        "sanity: got an offload pointer"
+    );
+    assert!(
+        pointer.contains("Preview:"),
+        "sanity: pointer has a preview body"
+    );
+
+    let mut msgs = vec![
+        ChatMessage::user("q"),
+        ChatMessage::tool("call-1", pointer.as_str()),
+        ChatMessage::user("more recent question"),
+    ];
+    let size = |m: &ChatMessage| m.byte_size() as u64;
+    let total: u64 = msgs.iter().map(size).sum();
+    // Impossibly small limit forces elision.
+    trim_tool_results(&mut msgs, total, 1, size);
+
+    let after = &msgs[1].content;
+    assert!(
+        after.contains("saved to"),
+        "the on-disk pointer must survive re-elision: {after}"
+    );
+    assert!(
+        !after.contains("Preview:"),
+        "the preview body should be dropped to actually free space: {after}"
+    );
+    assert!(
+        after.len() < pointer.len(),
+        "elided form must still be smaller than the original pointer+preview"
+    );
+}
+
+/// Re-eliding a message that's already just the bare pointer line (no preview
+/// left) must be a no-op — otherwise repeated elision passes could still churn
+/// or (if ever implemented carelessly) lose the pointer on a second pass.
+#[test]
+fn elided_tool_stub_is_idempotent_on_a_bare_pointer() {
+    use crate::orchestrator::elided_tool_stub;
+    use kitsu_providers::ChatMessage;
+
+    let bare = ChatMessage::tool(
+        "id",
+        "[tool output 5.0 KB — full result saved to /tmp/x.txt. Re-read it (or a line range) \
+         with fs_read_file on that path.]",
+    );
+    let stub = elided_tool_stub(&bare);
+    assert_eq!(
+        stub.content, bare.content,
+        "an already-minimal pointer must be left exactly as-is"
+    );
+}
+
+/// Regression: an ordinary tool result that happens to contain the phrase
+/// "saved to" (e.g. a build tool's own log output) must NOT be mistaken for a
+/// `maybe_offload` pointer — detection is anchored on the exact prefix
+/// `maybe_offload` emits, not a bare substring match, so this collapses to the
+/// normal generic elision stub instead of impersonating a (bogus) pointer.
+#[test]
+fn elided_tool_stub_does_not_false_positive_on_ordinary_saved_to_text() {
+    use crate::orchestrator::elided_tool_stub;
+    use kitsu_providers::ChatMessage;
+
+    let ordinary = ChatMessage::tool(
+        "id",
+        "Compiling project...\nOutput saved to build/out.js\nDone in 1.2s",
+    );
+    let stub = elided_tool_stub(&ordinary);
+    assert_eq!(
+        stub.content, "[older tool output elided]",
+        "ordinary output containing 'saved to' must get the generic stub, not be \
+         mistaken for a recoverable offload pointer"
+    );
+}
+
+/// Budgeting must count the tools' advertised JSON schema — real overhead on
+/// every request — not just the conversation messages, when there's no usage
+/// anchor to fall back on (the un-anchored, cold-estimate case).
+#[tokio::test]
+async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::enforce_context_budget;
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![]);
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(200); // target ~80 (see enforce_budget_token_path test)
+    cfg.max_tokens = Some(64);
+    let mut meter = ContextMeter::new(); // no anchor -> cold estimate
+
+    let mut tools = Registry::new();
+    // A large schema (~2000 chars, ~500+ tokens) that alone blows the ~80 target.
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "big_tool".to_string(),
+            description: "d".repeat(2000),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let schema_json = serde_json::to_string(tools.descriptors()).unwrap();
+
+    let mut msgs = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q"),
+        // Small enough that the conversation ALONE stays well under the target;
+        // large enough that eliding it is a real (not stub-inflating) win.
+        ChatMessage::tool("id1", "z".repeat(200).as_str()),
+    ];
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        &schema_json,
+        true,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
+
+    assert!(
+        msgs[2].content.contains("elided"),
+        "schema overhead must count toward the budget even though the conversation alone doesn't"
+    );
+}
+
+/// When the meter IS anchored (a real `prompt_tokens` from a past request that
+/// already included the schemas sent that round), the schema estimate must NOT
+/// be added again — double-counting would trigger needless trimming/dropping.
+#[tokio::test]
+async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::enforce_context_budget;
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![]);
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(1000);
+    cfg.max_tokens = None; // reserve=500 -> effective=500 -> buffer=100 -> target=400
+
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "big_tool".to_string(),
+            description: "d".repeat(2000), // ~500+ tokens if double-counted
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let schema_json = serde_json::to_string(tools.descriptors()).unwrap();
+
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..3 {
+        msgs.push(ChatMessage::user(format!("q{k}").as_str()));
+        msgs.push(ChatMessage::assistant(format!("a{k}").as_str(), vec![]));
+    }
+    let sent_len = msgs.len();
+    let mut meter = ContextMeter::new();
+    // Real usage for exactly these messages was 300 tokens — comfortably under
+    // the 400 target on its own (and already reflects that round's schema cost,
+    // hence `had_schema: true`).
+    meter.record(300, sent_len, true);
+
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        &schema_json,
+        true,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
+
+    assert_eq!(
+        msgs.len(),
+        sent_len,
+        "anchored estimate must not double-count schema tokens and trigger a needless drop"
+    );
+}
+
+/// The compaction summarizer issues an extra `chat_stream` call outside the
+/// main round loop; its real token cost must be folded into the turn's usage
+/// so `kitsu-usage:` (cost reporting) doesn't silently under-report spend.
+#[tokio::test]
+async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{enforce_context_budget, CompactionMode};
+    use kitsu_providers::{ChatMessage, Usage};
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("SUMMARY: earlier work on foo.rs".to_string()),
+        ChatDelta::Usage(Usage {
+            prompt_tokens: 111,
+            completion_tokens: 22,
+            total_tokens: 133,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut cfg = cfg(10);
+    cfg.context_window = Some(400);
+    cfg.max_tokens = Some(64);
+    cfg.compaction = CompactionMode::Summarize;
+    let mut meter = ContextMeter::new();
+
+    let mut msgs = vec![ChatMessage::system("sys")];
+    for k in 0..5 {
+        msgs.push(ChatMessage::user(
+            format!("q{k} {}", "y".repeat(300)).as_str(),
+        ));
+        msgs.push(ChatMessage::assistant(
+            format!("a{k} {}", "z".repeat(300)).as_str(),
+            vec![],
+        ));
+    }
+    let mut failures = 0u32;
+    let mut turn_usage = Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
+
+    assert_eq!(
+        turn_usage.prompt_tokens, 111,
+        "the summarizer call's real usage must be folded into the turn's usage"
+    );
+    assert_eq!(turn_usage.completion_tokens, 22);
+}
+
+/// Regression: when there's nothing safely droppable (too few exchanges),
+/// `CompactionMode::Trim` must not discard a still-valid anchor. Invalidating
+/// unconditionally would force every later estimate back to a full
+/// re-tokenize for no reason — exactly in the large, over-budget conversation
+/// case where the anchor's cheap anchor+tail path matters most.
+#[tokio::test]
+async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::enforce_context_budget;
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![]);
+    let mut cfg = cfg(10); // compaction defaults to Trim
+    cfg.context_window = Some(200); // target ~80 (see enforce_budget_token_path test)
+    cfg.max_tokens = Some(64);
+
+    // Only ONE user exchange (<= KEEP_RECENT_EXCHANGES) — nothing is safely
+    // droppable, so drop_old_exchanges is a guaranteed no-op on `messages`.
+    let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
+    let mut meter = ContextMeter::new();
+    let sent_len = msgs.len();
+    // A real anchor that's over target, forcing the compaction match to run.
+    meter.record(500, sent_len, true);
+
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    enforce_context_budget(
+        &provider,
+        &mut msgs,
+        &cfg,
+        "",
+        false,
+        &mut meter,
+        &mut turn_usage,
+        &mut failures,
+    )
+    .await;
+
+    assert!(
+        meter.anchored(&msgs),
+        "a guaranteed-no-op Trim pass must not discard a still-valid anchor"
     );
 }
