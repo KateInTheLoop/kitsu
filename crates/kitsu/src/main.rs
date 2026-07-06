@@ -742,6 +742,15 @@ async fn run_chat(
         let (d, h) = subagent::spawn_agent_tool(
             setup.provider.clone(),
             sub_tools.clone(),
+            sub_cfg.clone(),
+            live_mw.clone(),
+            sub_system.clone(),
+        );
+        tools.register_with_descriptor(d, h);
+        // Batch form: fan several isolated subagents out in parallel (Stage B).
+        let (d, h) = subagent::spawn_agents_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
             sub_cfg,
             live_mw.clone(),
             sub_system,
