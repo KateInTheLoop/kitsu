@@ -518,6 +518,7 @@ async fn run_scripted(
     skillset: &skills::SkillSet,
     ctx: &CtxInfo,
     context_window: &Rc<Cell<Option<u64>>>,
+    live_mw: &subagent::LiveModelWindow,
 ) -> Result<(), CliError> {
     let content = std::fs::read_to_string(path)
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
@@ -557,7 +558,7 @@ async fn run_scripted(
             continue;
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
-            match handle_slash(
+            let result = handle_slash(
                 rest,
                 messages,
                 model,
@@ -569,8 +570,10 @@ async fn run_scripted(
                 setup.context_window_pinned,
                 &mut state,
             )
-            .await
-            {
+            .await;
+            // Keep subagents in sync with any `/model` change in the script.
+            *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
+            match result {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
@@ -713,6 +716,14 @@ async fn run_chat(
         Arc::new(t)
     };
 
+    // The live (model, window) subagents should use, kept in sync with `/model`
+    // (see the loop below) so a subagent never runs the session's initial model
+    // against a stale window.
+    let live_mw: subagent::LiveModelWindow = Arc::new(std::sync::Mutex::new((
+        setup.model.clone(),
+        setup.context_window,
+    )));
+
     // The main tool set: base tools + `spawn_agent`, which delegates a task to a
     // subagent running the base `sub_tools` in its own isolated context (Stage A).
     let mut tools = Registry::new();
@@ -732,6 +743,7 @@ async fn run_chat(
             setup.provider.clone(),
             sub_tools.clone(),
             sub_cfg,
+            live_mw.clone(),
             sub_system,
         );
         tools.register_with_descriptor(d, h);
@@ -874,6 +886,7 @@ async fn run_chat(
             &skillset,
             &ctx,
             &context_window,
+            &live_mw,
         )
         .await;
     }
@@ -963,7 +976,7 @@ async fn run_chat(
         let _ = rl.add_history_entry(line);
 
         if let Some(rest) = line.strip_prefix('/') {
-            match handle_slash(
+            let result = handle_slash(
                 rest,
                 &mut messages,
                 &mut model,
@@ -975,8 +988,11 @@ async fn run_chat(
                 setup.context_window_pinned,
                 &mut session_state,
             )
-            .await
-            {
+            .await;
+            // Keep subagents in sync with any `/model` change (which may have
+            // swapped the model and re-discovered the window).
+            *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
+            match result {
                 SlashResult::Continue => continue,
                 SlashResult::Quit => break,
             }
