@@ -12,12 +12,18 @@ mod auth_tests;
 
 /// "How we attach credentials to a request."
 pub trait AuthProvider: Send + Sync {
-    /// Header name + value to attach, or an actionable error. The returned
-    /// `HeaderValue` MUST be marked sensitive so it is never logged.
-    fn header(&self) -> Result<(HeaderName, HeaderValue), AuthError>;
+    /// Header name + value to attach, `None` for an explicitly unauthenticated
+    /// provider, or an actionable credential error. Any returned `HeaderValue`
+    /// MUST be marked sensitive so it is never logged.
+    fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError>;
 
     /// Best-effort expiry check; used for a pre-request warning only.
     fn expiry_status(&self) -> ExpiryStatus;
+
+    /// Actionable credential-refresh guidance for a gateway rejection.
+    fn refresh_hint(&self) -> Option<String> {
+        None
+    }
 }
 
 /// Reads a bearer token from an environment variable at request time.
@@ -50,7 +56,7 @@ impl EnvBearerAuth {
 }
 
 impl AuthProvider for EnvBearerAuth {
-    fn header(&self) -> Result<(HeaderName, HeaderValue), AuthError> {
+    fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
         // Read the token from env at request time. Missing or empty is an
         // actionable error carrying the configured refresh hint.
         let token = match std::env::var(&self.env) {
@@ -85,7 +91,7 @@ impl AuthProvider for EnvBearerAuth {
         // Mark sensitive so reqwest/tracing never logs the token.
         value.set_sensitive(true);
 
-        Ok((name, value))
+        Ok(Some((name, value)))
     }
 
     fn expiry_status(&self) -> ExpiryStatus {
@@ -108,6 +114,10 @@ impl AuthProvider for EnvBearerAuth {
             Err(_) => ExpiryStatus::Unknown,
         }
     }
+
+    fn refresh_hint(&self) -> Option<String> {
+        self.refresh_hint.clone()
+    }
 }
 
 /// Inline static token (discouraged; see design §2). Attaches a fixed header.
@@ -128,12 +138,9 @@ impl StaticAuth {
 }
 
 impl AuthProvider for StaticAuth {
-    fn header(&self) -> Result<(HeaderName, HeaderValue), AuthError> {
+    fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
         if self.token.is_empty() {
-            return Err(AuthError::Missing {
-                env: String::new(),
-                hint: None,
-            });
+            return Err(AuthError::MissingStatic);
         }
         let name = HeaderName::from_bytes(self.header.to_lowercase().as_bytes())
             .map_err(|_| AuthError::Malformed { env: String::new() })?;
@@ -146,7 +153,7 @@ impl AuthProvider for StaticAuth {
         let mut value = HeaderValue::from_str(trimmed)
             .map_err(|_| AuthError::Malformed { env: String::new() })?;
         value.set_sensitive(true);
-        Ok((name, value))
+        Ok(Some((name, value)))
     }
 
     fn expiry_status(&self) -> ExpiryStatus {
@@ -155,20 +162,11 @@ impl AuthProvider for StaticAuth {
 }
 
 /// No-auth (local vLLM/Ollama).
-///
-/// `header()` returns the sentinel `AuthError::Missing { env: "" }`. The
-/// provider treats a `Missing` error whose `env` is empty as "attach no header"
-/// (skip silently) rather than a hard auth failure. This keeps the
-/// `AuthProvider` trait signature unchanged while letting NoAuth opt out of
-/// attaching credentials.
 pub struct NoAuth;
 
 impl AuthProvider for NoAuth {
-    fn header(&self) -> Result<(HeaderName, HeaderValue), AuthError> {
-        Err(AuthError::Missing {
-            env: String::new(),
-            hint: None,
-        })
+    fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
+        Ok(None)
     }
     fn expiry_status(&self) -> ExpiryStatus {
         ExpiryStatus::Unknown

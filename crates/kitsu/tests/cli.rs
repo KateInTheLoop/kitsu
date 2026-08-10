@@ -76,6 +76,71 @@ fn test_ask_missing_token() {
         .stderr(predicate::str::contains("refresh-token"));
 }
 
+/// Auth methods are a closed config vocabulary. A typo must fail before any
+/// provider/network work instead of silently becoming bearer-env authentication.
+#[test]
+fn test_unknown_auth_method_fails_fast() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create ~/.kitsu");
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test-model"
+context_window = 8000
+auth = { method = "bearer_env_typo", env = "KITSU_TEST_UNKNOWN_AUTH_TOKEN" }
+"#,
+    )
+    .expect("write config.toml");
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env_remove("KITSU_TEST_UNKNOWN_AUTH_TOKEN");
+    cmd.args(["ask", "--gateway", "example", "hi"]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "unsupported auth method 'bearer_env_typo'",
+        ));
+}
+
+/// `method = "static"` requires a non-empty token. Missing it must be reported
+/// as a config error rather than being reinterpreted as `method = "none"`.
+#[test]
+fn test_static_auth_without_token_fails_fast() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create ~/.kitsu");
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test-model"
+context_window = 8000
+auth = { method = "static" }
+"#,
+    )
+    .expect("write config.toml");
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["ask", "--gateway", "example", "hi"]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "static auth requires a non-empty token",
+        ));
+}
+
 // --- happy path against wiremock --------------------------------------------
 
 /// design §6 acceptance: with a valid token and a mock gateway, `kitsu ask` exits

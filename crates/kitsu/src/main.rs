@@ -15,7 +15,7 @@ use std::time::Duration;
 use clap::Parser;
 
 use cli::{Cli, Command};
-use config::{Config, Gateway};
+use config::{Config, ConfigError, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 use kitsu_core::{run_agent_turn, run_agent_turn_with_state, AgentConfig, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
@@ -387,12 +387,11 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     gateway
         .validate_flavor()
         .map_err(|e| CliError::user(e.to_string()))?;
-
     let model = gateway
         .resolve_model(cli.model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
 
-    let auth = build_auth(gateway);
+    let auth = build_auth(gateway).map_err(|e| CliError::user(e.to_string()))?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
     let provider = OpenAICompatProvider::new(
         OpenAICompatConfig {
@@ -1423,27 +1422,33 @@ fn shorten_home(p: &std::path::Path) -> String {
 }
 
 /// Build the appropriate AuthProvider from the profile's auth block.
-fn build_auth(gateway: &Gateway) -> Arc<dyn AuthProvider> {
+fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
+    gateway.validate_auth()?;
     let auth = &gateway.auth;
-    match auth.method.as_str() {
+    let provider: Arc<dyn AuthProvider> = match auth.method.as_str() {
         "none" => Arc::new(NoAuth),
         "static" => {
-            let token = auth.token.clone().unwrap_or_default();
+            let token = auth.token.clone().ok_or(ConfigError::StaticTokenRequired)?;
             Arc::new(StaticAuth {
                 token,
                 header: auth.header.clone(),
                 scheme: auth.scheme.clone(),
             })
         }
-        // "bearer-env" and anything else default to env-bearer.
-        _ => Arc::new(EnvBearerAuth {
+        "bearer-env" => Arc::new(EnvBearerAuth {
             env: auth.env.clone(),
             expires_env: auth.expires_env.clone(),
             header: auth.header.clone(),
             scheme: auth.scheme.clone(),
             refresh_hint: auth.refresh_hint.clone(),
         }),
-    }
+        other => {
+            return Err(ConfigError::UnsupportedAuthMethod {
+                method: other.to_string(),
+            })
+        }
+    };
+    Ok(provider)
 }
 
 /// Render an agent error for the interactive/scripted chat loop. When the
