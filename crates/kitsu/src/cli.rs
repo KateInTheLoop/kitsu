@@ -66,9 +66,10 @@ pub struct Cli {
 
     /// Total inference deadline in seconds, including retries, retry backoff,
     /// and response-body streaming. A heavy tool-aware round on a slower model
-    /// can exceed the default 60s and fail the turn; raise it (e.g. 300) for
-    /// tool-heavy review work.
-    #[arg(long, global = true, default_value_t = 60)]
+    /// (local Ollama/vLLM in particular) routinely exceeds even this default
+    /// and fails the turn; raise it further (e.g. 300) for tool-heavy review
+    /// work.
+    #[arg(long, global = true, default_value_t = 120)]
     pub timeout_secs: u64,
 
     /// Max output tokens per response. Unset lets the gateway apply its own cap
