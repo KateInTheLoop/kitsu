@@ -580,10 +580,25 @@ impl Permissions {
     }
 
     fn denied(&self, action: Action, requested: &Path) -> ToolError {
+        let (roots, flag, slash) = match action {
+            Action::Read => (self.read_roots(), "--allow-path", "/allow"),
+            Action::Write => (self.write_roots(), "--allow-write", "/allow-write"),
+        };
+        let allowed = if roots.is_empty() {
+            "none granted".to_string()
+        } else {
+            roots
+                .iter()
+                .map(|r| format!("'{}'", r.display()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         ToolError::PolicyDenied(format!(
-            "path '{}' is outside the allowed {} paths",
+            "{} denied: '{}' is outside the allowed {} root(s) ({allowed}) — grant it with \
+             {flag} <dir> (or {slash} <dir> mid-session)",
+            action.verb(),
             requested.display(),
-            action.verb()
+            action.verb(),
         ))
     }
 

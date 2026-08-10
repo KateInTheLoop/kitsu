@@ -979,7 +979,8 @@ fn format_session_status(
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "session:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        crate::cli::LONG_VERSION,
         gateway,
         shorten_home(&session.directory),
         shorten_home(&session.config_path),
@@ -2423,7 +2424,7 @@ async fn run_scripted_turn(
         }
         TurnOutcome::Completed(Err(e)) => {
             let kind = script_failure_kind(&e);
-            let error_message = chat_error_message(e, model);
+            let error_message = chat_error_message(e, model, cli.timeout_secs);
             if cli.jsonl {
                 emit_jsonl(
                     "error",
@@ -3993,7 +3994,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 last_failed = Some(retry_prompt);
-                eprintln!("{}", chat_error_message(e, &model));
+                eprintln!("{}", chat_error_message(e, &model, cli.timeout_secs));
                 eprintln!(
                     "~ failed turn rolled back; completed file changes, if any, remain on disk"
                 );
@@ -4212,7 +4213,7 @@ async fn handle_slash(
                     let kind = script_failure_kind(&error);
                     *messages = messages_before;
                     *state = state_before;
-                    let message = chat_error_message(error, model);
+                    let message = chat_error_message(error, model, cli.timeout_secs);
                     eprintln!("cannot compact context (context restored): {message}");
                     return if kind == ScriptFailureKind::Provider {
                         SlashResult::ProviderFailure(message)
@@ -4881,7 +4882,7 @@ fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
 /// gateway rejected the model id (ISSUE-004: a `/model` typo, or a model the
 /// gateway doesn't serve), add an actionable hint naming the model and pointing
 /// at `/model`, instead of dumping the raw HTTP 404 JSON.
-fn chat_error_message(e: kitsu_core::AgentError, model: &str) -> String {
+fn chat_error_message(e: kitsu_core::AgentError, model: &str, timeout_secs: u64) -> String {
     if let kitsu_core::AgentError::Provider(ProviderError::Http { status, body }) = &e {
         let looks_like_bad_model =
             *status == 404 || (body.contains("model") && body.to_lowercase().contains("not found"));
@@ -4893,6 +4894,17 @@ fn chat_error_message(e: kitsu_core::AgentError, model: &str) -> String {
                  check the gateway's available models.\n  detail: {body}"
             );
         }
+    }
+    if matches!(
+        &e,
+        kitsu_core::AgentError::Provider(ProviderError::Timeout)
+    ) {
+        return format!(
+            "request timed out after {timeout_secs}s - raise the budget with \
+             --timeout-secs <n> (e.g. --timeout-secs {}) for slower or tool-heavy turns, \
+             especially on local models.",
+            timeout_secs.saturating_mul(3).max(180)
+        );
     }
     kitsu_render::sanitize_terminal_text(&map_agent_error(e).to_string())
 }
