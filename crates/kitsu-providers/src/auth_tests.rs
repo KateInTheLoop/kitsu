@@ -5,7 +5,7 @@
 //! to `chrono::Utc::now()` (tests may call it; scripts may not) so the suite never
 //! depends on a hardcoded wall-clock date.
 
-use crate::auth::{AuthProvider, EnvBearerAuth};
+use crate::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use crate::error::{AuthError, ExpiryStatus};
 use chrono::{Duration, Utc};
 use serial_test::serial;
@@ -61,6 +61,32 @@ fn auth_for_test() -> EnvBearerAuth {
 
 // --- header() ---------------------------------------------------------------
 
+/// No-auth is a successful, explicit outcome — never an AuthError sentinel that
+/// can also be produced by a misconfigured credential provider.
+#[test]
+fn test_no_auth_header_is_explicit_success() {
+    assert!(
+        NoAuth
+            .header()
+            .expect("NoAuth should be a successful outcome")
+            .is_none(),
+        "NoAuth must not masquerade as a missing-credential error"
+    );
+}
+
+/// An omitted static token is a configuration/auth failure, not an implicit
+/// request to send no credentials.
+#[test]
+fn test_empty_static_token_is_not_treated_as_no_auth() {
+    let err = StaticAuth::new("")
+        .header()
+        .expect_err("an empty static token must fail");
+    assert!(
+        err.to_string().contains("static token"),
+        "error should identify the missing static token: {err}"
+    );
+}
+
 /// design §3: header() reads the token from the configured env var and returns
 /// ("authorization", "Bearer <token>").
 #[test]
@@ -71,7 +97,8 @@ fn test_header_reads_token_from_env() {
 
     let (name, value) = auth
         .header()
-        .expect("header() should succeed when token is set");
+        .expect("header() should succeed when token is set")
+        .expect("bearer auth should produce a header");
 
     assert_eq!(name.as_str(), "authorization");
     assert_eq!(value.to_str().unwrap(), "Bearer test-token");
@@ -87,7 +114,8 @@ fn test_header_value_is_sensitive() {
 
     let (_name, value) = auth
         .header()
-        .expect("header() should succeed when token is set");
+        .expect("header() should succeed when token is set")
+        .expect("bearer auth should produce a header");
     assert!(
         value.is_sensitive(),
         "auth HeaderValue must be marked sensitive"

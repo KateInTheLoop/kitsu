@@ -10,7 +10,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthProvider;
-use crate::error::{AuthError, ProviderError};
+use crate::error::ProviderError;
 use crate::types::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
 };
@@ -54,23 +54,18 @@ impl OpenAICompatProvider {
 
     /// Resolve the refresh hint surfaced on a gateway 401/403.
     fn refresh_hint(&self) -> Option<String> {
-        match self.auth.header() {
-            Err(AuthError::Missing { hint, .. }) => hint,
-            _ => None,
-        }
+        self.auth.refresh_hint()
     }
 
-    /// Attach the auth header to a request builder. A `NoAuth` sentinel
-    /// (`AuthError::Missing` with an empty `env`) means "attach nothing" and is
-    /// skipped silently; any other auth error is a hard failure.
+    /// Attach the configured auth header to a request builder. `None` is the
+    /// explicit no-auth outcome; credential errors remain hard failures.
     fn attach_auth(
         &self,
         rb: reqwest::RequestBuilder,
     ) -> Result<reqwest::RequestBuilder, ProviderError> {
-        match self.auth.header() {
-            Ok((name, value)) => Ok(rb.header(name, value)),
-            Err(AuthError::Missing { ref env, .. }) if env.is_empty() => Ok(rb),
-            Err(e) => Err(ProviderError::Auth(e)),
+        match self.auth.header()? {
+            Some((name, value)) => Ok(rb.header(name, value)),
+            None => Ok(rb),
         }
     }
 }
@@ -664,11 +659,7 @@ impl Provider for OpenAICompatProvider {
             .map(|p| p.is_empty())
             .unwrap_or(true);
         if degraded {
-            match self.auth.header() {
-                Ok(_) => Ok(()),
-                Err(AuthError::Missing { ref env, .. }) if env.is_empty() => Ok(()),
-                Err(e) => Err(ProviderError::Auth(e)),
-            }
+            self.auth.header().map(|_| ()).map_err(ProviderError::Auth)
         } else {
             self.list_models().await.map(|_| ())
         }

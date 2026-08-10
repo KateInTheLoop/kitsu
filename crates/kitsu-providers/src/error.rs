@@ -31,6 +31,9 @@ pub enum AuthError {
     #[error("auth error: ${env} is not set{}", .hint.as_ref().map(|h| format!(" — {h}")).unwrap_or_default())]
     Missing { env: String, hint: Option<String> },
 
+    #[error("auth error: static token is not configured")]
+    MissingStatic,
+
     #[error("auth error: token in ${env} is malformed")]
     Malformed { env: String },
 }

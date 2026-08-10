@@ -131,6 +131,11 @@ pub enum ConfigError {
     UnsupportedFlavor {
         flavor: String,
     },
+    UnsupportedAuthMethod {
+        method: String,
+    },
+    AuthEnvRequired,
+    StaticTokenRequired,
     ModelRequired,
 }
 
@@ -152,6 +157,18 @@ impl std::fmt::Display for ConfigError {
             ConfigError::UnsupportedFlavor { flavor } => write!(
                 f,
                 "config error: unsupported flavor '{flavor}' — expected one of: openai, anthropic, ollama"
+            ),
+            ConfigError::UnsupportedAuthMethod { method } => write!(
+                f,
+                "config error: unsupported auth method '{method}' — expected one of: bearer-env, static, none"
+            ),
+            ConfigError::AuthEnvRequired => write!(
+                f,
+                "config error: bearer-env auth requires a non-empty env name"
+            ),
+            ConfigError::StaticTokenRequired => write!(
+                f,
+                "config error: static auth requires a non-empty token"
             ),
             ConfigError::ModelRequired => {
                 write!(f, "provider.model is required — set it with --model <name>")
@@ -223,6 +240,30 @@ impl Gateway {
             "openai" | "anthropic" | "ollama" => Ok(()),
             other => Err(ConfigError::UnsupportedFlavor {
                 flavor: other.to_string(),
+            }),
+        }
+    }
+
+    /// Validate the closed auth-method vocabulary and its required inputs before
+    /// provider construction, so typos and missing static credentials never turn
+    /// into a different authentication mode at request time.
+    pub fn validate_auth(&self) -> Result<(), ConfigError> {
+        match self.auth.method.as_str() {
+            "none" => Ok(()),
+            "bearer-env" if self.auth.env.trim().is_empty() => Err(ConfigError::AuthEnvRequired),
+            "bearer-env" => Ok(()),
+            "static"
+                if self
+                    .auth
+                    .token
+                    .as_deref()
+                    .is_some_and(|token| !token.trim().is_empty()) =>
+            {
+                Ok(())
+            }
+            "static" => Err(ConfigError::StaticTokenRequired),
+            other => Err(ConfigError::UnsupportedAuthMethod {
+                method: other.to_string(),
             }),
         }
     }
