@@ -208,10 +208,17 @@ impl Permissions {
         // If the target already exists as a SYMLINK, a write follows it — so
         // containment must hold for the link's REAL destination, not the link
         // path (which is trivially inside the allowed parent). Resolve it and
-        // check that; unresolvable/escaping symlinks fall through to deny/prompt.
+        // check that. An unresolved/dangling symlink must fail closed: returning
+        // the in-root link path would let the later write follow it and create a
+        // file outside the allowed root.
         let contained_as = match std::fs::symlink_metadata(&target) {
             Ok(m) if m.file_type().is_symlink() => {
-                std::fs::canonicalize(&target).unwrap_or_else(|_| target.clone())
+                std::fs::canonicalize(&target).map_err(|_| {
+                    ToolError::PolicyDenied(format!(
+                        "write target '{}' is an unresolved symlink",
+                        requested.display()
+                    ))
+                })?
             }
             _ => target.clone(),
         };
@@ -435,6 +442,29 @@ mod symlink_tests {
             Err(ToolError::PolicyDenied(_))
         ));
         assert_eq!(std::fs::read_to_string(&secret).unwrap(), "orig");
+    }
+
+    #[tokio::test]
+    async fn dangling_symlink_write_escape_is_denied() {
+        let base = tempfile::tempdir().unwrap();
+        let allowed = base.path().join("allowed");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        // The destination does not exist yet, so canonicalizing the symlink itself
+        // fails. Falling back to the in-root link path would authorize a later
+        // std::fs::write, which follows the link and creates this outside file.
+        let escaped = outside.join("created-through-link.txt");
+        let link = allowed.join("link.txt");
+        std::os::unix::fs::symlink(&escaped, &link).unwrap();
+
+        let perms = Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
+        assert!(matches!(
+            perms.check_write(&link).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(!escaped.exists());
     }
 
     #[tokio::test]
