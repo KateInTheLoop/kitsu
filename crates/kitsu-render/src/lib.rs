@@ -344,9 +344,12 @@ pub fn prompt_string() -> String {
 }
 
 /// A "vibing kitsu" spinner shown on stderr while the model is working (the wait
-/// before the first token). Animates a cat/fox kaomoji in fox-orange. No-op on a
-/// non-TTY. Plain and reduced-motion modes show a static status. Stops (and
-/// erases an animated/styled-static line) on `stop()` or drop.
+/// before the first token). Animates a cat/fox kaomoji in fox-orange on a TTY.
+/// A redirected/piped stderr gets a periodic plain-text heartbeat instead of
+/// nothing, so a slow-but-working scripted run against a local model is
+/// distinguishable from a hung one. Plain and reduced-motion modes show a
+/// static status. Stops (and erases an animated/styled-static line) on
+/// `stop()` or drop.
 pub struct Spinner {
     handle: Option<tokio::task::JoinHandle<()>>,
     clear_line: bool,
@@ -354,7 +357,11 @@ pub struct Spinner {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SpinnerMode {
-    Hidden,
+    /// Redirected/piped stderr (`--script`, non-interactive): no cursor
+    /// tricks, but a slow-but-working scripted run against a local model can
+    /// sit silent for minutes with zero indication it hasn't hung — so print
+    /// a periodic plain heartbeat line instead of nothing at all.
+    Heartbeat,
     StaticPlain,
     StaticStyled,
     Animated,
@@ -362,7 +369,7 @@ enum SpinnerMode {
 
 fn spinner_mode(destination_is_tty: bool, plain: bool, reduced_motion: bool) -> SpinnerMode {
     if !destination_is_tty {
-        SpinnerMode::Hidden
+        SpinnerMode::Heartbeat
     } else if plain {
         SpinnerMode::StaticPlain
     } else if reduced_motion {
@@ -396,9 +403,24 @@ impl Spinner {
             std::env::var_os("KITSU_REDUCED_MOTION").is_some(),
         );
         match mode {
-            SpinnerMode::Hidden => {
+            SpinnerMode::Heartbeat => {
+                let handle = tokio::spawn(async move {
+                    // Long enough that a normal request never logs anything;
+                    // only a genuinely slow round (the exact case with no other
+                    // progress signal — heavy tool-calling on a local model)
+                    // does. Repeats so a multi-minute wait doesn't go silent.
+                    const FIRST_BEAT: std::time::Duration = std::time::Duration::from_secs(10);
+                    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
+                    tokio::time::sleep(FIRST_BEAT).await;
+                    let mut waited = FIRST_BEAT;
+                    loop {
+                        eprintln!("~ still waiting on the model ({}s)...", waited.as_secs());
+                        tokio::time::sleep(INTERVAL).await;
+                        waited += INTERVAL;
+                    }
+                });
                 return Self {
-                    handle: None,
+                    handle: Some(handle),
                     clear_line: false,
                 };
             }
@@ -1019,11 +1041,17 @@ mod tests {
 
     #[test]
     fn reduced_motion_selects_a_visible_static_status() {
-        assert_eq!(spinner_mode(false, false, true), SpinnerMode::Hidden);
+        assert_eq!(spinner_mode(false, false, true), SpinnerMode::Heartbeat);
         assert_eq!(spinner_mode(true, false, true), SpinnerMode::StaticStyled);
         assert_eq!(spinner_mode(true, true, true), SpinnerMode::StaticPlain);
         assert_eq!(spinner_mode(true, true, false), SpinnerMode::StaticPlain);
         assert_eq!(spinner_mode(true, false, false), SpinnerMode::Animated);
+
+        // A redirected/piped stderr (--script, non-interactive) always gets the
+        // plain heartbeat, regardless of --plain/reduced-motion — there's no
+        // cursor to control either way, so those flags don't apply.
+        assert_eq!(spinner_mode(false, true, false), SpinnerMode::Heartbeat);
+        assert_eq!(spinner_mode(false, false, false), SpinnerMode::Heartbeat);
 
         let plain_status = static_spinner_line(false);
         assert_eq!(plain_status, "* kitsu is thinking");
