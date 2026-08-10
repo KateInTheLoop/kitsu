@@ -1,38 +1,42 @@
 # kitsu 狐
 
-> A multi-gateway LLM CLI written in Rust. Talk to any OpenAI-compatible endpoint
-> — OpenAI, Anthropic, Hugging Face, Ollama, vLLM, or a custom gateway — through
-> one configurable interface, with an agent tool-loop, a Claude-Code-style
-> permission model for filesystem tools, and model-aware context management.
+> A Rust CLI for OpenAI-compatible hosted gateways and local model servers, with
+> interactive chat, guarded developer tools, durable sessions, automation, and
+> model-aware context management.
 
-kitsu is a Cargo workspace of five crates:
+Kitsu is a Cargo workspace of five crates:
 
-- `kitsu` — the CLI binary: `ask` (one-shot) and `chat` (interactive REPL), config
-  and gateway-profile resolution, the permission prompt, and project-context
-  loading.
-- `kitsu-core` — the agent orchestrator loop (call model → run tools → repeat) and
-  context management (token budgeting, trimming cascade).
-- `kitsu-providers` — the `Provider` trait and the OpenAI-compatible streaming
-  client shared by every gateway.
-- `kitsu-tools` — the tool registry, runtime `Permissions`, and built-in
-  filesystem tools (`fs_read_file`, `fs_list_dir`, `repo_grep`, `fs_write_file`).
-- `kitsu-render` — terminal rendering (banner, spinner, streamed output).
+- `kitsu` — `ask`, `models`, and `chat`; CLI/config resolution; slash commands;
+  sessions; JSONL automation; `@file`; project context; and background agents.
+- `kitsu-core` — the provider/tool agent loop, checked context preflight,
+  offload/trim/summarize cascade, manual compaction, and compaction telemetry.
+- `kitsu-providers` — provider traits and the shared OpenAI-compatible client,
+  including streaming, retry deadlines, and model discovery/cache behavior.
+- `kitsu-tools` — protected-path permissions, read/edit/write/search tools,
+  conflict-aware undo journals, and opt-in literal-argv developer commands.
+- `kitsu-render` — sanitized terminal output, plain/reduced-motion rendering,
+  streaming, diffs, tool activity, and usage/context telemetry.
+
+Project context loading consumes this file's text only; markdown links are an
+index for the model and are not followed automatically. Required context is
+capped at one third of the active window. The `## Optional` section is included
+only when the complete rendered file fits within one quarter of that window.
 
 ## Docs
 
-- [README](README.md): install, gateway profiles, per-provider recipes, auth, the
-  CLI reference, chat tools, and the context-window model
-- [Architecture](docs/architecture.md): design and component overview
-
-## Context management
-
-- [Design](docs/context-management-design.md): the token-budget trimming cascade
-  (offload → elide → drop turns → summarize) and llms.txt ingestion
-- [Development stages](docs/context-management-stages.md): the staged plan
+- [README](README.md): installation, gateway/auth recipes, CLI reference, chat
+  workflows, automation, tools, sessions, and context behavior.
+- [Functionality](docs/functionality.md): concise source-backed feature contract.
+- [Architecture](docs/architecture.md): crate and component overview.
+- [Context management](docs/context-management-design.md): implemented window,
+  budgeting, cascade, project-context, and telemetry contract.
 
 ## Optional
 
-- [Functionality notes](docs/functionality.md): feature notes
-- [UI guidelines](docs/ui_guidelines.md): terminal UX conventions
-- [Claude Code comparison](docs/claude-code-comparison.md): how kitsu relates to
-  Claude Code
+- [Cycle-2 UX audit](docs/chat-ux-cycle-2.md): reviewer findings, implemented
+  outcomes, verification gates, and platform residuals.
+- [UI guidelines](docs/ui_guidelines.md): terminal UX conventions.
+- [Development stages](docs/context-management-stages.md): historical staged
+  context-management plan.
+- [Codex comparison](docs/claude-code-comparison.md): historical product
+  comparison and roadmap notes.

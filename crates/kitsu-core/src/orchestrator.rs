@@ -8,6 +8,7 @@ use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderError, Role, ToolCall,
 };
 use kitsu_tools::Registry;
+use serde::Serialize;
 use thiserror::Error;
 
 #[cfg(test)]
@@ -47,6 +48,133 @@ pub struct AgentConfig {
     /// subagents so their output doesn't corrupt the interactive prompt while
     /// they run detached; their result is delivered via the agent registry.
     pub quiet: bool,
+    /// Optional structured trace for automation frontends. Recording is
+    /// in-memory and side-effect free; the CLI decides how to frame/serialize
+    /// these events after the turn.
+    pub event_log: Option<AgentEventLog>,
+}
+
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+#[serde(tag = "event", rename_all = "snake_case")]
+pub enum AgentRuntimeEvent {
+    ProviderRequest {
+        round: u32,
+        message_count: usize,
+        tools_offered: usize,
+    },
+    Usage {
+        round: u32,
+        prompt_tokens: u64,
+        completion_tokens: u64,
+        total_tokens: u64,
+    },
+    ToolStarted {
+        round: u32,
+        call_id: String,
+        name: String,
+        args: String,
+    },
+    ToolFinished {
+        round: u32,
+        call_id: String,
+        name: String,
+        success: bool,
+        /// True only when the in-flight tool future was dropped before it
+        /// returned. Ordinary tool errors are finished with `cancelled: false`
+        /// and their real structured error output.
+        cancelled: bool,
+        output: String,
+    },
+    TurnFinished {
+        success: bool,
+        completion: String,
+        tool_errors: u32,
+    },
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct AgentEventLog {
+    inner: std::sync::Arc<std::sync::Mutex<Vec<AgentRuntimeEvent>>>,
+}
+
+impl AgentEventLog {
+    pub fn record(&self, event: AgentRuntimeEvent) {
+        self.inner.lock().expect("agent event log").push(event);
+    }
+
+    pub fn take(&self) -> Vec<AgentRuntimeEvent> {
+        std::mem::take(&mut *self.inner.lock().expect("agent event log"))
+    }
+}
+
+/// Pairs every recorded [`AgentRuntimeEvent::ToolStarted`] with exactly one
+/// terminal [`AgentRuntimeEvent::ToolFinished`], even when the outer agent turn
+/// is cancelled and drops an in-flight tool future. Normal successes and tool
+/// errors explicitly finish/disarm the guard; only an early drop is reported as
+/// cancellation.
+struct ToolEventGuard {
+    pending: Option<PendingToolEvent>,
+}
+
+struct PendingToolEvent {
+    log: AgentEventLog,
+    round: u32,
+    call_id: String,
+    name: String,
+}
+
+impl ToolEventGuard {
+    fn start(
+        log: Option<&AgentEventLog>,
+        round: u32,
+        call_id: &str,
+        name: &str,
+        args: &str,
+    ) -> Self {
+        let pending = log.map(|log| {
+            log.record(AgentRuntimeEvent::ToolStarted {
+                round,
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+                args: event_preview(args),
+            });
+            PendingToolEvent {
+                log: log.clone(),
+                round,
+                call_id: call_id.to_string(),
+                name: name.to_string(),
+            }
+        });
+        Self { pending }
+    }
+
+    fn finish(mut self, success: bool, output: &str) {
+        if let Some(pending) = self.pending.take() {
+            pending.log.record(AgentRuntimeEvent::ToolFinished {
+                round: pending.round,
+                call_id: pending.call_id,
+                name: pending.name,
+                success,
+                cancelled: false,
+                output: event_preview(output),
+            });
+        }
+    }
+}
+
+impl Drop for ToolEventGuard {
+    fn drop(&mut self) {
+        if let Some(pending) = self.pending.take() {
+            pending.log.record(AgentRuntimeEvent::ToolFinished {
+                round: pending.round,
+                call_id: pending.call_id,
+                name: pending.name,
+                success: false,
+                cancelled: true,
+                output: "[cancelled: tool execution interrupted]".to_string(),
+            });
+        }
+    }
 }
 
 /// Strategy for reclaiming context when trimming tool results isn't enough.
@@ -57,6 +185,144 @@ pub enum CompactionMode {
     Trim,
     /// Summarize the oldest exchanges into a note via one LLM call (opt-in).
     Summarize,
+}
+
+/// Why a context compaction ran. Kept separate from [`CompactionMode`] so a UI
+/// can distinguish an automatic pressure response from an explicit `/compact`
+/// without trying to infer intent from the resulting message shape.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionReason {
+    ContextTargetExceeded,
+    ManualRequest,
+}
+
+/// What an individual compaction actually did. This may differ from the
+/// configured [`CompactionMode`]: summarization deliberately falls back to a
+/// local trim when the summary request/response is unusable or cannot fit.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompactionOutcome {
+    ToolResultsElided,
+    Trimmed,
+    Summarized,
+    SummaryFallbackTrim,
+}
+
+/// Why a requested summary used the trim fallback.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryFallbackReason {
+    /// The per-session circuit breaker has disabled further summary calls.
+    CircuitBreaker,
+    /// Even a locally shortened summary prompt could not fit the model window.
+    RequestTooLarge,
+    /// The provider failed or returned no usable summary text.
+    ProviderFailure,
+    /// The summary stream produced partial text but did not terminate with a
+    /// complete `stop` finish (for example length truncation, a tool-call finish,
+    /// or EOF without a terminal finish event).
+    IncompleteResponse,
+    /// No non-empty summary could coexist with the protected recent context.
+    ResponseTooLarge,
+    /// A real context window was unavailable, so a bounded summary call could
+    /// not be proved safe.
+    ContextWindowUnknown,
+}
+
+/// One durable, machine-readable account of a context compaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionRecord {
+    /// Monotonic, session-local sequence assigned by [`CompactionLedger`].
+    pub sequence: u64,
+    pub reason: CompactionReason,
+    pub configured_mode: CompactionMode,
+    pub outcome: CompactionOutcome,
+    pub fallback_reason: Option<SummaryFallbackReason>,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub messages_before: usize,
+    pub messages_after: usize,
+    pub tool_results_elided: u32,
+    pub exchanges_removed: u32,
+    /// The summarizer saw a bounded head/tail view rather than the whole old
+    /// transcript. This is provenance, not an error: the provider request was
+    /// deliberately shortened locally to honor its own context invariant.
+    pub summary_input_shortened: bool,
+    /// The returned summary was shortened locally before it was admitted into
+    /// the rebuilt main conversation.
+    pub summary_output_shortened: bool,
+}
+
+/// Persistent per-session compaction telemetry. The cumulative counters never
+/// lose information; detailed records are bounded so a very long chat cannot
+/// grow state without limit.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionLedger {
+    pub total_compactions: u64,
+    pub automatic_compactions: u64,
+    pub manual_compactions: u64,
+    pub summaries: u64,
+    pub trims: u64,
+    pub tool_results_elided: u64,
+    pub exchanges_removed: u64,
+    pub tokens_saved: u64,
+    pub omitted_records: u64,
+    pub records: Vec<CompactionRecord>,
+}
+
+impl CompactionLedger {
+    const RECORD_LIMIT: usize = 64;
+
+    fn push(&mut self, mut record: CompactionRecord) -> CompactionRecord {
+        self.total_compactions = self.total_compactions.saturating_add(1);
+        record.sequence = self.total_compactions;
+        match record.reason {
+            CompactionReason::ContextTargetExceeded => {
+                self.automatic_compactions = self.automatic_compactions.saturating_add(1);
+            }
+            CompactionReason::ManualRequest => {
+                self.manual_compactions = self.manual_compactions.saturating_add(1);
+            }
+        }
+        match record.outcome {
+            CompactionOutcome::Summarized => {
+                self.summaries = self.summaries.saturating_add(1);
+            }
+            CompactionOutcome::Trimmed | CompactionOutcome::SummaryFallbackTrim => {
+                self.trims = self.trims.saturating_add(1);
+            }
+            CompactionOutcome::ToolResultsElided => {}
+        }
+        self.tool_results_elided = self
+            .tool_results_elided
+            .saturating_add(u64::from(record.tool_results_elided));
+        self.exchanges_removed = self
+            .exchanges_removed
+            .saturating_add(u64::from(record.exchanges_removed));
+        self.tokens_saved = self
+            .tokens_saved
+            .saturating_add(record.tokens_before.saturating_sub(record.tokens_after));
+        if self.records.len() == Self::RECORD_LIMIT {
+            self.records.remove(0);
+            self.omitted_records = self.omitted_records.saturating_add(1);
+        }
+        self.records.push(record.clone());
+        record
+    }
+
+    pub fn last(&self) -> Option<&CompactionRecord> {
+        self.records.last()
+    }
+}
+
+/// Result returned by the public manual-compaction API.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionReport {
+    pub changed: bool,
+    pub target_tokens: u64,
+    pub tokens_before: u64,
+    pub tokens_after: u64,
+    pub record: Option<CompactionRecord>,
+    /// Provider usage incurred by an optional summarizer call.
+    pub usage: kitsu_providers::Usage,
 }
 
 impl Default for AgentConfig {
@@ -72,6 +338,7 @@ impl Default for AgentConfig {
             max_tokens: None,
             compaction: CompactionMode::Trim,
             quiet: false,
+            event_log: None,
         }
     }
 }
@@ -83,6 +350,38 @@ pub enum AgentError {
 
     #[error("agent loop error: {0}")]
     Loop(String),
+
+    #[error(
+        "context preflight stopped an oversized provider request: protected prompt needs about {required} {unit}, but the configured target is {target} {unit}; shorten the latest request or system instructions, disable large tool schemas, lower max output tokens, clear/compact history, or select a model with a larger context window"
+    )]
+    ContextOverflow {
+        required: u64,
+        target: u64,
+        unit: ContextUnit,
+        /// The resolved model window for token checks; `None` identifies the
+        /// coarse byte-budget fallback used when model metadata is unavailable.
+        window: Option<u64>,
+    },
+
+    #[error(
+        "manual compaction needs a resolved model context window; configure context_window or select a model whose window Kitsu can discover"
+    )]
+    ContextWindowUnknown,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ContextUnit {
+    Tokens,
+    Bytes,
+}
+
+impl std::fmt::Display for ContextUnit {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Tokens => f.write_str("tokens"),
+            Self::Bytes => f.write_str("bytes"),
+        }
+    }
 }
 
 /// Per-session state that should persist across multiple calls to
@@ -98,6 +397,7 @@ pub enum AgentError {
 pub struct AgentSessionState {
     pub meter: ContextMeter,
     pub compact_failures: u32,
+    pub compaction_ledger: CompactionLedger,
     /// Machine-readable outcome of the most recent turn. Interactive chat can
     /// still show partial/recovered answers, while strict scripted callers can
     /// reject incomplete automation without scraping display markers.
@@ -166,6 +466,18 @@ where
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
+    if let Some(log) = &cfg.event_log {
+        let completion = match state.last_turn.completion {
+            TurnCompletion::Complete => "complete",
+            TurnCompletion::LengthLimited => "length_limited",
+            TurnCompletion::MaxRounds => "max_rounds",
+        };
+        log.record(AgentRuntimeEvent::TurnFinished {
+            success: result.is_ok(),
+            completion: completion.to_string(),
+            tool_errors: state.last_turn.tool_errors,
+        });
+    }
     // The orchestrator owns assistant rendering and the end-of-turn boundary so
     // the answer always precedes telemetry in both streaming and buffered mode.
     if !cfg.quiet {
@@ -207,6 +519,7 @@ where
     let AgentSessionState {
         meter,
         compact_failures,
+        compaction_ledger,
         last_turn: turn_status,
     } = state;
     let mut last_assistant_text = String::new();
@@ -223,7 +536,6 @@ where
     // The tool set is fixed for the whole turn (every round advertises the same
     // descriptors), so serialize the schema once here rather than redoing it on
     // every round inside enforce_context_budget.
-    let has_schema = !tools.descriptors().is_empty();
     let schema_json = serde_json::to_string(tools.descriptors()).unwrap_or_default();
 
     loop {
@@ -234,18 +546,6 @@ where
             turn_status.completion = TurnCompletion::MaxRounds;
             return Ok(last_assistant_text);
         }
-
-        enforce_context_budget(
-            provider,
-            messages,
-            cfg,
-            &schema_json,
-            has_schema,
-            meter,
-            turn_usage,
-            compact_failures,
-        )
-        .await;
 
         // On the FINAL permitted round, withhold tools and inject a nudge so the
         // model must produce its final answer instead of emitting yet another
@@ -277,6 +577,25 @@ where
         // text-protocol fallback below.
         let tools_were_offered = offered_tools.is_some();
 
+        // Budget only after every request-visible mutation (notably the final
+        // round nudge above), and against the schema actually offered THIS
+        // round. This establishes the invariant the concrete request below is
+        // required to satisfy.
+        enforce_context_budget_recording(
+            provider,
+            messages,
+            cfg,
+            &schema_json,
+            tools_were_offered,
+            meter,
+            turn_usage,
+            compact_failures,
+            compaction_ledger,
+            CompactionReason::ContextTargetExceeded,
+            false,
+        )
+        .await?;
+
         // Number of messages this request sends — the anchor point for the meter.
         let sent_len = messages.len();
         let req = ChatRequest {
@@ -287,6 +606,19 @@ where
             temperature: cfg.temperature,
             max_tokens: cfg.max_tokens,
         };
+
+        // Keep the final check adjacent to the provider boundary. If a future
+        // edit adds another message or tool mutation between compaction and
+        // request construction, this check fails locally instead of leaking an
+        // oversized request to the gateway.
+        ensure_chat_request_fits(&req, cfg, meter)?;
+        if let Some(log) = &cfg.event_log {
+            log.record(AgentRuntimeEvent::ProviderRequest {
+                round,
+                message_count: req.messages.len(),
+                tools_offered: req.tools.as_ref().map_or(0, Vec::len),
+            });
+        }
 
         // "Vibing kitsu" while we wait for the model. No-op off a TTY; cleared on
         // the first stream item (or on drop if the request errors).
@@ -328,6 +660,14 @@ where
                     // ContextMeter::anchor_includes_schema).
                     meter.record(u.prompt_tokens, sent_len, tools_were_offered);
                     turn_usage.add(u);
+                    if let Some(log) = &cfg.event_log {
+                        log.record(AgentRuntimeEvent::Usage {
+                            round,
+                            prompt_tokens: u.prompt_tokens,
+                            completion_tokens: u.completion_tokens,
+                            total_tokens: u.total_tokens,
+                        });
+                    }
                 }
                 ChatDelta::Done(reason) => finish = reason,
             }
@@ -407,6 +747,13 @@ where
             if !cfg.quiet {
                 kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
             }
+            let tool_event = ToolEventGuard::start(
+                cfg.event_log.as_ref(),
+                round,
+                &tc.call_id,
+                &tc.tool_name,
+                &tc.args,
+            );
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
             let (content, is_err) = match tools.run(&tc.tool_name, tc.args.clone()).await {
                 Ok(out) => {
@@ -433,12 +780,13 @@ where
             if !cfg.quiet {
                 kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
             }
+            tool_event.finish(!is_err, &content);
             // Offload a large successful result to disk, leaving a re-readable
             // pointer, so one big result can't dominate a small window (Stage 2).
             let content = if is_err {
                 content
             } else {
-                maybe_offload(content, &tc.call_id, cfg.offload_dir.as_deref())
+                maybe_offload_for_tools(content, &tc.call_id, cfg.offload_dir.as_deref(), tools)
             };
             messages.push(ChatMessage::tool(tc.call_id.clone(), content));
         }
@@ -557,6 +905,18 @@ fn balanced_object_end(bytes: &[u8], start: usize) -> Option<usize> {
 /// Friendly, compact activity header for a tool call — e.g.
 /// `Read(deck1.md)`, `Write(fb.py)`, `Grep("TODO", src)`, `List(scratch)`.
 /// Falls back to the raw tool name if args don't parse.
+fn event_preview(value: &str) -> String {
+    const LIMIT: usize = 8 * 1024;
+    if value.len() <= LIMIT {
+        return value.to_string();
+    }
+    let mut boundary = LIMIT;
+    while boundary > 0 && !value.is_char_boundary(boundary) {
+        boundary -= 1;
+    }
+    format!("{}\n[truncated event payload]", &value[..boundary])
+}
+
 fn format_tool_header(name: &str, args: &str) -> String {
     let friendly = match name {
         "fs_read_file" => "Read",
@@ -658,16 +1018,150 @@ fn short_path(p: &str) -> String {
     }
 }
 
-/// Keep the conversation within budget before sending (design §3, Stage 1c/2/3).
-/// When the window is known, budget in **tokens**: elide the oldest tool-result
-/// bodies, then — if still over — either drop the oldest whole exchanges (`Trim`)
-/// or summarize them (`Summarize`). Otherwise fall back to the coarse byte budget.
-/// Both branches account for the tools' advertised JSON schema (`schema_json`,
-/// `has_schema` — precomputed once per turn by the caller, since the tool set
-/// never changes mid-turn) — real overhead on every request, not just the
-/// conversation messages — so budgeting can't silently undercount what's
-/// actually sent on the wire and let the gateway reject an oversized request
-/// that looked fine by our own estimate.
+#[derive(Debug, Clone, Copy)]
+struct RequestMeasurement {
+    used: u64,
+    target: u64,
+    window: Option<u64>,
+    unit: ContextUnit,
+}
+
+fn structural_request_tokens(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
+    messages.iter().map(message_tokens).sum::<u64>()
+        + if has_schema {
+            estimate_str(schema_json)
+        } else {
+            0
+        }
+}
+
+fn structural_request_bytes(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
+    messages.iter().map(|m| m.byte_size() as u64).sum::<u64>()
+        + if has_schema {
+            schema_json.len() as u64
+        } else {
+            0
+        }
+}
+
+fn request_measurement(
+    messages: &[ChatMessage],
+    cfg: &AgentConfig,
+    schema_json: &str,
+    has_schema: bool,
+    max_tokens: Option<u32>,
+    meter: &ContextMeter,
+) -> RequestMeasurement {
+    if let Some(window) = cfg.context_window {
+        let schema_tokens = if has_schema {
+            estimate_str(schema_json)
+        } else {
+            0
+        };
+        // A valid real-usage anchor is stronger than a cold chars/token pass.
+        // Add schemas only if that exact anchored request did not already carry
+        // them. Any mutation of covered messages invalidates the anchor first.
+        let used = meter.estimate(messages)
+            + if meter.anchor_includes_schema(messages) {
+                0
+            } else {
+                schema_tokens
+            };
+        RequestMeasurement {
+            used,
+            target: ContextBudget::new(window, max_tokens).target,
+            window: Some(window),
+            unit: ContextUnit::Tokens,
+        }
+    } else {
+        let schema_bytes = if has_schema {
+            schema_json.len() as u64
+        } else {
+            0
+        };
+        RequestMeasurement {
+            used: messages.iter().map(|m| m.byte_size() as u64).sum::<u64>() + schema_bytes,
+            target: cfg.max_context_bytes as u64,
+            window: None,
+            unit: ContextUnit::Bytes,
+        }
+    }
+}
+
+fn check_measurement(measurement: RequestMeasurement) -> Result<RequestMeasurement, AgentError> {
+    if measurement.used > measurement.target {
+        return Err(AgentError::ContextOverflow {
+            required: measurement.used,
+            target: measurement.target,
+            unit: measurement.unit,
+            window: measurement.window,
+        });
+    }
+    Ok(measurement)
+}
+
+/// The last-line guard used at every provider boundary in this module.
+fn ensure_chat_request_fits(
+    req: &ChatRequest,
+    cfg: &AgentConfig,
+    meter: &ContextMeter,
+) -> Result<RequestMeasurement, AgentError> {
+    let has_schema = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
+    let schema_json = req
+        .tools
+        .as_ref()
+        .map(|tools| serde_json::to_string(tools).unwrap_or_default())
+        .unwrap_or_default();
+    check_measurement(request_measurement(
+        &req.messages,
+        cfg,
+        &schema_json,
+        has_schema,
+        req.max_tokens,
+        meter,
+    ))
+}
+
+/// Compact eligible old exchanges immediately, even when the conversation is
+/// currently below the automatic threshold. This is the core entry point for a
+/// `/compact` UI. The same preflight used by normal turns is applied after the
+/// manual operation, and summarization is never attempted without a resolved
+/// window that can bound its own provider request.
+pub async fn compact_context<P>(
+    provider: &P,
+    tools: &Registry,
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    state: &mut AgentSessionState,
+) -> Result<CompactionReport, AgentError>
+where
+    P: Provider,
+{
+    if cfg.context_window.is_none() {
+        return Err(AgentError::ContextWindowUnknown);
+    }
+    let has_schema = !tools.descriptors().is_empty();
+    let schema_json = serde_json::to_string(tools.descriptors()).unwrap_or_default();
+    let mut usage = kitsu_providers::Usage::default();
+    enforce_context_budget_recording(
+        provider,
+        messages,
+        cfg,
+        &schema_json,
+        has_schema,
+        &mut state.meter,
+        &mut usage,
+        &mut state.compact_failures,
+        &mut state.compaction_ledger,
+        CompactionReason::ManualRequest,
+        true,
+    )
+    .await
+}
+
+/// Test-facing wrapper that exercises the production preflight without needing
+/// to construct a persistent ledger.
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 async fn enforce_context_budget<P>(
     provider: &P,
@@ -678,196 +1172,606 @@ async fn enforce_context_budget<P>(
     meter: &mut ContextMeter,
     turn_usage: &mut kitsu_providers::Usage,
     compact_failures: &mut u32,
-) where
+) -> Result<CompactionReport, AgentError>
+where
     P: Provider,
 {
-    let Some(window) = cfg.context_window else {
-        let schema_bytes = if has_schema {
-            schema_json.len() as u64
-        } else {
-            0
-        };
-        let total: u64 = messages.iter().map(|m| m.byte_size() as u64).sum::<u64>() + schema_bytes;
-        trim_tool_results(messages, total, cfg.max_context_bytes as u64, |m| {
-            m.byte_size() as u64
-        });
-        return;
-    };
-    let target = ContextBudget::new(window, cfg.max_tokens).target;
-    // Start from the accurate usage-anchored estimate; the trimmer then does
-    // relative accounting (decrement by tokens actually freed), so an in-turn edit
-    // of an anchored message doesn't skew the count. Only add the schema estimate
-    // when the anchor DOESN'T already cover it: a turn's final round withholds
-    // tools (forcing an answer), so an anchor recorded there is schema-less —
-    // the next round offering tools again must not assume that overhead is
-    // already included just because a real-usage anchor exists at all.
-    let schema_tokens = if has_schema {
-        estimate_str(schema_json)
-    } else {
-        0
-    };
-    let used = meter.estimate(messages)
-        + if meter.anchor_includes_schema(messages) {
-            0
-        } else {
-            schema_tokens
-        };
-    let after_elide = trim_tool_results(messages, used, target, message_tokens);
-    if after_elide <= target {
-        return;
-    }
-    // Same anchored/relative total flows into the next stage so both agree on scale.
-    match cfg.compaction {
-        CompactionMode::Trim => {
-            // Only invalidate when something was actually dropped — the dropped
-            // range structurally reshapes `messages`, so the anchor's `sent_len`
-            // no longer identifies the same prefix it measured and must not be
-            // trusted again just because the conversation regrows past that same
-            // count later. But when there was nothing safely droppable, `messages`
-            // is untouched and the anchor is still perfectly valid; discarding it
-            // anyway would force every later estimate back to a full re-tokenize
-            // for no reason — exactly in the large-conversation case where that
-            // cost matters most.
-            if drop_old_exchanges(messages, after_elide, target, message_tokens) {
+    enforce_context_budget_recording(
+        provider,
+        messages,
+        cfg,
+        schema_json,
+        has_schema,
+        meter,
+        turn_usage,
+        compact_failures,
+        &mut CompactionLedger::default(),
+        CompactionReason::ContextTargetExceeded,
+        false,
+    )
+    .await
+}
+
+#[derive(Debug, Default)]
+struct CompactionProgress {
+    outcome: Option<CompactionOutcome>,
+    fallback_reason: Option<SummaryFallbackReason>,
+    tool_results_elided: u32,
+    exchanges_removed: u32,
+    summary_input_shortened: bool,
+    summary_output_shortened: bool,
+}
+
+/// Keep the conversation within budget before sending (design §3, Stage 1c/2/3)
+/// and record every actual reshape in the session ledger. On return `Ok`, the
+/// exact next request shape is at or below its configured target. On failure no
+/// provider request is made by the caller.
+#[allow(clippy::too_many_arguments)]
+async fn enforce_context_budget_recording<P>(
+    provider: &P,
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    schema_json: &str,
+    has_schema: bool,
+    meter: &mut ContextMeter,
+    turn_usage: &mut kitsu_providers::Usage,
+    compact_failures: &mut u32,
+    ledger: &mut CompactionLedger,
+    reason: CompactionReason,
+    force: bool,
+) -> Result<CompactionReport, AgentError>
+where
+    P: Provider,
+{
+    let token_before = structural_request_tokens(messages, schema_json, has_schema);
+    let messages_before = messages.len();
+    let initial = request_measurement(
+        messages,
+        cfg,
+        schema_json,
+        has_schema,
+        cfg.max_tokens,
+        meter,
+    );
+    let mut progress = CompactionProgress::default();
+
+    if cfg.context_window.is_none() {
+        // With no model window, preserve the historical coarse byte guard. It is
+        // still a checked invariant: elide, then drop whole exchanges, then fail
+        // locally if protected content alone exceeds the configured cap.
+        if initial.used > initial.target {
+            let (after_elide, elided) =
+                trim_tool_results_counted(messages, initial.used, initial.target, |m| {
+                    m.byte_size() as u64
+                });
+            if elided > 0 {
                 meter.invalidate();
+                progress.tool_results_elided = elided;
+                progress.outcome = Some(CompactionOutcome::ToolResultsElided);
+            }
+            if after_elide > initial.target {
+                let mut current = after_elide;
+                let mut removed_total = 0u32;
+                loop {
+                    let removed = drop_old_exchanges_detailed(
+                        messages,
+                        current,
+                        initial.target,
+                        |m| m.byte_size() as u64,
+                        false,
+                    );
+                    if removed == 0 {
+                        break;
+                    }
+                    meter.invalidate();
+                    removed_total = removed_total.saturating_add(removed);
+                    current = structural_request_bytes(messages, schema_json, has_schema);
+                    if current <= initial.target {
+                        break;
+                    }
+                }
+                if removed_total > 0 {
+                    progress.exchanges_removed = removed_total;
+                    progress.outcome = Some(if cfg.compaction == CompactionMode::Summarize {
+                        progress.fallback_reason =
+                            Some(SummaryFallbackReason::ContextWindowUnknown);
+                        CompactionOutcome::SummaryFallbackTrim
+                    } else {
+                        CompactionOutcome::Trimmed
+                    });
+                }
             }
         }
-        CompactionMode::Summarize => {
-            compact_conversation(
-                provider,
-                messages,
-                cfg,
-                after_elide,
-                target,
-                compact_failures,
-                turn_usage,
-                meter,
-            )
-            .await;
+        let final_measurement = request_measurement(
+            messages,
+            cfg,
+            schema_json,
+            has_schema,
+            cfg.max_tokens,
+            meter,
+        );
+        let record = record_progress(
+            ledger,
+            cfg,
+            reason,
+            &progress,
+            token_before,
+            structural_request_tokens(messages, schema_json, has_schema),
+            messages_before,
+            messages.len(),
+        );
+        check_measurement(final_measurement)?;
+        return Ok(CompactionReport {
+            changed: record.is_some(),
+            target_tokens: 0,
+            tokens_before: token_before,
+            tokens_after: structural_request_tokens(messages, schema_json, has_schema),
+            record,
+            usage: *turn_usage,
+        });
+    }
+
+    let target = initial.target;
+    if !force && initial.used <= target {
+        return Ok(CompactionReport {
+            changed: false,
+            target_tokens: target,
+            tokens_before: token_before,
+            tokens_after: token_before,
+            record: None,
+            usage: *turn_usage,
+        });
+    }
+
+    let mut running = initial.used;
+    // Automatic pressure first reclaims old tool bodies cheaply. Explicit
+    // compaction goes straight to eligible whole exchanges so it is
+    // deterministic below the threshold and does not damage protected recent
+    // tool context merely to manufacture savings.
+    if !force {
+        let (after_elide, elided) =
+            trim_tool_results_counted(messages, running, target, message_tokens);
+        running = after_elide;
+        if elided > 0 {
+            meter.invalidate();
+            progress.tool_results_elided = elided;
+            progress.outcome = Some(CompactionOutcome::ToolResultsElided);
+            // Once covered content changes, use one consistent cold estimate for
+            // all subsequent stages and the final adjacent preflight.
+            running = structural_request_tokens(messages, schema_json, has_schema);
         }
     }
+
+    if force || running > target {
+        match cfg.compaction {
+            CompactionMode::Trim => {
+                let mut current = running;
+                let mut removed_total = 0u32;
+                loop {
+                    let removed = drop_old_exchanges_detailed(
+                        messages,
+                        current,
+                        target,
+                        message_tokens,
+                        force,
+                    );
+                    if removed == 0 {
+                        break;
+                    }
+                    meter.invalidate();
+                    removed_total = removed_total.saturating_add(removed);
+                    current = structural_request_tokens(messages, schema_json, has_schema);
+                    if force || current <= target {
+                        break;
+                    }
+                }
+                if removed_total > 0 {
+                    progress.exchanges_removed = removed_total;
+                    progress.outcome = Some(CompactionOutcome::Trimmed);
+                }
+            }
+            CompactionMode::Summarize => {
+                summarize_or_fallback(
+                    provider,
+                    messages,
+                    cfg,
+                    schema_json,
+                    has_schema,
+                    target,
+                    compact_failures,
+                    turn_usage,
+                    meter,
+                    &mut progress,
+                )
+                .await;
+            }
+        }
+    }
+
+    let token_after = structural_request_tokens(messages, schema_json, has_schema);
+    let record = record_progress(
+        ledger,
+        cfg,
+        reason,
+        &progress,
+        token_before,
+        token_after,
+        messages_before,
+        messages.len(),
+    );
+    check_measurement(request_measurement(
+        messages,
+        cfg,
+        schema_json,
+        has_schema,
+        cfg.max_tokens,
+        meter,
+    ))?;
+    Ok(CompactionReport {
+        changed: record.is_some(),
+        target_tokens: target,
+        tokens_before: token_before,
+        tokens_after: token_after,
+        record,
+        usage: *turn_usage,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn record_progress(
+    ledger: &mut CompactionLedger,
+    cfg: &AgentConfig,
+    reason: CompactionReason,
+    progress: &CompactionProgress,
+    tokens_before: u64,
+    tokens_after: u64,
+    messages_before: usize,
+    messages_after: usize,
+) -> Option<CompactionRecord> {
+    let outcome = progress.outcome?;
+    Some(ledger.push(CompactionRecord {
+        sequence: 0,
+        reason,
+        configured_mode: cfg.compaction,
+        outcome,
+        fallback_reason: progress.fallback_reason,
+        tokens_before,
+        tokens_after,
+        messages_before,
+        messages_after,
+        tool_results_elided: progress.tool_results_elided,
+        exchanges_removed: progress.exchanges_removed,
+        summary_input_shortened: progress.summary_input_shortened,
+        summary_output_shortened: progress.summary_output_shortened,
+    }))
 }
 
 /// Consecutive failed compactions after which we stop trying and just drop
 /// (circuit breaker — a doomed summarize loop would burn API calls).
 const MAX_COMPACT_FAILURES: u32 = 3;
-
+const DEFAULT_SUMMARY_MAX_TOKENS: u32 = 1_024;
 const SUMMARY_PROMPT: &str = "Summarize the conversation above so it can continue after the \
 older messages are dropped. Be concise but preserve everything needed to keep working. Cover: \
 (1) the user's primary request and intent; (2) files and code touched — paths, what changed, and \
 why; (3) key decisions, errors, and their fixes; (4) pending tasks; (5) what was being worked on \
 most recently; (6) the exact next step. Output only the summary.";
+const SUMMARY_INPUT_PREFIX: &str = "Conversation to compact:\n";
+const SUMMARY_INPUT_SUFFIX: &str = "\n\nCompaction instructions:\n";
+const SUMMARY_HISTORY_PREFIX: &str =
+    "[Summary of the earlier conversation, compacted to fit the context window]:\n\n";
 
-/// Replace the oldest exchanges with an LLM-written summary (Stage 3). On any
-/// failure it falls back to dropping them, and trips a circuit breaker after
-/// [`MAX_COMPACT_FAILURES`]. Rebuilds history as system prefix + summary + recent
-/// exchanges — recent starts at a user boundary, so no tool_result is orphaned.
+#[derive(Debug, Clone, Copy)]
+struct CompactionSpan {
+    prefix_end: usize,
+    recent_start: usize,
+    exchanges: u32,
+}
+
+fn compaction_span(messages: &[ChatMessage]) -> Option<CompactionSpan> {
+    let user_idxs = user_message_indices(messages);
+    let first_actual = user_idxs
+        .first()
+        .is_some_and(|idx| messages[*idx].content == TRIM_MARKER) as usize;
+    let actual = user_idxs.len().saturating_sub(first_actual);
+    if actual <= KEEP_RECENT_EXCHANGES {
+        return None;
+    }
+    let prefix_end = user_idxs[first_actual];
+    let recent_start = user_idxs[first_actual + actual - KEEP_RECENT_EXCHANGES];
+    Some(CompactionSpan {
+        prefix_end,
+        recent_start,
+        exchanges: (actual - KEEP_RECENT_EXCHANGES) as u32,
+    })
+}
+
+fn summary_max_tokens(window: u64, configured: Option<u32>) -> Option<u32> {
+    let window_cap = u32::try_from(window / 2).unwrap_or(u32::MAX);
+    let requested = configured
+        .unwrap_or(DEFAULT_SUMMARY_MAX_TOKENS)
+        .min(DEFAULT_SUMMARY_MAX_TOKENS);
+    (window_cap > 0).then_some(requested.min(window_cap).max(1))
+}
+
+fn summary_transcript(messages: &[ChatMessage]) -> String {
+    let mut out = String::new();
+    for message in messages {
+        let role = match message.role {
+            Role::System => "SYSTEM",
+            Role::User => "USER",
+            Role::Assistant => "ASSISTANT",
+            Role::Tool => "TOOL",
+        };
+        out.push_str(role);
+        out.push_str(":\n");
+        out.push_str(&message.content);
+        if !message.tool_calls.is_empty() {
+            out.push_str("\nTOOL CALLS: ");
+            out.push_str(&serde_json::to_string(&message.tool_calls).unwrap_or_default());
+        }
+        out.push_str("\n\n");
+    }
+    out
+}
+
+fn floor_char_boundary(text: &str, mut at: usize) -> usize {
+    at = at.min(text.len());
+    while at > 0 && !text.is_char_boundary(at) {
+        at -= 1;
+    }
+    at
+}
+
+fn ceil_char_boundary(text: &str, mut at: usize) -> usize {
+    at = at.min(text.len());
+    while at < text.len() && !text.is_char_boundary(at) {
+        at += 1;
+    }
+    at
+}
+
+fn truncate_middle_to_bytes(text: &str, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text.to_string();
+    }
+    const MARKER: &str = "\n[... older summary input shortened locally ...]\n";
+    if max_bytes <= MARKER.len() {
+        return text[..floor_char_boundary(text, max_bytes)].to_string();
+    }
+    let remaining = max_bytes - MARKER.len();
+    let head_end = floor_char_boundary(text, remaining / 2);
+    let tail_start = ceil_char_boundary(text, text.len().saturating_sub(remaining - head_end));
+    format!("{}{}{}", &text[..head_end], MARKER, &text[tail_start..])
+}
+
+fn bounded_summary_request(
+    cfg: &AgentConfig,
+    old_messages: &[ChatMessage],
+) -> Option<(ChatRequest, bool)> {
+    let window = cfg.context_window?;
+    let max_tokens = summary_max_tokens(window, cfg.max_tokens)?;
+    let target = ContextBudget::new(window, Some(max_tokens)).target;
+    let max_prompt_bytes = usize::try_from(target.saturating_mul(4)).unwrap_or(usize::MAX);
+    let fixed_bytes =
+        SUMMARY_INPUT_PREFIX.len() + SUMMARY_INPUT_SUFFIX.len() + SUMMARY_PROMPT.len();
+    if fixed_bytes >= max_prompt_bytes {
+        return None;
+    }
+    let transcript = summary_transcript(old_messages);
+    let available = max_prompt_bytes - fixed_bytes;
+    let bounded = truncate_middle_to_bytes(&transcript, available);
+    if bounded.trim().is_empty() {
+        return None;
+    }
+    let shortened = bounded.len() < transcript.len();
+    let content = format!("{SUMMARY_INPUT_PREFIX}{bounded}{SUMMARY_INPUT_SUFFIX}{SUMMARY_PROMPT}");
+    Some((
+        ChatRequest {
+            model: cfg.model.clone(),
+            messages: vec![ChatMessage::user(content)],
+            tools: None,
+            stream: false,
+            temperature: cfg.temperature,
+            max_tokens: Some(max_tokens),
+        },
+        shortened,
+    ))
+}
+
+fn rebuilt_with_summary(
+    messages: &[ChatMessage],
+    span: CompactionSpan,
+    summary: &str,
+) -> Vec<ChatMessage> {
+    let mut rebuilt = messages[..span.prefix_end].to_vec();
+    rebuilt.push(ChatMessage::user(format!(
+        "{SUMMARY_HISTORY_PREFIX}{summary}"
+    )));
+    rebuilt.extend_from_slice(&messages[span.recent_start..]);
+    rebuilt
+}
+
+fn fit_summary_rebuild(
+    messages: &[ChatMessage],
+    span: CompactionSpan,
+    summary: &str,
+    schema_json: &str,
+    has_schema: bool,
+    target: u64,
+) -> Option<(Vec<ChatMessage>, bool)> {
+    let mut cap = summary.len();
+    loop {
+        let bounded = truncate_middle_to_bytes(summary, cap);
+        if bounded.trim().is_empty() {
+            return None;
+        }
+        let rebuilt = rebuilt_with_summary(messages, span, bounded.trim());
+        let used = structural_request_tokens(&rebuilt, schema_json, has_schema);
+        if used <= target {
+            return Some((rebuilt, bounded.len() < summary.len()));
+        }
+        if cap == 0 {
+            return None;
+        }
+        let excess_bytes = usize::try_from(used.saturating_sub(target).saturating_mul(4))
+            .unwrap_or(usize::MAX)
+            .max(1);
+        let next = cap.saturating_sub(excess_bytes);
+        cap = if next == cap {
+            cap.saturating_sub(1)
+        } else {
+            next
+        };
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-async fn compact_conversation<P>(
+async fn summarize_or_fallback<P>(
     provider: &P,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
-    total: u64,
+    schema_json: &str,
+    has_schema: bool,
     target: u64,
     failures: &mut u32,
     turn_usage: &mut kitsu_providers::Usage,
     meter: &mut ContextMeter,
+    progress: &mut CompactionProgress,
 ) where
     P: Provider,
 {
-    let user_idxs = user_message_indices(messages);
-    let n = user_idxs.len();
-    if n <= KEEP_RECENT_EXCHANGES {
-        return; // nothing older to compact
-    }
-    let prefix_end = user_idxs[0];
-    let recent_start = user_idxs[n - KEEP_RECENT_EXCHANGES];
-
-    // Circuit breaker: after repeated failures, just drop (don't keep burning calls).
-    if *failures >= MAX_COMPACT_FAILURES {
-        // See the Trim-branch comment in enforce_context_budget: only invalidate
-        // when a drop actually happened.
-        if drop_old_exchanges(messages, total, target, message_tokens) {
-            meter.invalidate();
-        }
+    let Some(span) = compaction_span(messages) else {
         return;
-    }
-
-    // Summarize the old span [prefix_end, recent_start).
-    let mut req_msgs: Vec<ChatMessage> = messages[prefix_end..recent_start].to_vec();
-    req_msgs.push(ChatMessage::user(SUMMARY_PROMPT));
-    let req = ChatRequest {
-        model: cfg.model.clone(),
-        messages: req_msgs,
-        tools: None,
-        stream: false,
-        temperature: cfg.temperature,
-        max_tokens: Some(cfg.max_tokens.map_or(1024, |m| m.min(1024))),
     };
 
-    match collect_text(provider, req).await {
-        Some((s, usage)) if !s.trim().is_empty() => {
-            // Fold the summarizer call's real token cost into the turn's usage —
-            // it's an extra chat_stream() call outside the main round loop, so
-            // it's easy to forget, and the `kitsu-usage:` line documents itself as
-            // covering actual spend for the whole turn.
-            if let Some(u) = usage {
-                turn_usage.add(u);
-            }
-            *failures = 0;
-            let prefix: Vec<ChatMessage> = messages[..prefix_end].to_vec();
-            let recent: Vec<ChatMessage> = messages[recent_start..].to_vec();
-            let mut rebuilt = prefix;
-            rebuilt.push(ChatMessage::user(format!(
-                "[Summary of the earlier conversation, compacted to fit the context window]:\n\n{}",
-                s.trim()
-            )));
-            rebuilt.extend(recent);
-            *messages = rebuilt;
-            // The rebuild replaces a whole span of `messages` with a single
-            // summary message — a structural reshape just like drop_old_exchanges,
-            // so the anchor must not survive it either.
-            meter.invalidate();
-            if !cfg.quiet {
-                kitsu_render::compaction_boundary();
+    let fallback = if *failures >= MAX_COMPACT_FAILURES {
+        Some(SummaryFallbackReason::CircuitBreaker)
+    } else {
+        match bounded_summary_request(cfg, &messages[span.prefix_end..span.recent_start]) {
+            None => Some(SummaryFallbackReason::RequestTooLarge),
+            Some((req, shortened)) => {
+                progress.summary_input_shortened = shortened;
+                // This is a provider request in its own right. Check the concrete
+                // bounded request immediately before crossing the boundary.
+                let cold_meter = ContextMeter::new();
+                if ensure_chat_request_fits(&req, cfg, &cold_meter).is_err() {
+                    Some(SummaryFallbackReason::RequestTooLarge)
+                } else {
+                    match collect_text(provider, req).await {
+                        SummaryTextCollection::Complete { text, usage }
+                            if !text.trim().is_empty() =>
+                        {
+                            if let Some(usage) = usage {
+                                turn_usage.add(usage);
+                            }
+                            if let Some((rebuilt, output_shortened)) = fit_summary_rebuild(
+                                messages,
+                                span,
+                                text.trim(),
+                                schema_json,
+                                has_schema,
+                                target,
+                            ) {
+                                *messages = rebuilt;
+                                meter.invalidate();
+                                *failures = 0;
+                                progress.exchanges_removed = span.exchanges;
+                                progress.summary_output_shortened = output_shortened;
+                                progress.outcome = Some(CompactionOutcome::Summarized);
+                                if !cfg.quiet {
+                                    kitsu_render::compaction_boundary();
+                                }
+                                return;
+                            }
+                            *failures = failures.saturating_add(1);
+                            Some(SummaryFallbackReason::ResponseTooLarge)
+                        }
+                        SummaryTextCollection::Complete { usage, .. } => {
+                            if let Some(usage) = usage {
+                                turn_usage.add(usage);
+                            }
+                            *failures = failures.saturating_add(1);
+                            Some(SummaryFallbackReason::ProviderFailure)
+                        }
+                        SummaryTextCollection::Failed { reason, usage } => {
+                            if let Some(usage) = usage {
+                                turn_usage.add(usage);
+                            }
+                            *failures = failures.saturating_add(1);
+                            Some(reason)
+                        }
+                    }
+                }
             }
         }
-        Some((_, usage)) => {
-            // Got a response (real API cost incurred) but unusable — still
-            // account for it, even though we fall back to dropping.
-            if let Some(u) = usage {
-                turn_usage.add(u);
-            }
-            *failures += 1;
-            if drop_old_exchanges(messages, total, target, message_tokens) {
-                meter.invalidate();
-            }
-        }
-        None => {
-            *failures += 1;
-            if drop_old_exchanges(messages, total, target, message_tokens) {
-                meter.invalidate();
-            }
-        }
+    };
+
+    // Summary failure is always local and deterministic from here: remove every
+    // eligible old exchange, preserve the leading system/marker plus the two
+    // recent exchanges, then let the common final preflight either accept that
+    // smallest safe history or return ContextOverflow for protected context.
+    let current = structural_request_tokens(messages, schema_json, has_schema);
+    let removed = drop_old_exchanges_detailed(messages, current, target, message_tokens, true);
+    if removed > 0 {
+        meter.invalidate();
+        progress.exchanges_removed = removed;
+        progress.outcome = Some(CompactionOutcome::SummaryFallbackTrim);
+        progress.fallback_reason = fallback;
     }
 }
 
+enum SummaryTextCollection {
+    Complete {
+        text: String,
+        usage: Option<kitsu_providers::Usage>,
+    },
+    Failed {
+        reason: SummaryFallbackReason,
+        usage: Option<kitsu_providers::Usage>,
+    },
+}
+
 /// Collect all streamed text (and usage, if reported) from a non-tool request.
-async fn collect_text<P: Provider>(
-    provider: &P,
-    req: ChatRequest,
-) -> Option<(String, Option<kitsu_providers::Usage>)> {
-    let mut stream = provider.chat_stream(req).await.ok()?;
+/// Text is usable only when the provider stream is error-free, contains no tool
+/// calls, and explicitly terminates with `Done(Stop)`. This prevents partial
+/// text before a stream error, length cutoff, or bare EOF from being installed
+/// as durable conversation history.
+async fn collect_text<P: Provider>(provider: &P, req: ChatRequest) -> SummaryTextCollection {
+    let mut stream = match provider.chat_stream(req).await {
+        Ok(stream) => stream,
+        Err(_) => {
+            return SummaryTextCollection::Failed {
+                reason: SummaryFallbackReason::ProviderFailure,
+                usage: None,
+            };
+        }
+    };
     let mut text = String::new();
     let mut usage = None;
+    let mut finish = None;
+    let mut unexpected_tool_call = false;
     while let Some(item) = stream.next().await {
         match item {
             Ok(ChatDelta::Text(t)) => text.push_str(&t),
             Ok(ChatDelta::Usage(u)) => usage = Some(u),
-            _ => {}
+            Ok(ChatDelta::Done(reason)) => finish = Some(reason),
+            Ok(ChatDelta::ToolCall(_)) => unexpected_tool_call = true,
+            Err(_) => {
+                return SummaryTextCollection::Failed {
+                    reason: SummaryFallbackReason::ProviderFailure,
+                    usage,
+                };
+            }
         }
     }
-    Some((text, usage))
+    if unexpected_tool_call || finish != Some(FinishReason::Stop) {
+        SummaryTextCollection::Failed {
+            reason: SummaryFallbackReason::IncompleteResponse,
+            usage,
+        }
+    } else {
+        SummaryTextCollection::Complete { text, usage }
+    }
 }
 
 /// Elide the oldest tool-result bodies (replacing each with a short stub) until
@@ -875,16 +1779,27 @@ async fn collect_text<P: Provider>(
 /// decrementing by the amount each elision actually frees. Never touches the
 /// system prompt, the last user message, or any non-tool message. Returns the
 /// resulting total.
+#[cfg(test)]
 fn trim_tool_results(
+    messages: &mut [ChatMessage],
+    total: u64,
+    limit: u64,
+    size: impl Fn(&ChatMessage) -> u64,
+) -> u64 {
+    trim_tool_results_counted(messages, total, limit, size).0
+}
+
+fn trim_tool_results_counted(
     messages: &mut [ChatMessage],
     mut total: u64,
     limit: u64,
     size: impl Fn(&ChatMessage) -> u64,
-) -> u64 {
+) -> (u64, u32) {
     if total <= limit {
-        return total;
+        return (total, 0);
     }
     let last_user_idx = messages.iter().rposition(|m| m.role == Role::User);
+    let mut elided = 0u32;
     let mut i = 0;
     while total > limit && i < messages.len() {
         // Only elide tool results (never system / last-user / assistant turns).
@@ -895,11 +1810,12 @@ fn trim_tool_results(
             if after < before {
                 total = total.saturating_sub(before - after);
                 messages[i] = stub;
+                elided = elided.saturating_add(1);
             }
         }
         i += 1;
     }
-    total
+    (total, elided)
 }
 
 /// Build the elided replacement for a tool-result message. If the message is
@@ -939,11 +1855,31 @@ const OFFLOAD_POINTER_PREFIX: &str = "[tool output ";
 /// How much of an offloaded result to keep inline as a preview.
 const OFFLOAD_PREVIEW_CHARS: usize = 500;
 
-/// If `content` exceeds the cap and an offload `dir` is set, write the full
-/// result to `<dir>/<call_id>.txt` and return a pointer + preview the model can
-/// re-read via `fs_read_file`. Returns the content unchanged when there is no
-/// dir, it's under the cap, or the write fails (the trimming cascade still bounds
-/// it). The offload dir must be a model-readable path.
+/// Offload only when the active model can actually recover the resulting
+/// pointer. A registered-but-unadvertised handler is insufficient: the model
+/// must receive an `fs_read_file` descriptor in this turn's tool catalog.
+fn maybe_offload_for_tools(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+    tools: &Registry,
+) -> String {
+    let can_read = tools.is_registered("fs_read_file")
+        && tools
+            .descriptors()
+            .iter()
+            .any(|descriptor| descriptor.name == "fs_read_file");
+    if !can_read {
+        return content;
+    }
+    maybe_offload(content, call_id, dir)
+}
+
+/// If `content` exceeds the cap and an offload `dir` is set, allocate a unique
+/// private `<dir>/<call_id>-<sequence>.txt` artifact and return a pointer +
+/// preview the model can re-read via `fs_read_file`. Returns the content
+/// unchanged when there is no dir, it's under the cap, or the write fails (the
+/// trimming cascade still bounds it). The offload dir must be model-readable.
 fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) -> String {
     let Some(dir) = dir else {
         return content;
@@ -960,16 +1896,11 @@ fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) 
     } else {
         safe_id
     };
-    // A process-wide sequence keeps filenames unique even when call_ids repeat
-    // across rounds (e.g. text-protocol `textcall-0` resets each round), so an old
-    // pointer never resolves to a newer result.
-    use std::sync::atomic::{AtomicU64, Ordering};
-    static OFFLOAD_SEQ: AtomicU64 = AtomicU64::new(0);
-    let seq = OFFLOAD_SEQ.fetch_add(1, Ordering::Relaxed);
-    let path = dir.join(format!("{name}-{seq}.txt"));
-    if std::fs::write(&path, &content).is_err() {
-        return content;
-    }
+    let path = match kitsu_tools::builtins::fs::write_unique_private_text_file(dir, &name, &content)
+    {
+        Ok(path) => path,
+        Err(_) => return content,
+    };
     let preview: String = content.chars().take(OFFLOAD_PREVIEW_CHARS).collect();
     format!(
         "{OFFLOAD_POINTER_PREFIX}{:.1} KB — full result saved to {}. Re-read it (or a line range) \
@@ -981,6 +1912,7 @@ fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) 
 
 /// How many recent user-delimited exchanges to always keep intact.
 const KEEP_RECENT_EXCHANGES: usize = 2;
+const TRIM_MARKER: &str = "[earlier conversation trimmed to fit the context window]";
 
 /// Drop the oldest whole exchanges (a user message and everything up to the next
 /// user message) when tool-result elision wasn't enough. Cutting only at user
@@ -988,7 +1920,7 @@ const KEEP_RECENT_EXCHANGES: usize = 2;
 /// assistant tool_call. The leading system prefix and the most recent
 /// [`KEEP_RECENT_EXCHANGES`] exchanges are always kept; a marker records the drop.
 /// Indices of `Role::User` messages, in order — the exchange boundaries both
-/// [`drop_old_exchanges`] and `compact_conversation` need. Kept as one function
+/// [`drop_old_exchanges`] and summarizing compaction need. Kept as one function
 /// so the two can't drift out of sync with each other.
 fn user_message_indices(messages: &[ChatMessage]) -> Vec<usize> {
     messages
@@ -1005,37 +1937,59 @@ fn user_message_indices(messages: &[ChatMessage]) -> Vec<usize> {
 /// (and so whether a [`ContextMeter`] anchor needs invalidating), since
 /// invalidating on a guaranteed no-op would needlessly discard a still-valid
 /// anchor and force every later estimate back to a full re-tokenize.
+#[cfg(test)]
 fn drop_old_exchanges(
+    messages: &mut Vec<ChatMessage>,
+    total: u64,
+    target: u64,
+    size: impl Fn(&ChatMessage) -> u64,
+) -> bool {
+    drop_old_exchanges_detailed(messages, total, target, size, false) > 0
+}
+
+/// Detailed/force-capable form used by telemetry and explicit manual
+/// compaction. `force_all` deterministically removes every eligible old
+/// exchange even when `total` is already below `target`.
+fn drop_old_exchanges_detailed(
     messages: &mut Vec<ChatMessage>,
     mut total: u64,
     target: u64,
     size: impl Fn(&ChatMessage) -> u64,
-) -> bool {
+    force_all: bool,
+) -> u32 {
     let user_idxs = user_message_indices(messages);
-    let n = user_idxs.len();
-    if n <= KEEP_RECENT_EXCHANGES {
-        return false; // nothing safely droppable
+    let marker_present = user_idxs
+        .first()
+        .is_some_and(|idx| messages[*idx].content == TRIM_MARKER);
+    let first_actual = usize::from(marker_present);
+    let actual = user_idxs.len().saturating_sub(first_actual);
+    if actual <= KEEP_RECENT_EXCHANGES {
+        return 0; // nothing safely droppable
     }
-    let max_drop = n - KEEP_RECENT_EXCHANGES; // leading exchanges we may drop
+    let max_drop = actual - KEEP_RECENT_EXCHANGES;
 
     // `total` starts from the caller's running (anchored) estimate; decrement by
     // what each dropped exchange frees, keeping both trim stages on one scale.
+    // Account for the marker we insert on the first drop so returning "fits"
+    // cannot be invalidated merely by the marker's own token cost.
     let mut e = 0;
-    while total > target && e < max_drop {
-        let start = user_idxs[e];
-        let end = user_idxs[e + 1];
+    while (force_all || total > target) && e < max_drop {
+        let start = user_idxs[first_actual + e];
+        let end = user_idxs[first_actual + e + 1];
         total = total.saturating_sub(messages[start..end].iter().map(&size).sum::<u64>());
+        if e == 0 && !marker_present {
+            total = total.saturating_add(size(&ChatMessage::user(TRIM_MARKER)));
+        }
         e += 1;
     }
     if e == 0 {
-        return false;
+        return 0;
     }
-    let drop_start = user_idxs[0];
-    let drop_end = user_idxs[e];
+    let drop_start = user_idxs[first_actual];
+    let drop_end = user_idxs[first_actual + e];
     messages.drain(drop_start..drop_end);
-    messages.insert(
-        drop_start,
-        ChatMessage::user("[earlier conversation trimmed to fit the context window]"),
-    );
-    true
+    if !marker_present {
+        messages.insert(drop_start, ChatMessage::user(TRIM_MARKER));
+    }
+    u32::try_from(e).unwrap_or(u32::MAX)
 }

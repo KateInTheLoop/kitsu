@@ -11,11 +11,24 @@
 //! suggests still goes through the permission model.
 
 use std::collections::HashSet;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kitsu_providers::ToolDescriptor;
-use kitsu_tools::{HandlerFn, Permissions, ToolError};
+#[cfg(test)]
+use kitsu_tools::Permissions;
+use kitsu_tools::{HandlerFn, ToolError};
+
+const MAX_SKILL_MANIFEST_BYTES: usize = 256 * 1024;
+const MAX_SKILL_RESOURCE_BYTES: usize = 32 * 1024;
+const MAX_SKILL_RESOURCES_TOTAL_BYTES: usize = 64 * 1024;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SkillResource {
+    name: String,
+    content: String,
+}
 
 /// A parsed skill.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -30,6 +43,9 @@ pub struct Skill {
     pub links: Vec<String>,
     /// The skill's directory (its bundled resources live here — Stage S2).
     pub dir: PathBuf,
+    /// Bounded UTF-8 resources captured through no-follow file descriptors at
+    /// discovery time. Loading a skill never widens filesystem authority.
+    resources: Vec<SkillResource>,
 }
 
 /// The discovered skills for a session.
@@ -66,12 +82,35 @@ impl SkillSet {
             .join("\n")
     }
 
+    /// Terminal-safe index: every repository-controlled field is forced onto
+    /// one row before the rows are joined.
+    pub fn terminal_index(&self, filter: &str) -> String {
+        fn inline(value: &str) -> String {
+            kitsu_render::sanitize_terminal_text(value)
+                .chars()
+                .map(|ch| if matches!(ch, '\n' | '\t') { ' ' } else { ch })
+                .collect()
+        }
+
+        let f = filter.trim().to_lowercase();
+        self.skills
+            .iter()
+            .filter(|skill| {
+                f.is_empty()
+                    || skill.name.to_lowercase().contains(&f)
+                    || skill.description.to_lowercase().contains(&f)
+            })
+            .map(|skill| format!("- {} — {}", inline(&skill.name), inline(&skill.description)))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
     /// Bodies of `always: true` skills, concatenated (loaded up front).
     pub fn always_bodies(&self) -> String {
         self.skills
             .iter()
             .filter(|s| s.always && !s.body.is_empty())
-            .map(|s| format!("# Skill: {}\n{}", s.name, s.body))
+            .map(load_skill)
             .collect::<Vec<_>>()
             .join("\n\n")
     }
@@ -107,23 +146,112 @@ impl SkillSet {
 /// Read every `<dir>/*/SKILL.md`, parsing and appending skills whose name hasn't
 /// been seen yet.
 fn collect_from(dir: &Path, skills: &mut Vec<Skill>, seen: &mut HashSet<String>) {
+    // Skill roots and their `.kitsu` parent are configuration boundaries, not
+    // shortcuts to arbitrary filesystem locations. Ignore symlinked roots so a
+    // repository cannot redirect discovery outside the project or user skill
+    // namespace.
+    let regular_directory = |path: &Path| {
+        std::fs::symlink_metadata(path)
+            .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+            .unwrap_or(false)
+    };
+    if !regular_directory(dir)
+        || dir
+            .parent()
+            .is_some_and(|parent| !regular_directory(parent))
+    {
+        return;
+    }
     let Ok(entries) = std::fs::read_dir(dir) else {
         return;
     };
-    let mut paths: Vec<PathBuf> = entries.flatten().map(|e| e.path()).collect();
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_dir()))
+        .map(|entry| entry.path())
+        .collect();
     paths.sort(); // deterministic order
     for p in paths {
         let md = p.join("SKILL.md");
-        if !md.is_file() {
+        let Some(content) = read_regular_utf8_no_follow(&md, MAX_SKILL_MANIFEST_BYTES) else {
             continue;
-        }
-        if let Ok(content) = std::fs::read_to_string(&md) {
-            let skill = parse(&content, &p);
-            if !skill.name.is_empty() && seen.insert(skill.name.clone()) {
-                skills.push(skill);
-            }
+        };
+        let mut skill = parse(&content, &p);
+        skill.resources = collect_resources(&p);
+        if !skill.name.is_empty() && seen.insert(skill.name.clone()) {
+            skills.push(skill);
         }
     }
+}
+
+fn read_regular_utf8_no_follow(path: &Path, max_bytes: usize) -> Option<String> {
+    read_regular_utf8_no_follow_with_hook(path, max_bytes, || {})
+}
+
+fn read_regular_utf8_no_follow_with_hook<F>(
+    path: &Path,
+    max_bytes: usize,
+    after_open: F,
+) -> Option<String>
+where
+    F: FnOnce(),
+{
+    #[cfg(unix)]
+    let file = crate::attachments::open_regular_file_no_follow(path).ok()?;
+
+    #[cfg(not(unix))]
+    let file = {
+        let metadata = std::fs::symlink_metadata(path).ok()?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
+            return None;
+        }
+        std::fs::OpenOptions::new().read(true).open(path).ok()?
+    };
+
+    after_open();
+    let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
+    file.take(max_bytes.saturating_add(1) as u64)
+        .read_to_end(&mut bytes)
+        .ok()?;
+    if bytes.len() > max_bytes || bytes.contains(&0) {
+        return None;
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn collect_resources(dir: &Path) -> Vec<SkillResource> {
+    let Ok(entries) = std::fs::read_dir(dir) else {
+        return Vec::new();
+    };
+    let mut paths: Vec<PathBuf> = entries
+        .flatten()
+        .filter(|entry| entry.file_name() != "SKILL.md")
+        .filter(|entry| entry.file_type().is_ok_and(|kind| kind.is_file()))
+        .map(|entry| entry.path())
+        .collect();
+    paths.sort();
+
+    let mut total = 0usize;
+    let mut resources = Vec::new();
+    for path in paths {
+        let remaining = MAX_SKILL_RESOURCES_TOTAL_BYTES.saturating_sub(total);
+        if remaining == 0 {
+            break;
+        }
+        let cap = remaining.min(MAX_SKILL_RESOURCE_BYTES);
+        let Some(content) = read_regular_utf8_no_follow(&path, cap) else {
+            continue;
+        };
+        let Some(name) = path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string())
+        else {
+            continue;
+        };
+        total = total.saturating_add(content.len());
+        resources.push(SkillResource { name, content });
+    }
+    resources
 }
 
 /// Parse a `SKILL.md`: optional `---`-delimited frontmatter (`key: value` lines)
@@ -141,6 +269,7 @@ pub fn parse(content: &str, dir: &Path) -> Skill {
         body: String::new(),
         links: Vec::new(),
         dir: dir.to_path_buf(),
+        resources: Vec::new(),
     };
 
     let trimmed = content.trim_start_matches('\u{feff}');
@@ -193,18 +322,18 @@ struct SkillArgs {
     name: String,
 }
 
-/// Grant read access to `skill`'s directory (so its bundled files are reachable
-/// via `fs_read_file` without a broad `--allow-path`) and render its body plus a
-/// list of bundled files and declared links. Shared by the `skill` tool,
-/// `/skill`, and `--skill` (Stage S2). Links are surfaced, never fetched.
-pub fn load_skill(skill: &Skill, perms: &Permissions) -> String {
-    let _ = perms.grant_read_root(&skill.dir.to_string_lossy());
+/// Render a skill body plus bounded UTF-8 resources captured during discovery.
+/// Loading never widens filesystem authority. Shared by the `skill` tool,
+/// `/skill`, and `--skill`; declared links are surfaced, never fetched.
+pub fn load_skill(skill: &Skill) -> String {
     let mut out = format!("# Skill: {}\n{}", skill.name, skill.body);
-    let files = bundled_files(&skill.dir);
-    if !files.is_empty() {
-        out.push_str("\n\nBundled files (read with fs_read_file):\n");
-        for f in &files {
-            out.push_str(&format!("- {f}\n"));
+    if !skill.resources.is_empty() {
+        out.push_str("\n\nBundled resources (captured safely during discovery):\n");
+        for resource in &skill.resources {
+            out.push_str(&format!(
+                "\n<skill-resource name={:?}>\n{}\n</skill-resource>\n",
+                resource.name, resource.content
+            ));
         }
     }
     if !skill.links.is_empty() {
@@ -216,29 +345,14 @@ pub fn load_skill(skill: &Skill, perms: &Permissions) -> String {
     out
 }
 
-/// The skill's bundled resource files (everything in its dir except `SKILL.md`).
-fn bundled_files(dir: &Path) -> Vec<String> {
-    let Ok(entries) = std::fs::read_dir(dir) else {
-        return Vec::new();
-    };
-    let mut files: Vec<String> = entries
-        .flatten()
-        .filter(|e| e.file_name() != "SKILL.md")
-        .filter(|e| e.path().is_file())
-        .map(|e| e.path().to_string_lossy().to_string())
-        .collect();
-    files.sort();
-    files
-}
-
-/// Build the `skill` tool: `skill(name)` loads a skill's instructions (and grants
-/// read to its dir for bundled files) on demand. Registered only when skills exist.
-pub fn skill_tool(skills: Arc<SkillSet>, perms: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+/// Build the `skill` tool: `skill(name)` loads instructions and the bounded
+/// resource snapshot on demand. Registered only when skills exist.
+pub fn skill_tool(skills: Arc<SkillSet>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "skill".to_string(),
         description: "Load a named skill's full instructions into context. Call this when a task \
                       matches a skill's description (skills are listed in the system prompt). \
-                      Returns the instructions and any bundled files you may then read."
+                      Returns the instructions and bounded bundled resource contents."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -248,12 +362,11 @@ pub fn skill_tool(skills: Arc<SkillSet>, perms: Arc<Permissions>) -> (ToolDescri
     };
     let handler: HandlerFn = Box::new(move |args: String| {
         let skills = skills.clone();
-        let perms = perms.clone();
         Box::pin(async move {
             let a: SkillArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
             match skills.get(&a.name) {
-                Some(s) => Ok(load_skill(s, &perms)),
+                Some(s) => Ok(load_skill(s)),
                 None => Err(ToolError::ExecError(format!(
                     "no skill named '{}'; available: {}",
                     a.name,
@@ -311,6 +424,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                     body: String::new(),
                     links: Vec::new(),
                     dir: PathBuf::new(),
+                    resources: Vec::new(),
                 },
                 Skill {
                     name: "review".into(),
@@ -320,6 +434,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                     body: String::new(),
                     links: Vec::new(),
                     dir: PathBuf::new(),
+                    resources: Vec::new(),
                 },
             ],
         };
@@ -328,6 +443,27 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         // filter
         assert!(set.index("rev").contains("review"));
         assert!(!set.index("rev").contains("- a —"));
+    }
+
+    #[test]
+    fn terminal_index_keeps_each_repository_field_on_one_row() {
+        let set = SkillSet {
+            skills: vec![Skill {
+                name: "safe\nforged".into(),
+                description: "description\tspoof\u{1b}[2J".into(),
+                when_to_use: String::new(),
+                always: false,
+                body: String::new(),
+                links: Vec::new(),
+                dir: PathBuf::new(),
+                resources: Vec::new(),
+            }],
+        };
+        let rendered = set.terminal_index("");
+        assert!(!rendered.contains('\n'));
+        assert!(!rendered.contains('\t'));
+        assert!(!rendered.contains('\u{1b}'));
+        assert!(rendered.contains("safe forged"));
     }
 
     #[test]
@@ -379,6 +515,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
 
     #[tokio::test]
     async fn skill_tool_returns_body_and_errors_on_unknown() {
+        let dir = tempfile::tempdir().unwrap();
         let set = Arc::new(SkillSet {
             skills: vec![Skill {
                 name: "greet".into(),
@@ -387,11 +524,11 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                 always: false,
                 body: "Say hello warmly.".into(),
                 links: Vec::new(),
-                dir: PathBuf::new(),
+                dir: dir.path().to_path_buf(),
+                resources: Vec::new(),
             }],
         });
-        let perms = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
-        let (desc, handler) = skill_tool(set, perms);
+        let (desc, handler) = skill_tool(set);
         assert_eq!(desc.name, "skill");
         let ok = handler(r#"{"name":"greet"}"#.to_string()).await.unwrap();
         assert!(ok.contains("Say hello warmly."));
@@ -400,7 +537,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
     }
 
     #[tokio::test]
-    async fn load_skill_grants_read_lists_files_and_surfaces_links_without_fetching() {
+    async fn load_skill_captures_resources_without_granting_filesystem_access() {
         let dir = tempfile::tempdir().unwrap();
         let skdir = dir.path().join("cr");
         std::fs::create_dir_all(&skdir).unwrap();
@@ -421,11 +558,94 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         // Before loading, the bundled file is NOT readable (deny-by-default).
         assert!(perms.check_read(&checklist).await.is_err());
 
-        let out = load_skill(&skill, &perms);
+        let mut skill = skill;
+        skill.resources = collect_resources(&skdir);
+        let out = load_skill(&skill);
         assert!(out.contains("checklist.md"), "bundled file is listed");
+        assert!(out.contains("1. check"), "bundled contents are captured");
         assert!(out.contains("https://example.com/spec"), "link surfaced");
         assert!(out.contains("NOT fetched"), "links are not fetched");
-        // Loading granted read to the skill dir, so now it's readable.
-        assert!(perms.check_read(&checklist).await.is_ok());
+        // Loading does not widen filesystem authority; resources are served
+        // from the bounded discovery snapshot instead.
+        assert!(perms.check_read(&checklist).await.is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_ignores_symlinked_skill_directories_and_manifests() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let skills = root.path().join(".kitsu/skills");
+        std::fs::create_dir_all(&skills).unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        std::fs::write(
+            outside.path().join("SKILL.md"),
+            "---\nname: escaped-dir\n---\nsecret",
+        )
+        .unwrap();
+        symlink(outside.path(), skills.join("escaped-dir")).unwrap();
+
+        let linked_manifest = skills.join("linked-manifest");
+        std::fs::create_dir_all(&linked_manifest).unwrap();
+        symlink(
+            outside.path().join("SKILL.md"),
+            linked_manifest.join("SKILL.md"),
+        )
+        .unwrap();
+
+        let set = SkillSet::discover(root.path(), false);
+        assert!(set.get("escaped-dir").is_none());
+        assert!(set.get("linked-manifest").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn opened_manifest_stays_pinned_across_an_ancestor_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let skill_dir = root.path().join("skill");
+        let moved = root.path().join("moved-skill");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&skill_dir).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let manifest = skill_dir.join("SKILL.md");
+        std::fs::write(&manifest, "AUTHORIZED").unwrap();
+        std::fs::write(outside.join("SKILL.md"), "PRIVATE").unwrap();
+
+        let content = read_regular_utf8_no_follow_with_hook(&manifest, 1024, || {
+            std::fs::rename(&skill_dir, &moved).unwrap();
+            symlink(&outside, &skill_dir).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(content, "AUTHORIZED");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn load_skill_never_grants_a_symlinked_target() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let alias = root.path().join("skill-alias");
+        symlink(outside.path(), &alias).unwrap();
+        let skill = Skill {
+            name: "escaped".into(),
+            description: String::new(),
+            when_to_use: String::new(),
+            always: false,
+            body: "body".into(),
+            links: Vec::new(),
+            dir: alias,
+            resources: Vec::new(),
+        };
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+
+        assert!(load_skill(&skill).contains("body"));
+        assert!(perms.check_read(outside.path()).await.is_err());
     }
 }

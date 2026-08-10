@@ -2,7 +2,7 @@
 
 use thiserror::Error;
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     #[error("connection error: {0}")]
     Connection(String),
@@ -26,7 +26,7 @@ pub enum ProviderError {
     Auth(#[from] AuthError),
 }
 
-#[derive(Debug, Error)]
+#[derive(Debug, Clone, Error)]
 pub enum AuthError {
     #[error("auth error: ${env} is not set{}", .hint.as_ref().map(|h| format!(" — {h}")).unwrap_or_default())]
     Missing { env: String, hint: Option<String> },

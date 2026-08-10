@@ -15,6 +15,7 @@ use futures::StreamExt;
 use kitsu_core::{run_agent_turn, AgentConfig};
 use kitsu_providers::{ChatMessage, Provider, ToolDescriptor};
 use kitsu_tools::{HandlerFn, Registry, ToolError};
+use tokio::sync::watch;
 
 #[derive(serde::Deserialize)]
 struct SpawnArgs {
@@ -53,22 +54,51 @@ pub enum AgentStatus {
     Running,
     Done(String),
     Failed(String),
+    Cancelled(String),
 }
 
 struct AgentRecord {
     task: String,
     status: AgentStatus,
-    handle: Option<tokio::task::AbortHandle>,
+    handle: Option<tokio::task::JoinHandle<()>>,
 }
 
 /// Registry of background subagents, shared between `spawn_agent_bg`,
 /// `agent_result`, and the `/agents` command. Detached subagents update their
 /// record on completion; the user (via `/agents`) or the model (via
 /// `agent_result`) reads status/results back.
-#[derive(Default)]
+///
+/// Interactive frontends can subscribe to race-free state changes with
+/// [`AgentRegistry::subscribe`]. Watch updates are snapshots rather than edge
+/// notifications: a slow receiver may observe several changes at once, but it
+/// can never miss the latest running/terminal counts or the monotonic
+/// generation identifying that the registry changed.
 pub struct AgentRegistry {
     agents: Mutex<HashMap<u64, AgentRecord>>,
     next: AtomicU64,
+    generation: AtomicU64,
+    changes: watch::Sender<AgentRegistrySnapshot>,
+}
+
+/// Cheap state published whenever the externally visible agent registry
+/// changes. `terminal` includes done, failed, and cancelled agents.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct AgentRegistrySnapshot {
+    pub generation: u64,
+    pub running: usize,
+    pub terminal: usize,
+}
+
+impl Default for AgentRegistry {
+    fn default() -> Self {
+        let (changes, _receiver) = watch::channel(AgentRegistrySnapshot::default());
+        Self {
+            agents: Mutex::new(HashMap::new()),
+            next: AtomicU64::new(0),
+            generation: AtomicU64::new(0),
+            changes,
+        }
+    }
 }
 
 impl AgentRegistry {
@@ -79,29 +109,46 @@ impl AgentRegistry {
     /// Register a new running agent, returning its id.
     fn start(&self, task: String) -> u64 {
         let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
-        self.agents.lock().expect("agent registry").insert(
-            id,
-            AgentRecord {
-                task,
-                status: AgentStatus::Running,
-                handle: None,
-            },
-        );
+        let update = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            agents.insert(
+                id,
+                AgentRecord {
+                    task,
+                    status: AgentStatus::Running,
+                    handle: None,
+                },
+            );
+            self.changed_snapshot(&agents)
+        };
+        self.publish(update);
         id
     }
 
     /// Mark an agent done/failed with its result.
     fn finish(&self, id: u64, result: Result<String, String>) {
-        if let Some(rec) = self.agents.lock().expect("agent registry").get_mut(&id) {
+        let update = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(rec) = agents.get_mut(&id) else {
+                return;
+            };
+            // Cancellation is terminal. An abort races with a task leaving its
+            // final await; a late completion must never rewrite "cancelled" to
+            // "done" after the UI has claimed termination.
+            if !matches!(rec.status, AgentStatus::Running) {
+                return;
+            }
             rec.status = match result {
                 Ok(r) => AgentStatus::Done(r),
                 Err(e) => AgentStatus::Failed(e),
             };
             rec.handle = None;
-        }
+            self.changed_snapshot(&agents)
+        };
+        self.publish(update);
     }
 
-    fn attach(&self, id: u64, handle: tokio::task::AbortHandle) {
+    fn attach(&self, id: u64, handle: tokio::task::JoinHandle<()>) {
         if let Some(rec) = self.agents.lock().expect("agent registry").get_mut(&id) {
             if matches!(rec.status, AgentStatus::Running) {
                 rec.handle = Some(handle);
@@ -114,21 +161,56 @@ impl AgentRegistry {
         self.next.load(Ordering::Relaxed)
     }
 
+    /// Subscribe to registry changes without a check-then-sleep race.
+    ///
+    /// The receiver immediately contains the latest snapshot, including changes
+    /// that completed before subscription. Call `borrow_and_update()` once to
+    /// establish a baseline, then await `changed()`; after a wake, use
+    /// [`AgentRegistry::result`] or [`AgentRegistry::list`] for authoritative
+    /// details. Because the generation is monotonic, coalesced watch updates do
+    /// not masquerade as a single agent completion.
+    pub fn subscribe(&self) -> watch::Receiver<AgentRegistrySnapshot> {
+        self.changes.subscribe()
+    }
+
+    /// Return the most recently published registry snapshot.
+    pub fn snapshot(&self) -> AgentRegistrySnapshot {
+        *self.changes.borrow()
+    }
+
     /// Abort detached agents created by a parent turn that is being rolled
     /// back. Agents that predate the turn are intentionally left alone.
-    pub fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
-        let mut agents = self.agents.lock().expect("agent registry");
-        let mut cancelled = Vec::new();
-        for (id, record) in agents.iter_mut() {
-            if *id > watermark && matches!(record.status, AgentStatus::Running) {
-                if let Some(handle) = record.handle.take() {
-                    handle.abort();
+    pub async fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
+        let (mut cancelled, handles, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let mut cancelled = Vec::new();
+            let mut handles = Vec::new();
+            for (id, record) in agents.iter_mut() {
+                if *id > watermark && matches!(record.status, AgentStatus::Running) {
+                    if let Some(handle) = record.handle.take() {
+                        handles.push(handle);
+                    }
+                    record.status = AgentStatus::Cancelled(
+                        "cancelled because the parent turn was rolled back".to_string(),
+                    );
+                    cancelled.push(*id);
                 }
-                record.status = AgentStatus::Failed(
-                    "cancelled because the parent turn was rolled back".to_string(),
-                );
-                cancelled.push(*id);
             }
+            let update = (!cancelled.is_empty()).then(|| self.changed_snapshot(&agents));
+            (cancelled, handles, update)
+        };
+        // Abort and JOIN outside the registry lock. Once this function returns,
+        // "cancelled" means the detached task has actually terminated.
+        for handle in &handles {
+            handle.abort();
+        }
+        for handle in handles {
+            let _ = handle.await;
+        }
+        // Publish cancellation only after every aborted task has been joined,
+        // matching the terminal-state guarantee made by this method.
+        if let Some(update) = update {
+            self.publish(update);
         }
         cancelled.sort_unstable();
         cancelled
@@ -148,12 +230,16 @@ impl AgentRegistry {
     /// agents are running, so results from one conversation cannot be fetched
     /// by the next conversation through `agent_result`.
     pub fn reset(&self) {
-        let mut agents = self.agents.lock().expect("agent registry");
-        debug_assert!(!agents
-            .values()
-            .any(|record| matches!(record.status, AgentStatus::Running)));
-        agents.clear();
+        let update = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            debug_assert!(!agents
+                .values()
+                .any(|record| matches!(record.status, AgentStatus::Running)));
+            agents.clear();
+            self.changed_snapshot(&agents)
+        };
         self.next.store(0, Ordering::Relaxed);
+        self.publish(update);
     }
 
     /// One line per agent (`#id  [status]  task`), id-ordered, for `/agents`.
@@ -171,6 +257,7 @@ impl AgentRegistry {
                     AgentStatus::Running => "running",
                     AgentStatus::Done(_) => "done",
                     AgentStatus::Failed(_) => "failed",
+                    AgentStatus::Cancelled(_) => "cancelled",
                 };
                 format!("#{id}  [{tag}]  {}", rec.task)
             })
@@ -185,7 +272,38 @@ impl AgentRegistry {
             AgentStatus::Running => format!("agent #{id} is still running"),
             AgentStatus::Done(r) => r.clone(),
             AgentStatus::Failed(e) => format!("agent #{id} failed: {e}"),
+            AgentStatus::Cancelled(reason) => format!("agent #{id} cancelled: {reason}"),
         })
+    }
+
+    /// Build the next snapshot while holding `agents`, establishing one total
+    /// order for generation numbers and their associated counts.
+    fn changed_snapshot(&self, agents: &HashMap<u64, AgentRecord>) -> AgentRegistrySnapshot {
+        let generation = self.generation.fetch_add(1, Ordering::Relaxed) + 1;
+        let running = agents
+            .values()
+            .filter(|record| matches!(record.status, AgentStatus::Running))
+            .count();
+        AgentRegistrySnapshot {
+            generation,
+            running,
+            terminal: agents.len().saturating_sub(running),
+        }
+    }
+
+    /// Publish outside `agents` so a frontend can copy a watch snapshot and
+    /// query result details without lock-order coupling. Concurrent publishers
+    /// retain only the highest generation, preventing a delayed older mutation
+    /// from replacing a newer snapshot.
+    fn publish(&self, update: AgentRegistrySnapshot) {
+        self.changes.send_if_modified(|current| {
+            if current.generation >= update.generation {
+                false
+            } else {
+                *current = update;
+                true
+            }
+        });
     }
 }
 
@@ -406,7 +524,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                 let r = run_subagent(&provider, &sub_tools, &cfg, &extra_system, a.task).await;
                 running_registry.finish(id, r);
             });
-            registry.attach(id, handle.abort_handle());
+            registry.attach(id, handle);
             Ok(format!(
                 "Started background agent #{id}. It runs detached — fetch its result later with \
                  agent_result({id}); the user can also run /agents to see status."
@@ -606,6 +724,7 @@ mod tests {
     async fn spawn_agent_bg_registers_runs_detached_and_stores_result() {
         use std::time::Duration;
         let registry = AgentRegistry::new();
+        let mut changes = registry.subscribe();
         let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
         let mut cfg = sub_cfg();
         cfg.quiet = true;
@@ -624,17 +743,21 @@ mod tests {
             .expect("spawn should return an id");
         assert!(out.contains("#1"), "returned the agent id: {out}");
 
-        // The detached subagent completes shortly; poll the registry for it.
-        let mut final_result = None;
-        for _ in 0..200 {
-            let r = registry.result(1).expect("agent #1 exists");
-            if !r.contains("still running") {
-                final_result = Some(r);
-                break;
+        // Await registry changes rather than polling. If start and finish both
+        // happened before this future runs, watch still contains the latest
+        // terminal snapshot.
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                let snapshot = *changes.borrow_and_update();
+                if snapshot.terminal == 1 {
+                    break;
+                }
+                changes.changed().await.expect("registry still exists");
             }
-            tokio::time::sleep(Duration::from_millis(5)).await;
-        }
-        let r = final_result.expect("background agent should finish");
+        })
+        .await
+        .expect("background agent should finish");
+        let r = registry.result(1).expect("agent #1 exists");
         assert!(r.contains("echo:do work"), "stored result: {r}");
         assert_eq!(registry.running(), 0, "no agents still running");
 
@@ -648,25 +771,70 @@ mod tests {
         assert!(registry.list().contains("[done]"));
     }
 
+    #[test]
+    fn subscription_created_after_completion_contains_the_completion() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("already fast".to_string());
+        registry.finish(id, Ok("finished before subscribe".to_string()));
+
+        let changes = registry.subscribe();
+        let snapshot = *changes.borrow();
+        assert_eq!(snapshot.generation, 2);
+        assert_eq!(snapshot.running, 0);
+        assert_eq!(snapshot.terminal, 1);
+        assert_eq!(registry.snapshot(), snapshot);
+        assert_eq!(
+            registry.result(id).as_deref(),
+            Some("finished before subscribe")
+        );
+    }
+
+    #[tokio::test]
+    async fn coalesced_notifications_retain_the_latest_registry_state() {
+        let registry = AgentRegistry::new();
+        let mut changes = registry.subscribe();
+        let first = registry.start("first".to_string());
+        let second = registry.start("second".to_string());
+        registry.finish(first, Ok("one".to_string()));
+        registry.finish(second, Err("two failed".to_string()));
+
+        // The receiver need not consume four individual edges. One wake exposes
+        // the newest generation and counts, from which both results are readable.
+        changes.changed().await.expect("registry still exists");
+        let snapshot = *changes.borrow_and_update();
+        assert_eq!(snapshot.generation, 4);
+        assert_eq!(snapshot.running, 0);
+        assert_eq!(snapshot.terminal, 2);
+        assert_eq!(registry.result(first).as_deref(), Some("one"));
+        assert!(registry.result(second).unwrap().contains("two failed"));
+    }
+
     #[tokio::test]
     async fn rollback_cancels_only_agents_started_after_watermark() {
         let registry = AgentRegistry::new();
         let old = registry.start("older work".to_string());
         let old_handle = tokio::spawn(std::future::pending::<()>());
-        registry.attach(old, old_handle.abort_handle());
+        registry.attach(old, old_handle);
         let watermark = registry.watermark();
 
         let new = registry.start("rolled-back work".to_string());
         let new_handle = tokio::spawn(std::future::pending::<()>());
-        registry.attach(new, new_handle.abort_handle());
+        registry.attach(new, new_handle);
+        let mut changes = registry.subscribe();
+        let before_cancel = *changes.borrow_and_update();
 
-        assert_eq!(registry.cancel_started_after(watermark), vec![new]);
+        assert_eq!(registry.cancel_started_after(watermark).await, vec![new]);
+        changes.changed().await.expect("registry still exists");
+        let after_cancel = *changes.borrow_and_update();
+        assert!(after_cancel.generation > before_cancel.generation);
+        assert_eq!(after_cancel.running, 1);
+        assert_eq!(after_cancel.terminal, 1);
         assert!(registry.result(old).unwrap().contains("still running"));
         assert!(registry
             .result(new)
             .unwrap()
             .contains("parent turn was rolled back"));
-        old_handle.abort();
+        assert_eq!(registry.cancel_started_after(0).await, vec![old]);
     }
 
     #[tokio::test]

@@ -1,9 +1,11 @@
 //! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
 //! agent loop against the gateway (Mistral). See docs/architecture.md §6.
 
+mod attachments;
 mod cli;
 mod config;
 mod llms;
+mod prompt_queue;
 mod session;
 mod skills;
 mod subagent;
@@ -11,23 +13,97 @@ mod workspace;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
 use clap::Parser;
+use rustyline::ExternalPrinter as _;
 
 use cli::{Cli, Command};
 use config::{Config, ConfigError, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
-use kitsu_core::{run_agent_turn, run_agent_turn_with_state, AgentConfig, CompactionMode};
+use kitsu_core::{run_agent_turn_with_state, AgentConfig, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{ChatMessage, Provider, ProviderError};
-use kitsu_tools::{builtins, Decision, Mode, PermissionRequest, Permissions, Prompter, Registry};
+use kitsu_tools::{
+    builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
+    PermissionRequest, Permissions, Prompter, Registry,
+};
 
 /// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
 const EXIT_USER: i32 = 1;
 const EXIT_PROVIDER: i32 = 2;
+const EXIT_CANCELLED: i32 = 130;
+const JSONL_SCHEMA: &str = "kitsu.chat.v1";
+static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
+static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
+const PROMPT_QUEUE_CAPACITY: usize = 8;
+
+fn jsonl_requested() -> bool {
+    std::env::args_os()
+        .skip(1)
+        .take_while(|arg| arg != "--")
+        .any(|arg| arg == "--jsonl" || arg.to_str().is_some_and(|arg| arg.starts_with("--jsonl=")))
+}
+
+fn jsonl_run_id() -> &'static str {
+    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    RUN_ID.get_or_init(|| {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_nanos();
+        format!("{}-{nanos}", std::process::id())
+    })
+}
+
+fn emit_jsonl(kind: &str, payload: serde_json::Value) {
+    use std::io::Write;
+    let mut object = match payload {
+        serde_json::Value::Object(object) => object,
+        other => {
+            let mut object = serde_json::Map::new();
+            object.insert("value".to_string(), other);
+            object
+        }
+    };
+    object.insert(
+        "schema".to_string(),
+        serde_json::Value::String(JSONL_SCHEMA.to_string()),
+    );
+    object.insert(
+        "type".to_string(),
+        serde_json::Value::String(kind.to_string()),
+    );
+    object.insert(
+        "run_id".to_string(),
+        serde_json::Value::String(jsonl_run_id().to_string()),
+    );
+    let mut stdout = std::io::stdout().lock();
+    if serde_json::to_writer(&mut stdout, &object).is_ok() {
+        let _ = stdout.write_all(b"\n");
+        let _ = stdout.flush();
+    }
+}
+
+fn emit_jsonl_summary(status: &str, failures: usize, provider_failures: usize) {
+    JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
+    let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
+    emit_jsonl(
+        "final_summary",
+        serde_json::json!({
+            "status": status,
+            "failures": failures,
+            "provider_failures": provider_failures,
+            "user_failures": failures.saturating_sub(provider_failures + cancelled_failures),
+            "cancelled_failures": cancelled_failures,
+        }),
+    );
+}
 
 fn main() {
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
@@ -42,7 +118,26 @@ fn main() {
     let code = match run() {
         Ok(()) => 0,
         Err(e) => {
-            eprintln!("{e}");
+            if jsonl_requested() {
+                if !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire) {
+                    let cancelled = e.exit_code() == EXIT_CANCELLED;
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "kind": e.jsonl_kind(),
+                            "message": e.to_string(),
+                            "exit_code": e.exit_code(),
+                        }),
+                    );
+                    emit_jsonl_summary(
+                        if cancelled { "cancelled" } else { "error" },
+                        1,
+                        usize::from(e.exit_code() == EXIT_PROVIDER),
+                    );
+                }
+            } else {
+                eprintln!("{e}");
+            }
             e.exit_code()
         }
     };
@@ -68,29 +163,65 @@ impl CliError {
             code: EXIT_PROVIDER,
         }
     }
+    fn cancelled(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_CANCELLED,
+        }
+    }
     fn exit_code(&self) -> i32 {
         self.code
+    }
+
+    fn jsonl_kind(&self) -> &'static str {
+        match self.code {
+            EXIT_PROVIDER => "provider",
+            EXIT_CANCELLED => "cancelled",
+            _ => "user",
+        }
     }
 }
 
 impl std::fmt::Display for CliError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "{}", self.message)
+        write!(f, "{}", kitsu_render::sanitize_terminal_text(&self.message))
     }
 }
 
 fn run() -> Result<(), CliError> {
-    let cli = Cli::parse();
+    let cli = match Cli::try_parse() {
+        Ok(cli) => cli,
+        Err(error) => match error.kind() {
+            clap::error::ErrorKind::DisplayHelp | clap::error::ErrorKind::DisplayVersion => {
+                if jsonl_requested() {
+                    return Err(CliError::user(
+                        "--jsonl cannot be combined with human --help or --version output",
+                    ));
+                }
+                error
+                    .print()
+                    .map_err(|e| CliError::user(format!("failed to print command help: {e}")))?;
+                return Ok(());
+            }
+            _ => return Err(CliError::user(error.to_string())),
+        },
+    };
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| CliError::user(format!("failed to start runtime: {e}")))?;
 
     match &cli.command {
         Command::Ask { prompt } => runtime.block_on(run_ask(&cli, prompt)),
+        Command::Models { filter } => {
+            runtime.block_on(run_models(&cli, filter.as_deref().unwrap_or("")))
+        }
         Command::Chat {
             prompt,
             allow_paths,
             allow_write,
+            enable_commands,
+            command_roots,
+            allow_commands,
             script,
             resume,
             no_session,
@@ -101,6 +232,9 @@ fn run() -> Result<(), CliError> {
                 first_prompt: prompt.as_deref(),
                 allow_paths,
                 allow_write,
+                enable_commands: *enable_commands,
+                command_roots,
+                allow_commands,
                 script: script.as_deref(),
                 resume: resume.as_deref(),
                 no_session: *no_session,
@@ -114,6 +248,9 @@ struct ChatInvocation<'a> {
     first_prompt: Option<&'a str>,
     allow_paths: &'a [String],
     allow_write: &'a [String],
+    enable_commands: bool,
+    command_roots: &'a [String],
+    allow_commands: &'a [String],
     script: Option<&'a str>,
     resume: Option<&'a str>,
     no_session: bool,
@@ -125,6 +262,11 @@ struct ChatInvocation<'a> {
 struct ChatSetup {
     /// `Arc` so the main loop and spawned subagents can share one connection.
     provider: Arc<OpenAICompatProvider>,
+    /// User-requested model catalog operations get the full CLI timeout and a
+    /// cache isolated from the two-second advisory startup probe. Otherwise a
+    /// startup timeout's shared negative cache could make an immediate
+    /// `/models` fail without honoring the user's requested wait budget.
+    catalog_provider: Arc<OpenAICompatProvider>,
     gateway_name: String,
     config_path: std::path::PathBuf,
     state_dir: std::path::PathBuf,
@@ -155,8 +297,8 @@ fn preload_skills(cli: &Cli, skillset: &skills::SkillSet) -> Option<String> {
     let mut out = String::new();
     for name in &cli.skill {
         match skillset.get(name) {
-            Some(s) => out.push_str(&format!("# Skill: {}\n{}\n\n", s.name, s.body)),
-            None => eprintln!("~ no skill named '{name}' (skipped)"),
+            Some(s) => out.push_str(&format!("{}\n\n", skills::load_skill(s))),
+            None => eprintln!("~ no skill named '{}' (skipped)", terminal_inline(name)),
         }
     }
     let out = out.trim().to_string();
@@ -177,17 +319,26 @@ fn register_base_tools(
     skillset: &Arc<skills::SkillSet>,
     can_read: bool,
     can_write: bool,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    commands: Option<&Arc<kitsu_tools::CommandPolicy>>,
 ) {
-    if can_read || can_write {
+    if can_read {
         builtins::register_fs_tools(tools, perms.clone());
     }
     if can_write {
-        builtins::register_write_tools(tools, perms.clone());
+        builtins::register_write_tools_with_journal(tools, perms.clone(), journal.clone());
     }
-    if !skillset.is_empty() && (can_read || can_write) {
-        let (d, h) = skills::skill_tool(skillset.clone(), perms.clone());
+    if !skillset.is_empty() {
+        let (d, h) = skills::skill_tool(skillset.clone());
         tools.register_with_descriptor(d, h);
     }
+    if let Some(commands) = commands {
+        builtins::register_command_tool(tools, commands.clone());
+    }
+}
+
+fn can_resolve_offload_pointers(tool_names: &[String]) -> bool {
+    tool_names.iter().any(|name| name == "fs_read_file")
 }
 
 /// Parse the `--compaction` flag into the orchestrator's mode.
@@ -213,13 +364,18 @@ fn build_agent_config(
         model,
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
-        context_window,
+        // The CLI's documented conservative default is an enforcement value,
+        // not just a display fallback. Keep the session cell as `None` so
+        // `/status` can disclose that it was defaulted, but every provider
+        // request and manual compaction receives the same checked 8K budget.
+        context_window: Some(context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
         offload_dir,
-        stream: !cli.no_stream,
+        stream: !cli.no_stream && !cli.jsonl,
         temperature: cli.temperature,
         max_tokens: cli.max_output_tokens,
         compaction: compaction_mode(cli),
-        quiet: false,
+        quiet: cli.jsonl,
+        event_log: None,
     }
 }
 
@@ -268,14 +424,29 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "grant write access for this session",
     },
     SlashCommandSpec {
+        name: "archive",
+        args: "<id>",
+        description: "archive an inactive saved conversation",
+    },
+    SlashCommandSpec {
         name: "clear",
         args: "",
         description: "clear conversation history",
     },
     SlashCommandSpec {
+        name: "compact",
+        args: "",
+        description: "compact older conversation context now",
+    },
+    SlashCommandSpec {
         name: "context",
         args: "",
         description: "show detailed context utilization",
+    },
+    SlashCommandSpec {
+        name: "delete",
+        args: "<id>",
+        description: "permanently delete an inactive live session",
     },
     SlashCommandSpec {
         name: "diff",
@@ -286,6 +457,16 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "exit",
         args: "",
         description: "exit chat (alias for /quit)",
+    },
+    SlashCommandSpec {
+        name: "export",
+        args: "<file> [markdown|json]",
+        description: "export the active session without overwriting",
+    },
+    SlashCommandSpec {
+        name: "fork",
+        args: "[id]",
+        description: "clone and switch to a fresh session",
     },
     SlashCommandSpec {
         name: "help",
@@ -313,9 +494,19 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show filesystem access policy",
     },
     SlashCommandSpec {
+        name: "queue",
+        args: "[prompt]",
+        description: "show the prompt queue or append a prompt",
+    },
+    SlashCommandSpec {
         name: "quit",
         args: "",
         description: "exit chat",
+    },
+    SlashCommandSpec {
+        name: "restore",
+        args: "<id>",
+        description: "restore an archived session",
     },
     SlashCommandSpec {
         name: "resume",
@@ -362,6 +553,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         args: "",
         description: "show enabled tools and effective access",
     },
+    SlashCommandSpec {
+        name: "undo",
+        args: "",
+        description: "undo the latest conflict-free model file changes",
+    },
 ];
 
 fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
@@ -372,6 +568,7 @@ fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
 }
 
 fn slash_help(model: &str) -> String {
+    let model = terminal_inline(model);
     let width = SLASH_COMMANDS
         .iter()
         .map(|spec| spec.syntax().len())
@@ -394,7 +591,9 @@ fn slash_help(model: &str) -> String {
 /// verbatim: shortening it from a highlighter corrupts Rustyline's cursor-width
 /// accounting (especially for Unicode), so visual collapsing belongs in a
 /// future editor renderer that can preserve buffer geometry.
-struct ChatHelper;
+struct ChatHelper {
+    permissions: Arc<Permissions>,
+}
 
 impl rustyline::completion::Completer for ChatHelper {
     type Candidate = rustyline::completion::Pair;
@@ -406,6 +605,20 @@ impl rustyline::completion::Completer for ChatHelper {
         _ctx: &rustyline::Context<'_>,
     ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
         let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
+            if let Some((start, candidates)) =
+                attachments::complete(line, pos, self.permissions.as_ref())
+            {
+                return Ok((
+                    start,
+                    candidates
+                        .into_iter()
+                        .map(|(display, replacement)| rustyline::completion::Pair {
+                            display,
+                            replacement,
+                        })
+                        .collect(),
+                ));
+            }
             return Ok((0, Vec::new()));
         };
         if typed.chars().any(char::is_whitespace) {
@@ -473,6 +686,8 @@ struct SessionInfo {
     offload_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
     session_id: Rc<RefCell<Option<String>>>,
     tool_names: Vec<String>,
+    command_roots: Vec<std::path::PathBuf>,
+    command_mode: Option<&'static str>,
     window: Rc<Cell<Option<u64>>>,
     max_tokens: Option<u32>,
     provenance: RefCell<Vec<CtxEntry>>,
@@ -519,17 +734,31 @@ fn activate_offload_dir(
             )
         })?;
         perms
-            .grant_read_root(&dir.to_string_lossy())
+            .protect_write_path(&dir.to_string_lossy())
+            .map_err(|error| format!("cannot protect artifact directory: {error}"))?;
+        perms
+            .grant_trusted_read_root(dir)
             .map_err(|error| error.to_string())?;
     }
     *state.borrow_mut() = desired;
     Ok(())
 }
 
-fn grant_preloaded_skill_roots(cli: &Cli, skillset: &skills::SkillSet, perms: &Permissions) {
-    for name in &cli.skill {
-        if let Some(skill) = skillset.get(name) {
-            let _ = perms.grant_read_root(&skill.dir.to_string_lossy());
+fn reset_command_session(
+    policy: Option<&Arc<kitsu_tools::CommandPolicy>>,
+    explicit_grants: &[Vec<String>],
+    cwd: &std::path::Path,
+) {
+    let Some(policy) = policy else {
+        return;
+    };
+    policy.reset_session_grants();
+    for argv in explicit_grants {
+        if let Err(error) = policy.grant_command(argv, cwd) {
+            eprintln!(
+                "warning: could not restore explicit command grant {}: {error}",
+                serde_json::to_string(argv).unwrap_or_else(|_| "[invalid argv]".to_string())
+            );
         }
     }
 }
@@ -607,8 +836,12 @@ async fn authorized_workspace_diff(
 
 fn format_sessions(dir: &std::path::Path, current: Option<&str>) -> Result<String, String> {
     let sessions = session::SessionStore::list(dir)?;
+    Ok(format_session_summaries(&sessions, current))
+}
+
+fn format_session_summaries(sessions: &[session::SessionSummary], current: Option<&str>) -> String {
     if sessions.is_empty() {
-        return Ok("no saved sessions".to_string());
+        return "no saved sessions".to_string();
     }
     let mut out = String::from("saved sessions:\n");
     for saved in sessions {
@@ -617,19 +850,24 @@ fn format_sessions(dir: &std::path::Path, current: Option<&str>) -> Result<Strin
         } else {
             " "
         };
+        let id = terminal_inline(&saved.id);
+        let updated_at = terminal_inline(&saved.updated_at);
+        let gateway = terminal_inline(&saved.gateway);
+        let model = terminal_inline(&saved.model);
+        let preview = terminal_inline(&saved.preview);
         out.push_str(&format!(
             " {marker} {}  {}  {} turn(s)  {}/{}\n     {}\n     {}\n",
-            saved.id,
-            saved.updated_at,
+            id,
+            updated_at,
             saved.turns,
-            saved.gateway,
-            saved.model,
+            gateway,
+            model,
             shorten_home(std::path::Path::new(&saved.directory)),
-            saved.preview
+            preview
         ));
     }
     out.push_str("resume with /resume <id> or `kitsu chat --resume last`");
-    Ok(out)
+    out
 }
 
 fn permission_mode_label(mode: Mode) -> (&'static str, &'static str) {
@@ -671,6 +909,9 @@ fn format_session_status(
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
 ) -> String {
+    let model = terminal_inline(model);
+    let gateway = terminal_inline(&session.gateway);
+    let auth_status = terminal_inline(&session.auth_status);
     let (window, effective, used) = context_totals(messages, session, state);
     let pct = if effective == 0 {
         0
@@ -695,11 +936,13 @@ fn format_session_status(
     } else {
         format!("{window} default")
     };
-    let session_id = session
-        .session_id
-        .borrow()
-        .clone()
-        .unwrap_or_else(|| "disabled".to_string());
+    let session_id = terminal_inline(
+        &session
+            .session_id
+            .borrow()
+            .clone()
+            .unwrap_or_else(|| "disabled".to_string()),
+    );
     let project_context = session
         .project_context
         .borrow()
@@ -709,24 +952,52 @@ fn format_session_status(
     let git = workspace::status(&session.directory)
         .map(|status| {
             format!(
-                "{} · {} changed ({} untracked)",
-                status.branch, status.changed, status.untracked
+                "{} | {} changed ({} untracked)",
+                terminal_inline(&status.branch),
+                status.changed,
+                status.untracked
             )
         })
         .unwrap_or_else(|| "not a Git worktree".to_string());
+    let compaction_last = state
+        .compaction_ledger
+        .last()
+        .map(|record| {
+            format!(
+                "#{}, {:?}/{:?}, {} -> {} tokens{}",
+                record.sequence,
+                record.reason,
+                record.outcome,
+                record.tokens_before,
+                record.tokens_after,
+                record
+                    .fallback_reason
+                    .map(|reason| format!(", fallback {reason:?}"))
+                    .unwrap_or_default()
+            )
+        })
+        .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "session:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user · {assistant_turns} assistant · {tool_results} tool\n  tools        {} enabled\n  permissions  {mode} · {} read root(s) · {} write root(s)\n  agents       {} running",
-        session.gateway,
+        "session:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        gateway,
         shorten_home(&session.directory),
         shorten_home(&session.config_path),
         shorten_home(&session.state_dir),
         session.endpoint,
-        session.auth_status,
+        auth_status,
         effective.saturating_sub(used),
+        state.compaction_ledger.total_compactions,
+        state.compaction_ledger.tokens_saved,
+        state.compaction_ledger.exchanges_removed,
+        state.compaction_ledger.tool_results_elided,
         session.tool_names.len(),
         perms.read_roots().len(),
         perms.write_roots().len(),
+        session
+            .command_mode
+            .map(|mode| format!("{mode} | {} cwd root(s)", session.command_roots.len()))
+            .unwrap_or_else(|| "disabled".to_string()),
         registry.running(),
     )
 }
@@ -766,6 +1037,35 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
             }
         }
     }
+    let internal_reads = perms.internal_read_roots();
+    out.push_str("\n  internal reads");
+    if internal_reads.is_empty() {
+        out.push_str(" none");
+    } else {
+        for root in internal_reads {
+            out.push_str(&format!("\n    - {} (Kitsu-managed)", shorten_home(&root)));
+        }
+    }
+    let protected_writes = perms.protected_write_roots();
+    out.push_str("\n  protected writes");
+    if protected_writes.is_empty() {
+        out.push_str(" none");
+    } else {
+        for root in protected_writes {
+            out.push_str(&format!("\n    - {}", shorten_home(&root)));
+        }
+    }
+    out.push_str("\n  commands     ");
+    if let Some(mode) = session.command_mode {
+        out.push_str(&format!(
+            "{mode}; separate exact argv/cwd approval; --yes has no effect"
+        ));
+        for root in &session.command_roots {
+            out.push_str(&format!("\n    - {}", shorten_home(root)));
+        }
+    } else {
+        out.push_str("disabled (enable explicitly with --enable-commands)");
+    }
     out
 }
 
@@ -785,7 +1085,7 @@ fn render_context_command(
     let note = if ctx_window.is_some() {
         ""
     } else {
-        "default — set context_window or --context-window"
+        "default - set context_window or --context-window"
     };
     // Static provenance (system prompt sources + tool schemas) then the live
     // conversation. breakdown.system is already covered by the provenance rows.
@@ -800,7 +1100,7 @@ fn render_context_command(
                 "tool results",
                 b.tool_results,
                 "admitted",
-                "tool outputs (offloaded → pointers)",
+                "tool outputs (offloaded -> pointers)",
             ),
         ])
         .collect();
@@ -812,6 +1112,34 @@ fn render_context_command(
         estimated
     };
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
+    let ledger = &state.compaction_ledger;
+    if ledger.total_compactions > 0 {
+        eprintln!(
+            "compaction: {} total ({} manual, {} automatic; {} summarized, {} trimmed); {} token(s) saved, {} exchange(s) removed, {} tool result(s) elided",
+            ledger.total_compactions,
+            ledger.manual_compactions,
+            ledger.automatic_compactions,
+            ledger.summaries,
+            ledger.trims,
+            ledger.tokens_saved,
+            ledger.exchanges_removed,
+            ledger.tool_results_elided
+        );
+        if let Some(last) = ledger.last() {
+            eprintln!(
+                "last compaction: {:?} via {:?}, {} -> {} tokens{}",
+                last.reason,
+                last.outcome,
+                last.tokens_before,
+                last.tokens_after,
+                last.fallback_reason
+                    .map(|reason| format!(" (fallback: {reason:?})"))
+                    .unwrap_or_default()
+            );
+        }
+    } else {
+        eprintln!("compaction: none yet; run /compact to compact eligible older exchanges");
+    }
 }
 
 /// How long a discovered context window is trusted before re-discovering. A
@@ -960,12 +1288,16 @@ fn unix_now() -> u64 {
         .unwrap_or(0)
 }
 
-fn context_window_cache_key(base_url: &str, model: &str) -> String {
-    use std::hash::{Hash, Hasher};
-    let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    base_url.hash(&mut hasher);
-    model.hash(&mut hasher);
-    format!("v1-{:016x}", hasher.finish())
+fn context_window_cache_key(base_url: &str, models_path: Option<&str>, model: &str) -> String {
+    const OFFSET: u128 = 0x6c62_272e_07bb_0142_62b8_2175_6295_c58d;
+    const PRIME: u128 = 0x0000_0000_0100_0000_0000_0000_0000_013b;
+    let digest = [base_url, models_path.unwrap_or(""), model]
+        .into_iter()
+        .flat_map(|part| part.as_bytes().iter().copied().chain(std::iter::once(0)))
+        .fold(OFFSET, |hash, byte| {
+            (hash ^ u128::from(byte)).wrapping_mul(PRIME)
+        });
+    format!("v2-fnv128-{digest:032x}")
 }
 
 /// Status output should identify the endpoint without echoing credentials that
@@ -986,7 +1318,7 @@ fn redact_endpoint(endpoint: &str) -> String {
             display.replace_range(authority_start..at, "<redacted>");
         }
     }
-    display
+    terminal_inline(&display)
 }
 
 fn read_cached_context_window(path: &std::path::Path, key: &str) -> Option<u64> {
@@ -1002,8 +1334,8 @@ fn write_cached_context_window(path: &std::path::Path, key: &str, window: u64) {
         .ok()
         .and_then(|t| serde_json::from_str(&t).ok())
         .unwrap_or_default();
-    // Migrate away from the previous plaintext `<base_url>|<model>` keys.
-    cache.entries.retain(|key, _| key.starts_with("v1-"));
+    // Discard prior unstable/incomplete cache identities on the next write.
+    cache.entries.retain(|key, _| key.starts_with("v2-fnv128-"));
     cache.entries.insert(key.to_string(), (window, unix_now()));
     if let Some(parent) = path.parent() {
         let _ = std::fs::create_dir_all(parent);
@@ -1082,47 +1414,71 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     let auth = build_auth(gateway).map_err(|e| CliError::user(e.to_string()))?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
-    let provider = OpenAICompatProvider::new(
+    let provider = Arc::new(OpenAICompatProvider::new(
         OpenAICompatConfig {
             base_url: gateway.base_url.clone(),
             chat_path: gateway.chat_path.clone(),
-            models_path,
+            models_path: models_path.clone(),
             retries: 2,
             timeout: Duration::from_secs(cli.timeout_secs),
         },
         auth.clone(),
+    ));
+    let catalog_provider = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: gateway.base_url.clone(),
+                chat_path: gateway.chat_path.clone(),
+                models_path: models_path.clone(),
+                retries: 0,
+                timeout: Duration::from_secs(cli.timeout_secs),
+            },
+            auth.clone(),
+        )
+        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs)),
     );
 
     if let kitsu_providers::ExpiryStatus::Expired { since } = auth.expiry_status() {
         let hint = gateway.auth.refresh_hint.clone().unwrap_or_default();
-        eprintln!("warning: gateway token expired (since {since}) — sending anyway. {hint}");
+        eprintln!("warning: gateway token expired (since {since}) - sending anyway. {hint}");
     }
 
-    // Resolve the context window: explicit flag → profile → cached discovery →
-    // fresh /v1/models discovery. Left None when nothing reports it (the
-    // orchestrator then falls back to the coarse byte budget).
+    // Resolve the context window: explicit flag → profile → cached
+    // discovery. A cold optional catalog probe warms the disk cache in the
+    // background; it never delays the healthy inference path. This invocation
+    // uses the documented conservative default until a later run finds that
+    // cache (build_agent_config enforces the default, while `None` preserves
+    // honest provenance in /status and /context).
     let context_window_pinned = cli.context_window.or(gateway.context_window).is_some();
     let context_window = match cli.context_window.or(gateway.context_window) {
         Some(w) => Some(w),
         None => {
-            let cache_key = context_window_cache_key(&gateway.base_url, &model);
+            let cache_key =
+                context_window_cache_key(&gateway.base_url, models_path.as_deref(), &model);
             let cache_path = context_window_cache_path(&state_dir);
             let cached = read_cached_context_window(&cache_path, &cache_key);
             match cached {
                 Some(w) => Some(w),
                 None => {
-                    let discovered = provider.model_context_length(&model).await;
-                    if let Some(w) = discovered {
-                        write_cached_context_window(&cache_path, &cache_key, w);
-                    }
-                    discovered
+                    let discovery_provider = provider.clone();
+                    let discovery_model = model.clone();
+                    tokio::spawn(async move {
+                        if let Some(window) = discovery_provider
+                            .model_context_length(&discovery_model)
+                            .await
+                        {
+                            write_cached_context_window(&cache_path, &cache_key, window);
+                        }
+                    });
+                    None
                 }
             }
         }
     };
 
     Ok(ChatSetup {
-        provider: Arc::new(provider),
+        provider,
+        catalog_provider,
         gateway_name,
         config_path: path,
         state_dir,
@@ -1132,6 +1488,73 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         context_window,
         context_window_pinned,
     })
+}
+
+async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
+    let path = Config::resolve_path(cli.config.as_deref());
+    if !path.exists() {
+        return Err(CliError::user(format!(
+            "config error: no config found at {}",
+            shorten_home(&path)
+        )));
+    }
+    let config = Config::load(&path).map_err(|error| CliError::user(error.to_string()))?;
+    let (gateway_name, gateway) = config
+        .select_gateway(cli.gateway.as_deref())
+        .map_err(|error| CliError::user(error.to_string()))?;
+    gateway
+        .validate_flavor()
+        .map_err(|error| CliError::user(error.to_string()))?;
+    let auth = build_auth(gateway).map_err(|error| CliError::user(error.to_string()))?;
+    let provider = OpenAICompatProvider::new(
+        OpenAICompatConfig {
+            base_url: gateway.base_url.clone(),
+            chat_path: gateway.chat_path.clone(),
+            models_path: gateway.models_path.clone().filter(|path| !path.is_empty()),
+            retries: 0,
+            timeout: Duration::from_secs(cli.timeout_secs),
+        },
+        auth,
+    )
+    .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
+    if cli.jsonl {
+        emit_jsonl(
+            "run_started",
+            serde_json::json!({"mode": "models", "gateway": gateway_name}),
+        );
+    }
+    let result = await_cancellable(provider.list_models())
+        .await
+        .ok_or_else(|| CliError::cancelled("model catalog request cancelled by Ctrl+C"))?;
+    let Some(models) =
+        result.map_err(|error| map_agent_error(kitsu_core::AgentError::Provider(error)))?
+    else {
+        return Err(CliError::user(
+            "this gateway does not expose a model catalog; configure models_path".to_string(),
+        ));
+    };
+    let filter_lower = filter.trim().to_lowercase();
+    let mut matched: Vec<String> = models
+        .into_iter()
+        .filter(|model| filter_lower.is_empty() || model.to_lowercase().contains(&filter_lower))
+        .collect();
+    matched.sort();
+    matched.dedup();
+    if cli.jsonl {
+        let count = matched.len();
+        emit_jsonl(
+            "model_catalog",
+            serde_json::json!({"filter": filter, "models": matched, "count": count}),
+        );
+        emit_jsonl_summary("ok", 0, 0);
+    } else if matched.is_empty() {
+        eprintln!("no models matched '{}'", terminal_inline(filter));
+    } else {
+        for model in matched {
+            println!("{}", terminal_inline(&model));
+        }
+    }
+    Ok(())
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
@@ -1153,11 +1576,111 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     }
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
-    let agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
+    let mut agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
+    let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
+    agent_cfg.event_log = event_log.clone();
+    if cli.jsonl {
+        emit_jsonl(
+            "run_started",
+            serde_json::json!({
+                "mode": "ask",
+                "gateway": setup.gateway_name,
+                "model": setup.model,
+            }),
+        );
+        emit_jsonl(
+            "turn_started",
+            serde_json::json!({"turn_id": "ask:1", "input": prompt}),
+        );
+    }
 
-    match run_agent_turn(&setup.provider, &tools, &mut messages, &agent_cfg).await {
-        Ok(_) => Ok(()),
-        Err(e) => Err(map_agent_error(e)),
+    let mut state = kitsu_core::AgentSessionState::default();
+    let outcome = run_turn_cancellable(
+        &setup.provider,
+        &tools,
+        &mut messages,
+        &agent_cfg,
+        &mut state,
+    )
+    .await;
+    if let Some(log) = &event_log {
+        let assistant = match &outcome {
+            TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+            _ => None,
+        };
+        emit_agent_trace("ask:1", log, assistant);
+    }
+    match outcome {
+        TurnOutcome::Completed(Ok(_)) => {
+            if let Some(issue) = strict_turn_issue(&state.last_turn) {
+                let mapped = CliError::provider(format!("incomplete turn: {issue}"));
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": "ask:1",
+                            "kind": "incomplete_turn",
+                            "message": mapped.to_string(),
+                            "exit_code": mapped.exit_code(),
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "ask:1", "status": "error"}),
+                    );
+                    emit_jsonl_summary("error", 1, 1);
+                }
+                return Err(mapped);
+            }
+            if cli.jsonl {
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": "ask:1", "status": "ok"}),
+                );
+                emit_jsonl_summary("ok", 0, 0);
+            }
+            Ok(())
+        }
+        TurnOutcome::Completed(Err(error)) => {
+            let mapped = map_agent_error(error);
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": "ask:1",
+                        "kind": mapped.jsonl_kind(),
+                        "message": mapped.to_string(),
+                        "exit_code": mapped.exit_code(),
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": "ask:1", "status": "error"}),
+                );
+                emit_jsonl_summary("error", 1, usize::from(mapped.exit_code() == EXIT_PROVIDER));
+            }
+            Err(mapped)
+        }
+        TurnOutcome::Cancelled => {
+            let mapped = CliError::cancelled("request cancelled by Ctrl+C");
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": "ask:1",
+                        "kind": "cancelled",
+                        "message": mapped.to_string(),
+                        "exit_code": mapped.exit_code(),
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": "ask:1", "status": "cancelled"}),
+                );
+                emit_jsonl_summary("cancelled", 1, 0);
+            }
+            Err(mapped)
+        }
     }
 }
 
@@ -1169,13 +1692,15 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
         "You are kitsu, a concise, helpful CLI assistant.".to_string()
     } else {
         format!(
-            "You are kitsu, a concise, helpful CLI assistant with these filesystem tools: {}. \
+            "You are kitsu, a concise, helpful CLI assistant with these tools: {}. \
              When the user refers to a local file or directory, USE these tools to inspect it \
              directly — call fs_list_dir to see a directory's contents and fs_read_file to read a \
              file. Do NOT ask the user to paste file contents or list filenames; read them \
              yourself. Access is permission-gated, so simply attempt the tool call — the user is \
              asked to approve paths as needed. When asked to generate or edit code or files, use \
-             fs_write_file.",
+             fs_edit_file for exact localized changes or fs_write_file for full replacements. \
+             If command_exec is available, use its literal argv/cwd interface to run relevant \
+             builds, tests, and linters after edits; command approval is separate from file access.",
             tool_names.join(", ")
         )
     }
@@ -1192,11 +1717,14 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
 enum ScriptFailureKind {
     User,
     Provider,
+    Cancelled,
 }
 
 fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
     match error {
-        kitsu_core::AgentError::Provider(ProviderError::Auth(_)) => ScriptFailureKind::User,
+        kitsu_core::AgentError::Provider(ProviderError::Auth(_))
+        | kitsu_core::AgentError::ContextOverflow { .. }
+        | kitsu_core::AgentError::ContextWindowUnknown => ScriptFailureKind::User,
         _ => ScriptFailureKind::Provider,
     }
 }
@@ -1207,8 +1735,35 @@ fn transcript_line(prefix: &str, text: &str) {
     // diagnostics on stderr preserves clean pipeable stdout and deterministic
     // command/result ordering in captured scripts.
     let mut stderr = std::io::stderr().lock();
+    let text = kitsu_render::sanitize_terminal_text(text);
     let _ = writeln!(stderr, "{prefix}> {text}");
     let _ = stderr.flush();
+}
+
+fn emit_agent_trace(turn_id: &str, log: &kitsu_core::AgentEventLog, assistant: Option<&str>) {
+    for event in log.take() {
+        if matches!(event, kitsu_core::AgentRuntimeEvent::TurnFinished { .. }) {
+            continue;
+        }
+        let Ok(serde_json::Value::Object(mut object)) = serde_json::to_value(event) else {
+            continue;
+        };
+        let kind = object
+            .remove("event")
+            .and_then(|value| value.as_str().map(str::to_string))
+            .unwrap_or_else(|| "runtime_event".to_string());
+        object.insert(
+            "turn_id".to_string(),
+            serde_json::Value::String(turn_id.to_string()),
+        );
+        emit_jsonl(&kind, serde_json::Value::Object(object));
+    }
+    if let Some(text) = assistant {
+        emit_jsonl(
+            "assistant",
+            serde_json::json!({"turn_id": turn_id, "text": text}),
+        );
+    }
 }
 
 fn strict_turn_issue(status: &kitsu_core::AgentTurnStatus) -> Option<String> {
@@ -1237,6 +1792,105 @@ fn report_cancelled_agents(ids: Vec<u64>) {
     }
 }
 
+fn background_agent_notice(
+    previous: subagent::AgentRegistrySnapshot,
+    current: subagent::AgentRegistrySnapshot,
+) -> Option<String> {
+    let completed = current.terminal.saturating_sub(previous.terminal);
+    if completed > 0 {
+        return Some(if current.running == 0 {
+            format!("~ {completed} background agent(s) finished - /agents for results")
+        } else {
+            format!(
+                "~ {completed} background agent(s) finished; {} still running - /agents to check",
+                current.running
+            )
+        });
+    }
+    if current.running > previous.running {
+        Some(format!(
+            "~ {} background agent(s) running - /agents to check",
+            current.running
+        ))
+    } else if current.running < previous.running {
+        Some(if current.running == 0 {
+            "~ background agents finished - /agents for results".to_string()
+        } else {
+            format!(
+                "~ background agent finished; {} still running - /agents to check",
+                current.running
+            )
+        })
+    } else {
+        None
+    }
+}
+
+async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason: &str) {
+    let running = registry.running();
+    if running == 0 {
+        return;
+    }
+    eprintln!(
+        "{reason}; waiting for {running} background agent(s) to finish (Ctrl+C cancels them)"
+    );
+    let mut changes = registry.subscribe();
+    while changes.borrow().running > 0 {
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    break;
+                }
+            }
+            _ = tokio::signal::ctrl_c() => {
+                report_cancelled_agents(registry.cancel_started_after(0).await);
+                break;
+            }
+        }
+    }
+}
+
+fn format_write_checkpoint(report: &kitsu_tools::builtins::fs::JournalTurnReport) -> String {
+    let label = terminal_inline(&report.label);
+    let mut output = format!("~ verified file checkpoint #{} ({}):", report.id, label);
+    for change in &report.changes {
+        output.push_str(&format!(
+            "\n  - {} {} ({} -> {} bytes; first changed line {})",
+            change.change,
+            shorten_home(&change.path),
+            change
+                .before_bytes
+                .map(|bytes| bytes.to_string())
+                .unwrap_or_else(|| "new".to_string()),
+            change.after_bytes,
+            change.first_changed_line
+        ));
+    }
+    output.push_str("\n  /undo restores this checkpoint if none of those files changed later");
+    output
+}
+
+fn report_write_checkpoint(report: kitsu_tools::builtins::fs::JournalTurnReport) {
+    eprintln!("{}", format_write_checkpoint(&report));
+}
+
+fn report_write_checkpoints(
+    reports: impl IntoIterator<Item = kitsu_tools::builtins::fs::JournalTurnReport>,
+) {
+    for report in reports {
+        report_write_checkpoint(report);
+    }
+}
+
+async fn cancel_agents_and_report_writes(
+    registry: &Arc<subagent::AgentRegistry>,
+    watermark: u64,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+) {
+    report_cancelled_agents(registry.cancel_started_after(watermark).await);
+    report_write_checkpoints(journal.drain_and_take_reports().await);
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
@@ -1246,6 +1900,7 @@ async fn run_scripted(
     cli: &Cli,
     path: &str,
     perms: &Permissions,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
     offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
     session: &SessionInfo,
@@ -1254,7 +1909,9 @@ async fn run_scripted(
     registry: &Arc<subagent::AgentRegistry>,
     allow_turn_errors: bool,
 ) -> Result<(), CliError> {
-    let content = std::fs::read_to_string(path)
+    let content = read_text_file_cancellable(std::path::PathBuf::from(path))
+        .await
+        .ok_or_else(|| CliError::cancelled(format!("script read cancelled: {path}")))?
         .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
     // One session state for the whole script — the context-meter anchor and
     // compaction circuit breaker persist across turns, matching interactive chat
@@ -1265,6 +1922,19 @@ async fn run_scripted(
     let mut failures = 0usize;
     let mut provider_failures = 0usize;
     let mut last_failed: Option<SubmittedPrompt> = None;
+    macro_rules! stop_if_cancelled {
+        ($kind:expr, $line:expr) => {
+            if $kind == ScriptFailureKind::Cancelled {
+                if cli.jsonl {
+                    emit_jsonl_summary("cancelled", failures + 1, provider_failures);
+                }
+                return Err(CliError::cancelled(format!(
+                    "script cancelled at {path}:{}",
+                    $line
+                )));
+            }
+        };
+    }
     // Review prompts receive verified evidence directly and deliberately run
     // without the mutation-capable chat registry.
     let no_tools = Registry::new();
@@ -1290,6 +1960,8 @@ async fn run_scripted(
             let result = run_scripted_turn(
                 setup,
                 tools,
+                perms,
+                journal,
                 messages,
                 model,
                 cli,
@@ -1305,6 +1977,7 @@ async fn run_scripted(
             match result {
                 Ok(()) => last_failed = None,
                 Err(kind) => {
+                    stop_if_cancelled!(kind, line_number);
                     failures += 1;
                     provider_failures += usize::from(kind == ScriptFailureKind::Provider);
                     last_failed = Some(prompt);
@@ -1317,12 +1990,24 @@ async fn run_scripted(
         }
         if let Some(rest) = trimmed.strip_prefix('/') {
             transcript_line("command", trimmed);
+            if cli.jsonl {
+                emit_jsonl(
+                    "command_started",
+                    serde_json::json!({
+                        "line": line_number,
+                        "command": trimmed,
+                    }),
+                );
+            }
             let result = handle_slash(
                 rest,
                 messages,
                 model,
-                &setup.provider,
+                &setup.catalog_provider,
+                tools,
+                cli,
                 perms,
+                journal,
                 session,
                 skillset,
                 context_window,
@@ -1331,14 +2016,84 @@ async fn run_scripted(
                 registry,
             )
             .await;
+            let finish_command = |status: &str, error_message: Option<&str>, exit_code: i32| {
+                if !cli.jsonl {
+                    return;
+                }
+                if let Some(message) = error_message {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "line": line_number,
+                            "command": trimmed,
+                            "kind": if exit_code == EXIT_PROVIDER { "provider" } else { "user" },
+                            "message": message,
+                            "exit_code": exit_code,
+                        }),
+                    );
+                }
+                emit_jsonl(
+                    "command_finished",
+                    serde_json::json!({
+                        "line": line_number,
+                        "command": trimmed,
+                        "status": status,
+                    }),
+                );
+            };
             // Keep subagents in sync with any `/model` change in the script.
             *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
             match result {
-                SlashResult::Continue => continue,
-                SlashResult::Quit => break,
+                SlashResult::Continue => {
+                    finish_command("ok", None, EXIT_USER);
+                    continue;
+                }
+                SlashResult::Cancelled => {
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "line": line_number,
+                                "command": trimmed,
+                                "kind": "cancelled",
+                                "message": "command cancelled by Ctrl+C",
+                                "exit_code": EXIT_CANCELLED,
+                            }),
+                        );
+                    }
+                    finish_command("cancelled", None, EXIT_CANCELLED);
+                    if cli.jsonl {
+                        emit_jsonl_summary("cancelled", failures + 1, provider_failures);
+                    }
+                    return Err(CliError::cancelled(format!(
+                        "script cancelled at {path}:{line_number}"
+                    )));
+                }
+                SlashResult::Quit => {
+                    finish_command("ok", None, EXIT_USER);
+                    break;
+                }
                 SlashResult::Error => {
                     failures += 1;
-                    eprintln!("{path}:{line_number}: command failed: {trimmed}");
+                    let message = format!("command failed: {trimmed}");
+                    finish_command("error", Some(&message), EXIT_USER);
+                    eprintln!(
+                        "{}:{line_number}: {}",
+                        terminal_inline(path),
+                        kitsu_render::sanitize_terminal_text(&message)
+                    );
+                    continue;
+                }
+                SlashResult::ProviderFailure(detail) => {
+                    failures += 1;
+                    provider_failures += 1;
+                    let message = format!("provider command failed: {trimmed}: {detail}");
+                    finish_command("error", Some(&message), EXIT_PROVIDER);
+                    eprintln!(
+                        "{}:{line_number}: {}",
+                        terminal_inline(path),
+                        kitsu_render::sanitize_terminal_text(&message)
+                    );
                     continue;
                 }
                 SlashResult::SubmitPrompt(prompt) => {
@@ -1349,6 +2104,8 @@ async fn run_scripted(
                     let result = run_scripted_turn(
                         setup,
                         turn_tools,
+                        perms,
+                        journal,
                         messages,
                         model,
                         cli,
@@ -1362,11 +2119,19 @@ async fn run_scripted(
                     )
                     .await;
                     match result {
-                        Ok(()) => last_failed = None,
+                        Ok(()) => {
+                            last_failed = None;
+                            finish_command("ok", None, EXIT_USER);
+                        }
                         Err(kind) => {
+                            if kind == ScriptFailureKind::Cancelled {
+                                finish_command("cancelled", None, EXIT_CANCELLED);
+                            }
+                            stop_if_cancelled!(kind, line_number);
                             failures += 1;
                             provider_failures += usize::from(kind == ScriptFailureKind::Provider);
                             last_failed = Some(prompt);
+                            finish_command("error", None, EXIT_USER);
                         }
                     }
                     continue;
@@ -1374,7 +2139,9 @@ async fn run_scripted(
                 SlashResult::Retry => {
                     let Some(prompt) = last_failed.clone() else {
                         failures += 1;
-                        eprintln!("{path}:{line_number}: nothing to retry");
+                        let message = "nothing to retry";
+                        finish_command("error", Some(message), EXIT_USER);
+                        eprintln!("{}:{line_number}: {message}", terminal_inline(path));
                         continue;
                     };
                     let turn_tools = match prompt.tool_mode {
@@ -1384,6 +2151,8 @@ async fn run_scripted(
                     let result = run_scripted_turn(
                         setup,
                         turn_tools,
+                        perms,
+                        journal,
                         messages,
                         model,
                         cli,
@@ -1397,19 +2166,35 @@ async fn run_scripted(
                     )
                     .await;
                     match result {
-                        Ok(()) => last_failed = None,
+                        Ok(()) => {
+                            last_failed = None;
+                            finish_command("ok", None, EXIT_USER);
+                        }
                         Err(kind) => {
+                            if kind == ScriptFailureKind::Cancelled {
+                                finish_command("cancelled", None, EXIT_CANCELLED);
+                            }
+                            stop_if_cancelled!(kind, line_number);
                             failures += 1;
                             provider_failures += usize::from(kind == ScriptFailureKind::Provider);
+                            finish_command("error", None, EXIT_USER);
                         }
                     }
                     continue;
                 }
                 SlashResult::NewSession
+                | SlashResult::QueuePrompt(_)
                 | SlashResult::ResumeSession(_)
-                | SlashResult::ListSessions => {
+                | SlashResult::ListSessions
+                | SlashResult::ForkSession(_)
+                | SlashResult::ExportSession { .. }
+                | SlashResult::ArchiveSession(_)
+                | SlashResult::RestoreSession(_)
+                | SlashResult::DeleteSession(_) => {
                     failures += 1;
-                    eprintln!("{path}:{line_number}: session commands require interactive chat");
+                    let message = "session commands require interactive chat";
+                    finish_command("error", Some(message), EXIT_USER);
+                    eprintln!("{}:{line_number}: {message}", terminal_inline(path));
                     continue;
                 }
             }
@@ -1418,6 +2203,8 @@ async fn run_scripted(
         let result = run_scripted_turn(
             setup,
             tools,
+            perms,
+            journal,
             messages,
             model,
             cli,
@@ -1433,6 +2220,7 @@ async fn run_scripted(
         match result {
             Ok(()) => last_failed = None,
             Err(kind) => {
+                stop_if_cancelled!(kind, line_number);
                 failures += 1;
                 provider_failures += usize::from(kind == ScriptFailureKind::Provider);
                 last_failed = Some(prompt);
@@ -1446,10 +2234,21 @@ async fn run_scripted(
         eprintln!(
             "script ended with {unfinished_agents} unfinished background agent(s); detached work is not considered successful automation"
         );
-        report_cancelled_agents(registry.cancel_started_after(0));
+        cancel_agents_and_report_writes(registry, 0, journal).await;
     }
     if failures > 0 {
         eprintln!("script summary: {failures} failure(s)");
+        if cli.jsonl {
+            emit_jsonl_summary(
+                if allow_turn_errors {
+                    "partial"
+                } else {
+                    "error"
+                },
+                failures,
+                provider_failures,
+            );
+        }
         if !allow_turn_errors {
             let message = format!(
                 "script failed: {failures} turn(s) or command(s) failed (use --allow-turn-errors to accept partial success)"
@@ -1460,6 +2259,8 @@ async fn run_scripted(
                 CliError::user(message)
             });
         }
+    } else if cli.jsonl {
+        emit_jsonl_summary("ok", 0, 0);
     }
     Ok(())
 }
@@ -1470,6 +2271,8 @@ async fn run_scripted(
 async fn run_scripted_turn(
     setup: &ChatSetup,
     tools: &Registry,
+    perms: &Permissions,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
     messages: &mut Vec<ChatMessage>,
     model: &str,
     cli: &Cli,
@@ -1482,23 +2285,121 @@ async fn run_scripted_turn(
     location: &str,
 ) -> Result<(), ScriptFailureKind> {
     transcript_line("user", display_input);
+    if cli.jsonl {
+        emit_jsonl(
+            "turn_started",
+            serde_json::json!({"turn_id": location, "input": display_input}),
+        );
+    }
+    let expanded = match await_cancellable(attachments::expand(input, perms)).await {
+        Some(Ok(expanded)) => expanded,
+        Some(Err(error)) => {
+            eprintln!(
+                "{}: attachment error: {}",
+                terminal_inline(location),
+                terminal_inline(&error)
+            );
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": location,
+                        "kind": "attachment",
+                        "message": error.to_string(),
+                        "exit_code": EXIT_USER,
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": location, "status": "error"}),
+                );
+            }
+            return Err(ScriptFailureKind::User);
+        }
+        None => {
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": location,
+                        "kind": "cancelled",
+                        "message": "attachment preflight cancelled by Ctrl+C",
+                        "exit_code": EXIT_CANCELLED,
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": location, "status": "cancelled"}),
+                );
+            }
+            return Err(ScriptFailureKind::Cancelled);
+        }
+    };
+    if !expanded.labels.is_empty() {
+        eprintln!("~ attached {} file(s):", expanded.labels.len());
+        for label in &expanded.labels {
+            eprintln!("  - {}", terminal_inline(label));
+        }
+    }
     let messages_before = messages.clone();
     let state_before = state.clone();
     let agent_watermark = registry.watermark();
-    messages.push(ChatMessage::user(input));
-    let cfg = build_agent_config(
+    let journal_turn = journal.begin_attributed_turn(display_input);
+    if let Some(previous) = journal_turn.previous {
+        report_write_checkpoint(previous);
+    }
+    messages.push(ChatMessage::user(expanded.text));
+    let mut cfg = build_agent_config(
         model.to_string(),
         cli,
         context_window.get(),
         offload_dir.clone(),
     );
-    match run_agent_turn_with_state(&setup.provider, tools, messages, &cfg, state).await {
-        Ok(_) => {
+    let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
+    cfg.event_log = event_log.clone();
+    let outcome = journal
+        .scope_turn(
+            &journal_turn.token,
+            run_turn_cancellable(&setup.provider, tools, messages, &cfg, state),
+        )
+        .await;
+    report_write_checkpoints(journal.drain_and_take_reports().await);
+    if let Some(report) = journal.finish_attributed_turn(&journal_turn.token) {
+        report_write_checkpoint(report);
+    }
+    if let Some(log) = &event_log {
+        let assistant = match &outcome {
+            TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+            _ => None,
+        };
+        emit_agent_trace(location, log, assistant);
+    }
+    match outcome {
+        TurnOutcome::Completed(Ok(_)) => {
             if let Some(issue) = strict_turn_issue(&state.last_turn) {
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": location,
+                            "kind": "incomplete_turn",
+                            "message": issue,
+                            "tool_errors": state.last_turn.tool_errors,
+                            "exit_code": EXIT_PROVIDER,
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": location, "status": "error"}),
+                    );
+                }
                 *messages = messages_before;
                 *state = state_before;
-                report_cancelled_agents(registry.cancel_started_after(agent_watermark));
-                eprintln!("{location}: strict scripted turn failed: {issue}");
+                cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
+                eprintln!(
+                    "{}: strict scripted turn failed: {issue}",
+                    terminal_inline(location)
+                );
                 eprintln!(
                     "kitsu-context-rollback: incomplete turn removed from conversation state"
                 );
@@ -1507,18 +2408,68 @@ async fn run_scripted_turn(
                 );
                 Err(ScriptFailureKind::Provider)
             } else {
+                if cli.jsonl {
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({
+                            "turn_id": location,
+                            "status": "ok",
+                            "tool_errors": state.last_turn.tool_errors,
+                        }),
+                    );
+                }
                 Ok(())
             }
         }
-        Err(e) => {
+        TurnOutcome::Completed(Err(e)) => {
             let kind = script_failure_kind(&e);
+            let error_message = chat_error_message(e, model);
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": location,
+                        "kind": if kind == ScriptFailureKind::Provider { "provider" } else { "user" },
+                        "message": error_message,
+                        "exit_code": if kind == ScriptFailureKind::Provider { EXIT_PROVIDER } else { EXIT_USER },
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": location, "status": "error"}),
+                );
+            }
             *messages = messages_before;
             *state = state_before;
-            report_cancelled_agents(registry.cancel_started_after(agent_watermark));
-            eprintln!("{location}: {}", chat_error_message(e, model));
+            cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
+            eprintln!("{}: {error_message}", terminal_inline(location));
             eprintln!("kitsu-context-rollback: failed turn removed from conversation state");
             eprintln!("~ failed turn rolled back; completed file changes, if any, remain on disk");
             Err(kind)
+        }
+        TurnOutcome::Cancelled => {
+            if cli.jsonl {
+                emit_jsonl(
+                    "error",
+                    serde_json::json!({
+                        "turn_id": location,
+                        "kind": "cancelled",
+                        "message": "request cancelled by Ctrl+C",
+                        "exit_code": EXIT_CANCELLED,
+                    }),
+                );
+                emit_jsonl(
+                    "turn_finished",
+                    serde_json::json!({"turn_id": location, "status": "cancelled"}),
+                );
+            }
+            *messages = messages_before;
+            *state = state_before;
+            cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
+            eprintln!("{}: request cancelled by Ctrl+C", terminal_inline(location));
+            eprintln!("kitsu-context-rollback: cancelled turn removed from conversation state");
+            eprintln!("~ completed file changes, if any, remain on disk");
+            Err(ScriptFailureKind::Cancelled)
         }
     }
 }
@@ -1529,10 +2480,181 @@ enum TurnOutcome {
     Cancelled,
 }
 
+#[derive(Default)]
+struct TypeaheadCaptureResult {
+    captured: usize,
+    eof: bool,
+}
+
+/// Own complete lines submitted while a foreground turn is running. Rustyline
+/// restores canonical terminal mode after `readline`, so `poll` only marks stdin
+/// readable after Enter (or EOF); partial typing stays in the terminal buffer.
+/// Approval prompts temporarily claim stdin through `APPROVAL_INPUT_ACTIVE`.
+#[cfg(unix)]
+struct TypeaheadCollector {
+    stop: Arc<AtomicBool>,
+    handle: Option<std::thread::JoinHandle<TypeaheadCaptureResult>>,
+}
+
+#[cfg(unix)]
+impl TypeaheadCollector {
+    fn start(queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>) -> Self {
+        let stop = Arc::new(AtomicBool::new(false));
+        let thread_stop = stop.clone();
+        let handle = std::thread::spawn(move || {
+            let mut result = TypeaheadCaptureResult::default();
+            while !thread_stop.load(Ordering::Acquire) {
+                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire)
+                    || queue.lock().expect("prompt queue").status().is_full()
+                {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                }
+                // Serialize ownership of canonical stdin with permission and
+                // command prompts. Holding this lock from poll through
+                // read_line closes the check-to-read race where one submitted
+                // line could otherwise become either type-ahead or approval.
+                let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
+                    std::thread::sleep(Duration::from_millis(25));
+                    continue;
+                };
+                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+                    continue;
+                }
+
+                let mut descriptor = libc::pollfd {
+                    fd: libc::STDIN_FILENO,
+                    events: libc::POLLIN,
+                    revents: 0,
+                };
+                // SAFETY: `descriptor` points to one initialized pollfd for the
+                // duration of the call, and stdin's process fd is not owned or
+                // closed by this collector.
+                let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+                if ready < 0 {
+                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                        continue;
+                    }
+                    break;
+                }
+                if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+                    continue;
+                }
+
+                let mut line = String::new();
+                match std::io::stdin().read_line(&mut line) {
+                    Ok(0) => {
+                        result.eof = true;
+                        break;
+                    }
+                    Ok(_) => {
+                        let line = line.trim().to_string();
+                        if line.is_empty() {
+                            continue;
+                        }
+                        if queue.lock().expect("prompt queue").enqueue(line).is_ok() {
+                            result.captured += 1;
+                        }
+                    }
+                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+                    Err(_) => break,
+                }
+            }
+            result
+        });
+        Self {
+            stop,
+            handle: Some(handle),
+        }
+    }
+
+    fn finish(mut self) -> TypeaheadCaptureResult {
+        self.stop.store(true, Ordering::Release);
+        self.handle
+            .take()
+            .and_then(|handle| handle.join().ok())
+            .unwrap_or_default()
+    }
+}
+
+#[cfg(not(unix))]
+struct TypeaheadCollector;
+
+#[cfg(not(unix))]
+impl TypeaheadCollector {
+    fn start(_queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>) -> Self {
+        Self
+    }
+
+    fn finish(self) -> TypeaheadCaptureResult {
+        TypeaheadCaptureResult::default()
+    }
+}
+
 /// Run one turn, racing it against Ctrl+C. The turn future is awaited directly
 /// (never spawned), so a Ctrl+C drops it — and with it the in-flight HTTP
 /// request — with no leaked task (design §10). `state` persists the context-meter
 /// anchor and compaction circuit breaker across the session's turns.
+async fn await_cancellable<F>(future: F) -> Option<F::Output>
+where
+    F: std::future::Future,
+{
+    FOREGROUND_CANCELLED.store(false, Ordering::Release);
+    tokio::pin!(future);
+    let outcome = tokio::select! {
+        result = &mut future => Some(result),
+        _ = tokio::signal::ctrl_c() => None,
+    };
+    if outcome.is_none() {
+        FOREGROUND_CANCELLED.store(true, Ordering::Release);
+        while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+    } else {
+        FOREGROUND_CANCELLED.store(false, Ordering::Release);
+    }
+    outcome
+}
+
+/// Read a potentially blocking OS stream on a detached thread. Dropping a
+/// Tokio `spawn_blocking` task does not stop its syscall and the runtime waits
+/// for such tasks during shutdown; a FIFO or an intentionally held-open stdin
+/// could therefore prevent a Ctrl+C JSONL run from ever emitting and exiting.
+/// Detached standard threads do not hold Tokio shutdown hostage.
+async fn read_piped_stdin_cancellable() -> Option<std::io::Result<String>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        use std::io::Read;
+        let mut input = String::new();
+        let result = std::io::stdin().read_to_string(&mut input).map(|_| input);
+        let _ = sender.send(result);
+    });
+    await_cancellable(async move {
+        receiver.await.unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "stdin reader stopped before returning a result",
+            ))
+        })
+    })
+    .await
+}
+
+async fn read_text_file_cancellable(path: std::path::PathBuf) -> Option<std::io::Result<String>> {
+    let (sender, receiver) = tokio::sync::oneshot::channel();
+    std::thread::spawn(move || {
+        let result = std::fs::read_to_string(path);
+        let _ = sender.send(result);
+    });
+    await_cancellable(async move {
+        receiver.await.unwrap_or_else(|_| {
+            Err(std::io::Error::other(
+                "file reader stopped before returning a result",
+            ))
+        })
+    })
+    .await
+}
+
 async fn run_turn_cancellable(
     provider: &OpenAICompatProvider,
     tools: &Registry,
@@ -1540,11 +2662,13 @@ async fn run_turn_cancellable(
     cfg: &AgentConfig,
     state: &mut kitsu_core::AgentSessionState,
 ) -> TurnOutcome {
-    let turn = run_agent_turn_with_state(provider, tools, messages, cfg, state);
-    tokio::pin!(turn);
-    tokio::select! {
-        res = &mut turn => TurnOutcome::Completed(res),
-        _ = tokio::signal::ctrl_c() => TurnOutcome::Cancelled,
+    match await_cancellable(run_agent_turn_with_state(
+        provider, tools, messages, cfg, state,
+    ))
+    .await
+    {
+        Some(result) => TurnOutcome::Completed(result),
+        None => TurnOutcome::Cancelled,
     }
 }
 
@@ -1553,6 +2677,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         first_prompt,
         allow_paths,
         allow_write,
+        enable_commands,
+        command_roots,
+        allow_commands,
         script,
         resume,
         no_session,
@@ -1566,13 +2693,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // --allow-write pre-grant paths so those never prompt.
     let scripted = script.is_some();
     let interactive = kitsu_render::stdin_is_tty() && !scripted;
+    if cli.jsonl && interactive {
+        return Err(CliError::user(
+            "--jsonl is an automation mode; use --script, pipe one prompt, or use `ask`"
+                .to_string(),
+        ));
+    }
     if resume.is_some() && !interactive {
         return Err(CliError::user(
             "--resume requires an interactive TTY chat (it cannot be combined with --script or piped input)"
                 .to_string(),
         ));
     }
-    if interactive {
+    if cli.jsonl {
+        emit_jsonl(
+            "run_started",
+            serde_json::json!({
+                "mode": if scripted { "script" } else { "piped" },
+                "gateway": setup.gateway_name,
+                "model": setup.model,
+            }),
+        );
+    }
+    if interactive && !no_session {
         prepare_runtime_state_dir(&setup.state_dir).map_err(CliError::user)?;
     }
     let sessions_dir = setup.state_dir.join("sessions");
@@ -1627,21 +2770,67 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     perms
         .protect_read_path(&setup.config_path.to_string_lossy())
         .map_err(|error| CliError::user(format!("cannot protect Kitsu config: {error}")))?;
-    // Stateless runs intentionally leave this directory absent. If it exists,
-    // protect its canonical location from model file tools; interactive runs
-    // created and secured it just above.
-    if setup.state_dir.exists() {
-        perms
-            .protect_read_path(&setup.state_dir.to_string_lossy())
-            .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
-    }
+    perms
+        .protect_write_path(&setup.config_path.to_string_lossy())
+        .map_err(|error| CliError::user(format!("cannot protect Kitsu config: {error}")))?;
+    // Reserve the intended location even in a stateless run where it does not
+    // exist yet. A broad --allow-write/--yes grant must not become permission
+    // to mutate Kitsu's state if background discovery creates it later.
+    perms
+        .protect_read_path(&setup.state_dir.to_string_lossy())
+        .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
+    perms
+        .protect_write_path(&setup.state_dir.to_string_lossy())
+        .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
 
     // In interactive chat the tools are always available (permissions gate access
     // at call time). Non-interactively, register a tool only when it can actually
     // succeed — so scripted runs with no flags advertise nothing, and a read-only
     // grant doesn't advertise fs_write_file only to always deny it.
-    let can_read = interactive || cli.yes || !allow_paths.is_empty();
-    let can_write = interactive || cli.yes || !allow_write.is_empty();
+    let can_read = interactive || !allow_paths.is_empty();
+    let can_write = interactive || !allow_write.is_empty();
+    let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
+    let command_requested =
+        enable_commands || !command_roots.is_empty() || !allow_commands.is_empty();
+    let explicit_command_grants: Vec<Vec<String>> = allow_commands
+        .iter()
+        .map(|encoded| {
+            serde_json::from_str(encoded).map_err(|error| {
+                CliError::user(format!(
+                    "invalid --allow-command value {encoded:?}: expected a JSON string array ({error})"
+                ))
+            })
+        })
+        .collect::<Result<_, _>>()?;
+    let command_policy = if command_requested {
+        let launch_dir = std::env::current_dir().map_err(|error| {
+            CliError::user(format!("cannot resolve command directory: {error}"))
+        })?;
+        let roots = if command_roots.is_empty() {
+            vec![launch_dir.to_string_lossy().into_owned()]
+        } else {
+            command_roots.to_vec()
+        };
+        let command_mode = if interactive {
+            kitsu_tools::CommandMode::Ask
+        } else {
+            kitsu_tools::CommandMode::Deny
+        };
+        let mut policy = kitsu_tools::CommandPolicy::new(&roots, command_mode)
+            .map_err(|error| CliError::user(format!("invalid command policy: {error}")))?;
+        if interactive {
+            policy = policy.with_prompter(Arc::new(CliCommandPrompter));
+        }
+        let policy = Arc::new(policy);
+        for argv in &explicit_command_grants {
+            policy
+                .grant_command(argv, &launch_dir)
+                .map_err(|error| CliError::user(format!("invalid --allow-command: {error}")))?;
+        }
+        Some(policy)
+    } else {
+        None
+    };
 
     // Discover LOCAL skills before building tool sets (they register the `skill`
     // tool). Skills are budget-gated context, not privileged — suggested actions
@@ -1657,7 +2846,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // The subagent tool set: base tools ONLY (no `spawn_agent` → depth-1).
     let sub_tools = {
         let mut t = Registry::new();
-        register_base_tools(&mut t, &perms, &skillset, can_read, can_write);
+        register_base_tools(
+            &mut t,
+            &perms,
+            &skillset,
+            can_read,
+            can_write,
+            &write_journal,
+            command_policy.as_ref(),
+        );
         Arc::new(t)
     };
 
@@ -1675,8 +2872,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
     let mut tools = Registry::new();
-    register_base_tools(&mut tools, &perms, &skillset, can_read, can_write);
-    if can_read || can_write {
+    register_base_tools(
+        &mut tools,
+        &perms,
+        &skillset,
+        can_read,
+        can_write,
+        &write_journal,
+        command_policy.as_ref(),
+    );
+    if can_read || can_write || command_policy.is_some() {
         let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
         sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
         let sub_system = if skillset.is_empty() {
@@ -1729,26 +2934,26 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let persistent_artifacts = session_store
         .as_ref()
         .map(session::SessionStore::artifacts_dir);
-    let offload_dir = if tool_names.is_empty() {
+    // A pointer is useful only when this registry also exposes fs_read_file.
+    // In command-only automation, offloading would replace usable inline
+    // command output with a path the model has no tool capable of reading.
+    let desired_offload = if tool_names.is_empty() || !can_resolve_offload_pointers(&tool_names) {
         None
     } else {
-        let dir = persistent_artifacts.clone().unwrap_or_else(|| {
+        Some(persistent_artifacts.clone().unwrap_or_else(|| {
             std::env::temp_dir().join(format!("kitsu-offload-{}", std::process::id()))
-        });
-        match std::fs::create_dir_all(&dir).map(|_| perms.grant_read_root(&dir.to_string_lossy())) {
-            Ok(Ok(_)) => Some(dir),
-            _ => {
-                let _ = std::fs::remove_dir_all(&dir);
-                None
-            }
-        }
+        }))
     };
+    let offload_state = Rc::new(RefCell::new(None));
+    if let Err(error) = activate_offload_dir(&perms, &offload_state, desired_offload) {
+        eprintln!("warning: large tool-result offloading disabled: {error}");
+    }
+    let offload_dir = offload_state.borrow().clone();
     let _offload_guard = if persistent_artifacts.is_none() {
         offload_dir.clone().map(OffloadDirGuard)
     } else {
         None
     };
-    let offload_state = Rc::new(RefCell::new(offload_dir.clone()));
 
     let mut model = setup.model.clone();
     // Shared with session UI state and updated in place by `/model`, so
@@ -1839,12 +3044,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
     // --skill preloads named skills up front (in addition to on-demand loading).
     if let Some(pre) = preload_skills(cli, &skillset) {
-        // Grant read to each preloaded skill's dir so its bundled files are reachable.
-        grant_preloaded_skill_roots(cli, &skillset, &perms);
         let chunk = format!("\n\n---\nPreloaded skills (follow these):\n{pre}");
         system.push_str(&chunk);
         provenance.push(CtxEntry::new(
-            format!("skills (--skill ×{})", cli.skill.len()),
+            format!("skills (--skill x{})", cli.skill.len()),
             estimate_str(&chunk),
             "preloaded",
             "--skill flag",
@@ -1889,10 +3092,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )));
         }
         if cli.model.is_none() && saved.model != model {
-            model = saved.model.clone();
-            if !setup.context_window_pinned {
-                context_window.set(setup.provider.model_context_length(&model).await);
-            }
+            let resumed_model = saved.model.clone();
+            let resumed_window = if setup.context_window_pinned {
+                context_window.get()
+            } else {
+                await_cancellable(setup.catalog_provider.model_context_length(&resumed_model))
+                    .await
+                    .ok_or_else(|| {
+                        CliError::cancelled("session context-window discovery cancelled by Ctrl+C")
+                    })?
+            };
+            model = resumed_model;
+            context_window.set(resumed_window);
         }
         if no_project {
             project_context_source = None;
@@ -1927,6 +3138,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         offload_dir: offload_state.clone(),
         session_id,
         tool_names: tool_names.clone(),
+        command_roots: command_policy
+            .as_ref()
+            .map(|policy| policy.command_roots())
+            .unwrap_or_default(),
+        command_mode: command_policy.as_ref().map(|policy| match policy.mode() {
+            kitsu_tools::CommandMode::Ask => "ask",
+            kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
+        }),
         window: context_window.clone(),
         max_tokens: cli.max_output_tokens,
         provenance: RefCell::new(provenance),
@@ -1943,6 +3162,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             cli,
             path,
             &perms,
+            &write_journal,
             &offload_dir,
             &skillset,
             &session,
@@ -1959,10 +3179,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let prompt = match first_prompt {
             Some(p) => p.to_string(),
             None => {
-                use std::io::Read;
-                let mut buf = String::new();
-                std::io::stdin()
-                    .read_to_string(&mut buf)
+                let buf = read_piped_stdin_cancellable()
+                    .await
+                    .ok_or_else(|| CliError::cancelled("stdin read cancelled by Ctrl+C"))?
                     .map_err(|e| CliError::user(format!("failed to read stdin: {e}")))?;
                 buf.trim().to_string()
             }
@@ -1972,11 +3191,203 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 "chat: no input (provide a prompt or pipe text on stdin)".to_string(),
             ));
         }
-        messages.push(ChatMessage::user(prompt));
-        let cfg = base_cfg(model, cli);
-        return match run_agent_turn(&setup.provider, &tools, &mut messages, &cfg).await {
-            Ok(_) => Ok(()),
-            Err(e) => Err(map_agent_error(e)),
+        if cli.jsonl {
+            emit_jsonl(
+                "turn_started",
+                serde_json::json!({"turn_id": "piped:1", "input": &prompt}),
+            );
+        }
+        let expanded = match await_cancellable(attachments::expand(&prompt, &perms)).await {
+            Some(Ok(expanded)) => expanded,
+            Some(Err(error)) => {
+                eprintln!("attachment error: {}", terminal_inline(&error));
+                let mapped = CliError::user(error);
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": "piped:1",
+                            "kind": "attachment",
+                            "message": mapped.to_string(),
+                            "exit_code": mapped.exit_code(),
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                    );
+                    emit_jsonl_summary("error", 1, 0);
+                }
+                return Err(mapped);
+            }
+            None => {
+                let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": "piped:1",
+                            "kind": "cancelled",
+                            "message": mapped.to_string(),
+                            "exit_code": mapped.exit_code(),
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                    );
+                    emit_jsonl_summary("cancelled", 1, 0);
+                }
+                return Err(mapped);
+            }
+        };
+        if !expanded.labels.is_empty() {
+            eprintln!("~ attached {} file(s):", expanded.labels.len());
+            for label in &expanded.labels {
+                eprintln!("  - {}", terminal_inline(label));
+            }
+        }
+        let agent_watermark = agent_registry.watermark();
+        let journal_turn = write_journal.begin_attributed_turn(&prompt);
+        if let Some(previous) = journal_turn.previous {
+            report_write_checkpoint(previous);
+        }
+        messages.push(ChatMessage::user(expanded.text));
+        let mut cfg = base_cfg(model, cli);
+        let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
+        cfg.event_log = event_log.clone();
+        let outcome = write_journal
+            .scope_turn(
+                &journal_turn.token,
+                run_turn_cancellable(
+                    &setup.provider,
+                    &tools,
+                    &mut messages,
+                    &cfg,
+                    &mut session_state,
+                ),
+            )
+            .await;
+        report_write_checkpoints(write_journal.drain_and_take_reports().await);
+        if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
+            report_write_checkpoint(report);
+        }
+        if let Some(log) = &event_log {
+            let assistant = match &outcome {
+                TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+                _ => None,
+            };
+            emit_agent_trace("piped:1", log, assistant);
+        }
+        return match outcome {
+            TurnOutcome::Completed(Ok(_)) => {
+                let unfinished_agents = agent_registry.running();
+                if unfinished_agents > 0 {
+                    cancel_agents_and_report_writes(&agent_registry, 0, &write_journal).await;
+                    let mapped = CliError::provider(format!(
+                        "piped turn ended with {unfinished_agents} unfinished background agent(s)"
+                    ));
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "unfinished_background_agents",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        );
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                        );
+                        emit_jsonl_summary("error", 1, 1);
+                    }
+                    return Err(mapped);
+                }
+                if let Some(issue) = strict_turn_issue(&session_state.last_turn) {
+                    cancel_agents_and_report_writes(
+                        &agent_registry,
+                        agent_watermark,
+                        &write_journal,
+                    )
+                    .await;
+                    let mapped = CliError::provider(format!("incomplete turn: {issue}"));
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "incomplete_turn",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        );
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                        );
+                        emit_jsonl_summary("error", 1, 1);
+                    }
+                    return Err(mapped);
+                }
+                if cli.jsonl {
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "piped:1", "status": "ok"}),
+                    );
+                    emit_jsonl_summary("ok", 0, 0);
+                }
+                Ok(())
+            }
+            TurnOutcome::Completed(Err(error)) => {
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                let mapped = map_agent_error(error);
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": "piped:1",
+                            "kind": mapped.jsonl_kind(),
+                            "message": mapped.to_string(),
+                            "exit_code": mapped.exit_code(),
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                    );
+                    emit_jsonl_summary(
+                        "error",
+                        1,
+                        usize::from(mapped.exit_code() == EXIT_PROVIDER),
+                    );
+                }
+                Err(mapped)
+            }
+            TurnOutcome::Cancelled => {
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                let mapped = CliError::cancelled("request cancelled by Ctrl+C");
+                if cli.jsonl {
+                    emit_jsonl(
+                        "error",
+                        serde_json::json!({
+                            "turn_id": "piped:1",
+                            "kind": "cancelled",
+                            "message": mapped.to_string(),
+                            "exit_code": mapped.exit_code(),
+                        }),
+                    );
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                    );
+                    emit_jsonl_summary("cancelled", 1, 0);
+                }
+                Err(mapped)
+            }
         };
     }
 
@@ -1992,9 +3403,54 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         rustyline::Editor::with_config(rl_config)
             .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
     // Complete slash commands without changing the visible input-buffer width.
-    rl.set_helper(Some(ChatHelper));
+    rl.set_helper(Some(ChatHelper {
+        permissions: perms.clone(),
+    }));
+    let agent_notification_task = if kitsu_render::plain_mode() {
+        let mut changes = agent_registry.subscribe();
+        let notification_journal = write_journal.clone();
+        Some(tokio::spawn(async move {
+            let mut previous = *changes.borrow_and_update();
+            while changes.changed().await.is_ok() {
+                let current = *changes.borrow_and_update();
+                if let Some(message) = background_agent_notice(previous, current) {
+                    eprintln!("\n{message}");
+                }
+                if current.terminal > previous.terminal {
+                    for report in notification_journal.drain_and_take_reports().await {
+                        eprintln!("{}", format_write_checkpoint(&report));
+                    }
+                }
+                previous = current;
+            }
+        }))
+    } else {
+        rl.create_external_printer().ok().map(|mut printer| {
+            let mut changes = agent_registry.subscribe();
+            let notification_journal = write_journal.clone();
+            tokio::spawn(async move {
+                let mut previous = *changes.borrow_and_update();
+                while changes.changed().await.is_ok() {
+                    let current = *changes.borrow_and_update();
+                    if let Some(message) = background_agent_notice(previous, current) {
+                        let _ = printer.print(format!("\n{message}\n"));
+                    }
+                    if current.terminal > previous.terminal {
+                        for report in notification_journal.drain_and_take_reports().await {
+                            let _ =
+                                printer.print(format!("\n{}\n", format_write_checkpoint(&report)));
+                        }
+                    }
+                    previous = current;
+                }
+            })
+        })
+    };
+    let agent_notifications_live = agent_notification_task.is_some();
     let history_path = setup.state_dir.join("history");
-    let _ = rl.load_history(&history_path);
+    if !no_session {
+        let _ = rl.load_history(&history_path);
+    }
 
     kitsu_render::chat_banner(
         &session.gateway,
@@ -2004,30 +3460,85 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     );
     persist_session(&session_store, &session, &model, &messages);
 
-    // If a first prompt was given, queue it as the first turn.
-    let mut queued = first_prompt.map(|s| s.to_string());
+    // Kitsu owns submitted type-ahead in a bounded FIFO instead of leaving it as
+    // invisible terminal buffering. The kernel retains any lines beyond the
+    // bound until a queue slot opens, so overflow is never silently discarded.
+    let prompt_queue = Arc::new(std::sync::Mutex::new(prompt_queue::PromptQueue::new(
+        PROMPT_QUEUE_CAPACITY,
+    )));
+    if let Some(first) = first_prompt {
+        prompt_queue
+            .lock()
+            .expect("prompt queue")
+            .enqueue(first)
+            .expect("the initial prompt fits an empty queue");
+    }
+    let mut exit_after_queue = false;
+    // Session transitions are control-plane actions, not user prompts. They
+    // always run before queued model work and never consume bounded queue
+    // capacity (notably the immediate switch after `/fork`).
+    let mut priority_command: Option<String> = None;
     let prompt = kitsu_render::prompt_string();
-    // Report background-agent activity only when the running count changes, so
-    // the user notices work starting/finishing without a per-prompt spam line.
-    let mut last_running = 0usize;
+    // Fallback for terminals where Rustyline cannot create an external printer.
+    let mut last_agent_snapshot = agent_registry.snapshot();
     let mut last_failed: Option<SubmittedPrompt> = None;
     let no_tools = Registry::new();
 
     loop {
-        let running = agent_registry.running();
-        if running != last_running {
-            if running > 0 {
-                eprintln!("~ {running} background agent(s) running — /agents to check");
-            } else {
-                eprintln!("~ background agents finished — /agents for results");
+        let agent_snapshot = agent_registry.snapshot();
+        if !agent_notifications_live {
+            if let Some(message) = background_agent_notice(last_agent_snapshot, agent_snapshot) {
+                eprintln!("{message}");
             }
-            last_running = running;
+            if agent_snapshot.terminal > last_agent_snapshot.terminal {
+                report_write_checkpoints(write_journal.take_unreported_reports());
+            }
+            last_agent_snapshot = agent_snapshot;
         }
-        let line = match queued.take() {
-            Some(p) => p,
-            None => match rl.readline(&prompt) {
+        let prioritized = priority_command.take();
+        let queued_line = if prioritized.is_none() {
+            prompt_queue.lock().expect("prompt queue").dequeue()
+        } else {
+            None
+        };
+        let line = match (prioritized, queued_line) {
+            (Some(command), _) => command,
+            (None, Some(queued)) => {
+                let status = prompt_queue.lock().expect("prompt queue").status();
+                eprintln!(
+                    "~ running queued prompt ({} remaining; {} queue slot(s) available)",
+                    status.queued,
+                    status.remaining()
+                );
+                queued
+            }
+            (None, None) if exit_after_queue => {
+                debug_assert!(prompt_queue
+                    .lock()
+                    .expect("prompt queue")
+                    .status()
+                    .is_empty());
+                await_background_agents(
+                    &agent_registry,
+                    "end of input never discards detached work",
+                )
+                .await;
+                persist_session(&session_store, &session, &model, &messages);
+                break;
+            }
+            (None, None) => match rl.readline(&prompt) {
                 Ok(l) => l,
-                Err(rustyline::error::ReadlineError::Eof) => break,
+                Err(rustyline::error::ReadlineError::Eof) => {
+                    let running = agent_registry.running();
+                    if running > 0 {
+                        eprintln!(
+                            "exit waiting for {running} background agent(s); detached work will not be discarded"
+                        );
+                        exit_after_queue = true;
+                        continue;
+                    }
+                    break;
+                }
                 Err(rustyline::error::ReadlineError::Interrupted) => {
                     eprintln!("^C (input cleared; Ctrl+D or /quit exits)");
                     continue;
@@ -2042,7 +3553,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if line.is_empty() {
             continue;
         }
-        let _ = rl.add_history_entry(&line);
+        if !no_session {
+            let _ = rl.add_history_entry(&line);
+        }
         let mut submitted = SubmittedPrompt::full(line);
 
         if let Some(rest) = submitted.text.strip_prefix('/') {
@@ -2051,8 +3564,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 rest,
                 &mut messages,
                 &mut model,
-                &setup.provider,
+                &setup.catalog_provider,
+                &tools,
+                cli,
                 &perms,
+                &write_journal,
                 &session,
                 &skillset,
                 &context_window,
@@ -2072,12 +3588,36 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     persist_session(&session_store, &session, &model, &messages);
                     continue;
                 }
-                SlashResult::Error => continue,
+                SlashResult::Error | SlashResult::ProviderFailure(_) => continue,
+                SlashResult::Cancelled => continue,
                 SlashResult::Quit => {
+                    let running = agent_registry.running();
+                    if running > 0 {
+                        eprintln!(
+                            "exit blocked: {running} background agent(s) still running; use /agents and wait for them to finish"
+                        );
+                        continue;
+                    }
+                    report_write_checkpoints(write_journal.drain_and_take_reports().await);
                     persist_session(&session_store, &session, &model, &messages);
                     break;
                 }
                 SlashResult::SubmitPrompt(prompt) => submitted = prompt,
+                SlashResult::QueuePrompt(prompt) => {
+                    let mut queue = prompt_queue.lock().expect("prompt queue");
+                    match prompt {
+                        Some(prompt) => match queue.enqueue(prompt) {
+                            Ok(status) => eprintln!("~ {status}"),
+                            Err(error) => eprintln!(
+                                "queue refused a {}-character prompt at capacity {}; finish a queued turn and try again",
+                                error.prompt().chars().count(),
+                                error.capacity()
+                            ),
+                        },
+                        None => eprintln!("~ {}", queue.status()),
+                    }
+                    continue;
+                }
                 SlashResult::Retry => {
                     let Some(prompt) = last_failed.clone() else {
                         eprintln!("nothing to retry");
@@ -2099,19 +3639,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    report_write_checkpoints(write_journal.drain_and_take_reports().await);
+                    if let Some(store) = session_store.as_mut() {
+                        if let Err(error) = store.reset() {
+                            eprintln!(
+                                "new session cancelled because its autosave lease could not be created: {error}"
+                            );
+                            continue;
+                        }
+                        *session.session_id.borrow_mut() = Some(store.id().to_string());
+                    }
                     messages = vec![fresh_system_message.clone()];
                     session_state = kitsu_core::AgentSessionState::default();
                     last_failed = None;
                     agent_registry.reset();
+                    write_journal.reset();
                     *session.project_context.borrow_mut() = fresh_project_context_source.clone();
                     *session.provenance.borrow_mut() = fresh_provenance.clone();
-                    if let Some(store) = session_store.as_mut() {
-                        store.reset();
-                        *session.session_id.borrow_mut() = Some(store.id().to_string());
-                    }
                     perms.reset_runtime_grants();
-                    grant_preloaded_skill_roots(cli, &skillset, &perms);
-                    let desired_offload = if session.tool_names.is_empty() {
+                    reset_command_session(
+                        command_policy.as_ref(),
+                        &explicit_command_grants,
+                        &session.directory,
+                    );
+                    let desired_offload = if !can_resolve_offload_pointers(&session.tool_names) {
                         None
                     } else if let Some(store) = session_store.as_ref() {
                         Some(store.artifacts_dir())
@@ -2147,13 +3698,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
-                    if !persist_session(&session_store, &session, &model, &messages) {
-                        eprintln!(
-                            "resume cancelled because the current session could not be saved"
-                        );
-                        continue;
-                    }
-                    let saved = match session::SessionStore::load(&sessions_dir, &selector) {
+                    let active_id = session.session_id.borrow().clone();
+                    let saved = match session::SessionStore::load_other(
+                        &sessions_dir,
+                        &selector,
+                        active_id.as_deref(),
+                    ) {
                         Ok(saved) => saved,
                         Err(error) => {
                             eprintln!("cannot resume chat: {error}");
@@ -2163,7 +3713,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     if saved.gateway != session.gateway {
                         eprintln!(
                             "cannot resume session '{}': it uses gateway '{}', not '{}'",
-                            saved.id, saved.gateway, session.gateway
+                            saved.id,
+                            terminal_inline(&saved.gateway),
+                            terminal_inline(&session.gateway)
                         );
                         continue;
                     }
@@ -2186,6 +3738,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    if !persist_session(&session_store, &session, &model, &messages) {
+                        eprintln!(
+                            "resume cancelled because the current session could not be saved"
+                        );
+                        continue;
+                    }
+                    report_write_checkpoints(write_journal.drain_and_take_reports().await);
                     let resumed_store = if no_session {
                         None
                     } else {
@@ -2197,17 +3756,33 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             }
                         }
                     };
-                    model = saved.model.clone();
-                    if !setup.context_window_pinned {
-                        context_window.set(setup.provider.model_context_length(&model).await);
-                    }
+                    let resumed_model = saved.model.clone();
+                    let resumed_window = if setup.context_window_pinned {
+                        context_window.get()
+                    } else {
+                        let Some(window) = await_cancellable(
+                            setup.catalog_provider.model_context_length(&resumed_model),
+                        )
+                        .await
+                        else {
+                            eprintln!("^C (session context-window discovery cancelled)");
+                            continue;
+                        };
+                        window
+                    };
+                    model = resumed_model;
+                    context_window.set(resumed_window);
                     if let Some(store) = resumed_store {
                         session_store = Some(store);
                         *session.session_id.borrow_mut() = Some(saved.id.clone());
                     }
                     perms.reset_runtime_grants();
-                    grant_preloaded_skill_roots(cli, &skillset, &perms);
-                    let desired_offload = if session.tool_names.is_empty() {
+                    reset_command_session(
+                        command_policy.as_ref(),
+                        &explicit_command_grants,
+                        &session.directory,
+                    );
+                    let desired_offload = if !can_resolve_offload_pointers(&session.tool_names) {
                         None
                     } else if let Some(store) = session_store.as_ref() {
                         Some(store.artifacts_dir())
@@ -2243,6 +3818,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     session_state = kitsu_core::AgentSessionState::default();
                     last_failed = None;
                     agent_registry.reset();
+                    write_journal.reset();
                     *live_mw.lock().expect("live model/window") =
                         (model.clone(), context_window.get());
                     eprintln!(
@@ -2259,41 +3835,164 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     continue;
                 }
+                SlashResult::ForkSession(selector) => {
+                    if agent_registry.running() > 0 {
+                        eprintln!("fork blocked while background agents are running");
+                        continue;
+                    }
+                    if !persist_session(&session_store, &session, &model, &messages) {
+                        eprintln!("fork cancelled because the active session could not be saved");
+                        continue;
+                    }
+                    report_write_checkpoints(write_journal.drain_and_take_reports().await);
+                    let active_id = session.session_id.borrow().clone();
+                    let Some(selector) = selector.or(active_id) else {
+                        eprintln!("cannot fork: session autosave is disabled");
+                        continue;
+                    };
+                    match session::SessionStore::fork(&sessions_dir, &selector) {
+                        Ok(forked) => {
+                            eprintln!(
+                                "~ forked {} -> {}; switching with fresh runtime permissions",
+                                selector, forked.id
+                            );
+                            priority_command = Some(format!("/resume {}", forked.id));
+                        }
+                        Err(error) => eprintln!("cannot fork session: {error}"),
+                    }
+                    continue;
+                }
+                SlashResult::ExportSession {
+                    destination,
+                    format,
+                } => {
+                    if !persist_session(&session_store, &session, &model, &messages) {
+                        eprintln!("export cancelled because the active session could not be saved");
+                        continue;
+                    }
+                    let Some(active_id) = session.session_id.borrow().clone() else {
+                        eprintln!("cannot export: session autosave is disabled");
+                        continue;
+                    };
+                    match session::SessionStore::export(
+                        &sessions_dir,
+                        &active_id,
+                        &destination,
+                        format,
+                    ) {
+                        Ok(path) => eprintln!("~ exported session to {}", path.display()),
+                        Err(error) => eprintln!("cannot export session: {error}"),
+                    }
+                    continue;
+                }
+                SlashResult::ArchiveSession(id) => {
+                    let active_id = session.session_id.borrow().clone();
+                    match session::SessionStore::archive(&sessions_dir, &id, active_id.as_deref()) {
+                        Ok(path) => eprintln!(
+                            "~ archived session {id} at {}; restore with /restore {id}",
+                            shorten_home(&path)
+                        ),
+                        Err(error) => eprintln!("cannot archive session: {error}"),
+                    }
+                    continue;
+                }
+                SlashResult::RestoreSession(id) => {
+                    match session::SessionStore::restore_archived(&sessions_dir, &id) {
+                        Ok(saved) => eprintln!(
+                            "~ restored session {}; resume with /resume {}",
+                            saved.id, saved.id
+                        ),
+                        Err(error) => eprintln!("cannot restore session: {error}"),
+                    }
+                    continue;
+                }
+                SlashResult::DeleteSession(id) => {
+                    let active_id = session.session_id.borrow().clone();
+                    match session::SessionStore::delete(&sessions_dir, &id, active_id.as_deref()) {
+                        Ok(()) => eprintln!("~ permanently deleted session {id}"),
+                        Err(error) => eprintln!("cannot delete session: {error}"),
+                    }
+                    continue;
+                }
+            }
+        }
+
+        // Keep the submitted form for `/retry`; attachments are re-read on a
+        // retry so the model never receives a silently stale snapshot.
+        let retry_prompt = submitted.clone();
+        let expanded = match await_cancellable(attachments::expand(&submitted.text, &perms)).await {
+            Some(Ok(expanded)) => expanded,
+            Some(Err(error)) => {
+                eprintln!("attachment error: {}", terminal_inline(&error));
+                continue;
+            }
+            None => {
+                eprintln!("^C (attachment preflight cancelled)");
+                continue;
+            }
+        };
+        if !expanded.labels.is_empty() {
+            eprintln!("~ attached {} file(s):", expanded.labels.len());
+            for label in &expanded.labels {
+                eprintln!("  - {}", terminal_inline(label));
             }
         }
 
         let messages_before = messages.clone();
         let state_before = session_state.clone();
         let agent_watermark = agent_registry.watermark();
-        messages.push(ChatMessage::user(&submitted.text));
+        let journal_turn = write_journal.begin_attributed_turn(&retry_prompt.text);
+        if let Some(previous) = journal_turn.previous {
+            report_write_checkpoint(previous);
+        }
+        messages.push(ChatMessage::user(expanded.text));
         let cfg = base_cfg(model.clone(), cli);
         let turn_tools = match submitted.tool_mode {
             TurnToolMode::Full => &tools,
             TurnToolMode::None => &no_tools,
         };
-        match run_turn_cancellable(
-            &setup.provider,
-            turn_tools,
-            &mut messages,
-            &cfg,
-            &mut session_state,
-        )
-        .await
-        {
+        let typeahead = TypeaheadCollector::start(prompt_queue.clone());
+        let turn_outcome = write_journal
+            .scope_turn(
+                &journal_turn.token,
+                run_turn_cancellable(
+                    &setup.provider,
+                    turn_tools,
+                    &mut messages,
+                    &cfg,
+                    &mut session_state,
+                ),
+            )
+            .await;
+        let captured = typeahead.finish();
+        if captured.captured > 0 {
+            let status = prompt_queue.lock().expect("prompt queue").status();
+            eprintln!("~ captured type-ahead: {status}");
+        }
+        if captured.eof {
+            exit_after_queue = true;
+            eprintln!("~ end of input received; exiting after queued prompts finish");
+        }
+        report_write_checkpoints(write_journal.drain_and_take_reports().await);
+        if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
+            report_write_checkpoint(report);
+        }
+        match turn_outcome {
             TurnOutcome::Completed(Ok(text)) => {
                 last_failed = None;
                 // The model can return an empty completion for vague inputs;
                 // say so instead of looking hung.
                 if text.trim().is_empty() {
-                    eprintln!("(the model returned an empty response — try rephrasing)");
+                    eprintln!("(the model returned an empty response - try rephrasing)");
                 }
                 persist_session(&session_store, &session, &model, &messages);
             }
             TurnOutcome::Completed(Err(e)) => {
                 messages = messages_before;
                 session_state = state_before;
-                report_cancelled_agents(agent_registry.cancel_started_after(agent_watermark));
-                last_failed = Some(submitted);
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                last_failed = Some(retry_prompt);
                 eprintln!("{}", chat_error_message(e, &model));
                 eprintln!(
                     "~ failed turn rolled back; completed file changes, if any, remain on disk"
@@ -2302,16 +4001,28 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             TurnOutcome::Cancelled => {
                 messages = messages_before;
                 session_state = state_before;
-                report_cancelled_agents(agent_registry.cancel_started_after(agent_watermark));
-                last_failed = Some(submitted);
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                last_failed = Some(retry_prompt);
                 kitsu_render::finish_line();
-                eprintln!("^C (response cancelled; turn rolled back — /retry to try again)");
+                eprintln!("^C (response cancelled; turn rolled back - /retry to try again)");
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
         }
     }
 
-    let _ = rl.save_history(&history_path);
+    await_background_agents(
+        &agent_registry,
+        "chat input ended before background work completed",
+    )
+    .await;
+    report_write_checkpoints(write_journal.drain_and_take_reports().await);
+    if !no_session {
+        let _ = rl.save_history(&history_path);
+    }
+    if let Some(task) = agent_notification_task {
+        task.abort();
+    }
     Ok(())
 }
 
@@ -2347,11 +4058,22 @@ enum SlashResult {
     Continue,
     Quit,
     Error,
+    ProviderFailure(String),
+    Cancelled,
     SubmitPrompt(SubmittedPrompt),
+    QueuePrompt(Option<String>),
     Retry,
     NewSession,
     ResumeSession(String),
     ListSessions,
+    ForkSession(Option<String>),
+    ExportSession {
+        destination: std::path::PathBuf,
+        format: session::SessionExportFormat,
+    },
+    ArchiveSession(String),
+    RestoreSession(String),
+    DeleteSession(String),
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -2397,7 +4119,10 @@ async fn handle_slash(
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
     provider: &OpenAICompatProvider,
+    tools: &Registry,
+    cli: &Cli,
     perms: &Permissions,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
     session: &SessionInfo,
     skillset: &skills::SkillSet,
     context_window: &Rc<Cell<Option<u64>>>,
@@ -2413,6 +4138,7 @@ async fn handle_slash(
         && matches!(
             name,
             "clear"
+                | "compact"
                 | "context"
                 | "exit"
                 | "help"
@@ -2423,6 +4149,7 @@ async fn handle_slash(
                 | "sessions"
                 | "status"
                 | "tools"
+                | "undo"
         )
     {
         eprintln!("usage: {}", slash_syntax(name));
@@ -2440,6 +4167,84 @@ async fn handle_slash(
         ),
         "permissions" => eprintln!("{}", format_permissions(perms, session)),
         "context" => render_context_command(model, messages, session, state),
+        "compact" => {
+            let cfg = build_agent_config(
+                model.clone(),
+                cli,
+                context_window.get(),
+                session.offload_dir.borrow().clone(),
+            );
+            let messages_before = messages.clone();
+            let state_before = state.clone();
+            let result = await_cancellable(kitsu_core::compact_context(
+                provider, tools, messages, &cfg, state,
+            ))
+            .await;
+            let Some(result) = result else {
+                *messages = messages_before;
+                *state = state_before;
+                eprintln!("^C (manual compaction cancelled; context restored)");
+                return SlashResult::Cancelled;
+            };
+            match result {
+                Ok(report) if report.changed => {
+                    if let Some(record) = report.record {
+                        eprintln!(
+                            "~ compacted context: {} -> {} tokens ({:?}; {} exchange(s) removed, {} tool result(s) elided)",
+                            report.tokens_before,
+                            report.tokens_after,
+                            record.outcome,
+                            record.exchanges_removed,
+                            record.tool_results_elided
+                        );
+                    } else {
+                        eprintln!(
+                            "~ compacted context: {} -> {} tokens",
+                            report.tokens_before, report.tokens_after
+                        );
+                    }
+                }
+                Ok(report) => eprintln!(
+                    "~ nothing eligible to compact ({} tokens; target {})",
+                    report.tokens_before, report.target_tokens
+                ),
+                Err(error) => {
+                    let kind = script_failure_kind(&error);
+                    *messages = messages_before;
+                    *state = state_before;
+                    let message = chat_error_message(error, model);
+                    eprintln!("cannot compact context (context restored): {message}");
+                    return if kind == ScriptFailureKind::Provider {
+                        SlashResult::ProviderFailure(message)
+                    } else {
+                        SlashResult::Error
+                    };
+                }
+            }
+        }
+        "undo" => {
+            if registry.running() > 0 {
+                eprintln!("undo blocked while background agents are running; use /agents and wait for them to finish");
+                return SlashResult::Error;
+            }
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            match journal.undo_last(perms).await {
+                Ok(report) => {
+                    eprintln!(
+                        "~ restored checkpoint #{} ({}):",
+                        report.id,
+                        terminal_inline(&report.label)
+                    );
+                    for change in report.changes {
+                        eprintln!("  - {}", shorten_home(&change.path));
+                    }
+                }
+                Err(error) => {
+                    eprintln!("undo failed: {error}");
+                    return SlashResult::Error;
+                }
+            }
+        }
         "diff" => match authorized_workspace_diff(session, perms, arg).await {
             Ok(diff) => kitsu_render::render_diff(&diff),
             Err(error) => {
@@ -2463,6 +4268,39 @@ async fn handle_slash(
             }
         },
         "new" => return SlashResult::NewSession,
+        "fork" => {
+            return SlashResult::ForkSession((!arg.is_empty()).then(|| arg.to_string()));
+        }
+        "export" => {
+            let mut args = arg.split_whitespace();
+            let Some(destination) = args.next() else {
+                eprintln!("usage: /export <file> [markdown|json]");
+                return SlashResult::Error;
+            };
+            let format = match args.next().unwrap_or("markdown") {
+                "markdown" | "md" => session::SessionExportFormat::Markdown,
+                "json" => session::SessionExportFormat::Json,
+                other => {
+                    eprintln!("unknown export format '{other}'; use markdown or json");
+                    return SlashResult::Error;
+                }
+            };
+            if args.next().is_some() {
+                eprintln!("usage: /export <file> [markdown|json]");
+                return SlashResult::Error;
+            }
+            return SlashResult::ExportSession {
+                destination: std::path::PathBuf::from(destination),
+                format,
+            };
+        }
+        "archive" | "restore" | "delete" if arg.is_empty() => {
+            eprintln!("usage: /{name} <exact-id>");
+            return SlashResult::Error;
+        }
+        "archive" => return SlashResult::ArchiveSession(arg.to_string()),
+        "restore" => return SlashResult::RestoreSession(arg.to_string()),
+        "delete" => return SlashResult::DeleteSession(arg.to_string()),
         "resume" => {
             return SlashResult::ResumeSession(if arg.is_empty() {
                 "last".to_string()
@@ -2470,27 +4308,32 @@ async fn handle_slash(
                 arg.to_string()
             });
         }
+        "queue" => {
+            return SlashResult::QueuePrompt((!arg.is_empty()).then(|| arg.to_string()));
+        }
         "retry" => return SlashResult::Retry,
         "sessions" => return SlashResult::ListSessions,
         "tools" => {
             let (mode, behavior) = permission_mode_label(perms.mode());
             eprintln!(
-                "tools ({} enabled; permissions: {mode} — {behavior}):",
+                "tools ({} enabled; permissions: {mode} - {behavior}):",
                 session.tool_names.len()
             );
             for name in &session.tool_names {
                 eprintln!("  - {name}");
             }
             if session.tool_names.is_empty() {
-                eprintln!("  none — pre-grant --allow-path/--allow-write for scripted runs");
+                eprintln!("  none - pre-grant --allow-path/--allow-write for scripted runs");
             }
         }
         "agents" => {
             if arg.is_empty() {
-                eprintln!("{}", registry.list());
+                eprintln!("{}", kitsu_render::sanitize_terminal_text(&registry.list()));
             } else if let Ok(id) = arg.parse::<u64>() {
                 match registry.result(id) {
-                    Some(text) => eprintln!("#{id}:\n{text}"),
+                    Some(text) => {
+                        eprintln!("#{id}:\n{}", kitsu_render::sanitize_terminal_text(&text))
+                    }
                     None => {
                         eprintln!("no background agent #{id}");
                         return SlashResult::Error;
@@ -2504,10 +4347,10 @@ async fn handle_slash(
         "skills" => {
             if skillset.is_empty() {
                 eprintln!(
-                    "no skills found — add SKILL.md dirs under .kitsu/skills/ or ~/.kitsu/skills/"
+                    "no skills found - add SKILL.md dirs under .kitsu/skills/ or ~/.kitsu/skills/"
                 );
             } else {
-                eprintln!("skills:\n{}", skillset.index(arg));
+                eprintln!("skills:\n{}", skillset.terminal_index(arg));
                 eprintln!("load one with /skill <name>, or the model can call the `skill` tool");
             }
         }
@@ -2523,27 +4366,33 @@ async fn handle_slash(
                             .iter()
                             .any(|message| message.content.starts_with(&marker))
                         {
-                            eprintln!("~ skill '{}' is already loaded", s.name);
+                            eprintln!("~ skill '{}' is already loaded", terminal_inline(&s.name));
                             return SlashResult::Continue;
                         }
-                        // Grants read to the skill's dir + lists bundled files/links.
-                        let loaded = skills::load_skill(s, perms);
+                        let loaded = skills::load_skill(s);
                         if !s.links.is_empty() {
                             eprintln!("~ {} reference link(s) (not fetched)", s.links.len());
                         }
                         messages.push(ChatMessage::user(format!("{marker}\n\n{loaded}")));
-                        eprintln!("~ loaded skill '{}'", s.name);
+                        eprintln!("~ loaded skill '{}'", terminal_inline(&s.name));
                     }
                     None => {
-                        eprintln!("no skill named '{arg}' — try /skills");
+                        eprintln!("no skill named '{}' - try /skills", terminal_inline(arg));
                         return SlashResult::Error;
                     }
                 }
             }
         }
         "models" => {
-            if !list_models_and_print(provider, arg).await {
-                return SlashResult::Error;
+            let Some(result) = await_cancellable(list_models_and_print(provider, arg)).await else {
+                eprintln!("^C (model catalog request cancelled)");
+                return SlashResult::Cancelled;
+            };
+            match result {
+                Ok(true) => {}
+                Ok(false) => return SlashResult::Error,
+                Err(ProviderError::Auth(_)) => return SlashResult::Error,
+                Err(error) => return SlashResult::ProviderFailure(error.to_string()),
             }
         }
         "allow" => {
@@ -2552,7 +4401,7 @@ async fn handle_slash(
                 return SlashResult::Error;
             } else if !session.tool_names.iter().any(|name| name == "fs_read_file") {
                 eprintln!(
-                    "read tools are disabled in this run — restart with --allow-path <path> (scripted/piped chat cannot add tools after startup)"
+                    "read tools are disabled in this run - restart with --allow-path <path> (scripted/piped chat cannot add tools after startup)"
                 );
                 return SlashResult::Error;
             } else {
@@ -2575,7 +4424,7 @@ async fn handle_slash(
                 .any(|name| name == "fs_write_file")
             {
                 eprintln!(
-                    "write tools are disabled in this run — restart with --allow-write <path> (scripted/piped chat cannot add tools after startup)"
+                    "write tools are disabled in this run - restart with --allow-write <path> (scripted/piped chat cannot add tools after startup)"
                 );
                 return SlashResult::Error;
             } else {
@@ -2636,30 +4485,39 @@ async fn handle_slash(
         }
         "model" => {
             if arg.is_empty() {
-                eprintln!("usage: /model <name> (current: {model}); /models to list available");
+                eprintln!(
+                    "usage: /model <name> (current: {}); /models to list available",
+                    terminal_inline(model)
+                );
                 return SlashResult::Error;
             } else if arg == "list" || arg.starts_with("list ") {
                 // Alias: `/model list [filter]` → same as `/models [filter]`.
                 let filter = arg.strip_prefix("list").unwrap_or("").trim();
-                if !list_models_and_print(provider, filter).await {
-                    return SlashResult::Error;
+                let Some(result) = await_cancellable(list_models_and_print(provider, filter)).await
+                else {
+                    eprintln!("^C (model catalog request cancelled)");
+                    return SlashResult::Cancelled;
+                };
+                match result {
+                    Ok(true) => {}
+                    Ok(false) => return SlashResult::Error,
+                    Err(ProviderError::Auth(_)) => return SlashResult::Error,
+                    Err(error) => return SlashResult::ProviderFailure(error.to_string()),
                 }
             } else {
-                if let Ok(Some(models)) = provider.list_models().await {
+                let Some(catalog) = await_cancellable(provider.list_models()).await else {
+                    eprintln!("^C (model validation cancelled)");
+                    return SlashResult::Cancelled;
+                };
+                if let Ok(Some(models)) = catalog {
                     if !models.iter().any(|candidate| candidate == arg) {
-                        eprintln!("model '{arg}' is not in the gateway catalog — run /models");
+                        eprintln!(
+                            "model '{}' is not in the gateway catalog - run /models",
+                            terminal_inline(arg)
+                        );
                         return SlashResult::Error;
                     }
                 }
-                *model = arg.to_string();
-                // The meter's anchor is a real `prompt_tokens` count measured
-                // under the OLD model's tokenizer; a different model can tokenize
-                // the same text differently, so that anchor must not be trusted
-                // for the new one (same reasoning as /clear, just below in this
-                // match). The summarize circuit breaker is also model-specific —
-                // don't let a different model inherit "summarization is broken".
-                state.meter.invalidate();
-                state.compact_failures = 0;
                 // An explicit --context-window flag or gateway-profile
                 // context_window is a user/config declaration that overrides
                 // discovery entirely (see the flag's doc comment) — switching
@@ -2670,22 +4528,37 @@ async fn handle_slash(
                 let note = if context_window_pinned {
                     " (context window pinned by --context-window / config; unchanged)".to_string()
                 } else {
-                    let discovered = provider.model_context_length(model).await;
+                    let Some(discovered) =
+                        await_cancellable(provider.model_context_length(arg)).await
+                    else {
+                        eprintln!("^C (context-window discovery cancelled)");
+                        return SlashResult::Cancelled;
+                    };
                     context_window.set(discovered);
                     match discovered {
                         Some(w) => format!(" (context window: {w} tokens)"),
-                        None => " (context window unknown — falling back to the byte budget)"
-                            .to_string(),
+                        None => format!(
+                            " (context window not reported; using conservative {DEFAULT_CONTEXT_WINDOW}-token default)"
+                        ),
                     }
                 };
-                eprintln!("~ switched to {model}{note}");
+                *model = arg.to_string();
+                // The meter's anchor is a real `prompt_tokens` count measured
+                // under the OLD model's tokenizer; a different model can tokenize
+                // the same text differently, so that anchor must not be trusted
+                // for the new one. The summarize circuit breaker is likewise
+                // model-specific.
+                state.meter.invalidate();
+                state.compact_failures = 0;
+                eprintln!("~ switched to {}{note}", terminal_inline(model));
             }
         }
         other => {
+            let display = terminal_inline(other);
             if let Some(suggestion) = closest_slash_command(other) {
-                eprintln!("unknown command: /{other} — did you mean /{suggestion}?");
+                eprintln!("unknown command: /{display} - did you mean /{suggestion}?");
             } else {
-                eprintln!("unknown command: /{other} (try /help)");
+                eprintln!("unknown command: /{display} (try /help)");
             }
             return SlashResult::Error;
         }
@@ -2725,7 +4598,10 @@ fn extract_code_or_text(text: &str) -> String {
 /// optionally filtered by a case-insensitive substring. Output goes to stderr
 /// like other slash commands. The listed IDs are what you pass to `/model <id>`
 /// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
-async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) -> bool {
+async fn list_models_and_print(
+    provider: &OpenAICompatProvider,
+    filter: &str,
+) -> Result<bool, ProviderError> {
     match provider.list_models().await {
         Ok(Some(models)) => {
             let filter = filter.trim().to_lowercase();
@@ -2737,33 +4613,39 @@ async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) ->
             if filter.is_empty() {
                 eprintln!("~ {total} model(s) available:");
             } else {
-                eprintln!("~ {total} model(s) matching '{filter}':");
+                eprintln!(
+                    "~ {total} model(s) matching '{}':",
+                    terminal_inline(&filter)
+                );
             }
             const CAP: usize = 40;
             for m in matched.iter().take(CAP) {
-                eprintln!("  {m}");
+                eprintln!("  {}", terminal_inline(m));
             }
             if total > CAP {
                 eprintln!(
-                    "  … and {} more — narrow with `/models <substring>`",
+                    "  ... and {} more - narrow with `/models <substring>`",
                     total - CAP
                 );
             }
             if total > 0 {
                 eprintln!("switch with: /model <id>");
-                true
+                Ok(true)
             } else {
-                eprintln!("no matches — run /models without a filter to see the full catalog");
-                false
+                eprintln!("no matches - run /models without a filter to see the full catalog");
+                Ok(false)
             }
         }
         Ok(None) => {
             eprintln!("this gateway does not expose a model list (its models_path is empty)");
-            false
+            Ok(false)
         }
         Err(e) => {
-            eprintln!("could not fetch models: {e}");
-            false
+            eprintln!(
+                "could not fetch models: {}",
+                terminal_inline(&e.to_string())
+            );
+            Err(e)
         }
     }
 }
@@ -2775,6 +4657,75 @@ async fn list_models_and_print(provider: &OpenAICompatProvider, filter: &str) ->
 /// invalid input, EOF, or an input error denies without letting a later pasted
 /// line become an authorization decision.
 struct CliPrompter;
+
+struct CliCommandPrompter;
+
+struct ApprovalInputGuard {
+    _owner: std::sync::MutexGuard<'static, ()>,
+    previous_active: bool,
+}
+
+impl ApprovalInputGuard {
+    fn enter() -> Self {
+        let owner = APPROVAL_INPUT_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let previous_active = APPROVAL_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
+        Self {
+            _owner: owner,
+            previous_active,
+        }
+    }
+}
+
+impl Drop for ApprovalInputGuard {
+    fn drop(&mut self) {
+        APPROVAL_INPUT_ACTIVE.store(self.previous_active, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+fn read_approval_line() -> Option<String> {
+    loop {
+        if FOREGROUND_CANCELLED.load(Ordering::Acquire) {
+            return None;
+        }
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` is one initialized pollfd and stdin remains
+        // process-owned for the duration of the call.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return None;
+        }
+        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        let mut line = String::new();
+        return match std::io::stdin().read_line(&mut line) {
+            Ok(0) | Err(_) => None,
+            Ok(_) => Some(line),
+        };
+    }
+}
+
+#[cfg(not(unix))]
+fn read_approval_line() -> Option<String> {
+    if FOREGROUND_CANCELLED.load(Ordering::Acquire) {
+        return None;
+    }
+    let mut line = String::new();
+    match std::io::stdin().read_line(&mut line) {
+        Ok(0) | Err(_) => None,
+        Ok(_) => Some(line),
+    }
+}
 
 fn parse_permission_answer(answer: &str) -> Option<Decision> {
     let answer = answer
@@ -2794,31 +4745,28 @@ fn parse_permission_answer(answer: &str) -> Option<Decision> {
 impl Prompter for CliPrompter {
     fn ask(&self, req: &PermissionRequest) -> Decision {
         use std::io::Write;
+        let _input_guard = ApprovalInputGuard::enter();
         // Disable bracketed paste (ESC[?2004l) for the raw read; rustyline
         // re-enables it on the next prompt.
         if kitsu_render::plain_mode() {
             eprint!(
-                "\x1b[?2004l\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
+                "\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
                 req.action.verb(),
-                req.path,
-                req.grant_dir
+                terminal_inline(&req.path),
+                terminal_inline(&req.grant_dir)
             );
         } else {
             eprint!(
                 "\x1b[?2004l\n\u{23fa} kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
                 req.action.verb(),
-                req.path,
-                req.grant_dir
+                terminal_inline(&req.path),
+                terminal_inline(&req.grant_dir)
             );
         }
         let _ = std::io::stderr().flush();
-        let mut line = String::new();
-        let Ok(read) = std::io::stdin().read_line(&mut line) else {
+        let Some(line) = read_approval_line() else {
             return Decision::Deny;
         };
-        if read == 0 {
-            return Decision::Deny;
-        }
         parse_permission_answer(&line).unwrap_or_else(|| {
             eprintln!("invalid permission response; denied (enter y, a/always, or n next time)");
             Decision::Deny
@@ -2826,7 +4774,56 @@ impl Prompter for CliPrompter {
     }
 }
 
+impl CommandPrompter for CliCommandPrompter {
+    fn ask(&self, req: &CommandApprovalRequest) -> CommandDecision {
+        use std::io::Write;
+        let _input_guard = ApprovalInputGuard::enter();
+        if kitsu_render::plain_mode() {
+            eprint!(
+                "\ncommand permission> run {}\n  cwd: {}\n  timeout: {} ms\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+                terminal_inline(&req.display_argv()),
+                terminal_inline(&req.cwd),
+                req.timeout_ms
+            );
+        } else {
+            eprint!(
+                "\x1b[?2004l\ncommand permission> run {}\n  cwd: {}\n  timeout: {} ms\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+                terminal_inline(&req.display_argv()),
+                terminal_inline(&req.cwd),
+                req.timeout_ms
+            );
+        }
+        let _ = std::io::stderr().flush();
+        let Some(line) = read_approval_line() else {
+            return CommandDecision::Deny;
+        };
+        match line
+            .trim()
+            .trim_start_matches("\u{1b}[200~")
+            .trim_end_matches("\u{1b}[201~")
+            .trim()
+            .to_ascii_lowercase()
+            .as_str()
+        {
+            "y" | "yes" => CommandDecision::AllowOnce,
+            "a" | "always" => CommandDecision::AllowForSession,
+            "n" | "no" => CommandDecision::Deny,
+            _ => {
+                eprintln!("invalid command permission response; denied");
+                CommandDecision::Deny
+            }
+        }
+    }
+}
+
 /// Replace the home-directory prefix with `~` for compact display in the banner.
+fn terminal_inline(value: &str) -> String {
+    kitsu_render::sanitize_terminal_text(value)
+        .chars()
+        .map(|ch| if matches!(ch, '\n' | '\t') { ' ' } else { ch })
+        .collect()
+}
+
 fn shorten_home(p: &std::path::Path) -> String {
     let s = p.to_string_lossy().to_string();
     if let Some(home) = std::env::var_os("HOME") {
@@ -2842,12 +4839,12 @@ fn shorten_home(p: &std::path::Path) -> String {
                     return "~".to_string();
                 }
                 if let Some(rest) = rest.strip_prefix('/') {
-                    return format!("~/{rest}");
+                    return terminal_inline(&format!("~/{rest}"));
                 }
             }
         }
     }
-    s
+    terminal_inline(&s)
 }
 
 /// Build the appropriate AuthProvider from the profile's auth block.
@@ -2889,13 +4886,15 @@ fn chat_error_message(e: kitsu_core::AgentError, model: &str) -> String {
         let looks_like_bad_model =
             *status == 404 || (body.contains("model") && body.to_lowercase().contains("not found"));
         if looks_like_bad_model {
+            let model = terminal_inline(model);
+            let body = kitsu_render::sanitize_terminal_text(body);
             return format!(
-                "gateway rejected model '{model}' (HTTP {status}) — run /model <valid-id> and \
+                "gateway rejected model '{model}' (HTTP {status}) - run /model <valid-id> and \
                  check the gateway's available models.\n  detail: {body}"
             );
         }
     }
-    map_agent_error(e).to_string()
+    kitsu_render::sanitize_terminal_text(&map_agent_error(e).to_string())
 }
 
 /// Map an agent/provider error to the right exit code (design §6).
@@ -2909,6 +4908,10 @@ fn map_agent_error(e: kitsu_core::AgentError) -> CliError {
             other => CliError::provider(other.to_string()),
         },
         kitsu_core::AgentError::Loop(msg) => CliError::provider(format!("agent loop error: {msg}")),
+        context_error @ (kitsu_core::AgentError::ContextOverflow { .. }
+        | kitsu_core::AgentError::ContextWindowUnknown) => {
+            CliError::user(context_error.to_string())
+        }
     }
 }
 
@@ -2917,10 +4920,16 @@ mod tests {
     use super::*;
     use serial_test::serial;
 
+    fn chat_helper() -> ChatHelper {
+        ChatHelper {
+            permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+        }
+    }
+
     #[test]
     fn multiline_highlighting_preserves_buffer_geometry() {
         use rustyline::highlight::Highlighter;
-        let h = ChatHelper;
+        let h = chat_helper();
         assert_eq!(h.highlight("just one line", 0), "just one line");
         assert!(!h.highlight_char("just one line", 0, false));
         let pasted = "first line here\nsecond\nthird";
@@ -2934,7 +4943,8 @@ mod tests {
         let history = rustyline::history::DefaultHistory::new();
         let context = rustyline::Context::new(&history);
 
-        let (start, candidates) = ChatHelper.complete("/mod", 4, &context).unwrap();
+        let helper = chat_helper();
+        let (start, candidates) = helper.complete("/mod", 4, &context).unwrap();
         assert_eq!(start, 0);
         assert_eq!(
             candidates
@@ -2945,11 +4955,11 @@ mod tests {
         );
         assert!(candidates[0].display.contains("switch model"));
 
-        let (_, candidates) = ChatHelper.complete("/status", 7, &context).unwrap();
+        let (_, candidates) = helper.complete("/status", 7, &context).unwrap();
         assert_eq!(candidates.len(), 1);
         assert_eq!(candidates[0].replacement, "/status");
 
-        let (_, candidates) = ChatHelper.complete("/model qwen", 12, &context).unwrap();
+        let (_, candidates) = helper.complete("/model qwen", 12, &context).unwrap();
         assert!(candidates.is_empty(), "arguments are not command names");
     }
 
@@ -2967,6 +4977,65 @@ mod tests {
             assert!(help.contains(spec.description));
         }
         assert!(help.ends_with("current model: test-model"));
+    }
+
+    #[test]
+    fn coalesced_background_completion_still_has_a_notice() {
+        let previous = subagent::AgentRegistrySnapshot {
+            generation: 1,
+            running: 0,
+            terminal: 0,
+        };
+        let current = subagent::AgentRegistrySnapshot {
+            generation: 3,
+            running: 0,
+            terminal: 1,
+        };
+        let notice = background_agent_notice(previous, current).unwrap();
+        assert!(notice.contains("1 background agent(s) finished"));
+    }
+
+    #[test]
+    fn session_catalog_and_checkpoint_metadata_are_terminal_sanitized() {
+        let summaries = vec![session::SessionSummary {
+            id: "s-safe".to_string(),
+            updated_at: "now".to_string(),
+            model: "model\u{1b}]8;;https://evil.invalid\u{7}click\u{1b}]8;;\u{7}".to_string(),
+            gateway: "gateway\nforged-gateway-row".to_string(),
+            directory: "/tmp/project".to_string(),
+            preview: "preview\r\nforged-preview-row".to_string(),
+            turns: 1,
+        }];
+        let catalog = format_session_summaries(&summaries, None);
+        assert!(!catalog.contains('\u{1b}'));
+        assert!(!catalog.contains("https://evil.invalid"));
+        assert!(!catalog.contains("\nforged-gateway-row"));
+        assert!(!catalog.contains("\nforged-preview-row"));
+
+        let report = kitsu_tools::builtins::fs::JournalTurnReport {
+            id: 1,
+            label: "prompt\nforged-checkpoint\u{1b}]0;owned\u{7}".to_string(),
+            changes: Vec::new(),
+        };
+        let checkpoint = format_write_checkpoint(&report);
+        assert!(!checkpoint.contains('\u{1b}'));
+        assert!(!checkpoint.contains("\nforged-checkpoint"));
+    }
+
+    #[test]
+    fn unknown_cli_context_uses_the_documented_checked_default() {
+        let cli = Cli::try_parse_from(["kitsu", "ask", "hello"]).unwrap();
+        let cfg = build_agent_config("model".to_string(), &cli, None, None);
+        assert_eq!(cfg.context_window, Some(DEFAULT_CONTEXT_WINDOW));
+    }
+
+    #[test]
+    fn command_only_registry_does_not_advertise_readable_offload_pointers() {
+        assert!(!can_resolve_offload_pointers(&["command".to_string()]));
+        assert!(can_resolve_offload_pointers(&[
+            "command".to_string(),
+            "fs_read_file".to_string(),
+        ]));
     }
 
     #[test]
@@ -2997,11 +5066,31 @@ mod tests {
 
     #[test]
     fn context_cache_key_does_not_embed_endpoint_credentials() {
-        let key =
-            context_window_cache_key("https://user:secret@example.test/token/path", "model-a");
-        assert!(key.starts_with("v1-"));
+        let key = context_window_cache_key(
+            "https://user:secret@example.test/token/path",
+            Some("/v1/models"),
+            "model-a",
+        );
+        assert!(key.starts_with("v2-fnv128-"));
         assert!(!key.contains("secret"));
         assert!(!key.contains("token"));
+        assert_ne!(
+            key,
+            context_window_cache_key(
+                "https://user:secret@example.test/token/path",
+                Some("/different/models"),
+                "model-a"
+            ),
+            "models_path is part of catalog identity"
+        );
+    }
+
+    #[test]
+    fn context_cache_key_has_a_stable_versioned_vector() {
+        assert_eq!(
+            context_window_cache_key("https://example.test", Some("/v1/models"), "model-a"),
+            "v2-fnv128-cade2cf31e9e82068d9af7d4d5f7be8a"
+        );
     }
 
     #[test]
@@ -3086,6 +5175,108 @@ mod tests {
         assert_eq!(*state.borrow(), Some(new.clone()));
         assert!(perms.read_roots().iter().any(|root| root == &new));
         assert!(!perms.read_roots().iter().any(|root| root == old.path()));
+    }
+
+    #[tokio::test]
+    async fn ephemeral_offload_is_readable_but_not_model_writable() {
+        let root = tempfile::tempdir().unwrap();
+        let offload = root.path().join("ephemeral-artifacts");
+        let broad = root.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        let state = Rc::new(RefCell::new(None));
+
+        activate_offload_dir(&perms, &state, Some(offload.clone())).unwrap();
+        let artifact = offload.join("tool-result.txt");
+        std::fs::write(&artifact, "generated by Kitsu").unwrap();
+
+        assert_eq!(perms.check_read(&artifact).await.unwrap(), artifact);
+        assert!(matches!(
+            perms.check_write(&artifact).await,
+            Err(kitsu_tools::ToolError::PolicyDenied(_))
+        ));
+        assert_eq!(*state.borrow(), Some(offload));
+    }
+
+    #[tokio::test]
+    async fn resumed_offload_is_a_narrow_read_exception_and_write_protected() {
+        let root = tempfile::tempdir().unwrap();
+        let private_state = root.path().join("state");
+        let offload = private_state.join("sessions").join("saved.artifacts");
+        std::fs::create_dir_all(&private_state).unwrap();
+        let broad = root.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms
+            .protect_read_path(&private_state.to_string_lossy())
+            .unwrap();
+        perms
+            .protect_write_path(&private_state.to_string_lossy())
+            .unwrap();
+        let state = Rc::new(RefCell::new(None));
+
+        activate_offload_dir(&perms, &state, Some(offload.clone())).unwrap();
+        let artifact = offload.join("tool-result.txt");
+        std::fs::write(&artifact, "generated by Kitsu").unwrap();
+        let sibling = private_state.join("sessions").join("saved.json");
+        std::fs::write(&sibling, "private transcript").unwrap();
+
+        assert_eq!(perms.check_read(&artifact).await.unwrap(), artifact);
+        assert!(matches!(
+            perms.check_write(&artifact).await,
+            Err(kitsu_tools::ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_read(&sibling).await,
+            Err(kitsu_tools::ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn symlinked_offload_root_is_never_trusted() {
+        let root = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let apparent = root.path().join("artifacts");
+        std::os::unix::fs::symlink(outside.path(), &apparent).unwrap();
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        let state = Rc::new(RefCell::new(None));
+
+        let error = activate_offload_dir(&perms, &state, Some(apparent)).unwrap_err();
+
+        assert!(error.contains("not a regular directory"));
+        assert!(state.borrow().is_none());
+        assert!(perms.read_roots().is_empty());
+        assert!(perms.internal_read_roots().is_empty());
+    }
+
+    #[test]
+    fn session_switch_drops_live_command_grants_but_restores_cli_pregrants() {
+        let root = tempfile::tempdir().unwrap();
+        let policy = Arc::new(
+            kitsu_tools::CommandPolicy::new(
+                &[root.path().to_string_lossy().to_string()],
+                kitsu_tools::CommandMode::Deny,
+            )
+            .unwrap(),
+        );
+        let explicit = vec![vec!["cargo".to_string(), "test".to_string()]];
+        let live_only = vec!["cargo".to_string(), "clippy".to_string()];
+        policy.grant_command(&explicit[0], root.path()).unwrap();
+        policy.grant_command(&live_only, root.path()).unwrap();
+
+        reset_command_session(Some(&policy), &explicit, root.path());
+
+        assert!(policy.is_granted(&explicit[0], root.path()));
+        assert!(!policy.is_granted(&live_only, root.path()));
     }
 
     #[test]

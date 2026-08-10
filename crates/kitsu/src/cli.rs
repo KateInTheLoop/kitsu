@@ -28,6 +28,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_stream: bool,
 
+    /// Emit versioned JSON Lines automation events on stdout. Human diagnostics
+    /// may still appear on stderr; interactive TTY chat is not supported in
+    /// this mode.
+    #[arg(long, global = true)]
+    pub jsonl: bool,
+
     /// Sampling temperature. Omitted from the request unless set — some models
     /// (e.g. newer Anthropic models on Bedrock) reject a `temperature` field.
     #[arg(long, global = true)]
@@ -37,12 +43,18 @@ pub struct Cli {
     /// reviews of large repos need many rounds to read files THEN write the
     /// answer; the default 10 truncates them ("[stopped: max tool rounds
     /// reached]"). Raise it (e.g. 40) for tool-heavy work.
-    #[arg(long, global = true, default_value_t = 10)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 10,
+        value_parser = clap::value_parser!(u32).range(1..)
+    )]
     pub max_rounds: u32,
 
-    /// Per-request HTTP timeout in seconds. A heavy tool-aware round on a slower
-    /// model can exceed the default 60s and fail the whole turn; raise it (e.g.
-    /// 300) for tool-heavy review work.
+    /// Total inference deadline in seconds, including retries, retry backoff,
+    /// and response-body streaming. A heavy tool-aware round on a slower model
+    /// can exceed the default 60s and fail the turn; raise it (e.g. 300) for
+    /// tool-heavy review work.
     #[arg(long, global = true, default_value_t = 60)]
     pub timeout_secs: u64,
 
@@ -52,9 +64,9 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub max_output_tokens: Option<u32>,
 
-    /// Auto-approve all tool file access without prompting (for non-interactive
-    /// or scripted runs). Equivalent to answering "yes" to every permission
-    /// prompt — use with care.
+    /// Auto-approve filesystem tool access without prompting (for
+    /// non-interactive or scripted runs). This never enables filesystem tools
+    /// and never enables or approves developer commands.
     #[arg(long, global = true)]
     pub yes: bool,
 
@@ -95,6 +107,12 @@ pub enum Command {
         /// The prompt to send.
         prompt: String,
     },
+    /// List models advertised by the selected gateway without requiring a
+    /// configured or guessed model id.
+    Models {
+        /// Optional case-insensitive substring filter.
+        filter: Option<String>,
+    },
     /// Interactive chat REPL with multi-turn history and optional tools.
     Chat {
         /// Optional first prompt; queued as the first turn. In non-TTY mode
@@ -107,11 +125,28 @@ pub enum Command {
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<String>,
 
-        /// Allow the model to GENERATE/write files under this path (repeatable).
         /// Pre-grant model writes under this path (repeatable). Interactive chat
         /// can ask for unlisted writes; scripted/piped chat cannot prompt.
         #[arg(long = "allow-write", value_name = "PATH")]
         allow_write: Vec<String>,
+
+        /// Explicitly enable the guarded developer-command tool. Commands have
+        /// an independent approval policy and are never authorized by --yes or
+        /// filesystem grants.
+        #[arg(long)]
+        enable_commands: bool,
+
+        /// Constrain command working directories to this existing directory
+        /// (repeatable). Implies --enable-commands. With no explicit root,
+        /// --enable-commands uses the launch directory.
+        #[arg(long = "command-root", value_name = "PATH")]
+        command_roots: Vec<String>,
+
+        /// Pre-approve one exact argv in the launch directory, encoded as a
+        /// JSON string array, for example '["cargo","test"]'. Repeatable and
+        /// intended for non-interactive scripts.
+        #[arg(long = "allow-command", value_name = "JSON_ARGV")]
+        allow_commands: Vec<String>,
 
         /// Run turns from a FILE non-interactively (one turn per line; blank
         /// lines and `#` comments are skipped; lines starting with `/` are slash

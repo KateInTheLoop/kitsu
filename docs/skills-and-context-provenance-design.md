@@ -1,7 +1,7 @@
-# Skills & Context Provenance — Design
+# Skills & Context Provenance — Implementation Contract
 
-- **Status:** Draft / proposed
-- **Date:** 2026-07-05
+- **Status:** Implemented
+- **Updated:** 2026-08-10
 - **Depends on:** the context-management work
   ([design](context-management-design.md)) — reuses `ContextMeter`, the `llms.txt`
   loader (discovery + budget-gating), and the `/context` command.
@@ -82,8 +82,8 @@ model as `--allow-path`.
   (`name — description`), injected into the system prompt. Cost = a few tokens
   per skill; this is all that's always-present.
 - The model invokes a skill by calling a **`skill` tool** (`skill(name)`), or the
-  user runs **`/skill <name>`**. That loads the skill's **body** (and lists its
-  bundled files) into context for the rest of the session.
+  user runs **`/skill <name>`**. That loads the skill's **body** plus its bounded
+  UTF-8 resource snapshot into context for the rest of the session.
 - `always: true` skills load their body up front (for a project's house rules);
   discouraged unless small, and always shown in provenance so the cost is visible.
 - Loaded skill bodies are budget-gated exactly like `llms.txt` `## Optional`:
@@ -92,11 +92,12 @@ model as `--allow-path`.
 
 ### 2.4 Skills, files, and links (the file/link strategy)
 
-- **Bundled files.** A skill dir may ship resource files (templates, checklists,
-  examples). The skill body references them by relative path; the model reads
-  them with `fs_read_file`. kitsu grants read access to the skill's own directory
-  when the skill is loaded (permission-gated, like the offload dir), so bundled
-  resources are reachable without a broad `--allow-path`.
+- **Bundled files.** A skill dir may ship UTF-8 resource files (templates,
+  checklists, examples). During local discovery Kitsu opens each regular file
+  with component-wise no-follow descriptors, validates UTF-8, and captures at
+  most 32 KiB per resource / 64 KiB per skill. Loading serves that immutable
+  in-memory snapshot; it never grants filesystem authority or follows a later
+  path retarget.
 - **Links.** A skill's frontmatter/body may list reference URLs. kitsu does **not**
   auto-fetch them (network + injection risk). Instead: (a) surface them to the
   user, and (b) if/when a `web_fetch` tool exists, it's opt-in and permission-
@@ -234,8 +235,8 @@ useful.
   `commit-message` skill) as examples.
 
 ### Stage S2 — Skill files & links (the file/link strategy)  *(M)*
-- Grant read access to a loaded skill's own directory (permission-gated, like the
-  offload dir) so bundled resources are reachable via `fs_read_file`.
+- Capture bounded UTF-8 resources with no-follow descriptor reads and serve the
+  snapshot when the skill loads, without widening filesystem permissions.
 - Surface a skill's declared links to the user; do **not** auto-fetch.
 - Optional lightweight suggestion ("looks like a job for `code-review`").
 - **Tests:** bundled-file read is permitted only when the skill is loaded; links
