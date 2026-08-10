@@ -923,6 +923,7 @@ fn format_tool_header(name: &str, args: &str) -> String {
         "fs_list_dir" => "List",
         "repo_grep" => "Grep",
         "fs_write_file" => "Write",
+        "fs_edit_file" => "Edit",
         other => other,
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
@@ -967,7 +968,7 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
         return "error".to_string();
     }
     match name {
-        "fs_write_file" => serde_json::from_str::<serde_json::Value>(content)
+        "fs_write_file" | "fs_edit_file" => serde_json::from_str::<serde_json::Value>(content)
             .ok()
             .map(|value| {
                 let bytes = value.get("bytes").and_then(|item| item.as_u64());
@@ -975,9 +976,13 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
                     .get("change")
                     .and_then(|item| item.as_str())
                     .unwrap_or("written");
-                match bytes {
+                let base = match bytes {
                     Some(bytes) => format!("{change} · {bytes} bytes"),
                     None => change.to_string(),
+                };
+                match value.get("warning").and_then(|item| item.as_str()) {
+                    Some(warning) => format!("{base} — ⚠ {warning}"),
+                    None => base,
                 }
             })
             .unwrap_or_else(|| "written".to_string()),

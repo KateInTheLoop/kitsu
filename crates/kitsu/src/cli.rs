@@ -79,8 +79,13 @@ pub struct Cli {
     pub max_output_tokens: Option<u32>,
 
     /// Auto-approve filesystem tool access without prompting (for
-    /// non-interactive or scripted runs). This never enables filesystem tools
-    /// and never enables or approves developer commands.
+    /// non-interactive or scripted runs): once a tool is registered (via
+    /// --allow-path/--allow-write, or interactively), every path it touches is
+    /// approved with NO confinement to those roots — this removes the
+    /// approval step entirely, it does not scope it. --allow-path/--allow-write
+    /// alone (without --yes) is what confines access to specific directories.
+    /// --yes never registers filesystem tools by itself and never enables or
+    /// approves developer commands. Use with care.
     #[arg(long, global = true)]
     pub yes: bool,
 

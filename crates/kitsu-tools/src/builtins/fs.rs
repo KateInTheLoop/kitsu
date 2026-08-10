@@ -2440,6 +2440,47 @@ async fn write_file_run(policy: &Permissions, args: &str) -> Result<String, Tool
     write_file_run_with_journal(policy, None, args).await
 }
 
+/// Known chat-template control tokens across common local-model formats
+/// (ChatML, Llama 3, Mistral). Their presence in file content means the
+/// model's raw completion leaked its own protocol markers instead of the
+/// text it was supposed to produce.
+const CHAT_TEMPLATE_TOKENS: &[&str] = &[
+    "<|im_start|>",
+    "<|im_end|>",
+    "<|endoftext|>",
+    "<|eot_id|>",
+    "<|start_header_id|>",
+    "<|end_header_id|>",
+    "[INST]",
+    "[/INST]",
+];
+
+/// Best-effort detection of obviously-broken generated content: a model's raw
+/// protocol tokens leaking into the file, or a would-be multi-line file whose
+/// newlines never got un-escaped (literal `\n` two-char sequences instead of
+/// real line breaks). Advisory only — never blocks the write — a heuristic
+/// false positive on legitimately unusual content is far cheaper than a
+/// silently corrupted file (a real dogfooding finding: a Python file written
+/// with literal `\n` was a guaranteed SyntaxError, reported as a clean write).
+fn content_quality_warning(content: &str) -> Option<&'static str> {
+    if CHAT_TEMPLATE_TOKENS.iter().any(|tok| content.contains(tok)) {
+        return Some(
+            "content contains a raw chat-template token (e.g. <|im_start|>) — \
+             the model likely emitted its own control tokens instead of real content",
+        );
+    }
+    let plausible_source_file = content.len() > 200;
+    let has_real_newline = content.contains('\n');
+    let literal_escapes = content.matches("\\n").count();
+    if plausible_source_file && !has_real_newline && literal_escapes >= 2 {
+        return Some(
+            "content has no real line breaks but contains literal \\n escape sequences — \
+             likely unescaped text rather than a real multi-line file",
+        );
+    }
+    None
+}
+
 async fn write_file_run_with_journal(
     policy: &Permissions,
     journal: Option<&WriteJournal>,
@@ -2450,6 +2491,7 @@ async fn write_file_run_with_journal(
     policy.check_write_size(a.content.len())?;
     let target = policy.check_write(Path::new(&a.path)).await?;
     let bytes = a.content.len();
+    let quality_warning = content_quality_warning(&a.content);
     let display = target.display().to_string();
     let content = a.content.into_bytes();
     let written = target.clone();
@@ -2497,6 +2539,7 @@ async fn write_file_run_with_journal(
         "bytes": bytes,
         "change": outcome.0,
         "previous_bytes": outcome.1,
+        "warning": quality_warning,
     })
     .to_string())
 }
@@ -2629,6 +2672,7 @@ async fn edit_file_run_with_journal(
         original.replacen(&a.old_text, &a.new_text, 1)
     };
     debug_assert_eq!(updated.len(), bytes);
+    let quality_warning = content_quality_warning(&updated);
     let previous_bytes = original.len();
     let updated = updated.into_bytes();
     let written = target.clone();
@@ -2669,6 +2713,7 @@ async fn edit_file_run_with_journal(
         "change": "updated",
         "previous_bytes": previous_bytes,
         "replacements": replacements,
+        "warning": quality_warning,
     })
     .to_string())
 }
@@ -3206,6 +3251,46 @@ mod tests {
         assert!(out.contains("\"bytes\""));
         assert!(out.contains("\"change\":\"created\""));
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
+    }
+
+    #[test]
+    fn content_quality_warning_flags_chat_template_tokens() {
+        assert!(content_quality_warning("<|im_start|>system\nhi").is_some());
+        assert!(content_quality_warning("normal code, no tokens here").is_none());
+    }
+
+    #[test]
+    fn content_quality_warning_flags_unescaped_literal_newlines() {
+        let broken = "def f():\\n    return 1\\n\\ndef g():\\n    return 2\\n".repeat(6);
+        assert!(content_quality_warning(&broken).is_some());
+
+        // A real multi-line file (actual newlines) is never flagged, even if
+        // it also happens to contain the literal two-char sequence "\n" as text
+        // (e.g. documenting an escape sequence).
+        let real_file = "fn main() {\n    println!(\"a literal \\\\n in a string\");\n}\n"
+            .repeat(6);
+        assert!(content_quality_warning(&real_file).is_none());
+
+        // Short content is never flagged regardless of shape (avoids false
+        // positives on tiny legitimate one-liners).
+        assert!(content_quality_warning("a\\nb").is_none());
+    }
+
+    #[tokio::test]
+    async fn write_file_flags_literal_newline_corruption() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy = Permissions::for_roots(&[], &[root]).unwrap();
+        let target = dir.path().join("broken.py");
+        let corrupted = "def f():\\n    return 1\\n\\ndef g():\\n    return 2\\n".repeat(6);
+        let args = serde_json::json!({
+            "path": target.to_string_lossy(),
+            "content": corrupted,
+        })
+        .to_string();
+
+        let out = write_file_run(&policy, &args).await.expect("write ok");
+        assert!(out.contains("\"warning\":\"content has no real line breaks"));
     }
 
     #[tokio::test]
