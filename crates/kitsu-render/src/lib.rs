@@ -66,7 +66,10 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     row("directory", dir);
     row("tools", &tools_str);
     eprintln!("  {}", format!("╰{rule}────").truecolor(r, g, b));
-    eprintln!("  {}", "/help for commands · Ctrl+D to exit".dimmed());
+    eprintln!(
+        "  {}",
+        "/ for commands · Tab to complete · Ctrl+D to exit".dimmed()
+    );
     eprintln!();
 }
 
@@ -185,6 +188,60 @@ pub fn compaction_boundary() {
     }
 }
 
+fn grouped_count(value: u64) -> String {
+    let digits = value.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, ch) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out
+}
+
+fn human_turn_stats(
+    usage: Option<(u64, u64, u64)>,
+    context: Option<(u64, u64, u64)>,
+) -> Option<String> {
+    let mut parts = Vec::new();
+    if let Some((prompt, completion, _total)) = usage {
+        parts.push(format!("{} input", grouped_count(prompt)));
+        parts.push(format!("{} output", grouped_count(completion)));
+    }
+    if let Some((used, effective, _window)) = context {
+        let pct = if effective == 0 {
+            0
+        } else {
+            used.saturating_mul(100).saturating_div(effective).min(999)
+        };
+        parts.push(format!(
+            "{} / {} context ({pct}% used)",
+            grouped_count(used),
+            grouped_count(effective)
+        ));
+    }
+    (!parts.is_empty()).then(|| format!("  ↳ {}", parts.join(" · ")))
+}
+
+/// Emit end-of-turn usage and context telemetry. Interactive terminals get one
+/// compact, human-readable status line; redirected output retains the stable
+/// `kitsu-usage:` and `kitsu-context:` JSON records for automation.
+pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
+    if is_tty() {
+        if let Some(line) = human_turn_stats(usage, context) {
+            eprintln!("{}", line.dimmed());
+        }
+        return;
+    }
+    if let Some((prompt, completion, total)) = usage {
+        emit_usage(prompt, completion, total);
+    }
+    if let Some((used, effective, window)) = context {
+        emit_context(used, effective, window);
+    }
+}
+
 /// Machine-readable context-utilization line to **stderr** (companion to
 /// `kitsu-usage:`), emitted per turn so sessions and the dogfood harness can see
 /// how full the window is and whether trimming is near.
@@ -270,4 +327,30 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
         "kitsu-usage: {{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{total_tokens}}}"
     );
     let _ = err.flush();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{grouped_count, human_turn_stats};
+
+    #[test]
+    fn groups_token_counts_for_people() {
+        assert_eq!(grouped_count(0), "0");
+        assert_eq!(grouped_count(999), "999");
+        assert_eq!(grouped_count(1_000), "1,000");
+        assert_eq!(grouped_count(123_456_789), "123,456,789");
+    }
+
+    #[test]
+    fn combines_usage_and_context_into_one_status_line() {
+        assert_eq!(
+            human_turn_stats(Some((11, 3, 14)), Some((2_000, 8_000, 8_192))),
+            Some("  ↳ 11 input · 3 output · 2,000 / 8,000 context (25% used)".into())
+        );
+    }
+
+    #[test]
+    fn omits_status_line_without_stats() {
+        assert_eq!(human_turn_stats(None, None), None);
+    }
 }

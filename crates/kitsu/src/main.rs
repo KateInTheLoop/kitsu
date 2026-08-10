@@ -105,6 +105,7 @@ fn run() -> Result<(), CliError> {
 struct ChatSetup {
     /// `Arc` so the main loop and spawned subagents can share one connection.
     provider: Arc<OpenAICompatProvider>,
+    gateway_name: String,
     model: String,
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
@@ -203,22 +204,170 @@ impl Drop for OffloadDirGuard {
     }
 }
 
-/// rustyline helper that collapses a pasted MULTI-LINE input to a compact chip
-/// (`<first line>… [pasted N lines]`) in the editor display — Codex-style — so a
-/// big paste doesn't flood the prompt. The full text is untouched in the buffer
-/// and returned verbatim on Enter; only the on-screen rendering is collapsed.
-struct PasteCollapse;
-
-impl rustyline::completion::Completer for PasteCollapse {
-    type Candidate = String;
+#[derive(Debug, Clone, Copy)]
+struct SlashCommandSpec {
+    name: &'static str,
+    args: &'static str,
+    description: &'static str,
 }
-impl rustyline::hint::Hinter for PasteCollapse {
+
+impl SlashCommandSpec {
+    fn syntax(self) -> String {
+        if self.args.is_empty() {
+            format!("/{}", self.name)
+        } else {
+            format!("/{} {}", self.name, self.args)
+        }
+    }
+}
+
+/// One source of truth for interactive completion and `/help`. Keep aliases in
+/// the registry too so discoverability never depends on reading documentation.
+const SLASH_COMMANDS: &[SlashCommandSpec] = &[
+    SlashCommandSpec {
+        name: "agents",
+        args: "[id]",
+        description: "list background agents or show one result",
+    },
+    SlashCommandSpec {
+        name: "allow",
+        args: "<path>",
+        description: "grant read access for this session",
+    },
+    SlashCommandSpec {
+        name: "allow-write",
+        args: "<path>",
+        description: "grant write access for this session",
+    },
+    SlashCommandSpec {
+        name: "clear",
+        args: "",
+        description: "clear conversation history",
+    },
+    SlashCommandSpec {
+        name: "context",
+        args: "",
+        description: "show detailed context utilization",
+    },
+    SlashCommandSpec {
+        name: "exit",
+        args: "",
+        description: "exit chat (alias for /quit)",
+    },
+    SlashCommandSpec {
+        name: "help",
+        args: "",
+        description: "show command help",
+    },
+    SlashCommandSpec {
+        name: "model",
+        args: "<name>",
+        description: "switch model while keeping history",
+    },
+    SlashCommandSpec {
+        name: "models",
+        args: "[filter]",
+        description: "list gateway models",
+    },
+    SlashCommandSpec {
+        name: "permissions",
+        args: "",
+        description: "show filesystem access policy",
+    },
+    SlashCommandSpec {
+        name: "quit",
+        args: "",
+        description: "exit chat",
+    },
+    SlashCommandSpec {
+        name: "save",
+        args: "<file>",
+        description: "save the latest response",
+    },
+    SlashCommandSpec {
+        name: "skill",
+        args: "<name>",
+        description: "load a skill into context",
+    },
+    SlashCommandSpec {
+        name: "skills",
+        args: "[filter]",
+        description: "list available skills",
+    },
+    SlashCommandSpec {
+        name: "status",
+        args: "",
+        description: "show model, context, tools, and session state",
+    },
+];
+
+fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
+    SLASH_COMMANDS
+        .iter()
+        .filter(|spec| spec.name.starts_with(prefix))
+        .collect()
+}
+
+fn slash_help(model: &str) -> String {
+    let width = SLASH_COMMANDS
+        .iter()
+        .map(|spec| spec.syntax().len())
+        .max()
+        .unwrap_or(0);
+    let mut out = String::from("commands:\n");
+    for spec in SLASH_COMMANDS {
+        let syntax = spec.syntax();
+        out.push_str(&format!(
+            "  {syntax:<width$}  {}\n",
+            spec.description,
+            width = width
+        ));
+    }
+    out.push_str(&format!("current model: {model}"));
+    out
+}
+
+/// rustyline helper for Codex-style chat affordances: slash-command completion
+/// plus compact rendering of pasted MULTI-LINE input. The full pasted text stays
+/// untouched in the buffer; only its on-screen representation is collapsed.
+struct ChatHelper;
+
+impl rustyline::completion::Completer for ChatHelper {
+    type Candidate = rustyline::completion::Pair;
+
+    fn complete(
+        &self,
+        line: &str,
+        pos: usize,
+        _ctx: &rustyline::Context<'_>,
+    ) -> rustyline::Result<(usize, Vec<Self::Candidate>)> {
+        let Some(typed) = line.get(..pos).and_then(|text| text.strip_prefix('/')) else {
+            return Ok((0, Vec::new()));
+        };
+        if typed.chars().any(char::is_whitespace) {
+            return Ok((0, Vec::new()));
+        }
+        let candidates = matching_slash_commands(typed)
+            .into_iter()
+            .map(|spec| rustyline::completion::Pair {
+                display: format!("{:<24} {}", spec.syntax(), spec.description),
+                replacement: format!(
+                    "/{}{}",
+                    spec.name,
+                    if spec.args.is_empty() { "" } else { " " }
+                ),
+            })
+            .collect();
+        Ok((0, candidates))
+    }
+}
+impl rustyline::hint::Hinter for ChatHelper {
     type Hint = String;
 }
-impl rustyline::validate::Validator for PasteCollapse {}
-impl rustyline::Helper for PasteCollapse {}
+impl rustyline::validate::Validator for ChatHelper {}
+impl rustyline::Helper for ChatHelper {}
 
-impl rustyline::highlight::Highlighter for PasteCollapse {
+impl rustyline::highlight::Highlighter for ChatHelper {
     fn highlight<'l>(&self, line: &'l str, _pos: usize) -> std::borrow::Cow<'l, str> {
         match line.split_once('\n') {
             Some((first, _)) => {
@@ -266,37 +415,133 @@ impl CtxEntry {
     }
 }
 
-/// Context-window info for `/context`, assembled once per session. `provenance`
-/// records how the static context (system prompt sources + tool schemas) was
-/// built, so `/context` can show WHAT loaded, WHY, its tokens, and the policy.
-/// `window` is shared with the `AgentConfig` builder (see `build_agent_config`
-/// call sites) via a `Cell` so `/model` can update it in place for both.
-struct CtxInfo {
+/// Stable UI metadata plus context-window provenance for the running chat.
+/// `window` is shared with the `AgentConfig` builder via a `Cell` so `/model`
+/// updates both request budgeting and `/status`/`/context` immediately.
+struct SessionInfo {
+    gateway: String,
+    directory: String,
+    tool_names: Vec<String>,
     window: Rc<Cell<Option<u64>>>,
     max_tokens: Option<u32>,
     provenance: Vec<CtxEntry>,
 }
 
-fn ctx_info(
+fn session_info(
+    gateway: String,
+    directory: String,
+    tool_names: Vec<String>,
     context_window: Rc<Cell<Option<u64>>>,
     cli: &Cli,
     provenance: Vec<CtxEntry>,
-) -> CtxInfo {
-    CtxInfo {
+) -> SessionInfo {
+    SessionInfo {
+        gateway,
+        directory,
+        tool_names,
         window: context_window,
         max_tokens: cli.max_output_tokens,
         provenance,
     }
 }
 
+fn permission_mode_label(mode: Mode) -> (&'static str, &'static str) {
+    match mode {
+        Mode::Ask => ("ask", "prompt for unlisted paths"),
+        Mode::AutoAllow => ("auto-allow", "allow unlisted paths"),
+        Mode::Deny => ("deny", "reject unlisted paths"),
+    }
+}
+
+fn context_totals(messages: &[ChatMessage], session: &SessionInfo) -> (u64, u64, u64) {
+    let b = ContextMeter::new().breakdown(messages);
+    let window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let effective = ContextBudget::new(window, session.max_tokens).effective;
+    let static_tokens: u64 = session.provenance.iter().map(|entry| entry.tokens).sum();
+    let used = static_tokens + b.user + b.assistant + b.tool_results;
+    (window, effective, used)
+}
+
+fn format_session_status(
+    model: &str,
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    perms: &Permissions,
+    registry: &subagent::AgentRegistry,
+) -> String {
+    let (window, effective, used) = context_totals(messages, session);
+    let pct = if effective == 0 {
+        0
+    } else {
+        used.saturating_mul(100).saturating_div(effective).min(999)
+    };
+    let user_turns = messages
+        .iter()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::User))
+        .count();
+    let assistant_turns = messages
+        .iter()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::Assistant))
+        .count();
+    let tool_results = messages
+        .iter()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::Tool))
+        .count();
+    let (mode, _) = permission_mode_label(perms.mode());
+    let window_note = if session.window.get().is_some() {
+        window.to_string()
+    } else {
+        format!("{window} default")
+    };
+
+    format!(
+        "session:\n  gateway      {}\n  model        {model}\n  directory    {}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user · {assistant_turns} assistant · {tool_results} tool\n  tools        {} enabled\n  permissions  {mode} · {} read root(s) · {} write root(s)\n  agents       {} running",
+        session.gateway,
+        session.directory,
+        effective.saturating_sub(used),
+        session.tool_names.len(),
+        perms.read_roots().len(),
+        perms.write_roots().len(),
+        registry.running(),
+    )
+}
+
+fn format_permissions(perms: &Permissions) -> String {
+    let (mode, behavior) = permission_mode_label(perms.mode());
+    let read_roots = perms.read_roots();
+    let write_roots = perms.write_roots();
+    let mut out = format!("permissions:\n  mode         {mode} ({behavior})\n  read roots");
+    if read_roots.is_empty() {
+        out.push_str("   none\n");
+    } else {
+        out.push('\n');
+        for root in read_roots {
+            out.push_str(&format!("    - {}\n", shorten_home(&root)));
+        }
+    }
+    out.push_str("  write roots");
+    if write_roots.is_empty() {
+        out.push_str("  none");
+    } else {
+        out.push('\n');
+        for (index, root) in write_roots.iter().enumerate() {
+            out.push_str(&format!("    - {}", shorten_home(root)));
+            if index + 1 < write_roots.len() {
+                out.push('\n');
+            }
+        }
+    }
+    out
+}
+
 /// Render `/context`: the static provenance rows (what loaded and why) plus the
 /// live conversation, with token cost and policy per source. The per-turn
 /// `kitsu-context:` line carries the usage-anchored number; this is an estimate.
-fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) {
+fn render_context_command(model: &str, messages: &[ChatMessage], session: &SessionInfo) {
     let b = ContextMeter::new().breakdown(messages);
-    let ctx_window = ctx.window.get();
+    let ctx_window = session.window.get();
     let window = ctx_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let budget = ContextBudget::new(window, ctx.max_tokens);
+    let budget = ContextBudget::new(window, session.max_tokens);
     let note = if ctx_window.is_some() {
         ""
     } else {
@@ -304,7 +549,7 @@ fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) 
     };
     // Static provenance (system prompt sources + tool schemas) then the live
     // conversation. breakdown.system is already covered by the provenance rows.
-    let rows: Vec<(&str, u64, &str, &str)> = ctx
+    let rows: Vec<(&str, u64, &str, &str)> = session
         .provenance
         .iter()
         .map(|e| (e.label.as_str(), e.tokens, e.policy, e.why.as_str()))
@@ -319,7 +564,7 @@ fn render_context_command(model: &str, messages: &[ChatMessage], ctx: &CtxInfo) 
             ),
         ])
         .collect();
-    let prov_total: u64 = ctx.provenance.iter().map(|e| e.tokens).sum();
+    let prov_total: u64 = session.provenance.iter().map(|e| e.tokens).sum();
     let used = prov_total + b.user + b.assistant + b.tool_results;
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
 }
@@ -381,9 +626,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     let path = Config::resolve_path(cli.config.as_deref());
     let config = Config::load(&path).map_err(|e| CliError::user(e.to_string()))?;
 
-    let (_name, gateway) = config
+    let (gateway_name, gateway) = config
         .select_gateway(cli.gateway.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
+    let gateway_name = gateway_name.to_string();
     gateway
         .validate_flavor()
         .map_err(|e| CliError::user(e.to_string()))?;
@@ -436,6 +682,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     Ok(ChatSetup {
         provider: Arc::new(provider),
+        gateway_name,
         model,
         context_window,
         context_window_pinned,
@@ -465,12 +712,10 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
 
     match run_agent_turn(&setup.provider, &tools, &mut messages, &agent_cfg).await {
         Ok(text) => {
-            // When streaming, fragments were already printed; ensure a trailing
-            // newline. When not streaming, print the full text.
+            // When streaming, the orchestrator already terminated the line
+            // before rendering turn stats. Otherwise print the buffered text.
             if cli.no_stream {
                 println!("{text}");
-            } else {
-                println!();
             }
             Ok(())
         }
@@ -516,7 +761,7 @@ async fn run_scripted(
     perms: &Permissions,
     offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
-    ctx: &CtxInfo,
+    session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
@@ -565,7 +810,7 @@ async fn run_scripted(
                 model,
                 &setup.provider,
                 perms,
-                ctx,
+                session,
                 skillset,
                 context_window,
                 setup.context_window_pinned,
@@ -622,12 +867,9 @@ async fn run_scripted_turn(
         Ok(text) => {
             if cli.no_stream {
                 println!("{text}");
-            } else {
-                kitsu_render::finish_line();
             }
         }
         Err(e) => {
-            kitsu_render::finish_line();
             eprintln!("{}", chat_error_message(e, model));
         }
     }
@@ -799,7 +1041,7 @@ async fn run_chat(
     let _offload_guard = offload_dir.clone().map(OffloadDirGuard);
 
     let mut model = setup.model.clone();
-    // Shared with `ctx` (for `/context`) and updated in place by `/model`, so
+    // Shared with session UI state and updated in place by `/model`, so
     // switching models doesn't leave every subsequent turn budgeting against
     // the OLD model's window — a stale, larger window would under-trim and the
     // gateway would reject the oversized request instead of kitsu proactively
@@ -897,7 +1139,18 @@ async fn run_chat(
             tool_names.join(", "),
         ));
     }
-    let ctx = ctx_info(context_window.clone(), cli, provenance);
+    let directory = std::env::current_dir()
+        .ok()
+        .map(|path| shorten_home(&path))
+        .unwrap_or_default();
+    let session = session_info(
+        setup.gateway_name.clone(),
+        directory,
+        tool_names.clone(),
+        context_window.clone(),
+        cli,
+        provenance,
+    );
 
     let mut messages = vec![ChatMessage::system(system)];
 
@@ -914,7 +1167,7 @@ async fn run_chat(
             &perms,
             &offload_dir,
             &skillset,
-            &ctx,
+            &session,
             &context_window,
             &live_mw,
             &agent_registry,
@@ -946,8 +1199,6 @@ async fn run_chat(
             Ok(text) => {
                 if cli.no_stream {
                     println!("{text}");
-                } else {
-                    kitsu_render::finish_line();
                 }
                 Ok(())
             }
@@ -959,27 +1210,27 @@ async fn run_chat(
     // multi-line block (a code snippet or stack trace — the bread and butter of
     // coding chats) is captured as ONE turn instead of each line submitting
     // separately. It defaults on in rustyline 14, but we set it deliberately.
-    let rl_config = rustyline::Config::builder().bracketed_paste(true).build();
-    let mut rl: rustyline::Editor<PasteCollapse, rustyline::history::DefaultHistory> =
+    let rl_config = rustyline::Config::builder()
+        .bracketed_paste(true)
+        .completion_type(rustyline::CompletionType::List)
+        .build();
+    let mut rl: rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory> =
         rustyline::Editor::with_config(rl_config)
             .map_err(|e| CliError::user(format!("failed to start input editor: {e}")))?;
-    // Collapse pasted multi-line blocks to a chip in the editor display (#16).
-    rl.set_helper(Some(PasteCollapse));
+    // Collapse pasted blocks and complete slash commands from one helper.
+    rl.set_helper(Some(ChatHelper));
     let history_path = Config::resolve_path(cli.config.as_deref())
         .parent()
         .map(|p| p.join("history"))
         .unwrap_or_else(|| std::path::PathBuf::from(".kitsu_history"));
     let _ = rl.load_history(&history_path);
 
-    let gateway_name = cli
-        .gateway
-        .clone()
-        .unwrap_or_else(|| "(default)".to_string());
-    let dir = std::env::current_dir()
-        .ok()
-        .map(|p| shorten_home(&p))
-        .unwrap_or_default();
-    kitsu_render::chat_banner(&gateway_name, &model, &dir, &tool_names);
+    kitsu_render::chat_banner(
+        &session.gateway,
+        &model,
+        &session.directory,
+        &session.tool_names,
+    );
 
     // If a first prompt was given, queue it as the first turn.
     let mut queued = first_prompt.map(|s| s.to_string());
@@ -1025,7 +1276,7 @@ async fn run_chat(
                 &mut model,
                 &setup.provider,
                 &perms,
-                &ctx,
+                &session,
                 &skillset,
                 &context_window,
                 setup.context_window_pinned,
@@ -1054,7 +1305,6 @@ async fn run_chat(
         .await
         {
             TurnOutcome::Completed(Ok(text)) => {
-                kitsu_render::finish_line();
                 // The model can return an empty completion for vague inputs;
                 // say so instead of looking hung.
                 if text.trim().is_empty() {
@@ -1062,7 +1312,6 @@ async fn run_chat(
                 }
             }
             TurnOutcome::Completed(Err(e)) => {
-                kitsu_render::finish_line();
                 eprintln!("{}", chat_error_message(e, &model));
             }
             TurnOutcome::Cancelled => {
@@ -1089,7 +1338,7 @@ async fn handle_slash(
     model: &mut String,
     provider: &OpenAICompatProvider,
     perms: &Permissions,
-    ctx: &CtxInfo,
+    session: &SessionInfo,
     skillset: &skills::SkillSet,
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
@@ -1103,19 +1352,14 @@ async fn handle_slash(
     match name {
         "quit" | "exit" => return SlashResult::Quit,
         "help" => {
-            eprintln!(
-                "commands:\n  /model <name>  switch model (keeps history)\n  /models [filter]  \
-                 list models the gateway offers (optionally filtered)\n  /skills [filter]  list \
-                 available skills\n  /skill <name>  load a skill's instructions into context\n  \
-                 /allow <path>  grant read access to a path (no more prompts there)\n  \
-                 /allow-write <path>  grant write access to a path\n  /save <file>   write the \
-                 last response to <file> (code blocks if present)\n  /context       show \
-                 context-window utilization\n  /agents [id]   list background agents (or one \
-                 result)\n  /clear         clear conversation (keeps system \
-                 prompt)\n  /help          this help\n  /quit          exit\ncurrent model: {model}"
-            );
+            eprintln!("{}", slash_help(model));
         }
-        "context" => render_context_command(model, messages, ctx),
+        "status" => eprintln!(
+            "{}",
+            format_session_status(model, messages, session, perms, registry)
+        ),
+        "permissions" => eprintln!("{}", format_permissions(perms)),
+        "context" => render_context_command(model, messages, session),
         "agents" => {
             if arg.is_empty() {
                 eprintln!("{}", registry.list());
@@ -1491,7 +1735,7 @@ mod tests {
     #[test]
     fn paste_collapse_chips_multiline_only() {
         use rustyline::highlight::Highlighter;
-        let h = PasteCollapse;
+        let h = ChatHelper;
         // Single line: unchanged, and not re-highlighted.
         assert_eq!(h.highlight("just one line", 0), "just one line");
         assert!(!h.highlight_char("just one line", 0, false));
@@ -1504,6 +1748,47 @@ mod tests {
             h.highlight_char("a\nb", 0, false),
             "re-highlights when multi-line"
         );
+    }
+
+    #[test]
+    fn slash_completion_discovers_commands_and_inserts_argument_space() {
+        use rustyline::completion::Completer;
+        let history = rustyline::history::DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+
+        let (start, candidates) = ChatHelper.complete("/mod", 4, &context).unwrap();
+        assert_eq!(start, 0);
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.replacement.as_str())
+                .collect::<Vec<_>>(),
+            vec!["/model ", "/models "]
+        );
+        assert!(candidates[0].display.contains("switch model"));
+
+        let (_, candidates) = ChatHelper.complete("/status", 7, &context).unwrap();
+        assert_eq!(candidates.len(), 1);
+        assert_eq!(candidates[0].replacement, "/status");
+
+        let (_, candidates) = ChatHelper.complete("/model qwen", 12, &context).unwrap();
+        assert!(candidates.is_empty(), "arguments are not command names");
+    }
+
+    #[test]
+    fn slash_registry_is_sorted_unique_and_drives_help() {
+        let names: Vec<_> = SLASH_COMMANDS.iter().map(|spec| spec.name).collect();
+        let mut sorted = names.clone();
+        sorted.sort_unstable();
+        sorted.dedup();
+        assert_eq!(names, sorted, "registry must remain sorted and unique");
+
+        let help = slash_help("test-model");
+        for spec in SLASH_COMMANDS {
+            assert!(help.contains(&spec.syntax()));
+            assert!(help.contains(spec.description));
+        }
+        assert!(help.ends_with("current model: test-model"));
     }
 
     /// Regression: a sibling directory that merely SHARES the home dir as a
