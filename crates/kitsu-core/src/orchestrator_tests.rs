@@ -950,6 +950,28 @@ fn tool_activity_formatting() {
         ),
         "unchanged · 42 bytes"
     );
+    // A content-quality warning (garbage/corrupted write) surfaces inline so a
+    // human watching the transcript sees it, not just the model.
+    assert_eq!(
+        format_tool_result(
+            "fs_write_file",
+            r#"{"written":"x","bytes":42,"change":"created","warning":"looks corrupted"}"#,
+            false
+        ),
+        "created · 42 bytes — ⚠ looks corrupted"
+    );
+    assert_eq!(
+        format_tool_header("fs_edit_file", r#"{"path":"fb.py"}"#),
+        "Edit(fb.py)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_edit_file",
+            r#"{"edited":"x","bytes":10,"change":"updated"}"#,
+            false
+        ),
+        "updated · 10 bytes"
+    );
     assert_eq!(
         format_tool_result("repo_grep", "l1\nl2\nl3", false),
         "3 matches"

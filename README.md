@@ -432,7 +432,7 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
 | `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, and streamed body reads. Local-model tool-calling rounds routinely need more; raise it (e.g. `300`) for tool-heavy work. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
-| `--yes` | off | Auto-approve enabled filesystem requests; it never enables tools or approves developer commands. |
+| `--yes` | off | Auto-approve enabled filesystem requests with **no confinement** to `--allow-path`/`--allow-write` roots — use with care. Never enables tools by itself, and never approves developer commands. |
 | `--context-window <n>` | profile/cache, else `8192` | Override the model context window. A cold metadata lookup runs asynchronously and never delays the first inference. |
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
@@ -485,8 +485,13 @@ it won't ask again.
   whole repo but confine generated files to one scratch dir.
 - **In-session grants:** `/allow <path>` and `/allow-write <path>`.
 - **Non-interactive** (`--script`/piped): capabilities are absent unless their
-  paths are pre-granted. `--yes` changes approval behavior only; it does not
-  create read, write, or command authority.
+  paths are pre-granted (or the session is interactive). `--yes` never
+  registers a tool by itself and never approves developer commands — but once
+  a filesystem tool *is* registered, `--yes` approves it for **any**
+  non-protected path, not just the `--allow-path`/`--allow-write` roots you
+  granted. It is not a scoped "auto-approve within my sandbox" switch; it
+  removes the approval step entirely. To confine writes to one directory
+  without prompting, pass `--allow-write <dir>` **without** `--yes`.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
