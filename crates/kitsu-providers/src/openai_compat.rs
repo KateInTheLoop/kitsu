@@ -289,6 +289,11 @@ fn finish_from_str(s: &str) -> FinishReason {
     }
 }
 
+/// Tool-call indices come from an untrusted gateway response. Keep the maximum
+/// deliberately generous while preventing a sparse index from amplifying into
+/// an arbitrarily large `Vec` allocation.
+const MAX_STREAMED_TOOL_CALLS: usize = 64;
+
 /// Accumulates streamed tool-call deltas by index.
 #[derive(Default)]
 struct ToolCallAcc {
@@ -373,6 +378,9 @@ impl SseDecoder {
             }
         }
         for dtc in choice.delta.tool_calls {
+            if dtc.index >= MAX_STREAMED_TOOL_CALLS {
+                continue;
+            }
             if self.accs.len() <= dtc.index {
                 self.accs.resize_with(dtc.index + 1, ToolCallAcc::default);
             }

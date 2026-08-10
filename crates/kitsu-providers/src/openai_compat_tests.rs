@@ -102,6 +102,33 @@ fn sse_tool_call() -> String {
     .join("\n\n")
 }
 
+fn sse_tool_call_at_index(index: usize) -> String {
+    let delta = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": index,
+                    "id": "call_oversized",
+                    "type": "function",
+                    "function": {
+                        "name": "fs.read_file",
+                        "arguments": "{}"
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    [
+        format!("data: {delta}"),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        String::new(),
+    ]
+    .join("\n\n")
+}
+
 /// Drain a ChatStream into (collected text, tool calls, terminal finish reason).
 async fn collect_stream(
     mut stream: crate::ChatStream,
@@ -309,6 +336,40 @@ async fn test_chat_stream_tool_calls() {
         Some(FinishReason::ToolCalls),
         "stream should end Done(ToolCalls)"
     );
+}
+
+/// Regression: a gateway-controlled sparse tool-call index must not make the
+/// decoder allocate every missing slot or surface the invalid call.
+#[tokio::test]
+#[serial]
+async fn test_chat_stream_ignores_excessive_tool_call_index() {
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+
+    for index in [super::MAX_STREAMED_TOOL_CALLS, usize::MAX] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(CHAT_PATH))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_tool_call_at_index(index)),
+            )
+            .mount(&server)
+            .await;
+
+        let provider = provider_for(server.uri());
+        let stream = provider
+            .chat_stream(simple_request())
+            .await
+            .expect("chat_stream should tolerate an excessive tool-call index");
+
+        let (_text, tool_calls, finish) = collect_stream(stream).await;
+        assert!(
+            tool_calls.is_empty(),
+            "tool call at index {index} must be ignored"
+        );
+        assert_eq!(finish, Some(FinishReason::ToolCalls));
+    }
 }
 
 /// Regression: backoff must never panic, even for absurd attempt counts (the
