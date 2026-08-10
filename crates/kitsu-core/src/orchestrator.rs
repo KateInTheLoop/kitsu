@@ -132,10 +132,9 @@ where
 ///
 /// Generic over `P: Provider` so tests can pass a mock provider.
 ///
-/// As a side effect, when the gateway reported token usage, a single machine-
-/// readable `kitsu-usage: {...}` line is written to stderr after the turn — used
-/// by external consumers for cost reporting. Never on
-/// stdout, which carries only the assistant text.
+/// As a side effect, turn usage/context telemetry is written to stderr after the
+/// turn. Terminals get a compact human summary; redirected output gets stable
+/// `kitsu-usage:`/`kitsu-context:` records. Stdout carries only assistant text.
 pub async fn run_agent_turn_with_state<P>(
     provider: &P,
     tools: &Registry,
@@ -157,27 +156,22 @@ where
         &mut state.compact_failures,
     )
     .await;
-    // Emit usage regardless of Ok/Err — partial turns still cost tokens. Only
-    // when the gateway actually reported something.
-    if !turn_usage.is_empty() && !cfg.quiet {
-        // ISSUE-003: when streaming, the assistant text was written to stdout
-        // without a trailing newline. Terminate that line before the usage line
-        // (stderr) so the two don't run together (`OKkitsu-usage:` → `OK\nkitsu-usage:`).
-        if cfg.stream {
-            kitsu_render::finish_line();
-        }
-        kitsu_render::emit_usage(
+    // The orchestrator owns the end of a streamed turn: terminate assistant
+    // text before stderr telemetry, exactly once, on both success and error.
+    if cfg.stream {
+        kitsu_render::finish_line();
+    }
+    if !cfg.quiet {
+        let usage = (!turn_usage.is_empty()).then_some((
             turn_usage.prompt_tokens,
             turn_usage.completion_tokens,
             turn_usage.total_tokens,
-        );
-    }
-    // When the window is known, report context utilization for this turn.
-    if !cfg.quiet {
-        if let Some(window) = cfg.context_window {
+        ));
+        let context = cfg.context_window.map(|window| {
             let budget = ContextBudget::new(window, cfg.max_tokens);
-            kitsu_render::emit_context(state.meter.estimate(messages), budget.effective, window);
-        }
+            (state.meter.estimate(messages), budget.effective, window)
+        });
+        kitsu_render::emit_turn_stats(usage, context);
     }
     result
 }

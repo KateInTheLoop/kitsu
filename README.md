@@ -471,15 +471,24 @@ it won't ask again.
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
 
+Type `/` and press Tab to discover commands; completion and `/help` share the
+same command registry, so their descriptions stay in sync.
+
 Slash commands inside the REPL:
 
 | Command | Action |
 |---|---|
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
+| `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, and background agents. |
+| `/permissions` | Show the current permission mode and canonical read/write roots. |
 | `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
 | `/allow-write <path>` | Grant write access to a path for the rest of the session. |
+| `/skills [filter]` | List available local skills, optionally filtered by name. |
+| `/skill <name>` | Load a skill's instructions into the conversation context. |
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
+| `/context` | Show detailed context utilization and provenance. |
+| `/agents [id]` | List background agents, or show one agent's result. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
 | `/quit` (or `/exit`) | Exit. |
@@ -529,9 +538,10 @@ sessions don't overflow it — important for small local models.
   used/effective with a bar and headroom, then an honest **provenance table** —
   every context source with its `tokens`, `policy`, and `why` (base prompt,
   `project (llms.txt)`, `skill index`, `tool schemas`, and the conversation).
-  Nothing loads into your window without a line here. A machine
-  `kitsu-context: {"used":…,"effective":…,"window":…}` line is written to stderr
-  each turn (companion to `kitsu-usage:`).
+  Nothing loads into your window without a line here. Interactive turns end in
+  one compact usage/context summary; redirected runs retain the machine-readable
+  `kitsu-context: {"used":…,"effective":…,"window":…}` stderr record (companion to
+  `kitsu-usage:`).
 
 Summarizing compaction (an LLM-written summary when trimming would evict the
 active task) is planned; see
@@ -599,7 +609,8 @@ always: false
   because some models reject a `temperature` field.
 - **Local servers use `method = "none"`.** Ollama and vLLM (unless launched with
   `--api-key`) need no token.
-- **Token usage** is emitted (when the gateway reports it) as a single
-  `kitsu-usage: {...}` line on **stderr**, so stdout stays clean for piping.
+- **Token usage** is shown as a compact human status line in a terminal. When
+  output is redirected, it remains a stable `kitsu-usage: {...}` line on
+  **stderr**, so stdout stays clean for piping and scripts remain compatible.
 - **Exit codes:** `0` success, `1` user/config/auth-missing error, `2` provider
   error (network, gateway 4xx/5xx).

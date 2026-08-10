@@ -370,7 +370,9 @@ async fn test_max_rounds_flag_and_usage_line() {
         cmd.args(["--max-rounds", "40", "ask", "--gateway", "example", "hello"]);
         cmd.assert()
             .success()
-            .stdout(predicate::str::contains("answer"))
+            // Streaming owns exactly one trailing newline, even when telemetry
+            // is emitted after the response.
+            .stdout(predicate::eq("answer\n"))
             // usage surfaced to stderr, never stdout
             .stderr(predicate::str::contains("kitsu-usage:"))
             .stderr(predicate::str::contains("\"total_tokens\":14"))
@@ -639,6 +641,52 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
             .stderr(predicate::str::contains("base prompt"))
             .stderr(predicate::str::contains("policy"))
             .stderr(predicate::str::contains("why"));
+    })
+    .await
+    .expect("join");
+}
+
+/// `/status` and `/permissions` expose the live session without making a model
+/// request, including the selected gateway (not an ambiguous "default" label).
+#[tokio::test]
+#[serial]
+async fn test_status_and_permissions_slash_commands() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+model = "test-model"
+context_window = 8000
+auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
+"#,
+    )
+    .unwrap();
+
+    let script_path = home.path().join("scn.txt");
+    fs::write(&script_path, "/status\n/permissions\n/quit\n").unwrap();
+    let script_str = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("session:"))
+            .stderr(predicate::str::contains("gateway      example"))
+            .stderr(predicate::str::contains("model        test-model"))
+            .stderr(predicate::str::contains("context"))
+            .stderr(predicate::str::contains("permissions:"))
+            .stderr(predicate::str::contains("mode         deny"))
+            .stderr(predicate::str::contains("read roots   none"))
+            .stderr(predicate::str::contains("write roots  none"));
     })
     .await
     .expect("join");

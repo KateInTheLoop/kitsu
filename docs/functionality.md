@@ -40,11 +40,17 @@ Claude, and any OpenAI-compatible endpoint with no code changes — only config/
 
 A line-based REPL that prints to the terminal's normal scrollback, so **copy-paste and
 scroll-wheel work natively** (no alt-screen TUI). Powered by `rustyline`: history (persisted to
-`~/.kitsu/history`), arrow keys, Ctrl+A/E/W, and bracketed multi-line paste.
+`~/.kitsu/history`), arrow keys, Ctrl+A/E/W, bracketed multi-line paste, and Tab
+completion for slash commands.
 
 - **Multi-turn**: conversation history is retained across turns.
-- **Slash commands**: `/model <name>` (switch model, keep history), `/clear` (reset to system
-  prompt), `/help`, `/quit`.
+- **Slash commands**: type `/` then Tab to discover them. The session controls
+  include `/status`, `/permissions`, `/model`, `/models`, `/context`, `/allow`,
+  `/allow-write`, `/skills`, `/skill`, `/save`, `/agents`, `/clear`, `/help`, and
+  `/quit`.
+- **Turn status**: an interactive turn ends with one human-readable usage/context
+  line. Redirected runs keep the stable `kitsu-usage:` and `kitsu-context:` JSON
+  records on stderr for automation.
 - **Ctrl+C** cancels the in-flight streaming response and returns to the prompt; **Ctrl+D** (or
   Ctrl+C at an empty prompt) exits.
 - **Non-TTY stdin** (`echo "hi" | kitsu chat`) runs a single turn and exits — same shape as `ask`.

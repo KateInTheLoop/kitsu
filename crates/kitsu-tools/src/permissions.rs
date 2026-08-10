@@ -145,6 +145,21 @@ impl Permissions {
         self.max_bytes
     }
 
+    /// Current fallback policy for paths not already covered by a session root.
+    pub fn mode(&self) -> Mode {
+        self.mode
+    }
+
+    /// Snapshot the canonical read roots currently granted for this session.
+    pub fn read_roots(&self) -> Vec<PathBuf> {
+        self.read_roots.read().unwrap().clone()
+    }
+
+    /// Snapshot the canonical write roots currently granted for this session.
+    pub fn write_roots(&self) -> Vec<PathBuf> {
+        self.write_roots.read().unwrap().clone()
+    }
+
     /// Add a read-allowed root at runtime (e.g. the `/allow` command).
     pub fn grant_read_root(&self, path: &str) -> Result<PathBuf, ToolError> {
         let canon = std::fs::canonicalize(path).map_err(|e| {
