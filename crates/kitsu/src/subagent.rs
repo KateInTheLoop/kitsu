@@ -58,6 +58,7 @@ pub enum AgentStatus {
 struct AgentRecord {
     task: String,
     status: AgentStatus,
+    handle: Option<tokio::task::AbortHandle>,
 }
 
 /// Registry of background subagents, shared between `spawn_agent_bg`,
@@ -83,6 +84,7 @@ impl AgentRegistry {
             AgentRecord {
                 task,
                 status: AgentStatus::Running,
+                handle: None,
             },
         );
         id
@@ -95,7 +97,41 @@ impl AgentRegistry {
                 Ok(r) => AgentStatus::Done(r),
                 Err(e) => AgentStatus::Failed(e),
             };
+            rec.handle = None;
         }
+    }
+
+    fn attach(&self, id: u64, handle: tokio::task::AbortHandle) {
+        if let Some(rec) = self.agents.lock().expect("agent registry").get_mut(&id) {
+            if matches!(rec.status, AgentStatus::Running) {
+                rec.handle = Some(handle);
+            }
+        }
+    }
+
+    /// Highest id allocated before a parent turn starts.
+    pub fn watermark(&self) -> u64 {
+        self.next.load(Ordering::Relaxed)
+    }
+
+    /// Abort detached agents created by a parent turn that is being rolled
+    /// back. Agents that predate the turn are intentionally left alone.
+    pub fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
+        let mut agents = self.agents.lock().expect("agent registry");
+        let mut cancelled = Vec::new();
+        for (id, record) in agents.iter_mut() {
+            if *id > watermark && matches!(record.status, AgentStatus::Running) {
+                if let Some(handle) = record.handle.take() {
+                    handle.abort();
+                }
+                record.status = AgentStatus::Failed(
+                    "cancelled because the parent turn was rolled back".to_string(),
+                );
+                cancelled.push(*id);
+            }
+        }
+        cancelled.sort_unstable();
+        cancelled
     }
 
     /// Count of still-running background agents (for a prompt hint).
@@ -106,6 +142,18 @@ impl AgentRegistry {
             .values()
             .filter(|r| matches!(r.status, AgentStatus::Running))
             .count()
+    }
+
+    /// Clear completed records at a session boundary. Callers first ensure no
+    /// agents are running, so results from one conversation cannot be fetched
+    /// by the next conversation through `agent_result`.
+    pub fn reset(&self) {
+        let mut agents = self.agents.lock().expect("agent registry");
+        debug_assert!(!agents
+            .values()
+            .any(|record| matches!(record.status, AgentStatus::Running)));
+        agents.clear();
+        self.next.store(0, Ordering::Relaxed);
     }
 
     /// One line per agent (`#id  [status]  task`), id-ordered, for `/agents`.
@@ -353,10 +401,12 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
             let cfg = resolve_cfg(&sub_cfg, &live);
             let id = registry.start(task_preview(&a.task));
             // Detach: the subagent runs on the runtime while the parent continues.
-            tokio::spawn(async move {
+            let running_registry = registry.clone();
+            let handle = tokio::spawn(async move {
                 let r = run_subagent(&provider, &sub_tools, &cfg, &extra_system, a.task).await;
-                registry.finish(id, r);
+                running_registry.finish(id, r);
             });
+            registry.attach(id, handle.abort_handle());
             Ok(format!(
                 "Started background agent #{id}. It runs detached — fetch its result later with \
                  agent_result({id}); the user can also run /agents to see status."
@@ -596,6 +646,27 @@ mod tests {
         // /agents-style listing shows the finished agent.
         assert!(registry.list().contains("#1"));
         assert!(registry.list().contains("[done]"));
+    }
+
+    #[tokio::test]
+    async fn rollback_cancels_only_agents_started_after_watermark() {
+        let registry = AgentRegistry::new();
+        let old = registry.start("older work".to_string());
+        let old_handle = tokio::spawn(std::future::pending::<()>());
+        registry.attach(old, old_handle.abort_handle());
+        let watermark = registry.watermark();
+
+        let new = registry.start("rolled-back work".to_string());
+        let new_handle = tokio::spawn(std::future::pending::<()>());
+        registry.attach(new, new_handle.abort_handle());
+
+        assert_eq!(registry.cancel_started_after(watermark), vec![new]);
+        assert!(registry.result(old).unwrap().contains("still running"));
+        assert!(registry
+            .result(new)
+            .unwrap()
+            .contains("parent turn was rolled back"));
+        old_handle.abort();
     }
 
     #[tokio::test]

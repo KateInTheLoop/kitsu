@@ -94,10 +94,28 @@ pub enum AgentError {
 /// for this model/gateway gets re-tried from scratch (and re-burns its failure
 /// budget) on every subsequent turn. Single-turn callers (`ask`, one-shot piped
 /// input) can use `Default` via [`run_agent_turn`].
-#[derive(Debug, Default)]
+#[derive(Debug, Default, Clone)]
 pub struct AgentSessionState {
     pub meter: ContextMeter,
     pub compact_failures: u32,
+    /// Machine-readable outcome of the most recent turn. Interactive chat can
+    /// still show partial/recovered answers, while strict scripted callers can
+    /// reject incomplete automation without scraping display markers.
+    pub last_turn: AgentTurnStatus,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum TurnCompletion {
+    #[default]
+    Complete,
+    LengthLimited,
+    MaxRounds,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct AgentTurnStatus {
+    pub completion: TurnCompletion,
+    pub tool_errors: u32,
 }
 
 /// Run one user turn through the agent loop, with no state persisted across
@@ -146,19 +164,16 @@ where
     P: Provider,
 {
     let mut turn_usage = kitsu_providers::Usage::default();
-    let result = run_agent_turn_inner(
-        provider,
-        tools,
-        messages,
-        cfg,
-        &mut turn_usage,
-        &mut state.meter,
-        &mut state.compact_failures,
-    )
-    .await;
-    // The orchestrator owns the end of a streamed turn: terminate assistant
-    // text before stderr telemetry, exactly once, on both success and error.
-    if cfg.stream {
+    state.last_turn = AgentTurnStatus::default();
+    let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
+    // The orchestrator owns assistant rendering and the end-of-turn boundary so
+    // the answer always precedes telemetry in both streaming and buffered mode.
+    if !cfg.quiet {
+        if !cfg.stream {
+            if let Ok(text) = &result {
+                kitsu_render::print_message(text);
+            }
+        }
         kitsu_render::finish_line();
     }
     if !cfg.quiet {
@@ -184,12 +199,16 @@ async fn run_agent_turn_inner<P>(
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
     turn_usage: &mut kitsu_providers::Usage,
-    meter: &mut ContextMeter,
-    compact_failures: &mut u32,
+    state: &mut AgentSessionState,
 ) -> Result<String, AgentError>
 where
     P: Provider,
 {
+    let AgentSessionState {
+        meter,
+        compact_failures,
+        last_turn: turn_status,
+    } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
 
@@ -212,6 +231,7 @@ where
         if round > cfg.max_rounds {
             // (2) max-rounds backstop: stop gracefully, note it, return text.
             last_assistant_text.push_str("\n[stopped: max tool rounds reached]");
+            turn_status.completion = TurnCompletion::MaxRounds;
             return Ok(last_assistant_text);
         }
 
@@ -336,7 +356,7 @@ where
         // reasoning before a STRUCTURED tool call, and terminal answers, print
         // normally (previously over-suppressed, hiding read/grep output).
         if cfg.stream && tools_were_offered && !synthesized_call {
-            kitsu_render::print_fragment(&assistant_text);
+            kitsu_render::print_message(&assistant_text);
         }
 
         last_assistant_text = assistant_text.clone();
@@ -362,6 +382,7 @@ where
                 FinishReason::Length => {
                     tracing::warn!("response truncated: model hit its output length limit");
                     assistant_text.push_str("\n[truncated: model output length limit reached]");
+                    turn_status.completion = TurnCompletion::LengthLimited;
                     return Ok(assistant_text);
                 }
                 // No tool calls but ToolCalls finish reason: nothing to run, end.
@@ -373,6 +394,7 @@ where
         // arguments may be cut off (invalid JSON). Surface it rather than running
         // them blindly — the tool's own arg validation will then fail loudly.
         if finish == FinishReason::Length {
+            turn_status.completion = TurnCompletion::LengthLimited;
             tracing::warn!(
                 "tool-call round truncated by the model's output length limit; \
                  tool arguments may be incomplete"
@@ -400,6 +422,7 @@ where
                     if *n >= REPEAT_FAIL_LIMIT {
                         force_final_next = true;
                     }
+                    turn_status.tool_errors = turn_status.tool_errors.saturating_add(1);
                     (
                         serde_json::json!({ "error": e.kind(), "detail": e.to_string() })
                             .to_string(),
@@ -566,7 +589,19 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
     if is_err {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
             if let Some(kind) = v.get("error").and_then(|x| x.as_str()) {
-                return format!("error: {kind}");
+                let detail = v
+                    .get("detail")
+                    .and_then(|value| value.as_str())
+                    .unwrap_or("")
+                    .lines()
+                    .next()
+                    .unwrap_or("");
+                let detail: String = detail.chars().take(180).collect();
+                return if detail.is_empty() {
+                    format!("error: {kind}")
+                } else {
+                    format!("error: {kind} — {detail}")
+                };
             }
         }
         return "error".to_string();
@@ -574,8 +609,17 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
     match name {
         "fs_write_file" => serde_json::from_str::<serde_json::Value>(content)
             .ok()
-            .and_then(|v| v.get("bytes").and_then(|b| b.as_u64()))
-            .map(|b| format!("{b} bytes written"))
+            .map(|value| {
+                let bytes = value.get("bytes").and_then(|item| item.as_u64());
+                let change = value
+                    .get("change")
+                    .and_then(|item| item.as_str())
+                    .unwrap_or("written");
+                match bytes {
+                    Some(bytes) => format!("{change} · {bytes} bytes"),
+                    None => change.to_string(),
+                }
+            })
             .unwrap_or_else(|| "written".to_string()),
         "repo_grep" => {
             if content == "(no matches)" {

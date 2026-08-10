@@ -80,8 +80,11 @@ pub trait Prompter: Send + Sync {
 
 /// Runtime read/write permissions.
 pub struct Permissions {
+    base_read_roots: Vec<PathBuf>,
+    base_write_roots: Vec<PathBuf>,
     read_roots: RwLock<Vec<PathBuf>>,
     write_roots: RwLock<Vec<PathBuf>>,
+    protected_read_roots: RwLock<Vec<PathBuf>>,
     mode: Mode,
     prompter: Option<Arc<dyn Prompter>>,
     max_bytes: usize,
@@ -94,9 +97,20 @@ fn canonicalize_roots(roots: &[String], label: &str) -> Result<Vec<PathBuf>, Too
         let canon = std::fs::canonicalize(r).map_err(|e| {
             ToolError::PolicyDenied(format!("{label} '{r}' is not accessible: {e}"))
         })?;
-        out.push(canon);
+        insert_minimal_root(&mut out, canon);
     }
     Ok(out)
+}
+
+/// Insert one canonical root while keeping the set minimal. A parent grant
+/// already covers its descendants; a newly-added parent replaces child grants.
+fn insert_minimal_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
+    if roots.iter().any(|existing| root.starts_with(existing)) {
+        return;
+    }
+    roots.retain(|existing| !existing.starts_with(&root));
+    roots.push(root);
+    roots.sort();
 }
 
 /// The directory an "always" grant should add for a resolved target path: the
@@ -120,9 +134,14 @@ impl Permissions {
         write_roots: &[String],
         mode: Mode,
     ) -> Result<Self, ToolError> {
+        let read_roots = canonicalize_roots(read_roots, "allow-path")?;
+        let write_roots = canonicalize_roots(write_roots, "allow-write")?;
         Ok(Self {
-            read_roots: RwLock::new(canonicalize_roots(read_roots, "allow-path")?),
-            write_roots: RwLock::new(canonicalize_roots(write_roots, "allow-write")?),
+            base_read_roots: read_roots.clone(),
+            base_write_roots: write_roots.clone(),
+            read_roots: RwLock::new(read_roots),
+            write_roots: RwLock::new(write_roots),
+            protected_read_roots: RwLock::new(Vec::new()),
             mode,
             prompter: None,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -160,12 +179,46 @@ impl Permissions {
         self.write_roots.read().unwrap().clone()
     }
 
+    /// Paths containing Kitsu's own configuration/transcripts. These remain
+    /// unreadable to model tools even under a broader allow root or `--yes`.
+    pub fn protect_read_path(&self, path: &str) -> Result<PathBuf, ToolError> {
+        let canon = std::fs::canonicalize(path).map_err(|e| {
+            ToolError::PolicyDenied(format!("private path '{path}' is not accessible: {e}"))
+        })?;
+        insert_minimal_root(
+            &mut self.protected_read_roots.write().unwrap(),
+            canon.clone(),
+        );
+        Ok(canon)
+    }
+
+    pub fn protected_read_roots(&self) -> Vec<PathBuf> {
+        self.protected_read_roots.read().unwrap().clone()
+    }
+
+    pub fn is_read_protected(&self, path: &Path) -> bool {
+        let canon = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+        self.protected_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| canon.starts_with(root))
+    }
+
+    /// Revoke grants added after construction while preserving explicit CLI
+    /// roots (and the interactive launch-directory read root). Session switches
+    /// use this so one conversation's approvals cannot authorize another.
+    pub fn reset_runtime_grants(&self) {
+        *self.read_roots.write().unwrap() = self.base_read_roots.clone();
+        *self.write_roots.write().unwrap() = self.base_write_roots.clone();
+    }
+
     /// Add a read-allowed root at runtime (e.g. the `/allow` command).
     pub fn grant_read_root(&self, path: &str) -> Result<PathBuf, ToolError> {
         let canon = std::fs::canonicalize(path).map_err(|e| {
             ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
         })?;
-        self.read_roots.write().unwrap().push(canon.clone());
+        insert_minimal_root(&mut self.read_roots.write().unwrap(), canon.clone());
         Ok(canon)
     }
 
@@ -174,7 +227,7 @@ impl Permissions {
         let canon = std::fs::canonicalize(path).map_err(|e| {
             ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
         })?;
-        self.write_roots.write().unwrap().push(canon.clone());
+        insert_minimal_root(&mut self.write_roots.write().unwrap(), canon.clone());
         Ok(canon)
     }
 
@@ -187,6 +240,18 @@ impl Permissions {
                 requested.display()
             ))
         })?;
+        if self
+            .protected_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| canon.starts_with(root))
+        {
+            return Err(ToolError::PolicyDenied(format!(
+                "path '{}' contains Kitsu-private configuration or session state",
+                requested.display()
+            )));
+        }
         if self
             .read_roots
             .read()
@@ -244,9 +309,13 @@ impl Permissions {
             .iter()
             .any(|r| contained_as.starts_with(r))
         {
-            return Ok(target);
+            return Ok(contained_as);
         }
-        self.resolve(Action::Write, requested, target).await
+        // For a symlink, both the prompt and the returned write target must be
+        // the resolved destination. Showing/authorizing the innocent-looking
+        // in-repo link while later following it outside would be a confused-
+        // deputy write.
+        self.resolve(Action::Write, requested, contained_as).await
     }
 
     /// Shared tail of check_read/check_write for a not-yet-allowed `canon` path.
@@ -273,7 +342,7 @@ impl Permissions {
                             Action::Read => &self.read_roots,
                             Action::Write => &self.write_roots,
                         };
-                        roots.write().unwrap().push(grant_dir);
+                        insert_minimal_root(&mut roots.write().unwrap(), grant_dir);
                         Ok(canon)
                     }
                     Decision::Deny => Err(ToolError::PolicyDenied(format!(
@@ -431,6 +500,38 @@ mod tests {
             Err(ToolError::PolicyDenied(_))
         ));
     }
+
+    #[test]
+    fn runtime_grants_are_deduplicated_and_parent_minimized() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        std::fs::create_dir(&child).unwrap();
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+
+        perms.grant_read_root(&child.to_string_lossy()).unwrap();
+        perms.grant_read_root(&child.to_string_lossy()).unwrap();
+        assert_eq!(perms.read_roots().len(), 1);
+
+        perms
+            .grant_read_root(&dir.path().to_string_lossy())
+            .unwrap();
+        assert_eq!(perms.read_roots(), vec![dir.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn session_reset_revokes_runtime_grants_but_keeps_cli_roots() {
+        let base = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let perms =
+            Permissions::for_roots(&[base.path().to_string_lossy().to_string()], &[]).unwrap();
+        perms
+            .grant_read_root(&runtime.path().to_string_lossy())
+            .unwrap();
+        assert_eq!(perms.read_roots().len(), 2);
+
+        perms.reset_runtime_grants();
+        assert_eq!(perms.read_roots(), vec![base.path().to_path_buf()]);
+    }
 }
 
 #[cfg(test)]
@@ -492,6 +593,37 @@ mod symlink_tests {
         let link = allowed.join("link.txt");
         std::os::unix::fs::symlink(&real, &link).unwrap(); // link stays inside root
         let perms = Permissions::for_roots(&[], &[allowed.to_string_lossy().to_string()]).unwrap();
-        assert!(perms.check_write(&link).await.is_ok());
+        assert_eq!(perms.check_write(&link).await.unwrap(), real);
+    }
+
+    #[tokio::test]
+    async fn ask_mode_displays_and_authorizes_symlink_destination() {
+        use std::sync::Mutex;
+
+        struct Capture(Arc<Mutex<Option<String>>>);
+        impl Prompter for Capture {
+            fn ask(&self, request: &PermissionRequest) -> Decision {
+                *self.0.lock().unwrap() = Some(request.path.clone());
+                Decision::AllowOnce
+            }
+        }
+
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let destination = outside.join("credentials.txt");
+        std::fs::write(&destination, "original").unwrap();
+        let link = project.join("config.txt");
+        std::os::unix::fs::symlink(&destination, &link).unwrap();
+        let shown = Arc::new(Mutex::new(None));
+        let perms = Permissions::new(&[], &[], Mode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(Capture(shown.clone())));
+
+        let authorized = perms.check_write(&link).await.unwrap();
+        assert_eq!(authorized, destination);
+        assert_eq!(shown.lock().unwrap().as_deref(), destination.to_str());
     }
 }

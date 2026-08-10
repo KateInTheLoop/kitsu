@@ -143,8 +143,13 @@ pub fn discover(start: &Path, configured: Option<&Path>) -> Option<PathBuf> {
 /// (`AGENTS.md`/`CLAUDE.md`), rendering with the `## Optional` section included
 /// only if the whole thing fits within `window/4` tokens. The result is capped at
 /// `window/3` tokens so it can't swamp a small window (it lives in the protected
-/// system prompt and isn't trimmed). Returns `(rendered_context, token_estimate)`.
-pub fn load(start: &Path, configured: Option<&Path>, window: Option<u64>) -> Option<(String, u64)> {
+/// system prompt and isn't trimmed). Returns rendered context, token estimate,
+/// and the exact source path so the UI can disclose what will be sent.
+pub fn load(
+    start: &Path,
+    configured: Option<&Path>,
+    window: Option<u64>,
+) -> Option<(String, u64, PathBuf)> {
     let path = discover(start, configured)?;
     // Bound the read so a pathologically large file can't blow up memory; the
     // rendered context is capped again below.
@@ -175,7 +180,7 @@ pub fn load(start: &Path, configured: Option<&Path>, window: Option<u64>) -> Opt
 
     let rendered = cap_to_tokens(rendered, required_cap);
     let tokens = estimate_str(&rendered);
-    Some((rendered, tokens))
+    Some((rendered, tokens, path))
 }
 
 /// Read at most `max` bytes of a file as (lossy) UTF-8.
@@ -247,12 +252,13 @@ mod tests {
         let content = format!("# P\n> sum\n## S\n- [a](b)\n## Optional\n{big_optional}\n");
         std::fs::write(dir.path().join("llms.txt"), content).unwrap();
         // Small window → window/4 optional budget is tiny → optional dropped.
-        let (rendered, _) = load(dir.path(), None, Some(2000)).unwrap();
+        let (rendered, _, source) = load(dir.path(), None, Some(2000)).unwrap();
         assert!(rendered.contains("# P"));
         assert!(
             !rendered.contains("zzz"),
             "optional should be dropped under budget"
         );
+        assert_eq!(source, dir.path().join("llms.txt"));
     }
 
     #[test]

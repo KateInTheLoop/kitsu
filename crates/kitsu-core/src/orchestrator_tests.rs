@@ -14,7 +14,9 @@ use kitsu_providers::{
 };
 use kitsu_tools::{HandlerFn, Registry, ToolError};
 
-use crate::orchestrator::{run_agent_turn, AgentConfig};
+use crate::orchestrator::{
+    run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentSessionState, TurnCompletion,
+};
 
 /// One scripted round's worth of deltas.
 type Script = Vec<ChatDelta>;
@@ -225,7 +227,15 @@ async fn test_loop_max_rounds_cap() {
     let mut tools = Registry::new();
     tools.register("loop_tool", ok_handler(r#"{"ok":true}"#));
 
-    let result = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(3)).await;
+    let mut state = AgentSessionState::default();
+    let result = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(3),
+        &mut state,
+    )
+    .await;
 
     assert!(
         result.is_ok(),
@@ -236,6 +246,7 @@ async fn test_loop_max_rounds_cap() {
         3,
         "the loop must cap at exactly max_rounds (3) provider calls and not hang"
     );
+    assert_eq!(state.last_turn.completion, TurnCompletion::MaxRounds);
 }
 
 /// Robustness (robustness fix): on the FINAL permitted round the loop
@@ -351,9 +362,16 @@ async fn test_loop_tool_error_fed_back() {
     let mut tools = Registry::new();
     tools.register("bad_tool", err_handler(ran.clone()));
 
-    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
-        .await
-        .expect("a failing tool must not abort the loop");
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("a failing tool must not abort the loop");
 
     assert_eq!(
         ran.load(Ordering::SeqCst),
@@ -369,6 +387,7 @@ async fn test_loop_tool_error_fed_back() {
         out.contains("recovered"),
         "the loop should reach the round-2 answer: {out}"
     );
+    assert_eq!(state.last_turn.tool_errors, 1);
 
     // The error must have been fed back as a tool message on round 2.
     let seen = provider.seen_messages.lock().unwrap();
@@ -392,9 +411,16 @@ async fn test_loop_length_finish_is_surfaced() {
     ]]);
     let tools = Registry::new();
 
-    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
-        .await
-        .expect("length-truncated turn should still return Ok with the partial text");
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("length-truncated turn should still return Ok with the partial text");
 
     assert!(
         out.contains("partial answer that got cut o"),
@@ -405,6 +431,7 @@ async fn test_loop_length_finish_is_surfaced() {
         "truncation should be surfaced to the caller, got: {out}"
     );
     assert_eq!(provider.call_count(), 1);
+    assert_eq!(state.last_turn.completion, TurnCompletion::LengthLimited);
 }
 
 /// Fix #4 (edge case): a `Length` finish during a TOOL-CALL round must not be
@@ -883,7 +910,15 @@ fn tool_activity_formatting() {
 
     assert_eq!(
         format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
-        "42 bytes written"
+        "written · 42 bytes"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_write_file",
+            r#"{"written":"x","bytes":42,"change":"unchanged"}"#,
+            false
+        ),
+        "unchanged · 42 bytes"
     );
     assert_eq!(
         format_tool_result("repo_grep", "l1\nl2\nl3", false),
@@ -900,7 +935,7 @@ fn tool_activity_formatting() {
             r#"{"error":"PolicyDenied","detail":"nope"}"#,
             true
         ),
-        "error: PolicyDenied"
+        "error: PolicyDenied — nope"
     );
 }
 

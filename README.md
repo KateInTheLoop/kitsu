@@ -10,8 +10,8 @@ providers** in the binary — you describe each endpoint as a *gateway profile* 
 select it at runtime.
 
 - `kitsu ask "..."` — one-shot question, streamed answer.
-- `kitsu chat` — interactive multi-turn REPL, with optional read-only filesystem
-  tools.
+- `kitsu chat` — interactive multi-turn coding chat with permission-gated
+  filesystem tools, verified diffs, and resumable sessions.
 
 ---
 
@@ -129,7 +129,14 @@ mkdir -p ~/.kitsu
 cp kitsu.toml ~/.kitsu/config.toml
 ```
 
-Chat history is stored next to the config (e.g. `~/.kitsu/history`).
+Input history and interactive conversation snapshots live in private Kitsu state
+under `~/.kitsu/` (project-local configs get an isolated, stable versioned profile
+there, never a `sessions/` directory in the project). State is created lazily, so
+stateless scripted runs also work with a read-only home directory. Resume with
+`kitsu chat --resume last`. Auth configuration and permission grants are not
+stored, but the full conversation and tool transcript is—use `--no-session` when
+that text may contain secrets. Active config/state paths are excluded from model
+file tools and verified diffs.
 
 ---
 
@@ -424,6 +431,10 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--timeout-secs <n>` | `60` | Per-request HTTP timeout. Raise (e.g. `300`) for slow/heavy calls. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Auto-approve all tool file access without prompting (for scripts/CI). Equivalent to answering "yes" to every permission prompt — use with care. |
+| `--context-window <n>` | profile/discovered | Override the model context window. |
+| `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
+| `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
+| `--no-project-context` | off | Do not discover or send project `llms.txt`/`AGENTS.md` context or local skills. |
 
 **Chat-only flags**
 
@@ -432,6 +443,9 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--allow-path <PATH>` | Allow read-only filesystem tools under `PATH` (repeatable). See [Tools in chat](#tools-in-chat). |
 | `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
+| `--resume [ID]` | Resume an autosaved interactive session; omit the ID for `last`. Filesystem permissions are not restored. |
+| `--no-session` | Disable conversation autosave for this interactive chat. |
+| `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. |
 
 Examples:
 
@@ -471,8 +485,9 @@ it won't ask again.
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
 
-Type `/` and press Tab to discover commands; completion and `/help` share the
-same command registry, so their descriptions stay in sync.
+Enter `/` to show all commands, or type a slash prefix and press Tab to complete
+it. Completion and `/help` share the same command registry, so their descriptions
+stay in sync. Commands reject unexpected arguments and suggest close matches.
 
 Slash commands inside the REPL:
 
@@ -481,7 +496,10 @@ Slash commands inside the REPL:
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
 | `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, and background agents. |
+| `/diff [path]` | Show the verified staged, unstaged, and untracked workspace diff. This is read from Git/the filesystem, not assistant prose. |
+| `/review [path]` | Ask the model to review that verified diff in a no-tools turn (it cannot edit or inspect beyond the supplied evidence). |
 | `/permissions` | Show the current permission mode and canonical read/write roots. |
+| `/tools` | Show enabled tools and the effective permission behavior. |
 | `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
 | `/allow-write <path>` | Grant write access to a path for the rest of the session. |
 | `/skills [filter]` | List available local skills, optionally filtered by name. |
@@ -489,6 +507,10 @@ Slash commands inside the REPL:
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/context` | Show detailed context utilization and provenance. |
 | `/agents [id]` | List background agents, or show one agent's result. |
+| `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
+| `/new` | Autosave the current conversation and start a fresh session. |
+| `/sessions` | List saved sessions. |
+| `/resume <id\|last>` | Resume a saved session without restoring its old permissions. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
 | `/quit` (or `/exit`) | Exit. |
@@ -510,7 +532,17 @@ Slash commands inside the REPL:
 kitsu --gateway ollama chat --allow-write ./out --script gen.txt
 ```
 
-`Ctrl+C` cancels an in-flight response; `Ctrl+D` exits.
+Script failures include the file and line, roll the failed conversation turn
+back, and return exit `1` (command/input/auth setup) or `2` (provider,
+truncation, exhausted rounds, or a failed tool call). Use `--allow-turn-errors`
+only when partial success is intentional.
+
+`Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
+idle prompt it clears input. `Ctrl+D` or `/quit` exits. Completed filesystem side
+effects are never pretended away after cancellation—inspect them with `/diff`.
+
+For simple or accessible terminal output, set `NO_COLOR=1` or `KITSU_PLAIN=1`.
+Set `KITSU_REDUCED_MOTION=1` to disable the animated wait indicator.
 
 ---
 
@@ -556,7 +588,10 @@ into the system prompt. So the model knows what your project *is* without you
 pasting docs, and without slurping every markdown file. The `## Optional` section
 is loaded only when the window has room (it's the first thing skipped on small
 models). If there's no `llms.txt`, kitsu falls back to an `AGENTS.md`/`CLAUDE.md`.
-Set `KITSU_NO_PROJECT_CONTEXT=1` to disable. kitsu ships its own `llms.txt`, so any
+Kitsu prints the exact loaded source path at startup and includes it in `/status`
+and `/context`. Pass `--no-project-context` (or set
+`KITSU_NO_PROJECT_CONTEXT=1`) to disable, including when resuming a session (the
+saved project-bearing system message is replaced). kitsu ships its own `llms.txt`, so any
 `llms.txt`-aware tool — including kitsu — can understand the repo.
 
 ---
