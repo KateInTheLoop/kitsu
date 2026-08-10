@@ -1,196 +1,214 @@
-# Kitsu — Supported Functionality
+# Kitsu — supported functionality
 
-> Status as of 2026-06-19. This documents what the **MVP actually does today**,
-> verified against the live AI gateway. Planned-but-not-built features are listed
-> separately under [Not yet supported](#not-yet-supported) so the line is clear.
+> Status: 2026-08-10. This is a source- and test-backed description of the
+> current CLI. Hosted-provider availability, credentials, billing, and the
+> quality of a particular model remain external to this contract.
 
-Kitsu is a multi-gateway model CLI: **one binary, many models**. You point it at a gateway
-profile and a model id, and it streams the completion. The same binary talks to Mistral,
-Claude, and any OpenAI-compatible endpoint with no code changes — only config/flags differ.
+Kitsu is one OpenAI-compatible CLI for hosted gateways and local servers. Its
+three entry points are:
 
----
-
-## Commands
-
-| Command | What it does | Status |
-|---|---|---|
-| `kitsu ask <prompt>` | Single-turn question; streams the answer to stdout | ✅ Working |
-| `kitsu chat` | Interactive REPL (multi-turn, slash commands, optional tools) | ✅ Working |
-| `kitsu --help` / `kitsu <cmd> --help` | Usage | ✅ Working |
-| `kitsu --version` | Version | ✅ Working |
-
-## Global flags
-
-| Flag | Meaning | Default |
-|---|---|---|
-| `--gateway <name>` | Which `[gateways.<name>]` profile to use | `default_gateway` from config |
-| `--model <id>` | Override the model id (beats the gateway's default) | gateway's `model` |
-| `--config <path>` | Config file location | `$KITSU_CONFIG`, then `~/.kitsu/config.toml` |
-| `--no-stream` | Request a single non-streamed completion | streaming on |
-| `--temperature <f>` | Sampling temperature. **Omitted from the request unless set** | unset (not sent) |
-| `--allow-path <p>` | (`chat`) Allow read-only fs tools under this path (repeatable) | none (tools disabled) |
-
-> **Why `--temperature` is off by default:** newer Anthropic models on Bedrock reject a
-> `temperature` field (`HTTP 400: temperature is deprecated for this model`). Omitting it by
-> default keeps kitsu compatible across all models; pass `--temperature 0.2` when a model accepts it.
-
----
-
-## Interactive chat (`kitsu chat`)
-
-A line-based REPL that prints to the terminal's normal scrollback, so **copy-paste and
-scroll-wheel work natively** (no alt-screen TUI). Powered by `rustyline`: history (persisted to
-`~/.kitsu/history`), arrow keys, Ctrl+A/E/W, bracketed multi-line paste, and Tab
-completion for slash commands.
-
-- **Multi-turn**: conversation history is retained across turns.
-- **Slash commands**: type `/` then Tab to discover them. The session controls
-  include `/status`, `/permissions`, `/model`, `/models`, `/context`, `/allow`,
-  `/allow-write`, `/skills`, `/skill`, `/save`, `/agents`, `/clear`, `/help`, and
-  `/quit`.
-- **Turn status**: an interactive turn ends with one human-readable usage/context
-  line. Redirected runs keep the stable `kitsu-usage:` and `kitsu-context:` JSON
-  records on stderr for automation.
-- **Ctrl+C** cancels the in-flight streaming response and returns to the prompt; **Ctrl+D** (or
-  Ctrl+C at an empty prompt) exits.
-- **Non-TTY stdin** (`echo "hi" | kitsu chat`) runs a single turn and exits — same shape as `ask`.
-- **Tools**: pass `--allow-path <dir>` to enable read-only filesystem tools (`fs_read_file`,
-  `fs_list_dir`, and `repo_grep` if `rg` is installed). The model can call them during a turn;
-  every access is checked against the allowlist (deny-by-default, `..`/symlink-safe). Tool names
-  use underscores (not dots) so they pass Bedrock's `[a-zA-Z0-9_-]+` constraint across all gateways.
-
----
-
-## Gateways & models
-
-### How model routing works
-
-A **gateway profile** bundles `{ base_url, chat_path, model, flavor, auth }`. Because the example
-gateway exposes one OpenAI-compatible route (`/v1/chat/completions`) for *all* its
-models, switching models is just `--model <id>` against the same `example` profile — no new profile,
-no code change.
-
-### Verified working models (via gateway)
-
-| Model id | Provider | Tier | Verified |
-|---|---|---|---|
-| `example-model-v1` | Mistral (Bedrock) | high | ✅ chat + code-gen |
-| `claude-sonnet-4-6` | Anthropic (Bedrock) | med | ✅ chat |
-| `claude-opus-4-8` | Anthropic (Bedrock) | high | ✅ chat + code-gen (use without `--temperature`) |
-
-Other Anthropic ids on the same route (`claude-opus-4-7`, `claude-haiku-4-5-*`, etc.) should work
-identically — they share the `/v1/chat/completions` endpoint.
-
-### Provider flavors
-
-| Flavor | Wire shape | Status |
-|---|---|---|
-| `openai` | OpenAI chat/completions — covers OpenAI, vLLM, Mistral, **gateway, Anthropic-on-Bedrock** | ✅ Implemented |
-| `anthropic` | Anthropic-native `/v1/messages` (top-level system, content blocks) | ⏳ Accepted in config, **not implemented** (not needed — Anthropic works via `openai` flavor on the gateway) |
-| `ollama` | Ollama NDJSON | ⏳ Config-accepted, not implemented |
-
----
-
-## Authentication
-
-| Method (`auth.method`) | Behavior | Status |
-|---|---|---|
-| `bearer-env` | Reads token from env var (`auth.env`, default `ANTHROPIC_AUTH_TOKEN`); sends `Authorization: Bearer <token>` | ✅ Working |
-| `static` | Inline token in config (discouraged; redacted in output) | ✅ Implemented |
-| `none` | No auth header (local vLLM/Ollama) | ✅ Implemented |
-
-Security & expiry behavior:
-- The token is read from the env var **at request time**, marked sensitive, and **never logged,
-  persisted, or printed** in errors.
-- **Expiry**: read from `ANTHROPIC_TOKEN_EXPIRES` (RFC3339) only — no JWT decoding. If expired,
-  kitsu prints a stderr warning and **sends anyway** (the gateway's real 401 is authoritative).
-- **Missing token** → exit 1 with: `auth error: $ANTHROPIC_AUTH_TOKEN is not set — run refresh-token …`
-
----
-
-## The agent loop
-
-`kitsu ask` runs one user turn through the orchestrator loop (`kitsu-core::run_agent_turn`):
-
-1. Send messages to the model.
-2. If the model emits tool calls → execute each via the tool `Registry`, append results, repeat.
-3. Stop when the model returns a final answer, or a guard trips.
-
-Guards / behavior:
-- **`max_rounds` cap** (default 10) — hard backstop against infinite tool loops.
-- **Context budget** (default 128 KiB) — oldest tool-result messages truncated first; system
-  prompt and latest user message are never dropped.
-- **Error-as-tool-result** — a failing tool is serialized back to the model as a tool message so
-  it can recover, rather than aborting the run.
-
-> **Today's limit:** the tool `Registry` is empty and tool *descriptors are not advertised* to the
-> model, so in practice `ask` runs as a single round (text in → text out). The multi-round loop
-> machinery exists and is tested, but there are no built-in tools wired in yet (see below).
-
----
-
-## Output & exit codes
-
-- Streaming output prints tokens to stdout as they arrive; `--no-stream` buffers and prints once.
-- Errors go to stderr; the token is never echoed.
-
-| Exit code | Meaning |
+| Command | Behavior |
 |---|---|
-| `0` | Success |
-| `1` | User/config/auth error (bad args, unknown gateway, missing token) |
-| `2` | Provider error (gateway 401/403, HTTP error, timeout) |
+| `kitsu ask <prompt>` | One checked model turn; streaming by default. |
+| `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
+| `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
----
+See the [README CLI reference](../README.md#cli-reference) for every flag and
+gateway recipe.
 
-## Examples
+## Chat interface
 
-```bash
-# Mistral via the gateway (uses default_gateway = "example")
-kitsu ask --config ./kitsu.toml --gateway example "Explain a mutex in one sentence."
+Interactive chat uses normal terminal scrollback rather than an alternate-screen
+TUI. Rustyline supplies history, editing keys, bracketed multi-line paste, and
+Tab completion. `/help` and completion share one command registry. `@path`
+completion is additionally restricted to already granted, non-protected paths
+and refuses symlink-directory traversal.
 
-# Claude Opus 4.8 — same gateway, just a different model (no --temperature!)
-kitsu ask --config ./kitsu.toml --gateway example \
-  --model claude-opus-4-8 \
-  "Write a Python prime checker. Raw code only."
+The implemented chat controls include:
 
-# Capture generated code to a file
-kitsu ask --gateway example --model claude-sonnet-4-6 \
-  "Write a bash script that backs up ~/notes. Raw code only." > /tmp/backup.sh
-```
+- Inspection: `/status`, `/context`, `/permissions`, `/tools`, `/diff [path]`,
+  `/agents [id]`, and `/sessions`.
+- Model/context: `/model`, `/models`, `/compact`, `/clear`, and `/retry`.
+- Files/workflow: `/allow`, `/allow-write`, `/save`, `/review`, and `/undo`.
+- Local context: `/skills` and `/skill`; bounded UTF-8 skill resources are
+  captured with no-follow reads and loading them grants no filesystem access.
+- Scheduling: `/queue [prompt]`.
+- Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
+  `/restore`, and `/delete`.
 
-Minimal config (`kitsu.toml`):
+`/status` reports the active session, endpoint, model, directory/Git state,
+project-context source, context usage, tool and permission state, command roots,
+background agents, cumulative compaction savings, and the last compaction
+outcome/fallback. `/context` provides the more detailed source-by-source token
+estimate and compaction ledger.
 
-```toml
-default_gateway = "example"
+`Ctrl+C` cancels an active provider/tool turn, rolls its conversation and context
+meter back, and makes the submitted prompt available to `/retry`. Completed file
+side effects remain on disk and are reported rather than hidden. At an idle
+prompt, `Ctrl+C` clears the input; `Ctrl+D` or `/quit` exits. Interactive exit
+waits for background agents, and another `Ctrl+C` cancels that remaining work.
 
-[gateways.example]
-flavor      = "openai"
-base_url    = "https://gateway.example.com"
-chat_path   = "/v1/chat/completions"
-models_path = ""
-model       = "example-model-v1"
-auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
-```
+### Prompt queue and platform behavior
 
----
+The queue is an eight-entry FIFO. `/queue` shows it or appends one prompt, and
+queued prompts run in submission order. On Unix, Kitsu owns complete lines typed
+while a foreground turn is running and places them into this queue; partial input
+remains in the terminal buffer, and permission prompts temporarily own stdin. If
+the queue is full, the collector waits for a slot rather than evicting work.
 
-## Not yet supported
+Automatic type-ahead collection is not implemented on non-Unix platforms.
+`/queue <prompt>` still works there when the normal prompt is available, but text
+entered during generation remains subject to terminal/OS buffering.
 
-These are designed (`docs/architecture.md`) or planned (`development_plan.md`) but **not built**:
+## File and developer workflows
 
-- **Built-in tools** (`fs.read_file`, `fs.write_file`, `fs.list_dir`, `repo.grep`, `git.diff`) and
-  **tool descriptor advertising** — required for kitsu to write files / run tools on its own
-  (currently it returns code as text; you redirect to a file). *(Phase 3–4)*
-- **Interactive `chat` REPL** (history, `/model`, `/clear`) — currently a stub. *(Phase 1)*
-- **Anthropic-native and Ollama flavors** — config-accepted but not wired (Anthropic already works
-  via the `openai` flavor on the gateway). *(Phase 2 / post-MVP)*
-- **`--json` structured output**, **`doctor`**, **`models list`**, **shell completions**,
-  **policy engine + audit log**. *(Phases 2–5)*
-- **Retry/backoff** is implemented for 429/503; **Ctrl+C cancellation** is not yet.
+Interactive chat advertises read, edit, and write tools and asks for paths as
+needed. The launch directory is read-granted; writes begin ungranted. Scripted
+and piped runs advertise filesystem capabilities only when corresponding
+`--allow-path` or `--allow-write` roots were supplied. `--yes` changes approval
+behavior but never creates a capability.
 
-## Known gotchas
+- `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
+- `fs_write_file` performs a bounded whole-file create/replace.
+- `fs_edit_file` replaces exact UTF-8 `old_text`. The precondition must match
+  exactly once unless `replace_all` is set, and a concurrent change before
+  commit causes a conflict instead of an overwrite.
+- Successful model writes are grouped into checkpoints. Kitsu reports verified
+  paths, byte counts, and first changed lines. `/undo` restores only the latest
+  checkpoint and refuses if a covered file no longer matches its recorded
+  post-write snapshot. It is blocked while background agents are active.
+- `/diff` derives bounded staged, unstaged, and untracked evidence from Git and
+  the filesystem. `/review` submits exactly that evidence in a no-tools turn.
 
-- **`temperature`** — omit it (don't pass `--temperature`) for newer Anthropic models, or you get
-  `HTTP 400: temperature is deprecated`.
-- **Token staleness in long sessions** — `refresh-token` refreshes your login shell, not an
-  already-running process; re-source or read the fresh token from `~/.zshrc`.
+Developer commands are an independent, explicit capability. `--enable-commands`
+registers `command_exec`; roots come from `--command-root` or the launch
+directory. It accepts a literal argv array and an explicit cwd—never a shell
+string—and returns bounded stdout/stderr plus exit, signal, timeout, truncation,
+and elapsed-time metadata. Interactive invocations have their own approval
+prompt; automation must use exact `--allow-command` grants. `--yes` and
+filesystem grants do not approve commands. Default command timeout is 120
+seconds, the requestable maximum is 600 seconds, and retained stdout and stderr
+are each capped at 64 KiB.
+
+### `@file` attachments
+
+Prompts may contain `@path`, `@path:line`, or `@path:start-end`. Before the user
+turn is committed, each mention passes the normal canonical read policy and
+protected-path checks. Attachments are regular UTF-8 text only, reject NUL/binary
+data, are deduplicated, and are delimited as untrusted data in the expanded
+prompt. Selected content is capped at 32 KiB per attachment and 64 KiB per
+prompt. A bounded line range streams from a larger file without retaining the
+whole file, and reading stops after the requested end line. Kitsu prints the
+canonical attachment/range summary. `/retry` re-reads the submitted mentions.
+
+## Sessions and artifacts
+
+Interactive chat autosaves private snapshots and input history under Kitsu's
+state directory. Project-local configs receive isolated stable profile
+directories under `~/.kitsu`; no session directory is created in the project.
+Snapshots contain the conversation/tool transcript, not credentials or runtime
+permission grants. `--no-session` disables both snapshots and prompt history.
+
+- `/resume last` selects the most recently saved *other* session. Resume requires
+  the saved working directory and gateway and starts with fresh permissions.
+- `/fork [id]` copies a session to a fresh ID and switches to it with fresh
+  runtime authority. Persistent tool-output artifacts are copied and exact
+  stored pointers are rewritten.
+- `/export <file> [markdown|json]` never overwrites the primary destination. If
+  the session has artifacts it also creates a sibling named by appending
+  `.artifacts` to the complete destination filename (for example,
+  `chat.md.artifacts`) and rewrites exact exported pointers to that sidecar.
+  Existing primary or sidecar destinations are refused.
+- `/archive` and `/restore` move inactive snapshots and their artifacts through
+  recoverable private archive storage. `/delete` requires an exact inactive live
+  ID and permanently removes its validated snapshot/artifacts.
+- Leases prevent concurrent activation or lifecycle mutation of the same saved
+  session. Lifecycle commands reject symlinked or irregular private entries.
+
+## Context management
+
+The CLI always gives the orchestrator a token window. Resolution is:
+
+1. `--context-window`;
+2. gateway-profile `context_window`;
+3. a fresh 24-hour on-disk discovery entry for endpoint + models path + model;
+4. the enforced conservative default, 8192 tokens.
+
+On a cold cache, best-effort `/v1/models` discovery runs asynchronously with a
+separate two-second deadline and can populate a later run; it never delays the
+current inference. Explicit `models`/`/models` requests use the configured CLI
+timeout. Within one provider instance, successful catalogs are cached for 60
+seconds and eligible failures for five seconds. An unpinned `/model` switch
+resolves the new model's window before switching; a CLI/profile-pinned window is
+kept.
+
+The context meter estimates cold requests structurally, then anchors subsequent
+estimates on real provider `prompt_tokens`. It includes tool schemas and reserves
+reply space. Large successful tool results are stored as private artifacts with
+a re-readable pointer and preview. Under pressure Kitsu elides old tool bodies,
+then drops or summarizes eligible whole exchanges while preserving the leading
+system context and two newest exchanges. Every concrete provider request gets a
+final local fit check; protected recent context that cannot fit returns an
+actionable local error instead of being sent oversized.
+
+`--compaction trim` is deterministic. `summarize` uses a separately bounded,
+non-streaming summarizer request and accepts a summary only if the rebuilt
+history fits; otherwise it records a reason and falls back to trimming. Three
+consecutive summary failures open a circuit breaker. `/compact` forces the same
+machinery below the automatic threshold and restores the original conversation
+if it is cancelled or errors.
+
+See [context-management-design.md](context-management-design.md) for the exact
+budget and telemetry contract.
+
+## Automation, output, and exit status
+
+`--script` skips comments/blank lines, treats each normal line as a turn, and
+supports verbatim `<<<`/`>>>` multi-line turns. Slash commands work, except
+interactive-only queue/session transitions. Failed or cancelled turns roll back
+conversation state while preserving completed filesystem changes. Scripts are
+strict by default; `--allow-turn-errors` accepts partial completion.
+
+`--jsonl` is the machine protocol. It disables provider streaming and emits one
+`kitsu.chat.v1` JSON object per stdout line: run/turn/command framing,
+provider/tool/usage events, assistant text, typed errors, and exactly one
+`final_summary`. It rejects interactive TTY chat and human help/version output.
+Human diagnostics may still use stderr, but the event stream contains enough
+status and counts to determine the run outcome. Error events classify ordinary
+failures as `user`, `provider`, or `cancelled`; specialized turn/tool errors may
+use a more specific kind.
+
+Without JSONL, stdout contains assistant text only. Human metadata is on stderr;
+redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
+
+| Exit | Meaning |
+|---:|---|
+| `0` | Success, including a partial script explicitly accepted with `--allow-turn-errors`. |
+| `1` | CLI/input/config/missing-auth, attachment, permission/policy, context-fit, or slash-command failure. |
+| `2` | Provider/HTTP/timeout/agent-loop failure, or a strict incomplete turn caused by output truncation, exhausted rounds, or failed tool calls. |
+| `130` | Ctrl+C cancellation. |
+
+## Terminal and portability notes
+
+`KITSU_PLAIN=1`, `NO_COLOR=1`, or `TERM=dumb` selects plain rendering.
+Renderer-owned banners, progress, context tables, telemetry, tool activity, and
+approval prompts then use ASCII structural markers without ANSI/OSC styling.
+Model output is always stripped of terminal control strings, but arbitrary safe
+Unicode in model text, paths, and user data is preserved. `KITSU_REDUCED_MOTION=1`
+uses a visible static status instead of the animated spinner.
+
+Unix builds additionally use descriptor-bound command cwd, process-group command
+cancellation, and descriptor-relative no-follow mutation/session operations.
+Portable branches validate paths and snapshots and cancel/reap the direct child,
+but retain platform pathname races and cannot kill an entire descendant process
+group. Operations requiring an unavailable race-free atomic primitive fail
+closed rather than weakening the conflict guarantee.
+
+## Verification boundary
+
+The repository contract is local and reproducible: formatting, Clippy, workspace
+unit/integration tests, focused CLI/JSONL/context/session/security regressions,
+and release audits must pass before a cycle commit. Live hosted inference is a
+separate smoke test because it depends on external credentials, billing,
+provider availability, and model behavior; it is never implied by the local
+suite.

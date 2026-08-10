@@ -2,8 +2,9 @@
 //! AI gateway — they share one wire shape; only base_url/path/auth differ
 //! (design §1, §4).
 
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
@@ -27,7 +28,21 @@ pub struct OpenAICompatProvider {
     pub(crate) models_path: Option<String>,
     pub(crate) auth: Arc<dyn AuthProvider>,
     pub(crate) retries: u32,
+    /// End-to-end inference budget, including all retry sleeps and attempts.
     pub(crate) timeout: Duration,
+    /// Advisory catalog lookup budget. Kept separate from `timeout` so a slow
+    /// `/models` endpoint cannot consume the much larger inference budget.
+    pub(crate) discovery_timeout: Duration,
+    /// One provider instance serves startup discovery, `/models`, and `/model`.
+    /// Cache their shared raw catalog response so those paths do not issue
+    /// duplicate requests or repeatedly stall on the same failed endpoint.
+    models_cache: tokio::sync::Mutex<Option<ModelsCacheEntry>>,
+}
+
+struct ModelsCacheEntry {
+    stored_at: tokio::time::Instant,
+    ttl: Duration,
+    outcome: Result<(StatusCode, String), ProviderError>,
 }
 
 /// Builder inputs for constructing a gateway-backed provider.
@@ -36,10 +51,16 @@ pub struct OpenAICompatConfig {
     pub chat_path: String,
     pub models_path: Option<String>,
     pub retries: u32,
+    /// End-to-end inference budget, including all retry sleeps and attempts.
     pub timeout: Duration,
 }
 
 impl OpenAICompatProvider {
+    /// Advisory background model metadata uses a deliberately short budget.
+    const DEFAULT_DISCOVERY_TIMEOUT: Duration = Duration::from_secs(2);
+    const MODELS_CACHE_TTL: Duration = Duration::from_secs(60);
+    const MODELS_NEGATIVE_CACHE_TTL: Duration = Duration::from_secs(5);
+
     pub fn new(cfg: OpenAICompatConfig, auth: Arc<dyn AuthProvider>) -> Self {
         Self {
             http: reqwest::Client::new(),
@@ -49,7 +70,17 @@ impl OpenAICompatProvider {
             auth,
             retries: cfg.retries,
             timeout: cfg.timeout,
+            discovery_timeout: Self::DEFAULT_DISCOVERY_TIMEOUT,
+            models_cache: tokio::sync::Mutex::new(None),
         }
+    }
+
+    /// Override the catalog request budget. Explicit user-facing catalog
+    /// commands use the CLI's requested timeout; advisory background discovery
+    /// keeps the short default.
+    pub fn with_discovery_timeout(mut self, timeout: Duration) -> Self {
+        self.discovery_timeout = timeout;
+        self
     }
 
     /// Resolve the refresh hint surfaced on a gateway 401/403.
@@ -495,6 +526,35 @@ fn map_send_error(e: reqwest::Error) -> ProviderError {
     }
 }
 
+/// A gateway-provided retry delay is useful, but it is still untrusted input.
+/// Capping it keeps one response from parking the client for an arbitrary time;
+/// the request-wide deadline below may impose an even smaller bound.
+const MAX_RETRY_DELAY: Duration = Duration::from_secs(30);
+const MAX_RETRY_JITTER: Duration = Duration::from_millis(250);
+
+/// Parse either Retry-After form from RFC 9110: delay-seconds or an HTTP date.
+/// Numeric overflow is treated as a very large delay and therefore capped,
+/// rather than silently falling back to the much shorter exponential delay.
+fn parse_retry_after(value: &str, now: SystemTime) -> Option<Duration> {
+    let value = value.trim();
+    if !value.is_empty() && value.bytes().all(|b| b.is_ascii_digit()) {
+        let seconds = value
+            .parse::<u64>()
+            .unwrap_or(MAX_RETRY_DELAY.as_secs())
+            .min(MAX_RETRY_DELAY.as_secs());
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let retry_at = chrono::DateTime::parse_from_rfc2822(value).ok()?;
+    let now = chrono::DateTime::<chrono::Utc>::from(now);
+    let delay = retry_at
+        .with_timezone(&chrono::Utc)
+        .signed_duration_since(now)
+        .to_std()
+        .unwrap_or(Duration::ZERO);
+    Some(delay.min(MAX_RETRY_DELAY))
+}
+
 /// Exponential backoff for retry `attempt` (1-based): 200ms, 400ms, 800ms, …
 /// The shift exponent is clamped to 6 BEFORE shifting, so the multiplier maxes
 /// at 64 (~12.8s) and can never overflow regardless of how large `retries` is
@@ -503,6 +563,69 @@ fn backoff_delay(attempt: u32) -> Duration {
     let exp = attempt.saturating_sub(1).min(6);
     let mult = 1u64 << exp; // exp ≤ 6 ⇒ at most 64, never overflows
     Duration::from_millis(200 * mult)
+}
+
+/// Add positive jitter without ever exceeding the retry-delay cap. The sample
+/// is an argument so the arithmetic is deterministic in unit tests.
+fn add_retry_jitter(delay: Duration, sample: u64) -> Duration {
+    let jitter_cap = (delay / 10).min(MAX_RETRY_JITTER);
+    if jitter_cap.is_zero() {
+        return delay.min(MAX_RETRY_DELAY);
+    }
+    // `jitter_cap` is at most 250ms, so this conversion cannot truncate.
+    let slots = jitter_cap.as_nanos() as u64 + 1;
+    let jitter = Duration::from_nanos(sample % slots);
+    delay.saturating_add(jitter).min(MAX_RETRY_DELAY)
+}
+
+/// Select a retry delay. The local backoff remains a floor, so a zero/past
+/// Retry-After cannot turn a failing gateway into a hot loop.
+fn retry_delay(
+    attempt: u32,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    now: SystemTime,
+    jitter_sample: u64,
+) -> Duration {
+    let advertised = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, now))
+        .unwrap_or(Duration::ZERO);
+    add_retry_jitter(backoff_delay(attempt).max(advertised), jitter_sample)
+}
+
+/// Cheap process-local entropy is sufficient for retry jitter: it is not a
+/// security primitive, only a way to keep concurrent clients from marching in
+/// lockstep after a shared 429/503 response.
+fn retry_jitter_sample(attempt: u32) -> u64 {
+    static COUNTER: AtomicU64 = AtomicU64::new(0);
+    let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
+    let clock = SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .map(|duration| u64::from(duration.subsec_nanos()))
+        .unwrap_or(0);
+    clock ^ counter.rotate_left(17) ^ u64::from(attempt).wrapping_mul(0x9e37_79b9_7f4a_7c15)
+}
+
+fn remaining_request_time(started: tokio::time::Instant, timeout: Duration) -> Option<Duration> {
+    timeout
+        .checked_sub(started.elapsed())
+        .filter(|remaining| !remaining.is_zero())
+}
+
+/// Sleep only while the total request budget permits. If the requested delay
+/// reaches the deadline, return Timeout instead of starting a doomed attempt.
+async fn sleep_before_retry(
+    started: tokio::time::Instant,
+    timeout: Duration,
+    delay: Duration,
+) -> Result<(), ProviderError> {
+    let remaining = remaining_request_time(started, timeout).ok_or(ProviderError::Timeout)?;
+    if delay >= remaining {
+        tokio::time::sleep(remaining).await;
+        return Err(ProviderError::Timeout);
+    }
+    tokio::time::sleep(delay).await;
+    Ok(())
 }
 
 /// One step of the streaming SSE state machine for `stream::unfold`. Yields the
@@ -589,7 +712,55 @@ impl OpenAICompatProvider {
             .filter(|p| !p.is_empty())
             .ok_or_else(|| ProviderError::InvalidResponse("models_path not configured".into()))?;
         let url = format!("{}{}", self.base_url, path);
-        let rb = self.http.get(&url).timeout(self.timeout);
+
+        // A cached catalog must never turn a now-missing credential into an
+        // apparent healthcheck success. Validate current auth before consulting
+        // the cache; auth failures themselves are deliberately never cached.
+        self.auth.header().map_err(ProviderError::Auth)?;
+
+        // Keep the mutex across the request. Catalog calls are rare, and this
+        // prevents a startup discovery plus `/models` from stampeding the same
+        // endpoint before the first response populates the cache.
+        let mut cache = self.models_cache.lock().await;
+        if let Some(entry) = cache.as_ref() {
+            if entry.stored_at.elapsed() < entry.ttl {
+                return entry.outcome.clone();
+            }
+        }
+
+        let outcome = match self.fetch_models_response(&url).await {
+            Ok((status, text)) if status.is_success() => {
+                validate_models_catalog(&text).map(|()| (status, text))
+            }
+            other => other,
+        };
+        let ttl = match &outcome {
+            Ok((status, _)) if status.is_success() => Some(Self::MODELS_CACHE_TTL),
+            Ok((status, _))
+                if *status != StatusCode::UNAUTHORIZED && *status != StatusCode::FORBIDDEN =>
+            {
+                Some(Self::MODELS_NEGATIVE_CACHE_TTL)
+            }
+            Err(
+                ProviderError::Connection(_)
+                | ProviderError::Timeout
+                | ProviderError::InvalidResponse(_),
+            ) => Some(Self::MODELS_NEGATIVE_CACHE_TTL),
+            _ => None,
+        };
+        *cache = ttl.map(|ttl| ModelsCacheEntry {
+            stored_at: tokio::time::Instant::now(),
+            ttl,
+            outcome: outcome.clone(),
+        });
+        outcome
+    }
+
+    async fn fetch_models_response(
+        &self,
+        url: &str,
+    ) -> Result<(StatusCode, String), ProviderError> {
+        let rb = self.http.get(url).timeout(self.discovery_timeout);
         let rb = self.attach_auth(rb)?;
         let resp = rb.send().await.map_err(map_send_error)?;
         let status = resp.status();
@@ -657,6 +828,32 @@ impl OpenAICompatProvider {
     }
 }
 
+/// Validate the common catalog envelope before assigning the positive cache
+/// lifetime. Otherwise a malformed HTTP-200 response would be retained as a
+/// success for 60 seconds even though every consumer rejects it.
+fn validate_models_catalog(text: &str) -> Result<(), ProviderError> {
+    let json: serde_json::Value = serde_json::from_str(text).map_err(|error| {
+        ProviderError::InvalidResponse(format!("malformed /models JSON: {error}"))
+    })?;
+    let entries = json
+        .get("data")
+        .and_then(serde_json::Value::as_array)
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse("malformed /models JSON: missing data array".into())
+        })?;
+    if entries.iter().any(|entry| {
+        entry
+            .get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_none()
+    }) {
+        return Err(ProviderError::InvalidResponse(
+            "malformed /models JSON: every data entry must have a string id".into(),
+        ));
+    }
+    Ok(())
+}
+
 impl Provider for OpenAICompatProvider {
     async fn healthcheck(&self) -> Result<(), ProviderError> {
         // Degrade when there is no /models endpoint: just verify an auth token
@@ -677,13 +874,19 @@ impl Provider for OpenAICompatProvider {
         let url = format!("{}{}", self.base_url, self.chat_path);
         let body = build_body(&req);
 
-        // Retry loop for transient 429/503; other outcomes return immediately.
+        // Retry transient 429/503 responses within one end-to-end deadline.
+        // Each attempt receives only the remaining budget; reqwest keeps that
+        // timeout active through the response body, including streaming bodies.
+        // Auth failures and all other 4xx responses return immediately below.
+        let started = tokio::time::Instant::now();
         let mut attempt: u32 = 0;
         let response = loop {
+            let remaining =
+                remaining_request_time(started, self.timeout).ok_or(ProviderError::Timeout)?;
             let rb = self
                 .http
                 .post(&url)
-                .timeout(self.timeout)
+                .timeout(remaining)
                 .header(reqwest::header::CONTENT_TYPE, "application/json")
                 .json(&body);
             let rb = self.attach_auth(rb)?;
@@ -696,7 +899,14 @@ impl Provider for OpenAICompatProvider {
                         && attempt < self.retries
                     {
                         attempt += 1;
-                        tokio::time::sleep(backoff_delay(attempt)).await;
+                        let delay = retry_delay(
+                            attempt,
+                            resp.headers().get(reqwest::header::RETRY_AFTER),
+                            SystemTime::now(),
+                            retry_jitter_sample(attempt),
+                        );
+                        drop(resp);
+                        sleep_before_retry(started, self.timeout, delay).await?;
                         continue;
                     }
                     break resp;
@@ -704,6 +914,9 @@ impl Provider for OpenAICompatProvider {
                 Err(e) => {
                     if e.is_timeout() && attempt < self.retries {
                         attempt += 1;
+                        let delay =
+                            add_retry_jitter(backoff_delay(attempt), retry_jitter_sample(attempt));
+                        sleep_before_retry(started, self.timeout, delay).await?;
                         continue;
                     }
                     return Err(map_send_error(e));

@@ -2,8 +2,165 @@
 //! Full UX (palette, code blocks, spinners) is later phases (design §8).
 
 use std::io::{self, IsTerminal, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Mutex, OnceLock};
 
 use owo_colors::OwoColorize;
+
+const ESC: char = '\u{1b}';
+const CSI: char = '\u{009b}';
+const OSC: char = '\u{009d}';
+const ST: char = '\u{009c}';
+static ASSISTANT_OUTPUT_WRITTEN: AtomicBool = AtomicBool::new(false);
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum EscapeState {
+    #[default]
+    Ground,
+    Escape,
+    EscapeIntermediate,
+    Csi,
+    Osc,
+    OscEscape,
+    ControlString,
+    ControlStringEscape,
+}
+
+/// Incremental terminal-control scrubber used by streamed assistant output.
+///
+/// Escape sequences often span provider chunks, so sanitizing each fragment in
+/// isolation is insufficient: `ESC` may arrive in one chunk and `[31m` in the
+/// next. The state is retained until [`finish_line`] establishes the next turn
+/// boundary.
+#[derive(Debug, Default)]
+struct TerminalTextSanitizer {
+    state: EscapeState,
+}
+
+impl TerminalTextSanitizer {
+    fn push(&mut self, input: &str) -> String {
+        let mut output = String::with_capacity(input.len());
+        for ch in input.chars() {
+            match self.state {
+                EscapeState::Ground => match ch {
+                    ESC => self.state = EscapeState::Escape,
+                    CSI => self.state = EscapeState::Csi,
+                    OSC => self.state = EscapeState::Osc,
+                    // DCS, SOS, PM, and APC control strings. These are less
+                    // common than OSC but have the same terminal-injection
+                    // properties and are terminated by ST.
+                    '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
+                        self.state = EscapeState::ControlString;
+                    }
+                    '\n' | '\t' => output.push(ch),
+                    _ if !ch.is_control() => output.push(ch),
+                    _ => {}
+                },
+                EscapeState::Escape => match ch {
+                    '[' => self.state = EscapeState::Csi,
+                    ']' => self.state = EscapeState::Osc,
+                    'P' | 'X' | '^' | '_' => self.state = EscapeState::ControlString,
+                    ESC => {}
+                    '\u{20}'..='\u{2f}' => self.state = EscapeState::EscapeIntermediate,
+                    // A newline or tab is content, not part of a valid
+                    // single-character escape sequence. Preserve it while
+                    // still discarding the preceding ESC.
+                    '\n' | '\t' => {
+                        output.push(ch);
+                        self.state = EscapeState::Ground;
+                    }
+                    _ => self.state = EscapeState::Ground,
+                },
+                EscapeState::EscapeIntermediate => match ch {
+                    '\u{20}'..='\u{2f}' => {}
+                    ESC => self.state = EscapeState::Escape,
+                    '\n' | '\t' => {
+                        output.push(ch);
+                        self.state = EscapeState::Ground;
+                    }
+                    _ => self.state = EscapeState::Ground,
+                },
+                EscapeState::Csi => match ch {
+                    '\u{40}'..='\u{7e}' => self.state = EscapeState::Ground,
+                    ESC => self.state = EscapeState::Escape,
+                    '\n' | '\t' => output.push(ch),
+                    _ => {}
+                },
+                EscapeState::Osc => match ch {
+                    '\u{07}' | ST => self.state = EscapeState::Ground,
+                    ESC => self.state = EscapeState::OscEscape,
+                    _ => {}
+                },
+                EscapeState::OscEscape => match ch {
+                    '\\' | '\u{07}' | ST => self.state = EscapeState::Ground,
+                    ESC => {}
+                    _ => self.state = EscapeState::Osc,
+                },
+                EscapeState::ControlString => match ch {
+                    ST => self.state = EscapeState::Ground,
+                    ESC => self.state = EscapeState::ControlStringEscape,
+                    _ => {}
+                },
+                EscapeState::ControlStringEscape => match ch {
+                    '\\' | ST => self.state = EscapeState::Ground,
+                    ESC => {}
+                    _ => self.state = EscapeState::ControlString,
+                },
+            }
+        }
+        output
+    }
+
+    fn reset(&mut self) {
+        self.state = EscapeState::Ground;
+    }
+}
+
+fn stream_sanitizer() -> &'static Mutex<TerminalTextSanitizer> {
+    static SANITIZER: OnceLock<Mutex<TerminalTextSanitizer>> = OnceLock::new();
+    SANITIZER.get_or_init(|| Mutex::new(TerminalTextSanitizer::default()))
+}
+
+/// Remove terminal control sequences and unsafe control characters from
+/// untrusted text while preserving printable Unicode, newlines, and tabs.
+///
+/// CSI/SGR sequences, OSC hyperlinks/titles, other ECMA-48 control strings,
+/// C0/C1 controls, carriage returns, and DEL are removed. This function treats
+/// `input` as a complete message; [`print_fragment`] additionally carries
+/// parser state across streamed chunks.
+pub fn sanitize_terminal_text(input: &str) -> String {
+    TerminalTextSanitizer::default().push(input)
+}
+
+fn sanitize_terminal_inline(input: &str) -> String {
+    sanitize_terminal_text(input)
+        .chars()
+        .map(|ch| if matches!(ch, '\n' | '\t') { ' ' } else { ch })
+        .collect()
+}
+
+fn ascii_structural_markers(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    for ch in input.chars() {
+        match ch {
+            '·' => output.push('|'),
+            '—' | '–' | '─' | '□' => output.push('-'),
+            '│' => output.push('|'),
+            '■' => output.push('#'),
+            '↳' => output.push_str("->"),
+            '…' => output.push_str("..."),
+            '✻' | '⏺' => output.push('*'),
+            '⎿' => output.push('>'),
+            '╭' | '╮' | '╰' | '╯' => output.push('+'),
+            _ => output.push(ch),
+        }
+    }
+    output
+}
+
+fn sanitize_plain_inline(input: &str) -> String {
+    ascii_structural_markers(&sanitize_terminal_inline(input))
+}
 
 /// Cached at startup: is stdout a TTY?
 pub fn is_tty() -> bool {
@@ -36,36 +193,49 @@ pub fn stdin_is_tty() -> bool {
 
 /// Print a streamed text fragment immediately (no newline, flush).
 pub fn print_fragment(s: &str) {
+    let sanitized = stream_sanitizer()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .push(s);
+    if !sanitized.is_empty() {
+        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+    }
     let mut out = io::stdout();
-    let _ = out.write_all(s.as_bytes());
+    let _ = out.write_all(sanitized.as_bytes());
     let _ = out.flush();
 }
 
 /// Render a complete assistant message with lightweight terminal Markdown and
-/// diff styling. Redirected/plain output remains byte-for-byte text; streaming
-/// fragments continue through [`print_fragment`] until a full block is known.
+/// diff styling. Markdown markers are retained so buffered and streaming output
+/// have the same structure once terminal styling is stripped.
 pub fn print_message(s: &str) {
-    if !stdout_style() {
-        print_fragment(s);
-        return;
+    let sanitized = sanitize_terminal_text(s);
+    let rendered = format_message(&sanitized, stdout_style());
+    if !rendered.is_empty() {
+        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
     }
     let mut out = io::stdout();
+    let _ = out.write_all(rendered.as_bytes());
+    let _ = out.flush();
+}
+
+fn format_message(s: &str, styled: bool) -> String {
+    if !styled {
+        return s.to_string();
+    }
+    let mut out = String::with_capacity(s.len());
     let mut fence: Option<String> = None;
     for segment in s.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
+        let line = segment.trim_end_matches('\n');
         let newline = if segment.ends_with('\n') { "\n" } else { "" };
         if let Some(language) = line.trim().strip_prefix("```") {
             if fence.is_some() {
                 fence = None;
             } else {
                 fence = Some(language.trim().to_string());
-                let label = if language.trim().is_empty() {
-                    "code"
-                } else {
-                    language.trim()
-                };
-                let _ = writeln!(out, "{}", format!("  {label}").dimmed());
             }
+            out.push_str(&format!("{}", line.dimmed()));
+            out.push_str(newline);
             continue;
         }
         let rendered = if fence.as_deref() == Some("diff") || fence.as_deref() == Some("patch") {
@@ -78,18 +248,15 @@ pub fn print_message(s: &str) {
             } else {
                 line.to_string()
             }
-        } else if let Some(heading) = line.strip_prefix("### ") {
-            format!("{}", heading.bold())
-        } else if let Some(heading) = line.strip_prefix("## ") {
-            format!("{}", heading.bold())
-        } else if let Some(heading) = line.strip_prefix("# ") {
-            format!("{}", heading.bold())
+        } else if line.starts_with("### ") || line.starts_with("## ") || line.starts_with("# ") {
+            format!("{}", line.bold())
         } else {
             line.to_string()
         };
-        let _ = write!(out, "{rendered}{newline}");
+        out.push_str(&rendered);
+        out.push_str(newline);
     }
-    let _ = out.flush();
+    out
 }
 
 /// Fox-orange (kitsune) accent colour used across the UI.
@@ -99,7 +266,26 @@ const FOX: (u8, u8, u8) = (255, 140, 0);
 /// accent (狐 = kitsune). Printed to stderr at chat start. On a non-TTY it
 /// degrades to a single plain line so piped output stays clean.
 pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
-    if !stderr_style() {
+    let plain = plain_mode();
+    let clean = |value: &str| {
+        if plain {
+            sanitize_plain_inline(value)
+        } else {
+            sanitize_terminal_inline(value)
+        }
+    };
+    let gateway = clean(gateway);
+    let model = clean(model);
+    let dir = clean(dir);
+    let tools: Vec<String> = tools.iter().map(|tool| clean(tool)).collect();
+    if plain {
+        eprintln!(
+            "kitsu - gateway: {gateway} | model: {model} | directory: {dir} | tools: {}",
+            tools.len()
+        );
+        return;
+    }
+    if !stderr_is_tty() {
         eprintln!(
             "kitsu — gateway: {gateway} · model: {model} · directory: {dir} · tools: {}",
             tools.len()
@@ -136,9 +322,9 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     );
     eprintln!("  {}   {}", bar, "> ω <".truecolor(r, g, b));
     eprintln!("  {}", bar);
-    row("gateway", gateway);
-    row("model", model);
-    row("directory", dir);
+    row("gateway", &gateway);
+    row("model", &model);
+    row("directory", &dir);
     row("tools", &tools_str);
     eprintln!("  {}", format!("╰{rule}────").truecolor(r, g, b));
     eprintln!(
@@ -159,17 +345,82 @@ pub fn prompt_string() -> String {
 
 /// A "vibing kitsu" spinner shown on stderr while the model is working (the wait
 /// before the first token). Animates a cat/fox kaomoji in fox-orange. No-op on a
-/// non-TTY. Stops (and erases its line) on `stop()` or drop.
+/// non-TTY. Plain and reduced-motion modes show a static status. Stops (and
+/// erases an animated/styled-static line) on `stop()` or drop.
 pub struct Spinner {
     handle: Option<tokio::task::JoinHandle<()>>,
+    clear_line: bool,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SpinnerMode {
+    Hidden,
+    StaticPlain,
+    StaticStyled,
+    Animated,
+}
+
+fn spinner_mode(destination_is_tty: bool, plain: bool, reduced_motion: bool) -> SpinnerMode {
+    if !destination_is_tty {
+        SpinnerMode::Hidden
+    } else if plain {
+        SpinnerMode::StaticPlain
+    } else if reduced_motion {
+        SpinnerMode::StaticStyled
+    } else {
+        SpinnerMode::Animated
+    }
+}
+
+fn static_spinner_line(styled: bool) -> String {
+    if styled {
+        let (r, g, b) = FOX;
+        format!(
+            "  {} {}",
+            "*".truecolor(r, g, b),
+            "kitsu is thinking".dimmed()
+        )
+    } else {
+        "* kitsu is thinking".to_string()
+    }
 }
 
 impl Spinner {
     /// Start the animation (must be called within a tokio runtime). Returns an
-    /// inert handle on a non-TTY.
+    /// inert handle on a non-TTY. Plain and reduced-motion terminals get a
+    /// visible static status instead of losing progress feedback entirely.
     pub fn start() -> Self {
-        if !stderr_is_tty() || plain_mode() || std::env::var_os("KITSU_REDUCED_MOTION").is_some() {
-            return Self { handle: None };
+        let mode = spinner_mode(
+            stderr_is_tty(),
+            plain_mode(),
+            std::env::var_os("KITSU_REDUCED_MOTION").is_some(),
+        );
+        match mode {
+            SpinnerMode::Hidden => {
+                return Self {
+                    handle: None,
+                    clear_line: false,
+                };
+            }
+            SpinnerMode::StaticPlain => {
+                // A newline keeps plain mode escape-free; unlike a cursor-
+                // controlled status this line intentionally remains in the
+                // transcript when the response starts.
+                eprintln!("{}", static_spinner_line(false));
+                return Self {
+                    handle: None,
+                    clear_line: false,
+                };
+            }
+            SpinnerMode::StaticStyled => {
+                eprint!("\r{}", static_spinner_line(true));
+                let _ = io::stderr().flush();
+                return Self {
+                    handle: None,
+                    clear_line: true,
+                };
+            }
+            SpinnerMode::Animated => {}
         }
         let handle = tokio::spawn(async move {
             // Kitsu is vibing while the model does the hard work.
@@ -202,10 +453,12 @@ impl Spinner {
         });
         Self {
             handle: Some(handle),
+            clear_line: true,
         }
     }
 
-    /// Stop the animation and erase its line.
+    /// Stop progress feedback. Cursor-controlled lines are erased; an
+    /// escape-free plain static line remains in the transcript.
     pub fn stop(mut self) {
         self.clear();
     }
@@ -213,6 +466,8 @@ impl Spinner {
     fn clear(&mut self) {
         if let Some(h) = self.handle.take() {
             h.abort();
+        }
+        if std::mem::take(&mut self.clear_line) {
             eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
         }
@@ -227,6 +482,13 @@ impl Drop for Spinner {
 
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
+    stream_sanitizer()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .reset();
+    if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
+        return;
+    }
     let mut out = io::stdout();
     let _ = out.write_all(b"\n");
     let _ = out.flush();
@@ -235,9 +497,15 @@ pub fn finish_line() {
 /// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
 /// friendly line — e.g. `⏺ Read(deck1.md)`. Fox-orange marker on a TTY.
 pub fn tool_activity(header: &str) {
-    if stderr_style() {
+    let plain = plain_mode();
+    let header = if plain {
+        sanitize_plain_inline(header)
+    } else {
+        sanitize_terminal_inline(header)
+    };
+    if stderr_is_tty() && !plain {
         eprintln!("{} {header}", "⏺".truecolor(255, 140, 0));
-    } else if plain_mode() {
+    } else if plain {
         eprintln!("tool> {header}");
     } else {
         eprintln!("⏺ {header}");
@@ -247,10 +515,16 @@ pub fn tool_activity(header: &str) {
 /// The result summary line under a tool call — e.g. `  ⎿ 128 lines`. Dimmed on a
 /// TTY. Goes to stderr so stdout stays assistant-text only.
 pub fn tool_result(summary: &str) {
+    let plain = plain_mode();
+    let summary = if plain {
+        sanitize_plain_inline(summary)
+    } else {
+        sanitize_terminal_inline(summary)
+    };
     let line = format!("  ⎿ {summary}");
-    if stderr_style() {
+    if stderr_is_tty() && !plain {
         eprintln!("{}", line.dimmed());
-    } else if plain_mode() {
+    } else if plain {
         eprintln!("result> {summary}");
     } else {
         eprintln!("{line}");
@@ -260,6 +534,7 @@ pub fn tool_result(summary: &str) {
 /// Render a verified workspace diff to stderr. This output is generated from
 /// Git/filesystem state, not from assistant prose.
 pub fn render_diff(diff: &str) {
+    let diff = sanitize_terminal_text(diff);
     let line_count = diff.lines().count();
     eprintln!("verified workspace diff ({line_count} line(s)):");
     // Keep an interactive prompt usable after a repository-wide diff. Scripts
@@ -294,12 +569,16 @@ pub fn render_diff(diff: &str) {
 /// Announce a summarizing compaction to stderr, like Claude Code's boundary, so
 /// the user knows older history was replaced by a summary.
 pub fn compaction_boundary() {
-    let line = "✻ context compacted (older turns summarized)";
-    if stderr_style() {
+    if plain_mode() {
+        eprintln!("* context compacted (older turns summarized)");
+    } else if stderr_style() {
         let (r, g, b) = FOX;
-        eprintln!("{}", line.truecolor(r, g, b));
+        eprintln!(
+            "{}",
+            "✻ context compacted (older turns summarized)".truecolor(r, g, b)
+        );
     } else {
-        eprintln!("{line}");
+        eprintln!("✻ context compacted (older turns summarized)");
     }
 }
 
@@ -318,6 +597,7 @@ fn grouped_count(value: u64) -> String {
 fn human_turn_stats(
     usage: Option<(u64, u64, u64)>,
     context: Option<(u64, u64, u64)>,
+    ascii: bool,
 ) -> Option<String> {
     let mut parts = Vec::new();
     if let Some((prompt, completion, _total)) = usage {
@@ -336,29 +616,93 @@ fn human_turn_stats(
             grouped_count(effective)
         ));
     }
-    (!parts.is_empty()).then(|| format!("  ↳ {}", parts.join(" · ")))
+    (!parts.is_empty()).then(|| {
+        if ascii {
+            format!("  -> {}", parts.join(" | "))
+        } else {
+            format!("  ↳ {}", parts.join(" · "))
+        }
+    })
 }
 
 /// Emit end-of-turn usage and context telemetry. Interactive terminals get one
 /// compact, human-readable status line; redirected output retains the stable
-/// `kitsu-usage:` and `kitsu-context:` JSON records for automation.
+/// `kitsu-usage:` and `kitsu-context:` JSON records for automation. Formatting
+/// follows stderr's TTY state because stderr is the destination.
 pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
-    if is_tty() {
-        if let Some(line) = human_turn_stats(usage, context) {
-            if stderr_style() {
-                eprintln!("{}", line.dimmed());
+    let mut err = io::stderr();
+    let destination_is_tty = err.is_terminal();
+    let _ = write_turn_stats(&mut err, destination_is_tty, usage, context);
+}
+
+/// Write end-of-turn telemetry to an explicit destination.
+///
+/// Callers that route telemetry somewhere other than stderr can pass that
+/// destination's real TTY state. This avoids accidentally choosing human versus
+/// machine formatting from an unrelated stream such as stdout.
+pub fn write_turn_stats<W: Write>(
+    destination: &mut W,
+    destination_is_tty: bool,
+    usage: Option<(u64, u64, u64)>,
+    context: Option<(u64, u64, u64)>,
+) -> io::Result<()> {
+    write_turn_stats_with_mode(
+        destination,
+        destination_is_tty,
+        plain_mode(),
+        usage,
+        context,
+    )
+}
+
+fn write_turn_stats_with_mode<W: Write>(
+    destination: &mut W,
+    destination_is_tty: bool,
+    plain: bool,
+    usage: Option<(u64, u64, u64)>,
+    context: Option<(u64, u64, u64)>,
+) -> io::Result<()> {
+    if destination_is_tty {
+        if let Some(line) = human_turn_stats(usage, context, plain) {
+            if plain {
+                writeln!(destination, "{line}")?;
             } else {
-                eprintln!("{line}");
+                writeln!(destination, "{}", line.dimmed())?;
             }
         }
-        return;
+    } else {
+        if let Some((prompt, completion, total)) = usage {
+            write_usage(destination, prompt, completion, total)?;
+        }
+        if let Some((used, effective, window)) = context {
+            write_context_record(destination, used, effective, window)?;
+        }
     }
-    if let Some((prompt, completion, total)) = usage {
-        emit_usage(prompt, completion, total);
-    }
-    if let Some((used, effective, window)) = context {
-        emit_context(used, effective, window);
-    }
+    destination.flush()
+}
+
+fn write_context_record<W: Write>(
+    destination: &mut W,
+    used: u64,
+    effective: u64,
+    window: u64,
+) -> io::Result<()> {
+    writeln!(
+        destination,
+        "kitsu-context: {{\"used\":{used},\"effective\":{effective},\"window\":{window}}}"
+    )
+}
+
+fn write_usage<W: Write>(
+    destination: &mut W,
+    prompt_tokens: u64,
+    completion_tokens: u64,
+    total_tokens: u64,
+) -> io::Result<()> {
+    writeln!(
+        destination,
+        "kitsu-usage: {{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{total_tokens}}}"
+    )
 }
 
 /// Machine-readable context-utilization line to **stderr** (companion to
@@ -366,10 +710,7 @@ pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64
 /// how full the window is and whether trimming is near.
 pub fn emit_context(used: u64, effective: u64, window: u64) {
     let mut err = io::stderr();
-    let _ = writeln!(
-        err,
-        "kitsu-context: {{\"used\":{used},\"effective\":{effective},\"window\":{window}}}"
-    );
+    let _ = write_context_record(&mut err, used, effective, window);
     let _ = err.flush();
 }
 
@@ -388,7 +729,49 @@ pub fn render_context(
     used: u64,
     rows: &[(&str, u64, &str, &str)],
 ) {
+    let plain = plain_mode();
+    let lines = context_lines(
+        model,
+        window,
+        note,
+        effective,
+        used,
+        rows,
+        RenderMode {
+            styled: stderr_is_tty() && !plain,
+            plain,
+        },
+    );
+    for line in lines {
+        eprintln!("{line}");
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct RenderMode {
+    styled: bool,
+    plain: bool,
+}
+
+fn context_lines(
+    model: &str,
+    window: u64,
+    note: &str,
+    effective: u64,
+    used: u64,
+    rows: &[(&str, u64, &str, &str)],
+    mode: RenderMode,
+) -> Vec<String> {
     let (r, g, b) = FOX;
+    let clean = |value: &str| {
+        if mode.plain {
+            sanitize_plain_inline(value)
+        } else {
+            sanitize_terminal_inline(value)
+        }
+    };
+    let model = clean(model);
+    let note = clean(note);
     let pct = if effective > 0 {
         (used.saturating_mul(100) / effective).min(999)
     } else {
@@ -406,35 +789,46 @@ pub fn render_context(
     } else {
         CELLS
     };
+    let (filled_cell, empty_cell) = if mode.plain {
+        ('#', '-')
+    } else {
+        ('■', '□')
+    };
     let bar: String = (0..CELLS)
-        .map(|i| if i < filled { '■' } else { '□' })
+        .map(|i| if i < filled { filled_cell } else { empty_cell })
         .collect();
     let win = if note.is_empty() {
         format!("{window}")
     } else {
         format!("{window} ({note})")
     };
-    eprintln!("model: {model}   window: {win}");
-    let bar_disp = if stderr_style() {
+    let mut lines = vec![format!("model: {model}   window: {win}")];
+    let bar_disp = if mode.styled {
         format!("{}", bar.truecolor(r, g, b))
     } else {
         bar
     };
-    eprintln!("used {used} / {effective} effective  [{bar_disp}]  {pct}%   headroom: {headroom}");
+    lines.push(format!(
+        "used {used} / {effective} effective  [{bar_disp}]  {pct}%   headroom: {headroom}"
+    ));
     let header = format!(
         "  {:<20} {:>7}  {:<10}  {}",
         "source", "tokens", "policy", "why"
     );
-    if stderr_style() {
-        eprintln!("{}", header.dimmed());
+    if mode.styled {
+        lines.push(format!("{}", header.dimmed()));
     } else {
-        eprintln!("{header}");
+        lines.push(header);
     }
     for (label, tokens, policy, why) in rows {
         if *tokens > 0 || !why.is_empty() {
-            eprintln!("  {label:<20} {tokens:>7}  {policy:<10}  {why}");
+            let label = clean(label);
+            let policy = clean(policy);
+            let why = clean(why);
+            lines.push(format!("  {label:<20} {tokens:>7}  {policy:<10}  {why}"));
         }
     }
+    lines
 }
 
 /// Emit a single machine-readable token-usage line to **stderr** (never stdout,
@@ -446,16 +840,99 @@ pub fn render_context(
 /// ```
 pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64) {
     let mut err = io::stderr();
-    let _ = writeln!(
-        err,
-        "kitsu-usage: {{\"prompt_tokens\":{prompt_tokens},\"completion_tokens\":{completion_tokens},\"total_tokens\":{total_tokens}}}"
-    );
+    let _ = write_usage(&mut err, prompt_tokens, completion_tokens, total_tokens);
     let _ = err.flush();
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{grouped_count, human_turn_stats};
+    use super::{
+        context_lines, format_message, grouped_count, human_turn_stats, sanitize_plain_inline,
+        sanitize_terminal_inline, sanitize_terminal_text, spinner_mode, static_spinner_line,
+        write_turn_stats, write_turn_stats_with_mode, RenderMode, SpinnerMode,
+        TerminalTextSanitizer,
+    };
+
+    #[test]
+    fn strips_terminal_sequences_and_unsafe_controls() {
+        let input = concat!(
+            "safe",
+            "\x1b[31m",
+            "red",
+            "\x1b[0m",
+            "\x1b]8;;https://example.test\x1b\\",
+            "link",
+            "\x1b]8;;\x07",
+            "\0\r\x08\x7f",
+            "\tline\n",
+            "\u{009b}2J",
+            "done",
+            "\u{009d}title\u{009c}",
+            "!",
+            "\x1bPprivate payload\x1b\\",
+            "after"
+        );
+
+        assert_eq!(
+            sanitize_terminal_text(input),
+            "saferedlink\tline\ndone!after"
+        );
+    }
+
+    #[test]
+    fn preserves_printable_unicode_newlines_and_tabs() {
+        assert_eq!(
+            sanitize_terminal_text("狐 says:\tこんにちは\n🦊"),
+            "狐 says:\tこんにちは\n🦊"
+        );
+    }
+
+    #[test]
+    fn inline_terminal_fields_cannot_create_extra_rows() {
+        assert_eq!(
+            sanitize_terminal_inline("model\nspoofed\trow\x1b[2J"),
+            "model spoofed row"
+        );
+    }
+
+    #[test]
+    fn plain_inline_metadata_replaces_unicode_structural_markers() {
+        assert_eq!(
+            sanitize_plain_inline("written · 42 bytes — done … ↳ detail"),
+            "written | 42 bytes - done ... -> detail"
+        );
+    }
+
+    #[test]
+    fn streaming_sanitizer_tracks_split_csi_and_osc_sequences() {
+        let mut sanitizer = TerminalTextSanitizer::default();
+
+        assert_eq!(sanitizer.push("before\x1b"), "before");
+        assert_eq!(sanitizer.push("[31"), "");
+        assert_eq!(sanitizer.push("mred\x1b]"), "red");
+        assert_eq!(sanitizer.push("0;owned\x1b"), "");
+        assert_eq!(sanitizer.push("\\after"), "after");
+    }
+
+    #[test]
+    fn reset_ends_an_unterminated_streamed_control_string() {
+        let mut sanitizer = TerminalTextSanitizer::default();
+        assert_eq!(sanitizer.push("shown\x1b]unterminated"), "shown");
+        assert_eq!(sanitizer.push("still hidden"), "");
+
+        sanitizer.reset();
+        assert_eq!(sanitizer.push("next turn"), "next turn");
+    }
+
+    #[test]
+    fn buffered_markdown_retains_streaming_structure() {
+        let message = "# Heading\n\n```diff\n+added\n-removed\n@@ hunk\n```\n";
+        let rendered = format_message(message, true);
+
+        assert!(rendered.contains('\x1b'), "TTY rendering should be styled");
+        assert_eq!(sanitize_terminal_text(&rendered), message);
+        assert_eq!(format_message(message, false), message);
+    }
 
     #[test]
     fn groups_token_counts_for_people() {
@@ -468,13 +945,95 @@ mod tests {
     #[test]
     fn combines_usage_and_context_into_one_status_line() {
         assert_eq!(
-            human_turn_stats(Some((11, 3, 14)), Some((2_000, 8_000, 8_192))),
+            human_turn_stats(Some((11, 3, 14)), Some((2_000, 8_000, 8_192)), false),
             Some("  ↳ 11 input · 3 output · 2,000 / 8,000 context (25% used)".into())
         );
     }
 
     #[test]
     fn omits_status_line_without_stats() {
-        assert_eq!(human_turn_stats(None, None), None);
+        assert_eq!(human_turn_stats(None, None, false), None);
+    }
+
+    #[test]
+    fn telemetry_uses_the_explicit_destination_tty_state() {
+        let mut redirected = Vec::new();
+        write_turn_stats(
+            &mut redirected,
+            false,
+            Some((11, 3, 14)),
+            Some((2_000, 8_000, 8_192)),
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(redirected).unwrap(),
+            concat!(
+                "kitsu-usage: {\"prompt_tokens\":11,\"completion_tokens\":3,\"total_tokens\":14}\n",
+                "kitsu-context: {\"used\":2000,\"effective\":8000,\"window\":8192}\n"
+            )
+        );
+
+        let mut terminal = Vec::new();
+        write_turn_stats_with_mode(
+            &mut terminal,
+            true,
+            true,
+            Some((11, 3, 14)),
+            Some((2_000, 8_000, 8_192)),
+        )
+        .unwrap();
+        let terminal = String::from_utf8(terminal).unwrap();
+        assert_eq!(
+            terminal,
+            "  -> 11 input | 3 output | 2,000 / 8,000 context (25% used)\n"
+        );
+        assert!(terminal.is_ascii());
+        assert!(!terminal.contains('\x1b'));
+    }
+
+    #[test]
+    fn plain_context_uses_ascii_markers_and_scrubs_dynamic_fields() {
+        let rows = [("system\x1b[31m", 4, "keep\x1b]0;title\x07", "required\r")];
+        let output = context_lines(
+            "model\x1b[2J",
+            16,
+            "known\x1b[0m",
+            16,
+            4,
+            &rows,
+            RenderMode {
+                styled: false,
+                plain: true,
+            },
+        )
+        .join("\n");
+
+        assert!(output.is_ascii(), "{output:?}");
+        assert!(!output.contains('\x1b'));
+        assert!(output.contains("model: model   window: 16 (known)"));
+        assert!(output.contains("[####------------]"));
+        assert!(output.contains("system"));
+        assert!(output.contains("keep"));
+        assert!(output.contains("required"));
+    }
+
+    #[test]
+    fn reduced_motion_selects_a_visible_static_status() {
+        assert_eq!(spinner_mode(false, false, true), SpinnerMode::Hidden);
+        assert_eq!(spinner_mode(true, false, true), SpinnerMode::StaticStyled);
+        assert_eq!(spinner_mode(true, true, true), SpinnerMode::StaticPlain);
+        assert_eq!(spinner_mode(true, true, false), SpinnerMode::StaticPlain);
+        assert_eq!(spinner_mode(true, false, false), SpinnerMode::Animated);
+
+        let plain_status = static_spinner_line(false);
+        assert_eq!(plain_status, "* kitsu is thinking");
+        assert!(plain_status.is_ascii());
+        assert!(!plain_status.contains('\x1b'));
+
+        let styled_status = static_spinner_line(true);
+        assert_eq!(
+            sanitize_terminal_text(&styled_status),
+            "  * kitsu is thinking"
+        );
     }
 }

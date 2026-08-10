@@ -6,6 +6,10 @@ pub mod builtins;
 pub mod error;
 pub mod permissions;
 
+pub use builtins::command::{
+    command_exec_tool, execute_command, CommandApprovalRequest, CommandDecision, CommandExecArgs,
+    CommandLimits, CommandMode, CommandOutput, CommandPolicy, CommandPrompter, CommandTermination,
+};
 pub use error::ToolError;
 pub use permissions::{Action, Decision, Mode, PermissionRequest, Permissions, Prompter};
 

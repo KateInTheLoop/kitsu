@@ -88,6 +88,35 @@ impl Provider for MockProvider {
     }
 }
 
+/// A provider whose stream can fail after yielding one or more successful
+/// deltas. The ordinary mock scripts only successful deltas.
+#[derive(Clone)]
+struct FallibleMockProvider {
+    script: Arc<Vec<Result<ChatDelta, ProviderError>>>,
+}
+
+impl FallibleMockProvider {
+    fn new(script: Vec<Result<ChatDelta, ProviderError>>) -> Self {
+        Self {
+            script: Arc::new(script),
+        }
+    }
+}
+
+impl Provider for FallibleMockProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        Ok(Box::pin(stream::iter(self.script.as_ref().clone())))
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
 fn tc(name: &str, call_id: &str, args: &str) -> ToolCall {
     ToolCall {
         tool_name: name.to_string(),
@@ -108,6 +137,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         max_tokens: None,
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
+        event_log: None,
     }
 }
 
@@ -1020,7 +1050,8 @@ async fn enforce_budget_token_path_elides_when_window_set() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(msgs[2].content.contains("elided"));
     let total: u64 = msgs.iter().map(message_tokens).sum();
     let target = crate::context::ContextBudget::new(200, Some(64)).target;
@@ -1055,7 +1086,8 @@ async fn enforce_budget_byte_path_when_window_unset() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
     assert!(
         msgs[1].content.contains("elided"),
         "byte path should still trim"
@@ -1136,7 +1168,7 @@ async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
 
     let provider = MockProvider::new(vec![]);
     let mut cfg = cfg(10);
-    cfg.context_window = Some(400);
+    cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     let mut meter = ContextMeter::new();
 
@@ -1164,7 +1196,8 @@ async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
     let after: u64 = msgs.iter().map(message_tokens).sum();
     assert!(
         after < before,
@@ -1203,6 +1236,25 @@ fn maybe_offload_writes_large_result_and_returns_pointer() {
 }
 
 #[test]
+fn maybe_offload_never_clobbers_an_earlier_result_for_the_same_call() {
+    use crate::orchestrator::maybe_offload;
+    let dir = tempfile::tempdir().unwrap();
+    let first = "a".repeat(20_000);
+    let second = "b".repeat(20_000);
+
+    let first_pointer = maybe_offload(first.clone(), "same-call", Some(dir.path()));
+    let second_pointer = maybe_offload(second.clone(), "same-call", Some(dir.path()));
+
+    assert_ne!(first_pointer, second_pointer);
+    let mut contents = std::fs::read_dir(dir.path())
+        .unwrap()
+        .map(|entry| std::fs::read_to_string(entry.unwrap().path()).unwrap())
+        .collect::<Vec<_>>();
+    contents.sort();
+    assert_eq!(contents, vec![first, second]);
+}
+
+#[test]
 fn maybe_offload_keeps_small_results_inline() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
@@ -1215,6 +1267,43 @@ fn maybe_offload_is_noop_without_a_dir() {
     use crate::orchestrator::maybe_offload;
     let big = "x".repeat(20_000);
     assert_eq!(maybe_offload(big.clone(), "c", None), big);
+}
+
+#[test]
+fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
+    use crate::orchestrator::maybe_offload_for_tools;
+    use kitsu_providers::ToolDescriptor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let big = "x".repeat(20_000);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "command_exec".to_string(),
+            description: "run a command".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    let inline = maybe_offload_for_tools(big.clone(), "command", Some(dir.path()), &tools);
+    assert_eq!(inline, big);
+    assert!(
+        std::fs::read_dir(dir.path()).unwrap().next().is_none(),
+        "a command-only model cannot recover an fs_read_file pointer"
+    );
+
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "fs_read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let pointer = maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools);
+    assert!(pointer.contains("full result saved to"));
+    assert!(pointer.contains("fs_read_file"));
 }
 
 // --- summarizing compaction (Stage 3) ---------------------------------------
@@ -1230,7 +1319,7 @@ async fn compaction_summarize_rebuilds_history_with_summary() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut cfg = cfg(10);
-    cfg.context_window = Some(400);
+    cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
     let mut meter = ContextMeter::new();
@@ -1257,7 +1346,8 @@ async fn compaction_summarize_rebuilds_history_with_summary() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(msgs[0].content, "sys", "system kept");
     assert!(
@@ -1282,7 +1372,7 @@ async fn compaction_falls_back_to_drop_on_empty_summary() {
     // Provider returns no text → summary fails → fall back to dropping.
     let provider = MockProvider::new(vec![vec![ChatDelta::Done(FinishReason::Stop)]]);
     let mut cfg = cfg(10);
-    cfg.context_window = Some(400);
+    cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
     let mut meter = ContextMeter::new();
@@ -1310,7 +1400,8 @@ async fn compaction_falls_back_to_drop_on_empty_summary() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(failures, 1, "empty summary trips the breaker once");
     assert!(msgs.len() < before, "still shrank by dropping");
@@ -1318,6 +1409,107 @@ async fn compaction_falls_back_to_drop_on_empty_summary() {
         msgs.iter().any(|m| m.content.contains("trimmed to fit")),
         "drop marker present (fell back to drop)"
     );
+}
+
+#[tokio::test]
+async fn partial_summary_before_stream_error_is_never_installed() {
+    use crate::orchestrator::{
+        compact_context, CompactionMode, CompactionOutcome, SummaryFallbackReason,
+    };
+    use kitsu_providers::ChatMessage;
+
+    let provider = FallibleMockProvider::new(vec![
+        Ok(ChatDelta::Text("UNSAFE PARTIAL SUMMARY".to_string())),
+        Err(ProviderError::Connection("stream interrupted".to_string())),
+    ]);
+    let tools = Registry::new();
+    let mut c = cfg(10);
+    c.context_window = Some(8_192);
+    c.max_tokens = Some(64);
+    c.compaction = CompactionMode::Summarize;
+    let mut messages = vec![ChatMessage::system("sys")];
+    for k in 0..4 {
+        messages.push(ChatMessage::user(format!("q{k}")));
+        messages.push(ChatMessage::assistant(format!("a{k}"), vec![]));
+    }
+    let mut state = AgentSessionState::default();
+
+    let report = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .unwrap();
+    let record = report.record.unwrap();
+    assert_eq!(record.outcome, CompactionOutcome::SummaryFallbackTrim);
+    assert_eq!(
+        record.fallback_reason,
+        Some(SummaryFallbackReason::ProviderFailure)
+    );
+    assert!(!messages
+        .iter()
+        .any(|message| message.content.contains("UNSAFE PARTIAL SUMMARY")));
+    assert_eq!(messages[0].content, "sys");
+    assert!(messages.iter().any(|message| message.content == "q3"));
+}
+
+#[tokio::test]
+async fn truncated_or_unterminated_summary_streams_use_truthful_fallback() {
+    use crate::orchestrator::{
+        compact_context, CompactionMode, CompactionOutcome, SummaryFallbackReason,
+    };
+    use kitsu_providers::ChatMessage;
+
+    let cases = [
+        (
+            "length",
+            vec![
+                ChatDelta::Text("PARTIAL LENGTH SUMMARY".to_string()),
+                ChatDelta::Done(FinishReason::Length),
+            ],
+        ),
+        (
+            "bare EOF",
+            vec![ChatDelta::Text("PARTIAL EOF SUMMARY".to_string())],
+        ),
+    ];
+    for (case, script) in cases {
+        let provider = MockProvider::new(vec![script]);
+        let tools = Registry::new();
+        let mut c = cfg(10);
+        c.context_window = Some(8_192);
+        c.max_tokens = Some(64);
+        c.compaction = CompactionMode::Summarize;
+        let mut messages = vec![ChatMessage::system("sys")];
+        for k in 0..4 {
+            messages.push(ChatMessage::user(format!("q{k}")));
+            messages.push(ChatMessage::assistant(format!("a{k}"), vec![]));
+        }
+        let mut state = AgentSessionState::default();
+
+        let report = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+            .await
+            .unwrap();
+        let record = report.record.unwrap();
+        assert_eq!(
+            record.outcome,
+            CompactionOutcome::SummaryFallbackTrim,
+            "{case}"
+        );
+        assert_eq!(
+            record.fallback_reason,
+            Some(SummaryFallbackReason::IncompleteResponse),
+            "{case}"
+        );
+        assert!(
+            !messages
+                .iter()
+                .any(|message| message.content.contains("PARTIAL")),
+            "{case}: partial text must not become durable history"
+        );
+        assert_eq!(messages[0].content, "sys", "{case}");
+        assert!(
+            messages.iter().any(|message| message.content == "q3"),
+            "{case}: protected recent context survives"
+        );
+    }
 }
 
 // --- regressions: drop_old_exchanges underflow, offload-pointer survival,
@@ -1451,7 +1643,7 @@ fn elided_tool_stub_does_not_false_positive_on_ordinary_saved_to_text() {
 #[tokio::test]
 async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
     use crate::context::ContextMeter;
-    use crate::orchestrator::enforce_context_budget;
+    use crate::orchestrator::{enforce_context_budget, AgentError, ContextUnit};
     use kitsu_providers::ChatMessage;
 
     let provider = MockProvider::new(vec![]);
@@ -1481,7 +1673,7 @@ async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
     ];
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
-    enforce_context_budget(
+    let err = enforce_context_budget(
         &provider,
         &mut msgs,
         &cfg,
@@ -1491,12 +1683,20 @@ async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap_err();
 
     assert!(
         msgs[2].content.contains("elided"),
         "schema overhead must count toward the budget even though the conversation alone doesn't"
     );
+    assert!(matches!(
+        err,
+        AgentError::ContextOverflow {
+            unit: ContextUnit::Tokens,
+            ..
+        }
+    ));
 }
 
 /// When the meter IS anchored (a real `prompt_tokens` from a past request that
@@ -1548,7 +1748,8 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         msgs.len(),
@@ -1576,7 +1777,7 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut cfg = cfg(10);
-    cfg.context_window = Some(400);
+    cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
     let mut meter = ContextMeter::new();
@@ -1603,7 +1804,8 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap();
 
     assert_eq!(
         turn_usage.prompt_tokens, 111,
@@ -1620,7 +1822,7 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
 #[tokio::test]
 async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
     use crate::context::ContextMeter;
-    use crate::orchestrator::enforce_context_budget;
+    use crate::orchestrator::{enforce_context_budget, AgentError};
     use kitsu_providers::ChatMessage;
 
     let provider = MockProvider::new(vec![]);
@@ -1638,7 +1840,7 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
-    enforce_context_budget(
+    let err = enforce_context_budget(
         &provider,
         &mut msgs,
         &cfg,
@@ -1648,10 +1850,456 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
         &mut turn_usage,
         &mut failures,
     )
-    .await;
+    .await
+    .unwrap_err();
+
+    assert!(matches!(err, AgentError::ContextOverflow { .. }));
 
     assert!(
         meter.anchored(&msgs),
         "a guaranteed-no-op Trim pass must not discard a still-valid anchor"
     );
+}
+
+// --- checked context invariant + manual compaction --------------------------
+
+#[tokio::test]
+async fn protected_token_overflow_fails_locally_without_calling_provider() {
+    use crate::orchestrator::{AgentError, ContextUnit};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("must not be reached".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(1);
+    c.context_window = Some(200);
+    c.max_tokens = Some(64); // target = 80
+    let mut messages = vec![
+        ChatMessage::system("s".repeat(1_000)),
+        ChatMessage::user("latest request"),
+    ];
+
+    let err = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AgentError::ContextOverflow {
+            required,
+            target: 80,
+            unit: ContextUnit::Tokens,
+            window: Some(200),
+        } if required > 80
+    ));
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "an unshrinkable protected prompt must never cross the provider boundary"
+    );
+}
+
+#[tokio::test]
+async fn protected_byte_overflow_also_fails_before_provider_when_window_unknown() {
+    use crate::orchestrator::{AgentError, ContextUnit};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![ChatDelta::Done(FinishReason::Stop)]]);
+    let tools = Registry::new();
+    let mut c = cfg(1);
+    c.context_window = None;
+    c.max_context_bytes = 32;
+    let mut messages = vec![
+        ChatMessage::system("s".repeat(100)),
+        ChatMessage::user("latest"),
+    ];
+
+    let err = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        err,
+        AgentError::ContextOverflow {
+            unit: ContextUnit::Bytes,
+            window: None,
+            ..
+        }
+    ));
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test]
+async fn final_round_nudge_is_budgeted_before_the_second_provider_call() {
+    use crate::orchestrator::AgentError;
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("clock", "c", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("must not be reached".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "clock".to_string(),
+            description: String::new(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let mut c = cfg(2);
+    c.context_window = Some(400);
+    c.max_tokens = Some(64); // target = 160
+    let mut messages = vec![ChatMessage::system("s".repeat(480)), ChatMessage::user("q")];
+
+    let err = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap_err();
+    assert!(matches!(err, AgentError::ContextOverflow { .. }));
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "the first round fits, but the final nudge must be checked before round two"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|message| message.content.contains("reached the final step")),
+        "sanity: the request-visible mutation that caused the overflow was present"
+    );
+}
+
+#[tokio::test]
+async fn manual_trim_compacts_below_threshold_and_ledger_persists_across_calls() {
+    use crate::orchestrator::{compact_context, CompactionOutcome};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![]);
+    let tools = Registry::new();
+    let mut c = cfg(10);
+    c.context_window = Some(8_192);
+    c.max_tokens = Some(64);
+    let mut messages = vec![ChatMessage::system("sys")];
+    for k in 0..4 {
+        messages.push(ChatMessage::user(format!("q{k}")));
+        messages.push(ChatMessage::assistant(format!("a{k}"), vec![]));
+    }
+    let mut state = AgentSessionState::default();
+
+    let first = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .unwrap();
+    let first_record = first.record.unwrap();
+    assert!(
+        first.changed,
+        "manual compaction must not wait for pressure"
+    );
+    assert_eq!(first_record.sequence, 1);
+    assert_eq!(first_record.outcome, CompactionOutcome::Trimmed);
+    assert_eq!(first_record.exchanges_removed, 2);
+    assert!(messages
+        .iter()
+        .any(|m| m.content.contains("trimmed to fit")));
+
+    // Grow the same session and compact again. The ledger must survive calls,
+    // while an existing trim marker is not miscounted as an eligible exchange.
+    for k in 4..7 {
+        messages.push(ChatMessage::user(format!("q{k}")));
+        messages.push(ChatMessage::assistant(format!("a{k}"), vec![]));
+    }
+    let second = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .unwrap();
+    assert_eq!(second.record.unwrap().sequence, 2);
+    assert_eq!(state.compaction_ledger.total_compactions, 2);
+    assert_eq!(state.compaction_ledger.manual_compactions, 2);
+    assert_eq!(state.compaction_ledger.records.len(), 2);
+    assert_eq!(state.compaction_ledger.exchanges_removed, 5);
+    assert!(state.compaction_ledger.tokens_saved > 0);
+    assert_eq!(provider.call_count(), 0, "Trim mode is entirely local");
+}
+
+#[tokio::test]
+async fn summary_request_and_rebuilt_history_are_bounded_and_disclosed() {
+    use crate::context::{message_tokens, ContextBudget};
+    use crate::orchestrator::{compact_context, CompactionMode, CompactionOutcome};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("S".repeat(5_000)),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(10);
+    c.context_window = Some(1_200);
+    c.max_tokens = Some(10_000);
+    c.compaction = CompactionMode::Summarize;
+    let mut messages = vec![ChatMessage::system("sys")];
+    for k in 0..5 {
+        let body = if k < 3 {
+            "x".repeat(1_200)
+        } else {
+            "x".repeat(40)
+        };
+        messages.push(ChatMessage::user(format!("q{k} {body}")));
+        messages.push(ChatMessage::assistant(format!("a{k} {body}"), vec![]));
+    }
+    let mut state = AgentSessionState::default();
+
+    let report = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .unwrap();
+    let record = report.record.unwrap();
+    assert_eq!(record.outcome, CompactionOutcome::Summarized);
+    assert!(record.summary_input_shortened);
+    assert!(record.summary_output_shortened);
+    assert!(record.tokens_after <= report.target_tokens);
+
+    let seen_max = provider.seen_max_tokens.lock().unwrap();
+    assert_eq!(
+        seen_max.as_slice(),
+        &[Some(600)],
+        "the summary output cap must be derived from half the actual 1,200-token window"
+    );
+    drop(seen_max);
+    let seen_messages = provider.seen_messages.lock().unwrap();
+    let summary_prompt_tokens: u64 = seen_messages[0].iter().map(message_tokens).sum();
+    assert!(
+        summary_prompt_tokens <= ContextBudget::new(1_200, Some(600)).target,
+        "the summarizer's own concrete prompt must satisfy its request target"
+    );
+    assert_eq!(state.compaction_ledger.summaries, 1);
+}
+
+#[tokio::test]
+async fn summary_prompt_that_cannot_fit_falls_back_without_provider_call() {
+    use crate::orchestrator::{
+        compact_context, CompactionMode, CompactionOutcome, SummaryFallbackReason,
+    };
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![ChatDelta::Done(FinishReason::Stop)]]);
+    let tools = Registry::new();
+    let mut c = cfg(10);
+    c.context_window = Some(100); // summary instructions alone exceed target=40
+    c.max_tokens = Some(64);
+    c.compaction = CompactionMode::Summarize;
+    let mut messages = vec![ChatMessage::system("sys")];
+    for k in 0..4 {
+        messages.push(ChatMessage::user(format!("q{k}")));
+        messages.push(ChatMessage::assistant(format!("a{k}"), vec![]));
+    }
+    let mut state = AgentSessionState::default();
+
+    let report = compact_context(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .unwrap();
+    let record = report.record.unwrap();
+    assert_eq!(record.outcome, CompactionOutcome::SummaryFallbackTrim);
+    assert_eq!(
+        record.fallback_reason,
+        Some(SummaryFallbackReason::RequestTooLarge)
+    );
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "an oversized summarizer prompt must fall back locally, never be sent"
+    );
+}
+
+#[tokio::test]
+async fn structured_event_log_frames_provider_usage_tools_and_completion() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, Usage};
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("read", "call-1", r#"{"path":"a.txt"}"#)),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Usage(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+            }),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register("read", ok_handler(r#"{"ok":true}"#));
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let answer = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap();
+    assert_eq!(answer, "done");
+    let events = log.take();
+    assert!(matches!(
+        events.first(),
+        Some(AgentRuntimeEvent::ProviderRequest { round: 1, .. })
+    ));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolStarted { name, call_id, .. }
+            if name == "read" && call_id == "call-1"
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolFinished {
+            success: true,
+            cancelled: false,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::Usage {
+            total_tokens: 12,
+            ..
+        }
+    )));
+    assert!(matches!(
+        events.last(),
+        Some(AgentRuntimeEvent::TurnFinished {
+            success: true,
+            completion,
+            tool_errors: 0,
+        }) if completion == "complete"
+    ));
+    assert!(log.take().is_empty(), "take drains the trace");
+}
+
+#[tokio::test]
+async fn structured_event_log_marks_normal_tool_errors_as_finished_not_cancelled() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("fail", "call-error", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("recovered".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "fail".to_string(),
+            description: "fail normally".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        err_handler(Arc::new(AtomicUsize::new(0))),
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    assert_eq!(
+        run_agent_turn(&provider, &tools, &mut messages, &c)
+            .await
+            .unwrap(),
+        "recovered"
+    );
+    let events = log.take();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolFinished {
+            call_id,
+            success: false,
+            cancelled: false,
+            output,
+            ..
+        } if call_id == "call-error" && output.contains("boom")
+    )));
+}
+
+#[tokio::test]
+async fn dropping_in_flight_tool_turn_records_one_cancelled_terminal_event() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::ToolCall(tc("wait", "call-pending", "{}")),
+        ChatDelta::Done(FinishReason::ToolCalls),
+    ]]);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handler_started = started.clone();
+    let handler: HandlerFn = Box::new(move |_args| {
+        let handler_started = handler_started.clone();
+        Box::pin(async move {
+            handler_started.notify_one();
+            futures::future::pending::<Result<String, ToolError>>().await
+        })
+    });
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "wait".to_string(),
+            description: "wait forever".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        handler,
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let mut turn = Box::pin(run_agent_turn(&provider, &tools, &mut messages, &c));
+    tokio::select! {
+        _ = started.notified() => {}
+        result = &mut turn => panic!("pending tool turn unexpectedly finished: {result:?}"),
+    }
+    drop(turn);
+
+    let events = log.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(
+                |event| matches!(event, AgentRuntimeEvent::ToolStarted { call_id, .. }
+                if call_id == "call-pending")
+            )
+            .count(),
+        1
+    );
+    let terminal = events
+        .iter()
+        .filter(|event| {
+            matches!(event, AgentRuntimeEvent::ToolFinished { call_id, .. }
+            if call_id == "call-pending")
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        terminal.len(),
+        1,
+        "a started tool needs exactly one terminal"
+    );
+    assert!(matches!(
+        terminal[0],
+        AgentRuntimeEvent::ToolFinished {
+            success: false,
+            cancelled: true,
+            output,
+            ..
+        } if output.contains("cancelled")
+    ));
 }

@@ -6,15 +6,16 @@
 //! — the real ANTHROPIC_AUTH_TOKEN is never read.
 
 use std::env;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::StreamExt;
 use serial_test::serial;
 use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
-use crate::auth::EnvBearerAuth;
+use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::ProviderError;
 use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason};
@@ -242,10 +243,12 @@ async fn test_gateway_401_maps_unauthorized() {
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
         .respond_with(ResponseTemplate::new(401).set_body_string("unauthorized"))
+        .expect(1)
         .mount(&server)
         .await;
 
-    let provider = provider_for(server.uri());
+    let mut provider = provider_for(server.uri());
+    provider.retries = 5;
 
     let err = match provider.chat_stream(simple_request()).await {
         Err(e) => e,
@@ -262,6 +265,97 @@ async fn test_gateway_401_maps_unauthorized() {
         }
         other => panic!("expected ProviderError::Unauthorized, got {other:?}"),
     }
+}
+
+/// Most client errors are final: retrying a malformed request only adds latency
+/// and can duplicate side effects at gateways that accepted part of it.
+#[tokio::test]
+#[serial]
+async fn test_gateway_400_is_not_retried() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_calls.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(400).set_body_string("bad request")
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.retries = 5;
+    let err = match provider.chat_stream(simple_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("HTTP 400 must fail without retrying"),
+    };
+
+    assert!(matches!(err, ProviderError::Http { status: 400, .. }));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
+#[tokio::test]
+async fn test_gateway_retry_after_seconds_is_honored() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            if responder_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                ResponseTemplate::new(429).insert_header("retry-after", "1")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_two_text_deltas())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 1;
+    provider.timeout = Duration::from_secs(3);
+    let started = tokio::time::Instant::now();
+    let _stream = provider
+        .chat_stream(simple_request())
+        .await
+        .expect("the request should retry once and then succeed");
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    assert!(started.elapsed() >= Duration::from_secs(1));
+    assert!(started.elapsed() < Duration::from_secs(3));
+}
+
+#[tokio::test]
+async fn test_gateway_retry_after_cannot_exceed_total_deadline() {
+    let server = MockServer::start().await;
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 100;
+    provider.timeout = Duration::from_millis(250);
+    let started = tokio::time::Instant::now();
+    let err = match provider.chat_stream(simple_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("the total deadline must stop retries"),
+    };
+
+    assert!(matches!(err, ProviderError::Timeout));
+    assert!(started.elapsed() >= Duration::from_millis(200));
+    assert!(started.elapsed() < Duration::from_secs(1));
 }
 
 /// Security invariant (design §3/§7): the token value must never appear in any
@@ -393,6 +487,59 @@ fn test_backoff_delay_never_panics_and_is_capped() {
 }
 
 #[test]
+fn test_retry_after_accepts_seconds_and_http_date_and_caps_both() {
+    use super::{parse_retry_after, MAX_RETRY_DELAY};
+
+    let now = SystemTime::UNIX_EPOCH + Duration::from_secs(1_700_000_000);
+    assert_eq!(parse_retry_after("7", now), Some(Duration::from_secs(7)));
+    assert_eq!(
+        parse_retry_after("999999999999999999999999999999", now),
+        Some(MAX_RETRY_DELAY),
+        "overflowing delay-seconds must cap instead of falling back"
+    );
+
+    assert_eq!(
+        parse_retry_after("Tue, 14 Nov 2023 22:13:31 GMT", now),
+        Some(Duration::from_secs(11)),
+        "the preferred IMF-fixdate HTTP-date form must be accepted"
+    );
+    let far_future = chrono::DateTime::<chrono::Utc>::from(now + Duration::from_secs(300));
+    assert_eq!(
+        parse_retry_after(&far_future.to_rfc2822(), now),
+        Some(MAX_RETRY_DELAY)
+    );
+    assert_eq!(parse_retry_after("not-a-date", now), None);
+}
+
+#[test]
+fn test_retry_delay_respects_header_with_small_bounded_jitter() {
+    use super::{add_retry_jitter, retry_delay, MAX_RETRY_DELAY};
+
+    let header = reqwest::header::HeaderValue::from_static("5");
+    let delay = retry_delay(1, Some(&header), SystemTime::UNIX_EPOCH, u64::MAX);
+    assert!(delay >= Duration::from_secs(5));
+    assert!(delay <= Duration::from_millis(5_250));
+
+    assert_eq!(
+        add_retry_jitter(MAX_RETRY_DELAY, u64::MAX),
+        MAX_RETRY_DELAY,
+        "jitter must not push a capped Retry-After past the hard bound"
+    );
+}
+
+#[tokio::test(start_paused = true)]
+async fn test_retry_sleep_stops_at_total_request_deadline() {
+    use super::sleep_before_retry;
+
+    let started = tokio::time::Instant::now();
+    let err = sleep_before_retry(started, Duration::from_secs(3), Duration::from_secs(30))
+        .await
+        .expect_err("a retry delay beyond the total deadline must time out");
+    assert!(matches!(err, ProviderError::Timeout));
+    assert_eq!(started.elapsed(), Duration::from_secs(3));
+}
+
+#[test]
 fn test_parse_completion_surfaces_usage() {
     use super::parse_completion;
     use crate::types::ChatDelta;
@@ -461,6 +608,102 @@ fn provider_with_models(base_url: String) -> OpenAICompatProvider {
         },
         auth,
     )
+}
+
+#[tokio::test]
+async fn test_model_catalog_is_reused_across_list_and_context_discovery() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"cached-model","context_length":32768}]}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(
+        provider.list_models().await.unwrap(),
+        Some(vec!["cached-model".to_string()])
+    );
+    assert_eq!(
+        provider.model_context_length("cached-model").await,
+        Some(32768)
+    );
+}
+
+#[tokio::test]
+async fn test_model_discovery_failures_are_negatively_cached() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("catalog unavailable"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert!(matches!(
+        provider.list_models().await,
+        Err(ProviderError::Http { status: 503, .. })
+    ));
+    assert_eq!(provider.model_context_length("any-model").await, None);
+    assert!(matches!(
+        provider.list_models().await,
+        Err(ProviderError::Http { status: 503, .. })
+    ));
+}
+
+#[tokio::test]
+async fn test_malformed_success_catalog_uses_the_negative_cache() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not valid json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    for _ in 0..2 {
+        assert!(matches!(
+            provider.list_models().await,
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+    let cache = provider.models_cache.lock().await;
+    let entry = cache.as_ref().expect("malformed catalog is cached briefly");
+    assert_eq!(entry.ttl, OpenAICompatProvider::MODELS_NEGATIVE_CACHE_TTL);
+}
+
+/// Advisory discovery must not inherit a long inference timeout. The discovery
+/// budget is shortened further here so the integration test stays fast.
+#[tokio::test]
+async fn test_model_discovery_has_short_independent_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .set_body_string(r#"{"data":[{"id":"slow","context_length":8192}]}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.timeout = Duration::from_secs(60);
+    provider.discovery_timeout = Duration::from_millis(100);
+    let started = tokio::time::Instant::now();
+    assert_eq!(provider.model_context_length("slow").await, None);
+    assert!(started.elapsed() < Duration::from_millis(900));
 }
 
 /// A gateway that reports `max_model_len` per model → discovered as the window.

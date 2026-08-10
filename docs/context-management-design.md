@@ -1,389 +1,161 @@
-# Context-Window Management — Design
+# Context management — implementation contract
 
-- **Status:** Draft / proposed
-- **Date:** 2026-07-05
-- **Scope:** How kitsu should manage the model's finite context window across a
-  multi-turn `chat` session and tool-heavy agent loops.
-- **Companion:** [context-management-stages.md](context-management-stages.md) —
-  the staged development plan derived from this design.
+> Status: implemented as of 2026-08-10. This document describes the request
+> budget, compaction cascade, project-context loader, and user-visible telemetry
+> that Kitsu currently enforces.
 
----
+Kitsu sends the conversation again on every provider request. Context management
+therefore has two jobs: resolve a credible model window, then prove that the
+concrete request fits before it crosses the provider boundary.
 
-## 1. Problem statement
+## Window resolution and discovery
 
-kitsu runs an agent loop (`kitsu-core::orchestrator`) that appends to a growing
-`Vec<ChatMessage>` every round: user turns, assistant turns, tool calls, and tool
-results. The whole vector is re-sent to the gateway on every request. Left
-unbounded it eventually exceeds the model's context window and the gateway
-rejects the request (HTTP 400 "prompt too long" / context-length errors), failing
-the turn outright.
+The CLI resolves one context window in this order:
 
-### Current mechanism
+1. `--context-window`;
+2. the gateway profile's `context_window`;
+3. a fresh discovery-cache entry keyed by endpoint, models path, and model;
+4. the conservative default, **8192 tokens**.
 
-`enforce_context_budget(messages, max_bytes)` (orchestrator.rs) runs before each
-request. It:
+Discovery entries remain fresh for 24 hours. A missing entry never delays the
+first inference: Kitsu uses 8192 for that run and starts a best-effort catalog
+probe in the background. The probe has its own two-second deadline and can warm
+the cache for a later process. Within one provider instance, a successful model
+catalog is reused for 60 seconds and eligible discovery failures are cached for
+five seconds. Authentication failures are not treated as ordinary negative-cache
+entries.
 
-- Sums `byte_size()` of all messages.
-- If over `max_bytes` (hardcoded **128 KiB** in all three call sites), walks
-  oldest-first and **elides `Tool` messages only**, replacing their body with the
-  stub `"[older tool output elided]"`.
-- Never touches the system prompt, the last user message, or any
-  user/assistant message.
+Explicit `models` and `/models` commands are user-requested catalog operations,
+so they use the configured CLI timeout. `/model` validates against a catalog when
+one is available. If the window was set by CLI/config, the switch preserves it;
+otherwise Kitsu resolves the selected model's metadata synchronously and falls
+back to 8192 when no length is reported.
 
-### Why this is inadequate
+Discovery is advisory. The window actually enforced for the current request is
+always present, including on a cold cache.
 
-1. **Model-blind.** 128 KiB is a fixed byte count. It has no relationship to the
-   actual model's window. kitsu's primary audience is **local models via Ollama,
-   which commonly have 4 K–32 K token windows**. 128 KiB ≈ ~32 K tokens, so the
-   budget can be **larger than the model's entire window** — meaning kitsu never
-   trims, and the gateway hard-fails instead. The mechanism silently does nothing
-   on exactly the models it most needs to protect.
-2. **Bytes, not tokens.** Byte size is a poor proxy for tokens (code, JSON, and
-   Unicode all tokenize very differently), and the gateway budgets in tokens. We
-   also **already receive exact token usage** from every response (`Usage` /
-   `ChatDelta::Usage`) and don't use it for budgeting.
-3. **Only elides tool results.** Long assistant/user turns and a long back-and-
-   forth are never trimmed. A conversation with no large tool outputs but many
-   turns grows without bound until it fails.
-4. **No headroom for output.** The budget doesn't reserve space for the model's
-   response, so a request that just fits the window leaves no room to answer.
-5. **One blunt tier.** Eliding a tool body to a stub is lossy and irreversible
-   within the session, yet it's the *only* tool we have — there is no cheaper
-   reversible option (offload-and-pointer) and no higher-fidelity option
-   (summarize) when the task context itself must be shed.
+## Token accounting and budget
 
-### Goal
+Before Kitsu has provider usage, text is estimated at roughly four characters
+per token and tool-call JSON at three characters per token. Tool-schema overhead
+is included. Once a response reports `prompt_tokens`, the meter uses that real
+count as an anchor and estimates only messages appended afterward. Reshaping the
+history or changing models invalidates the anchor.
 
-Replace the single byte-based elision with a **model-aware, token-based, tiered**
-strategy that (a) never lets a session hard-fail on context length when it can be
-avoided, (b) prefers cheap reversible shedding over lossy summarization, and
-(c) works acceptably from 4 K local models up to 1 M cloud models.
+For a window `W`:
 
----
-
-## 2. Analysis
-
-### 2.1 What kitsu already has to build on
-
-- **Real token usage** per response: the OpenAI-compatible `usage` object
-  (`prompt_tokens`, `completion_tokens`, `total_tokens`) is parsed into `Usage`
-  and surfaced as `ChatDelta::Usage`. This is an *authoritative* anchor for how
-  many tokens the last request actually cost.
-- **A models endpoint**: `OpenAICompatProvider::list_models()` (`/v1/models`).
-  Several gateways — notably **Ollama** — expose the model's context length in
-  model metadata, so the window can often be discovered at runtime.
-- **`max_output_tokens`** is already a CLI flag and request field, so the output
-  reservation is available.
-- **Filesystem tools** (`fs_read_file`, `fs_write_file`) and a scratch area — so
-  the "offload a big tool result to disk, leave a pointer the model can re-read"
-  pattern is directly implementable.
-- A single choke point (`enforce_context_budget`, called once per round in
-  `run_agent_turn`) where the whole strategy can live.
-
-### 2.2 How Claude Code does it (reference implementation)
-
-Claude Code (analyzed from source) treats context management as a **cascade of
-increasingly expensive, decreasingly reversible tiers**, run in order every turn.
-If an earlier tier gets under the threshold, the later ones no-op. Cheap and
-reversible first; lossy LLM summarization only as a last resort.
-
-| Tier | Mechanism | Cost | Reversible |
-|---|---|---|---|
-| 0 | **Per-tool result cap at execution.** A tool result over its cap is written to disk; the in-context block becomes a `<persisted-output>` pointer + a ~2 KB preview. Read self-bounds at 25 K tokens / 0.25 MB. Bash 30 K chars, Grep 20 K, default 50 K. | free | yes — model re-reads the path |
-| 1 | **Per-message aggregate budget.** Parallel tools summing > 200 K chars in one wire message → offload the largest fresh results to disk. | free | yes |
-| 2 | **Micro-compact.** Clear the *bodies* of old tool results in place (keep the last ~5), replacing with `"[Old tool result content cleared]"`. Fires on a 60-min prompt-cache-cold gap. No LLM call. | free | on disk in transcript |
-| 3 | **Context-collapse.** A projection over full history that folds old reads/greps into re-expandable stubs, kept in a separate store. | free | yes |
-| 4 | **Auto-compact.** A one-shot **LLM summarization** of the conversation into a fixed 9-section summary; the post-compact context keeps a boundary marker + the summary + the **5 most-recent files re-read fresh** + plan/skills. | 1 API call | no (one-way) |
-
-**Token accounting** is a **hybrid**: anchor on the last *real* API `usage`
-(`input + cache_read + cache_creation + output`), then add a **~4-chars/token
-estimate** of only the messages appended since that response. It never
-re-tokenizes the whole history.
-
-**Window + thresholds** (200 K-model defaults):
-
-- Window resolution order: explicit env override → `[1m]` name suffix (1 M) →
-  per-model capability table → **200 K default fallback**.
-- `effective = window − min(max_output_tokens, 20 K reserve)`.
-- Auto-compact fires at `effective − 13 K` (~90 % of effective).
-- Warning to the user at `threshold − 20 K`; a hard blocking limit at
-  `effective − 3 K` reserves room for a manual compact.
-- **Circuit breaker:** stop attempting compaction after **3 consecutive
-  failures** (avoids burning API calls in a doomed loop).
-
-Key design lessons we adopt:
-
-1. **Order tiers cheap-reversible → expensive-lossy.** Never summarize if
-   dropping/offloading a few stale tool results would do.
-2. **Budget in tokens against the real window**, anchored on actual usage.
-3. **Reserve output headroom** off the top before computing "context left".
-4. **Cap tool results at the source**; for coding workloads, reads/greps are the
-   dominant context consumer, and offload-with-pointer is both cheap and
-   reversible.
-5. **A summary must carry the task forward** — intent, files, pending work,
-   verbatim next step — and re-attach the actual files in play, or the model
-   loses the thread.
-6. **Guard the machinery** with a failure circuit breaker.
-
-### 2.3 What is different for kitsu (constraints)
-
-- **Small windows are the common case.** Ollama models at 4 K–32 K make Stage 1
-  (model-aware token budgeting) not a nicety but the fix for the actual failure
-  mode. Claude Code's audience is 200 K+; kitsu's is often 50× smaller.
-- **No prompt cache semantics** on most OpenAI-compat gateways, so the cache-TTL
-  motivations behind micro-compact timing don't apply; kitsu triggers purely on
-  token pressure.
-- **Summarization quality scales with the model.** A 3 B local model summarizes
-  poorly; the auto-compact tier must be **quality-gated** (opt-in / capability-
-  gated), whereas trimming and offload work regardless of model.
-- **No per-model capability table.** kitsu must discover the window from
-  `/v1/models` when possible and otherwise fall back to config/default.
-
-### 2.4 What gets *loaded* into context — the `llms.txt` standard
-
-Context pressure is not only about *trimming what accumulates*; it is equally
-about *what we inject in the first place*. Agentic CLIs tend to auto-load large
-amounts of project material at startup — Claude Code slurps `CLAUDE.md` files and
-memory directories, and projects can carry hundreds of markdown files. This makes
-the agent knowledgeable but **spends the window on material that is often
-irrelevant to the specific task**, and on small local models it can consume the
-entire budget before the user has said anything.
-
-There is an emerging open standard for exactly this problem:
-[**llms.txt**](https://llmstxt.org/). kitsu is open source and should be a good
-citizen of industry/open-source conventions, so we adopt it rather than invent a
-bespoke project-context format.
-
-**The standard (summary of the spec):**
-
-- A file at the project/site root path **`/llms.txt`** (a subpath is allowed) —
-  a curated, LLM-optimized index, designed precisely because "context windows are
-  too small to handle most websites/projects in their entirety."
-- **Format** (fixed enough for classical parsers/regex):
-  - An **H1** with the project/site name — *the only required element*.
-  - A **blockquote** short summary with key information.
-  - Zero or more markdown sections (any type except headings) for details.
-  - Zero or more **H2 sections** each containing a *file list*: markdown links
-    with optional `: description` suffixes.
-  - A special **`## Optional`** section whose links are **secondary and may be
-    skipped for shorter contexts**.
-- Companion conventions: a clean **`.md` version of each page** at the same URL +
-  `.md`; and expanded dumps **`llms-full.txt`** / `llms-ctx.txt` (URL-less) /
-  `llms-ctx-full.txt` for whole-project context.
-- Example shape:
-  ```
-  # Title
-  > Optional short summary
-  Optional details
-  ## Section name
-  - [Link title](url): optional description
-  ## Optional
-  - [Secondary doc](url): loaded only if there's budget
-  ```
-
-**Why this fits kitsu's context design.** The `Optional` section is a
-**budget-aware boundary baked into the standard**: required content (H1 + summary
-+ non-optional sections) is always loaded; the `Optional` links are loaded only
-when the meter has headroom. That is the same cheap-first / degrade-gracefully
-principle as the trimming cascade, applied to *ingestion* instead of *eviction* —
-so the two mechanisms compose cleanly and use the same `ContextMeter`.
-
----
-
-## 3. Target implementation
-
-A single, model-aware, token-based cascade living behind the existing
-`enforce_context_budget` call site in `run_agent_turn`, plus a source-level tool-
-result cap. Tiers, cheapest first:
-
-### 3.1 Token accounting (`ContextMeter`)
-
-A small helper that estimates the current request's token cost the Claude-Code
-way:
-
-```
-tokens ≈ last_usage.prompt_tokens            // authoritative anchor, if we have one
-       + Σ estimate(msg) for messages appended since that usage was recorded
-estimate(msg) ≈ ceil(byte_len / 4)           // 4 chars/token; /2 for dense JSON args
+```text
+reply reserve = max(max_output_tokens, 512), capped at W / 2
+effective     = W - reply reserve
+trim target   = effective - min(W / 10, 2048)
 ```
 
-- The orchestrator already sees `ChatDelta::Usage`; record the running
-  `prompt_tokens` after each response as the anchor.
-- Before the first response (no anchor yet), fall back to a pure `bytes/4`
-  estimate of the whole message set.
+The reserve leaves room for an answer; the target leaves a buffer below the
+hard effective prompt limit. These are estimates, not a gateway-specific
+tokenizer, but reported usage continuously corrects their scale.
 
-### 3.2 Window discovery (`ContextWindow`)
+## Compaction cascade
 
-Resolution order (first hit wins), computed once per session:
+Kitsu applies cheaper and more recoverable reductions before more lossy ones:
 
-1. Explicit config / CLI (`context_window` on the gateway profile, or a flag).
-2. `/v1/models` metadata for the active model when the gateway exposes a context
-   length (Ollama does).
-3. A conservative **default fallback** (e.g. 8 K) — deliberately small so we
-   *under*-fill an unknown model rather than overflow it.
+1. **Offload large tool results.** A successful tool result above 8 KiB of text
+   is written to a private session artifact when an artifact directory is
+   available. The conversation retains the exact path, size, re-read guidance,
+   and a 500-character preview.
+2. **Elide old tool bodies.** Under pressure, older tool-result bodies become a
+   short marker. An existing offload pointer is retained so the result remains
+   re-readable.
+3. **Compact whole exchanges.** If needed, Kitsu removes or summarizes the
+   oldest complete user-delimited exchanges. It never splits an assistant tool
+   call from its tool result, and it preserves the leading system context plus
+   the two newest user exchanges.
 
-`effective_window = context_window − output_reserve`, where
-`output_reserve = max(max_output_tokens, MIN_RESERVE)` (a floor, e.g. 512), so we
-always leave room to answer. Trim target = `effective_window − BUFFER` with a
-small buffer scaled to the window (e.g. `min(window/10, 2 K)`).
+`--compaction trim` deterministically drops eligible old exchanges. It is the
+default and makes no extra provider call.
 
-### 3.3 The cascade (per round, before sending)
+`--compaction summarize` asks the active model for a compact continuation note.
+The summarizer request is non-streaming, capped at 1024 output tokens (and at
+half the actual model window), and locally shortened if its input would not fit.
+The returned summary is admitted only when the rebuilt main request fits the
+target; it may be shortened locally to do so. Empty, failed, or unfit summaries
+fall back to deterministic trimming. Three consecutive summary failures open a
+per-session circuit breaker so a doomed summarizer is not called repeatedly.
 
-1. **Tier 0 — cap tool results at the source.** When a tool returns, if its
-   result exceeds a per-tool cap, write the full result to the scratch dir and
-   replace the in-context content with a short pointer + preview
-   (`[output NN KB — saved to <path>; re-read with fs_read_file]`). kitsu already
-   truncates read output at 64 KiB; this generalizes it to *offload* rather than
-   silently drop, making it reversible. (Reuses the permission-gated write path.)
+Every provider request—including the summarizer request and every agent-loop
+round—receives a final check against its concrete messages and tool schemas. If
+the protected system/recent context still cannot fit after all eligible
+compaction, Kitsu stops locally with an actionable context-overflow error.
 
-2. **Tier 1 — trim/elide old tool results** (evolve the current mechanism to be
-   token-driven): oldest-first, replace stale tool-result bodies with a stub
-   until under target. Keep the last N (e.g. 3) tool results intact.
+## Manual compaction and rollback
 
-3. **Tier 2 — drop oldest whole turns.** If still over target, remove the oldest
-   user/assistant *pairs* (never the system prompt, never the most recent K
-   turns, never split a tool_use/tool_result pair), until under target.
+`/compact` invokes the same cascade without waiting for the automatic pressure
+threshold. It compacts all eligible older exchanges while preserving the normal
+system/recent boundary. The command reports its before/after estimate, method,
+removed exchanges, and tool-result elisions. If the command is cancelled or
+fails, both the conversation and its context-management state are restored.
 
-4. **Tier 3 — summarizing compaction (gated).** If trimming would evict the
-   active task (i.e. we'd have to drop recent turns), instead make one LLM call
-   to summarize the evicted span into a compact note, then rebuild history as:
-   `system → [compaction summary] → recent kept turns`. Adopt a scaled version of
-   Claude Code's summary structure (intent, files & code touched, decisions,
-   pending tasks, current work, exact next step). Re-read the most-recent file(s)
-   the model was working with. Gate on model capability and a config flag; apply
-   a **3-failure circuit breaker**.
+If fewer than three user exchanges exist, there may be nothing safe to compact.
+Manual compaction still requires a resolved window at the core API boundary; the
+CLI supplies its enforced 8192 fallback when no stronger value exists.
 
-Each tier reports how many tokens it freed; the cascade stops as soon as the
-estimate is under target.
+## Observability and session state
 
-### 3.4 Observability
+Redirected human-mode turns emit stable `kitsu-context: {...}` telemetry on
+stderr alongside `kitsu-usage:`. JSONL mode carries context and usage through
+versioned events instead.
 
-- A `kitsu-context:` stderr line (like `kitsu-usage:`) reporting
-  `used/effective` tokens and which tier fired, so sessions are debuggable and
-  the dogfood harness can assert on it.
-- On Tier 3, print a visible boundary (e.g. `✻ context compacted`) as Claude Code
-  does, so the user knows summarization happened.
+`/context` reports the window, used/effective tokens, remaining headroom,
+per-source provenance and estimates (including conversation roles and tool
+schemas), and the compaction ledger. `/status` includes cumulative compaction
+runs, tokens saved, exchanges removed, tool results elided, and the last
+outcome/fallback.
 
-#### `/context` — first-class utilization command
+The in-memory session ledger records automatic versus manual runs, trim versus
+summary outcomes, savings, fallback reason, and whether summary input/output was
+locally shortened. Its detailed record list is bounded. Conversation snapshots
+persist the compacted messages and artifact pointers, but the runtime meter,
+circuit-breaker count, and ledger are not serialized into a resumed session.
 
-A REPL slash command (and a companion the agent can be asked to run) that shows,
-on demand, how the window is being used right now — kitsu's analogue of Claude
-Code's `/context`. It reuses the `ContextMeter` and `ContextWindow` from §3.1–3.2,
-so it costs nothing beyond a walk of the current message set.
+## Project context (`llms.txt`)
 
-It reports:
+Unless `--no-project-context` or `KITSU_NO_PROJECT_CONTEXT` is set, Kitsu looks
+from the launch directory up to the Git/project root for `llms.txt`. If none is
+found, it falls back to the nearest `AGENTS.md` or `CLAUDE.md`. A configured
+project-context path takes precedence when it exists.
 
-- The **model** and its resolved **window** (and how it was resolved: config /
-  `/v1/models` / default).
-- **Used vs effective vs raw** tokens, as a number and a bar, with the
-  **headroom** remaining before trimming/compaction fires.
-- A **breakdown by category**, each estimated via the meter:
-  - System prompt
-  - Tool schemas advertised to the model
-  - Messages, split by role: user turns · assistant turns · tool results
-  - (Later) offloaded/compacted savings, so the effect of the cascade is visible.
+For `llms.txt`, Kitsu parses the H1, leading blockquote summary, required body,
+and `## Optional` section. It includes the optional section only when the entire
+rendered file fits within one quarter of the window, then caps the final project
+context at one third of the window. Fallback instruction files receive the same
+final cap. Reads are bounded to 256 KiB.
 
-Sketch of the intended output:
+Kitsu injects the file's contents; markdown links are an index for the model and
+are **not followed or fetched automatically**. The exact source is disclosed in
+`/status` and `/context`. `--no-project-context` also prevents saved project text
+from being silently reintroduced when resuming a session.
 
+## Verification boundary
+
+The local contract is covered by context-meter/budget unit tests, orchestrator
+tests for every cascade and preflight branch, provider discovery/cache tests,
+CLI tests for context provenance and JSONL telemetry, and session/artifact
+regressions. The release gates are:
+
+```bash
+cargo fmt --all -- --check
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
 ```
-kitsu> /context
-model: qwen2.5-coder:latest   window: 32768 (from /v1/models)
-used 7,412 / 29,696 effective  [■■■■□□□□□□□□□□□□]  25%   headroom: 22,284
-  system prompt        412
-  project (llms.txt)   980   (required 620 · optional 360)
-  tool schemas         690
-  user turns         1,240
-  assistant turns    1,180
-  tool results       2,910   (2 offloaded to disk)
-```
 
-Because it is driven by the same accounting that drives trimming, `/context`
-always agrees with what the budget will actually do — it is a window into the
-live meter, not a separate estimate.
+Live-provider smoke tests are supplementary: their result depends on credentials,
+billing, catalog metadata, provider availability, and model behavior.
 
-### 3.5 Data-model touch points
+## Deliberate limits
 
-- `AgentConfig`: replace `max_context_bytes: usize` with a richer
-  `context: ContextConfig { window, output_reserve, buffer, compaction: enum }`,
-  or keep `max_context_bytes` as a fallback and add the token fields alongside.
-- `Provider`/gateway config: optional `context_window` field; `list_models()`
-  extended to surface a context length when the gateway provides one.
-- Orchestrator: record last `prompt_tokens`; replace the `enforce_context_budget`
-  body with the cascade.
-
-### 3.6 Project context loading (`llms.txt`-compatible)
-
-kitsu should ingest project context in a **budget-aware, standards-compatible**
-way rather than slurping every markdown file.
-
-**kitsu as a consumer of `llms.txt`:**
-
-1. On `chat` start in a project directory (and on `/allow`-ed roots), look for
-   `llms.txt` — the launch dir, then the git/project root, then a path set in the
-   gateway/profile config.
-2. Parse it with a simple, spec-shaped parser (H1 name, blockquote summary,
-   sections, `## Optional`). Inject the **required** part (name + summary +
-   non-optional section text, and optionally the linked `.md` files) into the
-   session as project context.
-3. Treat the **`## Optional`** section as **budget-gated**: its linked content is
-   loaded only while the `ContextMeter` reports headroom under the trim target,
-   and it is the **first thing evicted** by the trimming cascade. This is a direct
-   use of the standard's own "may be skipped for shorter contexts" semantics.
-4. Prefer the `.md` version of a linked page when following links, per the
-   convention; support pointing kitsu at an `llms-full.txt` when the user wants
-   the whole project loaded.
-5. The loaded context is registered with the meter as its own `/context`
-   category ("project (llms.txt)"), so users can see and reason about its cost.
-
-**kitsu as a producer:** ship an `llms.txt` at the repository root describing
-kitsu (name, one-line summary, links to `README.md`, `docs/architecture.md`, the
-gateway recipes, and this design under `## Optional`). This makes kitsu itself
-consumable by any `llms.txt`-aware tool — including kitsu — and models the
-practice we're endorsing.
-
-**Ecosystem compatibility.** `llms.txt` is the primary target. kitsu should also
-degrade gracefully to, and interoperate with, adjacent conventions where trivial
-(e.g. an `AGENTS.md`/`CLAUDE.md` fallback for agent instructions when no
-`llms.txt` is present) — but those are additive; the curated, budget-aware
-`llms.txt` path is the canonical one. Being open source, kitsu favors these open
-conventions over any bespoke format so it composes with the wider tooling
-ecosystem.
-
----
-
-## 4. Non-goals
-
-- Server-side / API-native context management (Anthropic's `context_management`
-  beta) — not available on generic OpenAI-compat gateways.
-- Prompt-cache-aware timing (no cache semantics to exploit here).
-- A persistent cross-session "collapse store" — kitsu compaction is per-session.
-- Perfect token counts — an estimate anchored on real usage is sufficient;
-  exact re-tokenization per turn is not worth the cost/complexity.
-
----
-
-## 5. Open questions
-
-1. **Default fallback window** when `/v1/models` doesn't expose one — 8 K is safe
-   but wastes headroom on big models. Prefer requiring the user to set
-   `context_window` per profile, with 8 K only as a last resort?
-2. **Tier 3 gating** — how to decide a model is "capable enough" to summarize
-   well without a capability table? Options: config opt-in only; a size heuristic
-   from the model id; or always-on with a quality disclaimer.
-3. Should Tier 0 offload be **always on** (even under budget) for very large tool
-   results, to keep single results from dominating a small window?
-4. Whether to keep `max_context_bytes` as a coarse secondary guard for gateways
-   that report no usage and no window.
-5. **`llms.txt` discovery scope** — only the launch/project root, or also walk up
-   to the git root and honor a configured path? And should link-following load
-   linked `.md` files eagerly or lazily (on model request)?
-
----
-
-## 6. References
-
-- **llms.txt standard** — <https://llmstxt.org/> (curated, budget-aware project
-  context; the `## Optional` section is explicitly skippable for shorter
-  contexts). Adopted in §2.4 / §3.6 / Stage 4.
-- Claude Code context system (auto-compact, micro-compact, token budgeting) —
-  analyzed as the reference implementation for §2.2.
+- Accounting is a hybrid estimate, not model-specific tokenization.
+- Cold discovery improves a later run; it never changes a request already being
+  prepared with the 8192 fallback.
+- Summaries are lossy and model-dependent, which is why trim remains the default.
+- Project-context links and remote resources are never fetched automatically.
+- Context management is client-side; Kitsu does not rely on a provider-specific
+  server-side compaction extension.
