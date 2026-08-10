@@ -7,17 +7,46 @@ pub mod error;
 pub mod permissions;
 
 pub use builtins::command::{
-    command_exec_tool, execute_command, CommandApprovalRequest, CommandDecision, CommandExecArgs,
-    CommandLimits, CommandMode, CommandOutput, CommandPolicy, CommandPrompter, CommandTermination,
+    command_exec_tool, execute_command, CommandAmbientAuthority, CommandApprovalRequest,
+    CommandArtifactCompletion, CommandArtifactRequest, CommandDecision, CommandExecArgs,
+    CommandExecutableFingerprint, CommandExecutableIdentity, CommandExecutableResolution,
+    CommandGrantInfo, CommandGrantedExecutable, CommandLimits, CommandMode, CommandOutput,
+    CommandOutputArtifact, CommandOutputArtifactSink, CommandOutputArtifactWriter,
+    CommandOutputStream, CommandPolicy, CommandPrompter, CommandTermination,
 };
 pub use error::ToolError;
-pub use permissions::{Action, Decision, Mode, PermissionRequest, Permissions, Prompter};
+pub use permissions::{
+    Action, Decision, Mode, PermissionRequest, Permissions, Prompter, Revocation,
+};
 
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
 
 use kitsu_providers::ToolDescriptor;
+
+tokio::task_local! {
+    static INTERACTIVE_PROMPTS_ALLOWED: bool;
+}
+
+/// Run tool work without allowing it to claim the process's interactive input.
+///
+/// Background agents share the foreground permission policies and therefore
+/// retain explicit/session grants, but an ungranted operation must fail closed
+/// instead of racing the foreground prompt for stdin. Tokio task-local state is
+/// intentionally scoped to the agent future and is not a process-global mode.
+pub async fn scope_without_interactive_prompts<F>(future: F) -> F::Output
+where
+    F: Future,
+{
+    INTERACTIVE_PROMPTS_ALLOWED.scope(false, future).await
+}
+
+pub(crate) fn interactive_prompts_allowed() -> bool {
+    INTERACTIVE_PROMPTS_ALLOWED
+        .try_with(|allowed| *allowed)
+        .unwrap_or(true)
+}
 
 /// A tool handler: takes raw JSON args, returns a JSON string result.
 pub type HandlerFn = Box<

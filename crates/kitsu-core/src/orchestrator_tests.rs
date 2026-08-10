@@ -117,6 +117,57 @@ impl Provider for FallibleMockProvider {
     }
 }
 
+#[derive(Clone)]
+struct TelemetryProvider;
+
+impl Provider for TelemetryProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        Ok(Box::pin(stream::iter(vec![Ok(ChatDelta::Done(
+            FinishReason::Stop,
+        ))])))
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<kitsu_providers::ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        if let Some(telemetry) = telemetry {
+            telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 2,
+                category: kitsu_providers::ProviderAttemptCategory::RateLimited,
+                status: Some(429),
+                outcome: kitsu_providers::ProviderAttemptOutcome::RetryScheduled,
+                terminal: false,
+                retry_delay_ms: Some(250),
+                retry_after_used: false,
+                remaining_deadline_ms: 10_000,
+            });
+            telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                attempt: 2,
+                max_attempts: 2,
+                category: kitsu_providers::ProviderAttemptCategory::Success,
+                status: Some(200),
+                outcome: kitsu_providers::ProviderAttemptOutcome::ResponseAccepted,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: 9_700,
+            });
+        }
+        self.chat_stream(req).await
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
 fn tc(name: &str, call_id: &str, args: &str) -> ToolCall {
     ToolCall {
         tool_name: name.to_string(),
@@ -958,7 +1009,7 @@ fn tool_activity_formatting() {
             r#"{"written":"x","bytes":42,"change":"created","warning":"looks corrupted"}"#,
             false
         ),
-        "created · 42 bytes — ⚠ looks corrupted"
+        "created · 42 bytes — warning: looks corrupted"
     );
     assert_eq!(
         format_tool_header("fs_edit_file", r#"{"path":"fb.py"}"#),
@@ -989,6 +1040,92 @@ fn tool_activity_formatting() {
         ),
         "error: PolicyDenied — nope"
     );
+
+    assert_eq!(
+        format_tool_header(
+            "command_exec",
+            r#"{"argv":["git","status"],"cwd":"/workspace/project","timeout_ms":5000}"#
+        ),
+        r#"Command(argv="git" "status"; cwd="/workspace/project")"#
+    );
+    let command_output = serde_json::json!({
+            "argv": ["git", "status"],
+            "cwd": "/workspace/project",
+            "executable": {
+                "invocation": "git",
+                "resolution": "ambient_path",
+                "observed_path": "/usr/bin/git",
+                "pinned": false
+            },
+            "ambient_authority": {
+                "inherits_environment": true,
+                "filesystem_confined_to_command_roots": false,
+                "network_confined": false,
+                "executable_identity_pinned": false
+            },
+            "termination": "exited",
+            "success": false,
+            "exit_code": 7,
+            "signal": null,
+            "stdout": "12\n[... 5 bytes omitted ...]\n89",
+            "stderr": "bad",
+            "stdout_bytes": 9,
+            "stderr_bytes": 3,
+            "stdout_retained_bytes": 4,
+            "stderr_retained_bytes": 3,
+            "stdout_truncated": true,
+            "stderr_truncated": false,
+            "stdout_capture_complete": true,
+            "stderr_capture_complete": true,
+            "elapsed_ms": 42,
+            "artifact": {"reference": "session:command-1"},
+            "artifact_error": null
+    });
+    let command_result = format_tool_result("command_exec", &command_output.to_string(), false);
+    assert!(command_result.contains("exit 7 | 42 ms"));
+    assert!(command_result.contains("stdout 4/9 B truncated"));
+    assert!(command_result.contains("89"));
+    assert!(command_result.contains("stderr 3 B"));
+    assert!(command_result.contains("bad"));
+    assert!(command_result.contains("full output=\"session:command-1\""));
+
+    let mut signaled = command_output.clone();
+    signaled["termination"] = serde_json::json!("signaled");
+    signaled["exit_code"] = serde_json::Value::Null;
+    signaled["signal"] = serde_json::json!(15);
+    assert!(
+        format_tool_result("command_exec", &signaled.to_string(), false)
+            .starts_with("signal 15 | 42 ms")
+    );
+
+    let mut timed_out = command_output.clone();
+    timed_out["termination"] = serde_json::json!("timed_out");
+    timed_out["exit_code"] = serde_json::Value::Null;
+    timed_out["signal"] = serde_json::json!(9);
+    assert!(
+        format_tool_result("command_exec", &timed_out.to_string(), false)
+            .starts_with("timeout (signal 9) | 42 ms")
+    );
+
+    let unsafe_header = format_tool_header(
+        "command_exec",
+        &serde_json::json!({
+            "argv": ["printf", "\u{1b}[31mred\nnext"],
+            "cwd": "/workspace\u{1b}]0;owned\u{7}",
+        })
+        .to_string(),
+    );
+    assert!(!unsafe_header.contains('\u{1b}'));
+    assert!(!unsafe_header.contains('\n'));
+    assert!(unsafe_header.contains("\\n"));
+
+    let sanitized_warning = format_tool_result(
+        "fs_write_file",
+        r#"{"bytes":1,"warning":"raw <|im_start|> marker"}"#,
+        false,
+    );
+    assert!(!sanitized_warning.contains("<|im_start|>"));
+    assert!(sanitized_warning.contains("[chat-template marker]"));
 }
 
 // --- context trimming (Stage 1c) --------------------------------------------
@@ -2204,6 +2341,124 @@ async fn structured_event_log_frames_provider_usage_tools_and_completion() {
 }
 
 #[tokio::test]
+async fn structured_event_log_uses_native_command_fields_instead_of_json_blobs() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc(
+                "command_exec",
+                "command-1",
+                r#"{"argv":["git","status"],"cwd":"/workspace","timeout_ms":5000}"#,
+            )),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register(
+        "command_exec",
+        ok_handler(
+            r#"{"argv":["git","status"],"cwd":"/workspace","executable":{"invocation":"git","resolution":"ambient_path","observed_path":"/usr/bin/git","pinned":false},"ambient_authority":{"inherits_environment":true,"filesystem_confined_to_command_roots":false,"network_confined":false,"executable_identity_pinned":false},"termination":"exited","success":true,"exit_code":0,"signal":null,"stdout":"clean","stderr":"","stdout_bytes":5,"stderr_bytes":0,"stdout_retained_bytes":5,"stderr_retained_bytes":0,"stdout_truncated":false,"stderr_truncated":false,"stdout_capture_complete":true,"stderr_capture_complete":true,"elapsed_ms":12,"artifact":{"reference":"session:command-1"},"artifact_error":null}"#,
+        ),
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    assert_eq!(
+        run_agent_turn(&provider, &tools, &mut messages, &c)
+            .await
+            .unwrap(),
+        "done"
+    );
+    let events = log.take();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolStarted {
+            call_id,
+            args,
+            command: Some(command),
+            ..
+        } if call_id == "command-1"
+            && args == "[structured command invocation]"
+            && command.argv == ["git", "status"]
+            && command.cwd == "/workspace"
+            && command.timeout_ms == Some(5000)
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolFinished {
+            call_id,
+            output,
+            command: Some(command),
+            ..
+        } if call_id == "command-1"
+            && output == "[structured command result]"
+            && command.exit_code == Some(0)
+            && command.elapsed_ms == 12
+            && command.stdout_bytes == 5
+            && command.stdout_tail == "clean"
+            && !command.ambient_authority.filesystem_confined_to_command_roots
+            && command.artifact.as_ref().map(|artifact| artifact.reference.as_str())
+                == Some("session:command-1")
+    )));
+}
+
+#[tokio::test]
+async fn structured_event_log_separates_logical_requests_from_physical_attempts() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ProviderAttemptOutcome};
+
+    let provider = TelemetryProvider;
+    let tools = Registry::new();
+    let log = AgentEventLog::default();
+    let mut c = cfg(1);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap();
+    let events = log.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentRuntimeEvent::ProviderRequest { .. }))
+            .count(),
+        1,
+        "retries must not duplicate the logical provider_request event"
+    );
+    let attempts: Vec<_> = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::ProviderAttempt {
+                round,
+                attempt,
+                outcome,
+                terminal,
+                ..
+            } => Some((*round, *attempt, *outcome, *terminal)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        attempts,
+        vec![
+            (1, 1, ProviderAttemptOutcome::RetryScheduled, false),
+            (1, 2, ProviderAttemptOutcome::ResponseAccepted, true),
+        ]
+    );
+}
+
+#[tokio::test]
 async fn structured_event_log_marks_normal_tool_errors_as_finished_not_cancelled() {
     use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
     use kitsu_providers::{ChatMessage, ToolDescriptor};
@@ -2324,4 +2579,148 @@ async fn dropping_in_flight_tool_turn_records_one_cancelled_terminal_event() {
             ..
         } if output.contains("cancelled")
     ));
+}
+
+#[tokio::test]
+async fn dropping_in_flight_command_records_native_cancelled_metadata() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+    use kitsu_tools::CommandTermination;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::ToolCall(tc(
+            "command_exec",
+            "call-command-pending",
+            r#"{"argv":["sleep","30"],"cwd":".","timeout_ms":30000}"#,
+        )),
+        ChatDelta::Done(FinishReason::ToolCalls),
+    ]]);
+    let started = Arc::new(tokio::sync::Notify::new());
+    let handler_started = started.clone();
+    let handler: HandlerFn = Box::new(move |_args| {
+        let handler_started = handler_started.clone();
+        Box::pin(async move {
+            handler_started.notify_one();
+            futures::future::pending::<Result<String, ToolError>>().await
+        })
+    });
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "command_exec".to_string(),
+            description: "wait forever".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        handler,
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let mut turn = Box::pin(run_agent_turn(&provider, &tools, &mut messages, &c));
+    tokio::select! {
+        _ = started.notified() => {}
+        result = &mut turn => panic!("pending command turn unexpectedly finished: {result:?}"),
+    }
+    drop(turn);
+
+    let events = log.take();
+    let terminal = events
+        .iter()
+        .find(|event| {
+            matches!(event, AgentRuntimeEvent::ToolFinished { call_id, .. }
+                if call_id == "call-command-pending")
+        })
+        .expect("cancelled command needs a terminal event");
+    assert!(matches!(
+        terminal,
+        AgentRuntimeEvent::ToolFinished {
+            success: false,
+            cancelled: true,
+            command: Some(command),
+            ..
+        } if command.termination == CommandTermination::Cancelled
+            && !command.stdout_capture_complete
+            && !command.stderr_capture_complete
+            && command.artifact.is_none()
+            && command.artifact_error.as_deref().is_some_and(|error| {
+                error.contains("not published") && error.contains("cleanup was requested")
+            })
+    ));
+}
+
+#[tokio::test]
+async fn failed_live_event_sink_stops_before_provider_send() {
+    use crate::orchestrator::{AgentError, AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("must not be requested".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let log = AgentEventLog::with_fallible_observer(|event| {
+        !matches!(event, AgentRuntimeEvent::ProviderRequest { .. })
+    });
+    let mut c = cfg(2);
+    c.quiet = true;
+    c.event_log = Some(log);
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let error = run_agent_turn(&provider, &Registry::new(), &mut messages, &c)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Loop(message) if message.contains("event sink")));
+    assert_eq!(provider.call_count(), 0, "no unobservable send may start");
+}
+
+#[tokio::test]
+async fn failed_live_event_sink_stops_before_tool_mutation() {
+    use crate::orchestrator::{AgentError, AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::ToolCall(tc("mutate", "call-must-not-run", "{}")),
+        ChatDelta::Done(FinishReason::ToolCalls),
+    ]]);
+    let runs = Arc::new(AtomicUsize::new(0));
+    let handler_runs = runs.clone();
+    let handler: HandlerFn = Box::new(move |_args| {
+        let handler_runs = handler_runs.clone();
+        Box::pin(async move {
+            handler_runs.fetch_add(1, Ordering::SeqCst);
+            Ok("mutated".to_string())
+        })
+    });
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "mutate".to_string(),
+            description: "must not run".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        handler,
+    );
+    let log = AgentEventLog::with_fallible_observer(|event| {
+        !matches!(event, AgentRuntimeEvent::ToolStarted { .. })
+    });
+    let mut c = cfg(2);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let error = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap_err();
+    assert!(matches!(error, AgentError::Loop(message) if message.contains("event sink")));
+    assert_eq!(runs.load(Ordering::SeqCst), 0);
+    assert!(log.take().iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolFinished {
+            call_id,
+            cancelled: true,
+            ..
+        } if call_id == "call-must-not-run"
+    )));
 }

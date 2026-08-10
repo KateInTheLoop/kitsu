@@ -18,6 +18,7 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::ProviderError;
 use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
+use crate::telemetry::{ProviderAttemptCategory, ProviderAttemptOutcome, ProviderTelemetrySink};
 use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason};
 use crate::Provider;
 
@@ -333,6 +334,97 @@ async fn test_gateway_retry_after_seconds_is_honored() {
 }
 
 #[tokio::test]
+async fn test_physical_attempt_telemetry_reports_retry_and_terminal_success() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            if responder_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                ResponseTemplate::new(429).insert_header("retry-after", "1")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_two_text_deltas())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 1;
+    provider.timeout = Duration::from_secs(3);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+
+    let _stream = provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+        .expect("the request should retry once and then succeed");
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2, "one event is required per HTTP send");
+    let retry = &events[0];
+    assert_eq!(retry.attempt, 1);
+    assert_eq!(retry.max_attempts, 2);
+    assert_eq!(retry.category, ProviderAttemptCategory::RateLimited);
+    assert_eq!(retry.status, Some(429));
+    assert_eq!(retry.outcome, ProviderAttemptOutcome::RetryScheduled);
+    assert!(!retry.terminal);
+    assert!(retry.retry_delay_ms.is_some_and(|delay| delay >= 1000));
+    assert!(retry.retry_after_used);
+    assert!(retry.remaining_deadline_ms <= 3000);
+
+    let success = &events[1];
+    assert_eq!(success.attempt, 2);
+    assert_eq!(success.category, ProviderAttemptCategory::Success);
+    assert_eq!(success.status, Some(200));
+    assert_eq!(success.outcome, ProviderAttemptOutcome::ResponseAccepted);
+    assert!(success.terminal);
+    assert_eq!(success.retry_delay_ms, None);
+    assert!(!success.retry_after_used);
+}
+
+#[tokio::test]
+async fn test_physical_attempt_telemetry_excludes_http_body_and_marks_final_rejection() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(400).set_body_string("secret response detail"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let error = match provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("HTTP 400 must be terminal"),
+    };
+    assert!(matches!(error, ProviderError::Http { status: 400, .. }));
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::ClientError);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::Rejected);
+    assert!(events[0].terminal);
+    let serialized = serde_json::to_string(&events[0]).unwrap();
+    assert!(!serialized.contains("secret response detail"));
+    assert!(!serialized.contains(&server.uri()));
+}
+
+#[tokio::test]
 async fn test_gateway_retry_after_cannot_exceed_total_deadline() {
     let server = MockServer::start().await;
 
@@ -356,6 +448,45 @@ async fn test_gateway_retry_after_cannot_exceed_total_deadline() {
     assert!(matches!(err, ProviderError::Timeout));
     assert!(started.elapsed() >= Duration::from_millis(200));
     assert!(started.elapsed() < Duration::from_secs(1));
+}
+
+#[tokio::test]
+async fn test_attempt_telemetry_marks_retry_that_cannot_fit_as_terminal_deadline() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "30"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 100;
+    provider.timeout = Duration::from_millis(250);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let error = match provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("the total deadline must stop retries"),
+    };
+    assert!(matches!(error, ProviderError::Timeout));
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "no second HTTP send was made");
+    let attempt = &events[0];
+    assert_eq!(attempt.attempt, 1);
+    assert_eq!(attempt.category, ProviderAttemptCategory::Unavailable);
+    assert_eq!(attempt.status, Some(503));
+    assert_eq!(attempt.outcome, ProviderAttemptOutcome::DeadlineExceeded);
+    assert!(attempt.terminal);
+    assert!(attempt.retry_after_used);
+    assert_eq!(attempt.retry_delay_ms, Some(30_000));
+    assert!(attempt.remaining_deadline_ms <= 250);
 }
 
 /// Security invariant (design §3/§7): the token value must never appear in any

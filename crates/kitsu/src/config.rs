@@ -42,9 +42,10 @@ fn default_chat_path() -> String {
 
 /// Auth block within a gateway profile.
 ///
-/// `Debug` is implemented manually to redact `token` — an inline static token
-/// must never leak via `{:?}` / `debug!(?config)`. `Gateway` and `Config` derive
-/// `Debug` and delegate here, so the whole config tree is safe to debug-print.
+/// `Debug` is implemented manually to redact credential-bearing free-form
+/// fields. An inline static token or a token accidentally pasted into a refresh
+/// hint must never leak via `{:?}` / `debug!(?config)`. `Gateway` and `Config`
+/// derive `Debug` and delegate here.
 #[derive(Clone, Deserialize)]
 pub struct AuthConfig {
     #[serde(default = "default_auth_method")]
@@ -86,11 +87,15 @@ impl std::fmt::Debug for AuthConfig {
             Some(_) => "Some(\"<redacted>\")",
             None => "None",
         };
+        let refresh_hint = match &self.refresh_hint {
+            Some(_) => "Some(\"<redacted>\")",
+            None => "None",
+        };
         f.debug_struct("AuthConfig")
             .field("method", &self.method)
             .field("env", &self.env)
             .field("expires_env", &self.expires_env)
-            .field("refresh_hint", &self.refresh_hint)
+            .field("refresh_hint", &format_args!("{refresh_hint}"))
             .field("header", &self.header)
             .field("scheme", &self.scheme)
             .field("token", &format_args!("{token}"))
@@ -122,7 +127,13 @@ pub enum ConfigError {
         path: String,
         source: std::io::Error,
     },
-    Parse(String),
+    /// A TOML parse failure. Only location metadata is retained: the parser's
+    /// formatted error embeds the offending source line, which may contain a
+    /// credential from a malformed assignment.
+    Parse {
+        line: Option<usize>,
+        column: Option<usize>,
+    },
     UnknownGateway {
         name: String,
         defined: String,
@@ -145,7 +156,17 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Read { path, source } => {
                 write!(f, "config error: cannot read {path}: {source}")
             }
-            ConfigError::Parse(msg) => write!(f, "config error: {msg}"),
+            ConfigError::Parse {
+                line: Some(line),
+                column: Some(column),
+            } => write!(
+                f,
+                "config error: TOML parse failed at line {line}, column {column} (source excerpt withheld to avoid echoing credentials)"
+            ),
+            ConfigError::Parse { .. } => write!(
+                f,
+                "config error: TOML parse failed (source excerpt withheld to avoid echoing credentials)"
+            ),
             ConfigError::UnknownGateway { name, defined } => write!(
                 f,
                 "config error: unknown gateway '{name}' — defined gateways: {defined}"
@@ -199,7 +220,26 @@ impl Config {
     /// (so `--gateway` validation can still produce a clear error).
     pub fn load(path: &Path) -> Result<Config, ConfigError> {
         match std::fs::read_to_string(path) {
-            Ok(text) => toml::from_str(&text).map_err(|e| ConfigError::Parse(e.to_string())),
+            Ok(text) => toml::from_str(&text).map_err(|error: toml::de::Error| {
+                // Never retain `error.to_string()`: toml's Display includes a
+                // verbatim excerpt of the source line. Derive only a safe,
+                // one-based location from the byte span.
+                let location = error.span().and_then(|span| {
+                    let prefix = text.get(..span.start.min(text.len()))?;
+                    let line = prefix.chars().filter(|ch| *ch == '\n').count() + 1;
+                    let column = prefix
+                        .rsplit_once('\n')
+                        .map_or(prefix, |(_, tail)| tail)
+                        .chars()
+                        .count()
+                        + 1;
+                    Some((line, column))
+                });
+                ConfigError::Parse {
+                    line: location.map(|(line, _)| line),
+                    column: location.map(|(_, column)| column),
+                }
+            }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
             Err(e) => Err(ConfigError::Read {
                 path: path.display().to_string(),
@@ -289,9 +329,11 @@ mod tests {
     /// Regression: a debug-print of config must never expose a static token.
     #[test]
     fn debug_redacts_static_token() {
+        const HINT_SECRET: &str = "hf_refresh_hint_secret_value";
         let auth = AuthConfig {
             method: "static".to_string(),
             token: Some("super-secret-token-value".to_string()),
+            refresh_hint: Some(HINT_SECRET.to_string()),
             ..AuthConfig::default()
         };
         let dbg = format!("{auth:?}");
@@ -302,6 +344,10 @@ mod tests {
         assert!(
             dbg.contains("<redacted>"),
             "expected redaction marker: {dbg}"
+        );
+        assert!(
+            !dbg.contains(HINT_SECRET),
+            "refresh hint leaked in Debug output: {dbg}"
         );
 
         // And via the enclosing Gateway/Config (which derive Debug).
@@ -318,5 +364,28 @@ mod tests {
             !format!("{gw:?}").contains("super-secret-token-value"),
             "token leaked through Gateway Debug"
         );
+    }
+
+    #[test]
+    fn parse_error_retains_location_but_never_source_excerpt() {
+        const SECRET: &str = "hf_parse_error_secret_value";
+        let directory = tempfile::tempdir().expect("temp config directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!("default_gateway = \"example\"\ncredential = \"{SECRET}\" trailing\n"),
+        )
+        .expect("write malformed config");
+
+        let error = Config::load(&path).expect_err("config must be malformed");
+        let display = error.to_string();
+        let debug = format!("{error:?}");
+        assert!(display.contains("TOML parse failed at line 2"), "{display}");
+        assert!(display.contains("source excerpt withheld"), "{display}");
+        assert!(
+            !display.contains(SECRET),
+            "source leaked in Display: {display}"
+        );
+        assert!(!debug.contains(SECRET), "source leaked in Debug: {debug}");
     }
 }

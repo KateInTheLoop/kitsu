@@ -5,12 +5,16 @@
 > quality of a particular model remain external to this contract.
 
 Kitsu is one OpenAI-compatible CLI for hosted gateways and local servers. Its
-three entry points are:
+top-level entry points are:
 
 | Command | Behavior |
 |---|---|
+| `kitsu init [--path PATH]` | No-clobber, credential-free starter config creation. |
+| `kitsu doctor [--online]` | Read-only config/auth/context/state/tool-policy diagnostics; network checks are opt-in. |
 | `kitsu ask <prompt>` | One checked model turn; streaming by default. |
+| `kitsu review [path]` | One tool-free turn over host-verified working/staged/unstaged/base/commit evidence, with optional JSONL and session continuity. |
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
+| `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and
@@ -26,13 +30,15 @@ and refuses symlink-directory traversal.
 
 The implemented chat controls include:
 
-- Inspection: `/status`, `/context`, `/permissions`, `/tools`, `/diff [path]`,
-  `/agents [id]`, and `/sessions`.
+- Inspection: `/status`, `/context [refresh]`, `/permissions`, `/tools`, scoped
+  `/diff`, `/checkpoints`, `/checkpoint <id>`, `/jobs`, and `/sessions`.
 - Model/context: `/model`, `/models`, `/compact`, `/clear`, and `/retry`.
-- Files/workflow: `/allow`, `/allow-write`, `/save`, `/review`, and `/undo`.
+- Files/workflow: `/allow`, `/allow-write`, `/allow-read-write`,
+  `/revoke-read`, `/revoke-write`, `/revoke-command`, `/save`, scoped `/review`,
+  and `/undo [id]`.
 - Local context: `/skills` and `/skill`; bounded UTF-8 skill resources are
   captured with no-follow reads and loading them grants no filesystem access.
-- Scheduling: `/queue [prompt]`.
+- Scheduling: editable `/queue` controls plus active-turn `/steer` on Unix.
 - Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
   `/restore`, and `/delete`.
 
@@ -45,16 +51,21 @@ estimate and compaction ledger.
 `Ctrl+C` cancels an active provider/tool turn, rolls its conversation and context
 meter back, and makes the submitted prompt available to `/retry`. Completed file
 side effects remain on disk and are reported rather than hidden. At an idle
-prompt, `Ctrl+C` clears the input; `Ctrl+D` or `/quit` exits. Interactive exit
-waits for background agents, and another `Ctrl+C` cancels that remaining work.
+prompt, `Ctrl+C` clears the input. `/quit wait` waits for background jobs and
+`/quit cancel` cancels and joins them; an unqualified exit refuses to discard
+live work.
 
 ### Prompt queue and platform behavior
 
-The queue is an eight-entry FIFO. `/queue` shows it or appends one prompt, and
-queued prompts run in submission order. On Unix, Kitsu owns complete lines typed
+The queue is an eight-entry FIFO with list/add/remove/edit/move/promote/clear
+operations; the legacy `/queue <prompt>` shorthand still appends. On Unix,
+Kitsu owns complete lines typed
 while a foreground turn is running and places them into this queue; partial input
 remains in the terminal buffer, and permission prompts temporarily own stdin. If
-the queue is full, the collector waits for a slot rather than evicting work.
+the queue is full, the collector waits for a slot rather than evicting work. A
+`/steer <correction>` line uses a separate turn-scoped channel: it rolls back the
+partial conversation, retains/reports completed file effects, and restarts that
+turn before queued follow-ups. Corrections never become later prompts implicitly.
 
 Automatic type-ahead collection is not implemented on non-Unix platforms.
 `/queue <prompt>` still works there when the normal prompt is available, but text
@@ -65,30 +76,58 @@ entered during generation remains subject to terminal/OS buffering.
 Interactive chat advertises read, edit, and write tools and asks for paths as
 needed. The launch directory is read-granted; writes begin ungranted. Scripted
 and piped runs advertise filesystem capabilities only when corresponding
-`--allow-path` or `--allow-write` roots were supplied. `--yes` changes approval
-behavior but never creates a capability.
+`--allow-path`, `--allow-write`, or `--allow-read-write` roots were supplied.
+`--allow-write` is write-only; the combined flag is required for readback.
+`--yes` suppresses prompts while preserving current-root confinement and never
+creates a capability. Only `--dangerously-allow-all-filesystem` bypasses roots
+for enabled filesystem tools, and protected Kitsu-private paths still win.
+
+`/permissions` separates invocation and runtime roots, reports invocation roots
+revoked for the current session, and lists protected reads/writes plus narrow
+Kitsu-managed internal reads. `/revoke-read <exact-root>` and
+`/revoke-write <exact-root>` remove only exact user-controlled grants; they
+cannot weaken protected/internal state. A new/resumed/forked session restores
+invocation roots and drops runtime grants. Exact command grants are numbered,
+labeled invocation/runtime, and revocable with `/revoke-command <number>`.
+Detached agents share active grants but cannot invoke either interactive
+prompter; ungranted background work fails closed without racing foreground
+stdin.
 
 - `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
 - `fs_write_file` performs a bounded whole-file create/replace.
-- `fs_edit_file` replaces exact UTF-8 `old_text`. The precondition must match
+- `fs_edit_file` is advertised only when both read and write capabilities are
+  present. It replaces exact UTF-8 `old_text`; the precondition must match
   exactly once unless `replace_all` is set, and a concurrent change before
   commit causes a conflict instead of an overwrite.
-- Successful model writes are grouped into checkpoints. Kitsu reports verified
-  paths, byte counts, and first changed lines. `/undo` restores only the latest
-  checkpoint and refuses if a covered file no longer matches its recorded
-  post-write snapshot. It is blocked while background agents are active.
-- `/diff` derives bounded staged, unstaged, and untracked evidence from Git and
-  the filesystem. `/review` submits exactly that evidence in a no-tools turn.
+- Successful model writes are grouped into checkpoints. Kitsu reports bounded,
+  snapshot-derived unified diffs and an exact recovery command. `/checkpoints`
+  lists them, `/checkpoint <id>` previews one, and `/undo [id]` restores the
+  selected checkpoint only when its files still match. Undo is blocked while
+  background agents are active.
+- `/diff` derives bounded working/staged/unstaged+untracked/base/commit/checkpoint
+  evidence from Git, the journal, and filesystem. `/review` submits exactly that
+  evidence in a no-tools turn. `kitsu review` is the one-shot automation surface.
 
 Developer commands are an independent, explicit capability. `--enable-commands`
 registers `command_exec`; roots come from `--command-root` or the launch
 directory. It accepts a literal argv array and an explicit cwd—never a shell
 string—and returns bounded stdout/stderr plus exit, signal, timeout, truncation,
-and elapsed-time metadata. Interactive invocations have their own approval
+elapsed-time metadata, safe head/tail previews, and a retained protected `0600`
+full-output artifact. Interactive invocations have their own approval
 prompt; automation must use exact `--allow-command` grants. `--yes` and
-filesystem grants do not approve commands. Default command timeout is 120
-seconds, the requestable maximum is 600 seconds, and retained stdout and stderr
-are each capped at 64 KiB.
+filesystem grants do not approve commands. Command roots constrain only the
+requested working directory: approved processes retain the ambient host user's
+filesystem, network, environment, and process authority and are not sandboxed.
+Session grants also bind the executable observed at approval time; replacement
+or changed `PATH` resolution invalidates the grant before execution.
+Default command timeout is 120 seconds, the requestable maximum is 600 seconds,
+and retained stdout and stderr are each capped at 64 KiB.
+
+`/jobs` exposes bounded running/record capacity, status, elapsed time, model,
+usage, tool/write counts, safe recent activity, failure class, full terminal
+result retrieval, cancel+join, and pruning. `/agents` remains a compatibility
+alias. Background notices use a redraw-safe external printer in plain and
+styled modes.
 
 ### `@file` attachments
 
@@ -108,6 +147,26 @@ state directory. Project-local configs receive isolated stable profile
 directories under `~/.kitsu`; no session directory is created in the project.
 Snapshots contain the conversation/tool transcript, not credentials or runtime
 permission grants. `--no-session` disables both snapshots and prompt history.
+It does not discard full-output artifacts from explicitly approved developer
+commands: those remain in a unique protected runtime-state directory so a
+one-shot command never reports a dead recovery path.
+
+Scripted and piped chat are stateless by default. `--session` explicitly
+creates a durable conversation, and `--resume [id|last]` resumes and autosaves
+in interactive, scripted, or piped modes. Each successful automation turn is
+saved before the next one; a save failure makes the automation command fail.
+`--no-session` conflicts with both continuity forms. Resume/new-session
+boundaries drop runtime grants and restore current invocation roots; no saved
+session can restore authority.
+
+The top-level lifecycle/inventory commands operate without constructing a
+provider or parsing the selected config. The resolved config path chooses the
+state namespace. `list` (also the default), `show`, `fork`, `export`,
+`archive`, `restore`, and `delete` support scripting through `--json`.
+`sessions resume` launches normal provider-backed chat on a TTY; outside a TTY
+or with `--json` it resolves the session and returns exact argv without making
+a network call. A missing namespace lists as an empty collection rather than an
+error.
 
 - `/resume last` selects the most recently saved *other* session. Resume requires
   the saved working directory and gateway and starts with fresh permissions.
@@ -140,7 +199,8 @@ current inference. Explicit `models`/`/models` requests use the configured CLI
 timeout. Within one provider instance, successful catalogs are cached for 60
 seconds and eligible failures for five seconds. An unpinned `/model` switch
 resolves the new model's window before switching; a CLI/profile-pinned window is
-kept.
+kept. `/context refresh` explicitly refreshes unpinned metadata, preserves the
+current known window when discovery fails, and reports cache-write status.
 
 The context meter estimates cold requests structurally, then anchors subsequent
 estimates on real provider `prompt_tokens`. It includes tool schemas and reserves
@@ -168,6 +228,10 @@ supports verbatim `<<<`/`>>>` multi-line turns. Slash commands work, except
 interactive-only queue/session transitions. Failed or cancelled turns roll back
 conversation state while preserving completed filesystem changes. Scripts are
 strict by default; `--allow-turn-errors` accepts partial completion.
+
+`init --json`, `doctor --json`, and `sessions --json` provide single
+machine-readable documents for management workflows. They reject `--jsonl`,
+whose event protocol is reserved for model-turn automation.
 
 `--jsonl` is the machine protocol. It disables provider streaming and emits one
 `kitsu.chat.v1` JSON object per stdout line: run/turn/command framing,

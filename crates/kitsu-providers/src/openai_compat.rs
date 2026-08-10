@@ -12,6 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthProvider;
 use crate::error::ProviderError;
+use crate::telemetry::{
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
+};
 use crate::types::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
 };
@@ -580,17 +583,37 @@ fn add_retry_jitter(delay: Duration, sample: u64) -> Duration {
 
 /// Select a retry delay. The local backoff remains a floor, so a zero/past
 /// Retry-After cannot turn a failing gateway into a hot loop.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct RetryDelayDecision {
+    delay: Duration,
+    retry_after_used: bool,
+}
+
+fn retry_delay_decision(
+    attempt: u32,
+    retry_after: Option<&reqwest::header::HeaderValue>,
+    now: SystemTime,
+    jitter_sample: u64,
+) -> RetryDelayDecision {
+    let advertised = retry_after
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| parse_retry_after(value, now));
+    let local = backoff_delay(attempt);
+    let retry_after_used = advertised.is_some_and(|delay| delay >= local);
+    RetryDelayDecision {
+        delay: add_retry_jitter(local.max(advertised.unwrap_or_default()), jitter_sample),
+        retry_after_used,
+    }
+}
+
+#[cfg(test)]
 fn retry_delay(
     attempt: u32,
     retry_after: Option<&reqwest::header::HeaderValue>,
     now: SystemTime,
     jitter_sample: u64,
 ) -> Duration {
-    let advertised = retry_after
-        .and_then(|value| value.to_str().ok())
-        .and_then(|value| parse_retry_after(value, now))
-        .unwrap_or(Duration::ZERO);
-    add_retry_jitter(backoff_delay(attempt).max(advertised), jitter_sample)
+    retry_delay_decision(attempt, retry_after, now, jitter_sample).delay
 }
 
 /// Cheap process-local entropy is sufficient for retry jitter: it is not a
@@ -610,6 +633,91 @@ fn remaining_request_time(started: tokio::time::Instant, timeout: Duration) -> O
     timeout
         .checked_sub(started.elapsed())
         .filter(|remaining| !remaining.is_zero())
+}
+
+fn duration_millis(duration: Duration) -> u64 {
+    duration.as_millis().min(u128::from(u64::MAX)) as u64
+}
+
+fn remaining_deadline_millis(started: tokio::time::Instant, timeout: Duration) -> u64 {
+    remaining_request_time(started, timeout)
+        .map(duration_millis)
+        .unwrap_or(0)
+}
+
+fn status_category(status: StatusCode) -> ProviderAttemptCategory {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => ProviderAttemptCategory::RateLimited,
+        StatusCode::SERVICE_UNAVAILABLE => ProviderAttemptCategory::Unavailable,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderAttemptCategory::Authentication,
+        status if status.is_success() => ProviderAttemptCategory::Success,
+        status if status.is_client_error() => ProviderAttemptCategory::ClientError,
+        status if status.is_server_error() => ProviderAttemptCategory::ServerError,
+        _ => ProviderAttemptCategory::UnexpectedStatus,
+    }
+}
+
+fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) {
+    if let Some(telemetry) = telemetry {
+        telemetry.record(event);
+    }
+}
+
+/// Ensures an admitted physical send remains observable when its async future
+/// is dropped (for example by the CLI Ctrl+C race). Completed sends disarm the
+/// guard before their ordinary status/transport event is recorded.
+struct InFlightAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+    attempt: u32,
+    max_attempts: u32,
+    started: tokio::time::Instant,
+    timeout: Duration,
+    armed: bool,
+}
+
+impl InFlightAttemptGuard {
+    fn new(
+        telemetry: Option<&ProviderTelemetrySink>,
+        attempt: u32,
+        max_attempts: u32,
+        started: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            telemetry: telemetry.cloned(),
+            attempt,
+            max_attempts,
+            started,
+            timeout,
+            armed: true,
+        }
+    }
+
+    fn completed(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for InFlightAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        record_attempt(
+            self.telemetry.as_ref(),
+            ProviderAttemptEvent {
+                attempt: self.attempt,
+                max_attempts: self.max_attempts,
+                category: ProviderAttemptCategory::Cancelled,
+                status: None,
+                outcome: ProviderAttemptOutcome::Cancelled,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
+            },
+        );
+    }
 }
 
 /// Sleep only while the total request budget permits. If the requested delay
@@ -871,6 +979,14 @@ impl Provider for OpenAICompatProvider {
     }
 
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        self.chat_stream_with_telemetry(req, None).await
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
         let url = format!("{}{}", self.base_url, self.chat_path);
         let body = build_body(&req);
 
@@ -879,10 +995,14 @@ impl Provider for OpenAICompatProvider {
         // timeout active through the response body, including streaming bodies.
         // Auth failures and all other 4xx responses return immediately below.
         let started = tokio::time::Instant::now();
+        let max_attempts = self.retries.saturating_add(1);
+        // Number of retries already completed; the physical attempt exposed to
+        // telemetry is therefore always `attempt + 1`.
         let mut attempt: u32 = 0;
         let response = loop {
             let remaining =
                 remaining_request_time(started, self.timeout).ok_or(ProviderError::Timeout)?;
+            let physical_attempt = attempt.saturating_add(1);
             let rb = self
                 .http
                 .post(&url)
@@ -891,34 +1011,137 @@ impl Provider for OpenAICompatProvider {
                 .json(&body);
             let rb = self.attach_auth(rb)?;
 
-            match rb.send().await {
+            let attempt_guard = InFlightAttemptGuard::new(
+                telemetry.as_ref(),
+                physical_attempt,
+                max_attempts,
+                started,
+                self.timeout,
+            );
+            let send_result = rb.send().await;
+            attempt_guard.completed();
+
+            match send_result {
                 Ok(resp) => {
                     let status = resp.status();
                     if (status == StatusCode::TOO_MANY_REQUESTS
                         || status == StatusCode::SERVICE_UNAVAILABLE)
                         && attempt < self.retries
                     {
-                        attempt += 1;
-                        let delay = retry_delay(
-                            attempt,
+                        let retry_number = attempt.saturating_add(1);
+                        let decision = retry_delay_decision(
+                            retry_number,
                             resp.headers().get(reqwest::header::RETRY_AFTER),
                             SystemTime::now(),
-                            retry_jitter_sample(attempt),
+                            retry_jitter_sample(retry_number),
+                        );
+                        let remaining_after = remaining_request_time(started, self.timeout);
+                        let can_retry =
+                            remaining_after.is_some_and(|remaining| decision.delay < remaining);
+                        record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: status_category(status),
+                                status: Some(status.as_u16()),
+                                outcome: if can_retry {
+                                    ProviderAttemptOutcome::RetryScheduled
+                                } else {
+                                    ProviderAttemptOutcome::DeadlineExceeded
+                                },
+                                terminal: !can_retry,
+                                retry_delay_ms: Some(duration_millis(decision.delay)),
+                                retry_after_used: decision.retry_after_used,
+                                remaining_deadline_ms: remaining_after
+                                    .map(duration_millis)
+                                    .unwrap_or(0),
+                            },
                         );
                         drop(resp);
-                        sleep_before_retry(started, self.timeout, delay).await?;
+                        if !can_retry {
+                            sleep_before_retry(started, self.timeout, decision.delay).await?;
+                            return Err(ProviderError::Timeout);
+                        }
+                        sleep_before_retry(started, self.timeout, decision.delay).await?;
+                        attempt = retry_number;
                         continue;
                     }
+                    record_attempt(
+                        telemetry.as_ref(),
+                        ProviderAttemptEvent {
+                            attempt: physical_attempt,
+                            max_attempts,
+                            category: status_category(status),
+                            status: Some(status.as_u16()),
+                            outcome: if status.is_success() {
+                                ProviderAttemptOutcome::ResponseAccepted
+                            } else {
+                                ProviderAttemptOutcome::Rejected
+                            },
+                            terminal: true,
+                            retry_delay_ms: None,
+                            retry_after_used: false,
+                            remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
+                        },
+                    );
                     break resp;
                 }
                 Err(e) => {
                     if e.is_timeout() && attempt < self.retries {
-                        attempt += 1;
-                        let delay =
-                            add_retry_jitter(backoff_delay(attempt), retry_jitter_sample(attempt));
+                        let retry_number = attempt.saturating_add(1);
+                        let delay = add_retry_jitter(
+                            backoff_delay(retry_number),
+                            retry_jitter_sample(retry_number),
+                        );
+                        let remaining_after = remaining_request_time(started, self.timeout);
+                        let can_retry = remaining_after.is_some_and(|remaining| delay < remaining);
+                        record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: ProviderAttemptCategory::Timeout,
+                                status: None,
+                                outcome: if can_retry {
+                                    ProviderAttemptOutcome::RetryScheduled
+                                } else {
+                                    ProviderAttemptOutcome::DeadlineExceeded
+                                },
+                                terminal: !can_retry,
+                                retry_delay_ms: Some(duration_millis(delay)),
+                                retry_after_used: false,
+                                remaining_deadline_ms: remaining_after
+                                    .map(duration_millis)
+                                    .unwrap_or(0),
+                            },
+                        );
+                        if !can_retry {
+                            sleep_before_retry(started, self.timeout, delay).await?;
+                            return Err(ProviderError::Timeout);
+                        }
                         sleep_before_retry(started, self.timeout, delay).await?;
+                        attempt = retry_number;
                         continue;
                     }
+                    record_attempt(
+                        telemetry.as_ref(),
+                        ProviderAttemptEvent {
+                            attempt: physical_attempt,
+                            max_attempts,
+                            category: if e.is_timeout() {
+                                ProviderAttemptCategory::Timeout
+                            } else {
+                                ProviderAttemptCategory::Connection
+                            },
+                            status: None,
+                            outcome: ProviderAttemptOutcome::TransportFailed,
+                            terminal: true,
+                            retry_delay_ms: None,
+                            retry_after_used: false,
+                            remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
+                        },
+                    );
                     return Err(map_send_error(e));
                 }
             }
