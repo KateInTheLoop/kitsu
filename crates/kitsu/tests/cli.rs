@@ -76,6 +76,32 @@ fn test_ask_missing_token() {
         .stderr(predicate::str::contains("refresh-token"));
 }
 
+/// Scripted chat classifies a locally missing credential the same way as
+/// `ask`: user/config error (1), not provider outage (2).
+#[test]
+#[serial]
+fn test_script_missing_token_exits_one() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "https://gateway.invalid");
+    let script = home.path().join("missing-auth.txt");
+    fs::write(&script, "hello\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
+    cmd.args([
+        "chat",
+        "--gateway",
+        "example",
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("refresh-token"))
+        .stderr(predicate::str::contains("script summary: 1 failure"));
+}
+
 /// Auth methods are a closed config vocabulary. A typo must fail before any
 /// provider/network work instead of silently becoming bearer-env authentication.
 #[test]
@@ -139,6 +165,46 @@ auth = { method = "static" }
         .stderr(predicate::str::contains(
             "static auth requires a non-empty token",
         ));
+}
+
+/// A stateless automation invocation must not require a usable HOME merely to
+/// resolve where interactive history would live.
+#[test]
+fn test_empty_script_does_not_require_writable_home() {
+    let root = TempDir::new().expect("temp root");
+    let blocked_home = root.path().join("home-is-a-file");
+    fs::write(&blocked_home, "not a directory").expect("write blocked HOME sentinel");
+    let config = root.path().join("kitsu.toml");
+    fs::write(
+        &config,
+        r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test-model"
+context_window = 8000
+auth = { method = "none" }
+"#,
+    )
+    .expect("write config");
+    let script = root.path().join("empty.script");
+    fs::write(&script, "").expect("write empty script");
+
+    let mut cmd = Command::cargo_bin("kitsu").expect("kitsu binary should build");
+    cmd.env("HOME", &blocked_home)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("cannot create runtime state").not());
 }
 
 // --- happy path against wiremock --------------------------------------------
@@ -534,12 +600,530 @@ async fn test_invalid_model_friendly_error() {
             &script_str,
         ]);
         cmd.assert()
-            .success() // scripted mode prints the error and continues
+            .failure()
+            .code(2)
             .stderr(predicate::str::contains("run /model"))
-            .stderr(predicate::str::contains("tiny-fast-thing"));
+            .stderr(predicate::str::contains("tiny-fast-thing"))
+            .stderr(predicate::str::contains("script summary: 1 failure"));
     })
     .await
     .expect("spawned kitsu process should join");
+}
+
+/// Automation is strict by default, but callers can explicitly accept partial
+/// success while migrating legacy scripts.
+#[tokio::test]
+#[serial]
+async fn test_script_allow_turn_errors_preserves_zero_exit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("allow-errors.txt");
+    fs::write(&script_path, "will fail\n").unwrap();
+    let script = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script,
+            "--allow-turn-errors",
+        ]);
+        cmd.assert()
+            .success()
+            .stderr(predicate::str::contains("script summary: 1 failure"));
+    })
+    .await
+    .expect("join");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_strict_script_rejects_length_truncated_turn() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"partial answer"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"length"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("truncated.txt");
+    fs::write(&script, "long answer please\n").unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "chat",
+            "--gateway",
+            "example",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stdout(predicate::str::contains("partial answer"))
+            .stderr(predicate::str::contains(
+                "strict scripted turn failed: model output was truncated",
+            ))
+            .stderr(predicate::str::contains("kitsu-context-rollback"));
+    })
+    .await
+    .expect("join");
+}
+
+/// A failed scripted turn is removed from conversation state before the next
+/// line is sent. This prevents a provider error from poisoning later context.
+#[tokio::test]
+#[serial]
+async fn test_failed_script_turn_is_transactionally_rolled_back() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let success_sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"recovered"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            if body.contains("FIRST_FAILED_PROMPT") {
+                ResponseTemplate::new(500).set_body_string("first turn failed")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(success_sse.clone())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("transaction.txt");
+    fs::write(
+        &script_path,
+        "FIRST_FAILED_PROMPT\nSECOND_RECOVERY_PROMPT\n",
+    )
+    .unwrap();
+    let script = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script,
+            "--allow-turn-errors",
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("recovered"))
+            .stderr(predicate::str::contains("failed turn rolled back"));
+    })
+    .await
+    .expect("join");
+
+    let requests = server.received_requests().await.unwrap();
+    let recovery = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("SECOND_RECOVERY_PROMPT"))
+        .expect("recovery request");
+    let body = String::from_utf8_lossy(&recovery.body);
+    assert!(
+        !body.contains("FIRST_FAILED_PROMPT"),
+        "failed prompt leaked: {body}"
+    );
+}
+
+#[test]
+fn test_unterminated_script_block_is_line_aware_and_nonzero() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("broken.txt");
+    fs::write(&script_path, "# comment\n<<<\nmissing close\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    cmd.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("broken.txt:2"))
+        .stderr(predicate::str::contains("missing >>>"));
+}
+
+#[test]
+fn test_explicit_missing_config_names_the_requested_path() {
+    let home = TempDir::new().expect("temp home");
+    let missing = home.path().join("does-not-exist.toml");
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["--config", &missing.to_string_lossy(), "ask", "hello"]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(missing.to_string_lossy().as_ref()))
+        .stderr(predicate::str::contains("does not exist"));
+}
+
+#[test]
+fn test_default_missing_config_has_a_quick_start() {
+    let home = TempDir::new().expect("temp home");
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["chat"]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("no config found"))
+        .stderr(predicate::str::contains("kitsu --config ./kitsu.toml chat"));
+}
+
+/// `/diff` is sourced from Git and the filesystem, including untracked files;
+/// it requires no model call and is visibly labelled as verified evidence.
+#[test]
+fn test_diff_command_reports_verified_tracked_and_untracked_changes() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("work dir");
+    let git = |args: &[&str]| {
+        let status = std::process::Command::new("git")
+            .arg("-C")
+            .arg(work.path())
+            .args(args)
+            .status()
+            .unwrap();
+        assert!(status.success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(work.path().join("tracked.txt"), "before\n").unwrap();
+    git(&["add", "tracked.txt"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(work.path().join("tracked.txt"), "after\n").unwrap();
+    fs::write(work.path().join("untracked.txt"), "new evidence\n").unwrap();
+    let script_path = work.path().join("diff.txt");
+    fs::write(&script_path, "/diff\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    cmd.current_dir(work.path());
+    cmd.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--allow-path",
+        &work.path().to_string_lossy(),
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("command> /diff"))
+        .stderr(predicate::str::contains("verified workspace diff"))
+        .stderr(predicate::str::contains("-before"))
+        .stderr(predicate::str::contains("+after"))
+        .stderr(predicate::str::contains("new file (untracked)"))
+        .stderr(predicate::str::contains("+new evidence"));
+}
+
+#[test]
+fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    let package = repo.path().join("crates/widget");
+    fs::create_dir_all(package.join("src")).unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(package.join("src/lib.rs"), "before\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(package.join("src/lib.rs"), "after\n").unwrap();
+    let script = package.join("diff-script.txt");
+    fs::write(&script, "/diff src/lib.rs\n/quit\n").unwrap();
+
+    let mut denied = base_cmd(home.path());
+    denied.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    denied.current_dir(&package);
+    denied.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--allow-path",
+        &package.to_string_lossy(),
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    denied
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("read permission required"));
+
+    let mut allowed = base_cmd(home.path());
+    allowed.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    allowed.current_dir(&package);
+    allowed.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--allow-path",
+        &repo.path().to_string_lossy(),
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    allowed
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("crates/widget/src/lib.rs"))
+        .stderr(predicate::str::contains("+after"));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_review_turn_does_not_offer_or_execute_write_tools() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("change.txt"), "review me\n").unwrap();
+    let attempted = repo.path().join("review-must-not-write.txt");
+    let tool_args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"MUTATED\"}}"#,
+        attempted.to_string_lossy().replace('\\', "\\\\")
+    );
+    let malicious = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_write","type":"function","function":{{"name":"fs_write_file","arguments":"{tool_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        "".to_string(),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(malicious),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let final_answer = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"review complete"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(final_answer),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = repo.path().join("review.txt");
+    fs::write(&script, "/review\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script_path = script.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.current_dir(&repo_path);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--allow-path",
+            &repo_path.to_string_lossy(),
+            "--allow-write",
+            &repo_path.to_string_lossy(),
+            "--script",
+            &script_path.to_string_lossy(),
+        ]);
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("tool call(s) failed"));
+    })
+    .await
+    .unwrap();
+
+    assert!(!attempted.exists(), "review executed a write-capable tool");
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("tools")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(true),
+            "review request advertised tools: {body}"
+        );
+    }
+}
+
+#[test]
+fn test_project_context_source_is_disclosed_and_can_be_disabled() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("work dir");
+    fs::create_dir_all(work.path().join(".git")).unwrap();
+    let context_path = work.path().join("AGENTS.md");
+    fs::write(&context_path, "PROJECT_CONTEXT_MARKER\n").unwrap();
+    let script_path = work.path().join("status.txt");
+    fs::write(&script_path, "/status\n/quit\n").unwrap();
+
+    let mut enabled = base_cmd(home.path());
+    enabled.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    enabled.env_remove("KITSU_NO_PROJECT_CONTEXT");
+    enabled.current_dir(work.path());
+    enabled.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    enabled
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("loaded project context from"))
+        .stderr(predicate::str::contains(
+            context_path.to_string_lossy().as_ref(),
+        ));
+
+    let mut disabled = base_cmd(home.path());
+    disabled.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    disabled.env_remove("KITSU_NO_PROJECT_CONTEXT");
+    disabled.current_dir(work.path());
+    disabled.args([
+        "--gateway",
+        "example",
+        "--no-project-context",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    disabled
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "project ctx  disabled / not found",
+        ))
+        .stderr(predicate::str::contains("loaded project context from").not());
+}
+
+#[test]
+fn test_unknown_script_command_is_echoed_suggested_and_nonzero() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("typo.txt");
+    fs::write(&script_path, "/statsu\n").unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    cmd.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("command> /statsu"))
+        .stderr(predicate::str::contains("did you mean /status"))
+        .stderr(predicate::str::contains("typo.txt:1"));
 }
 
 // --- /models command --------------------------------------------------------

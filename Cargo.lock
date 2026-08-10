@@ -878,6 +878,7 @@ version = "0.1.0"
 dependencies = [
  "chrono",
  "kitsu-providers",
+ "libc",
  "serde",
  "serde_json",
  "tempfile",

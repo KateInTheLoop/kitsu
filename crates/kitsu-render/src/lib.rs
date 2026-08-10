@@ -10,6 +10,25 @@ pub fn is_tty() -> bool {
     io::stdout().is_terminal()
 }
 
+fn stderr_is_tty() -> bool {
+    io::stderr().is_terminal()
+}
+
+/// Whether terminal decoration should be replaced with stable ASCII output.
+pub fn plain_mode() -> bool {
+    std::env::var_os("KITSU_PLAIN").is_some()
+        || std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+}
+
+fn stderr_style() -> bool {
+    stderr_is_tty() && !plain_mode()
+}
+
+fn stdout_style() -> bool {
+    is_tty() && !plain_mode()
+}
+
 /// Is stdin a TTY? Chat uses this to decide interactive loop vs one-shot.
 pub fn stdin_is_tty() -> bool {
     io::stdin().is_terminal()
@@ -22,6 +41,57 @@ pub fn print_fragment(s: &str) {
     let _ = out.flush();
 }
 
+/// Render a complete assistant message with lightweight terminal Markdown and
+/// diff styling. Redirected/plain output remains byte-for-byte text; streaming
+/// fragments continue through [`print_fragment`] until a full block is known.
+pub fn print_message(s: &str) {
+    if !stdout_style() {
+        print_fragment(s);
+        return;
+    }
+    let mut out = io::stdout();
+    let mut fence: Option<String> = None;
+    for segment in s.split_inclusive('\n') {
+        let line = segment.trim_end_matches('\n').trim_end_matches('\r');
+        let newline = if segment.ends_with('\n') { "\n" } else { "" };
+        if let Some(language) = line.trim().strip_prefix("```") {
+            if fence.is_some() {
+                fence = None;
+            } else {
+                fence = Some(language.trim().to_string());
+                let label = if language.trim().is_empty() {
+                    "code"
+                } else {
+                    language.trim()
+                };
+                let _ = writeln!(out, "{}", format!("  {label}").dimmed());
+            }
+            continue;
+        }
+        let rendered = if fence.as_deref() == Some("diff") || fence.as_deref() == Some("patch") {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                format!("{}", line.green())
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                format!("{}", line.red())
+            } else if line.starts_with("@@") {
+                format!("{}", line.cyan())
+            } else {
+                line.to_string()
+            }
+        } else if let Some(heading) = line.strip_prefix("### ") {
+            format!("{}", heading.bold())
+        } else if let Some(heading) = line.strip_prefix("## ") {
+            format!("{}", heading.bold())
+        } else if let Some(heading) = line.strip_prefix("# ") {
+            format!("{}", heading.bold())
+        } else {
+            line.to_string()
+        };
+        let _ = write!(out, "{rendered}{newline}");
+    }
+    let _ = out.flush();
+}
+
 /// Fox-orange (kitsune) accent colour used across the UI.
 const FOX: (u8, u8, u8) = (255, 140, 0);
 
@@ -29,8 +99,11 @@ const FOX: (u8, u8, u8) = (255, 140, 0);
 /// accent (狐 = kitsune). Printed to stderr at chat start. On a non-TTY it
 /// degrades to a single plain line so piped output stays clean.
 pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
-    if !is_tty() {
-        eprintln!("kitsu — gateway: {gateway} · model: {model}");
+    if !stderr_style() {
+        eprintln!(
+            "kitsu — gateway: {gateway} · model: {model} · directory: {dir} · tools: {}",
+            tools.len()
+        );
         return;
     }
     let (r, g, b) = FOX;
@@ -38,6 +111,8 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     let rule: String = "─".repeat(42);
     let tools_str = if tools.is_empty() {
         "none (read-only chat)".to_string()
+    } else if tools.join(", ").chars().count() > 64 {
+        format!("{} enabled (use /tools)", tools.len())
     } else {
         tools.join(", ")
     };
@@ -68,14 +143,14 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     eprintln!("  {}", format!("╰{rule}────").truecolor(r, g, b));
     eprintln!(
         "  {}",
-        "/ for commands · Tab to complete · Ctrl+D to exit".dimmed()
+        "Enter / for commands · Tab completes prefixes · Ctrl+D exits".dimmed()
     );
     eprintln!();
 }
 
 /// The interactive chat prompt. Fox-orange on a TTY, plain otherwise.
 pub fn prompt_string() -> String {
-    if is_tty() {
+    if stdout_style() {
         format!("{} ", "kitsu>".truecolor(255, 140, 0).bold())
     } else {
         "kitsu> ".to_string()
@@ -93,7 +168,7 @@ impl Spinner {
     /// Start the animation (must be called within a tokio runtime). Returns an
     /// inert handle on a non-TTY.
     pub fn start() -> Self {
-        if !is_tty() {
+        if !stderr_is_tty() || plain_mode() || std::env::var_os("KITSU_REDUCED_MOTION").is_some() {
             return Self { handle: None };
         }
         let handle = tokio::spawn(async move {
@@ -109,6 +184,8 @@ impl Spinner {
             const DOTS: [&str; 4] = ["   ", "･  ", "･･ ", "･･･"];
             let (r, g, b) = FOX;
             let mut i = 0usize;
+            // Avoid a distracting flash for fast local responses.
+            tokio::time::sleep(std::time::Duration::from_millis(180)).await;
             loop {
                 let frame = FRAMES[i % FRAMES.len()];
                 let dots = DOTS[i % DOTS.len()];
@@ -136,7 +213,7 @@ impl Spinner {
     fn clear(&mut self) {
         if let Some(h) = self.handle.take() {
             h.abort();
-            eprint!("\r{}\r", " ".repeat(34));
+            eprint!("\r\x1b[2K");
             let _ = io::stderr().flush();
         }
     }
@@ -158,8 +235,10 @@ pub fn finish_line() {
 /// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
 /// friendly line — e.g. `⏺ Read(deck1.md)`. Fox-orange marker on a TTY.
 pub fn tool_activity(header: &str) {
-    if is_tty() {
+    if stderr_style() {
         eprintln!("{} {header}", "⏺".truecolor(255, 140, 0));
+    } else if plain_mode() {
+        eprintln!("tool> {header}");
     } else {
         eprintln!("⏺ {header}");
     }
@@ -169,10 +248,46 @@ pub fn tool_activity(header: &str) {
 /// TTY. Goes to stderr so stdout stays assistant-text only.
 pub fn tool_result(summary: &str) {
     let line = format!("  ⎿ {summary}");
-    if is_tty() {
+    if stderr_style() {
         eprintln!("{}", line.dimmed());
+    } else if plain_mode() {
+        eprintln!("result> {summary}");
     } else {
         eprintln!("{line}");
+    }
+}
+
+/// Render a verified workspace diff to stderr. This output is generated from
+/// Git/filesystem state, not from assistant prose.
+pub fn render_diff(diff: &str) {
+    let line_count = diff.lines().count();
+    eprintln!("verified workspace diff ({line_count} line(s)):");
+    // Keep an interactive prompt usable after a repository-wide diff. Scripts
+    // and redirected captures still receive the full bounded evidence; people
+    // can narrow an interactive view with `/diff <path>`.
+    let display_limit = if stderr_is_tty() { 240 } else { usize::MAX };
+    for line in diff.lines().take(display_limit) {
+        if stderr_style() {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                eprintln!("{}", line.green());
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                eprintln!("{}", line.red());
+            } else if line.starts_with("@@") {
+                eprintln!("{}", line.cyan());
+            } else if line.starts_with("diff --git") || line.starts_with("new file") {
+                eprintln!("{}", line.bold());
+            } else {
+                eprintln!("{line}");
+            }
+        } else {
+            eprintln!("{line}");
+        }
+    }
+    if line_count > display_limit {
+        eprintln!(
+            "... {} line(s) omitted from the terminal view; use /diff <path> to narrow it",
+            line_count - display_limit
+        );
     }
 }
 
@@ -180,7 +295,7 @@ pub fn tool_result(summary: &str) {
 /// the user knows older history was replaced by a summary.
 pub fn compaction_boundary() {
     let line = "✻ context compacted (older turns summarized)";
-    if is_tty() {
+    if stderr_style() {
         let (r, g, b) = FOX;
         eprintln!("{}", line.truecolor(r, g, b));
     } else {
@@ -230,7 +345,11 @@ fn human_turn_stats(
 pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
     if is_tty() {
         if let Some(line) = human_turn_stats(usage, context) {
-            eprintln!("{}", line.dimmed());
+            if stderr_style() {
+                eprintln!("{}", line.dimmed());
+            } else {
+                eprintln!("{line}");
+            }
         }
         return;
     }
@@ -278,7 +397,12 @@ pub fn render_context(
     let headroom = effective.saturating_sub(used);
     const CELLS: u64 = 16;
     let filled = if effective > 0 {
-        (used.saturating_mul(CELLS) / effective).min(CELLS)
+        let cells = (used.saturating_mul(CELLS) / effective).min(CELLS);
+        if used > 0 && cells == 0 {
+            1
+        } else {
+            cells
+        }
     } else {
         CELLS
     };
@@ -291,7 +415,7 @@ pub fn render_context(
         format!("{window} ({note})")
     };
     eprintln!("model: {model}   window: {win}");
-    let bar_disp = if is_tty() {
+    let bar_disp = if stderr_style() {
         format!("{}", bar.truecolor(r, g, b))
     } else {
         bar
@@ -301,7 +425,7 @@ pub fn render_context(
         "  {:<20} {:>7}  {:<10}  {}",
         "source", "tokens", "policy", "why"
     );
-    if is_tty() {
+    if stderr_style() {
         eprintln!("{}", header.dimmed());
     } else {
         eprintln!("{header}");

@@ -4,7 +4,12 @@
 use clap::{Parser, Subcommand};
 
 #[derive(Debug, Parser)]
-#[command(name = "kitsu", version, about = "kitsu — multi-gateway model CLI")]
+#[command(
+    name = "kitsu",
+    version,
+    about = "kitsu — multi-gateway model CLI",
+    after_help = "QUICK START:\n  kitsu --config ./kitsu.toml chat\n  kitsu --gateway ollama chat\n  kitsu chat  # after installing ~/.kitsu/config.toml\n\nConfiguration: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+)]
 pub struct Cli {
     /// Gateway profile to use (from [gateways.<name>] in the config).
     #[arg(long, global = true)]
@@ -67,11 +72,16 @@ pub struct Cli {
     #[arg(long, global = true, default_value = "trim", value_parser = ["trim", "summarize"])]
     pub compaction: String,
 
+    /// Do not discover or send llms.txt/AGENTS.md/CLAUDE.md project context for
+    /// this run. Useful for privacy-sensitive or isolated automation.
+    #[arg(long, global = true)]
+    pub no_project_context: bool,
+
     /// Preload a named skill's instructions for this run (repeatable). Works for
     /// `ask` and `chat` — the skill body is injected up front so it's available
     /// immediately (and to spawned agents), not just discovered on demand. See
     /// `/skills` for available names.
-    #[arg(long = "skill", value_name = "NAME")]
+    #[arg(long = "skill", value_name = "NAME", global = true)]
     pub skill: Vec<String>,
 
     #[command(subcommand)]
@@ -91,16 +101,15 @@ pub enum Command {
         /// (piped stdin) this (or stdin) is the single turn.
         prompt: Option<String>,
 
-        /// Allow filesystem tools to read under this path (repeatable). Passing
-        /// at least one implicitly enables the read-only fs tool set; without
-        /// it, fs tools are not registered or advertised.
+        /// Pre-grant filesystem reads under this path (repeatable). Interactive
+        /// chat also offers filesystem tools and asks before any unlisted path;
+        /// scripted/piped chat is deny-by-default unless paths are pre-granted.
         #[arg(long = "allow-path", value_name = "PATH")]
         allow_paths: Vec<String>,
 
         /// Allow the model to GENERATE/write files under this path (repeatable).
-        /// Enables the `fs_write_file` tool, gated by a deny-by-default write
-        /// allowlist separate from --allow-path. Without it, no write tool is
-        /// registered or advertised.
+        /// Pre-grant model writes under this path (repeatable). Interactive chat
+        /// can ask for unlisted writes; scripted/piped chat cannot prompt.
         #[arg(long = "allow-write", value_name = "PATH")]
         allow_write: Vec<String>,
 
@@ -110,5 +119,19 @@ pub enum Command {
         /// with or without a TTY — used for scripted/replayable sessions.
         #[arg(long, value_name = "FILE")]
         script: Option<String>,
+
+        /// Resume a saved interactive session by id, or use `last`. Permission
+        /// grants are intentionally not restored.
+        #[arg(long, value_name = "ID", default_missing_value = "last", num_args = 0..=1)]
+        resume: Option<String>,
+
+        /// Disable automatic local session snapshots for this chat.
+        #[arg(long)]
+        no_session: bool,
+
+        /// Preserve the legacy script behavior of exiting 0 even when one or
+        /// more scripted turns or slash commands fail.
+        #[arg(long)]
+        allow_turn_errors: bool,
     },
 }
