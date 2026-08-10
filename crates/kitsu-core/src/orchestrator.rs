@@ -5,10 +5,16 @@
 use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
 use futures::StreamExt;
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderError, Role, ToolCall,
+    ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
+    ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink, Role, ToolCall,
 };
-use kitsu_tools::Registry;
+use kitsu_tools::{
+    CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
+    CommandExecutableResolution, CommandOutput, CommandOutputArtifact, CommandTermination,
+    Registry,
+};
 use serde::Serialize;
+use std::sync::atomic::{AtomicBool, Ordering};
 use thiserror::Error;
 
 #[cfg(test)]
@@ -48,9 +54,9 @@ pub struct AgentConfig {
     /// subagents so their output doesn't corrupt the interactive prompt while
     /// they run detached; their result is delivered via the agent registry.
     pub quiet: bool,
-    /// Optional structured trace for automation frontends. Recording is
-    /// in-memory and side-effect free; the CLI decides how to frame/serialize
-    /// these events after the turn.
+    /// Optional structured trace for automation frontends. By default events
+    /// are retained in memory; a frontend may also install a synchronous,
+    /// content-bounded observer to surface progress while the turn is active.
     pub event_log: Option<AgentEventLog>,
 }
 
@@ -62,6 +68,21 @@ pub enum AgentRuntimeEvent {
         message_count: usize,
         tools_offered: usize,
     },
+    /// One physical network send inside the preceding logical
+    /// [`ProviderRequest`](Self::ProviderRequest). Retries produce additional
+    /// attempt events, never additional logical request events.
+    ProviderAttempt {
+        round: u32,
+        attempt: u32,
+        max_attempts: u32,
+        category: ProviderAttemptCategory,
+        status: Option<u16>,
+        outcome: ProviderAttemptOutcome,
+        terminal: bool,
+        retry_delay_ms: Option<u64>,
+        retry_after_used: bool,
+        remaining_deadline_ms: u64,
+    },
     Usage {
         round: u32,
         prompt_tokens: u64,
@@ -72,7 +93,11 @@ pub enum AgentRuntimeEvent {
         round: u32,
         call_id: String,
         name: String,
+        /// Generic tools retain a bounded raw argument preview. Commands use
+        /// `command` instead of embedding minified JSON here.
         args: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<CommandRuntimeInvocation>,
     },
     ToolFinished {
         round: u32,
@@ -83,7 +108,11 @@ pub enum AgentRuntimeEvent {
         /// returned. Ordinary tool errors are finished with `cancelled: false`
         /// and their real structured error output.
         cancelled: bool,
+        /// Generic tools retain a bounded raw output preview. Commands use
+        /// `command` instead of embedding minified JSON here.
         output: String,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        command: Option<CommandRuntimeResult>,
     },
     TurnFinished {
         success: bool,
@@ -92,19 +121,145 @@ pub enum AgentRuntimeEvent {
     },
 }
 
-#[derive(Debug, Clone, Default)]
+/// Native command invocation fields for automation frontends.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommandRuntimeInvocation {
+    pub argv: Vec<String>,
+    pub cwd: String,
+    pub timeout_ms: Option<u64>,
+}
+
+/// Native command completion fields for automation frontends.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct CommandRuntimeResult {
+    pub termination: CommandTermination,
+    pub success: bool,
+    pub exit_code: Option<i32>,
+    pub signal: Option<i32>,
+    pub elapsed_ms: u64,
+    pub stdout_bytes: u64,
+    pub stderr_bytes: u64,
+    pub stdout_retained_bytes: usize,
+    pub stderr_retained_bytes: usize,
+    pub stdout_truncated: bool,
+    pub stderr_truncated: bool,
+    pub stdout_capture_complete: bool,
+    pub stderr_capture_complete: bool,
+    pub stdout_tail: String,
+    pub stderr_tail: String,
+    pub executable: CommandExecutableIdentity,
+    pub ambient_authority: CommandAmbientAuthority,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact: Option<CommandOutputArtifact>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub artifact_error: Option<String>,
+}
+
+type AgentEventObserver =
+    std::sync::Arc<dyn Fn(&AgentRuntimeEvent) -> bool + Send + Sync + 'static>;
+
+#[derive(Clone, Default)]
 pub struct AgentEventLog {
     inner: std::sync::Arc<std::sync::Mutex<Vec<AgentRuntimeEvent>>>,
+    observer: Option<AgentEventObserver>,
+    abort_requested: std::sync::Arc<AtomicBool>,
+}
+
+impl std::fmt::Debug for AgentEventLog {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AgentEventLog")
+            .field("live_observer", &self.observer.is_some())
+            .finish_non_exhaustive()
+    }
 }
 
 impl AgentEventLog {
+    pub fn with_observer<F>(observer: F) -> Self
+    where
+        F: Fn(&AgentRuntimeEvent) + Send + Sync + 'static,
+    {
+        Self::with_fallible_observer(move |event| {
+            observer(event);
+            true
+        })
+    }
+
+    /// Attach a live observer that may stop the turn by returning `false`.
+    ///
+    /// This is used by durable automation sinks: once a JSONL record cannot be
+    /// written, no later provider call or tool mutation should proceed without
+    /// observable framing. The event remains retained for local diagnostics.
+    pub fn with_fallible_observer<F>(observer: F) -> Self
+    where
+        F: Fn(&AgentRuntimeEvent) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            inner: std::sync::Arc::new(std::sync::Mutex::new(Vec::new())),
+            observer: Some(std::sync::Arc::new(observer)),
+            abort_requested: std::sync::Arc::new(AtomicBool::new(false)),
+        }
+    }
+
     pub fn record(&self, event: AgentRuntimeEvent) {
-        self.inner.lock().expect("agent event log").push(event);
+        self.inner
+            .lock()
+            .expect("agent event log")
+            .push(event.clone());
+        if let Some(observer) = &self.observer {
+            if !observer(&event) {
+                self.abort_requested.store(true, Ordering::Release);
+            }
+        }
     }
 
     pub fn take(&self) -> Vec<AgentRuntimeEvent> {
         std::mem::take(&mut *self.inner.lock().expect("agent event log"))
     }
+
+    pub fn has_live_observer(&self) -> bool {
+        self.observer.is_some()
+    }
+
+    pub fn abort_requested(&self) -> bool {
+        self.abort_requested.load(Ordering::Acquire)
+    }
+}
+
+fn abort_if_event_sink_failed(cfg: &AgentConfig) -> Result<(), AgentError> {
+    if cfg
+        .event_log
+        .as_ref()
+        .is_some_and(AgentEventLog::abort_requested)
+    {
+        Err(AgentError::Loop(
+            "runtime event sink closed; stopped before further provider or tool work".to_string(),
+        ))
+    } else {
+        Ok(())
+    }
+}
+
+fn provider_telemetry_sink(
+    log: Option<&AgentEventLog>,
+    round: u32,
+) -> Option<ProviderTelemetrySink> {
+    log.map(|log| {
+        let log = log.clone();
+        ProviderTelemetrySink::new(move |event| {
+            log.record(AgentRuntimeEvent::ProviderAttempt {
+                round,
+                attempt: event.attempt,
+                max_attempts: event.max_attempts,
+                category: event.category,
+                status: event.status,
+                outcome: event.outcome,
+                terminal: event.terminal,
+                retry_delay_ms: event.retry_delay_ms,
+                retry_after_used: event.retry_after_used,
+                remaining_deadline_ms: event.remaining_deadline_ms,
+            });
+        })
+    })
 }
 
 /// Pairs every recorded [`AgentRuntimeEvent::ToolStarted`] with exactly one
@@ -121,6 +276,8 @@ struct PendingToolEvent {
     round: u32,
     call_id: String,
     name: String,
+    command: Option<CommandRuntimeInvocation>,
+    started: std::time::Instant,
 }
 
 impl ToolEventGuard {
@@ -132,17 +289,25 @@ impl ToolEventGuard {
         args: &str,
     ) -> Self {
         let pending = log.map(|log| {
+            let command = command_runtime_invocation(name, args);
             log.record(AgentRuntimeEvent::ToolStarted {
                 round,
                 call_id: call_id.to_string(),
                 name: name.to_string(),
-                args: event_preview(args),
+                args: if command.is_some() {
+                    "[structured command invocation]".to_string()
+                } else {
+                    event_preview(args)
+                },
+                command: command.clone(),
             });
             PendingToolEvent {
                 log: log.clone(),
                 round,
                 call_id: call_id.to_string(),
                 name: name.to_string(),
+                command,
+                started: std::time::Instant::now(),
             }
         });
         Self { pending }
@@ -150,13 +315,22 @@ impl ToolEventGuard {
 
     fn finish(mut self, success: bool, output: &str) {
         if let Some(pending) = self.pending.take() {
+            let command = pending
+                .command
+                .as_ref()
+                .and_then(|_| command_runtime_result(output));
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
                 name: pending.name,
                 success,
                 cancelled: false,
-                output: event_preview(output),
+                output: if command.is_some() {
+                    "[structured command result]".to_string()
+                } else {
+                    event_preview(output)
+                },
+                command,
             });
         }
     }
@@ -172,6 +346,51 @@ impl Drop for ToolEventGuard {
                 success: false,
                 cancelled: true,
                 output: "[cancelled: tool execution interrupted]".to_string(),
+                command: pending.command.as_ref().map(|invocation| {
+                    let executable_name = invocation.argv.first().cloned().unwrap_or_default();
+                    let executable_path = std::path::Path::new(&executable_name);
+                    let executable_resolution = if executable_path.is_absolute()
+                        || executable_path.components().count() > 1
+                    {
+                        CommandExecutableResolution::InvocationPath
+                    } else {
+                        CommandExecutableResolution::AmbientPath
+                    };
+                    CommandRuntimeResult {
+                        termination: CommandTermination::Cancelled,
+                        success: false,
+                        exit_code: None,
+                        signal: None,
+                        elapsed_ms: pending
+                            .started
+                            .elapsed()
+                            .as_millis()
+                            .min(u128::from(u64::MAX)) as u64,
+                        stdout_bytes: 0,
+                        stderr_bytes: 0,
+                        stdout_retained_bytes: 0,
+                        stderr_retained_bytes: 0,
+                        stdout_truncated: false,
+                        stderr_truncated: false,
+                        stdout_capture_complete: false,
+                        stderr_capture_complete: false,
+                        stdout_tail: String::new(),
+                        stderr_tail: String::new(),
+                        executable: CommandExecutableIdentity {
+                            invocation: executable_name,
+                            resolution: executable_resolution,
+                            observed_path: None,
+                            pinned: false,
+                        },
+                        ambient_authority: CommandAmbientAuthority::CURRENT,
+                        artifact: None,
+                        artifact_error: Some(
+                            "command cancelled; unfinished full-output artifact was not published \
+                             and cleanup was requested"
+                                .to_string(),
+                        ),
+                    }
+                }),
             });
         }
     }
@@ -619,6 +838,7 @@ where
                 tools_offered: req.tools.as_ref().map_or(0, Vec::len),
             });
         }
+        abort_if_event_sink_failed(cfg)?;
 
         // "Vibing kitsu" while we wait for the model. No-op off a TTY; cleared on
         // the first stream item (or on drop if the request errors).
@@ -629,7 +849,10 @@ where
         };
 
         // 401/403 surface here (or as the first stream item) as a hard error.
-        let mut stream = provider.chat_stream(req).await?;
+        let mut stream = provider
+            .chat_stream_with_telemetry(req, provider_telemetry_sink(cfg.event_log.as_ref(), round))
+            .await?;
+        abort_if_event_sink_failed(cfg)?;
 
         let mut assistant_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -668,6 +891,7 @@ where
                             total_tokens: u.total_tokens,
                         });
                     }
+                    abort_if_event_sink_failed(cfg)?;
                 }
                 ChatDelta::Done(reason) => finish = reason,
             }
@@ -754,6 +978,7 @@ where
                 &tc.tool_name,
                 &tc.args,
             );
+            abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
             let (content, is_err) = match tools.run(&tc.tool_name, tc.args.clone()).await {
                 Ok(out) => {
@@ -781,6 +1006,7 @@ where
                 kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
             }
             tool_event.finish(!is_err, &content);
+            abort_if_event_sink_failed(cfg)?;
             // Offload a large successful result to disk, leaving a re-readable
             // pointer, so one big result can't dominate a small window (Stage 2).
             let content = if is_err {
@@ -917,7 +1143,91 @@ fn event_preview(value: &str) -> String {
     format!("{}\n[truncated event payload]", &value[..boundary])
 }
 
+fn command_runtime_invocation(name: &str, args: &str) -> Option<CommandRuntimeInvocation> {
+    if name != "command_exec" {
+        return None;
+    }
+    let args = serde_json::from_str::<CommandExecArgs>(args).ok()?;
+    Some(CommandRuntimeInvocation {
+        argv: args.argv,
+        cwd: args.cwd,
+        timeout_ms: args.timeout_ms,
+    })
+}
+
+fn command_runtime_result(output: &str) -> Option<CommandRuntimeResult> {
+    let output = serde_json::from_str::<CommandOutput>(output).ok()?;
+    Some(CommandRuntimeResult {
+        termination: output.termination,
+        success: output.success,
+        exit_code: output.exit_code,
+        signal: output.signal,
+        elapsed_ms: output.elapsed_ms,
+        stdout_bytes: output.stdout_bytes,
+        stderr_bytes: output.stderr_bytes,
+        stdout_retained_bytes: output.stdout_retained_bytes,
+        stderr_retained_bytes: output.stderr_retained_bytes,
+        stdout_truncated: output.stdout_truncated,
+        stderr_truncated: output.stderr_truncated,
+        stdout_capture_complete: output.stdout_capture_complete,
+        stderr_capture_complete: output.stderr_capture_complete,
+        stdout_tail: terminal_safe_tail(&output.stdout, 1024),
+        stderr_tail: terminal_safe_tail(&output.stderr, 1024),
+        executable: output.executable,
+        ambient_authority: output.ambient_authority,
+        artifact: output.artifact,
+        artifact_error: output.artifact_error,
+    })
+}
+
+fn terminal_safe_inline(value: &str) -> String {
+    let clean = kitsu_render::sanitize_terminal_text(value);
+    let mut output = String::with_capacity(clean.len());
+    for character in clean.chars() {
+        match character {
+            '\n' => output.push_str("\\n"),
+            '\t' => output.push_str("\\t"),
+            '\r' => output.push_str("\\r"),
+            character => output.push(character),
+        }
+    }
+    output
+}
+
+fn terminal_safe_tail(value: &str, max_chars: usize) -> String {
+    let safe = terminal_safe_inline(value);
+    let chars = safe.chars().collect::<Vec<_>>();
+    if chars.len() <= max_chars {
+        return safe;
+    }
+    format!(
+        "...{}",
+        chars[chars.len() - max_chars..].iter().collect::<String>()
+    )
+}
+
+fn bounded_human_value(value: &str, max_chars: usize) -> String {
+    let safe = terminal_safe_inline(value);
+    let mut chars = safe.chars();
+    let head = chars.by_ref().take(max_chars).collect::<String>();
+    if chars.next().is_some() {
+        format!("{head}...")
+    } else {
+        head
+    }
+}
+
 fn format_tool_header(name: &str, args: &str) -> String {
+    if name == "command_exec" {
+        return serde_json::from_str::<CommandExecArgs>(args)
+            .ok()
+            .map(|args| {
+                let argv = bounded_human_value(&args.display_argv(), 320);
+                let cwd = bounded_human_value(&args.cwd, 240);
+                format!("Command(argv={argv}; cwd={cwd:?})")
+            })
+            .unwrap_or_else(|| "Command(invalid arguments)".to_string());
+    }
     let friendly = match name {
         "fs_read_file" => "Read",
         "fs_list_dir" => "List",
@@ -968,6 +1278,10 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
         return "error".to_string();
     }
     match name {
+        "command_exec" => serde_json::from_str::<CommandOutput>(content)
+            .ok()
+            .map(|output| format_command_result(&output))
+            .unwrap_or_else(|| "command completed (invalid result metadata)".to_string()),
         "fs_write_file" | "fs_edit_file" => serde_json::from_str::<serde_json::Value>(content)
             .ok()
             .map(|value| {
@@ -981,7 +1295,9 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
                     None => change.to_string(),
                 };
                 match value.get("warning").and_then(|item| item.as_str()) {
-                    Some(warning) => format!("{base} — ⚠ {warning}"),
+                    Some(warning) => {
+                        format!("{base} — warning: {}", safe_warning_summary(warning))
+                    }
                     None => base,
                 }
             })
@@ -999,6 +1315,104 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
             format!("{n} line{}", if n == 1 { "" } else { "s" })
         }
     }
+}
+
+fn format_command_result(output: &CommandOutput) -> String {
+    let completion = match output.termination {
+        CommandTermination::Exited => match output.exit_code {
+            Some(code) => format!("exit {code}"),
+            None => "exited".to_string(),
+        },
+        CommandTermination::Signaled => match output.signal {
+            Some(signal) => format!("signal {signal}"),
+            None => "signaled".to_string(),
+        },
+        CommandTermination::TimedOut => match output.signal {
+            Some(signal) => format!("timeout (signal {signal})"),
+            None => "timeout".to_string(),
+        },
+        CommandTermination::Cancelled => "cancelled".to_string(),
+    };
+    let mut fields = vec![completion, format!("{} ms", output.elapsed_ms)];
+    append_command_stream_summary(
+        &mut fields,
+        "stdout",
+        &output.stdout,
+        output.stdout_bytes,
+        output.stdout_retained_bytes,
+        output.stdout_truncated,
+        output.stdout_capture_complete,
+    );
+    append_command_stream_summary(
+        &mut fields,
+        "stderr",
+        &output.stderr,
+        output.stderr_bytes,
+        output.stderr_retained_bytes,
+        output.stderr_truncated,
+        output.stderr_capture_complete,
+    );
+    if let Some(artifact) = &output.artifact {
+        fields.push(format!(
+            "full output={:?}",
+            bounded_human_value(&artifact.reference, 160)
+        ));
+    }
+    if let Some(error) = &output.artifact_error {
+        fields.push(format!(
+            "artifact error={:?}",
+            bounded_human_value(error, 160)
+        ));
+    }
+    fields.join(" | ")
+}
+
+fn append_command_stream_summary(
+    fields: &mut Vec<String>,
+    name: &str,
+    preview: &str,
+    total_bytes: u64,
+    retained_bytes: usize,
+    truncated: bool,
+    complete: bool,
+) {
+    if total_bytes == 0 && complete {
+        return;
+    }
+    let mut metadata = if truncated {
+        format!("{name} {retained_bytes}/{total_bytes} B")
+    } else {
+        format!("{name} {total_bytes} B")
+    };
+    if truncated {
+        metadata.push_str(" truncated");
+    }
+    if !complete {
+        metadata.push_str(" incomplete");
+    }
+    if !preview.is_empty() {
+        metadata.push_str(" tail=");
+        metadata.push_str(&format!("{:?}", terminal_safe_tail(preview, 180)));
+    }
+    fields.push(metadata);
+}
+
+fn safe_warning_summary(warning: &str) -> String {
+    const CHAT_TEMPLATE_MARKERS: [&str; 8] = [
+        "<|im_start|>",
+        "<|im_end|>",
+        "<|start_header_id|>",
+        "<|end_header_id|>",
+        "<|eot_id|>",
+        "[INST]",
+        "[/INST]",
+        "<tool_call>",
+    ];
+    let mut safe = terminal_safe_inline(warning);
+    for marker in CHAT_TEMPLATE_MARKERS {
+        safe = safe.replace(marker, "[chat-template marker]");
+    }
+    bounded_human_value(&safe, 180)
 }
 
 /// Compact a path to at most its last two segments (with a leading `…` when more

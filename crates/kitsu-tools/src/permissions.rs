@@ -6,7 +6,10 @@
 //!
 //! - [`Mode::Ask`] — consult a [`Prompter`] (interactive approval; "always" can
 //!   widen the session allowlist).
-//! - [`Mode::AutoAllow`] — allow every non-protected path without prompting.
+//! - [`Mode::Scoped`] — never prompt and deny anything outside the current
+//!   roots (`--yes`).
+//! - [`Mode::AutoAllow`] — allow every non-protected path without prompting;
+//!   reserved for an explicitly dangerous global bypass.
 //! - [`Mode::Deny`] — deny anything not pre-granted (non-interactive default).
 //!
 //! Containment is enforced by canonicalizing paths (the parent, for writes to a
@@ -14,6 +17,8 @@
 //! escapes. The allowlists live behind `RwLock` so `/allow` and an "always"
 //! approval can widen them mid-session.
 
+#[cfg(unix)]
+use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
@@ -23,6 +28,127 @@ use crate::error::ToolError;
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
 /// Cap on a single generated file's size (bytes); a larger write is rejected.
 pub const DEFAULT_MAX_WRITE_BYTES: usize = 1024 * 1024;
+
+/// Stable identity of one Unix filesystem object while that object exists.
+///
+/// Hard links have distinct paths but share this pair. Device identity is
+/// included because inode numbers are only unique within one filesystem.
+/// Directory hard links are intentionally out of scope: ordinary Unix
+/// filesystems prohibit them, and this policy records regular files only.
+#[cfg(unix)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+struct ProtectedFileIdentity {
+    device: u64,
+    inode: u64,
+}
+
+#[cfg(unix)]
+fn protected_file_identity(metadata: &std::fs::Metadata) -> Option<ProtectedFileIdentity> {
+    use std::os::unix::fs::MetadataExt;
+
+    metadata.is_file().then_some(ProtectedFileIdentity {
+        device: metadata.dev(),
+        inode: metadata.ino(),
+    })
+}
+
+/// Add every existing regular file below `path` without following symlinks.
+/// Missing entries are benign because protected state can be created lazily.
+#[cfg(unix)]
+fn collect_protected_file_identities(
+    path: &Path,
+    identities: &mut HashSet<ProtectedFileIdentity>,
+    multiply_linked: &mut HashSet<ProtectedFileIdentity>,
+) -> Result<(), std::io::Error> {
+    use std::os::unix::fs::MetadataExt;
+
+    let metadata = match std::fs::symlink_metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error)
+            if matches!(
+                error.kind(),
+                std::io::ErrorKind::NotFound | std::io::ErrorKind::NotADirectory
+            ) =>
+        {
+            return Ok(());
+        }
+        Err(error) => return Err(error),
+    };
+    if metadata.file_type().is_symlink() {
+        return Ok(());
+    }
+    if let Some(identity) = protected_file_identity(&metadata) {
+        identities.insert(identity);
+        if metadata.nlink() > 1 {
+            multiply_linked.insert(identity);
+        }
+        return Ok(());
+    }
+    if !metadata.is_dir() {
+        return Ok(());
+    }
+    for entry in std::fs::read_dir(path)? {
+        let entry = match entry {
+            Ok(entry) => entry,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => return Err(error),
+        };
+        collect_protected_file_identities(&entry.path(), identities, multiply_linked)?;
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn refresh_protected_file_identities(
+    roots: &RwLock<Vec<PathBuf>>,
+    identities: &RwLock<HashSet<ProtectedFileIdentity>>,
+    multiply_linked: &RwLock<HashSet<ProtectedFileIdentity>>,
+) -> Result<(), ToolError> {
+    let roots = roots.read().unwrap().clone();
+    let mut discovered = HashSet::new();
+    let mut discovered_multiply_linked = HashSet::new();
+    for root in &roots {
+        collect_protected_file_identities(root, &mut discovered, &mut discovered_multiply_linked)
+            .map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot safely inspect Kitsu-private path '{}': {error}",
+                root.display()
+            ))
+        })?;
+    }
+    identities.write().unwrap().extend(discovered);
+    multiply_linked
+        .write()
+        .unwrap()
+        .extend(discovered_multiply_linked);
+    Ok(())
+}
+
+#[cfg(unix)]
+fn path_has_protected_file_identity(
+    path: &Path,
+    identities: &RwLock<HashSet<ProtectedFileIdentity>>,
+) -> bool {
+    std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| protected_file_identity(&metadata))
+        .is_some_and(|identity| identities.read().unwrap().contains(&identity))
+}
+
+#[cfg(unix)]
+fn path_has_multiply_linked_protected_identity(
+    path: &Path,
+    identities: &RwLock<HashSet<ProtectedFileIdentity>>,
+) -> bool {
+    path_has_protected_file_identity(path, identities)
+}
+
+#[cfg(unix)]
+fn path_is_multiply_linked_regular_file(path: &Path) -> bool {
+    use std::os::unix::fs::MetadataExt;
+
+    std::fs::metadata(path).is_ok_and(|metadata| metadata.is_file() && metadata.nlink() > 1)
+}
 
 /// A read or a write — what the model is asking to do.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -56,6 +182,8 @@ pub enum Decision {
 pub enum Mode {
     /// Prompt the user (interactive TTY).
     Ask,
+    /// Never prompt; rely exclusively on explicit and current session roots.
+    Scoped,
     /// Auto-allow every non-protected operation; never prompt.
     AutoAllow,
     /// Deny anything not pre-granted; never prompt (non-interactive default).
@@ -82,15 +210,57 @@ pub trait Prompter: Send + Sync {
 pub struct Permissions {
     base_read_roots: Vec<PathBuf>,
     base_write_roots: Vec<PathBuf>,
+    /// Invocation roots still active in this session. A user can revoke one
+    /// without mutating the immutable base snapshot restored on session reset.
     read_roots: RwLock<Vec<PathBuf>>,
     write_roots: RwLock<Vec<PathBuf>>,
+    /// Grants added by prompts and slash commands after construction. Keeping
+    /// these separate makes effective authority and provenance inspectable.
+    runtime_read_roots: RwLock<Vec<PathBuf>>,
+    runtime_write_roots: RwLock<Vec<PathBuf>>,
     protected_read_roots: RwLock<Vec<PathBuf>>,
+    /// Existing regular files under protected read roots, keyed by Unix
+    /// device/inode so a hard-link alias cannot shed Kitsu-private status.
+    /// Identities are retained for this Permissions lifetime after names are
+    /// removed; an inode recycled unusually quickly can therefore cause a
+    /// conservative denial rather than exposing a former private alias.
+    #[cfg(unix)]
+    protected_read_files: RwLock<HashSet<ProtectedFileIdentity>>,
+    /// Files observed with multiple names remain non-readable through an
+    /// internal-read subtree even if one link is subsequently removed.
+    #[cfg(unix)]
+    protected_read_multiply_linked_files: RwLock<HashSet<ProtectedFileIdentity>>,
     internal_read_roots: RwLock<Vec<PathBuf>>,
     protected_write_roots: RwLock<Vec<PathBuf>>,
+    /// Write-side counterpart to `protected_read_files`.
+    #[cfg(unix)]
+    protected_write_files: RwLock<HashSet<ProtectedFileIdentity>>,
+    #[cfg(unix)]
+    protected_write_multiply_linked_files: RwLock<HashSet<ProtectedFileIdentity>>,
     mode: Mode,
     prompter: Option<Arc<dyn Prompter>>,
     max_bytes: usize,
     max_write_bytes: usize,
+}
+
+/// Which user-controlled grant sources were removed by a revoke operation.
+/// Protected and Kitsu-internal roots are deliberately not revocable through
+/// this API.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Revocation {
+    pub invocation: bool,
+    pub runtime: bool,
+}
+
+impl Revocation {
+    pub fn description(self) -> &'static str {
+        match (self.invocation, self.runtime) {
+            (true, true) => "invocation and session",
+            (true, false) => "invocation",
+            (false, true) => "session",
+            (false, false) => "none",
+        }
+    }
 }
 
 fn canonicalize_roots(roots: &[String], label: &str) -> Result<Vec<PathBuf>, ToolError> {
@@ -205,6 +375,32 @@ fn insert_minimal_root(roots: &mut Vec<PathBuf>, root: PathBuf) {
     roots.sort();
 }
 
+fn merged_roots(invocation: &[PathBuf], runtime: &[PathBuf]) -> Vec<PathBuf> {
+    let mut roots = invocation.to_vec();
+    for root in runtime {
+        insert_minimal_root(&mut roots, root.clone());
+    }
+    roots
+}
+
+/// Canonical identity for revocation. Revocation is allowed to target a root
+/// that has since disappeared because removing authority is always safe. If a
+/// path still exists, canonicalization preserves the identity used at grant
+/// time; otherwise the absolute lexical identity can match a displayed root.
+fn revocation_target(path: &str) -> Result<PathBuf, ToolError> {
+    match std::fs::canonicalize(path) {
+        Ok(canonical) => Ok(canonical),
+        Err(_) => normalize_apparent(Path::new(path)),
+    }
+}
+
+fn remove_exact_root(roots: &RwLock<Vec<PathBuf>>, target: &Path) -> bool {
+    let mut roots = roots.write().unwrap();
+    let before = roots.len();
+    roots.retain(|root| root != target);
+    roots.len() != before
+}
+
 /// The directory an "always" grant should add for a resolved target path: the
 /// path itself if it is a directory, otherwise its parent.
 fn grant_dir_for(canon: &Path) -> PathBuf {
@@ -233,9 +429,19 @@ impl Permissions {
             base_write_roots: write_roots.clone(),
             read_roots: RwLock::new(read_roots),
             write_roots: RwLock::new(write_roots),
+            runtime_read_roots: RwLock::new(Vec::new()),
+            runtime_write_roots: RwLock::new(Vec::new()),
             protected_read_roots: RwLock::new(Vec::new()),
+            #[cfg(unix)]
+            protected_read_files: RwLock::new(HashSet::new()),
+            #[cfg(unix)]
+            protected_read_multiply_linked_files: RwLock::new(HashSet::new()),
             internal_read_roots: RwLock::new(Vec::new()),
             protected_write_roots: RwLock::new(Vec::new()),
+            #[cfg(unix)]
+            protected_write_files: RwLock::new(HashSet::new()),
+            #[cfg(unix)]
+            protected_write_multiply_linked_files: RwLock::new(HashSet::new()),
             mode,
             prompter: None,
             max_bytes: DEFAULT_MAX_BYTES,
@@ -263,14 +469,51 @@ impl Permissions {
         self.mode
     }
 
-    /// Snapshot the canonical read roots currently granted for this session.
+    /// Snapshot the minimal union of invocation and runtime read roots.
     pub fn read_roots(&self) -> Vec<PathBuf> {
+        merged_roots(
+            &self.read_roots.read().unwrap(),
+            &self.runtime_read_roots.read().unwrap(),
+        )
+    }
+
+    /// Snapshot the minimal union of invocation and runtime write roots.
+    pub fn write_roots(&self) -> Vec<PathBuf> {
+        merged_roots(
+            &self.write_roots.read().unwrap(),
+            &self.runtime_write_roots.read().unwrap(),
+        )
+    }
+
+    /// Immutable invocation read roots. A session revoke may make one inactive;
+    /// [`Self::reset_runtime_grants`] restores this snapshot.
+    pub fn base_read_roots(&self) -> Vec<PathBuf> {
+        self.base_read_roots.clone()
+    }
+
+    /// Immutable invocation write roots.
+    pub fn base_write_roots(&self) -> Vec<PathBuf> {
+        self.base_write_roots.clone()
+    }
+
+    /// Invocation read roots that remain active in the current session.
+    pub fn active_base_read_roots(&self) -> Vec<PathBuf> {
         self.read_roots.read().unwrap().clone()
     }
 
-    /// Snapshot the canonical write roots currently granted for this session.
-    pub fn write_roots(&self) -> Vec<PathBuf> {
+    /// Invocation write roots that remain active in the current session.
+    pub fn active_base_write_roots(&self) -> Vec<PathBuf> {
         self.write_roots.read().unwrap().clone()
+    }
+
+    /// Read roots granted by prompts or slash commands in this session.
+    pub fn runtime_read_roots(&self) -> Vec<PathBuf> {
+        self.runtime_read_roots.read().unwrap().clone()
+    }
+
+    /// Write roots granted by prompts or slash commands in this session.
+    pub fn runtime_write_roots(&self) -> Vec<PathBuf> {
+        self.runtime_write_roots.read().unwrap().clone()
     }
 
     /// Paths containing Kitsu's own configuration/transcripts. Except for an
@@ -280,9 +523,17 @@ impl Permissions {
         let requested = Path::new(path);
         let apparent = normalize_apparent(requested)?;
         let canon = canonicalize_intended(requested)?;
-        let mut roots = self.protected_read_roots.write().unwrap();
-        insert_minimal_root(&mut roots, apparent);
-        insert_minimal_root(&mut roots, canon.clone());
+        {
+            let mut roots = self.protected_read_roots.write().unwrap();
+            insert_minimal_root(&mut roots, apparent);
+            insert_minimal_root(&mut roots, canon.clone());
+        }
+        #[cfg(unix)]
+        refresh_protected_file_identities(
+            &self.protected_read_roots,
+            &self.protected_read_files,
+            &self.protected_read_multiply_linked_files,
+        )?;
         Ok(canon)
     }
 
@@ -335,24 +586,51 @@ impl Permissions {
     pub fn is_within_protected_read_root(&self, path: &Path) -> bool {
         let apparent = normalize_apparent(path).unwrap_or_else(|_| path.to_path_buf());
         let resolved = std::fs::canonicalize(path).unwrap_or_else(|_| apparent.clone());
-        self.protected_read_roots
+        let protected_by_path = self
+            .protected_read_roots
             .read()
             .unwrap()
             .iter()
-            .any(|root| apparent.starts_with(root) || resolved.starts_with(root))
+            .any(|root| apparent.starts_with(root) || resolved.starts_with(root));
+        #[cfg(unix)]
+        {
+            // A single-link file cannot currently alias another namespace
+            // entry. Previously observed identities remain in the set, while
+            // multiply-linked candidates trigger discovery of new state files.
+            if path_is_multiply_linked_regular_file(&resolved) {
+                let _ = refresh_protected_file_identities(
+                    &self.protected_read_roots,
+                    &self.protected_read_files,
+                    &self.protected_read_multiply_linked_files,
+                );
+            }
+            protected_by_path
+                || path_has_protected_file_identity(&resolved, &self.protected_read_files)
+        }
+        #[cfg(not(unix))]
+        {
+            protected_by_path
+        }
     }
 
     pub fn is_read_protected(&self, path: &Path) -> bool {
         let apparent = normalize_apparent(path).unwrap_or_else(|_| path.to_path_buf());
         let canon = std::fs::canonicalize(path).unwrap_or_else(|_| apparent.clone());
         let protected = self.is_within_protected_read_root(path);
-        protected
-            && !self
-                .internal_read_roots
-                .read()
-                .unwrap()
-                .iter()
-                .any(|root| canon.starts_with(root))
+        let internal = self
+            .internal_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| canon.starts_with(root));
+        #[cfg(unix)]
+        let unsafe_internal_alias = path_has_multiply_linked_protected_identity(
+            &canon,
+            &self.protected_read_multiply_linked_files,
+        );
+        #[cfg(not(unix))]
+        let unsafe_internal_alias = false;
+        protected && (!internal || unsafe_internal_alias)
     }
 
     /// Grant a Kitsu-selected directory without allowing a symlinked final
@@ -386,9 +664,17 @@ impl Permissions {
         let requested = Path::new(path);
         let apparent = normalize_apparent(requested)?;
         let canon = canonicalize_intended(requested)?;
-        let mut roots = self.protected_write_roots.write().unwrap();
-        insert_minimal_root(&mut roots, apparent);
-        insert_minimal_root(&mut roots, canon.clone());
+        {
+            let mut roots = self.protected_write_roots.write().unwrap();
+            insert_minimal_root(&mut roots, apparent);
+            insert_minimal_root(&mut roots, canon.clone());
+        }
+        #[cfg(unix)]
+        refresh_protected_file_identities(
+            &self.protected_write_roots,
+            &self.protected_write_files,
+            &self.protected_write_multiply_linked_files,
+        )?;
         Ok(canon)
     }
 
@@ -397,13 +683,16 @@ impl Permissions {
         self.protected_write_roots.read().unwrap().clone()
     }
 
-    /// Revoke grants added after construction, including internal reads, while
-    /// preserving explicit CLI roots (and the interactive launch-directory read
-    /// root). Session switches use this so one conversation's approvals and
-    /// artifact roots cannot authorize another.
+    /// Revoke grants added after construction, including internal reads, and
+    /// restore invocation roots that were explicitly revoked in this session.
+    /// Session switches use this so one conversation's approvals and artifact
+    /// roots cannot authorize another while the invocation policy remains the
+    /// stable baseline.
     pub fn reset_runtime_grants(&self) {
         *self.read_roots.write().unwrap() = self.base_read_roots.clone();
         *self.write_roots.write().unwrap() = self.base_write_roots.clone();
+        self.runtime_read_roots.write().unwrap().clear();
+        self.runtime_write_roots.write().unwrap().clear();
         self.internal_read_roots.write().unwrap().clear();
     }
 
@@ -412,7 +701,7 @@ impl Permissions {
         let canon = std::fs::canonicalize(path).map_err(|e| {
             ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
         })?;
-        insert_minimal_root(&mut self.read_roots.write().unwrap(), canon.clone());
+        insert_minimal_root(&mut self.runtime_read_roots.write().unwrap(), canon.clone());
         Ok(canon)
     }
 
@@ -421,8 +710,72 @@ impl Permissions {
         let canon = std::fs::canonicalize(path).map_err(|e| {
             ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
         })?;
-        insert_minimal_root(&mut self.write_roots.write().unwrap(), canon.clone());
+        insert_minimal_root(
+            &mut self.runtime_write_roots.write().unwrap(),
+            canon.clone(),
+        );
         Ok(canon)
+    }
+
+    /// Add matching read and write roots as one explicit combined capability.
+    pub fn grant_read_write_root(&self, path: &str) -> Result<PathBuf, ToolError> {
+        let canon = std::fs::canonicalize(path).map_err(|e| {
+            ToolError::PolicyDenied(format!("path '{path}' is not accessible: {e}"))
+        })?;
+        insert_minimal_root(&mut self.runtime_read_roots.write().unwrap(), canon.clone());
+        insert_minimal_root(
+            &mut self.runtime_write_roots.write().unwrap(),
+            canon.clone(),
+        );
+        Ok(canon)
+    }
+
+    /// Revoke one exact user-visible read grant for this session. Descendants
+    /// of a broader grant are not accepted because this policy has no deny-hole
+    /// representation; the error points users at the exact roots to revoke.
+    pub fn revoke_read_root(&self, path: &str) -> Result<Revocation, ToolError> {
+        self.revoke_root(path, Action::Read)
+    }
+
+    /// Revoke one exact user-visible write grant for this session.
+    pub fn revoke_write_root(&self, path: &str) -> Result<Revocation, ToolError> {
+        self.revoke_root(path, Action::Write)
+    }
+
+    fn revoke_root(&self, path: &str, action: Action) -> Result<Revocation, ToolError> {
+        let target = revocation_target(path)?;
+        let (invocation_roots, runtime_roots) = match action {
+            Action::Read => (&self.read_roots, &self.runtime_read_roots),
+            Action::Write => (&self.write_roots, &self.runtime_write_roots),
+        };
+        let revocation = Revocation {
+            invocation: remove_exact_root(invocation_roots, &target),
+            runtime: remove_exact_root(runtime_roots, &target),
+        };
+        if revocation.invocation || revocation.runtime {
+            return Ok(revocation);
+        }
+
+        let covering = match action {
+            Action::Read => self.read_roots(),
+            Action::Write => self.write_roots(),
+        }
+        .into_iter()
+        .find(|root| target.starts_with(root));
+        let detail = covering
+            .map(|root| {
+                format!(
+                    " (it is covered by '{}'; revoke that exact root instead)",
+                    root.display()
+                )
+            })
+            .unwrap_or_default();
+        Err(ToolError::PolicyDenied(format!(
+            "no exact active {} grant for '{}'{}",
+            action.verb(),
+            target.display(),
+            detail
+        )))
     }
 
     /// Check (and possibly prompt for) read access to `requested`. Returns the
@@ -435,12 +788,25 @@ impl Permissions {
                 requested.display()
             ))
         })?;
-        let protected = self
+        #[cfg(unix)]
+        if path_is_multiply_linked_regular_file(&canon) {
+            refresh_protected_file_identities(
+                &self.protected_read_roots,
+                &self.protected_read_files,
+                &self.protected_read_multiply_linked_files,
+            )?;
+        }
+        let protected_by_path = self
             .protected_read_roots
             .read()
             .unwrap()
             .iter()
             .any(|root| apparent.starts_with(root) || canon.starts_with(root));
+        #[cfg(unix)]
+        let protected = protected_by_path
+            || path_has_protected_file_identity(&canon, &self.protected_read_files);
+        #[cfg(not(unix))]
+        let protected = protected_by_path;
         if protected {
             let internal = self
                 .internal_read_roots
@@ -448,7 +814,14 @@ impl Permissions {
                 .unwrap()
                 .iter()
                 .any(|root| canon.starts_with(root));
-            if internal {
+            #[cfg(unix)]
+            let unsafe_internal_alias = path_has_multiply_linked_protected_identity(
+                &canon,
+                &self.protected_read_multiply_linked_files,
+            );
+            #[cfg(not(unix))]
+            let unsafe_internal_alias = false;
+            if internal && !unsafe_internal_alias {
                 return Ok(canon);
             }
             return Err(ToolError::PolicyDenied(format!(
@@ -456,13 +829,7 @@ impl Permissions {
                 requested.display()
             )));
         }
-        if self
-            .read_roots
-            .read()
-            .unwrap()
-            .iter()
-            .any(|r| canon.starts_with(r))
-        {
+        if self.read_roots().iter().any(|r| canon.starts_with(r)) {
             return Ok(canon);
         }
         self.resolve(Action::Read, requested, canon).await
@@ -507,10 +874,18 @@ impl Permissions {
             }
             _ => target.clone(),
         };
+        #[cfg(unix)]
+        if path_is_multiply_linked_regular_file(&contained_as) {
+            refresh_protected_file_identities(
+                &self.protected_write_roots,
+                &self.protected_write_files,
+                &self.protected_write_multiply_linked_files,
+            )?;
+        }
         // Check both identities. `target` protects a private path even when its
         // final component is a symlink pointing out, while `contained_as`
         // protects a private destination reached through a symlink alias.
-        if self
+        let protected_by_path = self
             .protected_write_roots
             .read()
             .unwrap()
@@ -519,17 +894,20 @@ impl Permissions {
                 apparent.starts_with(root)
                     || target.starts_with(root)
                     || contained_as.starts_with(root)
-            })
-        {
+            });
+        #[cfg(unix)]
+        let protected = protected_by_path
+            || path_has_protected_file_identity(&contained_as, &self.protected_write_files);
+        #[cfg(not(unix))]
+        let protected = protected_by_path;
+        if protected {
             return Err(ToolError::PolicyDenied(format!(
                 "path '{}' contains Kitsu-private configuration or session state",
                 requested.display()
             )));
         }
         if self
-            .write_roots
-            .read()
-            .unwrap()
+            .write_roots()
             .iter()
             .any(|r| contained_as.starts_with(r))
         {
@@ -550,9 +928,17 @@ impl Permissions {
         canon: PathBuf,
     ) -> Result<PathBuf, ToolError> {
         match self.mode {
-            Mode::Deny => Err(self.denied(action, requested)),
+            Mode::Scoped | Mode::Deny => Err(self.denied(action, requested)),
             Mode::AutoAllow => Ok(canon),
             Mode::Ask => {
+                if !crate::interactive_prompts_allowed() {
+                    return Err(ToolError::PolicyDenied(format!(
+                        "{} denied: background agents cannot open interactive permission prompts; \
+                         pre-grant '{}' from the foreground session",
+                        action.verb(),
+                        requested.display()
+                    )));
+                }
                 let grant_dir = grant_dir_for(&canon);
                 let req = PermissionRequest {
                     action,
@@ -563,8 +949,8 @@ impl Permissions {
                     Decision::AllowOnce => Ok(canon),
                     Decision::AllowAlways => {
                         let roots = match action {
-                            Action::Read => &self.read_roots,
-                            Action::Write => &self.write_roots,
+                            Action::Read => &self.runtime_read_roots,
+                            Action::Write => &self.runtime_write_roots,
                         };
                         insert_minimal_root(&mut roots.write().unwrap(), grant_dir);
                         Ok(canon)
@@ -702,6 +1088,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn scoped_mode_never_escapes_current_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let allowed_file = write_file(allowed.path(), "inside.txt", "ok");
+        let outside_file = write_file(outside.path(), "outside.txt", "secret");
+        let root = allowed.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&root),
+            std::slice::from_ref(&root),
+            Mode::Scoped,
+        )
+        .unwrap();
+
+        assert_eq!(perms.check_read(&allowed_file).await.unwrap(), allowed_file);
+        assert!(perms
+            .check_write(&allowed.path().join("new.txt"))
+            .await
+            .is_ok());
+        assert!(matches!(
+            perms.check_read(&outside_file).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&outside.path().join("new.txt")).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn write_root_does_not_imply_read_authority() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = write_file(dir.path(), "existing.txt", "private");
+        let root = dir.path().to_string_lossy().to_string();
+        let perms = Permissions::new(&[], std::slice::from_ref(&root), Mode::Scoped).unwrap();
+
+        assert!(matches!(
+            perms.check_read(&existing).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(perms.check_write(&dir.path().join("new.txt")).await.is_ok());
+    }
+
+    #[tokio::test]
     async fn ask_mode_widens_on_allow_always() {
         struct Yes;
         impl Prompter for Yes {
@@ -740,6 +1169,33 @@ mod tests {
         ));
     }
 
+    #[tokio::test]
+    async fn background_scope_denies_without_invoking_interactive_prompter() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        struct CountPrompts(Arc<AtomicUsize>);
+        impl Prompter for CountPrompts {
+            fn ask(&self, _req: &PermissionRequest) -> Decision {
+                self.0.fetch_add(1, Ordering::Relaxed);
+                Decision::AllowOnce
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let target = write_file(dir.path(), "background.txt", "private");
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let perms = Permissions::new(&[], &[], Mode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(CountPrompts(prompts.clone())));
+
+        let error = crate::scope_without_interactive_prompts(perms.check_read(&target))
+            .await
+            .unwrap_err();
+        assert!(matches!(error, ToolError::PolicyDenied(_)));
+        assert!(error.to_string().contains("background agents"));
+        assert_eq!(prompts.load(Ordering::Relaxed), 0);
+    }
+
     #[test]
     fn runtime_grants_are_deduplicated_and_parent_minimized() {
         let dir = tempfile::tempdir().unwrap();
@@ -770,6 +1226,89 @@ mod tests {
 
         perms.reset_runtime_grants();
         assert_eq!(perms.read_roots(), vec![base.path().to_path_buf()]);
+    }
+
+    #[test]
+    fn grant_provenance_and_exact_revocation_survive_session_reset() {
+        let base = tempfile::tempdir().unwrap();
+        let runtime = tempfile::tempdir().unwrap();
+        let perms = Permissions::for_roots(
+            &[base.path().to_string_lossy().to_string()],
+            &[base.path().to_string_lossy().to_string()],
+        )
+        .unwrap();
+        perms
+            .grant_read_write_root(&runtime.path().to_string_lossy())
+            .unwrap();
+
+        assert_eq!(perms.base_read_roots(), vec![base.path().to_path_buf()]);
+        assert_eq!(
+            perms.active_base_read_roots(),
+            vec![base.path().to_path_buf()]
+        );
+        assert_eq!(
+            perms.runtime_read_roots(),
+            vec![runtime.path().to_path_buf()]
+        );
+        assert_eq!(
+            perms.runtime_write_roots(),
+            vec![runtime.path().to_path_buf()]
+        );
+
+        let revoked_read = perms
+            .revoke_read_root(&base.path().to_string_lossy())
+            .unwrap();
+        let revoked_write = perms
+            .revoke_write_root(&base.path().to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            revoked_read,
+            Revocation {
+                invocation: true,
+                runtime: false
+            }
+        );
+        assert_eq!(revoked_write, revoked_read);
+        assert!(perms.active_base_read_roots().is_empty());
+        assert!(perms.active_base_write_roots().is_empty());
+
+        perms.reset_runtime_grants();
+        assert_eq!(
+            perms.active_base_read_roots(),
+            vec![base.path().to_path_buf()]
+        );
+        assert_eq!(
+            perms.active_base_write_roots(),
+            vec![base.path().to_path_buf()]
+        );
+        assert!(perms.runtime_read_roots().is_empty());
+        assert!(perms.runtime_write_roots().is_empty());
+    }
+
+    #[test]
+    fn revoke_requires_an_exact_root_and_never_touches_protected_state() {
+        let dir = tempfile::tempdir().unwrap();
+        let child = dir.path().join("child");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&child).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        let perms = Permissions::for_roots(
+            &[dir.path().to_string_lossy().to_string()],
+            &[dir.path().to_string_lossy().to_string()],
+        )
+        .unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .protect_write_path(&private.to_string_lossy())
+            .unwrap();
+
+        let error = perms
+            .revoke_read_root(&child.to_string_lossy())
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains("revoke that exact root"));
+        assert_eq!(perms.protected_read_roots(), vec![private.clone()]);
+        assert_eq!(perms.protected_write_roots(), vec![private]);
     }
 
     #[tokio::test]
@@ -977,6 +1516,26 @@ mod tests {
             perms.check_read(&artifact).await,
             Err(ToolError::PolicyDenied(_))
         ));
+    }
+
+    #[test]
+    fn future_private_root_below_regular_file_ancestor_is_still_reserved() {
+        let base = tempfile::tempdir().unwrap();
+        let unusable_parent = base.path().join("home-is-a-file");
+        std::fs::write(&unusable_parent, "not a directory").unwrap();
+        let future = unusable_parent.join(".kitsu/profiles/example");
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+
+        assert!(perms.protect_read_path(&future.to_string_lossy()).is_ok());
+        assert!(perms.protect_write_path(&future.to_string_lossy()).is_ok());
+        assert!(perms
+            .protected_read_roots()
+            .iter()
+            .any(|root| root == &future));
+        assert!(perms
+            .protected_write_roots()
+            .iter()
+            .any(|root| root == &future));
     }
 }
 
@@ -1217,6 +1776,125 @@ mod symlink_tests {
             Err(ToolError::PolicyDenied(_))
         ));
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn hard_link_alias_of_a_protected_file_is_never_readable_or_writable() {
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("kitsu.toml");
+        let alias = base.path().join("innocent.toml");
+        std::fs::write(&private, "token = 'private'\n").unwrap();
+        std::fs::hard_link(&private, &alias).unwrap();
+        let broad = base.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .protect_write_path(&private.to_string_lossy())
+            .unwrap();
+
+        assert!(perms.is_read_protected(&alias));
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert_eq!(
+            std::fs::read_to_string(private).unwrap(),
+            "token = 'private'\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn protected_directory_discovers_new_files_and_remembers_unlinked_names() {
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("state");
+        std::fs::create_dir(&private).unwrap();
+        let broad = base.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .protect_write_path(&private.to_string_lossy())
+            .unwrap();
+
+        // The file did not exist when the directory was protected. The next
+        // authorization refreshes identities below the protected directory.
+        let session = private.join("session.json");
+        let alias = base.path().join("shared-session.json");
+        std::fs::write(&session, "new private state").unwrap();
+        std::fs::hard_link(&session, &alias).unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // Keep the stable identity for this Permissions lifetime even if the
+        // original private namespace entry disappears while its alias lives.
+        std::fs::remove_file(&session).unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn internal_read_root_does_not_exempt_a_private_hard_link_alias() {
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("state");
+        let sessions = private.join("sessions");
+        let artifacts = private.join("artifacts");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&artifacts).unwrap();
+        let session = sessions.join("session.json");
+        let legitimate_artifact = artifacts.join("result.txt");
+        std::fs::write(&session, "private transcript").unwrap();
+        std::fs::write(&legitimate_artifact, "safe result").unwrap();
+
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .allow_internal_read_root(&artifacts.to_string_lossy())
+            .unwrap();
+        assert_eq!(
+            perms.check_read(&legitimate_artifact).await.unwrap(),
+            legitimate_artifact
+        );
+
+        let alias = artifacts.join("apparently-safe.json");
+        std::fs::hard_link(&session, &alias).unwrap();
+        assert!(perms.is_read_protected(&alias));
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // Once observed as multiply linked, removing the private name cannot
+        // turn the remaining alias into a trusted generated artifact.
+        std::fs::remove_file(&session).unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
     }
 
     #[test]

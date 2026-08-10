@@ -1,0 +1,459 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:kitsu:schema:chat:v1",
+  "title": "Kitsu chat JSONL event (v1)",
+  "description": "One line-delimited event emitted by Kitsu --jsonl.",
+  "oneOf": [
+    { "$ref": "#/$defs/run_started" },
+    { "$ref": "#/$defs/model_catalog" },
+    { "$ref": "#/$defs/turn_started" },
+    { "$ref": "#/$defs/provider_request" },
+    { "$ref": "#/$defs/provider_attempt" },
+    { "$ref": "#/$defs/usage" },
+    { "$ref": "#/$defs/tool_started" },
+    { "$ref": "#/$defs/tool_finished" },
+    { "$ref": "#/$defs/assistant" },
+    { "$ref": "#/$defs/turn_finished" },
+    { "$ref": "#/$defs/command_started" },
+    { "$ref": "#/$defs/command_result" },
+    { "$ref": "#/$defs/command_finished" },
+    { "$ref": "#/$defs/error" },
+    { "$ref": "#/$defs/final_summary" },
+    { "$ref": "#/$defs/forward_compatible_event" }
+  ],
+  "$defs": {
+    "envelope": {
+      "type": "object",
+      "required": ["schema", "type", "run_id"],
+      "properties": {
+        "schema": { "const": "kitsu.chat.v1" },
+        "type": { "type": "string", "minLength": 1 },
+        "run_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "turn_identity": {
+      "type": "object",
+      "required": ["turn_id"],
+      "properties": {
+        "turn_id": { "type": "string", "minLength": 1 }
+      }
+    },
+    "command_invocation": {
+      "type": "object",
+      "required": ["argv", "cwd", "timeout_ms"],
+      "properties": {
+        "argv": {
+          "type": "array",
+          "items": { "type": "string" },
+          "minItems": 1
+        },
+        "cwd": { "type": "string" },
+        "timeout_ms": { "type": ["integer", "null"], "minimum": 0 }
+      }
+    },
+    "command_executable": {
+      "type": "object",
+      "required": ["invocation", "resolution", "observed_path", "pinned"],
+      "properties": {
+        "invocation": { "type": "string" },
+        "resolution": { "enum": ["ambient_path", "invocation_path"] },
+        "observed_path": { "type": ["string", "null"] },
+        "pinned": { "type": "boolean" }
+      }
+    },
+    "command_ambient_authority": {
+      "type": "object",
+      "required": [
+        "inherits_environment",
+        "filesystem_confined_to_command_roots",
+        "network_confined",
+        "executable_identity_pinned"
+      ],
+      "properties": {
+        "inherits_environment": { "type": "boolean" },
+        "filesystem_confined_to_command_roots": { "type": "boolean" },
+        "network_confined": { "type": "boolean" },
+        "executable_identity_pinned": { "type": "boolean" }
+      }
+    },
+    "command_execution_result": {
+      "type": "object",
+      "required": [
+        "termination",
+        "success",
+        "exit_code",
+        "signal",
+        "elapsed_ms",
+        "stdout_bytes",
+        "stderr_bytes",
+        "stdout_retained_bytes",
+        "stderr_retained_bytes",
+        "stdout_truncated",
+        "stderr_truncated",
+        "stdout_capture_complete",
+        "stderr_capture_complete",
+        "stdout_tail",
+        "stderr_tail",
+        "executable",
+        "ambient_authority"
+      ],
+      "properties": {
+        "termination": { "enum": ["exited", "signaled", "timed_out", "cancelled"] },
+        "success": { "type": "boolean" },
+        "exit_code": { "type": ["integer", "null"] },
+        "signal": { "type": ["integer", "null"] },
+        "elapsed_ms": { "type": "integer", "minimum": 0 },
+        "stdout_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_bytes": { "type": "integer", "minimum": 0 },
+        "stdout_retained_bytes": { "type": "integer", "minimum": 0 },
+        "stderr_retained_bytes": { "type": "integer", "minimum": 0 },
+        "stdout_truncated": { "type": "boolean" },
+        "stderr_truncated": { "type": "boolean" },
+        "stdout_capture_complete": { "type": "boolean" },
+        "stderr_capture_complete": { "type": "boolean" },
+        "stdout_tail": { "type": "string" },
+        "stderr_tail": { "type": "string" },
+        "executable": { "$ref": "#/$defs/command_executable" },
+        "ambient_authority": { "$ref": "#/$defs/command_ambient_authority" },
+        "artifact": {
+          "type": "object",
+          "required": ["reference"],
+          "properties": {
+            "reference": { "type": "string" }
+          }
+        },
+        "artifact_error": { "type": "string" }
+      }
+    },
+    "run_started": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["mode", "gateway"],
+          "properties": {
+            "type": { "const": "run_started" },
+            "mode": { "enum": ["ask", "script", "piped", "review", "models"] },
+            "gateway": { "type": "string" },
+            "model": { "type": "string" },
+            "session_id": { "type": ["string", "null"] },
+            "resumed": { "type": "boolean" },
+            "durable_session": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "model_catalog": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["filter", "models", "count"],
+          "properties": {
+            "type": { "const": "model_catalog" },
+            "filter": { "type": "string" },
+            "models": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "count": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "turn_started": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["input"],
+          "properties": {
+            "type": { "const": "turn_started" },
+            "input": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "provider_request": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["round", "message_count", "tools_offered"],
+          "properties": {
+            "type": { "const": "provider_request" },
+            "round": { "type": "integer", "minimum": 1 },
+            "message_count": { "type": "integer", "minimum": 0 },
+            "tools_offered": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "provider_attempt": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": [
+            "round",
+            "attempt",
+            "max_attempts",
+            "category",
+            "status",
+            "outcome",
+            "terminal",
+            "retry_delay_ms",
+            "retry_after_used",
+            "remaining_deadline_ms"
+          ],
+          "properties": {
+            "type": { "const": "provider_attempt" },
+            "round": { "type": "integer", "minimum": 1 },
+            "attempt": { "type": "integer", "minimum": 1 },
+            "max_attempts": { "type": "integer", "minimum": 1 },
+            "category": {
+              "enum": [
+                "success",
+                "rate_limited",
+                "unavailable",
+                "authentication",
+                "client_error",
+                "server_error",
+                "unexpected_status",
+                "timeout",
+                "connection",
+                "cancelled"
+              ]
+            },
+            "status": {
+              "type": ["integer", "null"],
+              "minimum": 100,
+              "maximum": 599
+            },
+            "outcome": {
+              "enum": [
+                "response_accepted",
+                "retry_scheduled",
+                "rejected",
+                "transport_failed",
+                "deadline_exceeded",
+                "cancelled"
+              ]
+            },
+            "terminal": { "type": "boolean" },
+            "retry_delay_ms": { "type": ["integer", "null"], "minimum": 0 },
+            "retry_after_used": { "type": "boolean" },
+            "remaining_deadline_ms": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "usage": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["round", "prompt_tokens", "completion_tokens", "total_tokens"],
+          "properties": {
+            "type": { "const": "usage" },
+            "round": { "type": "integer", "minimum": 1 },
+            "prompt_tokens": { "type": "integer", "minimum": 0 },
+            "completion_tokens": { "type": "integer", "minimum": 0 },
+            "total_tokens": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "tool_started": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["round", "call_id", "name", "args"],
+          "properties": {
+            "type": { "const": "tool_started" },
+            "round": { "type": "integer", "minimum": 1 },
+            "call_id": { "type": "string" },
+            "name": { "type": "string" },
+            "args": { "type": "string" },
+            "command": { "$ref": "#/$defs/command_invocation" }
+          }
+        }
+      ]
+    },
+    "tool_finished": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["round", "call_id", "name", "success", "cancelled", "output"],
+          "properties": {
+            "type": { "const": "tool_finished" },
+            "round": { "type": "integer", "minimum": 1 },
+            "call_id": { "type": "string" },
+            "name": { "type": "string" },
+            "success": { "type": "boolean" },
+            "cancelled": { "type": "boolean" },
+            "output": { "type": "string" },
+            "command": { "$ref": "#/$defs/command_execution_result" }
+          }
+        }
+      ]
+    },
+    "assistant": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["text"],
+          "properties": {
+            "type": { "const": "assistant" },
+            "text": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "turn_finished": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": ["status"],
+          "properties": {
+            "type": { "const": "turn_finished" },
+            "status": { "enum": ["ok", "partial", "error", "cancelled"] },
+            "background_writes": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "command_started": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["line", "command"],
+          "properties": {
+            "type": { "const": "command_started" },
+            "line": { "type": "integer", "minimum": 1 },
+            "command": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "command_finished": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["line", "command", "status"],
+          "properties": {
+            "type": { "const": "command_finished" },
+            "line": { "type": "integer", "minimum": 1 },
+            "command": { "type": "string" },
+            "status": { "enum": ["ok", "error", "cancelled"] }
+          }
+        }
+      ]
+    },
+    "command_result": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["line", "command", "result"],
+          "properties": {
+            "type": { "const": "command_result" },
+            "line": { "type": "integer", "minimum": 1 },
+            "command": { "type": "string" },
+            "result": {
+              "type": "object",
+              "required": ["kind"]
+            }
+          }
+        }
+      ]
+    },
+    "error": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["kind", "message", "exit_code"],
+          "properties": {
+            "type": { "const": "error" },
+            "turn_id": { "type": "string" },
+            "line": { "type": "integer", "minimum": 1 },
+            "command": { "type": "string" },
+            "kind": { "type": "string" },
+            "message": { "type": "string" },
+            "exit_code": { "type": "integer" },
+            "tool_errors": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "final_summary": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "status",
+            "failures",
+            "provider_failures",
+            "user_failures",
+            "cancelled_failures"
+          ],
+          "properties": {
+            "type": { "const": "final_summary" },
+            "status": { "enum": ["ok", "partial", "error", "cancelled"] },
+            "failures": { "type": "integer", "minimum": 0 },
+            "provider_failures": { "type": "integer", "minimum": 0 },
+            "user_failures": { "type": "integer", "minimum": 0 },
+            "cancelled_failures": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "forward_compatible_event": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "properties": {
+            "type": {
+              "not": {
+                "enum": [
+                  "run_started",
+                  "model_catalog",
+                  "turn_started",
+                  "provider_request",
+                  "provider_attempt",
+                  "usage",
+                  "tool_started",
+                  "tool_finished",
+                  "assistant",
+                  "turn_finished",
+                  "command_started",
+                  "command_result",
+                  "command_finished",
+                  "error",
+                  "final_summary"
+                ]
+              }
+            }
+          }
+        }
+      ]
+    }
+  }
+}

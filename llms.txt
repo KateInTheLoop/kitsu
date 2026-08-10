@@ -6,14 +6,17 @@
 
 Kitsu is a Cargo workspace of five crates:
 
-- `kitsu` — `ask`, `models`, and `chat`; CLI/config resolution; slash commands;
-  sessions; JSONL automation; `@file`; project context; and background agents.
+- `kitsu` — `init`, `doctor`, `ask`, verified `review`, `models`, `sessions`, and
+  `chat`; slash commands; JSONL automation; `@file`; editable queues/steering;
+  project context; and bounded background-job control.
 - `kitsu-core` — the provider/tool agent loop, checked context preflight,
   offload/trim/summarize cascade, manual compaction, and compaction telemetry.
 - `kitsu-providers` — provider traits and the shared OpenAI-compatible client,
-  including streaming, retry deadlines, and model discovery/cache behavior.
+  including streaming, physical-attempt telemetry, retry deadlines, and model
+  discovery/cache behavior.
 - `kitsu-tools` — protected-path permissions, read/edit/write/search tools,
-  conflict-aware undo journals, and opt-in literal-argv developer commands.
+  verified diff/checkpoint journals, and opt-in literal-argv developer commands
+  with protected full-output artifacts.
 - `kitsu-render` — sanitized terminal output, plain/reduced-motion rendering,
   streaming, diffs, tool activity, and usage/context telemetry.
 
@@ -35,6 +38,8 @@ only when the complete rendered file fits within one quarter of that window.
 
 - [Cycle-2 UX audit](docs/chat-ux-cycle-2.md): reviewer findings, implemented
   outcomes, verification gates, and platform residuals.
+- [Cycle-3 UX audit](docs/chat-ux-cycle-3.md): ten-agent dogfood findings and
+  the accepted improvement scope.
 - [UI guidelines](docs/ui_guidelines.md): terminal UX conventions.
 - [Development stages](docs/context-management-stages.md): historical staged
   context-management plan.

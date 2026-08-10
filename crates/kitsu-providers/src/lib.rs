@@ -4,9 +4,13 @@
 pub mod auth;
 pub mod error;
 pub mod openai_compat;
+pub mod telemetry;
 pub mod types;
 
 pub use error::{AuthError, ExpiryStatus, ProviderError};
+pub use telemetry::{
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
+};
 pub use types::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
 };
@@ -26,6 +30,20 @@ pub trait Provider: Send + Sync {
         req: ChatRequest,
     ) -> impl std::future::Future<Output = Result<ChatStream, ProviderError>> + Send;
 
+    /// Start a chat request while reporting each physical transport attempt.
+    ///
+    /// The default preserves compatibility for providers without retry
+    /// instrumentation. Concrete adapters that retry internally should
+    /// override this method and emit one event for every actual network send.
+    fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> impl std::future::Future<Output = Result<ChatStream, ProviderError>> + Send {
+        let _ = telemetry;
+        self.chat_stream(req)
+    }
+
     fn list_models(
         &self,
     ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send;
@@ -42,6 +60,13 @@ impl<P: Provider> Provider for std::sync::Arc<P> {
         req: ChatRequest,
     ) -> impl std::future::Future<Output = Result<ChatStream, ProviderError>> + Send {
         (**self).chat_stream(req)
+    }
+    fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> impl std::future::Future<Output = Result<ChatStream, ProviderError>> + Send {
+        (**self).chat_stream_with_telemetry(req, telemetry)
     }
     fn list_models(
         &self,

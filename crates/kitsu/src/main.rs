@@ -3,6 +3,7 @@
 
 mod attachments;
 mod cli;
+mod command_artifact;
 mod config;
 mod llms;
 mod prompt_queue;
@@ -14,13 +15,13 @@ mod workspace;
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use clap::Parser;
 use rustyline::ExternalPrinter as _;
 
-use cli::{Cli, Command};
+use cli::{Cli, Command, SessionCommand};
 use config::{Config, ConfigError, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, CompactionMode};
@@ -42,6 +43,22 @@ static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
 const PROMPT_QUEUE_CAPACITY: usize = 8;
+const STEERING_CAPACITY: usize = 4;
+
+/// Human diagnostics are silent in JSONL automation mode. Errors that can no
+/// longer be framed because stdout itself failed use `std::eprintln!` directly.
+macro_rules! eprintln {
+    () => {
+        if !jsonl_requested() {
+            std::eprintln!();
+        }
+    };
+    ($($arg:tt)*) => {
+        if !jsonl_requested() {
+            std::eprintln!($($arg)*);
+        }
+    };
+}
 
 fn jsonl_requested() -> bool {
     std::env::args_os()
@@ -51,7 +68,7 @@ fn jsonl_requested() -> bool {
 }
 
 fn jsonl_run_id() -> &'static str {
-    static RUN_ID: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    static RUN_ID: OnceLock<String> = OnceLock::new();
     RUN_ID.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
@@ -61,37 +78,40 @@ fn jsonl_run_id() -> &'static str {
     })
 }
 
-fn emit_jsonl(kind: &str, payload: serde_json::Value) {
-    use std::io::Write;
-    let mut object = match payload {
-        serde_json::Value::Object(object) => object,
-        other => {
-            let mut object = serde_json::Map::new();
-            object.insert("value".to_string(), other);
-            object
-        }
-    };
-    object.insert(
-        "schema".to_string(),
-        serde_json::Value::String(JSONL_SCHEMA.to_string()),
-    );
-    object.insert(
-        "type".to_string(),
-        serde_json::Value::String(kind.to_string()),
-    );
-    object.insert(
-        "run_id".to_string(),
-        serde_json::Value::String(jsonl_run_id().to_string()),
-    );
-    let mut stdout = std::io::stdout().lock();
-    if serde_json::to_writer(&mut stdout, &object).is_ok() {
-        let _ = stdout.write_all(b"\n");
-        let _ = stdout.flush();
-    }
+fn jsonl_emitter() -> &'static Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::Stdout>> {
+    static EMITTER: OnceLock<Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::Stdout>>> =
+        OnceLock::new();
+    EMITTER.get_or_init(|| {
+        Mutex::new(kitsu_render::jsonl::JsonlEmitter::new(
+            std::io::stdout(),
+            JSONL_SCHEMA,
+            jsonl_run_id(),
+        ))
+    })
 }
 
-fn emit_jsonl_summary(status: &str, failures: usize, provider_failures: usize) {
-    JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
+fn emit_jsonl(kind: &str, payload: serde_json::Value) -> Result<(), CliError> {
+    jsonl_emitter()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .emit(kind, payload)
+        .map_err(CliError::jsonl_output)
+}
+
+fn jsonl_output_failure() -> Option<CliError> {
+    jsonl_emitter()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .failure()
+        .cloned()
+        .map(CliError::jsonl_output)
+}
+
+fn emit_jsonl_summary(
+    status: &str,
+    failures: usize,
+    provider_failures: usize,
+) -> Result<(), CliError> {
     let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
     emit_jsonl(
         "final_summary",
@@ -102,43 +122,73 @@ fn emit_jsonl_summary(status: &str, failures: usize, provider_failures: usize) {
             "user_failures": failures.saturating_sub(provider_failures + cancelled_failures),
             "cancelled_failures": cancelled_failures,
         }),
-    );
+    )?;
+    JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
+    Ok(())
 }
 
 fn main() {
+    let jsonl_mode = jsonl_requested();
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
+    // JSONL owns both output channels: stdout is framed events and routine
+    // diagnostics are suppressed so automation never has to scrape stderr.
+    let trace_writer = if jsonl_mode {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::sink)
+    } else {
+        tracing_subscriber::fmt::writer::BoxMakeWriter::new(std::io::stderr)
+    };
     let _ = tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::try_from_default_env()
                 .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("warn")),
         )
-        .with_writer(std::io::stderr)
+        .with_writer(trace_writer)
         .try_init();
 
     let code = match run() {
+        Ok(()) if jsonl_mode => jsonl_output_failure().map_or(0, |error| {
+            std::eprintln!("{error}");
+            error.exit_code()
+        }),
         Ok(()) => 0,
         Err(e) => {
-            if jsonl_requested() {
-                if !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire) {
+            if !jsonl_mode {
+                eprintln!("{e}");
+                e.exit_code()
+            } else {
+                if jsonl_output_failure().is_none()
+                    && !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire)
+                {
                     let cancelled = e.exit_code() == EXIT_CANCELLED;
-                    emit_jsonl(
+                    let frame_result = emit_jsonl(
                         "error",
                         serde_json::json!({
                             "kind": e.jsonl_kind(),
                             "message": e.to_string(),
                             "exit_code": e.exit_code(),
                         }),
-                    );
-                    emit_jsonl_summary(
-                        if cancelled { "cancelled" } else { "error" },
-                        1,
-                        usize::from(e.exit_code() == EXIT_PROVIDER),
-                    );
+                    )
+                    .and_then(|()| {
+                        emit_jsonl_summary(
+                            if cancelled { "cancelled" } else { "error" },
+                            1,
+                            usize::from(e.exit_code() == EXIT_PROVIDER),
+                        )
+                    });
+                    // `jsonl_output_failure` below reports the retained
+                    // terminal error exactly once when framing itself fails.
+                    let _ = frame_result;
                 }
-            } else {
-                eprintln!("{e}");
+                jsonl_output_failure().map_or_else(
+                    || e.exit_code(),
+                    |output_error| {
+                        // Framing is impossible after a terminal write/flush
+                        // failure, so this is the one JSONL-mode stderr diagnostic.
+                        std::eprintln!("{output_error}");
+                        output_error.exit_code()
+                    },
+                )
             }
-            e.exit_code()
         }
     };
     std::process::exit(code);
@@ -168,6 +218,10 @@ impl CliError {
             message: message.into(),
             code: EXIT_CANCELLED,
         }
+    }
+
+    fn jsonl_output(error: kitsu_render::jsonl::JsonlEmitError) -> Self {
+        Self::user(format!("JSONL output failed: {error}"))
     }
     fn exit_code(&self) -> i32 {
         self.code
@@ -206,24 +260,66 @@ fn run() -> Result<(), CliError> {
             _ => return Err(CliError::user(error.to_string())),
         },
     };
+    kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion);
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| CliError::user(format!("failed to start runtime: {e}")))?;
 
     match &cli.command {
+        Command::Init { path, json } => run_init(&cli, path.as_deref(), *json),
+        Command::Doctor { online, json } => runtime.block_on(run_doctor(&cli, *online, *json)),
         Command::Ask { prompt } => runtime.block_on(run_ask(&cli, prompt)),
+        Command::Review {
+            path,
+            staged,
+            unstaged,
+            base,
+            commit,
+            instructions,
+            resume,
+            session,
+        } => {
+            let scope = if *staged {
+                ReviewScope::Staged
+            } else if *unstaged {
+                ReviewScope::Unstaged
+            } else if let Some(revision) = base {
+                ReviewScope::Base(revision.clone())
+            } else if let Some(revision) = commit {
+                ReviewScope::Commit(revision.clone())
+            } else {
+                ReviewScope::Working
+            };
+            runtime.block_on(run_review(
+                &cli,
+                InitialReview {
+                    request: ReviewRequest {
+                        scope,
+                        path: path.clone(),
+                    },
+                    instructions: instructions.clone(),
+                },
+                resume.as_deref(),
+                *session,
+            ))
+        }
         Command::Models { filter } => {
             runtime.block_on(run_models(&cli, filter.as_deref().unwrap_or("")))
+        }
+        Command::Sessions { json, command } => {
+            runtime.block_on(run_sessions(&cli, *json, command.as_ref()))
         }
         Command::Chat {
             prompt,
             allow_paths,
             allow_write,
+            allow_read_write,
             enable_commands,
             command_roots,
             allow_commands,
             script,
             resume,
+            session,
             no_session,
             allow_turn_errors,
         } => runtime.block_on(run_chat(
@@ -232,13 +328,16 @@ fn run() -> Result<(), CliError> {
                 first_prompt: prompt.as_deref(),
                 allow_paths,
                 allow_write,
+                allow_read_write,
                 enable_commands: *enable_commands,
                 command_roots,
                 allow_commands,
                 script: script.as_deref(),
                 resume: resume.as_deref(),
+                persist_session: *session,
                 no_session: *no_session,
                 allow_turn_errors: *allow_turn_errors,
+                initial_review: None,
             },
         )),
     }
@@ -248,13 +347,1156 @@ struct ChatInvocation<'a> {
     first_prompt: Option<&'a str>,
     allow_paths: &'a [String],
     allow_write: &'a [String],
+    allow_read_write: &'a [String],
     enable_commands: bool,
     command_roots: &'a [String],
     allow_commands: &'a [String],
     script: Option<&'a str>,
     resume: Option<&'a str>,
+    persist_session: bool,
     no_session: bool,
     allow_turn_errors: bool,
+    initial_review: Option<InitialReview>,
+}
+
+#[derive(Clone)]
+struct InitialReview {
+    request: ReviewRequest,
+    instructions: Option<String>,
+}
+
+async fn run_review(
+    cli: &Cli,
+    review: InitialReview,
+    resume: Option<&str>,
+    persist_session: bool,
+) -> Result<(), CliError> {
+    let start = std::env::current_dir()
+        .map_err(|error| CliError::user(format!("cannot resolve review directory: {error}")))?;
+    let root = workspace::repository_root(&start).unwrap_or(start);
+    let allow_paths = vec![root.to_string_lossy().into_owned()];
+    run_chat(
+        cli,
+        ChatInvocation {
+            first_prompt: None,
+            allow_paths: &allow_paths,
+            allow_write: &[],
+            allow_read_write: &[],
+            enable_commands: false,
+            command_roots: &[],
+            allow_commands: &[],
+            script: None,
+            resume,
+            persist_session,
+            no_session: false,
+            allow_turn_errors: false,
+            initial_review: Some(review),
+        },
+    )
+    .await
+}
+
+const STARTER_CONFIG: &str = r#"# Kitsu starter configuration (contains no credentials).
+# Run kitsu doctor, then kitsu --config ./kitsu.toml chat.
+default_gateway = "ollama"
+
+[gateways.ollama]
+flavor = "ollama"
+base_url = "http://127.0.0.1:11434"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "qwen2.5-coder:7b"
+context_window = 32768
+auth = { method = "none" }
+"#;
+
+fn reject_jsonl_for_management(cli: &Cli, replacement: &str) -> Result<(), CliError> {
+    if cli.jsonl {
+        Err(CliError::user(format!(
+            "--jsonl is reserved for chat automation events; use {replacement} for this command"
+        )))
+    } else {
+        Ok(())
+    }
+}
+
+fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
+    use std::io::Write as _;
+    let mut stdout = std::io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)
+        .map_err(|error| CliError::user(format!("failed to encode JSON output: {error}")))?;
+    stdout
+        .write_all(b"\n")
+        .map_err(|error| CliError::user(format!("failed to write output: {error}")))?;
+    stdout
+        .flush()
+        .map_err(|error| CliError::user(format!("failed to flush output: {error}")))
+}
+
+fn run_init(cli: &Cli, requested: Option<&std::path::Path>, json: bool) -> Result<(), CliError> {
+    use std::io::Write as _;
+
+    reject_jsonl_for_management(cli, "kitsu init --json")?;
+    let destination = requested
+        .map(std::path::Path::to_path_buf)
+        .or_else(|| cli.config.as_deref().map(std::path::PathBuf::from))
+        .unwrap_or_else(|| std::path::PathBuf::from("kitsu.toml"));
+    if let Some(parent) = destination
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+    {
+        std::fs::create_dir_all(parent).map_err(|error| {
+            CliError::user(format!(
+                "cannot create config directory '{}': {error}",
+                parent.display()
+            ))
+        })?;
+    }
+
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(&destination).map_err(|error| {
+        let detail = if error.kind() == std::io::ErrorKind::AlreadyExists {
+            "already exists; refusing to overwrite it".to_string()
+        } else {
+            error.to_string()
+        };
+        CliError::user(format!(
+            "cannot initialize config '{}': {detail}",
+            destination.display()
+        ))
+    })?;
+    let write_result = file
+        .write_all(STARTER_CONFIG.as_bytes())
+        .and_then(|()| file.flush())
+        .and_then(|()| file.sync_all());
+    if let Err(error) = write_result {
+        drop(file);
+        let cleanup = std::fs::remove_file(&destination);
+        let cleanup_note = cleanup
+            .err()
+            .map(|cleanup| format!("; partial file cleanup also failed: {cleanup}"))
+            .unwrap_or_default();
+        return Err(CliError::user(format!(
+            "cannot write config '{}': {error}{cleanup_note}",
+            destination.display()
+        )));
+    }
+
+    if json {
+        print_json(&serde_json::json!({
+            "created": true,
+            "path": destination,
+            "contains_credentials": false,
+            "next": ["kitsu", "--config", destination, "doctor"],
+        }))
+    } else {
+        println!(
+            "created no-secret starter config at {}",
+            terminal_inline(&destination.to_string_lossy())
+        );
+        let next = format!(
+            "kitsu --config {} doctor",
+            shell_quote(&destination.to_string_lossy())
+        );
+        println!("next: {}", terminal_inline(&next));
+        Ok(())
+    }
+}
+
+fn shell_quote(value: &str) -> String {
+    #[cfg(unix)]
+    {
+        if !value.is_empty()
+            && value.bytes().all(|byte| {
+                byte.is_ascii_alphanumeric() || matches!(byte, b'/' | b'.' | b'_' | b'-' | b':')
+            })
+        {
+            value.to_string()
+        } else {
+            format!("'{}'", value.replace('\'', "'\\''"))
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        serde_json::to_string(value).unwrap_or_else(|_| "\"<path>\"".to_string())
+    }
+}
+
+fn resume_argv(config_path: &std::path::Path, id: &str) -> Vec<String> {
+    vec![
+        "kitsu".to_string(),
+        "--config".to_string(),
+        config_path.to_string_lossy().into_owned(),
+        "chat".to_string(),
+        "--resume".to_string(),
+        id.to_string(),
+    ]
+}
+
+fn display_argv(argv: &[String]) -> String {
+    argv.iter()
+        .map(|argument| shell_quote(argument))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn session_error(
+    operation: &str,
+    config_path: &std::path::Path,
+    error: impl std::fmt::Display,
+) -> CliError {
+    CliError::user(format!(
+        "cannot {operation} session in the namespace for config '{}': {error}",
+        config_path.display()
+    ))
+}
+
+fn require_session_namespace(
+    sessions_dir: &std::path::Path,
+    operation: &str,
+    config_path: &std::path::Path,
+) -> Result<(), CliError> {
+    match std::fs::symlink_metadata(sessions_dir) {
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Err(session_error(
+            operation,
+            config_path,
+            "no saved sessions in this config directory",
+        )),
+        // Let SessionStore produce its descriptor/file-type-specific error for
+        // permission failures, symlinks, and irregular existing entries.
+        Err(_) => Ok(()),
+    }
+}
+
+fn role_label(role: kitsu_providers::Role) -> &'static str {
+    match role {
+        kitsu_providers::Role::System => "system",
+        kitsu_providers::Role::User => "user",
+        kitsu_providers::Role::Assistant => "assistant",
+        kitsu_providers::Role::Tool => "tool",
+    }
+}
+
+fn format_saved_session(saved: &session::SavedSession) -> String {
+    const MAX_TRANSCRIPT_BYTES: usize = 64 * 1024;
+    let mut output = format!(
+        "session {}\nupdated: {}\ngateway/model: {}/{}\ndirectory: {}\nmessages: {}\n\n",
+        terminal_inline(&saved.id),
+        terminal_inline(&saved.updated_at),
+        terminal_inline(&saved.gateway),
+        terminal_inline(&saved.model),
+        shorten_home(std::path::Path::new(&saved.directory)),
+        saved.messages.len(),
+    );
+    let mut truncated = false;
+    for message in &saved.messages {
+        let content = kitsu_render::sanitize_terminal_text(&message.content);
+        let block = format!("[{}]\n{}\n\n", role_label(message.role), content);
+        let remaining = MAX_TRANSCRIPT_BYTES.saturating_sub(output.len());
+        if block.len() <= remaining {
+            output.push_str(&block);
+            continue;
+        }
+        let mut boundary = remaining.min(block.len());
+        while boundary > 0 && !block.is_char_boundary(boundary) {
+            boundary -= 1;
+        }
+        output.push_str(&block[..boundary]);
+        truncated = true;
+        break;
+    }
+    if truncated {
+        output.push_str(
+            "\n\n[transcript truncated at 64 KiB; use --json or export for the complete snapshot]\n",
+        );
+    }
+    output
+}
+
+async fn run_sessions(
+    cli: &Cli,
+    json: bool,
+    command: Option<&SessionCommand>,
+) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu sessions --json")?;
+    let config_path = Config::resolve_path(cli.config.as_deref());
+    let state_dir = runtime_state_dir_read_only(&config_path);
+    let sessions_dir = state_dir.join("sessions");
+
+    match command {
+        None | Some(SessionCommand::List) => {
+            let saved = session::SessionStore::list(&sessions_dir)
+                .map_err(|error| session_error("list", &config_path, error))?;
+            if json {
+                print_json(&saved)
+            } else if saved.is_empty() {
+                println!(
+                    "no saved sessions for config {}",
+                    shorten_home(&config_path)
+                );
+                Ok(())
+            } else {
+                println!("{}", format_session_summaries(&saved, None));
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Show { id }) => {
+            require_session_namespace(&sessions_dir, "show", &config_path)?;
+            let saved = session::SessionStore::load(&sessions_dir, id)
+                .map_err(|error| session_error("show", &config_path, error))?;
+            if json {
+                print_json(&saved)
+            } else {
+                print!("{}", format_saved_session(&saved));
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Resume { id }) => {
+            require_session_namespace(&sessions_dir, "resume", &config_path)?;
+            let saved = session::SessionStore::load(&sessions_dir, id)
+                .map_err(|error| session_error("resume", &config_path, error))?;
+            if json || !kitsu_render::stdin_is_tty() {
+                let argv = resume_argv(&config_path, &saved.id);
+                if json {
+                    print_json(&serde_json::json!({
+                        "action": "resume",
+                        "launched": false,
+                        "session_id": saved.id,
+                        "argv": argv,
+                    }))
+                } else {
+                    println!("resume with: {}", terminal_inline(&display_argv(&argv)));
+                    println!(
+                        "exact argv: {}",
+                        serde_json::to_string(&argv)
+                            .unwrap_or_else(|_| "[\"kitsu\", \"chat\"]".to_string())
+                    );
+                    Ok(())
+                }
+            } else {
+                run_chat(
+                    cli,
+                    ChatInvocation {
+                        first_prompt: None,
+                        allow_paths: &[],
+                        allow_write: &[],
+                        allow_read_write: &[],
+                        enable_commands: false,
+                        command_roots: &[],
+                        allow_commands: &[],
+                        script: None,
+                        resume: Some(&saved.id),
+                        persist_session: false,
+                        no_session: false,
+                        allow_turn_errors: false,
+                        initial_review: None,
+                    },
+                )
+                .await
+            }
+        }
+        Some(SessionCommand::Fork { id }) => {
+            require_session_namespace(&sessions_dir, "fork", &config_path)?;
+            let saved = session::SessionStore::fork(&sessions_dir, id)
+                .map_err(|error| session_error("fork", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({
+                    "action": "fork",
+                    "session": saved,
+                    "permissions_restored": false,
+                }))
+            } else {
+                println!(
+                    "forked session {} (permissions were not copied)",
+                    terminal_inline(&saved.id)
+                );
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Export {
+            id,
+            destination,
+            format,
+        }) => {
+            require_session_namespace(&sessions_dir, "export", &config_path)?;
+            let format = match format.as_str() {
+                "markdown" => session::SessionExportFormat::Markdown,
+                "json" => session::SessionExportFormat::Json,
+                _ => unreachable!("clap validates session export format"),
+            };
+            let output = session::SessionStore::export(&sessions_dir, id, destination, format)
+                .map_err(|error| session_error("export", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({"action": "export", "path": output}))
+            } else {
+                println!("exported session to {}", output.display());
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Archive { id }) => {
+            require_session_namespace(&sessions_dir, "archive", &config_path)?;
+            session::SessionStore::load(&sessions_dir, id)
+                .map_err(|error| session_error("archive", &config_path, error))?;
+            let output = session::SessionStore::archive(&sessions_dir, id, None)
+                .map_err(|error| session_error("archive", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({"action": "archive", "id": id, "path": output}))
+            } else {
+                println!("archived session {}", terminal_inline(id));
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Restore { id }) => {
+            require_session_namespace(&sessions_dir, "restore", &config_path)?;
+            let saved = session::SessionStore::restore_archived(&sessions_dir, id)
+                .map_err(|error| session_error("restore", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({"action": "restore", "session": saved}))
+            } else {
+                println!("restored session {}", terminal_inline(&saved.id));
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Delete { id }) => {
+            require_session_namespace(&sessions_dir, "delete", &config_path)?;
+            session::SessionStore::load(&sessions_dir, id)
+                .map_err(|error| session_error("delete", &config_path, error))?;
+            session::SessionStore::delete(&sessions_dir, id, None)
+                .map_err(|error| session_error("delete", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({"action": "delete", "id": id, "deleted": true}))
+            } else {
+                println!("deleted session {}", terminal_inline(id));
+                Ok(())
+            }
+        }
+    }
+}
+
+fn config_resolution_source(cli: &Cli) -> &'static str {
+    if cli.config.is_some() {
+        "--config"
+    } else if std::env::var_os("KITSU_CONFIG").is_some_and(|value| !value.is_empty()) {
+        "KITSU_CONFIG"
+    } else {
+        "default"
+    }
+}
+
+#[cfg(unix)]
+fn directory_is_writable(path: &std::path::Path) -> bool {
+    use std::os::unix::ffi::OsStrExt as _;
+    let Ok(path) = std::ffi::CString::new(path.as_os_str().as_bytes()) else {
+        return false;
+    };
+    unsafe { libc::access(path.as_ptr(), libc::W_OK | libc::X_OK) == 0 }
+}
+
+#[cfg(not(unix))]
+fn directory_is_writable(path: &std::path::Path) -> bool {
+    std::fs::metadata(path)
+        .map(|metadata| metadata.is_dir() && !metadata.permissions().readonly())
+        .unwrap_or(false)
+}
+
+fn runtime_state_diagnostic(path: &std::path::Path) -> serde_json::Value {
+    match std::fs::symlink_metadata(path) {
+        Ok(metadata) if metadata.file_type().is_symlink() => serde_json::json!({
+            "path": path,
+            "exists": true,
+            "writable": false,
+            "status": "unsafe: state path is a symlink",
+        }),
+        Ok(metadata) if !metadata.file_type().is_dir() => serde_json::json!({
+            "path": path,
+            "exists": true,
+            "writable": false,
+            "status": "unusable: state path is not a directory",
+        }),
+        Ok(_) => {
+            let writable = directory_is_writable(path);
+            serde_json::json!({
+                "path": path,
+                "exists": true,
+                "writable": writable,
+                "status": if writable { "writable" } else { "not writable" },
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            let mut ancestor = path.parent();
+            let mut nearest = None;
+            while let Some(candidate) = ancestor {
+                match std::fs::canonicalize(candidate) {
+                    Ok(existing) if existing.is_dir() => {
+                        nearest = Some(existing);
+                        break;
+                    }
+                    _ => ancestor = candidate.parent(),
+                }
+            }
+            let writable = nearest
+                .as_deref()
+                .map(directory_is_writable)
+                .unwrap_or(false);
+            serde_json::json!({
+                "path": path,
+                "exists": false,
+                "writable": writable,
+                "nearest_existing_ancestor": nearest,
+                "status": if writable {
+                    "not created; nearest parent is writable"
+                } else {
+                    "not created; nearest parent is not writable"
+                },
+            })
+        }
+        Err(error) => serde_json::json!({
+            "path": path,
+            "exists": false,
+            "writable": false,
+            "status": format!("cannot inspect state path: {}", error.kind()),
+        }),
+    }
+}
+
+fn safe_config_error(error: &ConfigError) -> String {
+    match error {
+        ConfigError::Parse { .. } => error.to_string(),
+        ConfigError::Read { source, .. } => {
+            format!("cannot read config: {}", source.kind())
+        }
+        other => other.to_string(),
+    }
+}
+
+#[derive(Clone, Copy)]
+enum ProviderOperation<'a> {
+    Chat { model: &'a str },
+    ModelCatalog,
+    Healthcheck,
+}
+
+impl ProviderOperation<'_> {
+    fn subject(self) -> &'static str {
+        match self {
+            Self::Chat { .. } => "chat request",
+            Self::ModelCatalog => "model catalog request",
+            Self::Healthcheck => "provider healthcheck",
+        }
+    }
+}
+
+fn safe_auth_refresh_hint(hint: Option<&str>) -> Option<String> {
+    let hint = terminal_inline(hint?).trim().to_string();
+    if hint.is_empty() {
+        return None;
+    }
+    let bounded: String = hint.chars().take(240).collect();
+    if refresh_hint_contains_credential(&bounded) {
+        return None;
+    }
+    Some(bounded)
+}
+
+/// Refresh hints are configuration-controlled prose, but are routinely copied
+/// from credential setup snippets. Reject the entire hint if it resembles a
+/// URL, header, assignment, or common hosted-provider token. Keeping a partial
+/// redaction would still disclose useful credential fragments.
+fn refresh_hint_contains_credential(hint: &str) -> bool {
+    let lowered = hint.to_ascii_lowercase();
+    if [
+        "://",
+        "api_key",
+        "api-key",
+        "api key",
+        "apikey",
+        "authorization",
+        "bearer ",
+        "password",
+        "secret",
+        "access_token",
+        "access-token",
+        "access token",
+    ]
+    .iter()
+    .any(|marker| lowered.contains(marker))
+        || hint.contains("hf_")
+        || hint.contains("sk-")
+    {
+        return true;
+    }
+
+    // Reject a standalone `token` label followed by a value separator. A
+    // hyphenated command such as `refresh-token` remains safe and actionable,
+    // as do environment-variable names such as `HF_TOKEN`.
+    for (start, _) in lowered.match_indices("token") {
+        let before = lowered[..start].chars().next_back();
+        if before.is_some_and(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '_' | '-')) {
+            continue;
+        }
+        let after = &lowered[start + "token".len()..];
+        let mut chars = after.chars();
+        match chars.next() {
+            Some('=' | ':' | '"' | '\'' | '_' | '-') => return true,
+            Some(ch) if ch.is_ascii_whitespace() => {
+                if chars.any(|ch| !ch.is_ascii_whitespace()) {
+                    return true;
+                }
+            }
+            _ => {}
+        }
+    }
+    false
+}
+
+fn auth_refresh_hint_suffix(hint: Option<&str>) -> String {
+    safe_auth_refresh_hint(hint)
+        .map(|hint| format!("; configured refresh hint: {hint}"))
+        .unwrap_or_default()
+}
+
+fn expired_auth_warning(since: &str, hint: Option<&str>) -> String {
+    format!(
+        "warning: gateway token expired (since {}) - sending anyway{}",
+        terminal_inline(since),
+        auth_refresh_hint_suffix(hint)
+    )
+}
+
+/// One bounded formatter for every provider-facing surface. Provider-supplied
+/// URL/body/detail strings are never interpolated; configured refresh hints are
+/// accepted only when bounded and free of URL/credential-like markers.
+fn safe_provider_error_message(
+    error: &ProviderError,
+    operation: ProviderOperation<'_>,
+    timeout_secs: Option<u64>,
+) -> String {
+    let subject = operation.subject();
+    match error {
+        ProviderError::Connection(_) => format!(
+            "{subject} could not reach the gateway - check the selected gateway's base_url, network access, and provider availability; run `kitsu doctor --online`"
+        ),
+        ProviderError::Timeout => match timeout_secs {
+            Some(timeout_secs) => format!(
+                "{subject} timed out after {timeout_secs}s - raise the budget with --timeout-secs <n> (e.g. --timeout-secs {}) for a slow, queued, or tool-heavy request",
+                timeout_secs.saturating_mul(3).max(180)
+            ),
+            None => format!(
+                "{subject} timed out - retry with a larger --timeout-secs budget if the gateway is slow or queued"
+            ),
+        },
+        ProviderError::InvalidResponse(_) => format!(
+            "{subject} received an invalid provider response - verify the gateway flavor and API compatibility"
+        ),
+        ProviderError::Unauthorized { status, hint } => {
+            format!(
+                "{subject} authentication/access was rejected (HTTP {status}) - refresh the configured credential and confirm model access{}",
+                auth_refresh_hint_suffix(hint.as_deref())
+            )
+        }
+        ProviderError::Http { status: 402, .. } => format!(
+            "{subject} was rejected for billing or quota (HTTP 402) - check provider credits and billing settings"
+        ),
+        ProviderError::Http { status: 403, .. } => format!(
+            "{subject} was forbidden (HTTP 403) - confirm the credential has inference and gated-model access"
+        ),
+        ProviderError::Http { status: 404, .. } => match operation {
+            ProviderOperation::Chat { model } => format!(
+                "gateway rejected the chat route or model '{}' (HTTP 404) - verify the catalog with `kitsu models` or /models, run /model <valid-id>, and check the configured chat_path",
+                terminal_inline(model)
+            ),
+            ProviderOperation::ModelCatalog => {
+                "model catalog endpoint was not found (HTTP 404) - check models_path or disable catalog discovery".to_string()
+            }
+            ProviderOperation::Healthcheck => {
+                "provider healthcheck endpoint was not found (HTTP 404) - check the selected gateway paths".to_string()
+            }
+        },
+        ProviderError::Http { status: 429, .. } => format!(
+            "{subject} remained rate-limited after retries (HTTP 429) - wait for quota to recover or increase --timeout-secs so Retry-After can fit"
+        ),
+        ProviderError::Http { status, .. } if *status >= 500 => format!(
+            "{subject} failed because the gateway is unavailable (HTTP {status}) - retry later or check provider status"
+        ),
+        ProviderError::Http { status, .. } if *status == 400 || *status == 422 => format!(
+            "{subject} was rejected (HTTP {status}) - verify the selected model, gateway flavor, and request compatibility"
+        ),
+        ProviderError::Http { status, .. } => format!(
+            "{subject} was rejected (HTTP {status}) - check gateway configuration and model access"
+        ),
+        ProviderError::ToolsNotSupported => format!(
+            "{subject} requires tool calls that this provider does not support - disable tools or choose a tool-capable model"
+        ),
+        ProviderError::Auth(kitsu_providers::AuthError::Missing { env, hint }) => {
+            format!(
+                "credential variable ${} is missing - set it or update the gateway auth configuration{}",
+                terminal_inline(env),
+                auth_refresh_hint_suffix(hint.as_deref())
+            )
+        }
+        ProviderError::Auth(kitsu_providers::AuthError::MissingStatic) => {
+            "static credential is missing - configure it or select a different auth method"
+                .to_string()
+        }
+        ProviderError::Auth(kitsu_providers::AuthError::Malformed { env }) => {
+            format!(
+                "credential variable ${} is malformed - replace it with a valid token",
+                terminal_inline(env)
+            )
+        }
+    }
+}
+
+fn safe_provider_diagnostic(error: &ProviderError) -> String {
+    safe_provider_error_message(error, ProviderOperation::Healthcheck, None)
+}
+
+/// Integration hook for human-mode provider telemetry. The runtime event log
+/// can call this beside its JSONL serializer; the result contains only bounded
+/// enums, numeric status/timing fields, and no provider-controlled text.
+fn format_provider_attempt_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
+    let kitsu_core::AgentRuntimeEvent::ProviderAttempt {
+        attempt,
+        max_attempts,
+        category,
+        status,
+        outcome,
+        terminal,
+        retry_delay_ms,
+        retry_after_used,
+        remaining_deadline_ms,
+        ..
+    } = event
+    else {
+        return None;
+    };
+    let category = match category {
+        kitsu_providers::ProviderAttemptCategory::Success => "success",
+        kitsu_providers::ProviderAttemptCategory::RateLimited => "rate limited",
+        kitsu_providers::ProviderAttemptCategory::Unavailable => "unavailable",
+        kitsu_providers::ProviderAttemptCategory::Authentication => "authentication",
+        kitsu_providers::ProviderAttemptCategory::ClientError => "client error",
+        kitsu_providers::ProviderAttemptCategory::ServerError => "server error",
+        kitsu_providers::ProviderAttemptCategory::UnexpectedStatus => "unexpected status",
+        kitsu_providers::ProviderAttemptCategory::Timeout => "timeout",
+        kitsu_providers::ProviderAttemptCategory::Connection => "connection",
+        kitsu_providers::ProviderAttemptCategory::Cancelled => "cancelled",
+    };
+    let outcome = match outcome {
+        kitsu_providers::ProviderAttemptOutcome::ResponseAccepted => "response accepted",
+        kitsu_providers::ProviderAttemptOutcome::RetryScheduled => "retry scheduled",
+        kitsu_providers::ProviderAttemptOutcome::Rejected => "request rejected",
+        kitsu_providers::ProviderAttemptOutcome::TransportFailed => "transport failed",
+        kitsu_providers::ProviderAttemptOutcome::DeadlineExceeded => "deadline exhausted",
+        kitsu_providers::ProviderAttemptOutcome::Cancelled => "cancelled",
+    };
+    let status = status
+        .map(|status| format!("; HTTP {status}"))
+        .unwrap_or_default();
+    let retry = retry_delay_ms
+        .map(|delay| {
+            format!(
+                "; retry in {delay}ms{}",
+                if *retry_after_used {
+                    " (Retry-After)"
+                } else {
+                    ""
+                }
+            )
+        })
+        .unwrap_or_default();
+    Some(format!(
+        "provider attempt {attempt}/{max_attempts}: {category}{status}; {outcome}; terminal={terminal}{retry}; {remaining_deadline_ms}ms deadline remaining"
+    ))
+}
+
+fn doctor_value<'a>(report: &'a serde_json::Value, pointer: &str) -> &'a str {
+    report
+        .pointer(pointer)
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("unavailable")
+}
+
+fn doctor_text(report: &serde_json::Value, pointer: &str) -> String {
+    terminal_inline(doctor_value(report, pointer))
+}
+
+fn print_doctor_human(report: &serde_json::Value) {
+    let config_mark = if report
+        .pointer("/config/parse_ok")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "ok"
+    } else {
+        "FAIL"
+    };
+    println!("kitsu {}", doctor_text(report, "/version"));
+    println!(
+        "[{config_mark}] config ({}) {} — {}",
+        doctor_text(report, "/config/source"),
+        doctor_text(report, "/config/path_display"),
+        doctor_text(report, "/config/status"),
+    );
+    println!(
+        "[info] gateway/model: {}/{}",
+        doctor_text(report, "/gateway/name"),
+        doctor_text(report, "/gateway/model"),
+    );
+    println!("[info] auth: {}", doctor_text(report, "/auth/status"),);
+    println!(
+        "[info] context window: {} tokens ({})",
+        report
+            .pointer("/context/window")
+            .and_then(serde_json::Value::as_u64)
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "unavailable".to_string()),
+        doctor_text(report, "/context/source"),
+    );
+    println!(
+        "[info] project context: {}",
+        doctor_text(report, "/project_context/status"),
+    );
+    let state_mark = if report
+        .pointer("/runtime_state/writable")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        "ok"
+    } else {
+        "WARN"
+    };
+    println!(
+        "[{state_mark}] runtime state: {} — {}",
+        doctor_text(report, "/runtime_state/path_display"),
+        doctor_text(report, "/runtime_state/status"),
+    );
+    println!(
+        "[info] provider check: {}",
+        doctor_text(report, "/online/status"),
+    );
+    println!(
+        "[info] tools: filesystem={} commands={}",
+        doctor_text(report, "/tool_policy/filesystem"),
+        doctor_text(report, "/tool_policy/commands"),
+    );
+    let issues = report
+        .pointer("/blocking_issues")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or(&[]);
+    if issues.is_empty() {
+        println!("doctor: no blocking issues found");
+    } else {
+        println!("doctor: {} blocking issue(s)", issues.len());
+        for issue in issues {
+            if let Some(issue) = issue.as_str() {
+                println!("  - {}", terminal_inline(issue));
+            }
+        }
+    }
+}
+
+async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu doctor --json")?;
+    let config_path = Config::resolve_path(cli.config.as_deref());
+    let config_exists = std::fs::symlink_metadata(&config_path).is_ok();
+    let config_is_file = config_path.is_file();
+    let state_dir = runtime_state_dir_read_only(&config_path);
+    let mut runtime_state = runtime_state_diagnostic(&state_dir);
+    if let Some(object) = runtime_state.as_object_mut() {
+        object.insert(
+            "path_display".to_string(),
+            serde_json::Value::String(shorten_home(&state_dir)),
+        );
+    }
+    let mut issues = Vec::<String>::new();
+    let mut gateway_report = serde_json::json!({
+        "name": "unavailable",
+        "model": "unavailable",
+        "flavor": "unavailable",
+        "endpoint": "unavailable",
+    });
+    let mut auth_report = serde_json::json!({
+        "method": "unavailable",
+        "credential_present": false,
+        "status": "unavailable until config and gateway are valid",
+    });
+    let cache_path = context_window_cache_path(&state_dir);
+    let mut context_report = serde_json::json!({
+        "window": DEFAULT_CONTEXT_WINDOW,
+        "source": "conservative default",
+        "cache_path": cache_path,
+    });
+    let project_source = std::env::current_dir()
+        .ok()
+        .and_then(|directory| llms::discover(&directory, None));
+    let project_report = if project_context_disabled(cli) {
+        serde_json::json!({"enabled": false, "status": "disabled by flag or environment"})
+    } else if let Some(source) = project_source {
+        serde_json::json!({
+            "enabled": true,
+            "status": format!("will load {}", shorten_home(&source)),
+            "source": source,
+        })
+    } else {
+        serde_json::json!({"enabled": true, "status": "no llms.txt, AGENTS.md, or CLAUDE.md found"})
+    };
+    let mut online_report = serde_json::json!({
+        "requested": online,
+        "status": if online { "not run" } else { "not requested (offline default)" },
+    });
+
+    let config = if !config_exists {
+        issues.push(format!(
+            "config does not exist at {} (run kitsu init)",
+            config_path.display()
+        ));
+        None
+    } else if !config_is_file {
+        issues.push(format!(
+            "config path {} is not a readable file",
+            config_path.display()
+        ));
+        None
+    } else {
+        match Config::load(&config_path) {
+            Ok(config) => Some(config),
+            Err(error) => {
+                issues.push(safe_config_error(&error));
+                None
+            }
+        }
+    };
+    let parse_ok = config.is_some();
+    let config_status = if !config_exists {
+        "missing"
+    } else if parse_ok {
+        "parsed successfully"
+    } else {
+        "parse/read failed"
+    };
+
+    if let Some(config) = config.as_ref() {
+        match config.select_gateway(cli.gateway.as_deref()) {
+            Ok((gateway_name, gateway)) => {
+                let flavor_ok = match gateway.validate_flavor() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        issues.push(error.to_string());
+                        false
+                    }
+                };
+                let model = match gateway.resolve_model(cli.model.as_deref()) {
+                    Ok(model) => Some(model),
+                    Err(error) => {
+                        issues.push(error.to_string());
+                        None
+                    }
+                };
+                gateway_report = serde_json::json!({
+                    "name": gateway_name,
+                    "model": model.as_deref().unwrap_or("unavailable"),
+                    "flavor": gateway.flavor,
+                    "flavor_valid": flavor_ok,
+                    "endpoint": redact_endpoint(&format!("{}{}", gateway.base_url, gateway.chat_path)),
+                    "models_path_configured": gateway.models_path.as_deref().is_some_and(|path| !path.is_empty()),
+                });
+
+                let auth_valid = match gateway.validate_auth() {
+                    Ok(()) => true,
+                    Err(error) => {
+                        issues.push(error.to_string());
+                        false
+                    }
+                };
+                let (credential_present, auth_status) = match gateway.auth.method.as_str() {
+                    "none" => (true, "no credential required".to_string()),
+                    "bearer-env" => {
+                        let present = std::env::var_os(&gateway.auth.env)
+                            .is_some_and(|value| !value.is_empty());
+                        if auth_valid && !present {
+                            issues
+                                .push(format!("auth variable {} is not present", gateway.auth.env));
+                        }
+                        (
+                            present,
+                            format!(
+                                "bearer variable {} is {}",
+                                gateway.auth.env,
+                                if present { "present" } else { "missing" }
+                            ),
+                        )
+                    }
+                    "static" => {
+                        let present = gateway
+                            .auth
+                            .token
+                            .as_deref()
+                            .is_some_and(|token| !token.trim().is_empty());
+                        (
+                            present,
+                            if present {
+                                "static credential is configured (value hidden)".to_string()
+                            } else {
+                                "static credential is missing".to_string()
+                            },
+                        )
+                    }
+                    other => (false, format!("unsupported auth method {other}")),
+                };
+                auth_report = serde_json::json!({
+                    "method": gateway.auth.method,
+                    "env": if gateway.auth.method == "bearer-env" {
+                        Some(gateway.auth.env.as_str())
+                    } else {
+                        None
+                    },
+                    "credential_present": credential_present,
+                    "valid": auth_valid,
+                    "status": auth_status,
+                });
+
+                if let Some(model) = model.as_deref() {
+                    let (window, source) = if let Some(window) = cli.context_window {
+                        (window, "--context-window")
+                    } else if let Some(window) = gateway.context_window {
+                        (window, "gateway profile")
+                    } else {
+                        let key = context_window_cache_key(
+                            &gateway.base_url,
+                            gateway.models_path.as_deref(),
+                            model,
+                        );
+                        match read_cached_context_window(&cache_path, &key) {
+                            Some(window) => (window, "fresh discovery cache"),
+                            None => (DEFAULT_CONTEXT_WINDOW, "conservative default"),
+                        }
+                    };
+                    context_report = serde_json::json!({
+                        "window": window,
+                        "source": source,
+                        "cache_path": cache_path,
+                    });
+                }
+
+                if online {
+                    let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
+                    if models_path.is_none() {
+                        online_report = serde_json::json!({
+                            "requested": true,
+                            "status": "skipped: no models_path is configured for a safe read-only probe",
+                        });
+                    } else if !flavor_ok || !auth_valid || !credential_present {
+                        online_report = serde_json::json!({
+                            "requested": true,
+                            "status": "skipped: fix gateway/auth diagnostics first",
+                        });
+                    } else {
+                        let auth = build_auth(gateway)
+                            .map_err(|error| CliError::user(safe_config_error(&error)))?;
+                        let provider = OpenAICompatProvider::new(
+                            OpenAICompatConfig {
+                                base_url: gateway.base_url.clone(),
+                                chat_path: gateway.chat_path.clone(),
+                                models_path,
+                                retries: 0,
+                                timeout: Duration::from_secs(cli.timeout_secs),
+                            },
+                            auth,
+                        )
+                        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
+                        match await_cancellable(provider.list_models()).await {
+                            Some(Ok(Some(models))) => {
+                                online_report = serde_json::json!({
+                                    "requested": true,
+                                    "status": "reachable",
+                                    "models": models.len(),
+                                });
+                            }
+                            Some(Ok(None)) => {
+                                online_report = serde_json::json!({
+                                    "requested": true,
+                                    "status": "skipped: provider has no model catalog",
+                                });
+                            }
+                            Some(Err(error)) => {
+                                let safe = safe_provider_diagnostic(&error);
+                                issues.push(format!("online provider check failed: {safe}"));
+                                online_report = serde_json::json!({
+                                    "requested": true,
+                                    "status": safe,
+                                });
+                            }
+                            None => {
+                                return Err(CliError::cancelled(
+                                    "doctor provider check cancelled by Ctrl+C",
+                                ));
+                            }
+                        }
+                    }
+                }
+            }
+            Err(error) => issues.push(error.to_string()),
+        }
+    }
+
+    let filesystem_policy = if cli.dangerously_allow_all_filesystem {
+        "DANGER: global non-protected filesystem bypass when tools are enabled"
+    } else if cli.yes {
+        "non-prompting and confined to explicit/current roots when tools are enabled"
+    } else {
+        "interactive chat prompts; automation is deny-by-default unless roots are granted"
+    };
+    let report = serde_json::json!({
+        "version": cli::LONG_VERSION,
+        "read_only": true,
+        "config": {
+            "source": config_resolution_source(cli),
+            "path": config_path,
+            "path_display": shorten_home(&config_path),
+            "exists": config_exists,
+            "regular_file": config_is_file,
+            "parse_ok": parse_ok,
+            "status": config_status,
+        },
+        "gateway": gateway_report,
+        "auth": auth_report,
+        "context": context_report,
+        "project_context": project_report,
+        "runtime_state": runtime_state,
+        "online": online_report,
+        "tool_policy": {
+            "filesystem": filesystem_policy,
+            "commands": "disabled unless explicitly enabled; command roots restrict cwd and are not a sandbox",
+            "scripted_tools": "not registered unless a filesystem capability or command policy is explicit",
+        },
+        "blocking_issues": issues,
+    });
+    if json {
+        print_json(&report)?;
+    } else {
+        print_doctor_human(&report);
+    }
+    let failures = report
+        .pointer("/blocking_issues")
+        .and_then(serde_json::Value::as_array)
+        .map(Vec::len)
+        .unwrap_or(0);
+    if failures == 0 {
+        Ok(())
+    } else {
+        Err(CliError::user(format!(
+            "doctor found {failures} blocking issue(s)"
+        )))
+    }
 }
 
 /// Provider + model + auth resolved from config and CLI flags. Shared by the
@@ -282,6 +1524,202 @@ struct ChatSetup {
     /// "any value discovered from `/v1/models`" (see the flag's doc comment) —
     /// `/model` must not silently replace it with fresh auto-discovery.
     context_window_pinned: bool,
+    /// Human-readable, secret-free provenance for the effective context
+    /// window. The background cold-cache probe updates only its discovery
+    /// state; the conservative current-run budget remains unchanged.
+    context_window_provenance: Arc<std::sync::Mutex<ContextWindowProvenance>>,
+    context_window_refresh: ContextWindowRefreshConfig,
+}
+
+#[derive(Clone)]
+struct ContextWindowRefreshConfig {
+    cache_path: std::path::PathBuf,
+    base_url: String,
+    models_path: Option<String>,
+}
+
+impl ContextWindowRefreshConfig {
+    fn cache_key(&self, model: &str) -> String {
+        context_window_cache_key(&self.base_url, self.models_path.as_deref(), model)
+    }
+
+    fn enabled(&self) -> bool {
+        self.models_path.is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextWindowSource {
+    Cli,
+    Profile,
+    DiskCache,
+    LiveDiscovery,
+    ConservativeDefault,
+}
+
+impl ContextWindowSource {
+    fn label(&self) -> &'static str {
+        match self {
+            Self::Cli => "CLI --context-window",
+            Self::Profile => "gateway profile context_window",
+            Self::DiskCache => "disk cache",
+            Self::LiveDiscovery => "live model discovery",
+            Self::ConservativeDefault => "conservative default",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextWindowCacheState {
+    NotConsulted,
+    Miss,
+    Unreadable,
+    WriteFailed,
+    Fresh { age_secs: u64, ttl_secs: u64 },
+    Stale { age_secs: u64, ttl_secs: u64 },
+}
+
+impl ContextWindowCacheState {
+    fn label(&self) -> String {
+        match self {
+            Self::NotConsulted => "not consulted".to_string(),
+            Self::Miss => "cold (no entry)".to_string(),
+            Self::Unreadable => "cold (cache unreadable or invalid)".to_string(),
+            Self::WriteFailed => "cache write failed".to_string(),
+            Self::Fresh { age_secs, ttl_secs } => format!(
+                "fresh (age {}; TTL {})",
+                compact_duration(*age_secs),
+                compact_duration(*ttl_secs)
+            ),
+            Self::Stale { age_secs, ttl_secs } => format!(
+                "stale (age {}; TTL {})",
+                compact_duration(*age_secs),
+                compact_duration(*ttl_secs)
+            ),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ContextWindowDiscoveryState {
+    NotNeeded,
+    Disabled,
+    Pending,
+    ReadyForNextRun { window: u64 },
+    CompleteButNotCached { window: u64 },
+    FinishedWithoutMetadata,
+    LiveComplete,
+}
+
+impl ContextWindowDiscoveryState {
+    fn label(&self) -> String {
+        match self {
+            Self::NotNeeded => "not needed".to_string(),
+            Self::Disabled => "disabled (models_path is not configured)".to_string(),
+            Self::Pending => {
+                "in progress (current run keeps the default; result applies next run)".to_string()
+            }
+            Self::ReadyForNextRun { window } => format!(
+                "complete ({window} tokens cached for the next run; current run keeps the default)"
+            ),
+            Self::CompleteButNotCached { window } => format!(
+                "complete ({window} tokens discovered, but the private cache write failed; current run keeps the default)"
+            ),
+            Self::FinishedWithoutMetadata => {
+                "finished without usable metadata (or the advisory request failed)".to_string()
+            }
+            Self::LiveComplete => "complete for the current model".to_string(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ContextWindowProvenance {
+    source: ContextWindowSource,
+    cache: ContextWindowCacheState,
+    discovery: ContextWindowDiscoveryState,
+}
+
+impl ContextWindowProvenance {
+    fn pinned(source: ContextWindowSource) -> Self {
+        Self {
+            source,
+            cache: ContextWindowCacheState::NotConsulted,
+            discovery: ContextWindowDiscoveryState::NotNeeded,
+        }
+    }
+
+    fn cached(age_secs: u64) -> Self {
+        Self {
+            source: ContextWindowSource::DiskCache,
+            cache: ContextWindowCacheState::Fresh {
+                age_secs,
+                ttl_secs: CONTEXT_WINDOW_CACHE_TTL_SECS,
+            },
+            discovery: ContextWindowDiscoveryState::NotNeeded,
+        }
+    }
+
+    fn defaulted(cache: ContextWindowCacheState, discovery: ContextWindowDiscoveryState) -> Self {
+        Self {
+            source: ContextWindowSource::ConservativeDefault,
+            cache,
+            discovery,
+        }
+    }
+
+    fn live_discovery(window: Option<u64>) -> Self {
+        match window {
+            Some(_) => Self {
+                source: ContextWindowSource::LiveDiscovery,
+                cache: ContextWindowCacheState::NotConsulted,
+                discovery: ContextWindowDiscoveryState::LiveComplete,
+            },
+            None => Self::defaulted(
+                ContextWindowCacheState::NotConsulted,
+                ContextWindowDiscoveryState::FinishedWithoutMetadata,
+            ),
+        }
+    }
+
+    fn refreshed(cache_written: bool) -> Self {
+        Self {
+            source: ContextWindowSource::LiveDiscovery,
+            cache: if cache_written {
+                ContextWindowCacheState::Fresh {
+                    age_secs: 0,
+                    ttl_secs: CONTEXT_WINDOW_CACHE_TTL_SECS,
+                }
+            } else {
+                ContextWindowCacheState::WriteFailed
+            },
+            discovery: ContextWindowDiscoveryState::LiveComplete,
+        }
+    }
+}
+
+fn compact_duration(seconds: u64) -> String {
+    if seconds < 60 {
+        format!("{seconds}s")
+    } else if seconds < 60 * 60 {
+        format!("{}m", seconds / 60)
+    } else if seconds < 24 * 60 * 60 {
+        let hours = seconds / (60 * 60);
+        let minutes = (seconds % (60 * 60)) / 60;
+        if minutes == 0 {
+            format!("{hours}h")
+        } else {
+            format!("{hours}h {minutes}m")
+        }
+    } else {
+        let days = seconds / (24 * 60 * 60);
+        let hours = (seconds % (24 * 60 * 60)) / (60 * 60);
+        if hours == 0 {
+            format!("{days}d")
+        } else {
+            format!("{days}d {hours}h")
+        }
+    }
 }
 
 fn project_context_disabled(cli: &Cli) -> bool {
@@ -326,7 +1764,16 @@ fn register_base_tools(
         builtins::register_fs_tools(tools, perms.clone());
     }
     if can_write {
-        builtins::register_write_tools_with_journal(tools, perms.clone(), journal.clone());
+        let (descriptor, handler) =
+            builtins::fs::write_file_tool_with_journal(perms.clone(), Some(journal.clone()));
+        tools.register_with_descriptor(descriptor, handler);
+    }
+    // Exact-text edits necessarily inspect existing content. Do not advertise
+    // that read-modify-write primitive for a genuinely write-only invocation.
+    if can_read && can_write {
+        let (descriptor, handler) =
+            builtins::fs::edit_file_tool_with_journal(perms.clone(), Some(journal.clone()));
+        tools.register_with_descriptor(descriptor, handler);
     }
     if !skillset.is_empty() {
         let (d, h) = skills::skill_tool(skillset.clone());
@@ -379,12 +1826,83 @@ fn build_agent_config(
     }
 }
 
-/// Removes the per-session offload scratch dir (and its files) when the chat
-/// session ends, so we don't leak temp dirs into `/tmp`.
+/// Removes a stateless run's offload namespace (and every session generation
+/// beneath it) when the chat ends, so we don't leak temp dirs into `/tmp`.
 struct OffloadDirGuard(std::path::PathBuf);
 impl Drop for OffloadDirGuard {
     fn drop(&mut self) {
         let _ = std::fs::remove_dir_all(&self.0);
+    }
+}
+
+/// Allocates a destination that has never carried artifact authority in this
+/// process. Session sidecars remain durable, but every `/new` and `/resume`
+/// receives a fresh child so resetting runtime grants cannot be undone by
+/// granting the same directory again.
+#[derive(Debug, Default)]
+struct ArtifactDirectoryAllocator {
+    next_generation: u64,
+}
+
+impl ArtifactDirectoryAllocator {
+    fn allocate(&mut self, base: &std::path::Path) -> Result<std::path::PathBuf, String> {
+        std::fs::create_dir_all(base).map_err(|error| {
+            format!(
+                "cannot create artifact namespace {}: {error}",
+                base.display()
+            )
+        })?;
+        let metadata = std::fs::symlink_metadata(base).map_err(|error| {
+            format!(
+                "cannot inspect artifact namespace {}: {error}",
+                base.display()
+            )
+        })?;
+        if metadata.file_type().is_symlink() || !metadata.file_type().is_dir() {
+            return Err(format!(
+                "artifact namespace '{}' is not a regular directory",
+                base.display()
+            ));
+        }
+
+        for _ in 0..256 {
+            let generation = self.next_generation;
+            self.next_generation = self
+                .next_generation
+                .checked_add(1)
+                .ok_or_else(|| "artifact generation counter exhausted".to_string())?;
+            let directory = base.join(format!("runtime-{}-{generation}", jsonl_run_id()));
+            match std::fs::create_dir(&directory) {
+                Ok(()) => {
+                    #[cfg(unix)]
+                    {
+                        use std::os::unix::fs::PermissionsExt as _;
+                        if let Err(error) = std::fs::set_permissions(
+                            &directory,
+                            std::fs::Permissions::from_mode(0o700),
+                        ) {
+                            let _ = std::fs::remove_dir(&directory);
+                            return Err(format!(
+                                "cannot secure artifact directory {}: {error}",
+                                directory.display()
+                            ));
+                        }
+                    }
+                    return Ok(directory);
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
+                Err(error) => {
+                    return Err(format!(
+                        "cannot create artifact directory {}: {error}",
+                        directory.display()
+                    ));
+                }
+            }
+        }
+        Err(format!(
+            "cannot allocate a fresh artifact directory under {}",
+            base.display()
+        ))
     }
 }
 
@@ -411,12 +1929,17 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "agents",
         args: "[id]",
-        description: "list background agents or show one result",
+        description: "backward-compatible alias for /jobs",
     },
     SlashCommandSpec {
         name: "allow",
         args: "<path>",
         description: "grant read access for this session",
+    },
+    SlashCommandSpec {
+        name: "allow-read-write",
+        args: "<path>",
+        description: "grant read and write access for this session",
     },
     SlashCommandSpec {
         name: "allow-write",
@@ -427,6 +1950,16 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "archive",
         args: "<id>",
         description: "archive an inactive saved conversation",
+    },
+    SlashCommandSpec {
+        name: "checkpoint",
+        args: "<id>",
+        description: "preview one recoverable verified file checkpoint",
+    },
+    SlashCommandSpec {
+        name: "checkpoints",
+        args: "",
+        description: "list recoverable verified file checkpoints",
     },
     SlashCommandSpec {
         name: "clear",
@@ -440,8 +1973,8 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "context",
-        args: "",
-        description: "show detailed context utilization",
+        args: "[refresh]",
+        description: "show context utilization or refresh discovered window metadata",
     },
     SlashCommandSpec {
         name: "delete",
@@ -450,13 +1983,13 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "diff",
-        args: "[path]",
-        description: "show the verified Git and filesystem diff",
+        args: "[scope] [path]",
+        description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
     },
     SlashCommandSpec {
         name: "exit",
-        args: "",
-        description: "exit chat (alias for /quit)",
+        args: "[wait|cancel]",
+        description: "exit chat with an explicit background-job policy",
     },
     SlashCommandSpec {
         name: "export",
@@ -472,6 +2005,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "help",
         args: "",
         description: "show command help",
+    },
+    SlashCommandSpec {
+        name: "jobs",
+        args: "[list|show <id>|stop <id>|stop-all|prune <id|all>]",
+        description: "inspect and control background jobs",
     },
     SlashCommandSpec {
         name: "model",
@@ -495,13 +2033,13 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "queue",
-        args: "[prompt]",
-        description: "show the prompt queue or append a prompt",
+        args: "[list|add|remove|edit|move|promote|clear]",
+        description: "inspect or edit the bounded prompt queue",
     },
     SlashCommandSpec {
         name: "quit",
-        args: "",
-        description: "exit chat",
+        args: "[wait|cancel]",
+        description: "exit, wait for jobs, or cancel and join them",
     },
     SlashCommandSpec {
         name: "restore",
@@ -520,8 +2058,23 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "review",
-        args: "[path]",
-        description: "ask the model to review the verified diff",
+        args: "[scope] [path]",
+        description: "review a verified working/staged/unstaged/base/commit/checkpoint diff",
+    },
+    SlashCommandSpec {
+        name: "revoke-command",
+        args: "<number>",
+        description: "revoke a numbered exact command grant",
+    },
+    SlashCommandSpec {
+        name: "revoke-read",
+        args: "<exact-root>",
+        description: "revoke an exact read root for this session",
+    },
+    SlashCommandSpec {
+        name: "revoke-write",
+        args: "<exact-root>",
+        description: "revoke an exact write root for this session",
     },
     SlashCommandSpec {
         name: "save",
@@ -549,14 +2102,19 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show model, context, tools, and session state",
     },
     SlashCommandSpec {
+        name: "steer",
+        args: "<correction>",
+        description: "redirect the active response and restart that turn",
+    },
+    SlashCommandSpec {
         name: "tools",
         args: "",
         description: "show enabled tools and effective access",
     },
     SlashCommandSpec {
         name: "undo",
-        args: "",
-        description: "undo the latest conflict-free model file changes",
+        args: "[id]",
+        description: "undo the latest or selected conflict-free file checkpoint",
     },
 ];
 
@@ -688,9 +2246,22 @@ struct SessionInfo {
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
+    command_policy: Option<Arc<kitsu_tools::CommandPolicy>>,
+    invocation_command_grants: Vec<kitsu_tools::CommandGrantInfo>,
     window: Rc<Cell<Option<u64>>>,
+    window_provenance: Arc<std::sync::Mutex<ContextWindowProvenance>>,
+    window_refresh: ContextWindowRefreshConfig,
     max_tokens: Option<u32>,
     provenance: RefCell<Vec<CtxEntry>>,
+}
+
+fn context_window_provenance(
+    provenance: &Arc<std::sync::Mutex<ContextWindowProvenance>>,
+) -> ContextWindowProvenance {
+    provenance
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .clone()
 }
 
 fn persist_session(
@@ -714,6 +2285,21 @@ fn persist_session(
         false
     } else {
         true
+    }
+}
+
+fn persist_session_required(
+    store: &Option<session::SessionStore>,
+    session: &SessionInfo,
+    model: &str,
+    messages: &[ChatMessage],
+) -> Result<(), CliError> {
+    if persist_session(store, session, model, messages) {
+        Ok(())
+    } else {
+        Err(CliError::user(
+            "session autosave failed; refusing to report durable automation success",
+        ))
     }
 }
 
@@ -742,6 +2328,55 @@ fn activate_offload_dir(
     }
     *state.borrow_mut() = desired;
     Ok(())
+}
+
+fn artifact_directory_for_boundary(
+    allocator: &mut ArtifactDirectoryAllocator,
+    enabled: bool,
+    store: Option<&session::SessionStore>,
+    stateless_base: &std::path::Path,
+) -> Result<Option<std::path::PathBuf>, String> {
+    if !enabled {
+        return Ok(None);
+    }
+    let base = store
+        .map(session::SessionStore::artifacts_dir)
+        .unwrap_or_else(|| stateless_base.to_path_buf());
+    allocator.allocate(&base).map(Some)
+}
+
+fn rotate_artifact_storage<F>(
+    perms: &Permissions,
+    state: &Rc<RefCell<Option<std::path::PathBuf>>>,
+    command_sink: Option<&command_artifact::CommandArtifactSink>,
+    destination: F,
+) -> Result<(), String>
+where
+    F: FnOnce() -> Result<Option<std::path::PathBuf>, String>,
+{
+    // Revoke the host writer's old destination before allocating or validating
+    // the replacement. The caller resets runtime filesystem grants first; this
+    // ordering ensures an allocation failure leaves neither authority stale.
+    *state.borrow_mut() = None;
+    if let Some(sink) = command_sink {
+        sink.set_directory(None);
+    }
+    let desired = destination()?;
+    activate_offload_dir(perms, state, desired)?;
+    if let Some(sink) = command_sink {
+        sink.set_directory(state.borrow().clone());
+    }
+    Ok(())
+}
+
+fn dangerous_bypass_revocation_error(mode: Mode, access: &str) -> Option<String> {
+    (mode == Mode::AutoAllow).then(|| {
+        format!(
+            "cannot revoke {access} roots while --dangerously-allow-all-filesystem is active: \
+             the global bypass would still authorize every non-protected path; restart without \
+             the dangerous flag to use scoped revocation"
+        )
+    })
 }
 
 fn reset_command_session(
@@ -809,29 +2444,270 @@ fn same_directory(saved: &str, current: &std::path::Path) -> bool {
     }
 }
 
-async fn authorized_workspace_diff(
+const REVIEW_SCOPE_USAGE: &str =
+    "[working|staged|unstaged|base <revision>|commit <revision>|checkpoint <id>] [path]";
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum ReviewScope {
+    Working,
+    Staged,
+    Unstaged,
+    Base(String),
+    Commit(String),
+    Checkpoint(u64),
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReviewRequest {
+    scope: ReviewScope,
+    /// Exact literal path as entered after the scope. A path without an
+    /// explicit scope remains the backwards-compatible working-tree form.
+    path: Option<String>,
+}
+
+fn split_review_argument(input: &str) -> (&str, &str) {
+    let mut parts = input.trim().splitn(2, char::is_whitespace);
+    let head = parts.next().unwrap_or("");
+    let tail = parts.next().unwrap_or("").trim();
+    (head, tail)
+}
+
+fn review_path(input: &str) -> Option<String> {
+    (!input.is_empty()).then(|| input.to_string())
+}
+
+fn parse_review_request(input: &str) -> Result<ReviewRequest, String> {
+    let input = input.trim();
+    let (head, tail) = split_review_argument(input);
+    let request = match head {
+        "" => ReviewRequest {
+            scope: ReviewScope::Working,
+            path: None,
+        },
+        "working" => ReviewRequest {
+            scope: ReviewScope::Working,
+            path: review_path(tail),
+        },
+        "staged" => ReviewRequest {
+            scope: ReviewScope::Staged,
+            path: review_path(tail),
+        },
+        "unstaged" => ReviewRequest {
+            scope: ReviewScope::Unstaged,
+            path: review_path(tail),
+        },
+        "base" | "commit" | "checkpoint" => {
+            let (value, path) = split_review_argument(tail);
+            if value.is_empty() {
+                return Err(format!(
+                    "missing value after '{head}'; expected {REVIEW_SCOPE_USAGE}"
+                ));
+            }
+            let scope = match head {
+                "base" => ReviewScope::Base(value.to_string()),
+                "commit" => ReviewScope::Commit(value.to_string()),
+                "checkpoint" => ReviewScope::Checkpoint(parse_checkpoint_id(value)?),
+                _ => unreachable!("matched review scope"),
+            };
+            ReviewRequest {
+                scope,
+                path: review_path(path),
+            }
+        }
+        // Preserve `/diff path` and `/review path`: only documented scope
+        // keywords change the interpretation of the first argument.
+        _ => ReviewRequest {
+            scope: ReviewScope::Working,
+            path: Some(input.to_string()),
+        },
+    };
+    Ok(request)
+}
+
+fn parse_checkpoint_id(input: &str) -> Result<u64, String> {
+    let id = input
+        .parse::<u64>()
+        .map_err(|_| "invalid checkpoint id; expected a positive integer".to_string())?;
+    if id == 0 {
+        Err("invalid checkpoint id; expected a positive integer".to_string())
+    } else {
+        Ok(id)
+    }
+}
+
+fn parse_exact_checkpoint_id(input: &str) -> Result<u64, String> {
+    let (id, extra) = split_review_argument(input);
+    if id.is_empty() || !extra.is_empty() {
+        return Err("expected exactly one checkpoint id".to_string());
+    }
+    parse_checkpoint_id(id)
+}
+
+fn parse_optional_checkpoint_id(input: &str) -> Result<Option<u64>, String> {
+    if input.trim().is_empty() {
+        Ok(None)
+    } else {
+        parse_exact_checkpoint_id(input).map(Some)
+    }
+}
+
+fn private_workspace_paths(session: &SessionInfo) -> Vec<std::path::PathBuf> {
+    let mut paths = vec![session.config_path.clone(), session.state_dir.clone()];
+    if let Some(path) = session.offload_dir.borrow().clone() {
+        paths.push(path);
+    }
+    paths.sort_unstable();
+    paths.dedup();
+    paths
+}
+
+fn path_identities(path: &std::path::Path) -> Vec<std::path::PathBuf> {
+    let mut identities = vec![path.to_path_buf()];
+    if let Ok(canonical) = std::fs::canonicalize(path) {
+        if !identities.contains(&canonical) {
+            identities.push(canonical);
+        }
+    }
+    identities
+}
+
+fn path_is_within(path: &std::path::Path, directory: &std::path::Path) -> bool {
+    let paths = path_identities(path);
+    let directories = path_identities(directory);
+    paths.iter().any(|path| {
+        directories
+            .iter()
+            .any(|directory| path == directory || path.starts_with(directory))
+    })
+}
+
+fn checkpoint_change_matches_path(
+    root: &std::path::Path,
+    path: &std::path::Path,
+    pathspec: Option<&str>,
+) -> bool {
+    let Some(pathspec) = pathspec.filter(|pathspec| *pathspec != ".") else {
+        return true;
+    };
+    path_identities(path).iter().any(|path| {
+        path.strip_prefix(root).is_ok_and(|relative| {
+            relative == std::path::Path::new(pathspec)
+                || relative.starts_with(std::path::Path::new(pathspec))
+        })
+    })
+}
+
+fn review_target_label(evidence: &workspace::ReviewEvidence) -> String {
+    let mut label = format!("target {}", terminal_inline(&evidence.target));
+    if let Some(revision) = &evidence.resolved_revision {
+        label.push_str(&format!(", resolved {}", terminal_inline(revision)));
+    }
+    if let Some(merge_base) = &evidence.merge_base {
+        label.push_str(&format!(", merge base {}", terminal_inline(merge_base)));
+    }
+    if evidence.truncated {
+        label.push_str(", truncated");
+    }
+    label
+}
+
+fn review_evidence_is_empty(evidence: &workspace::ReviewEvidence) -> bool {
+    matches!(
+        evidence.diff.as_str(),
+        "(working tree clean)"
+            | "(no staged changes)"
+            | "(no unstaged or untracked changes)"
+            | "(no changes from merge base)"
+            | "(commit has no changes for this path)"
+            | "(checkpoint has no reviewable changes)"
+    )
+}
+
+fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
+    format!(
+        "Review the following host-verified diff evidence ({scope}). Focus on correctness, security, regressions, and missing tests. Report findings by severity with file/line references. Do not claim anything outside this exact evidence. This is a review-only turn with no tools.\n\n```diff\n{diff}\n```",
+        scope = review_target_label(evidence),
+        diff = evidence.diff,
+    )
+}
+
+async fn authorized_workspace_review(
     session: &SessionInfo,
     perms: &Permissions,
-    arg: &str,
-) -> Result<String, String> {
-    let root = workspace::repository_root(&session.directory)?;
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    request: ReviewRequest,
+) -> Result<workspace::ReviewEvidence, String> {
+    let private_paths = private_workspace_paths(session);
+    let (root, target) = match request.scope {
+        ReviewScope::Checkpoint(id) => {
+            let root = workspace::repository_root(&session.directory).unwrap_or_else(|_| {
+                std::fs::canonicalize(&session.directory)
+                    .unwrap_or_else(|_| session.directory.clone())
+            });
+            let report = journal.checkpoint_preview(id).ok_or_else(|| {
+                format!("checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints")
+            })?;
+            let pathspec = workspace::pathspec_from_directory(
+                &root,
+                &session.directory,
+                request.path.as_deref().unwrap_or(""),
+            )?;
+            for change in &report.changes {
+                if private_paths
+                    .iter()
+                    .any(|private| path_is_within(&change.path, private))
+                    || !checkpoint_change_matches_path(&root, &change.path, pathspec.as_deref())
+                {
+                    continue;
+                }
+                perms.check_read(&change.path).await.map_err(|error| {
+                    format!(
+                        "read permission required for checkpoint path {}: {error}",
+                        change.path.display()
+                    )
+                })?;
+            }
+            return workspace::review_evidence_excluding(
+                &root,
+                workspace::ReviewTarget::Checkpoint(report),
+                pathspec.as_deref(),
+                &private_paths,
+            );
+        }
+        ReviewScope::Working => (
+            workspace::repository_root(&session.directory)?,
+            workspace::ReviewTarget::WorkingTree,
+        ),
+        ReviewScope::Staged => (
+            workspace::repository_root(&session.directory)?,
+            workspace::ReviewTarget::Staged,
+        ),
+        ReviewScope::Unstaged => (
+            workspace::repository_root(&session.directory)?,
+            workspace::ReviewTarget::Unstaged,
+        ),
+        ReviewScope::Base(revision) => (
+            workspace::repository_root(&session.directory)?,
+            workspace::ReviewTarget::Base(revision),
+        ),
+        ReviewScope::Commit(revision) => (
+            workspace::repository_root(&session.directory)?,
+            workspace::ReviewTarget::Commit(revision),
+        ),
+    };
     let root = perms
         .check_read(&root)
         .await
         .map_err(|error| format!("read permission required for {}: {error}", root.display()))?;
-    let pathspec = workspace::pathspec_from_directory(&root, &session.directory, arg)?;
-    if [&session.config_path, &session.state_dir]
-        .iter()
-        .filter_map(|path| std::fs::canonicalize(path).ok())
-        .any(|path| path.starts_with(&root))
-    {
+    let pathspec = workspace::pathspec_from_directory(
+        &root,
+        &session.directory,
+        request.path.as_deref().unwrap_or(""),
+    )?;
+    if private_paths.iter().any(|path| path_is_within(path, &root)) {
         eprintln!("~ active Kitsu config/private state omitted from workspace evidence");
     }
-    workspace::diff_excluding(
-        &root,
-        pathspec.as_deref(),
-        &[session.config_path.clone(), session.state_dir.clone()],
-    )
+    workspace::review_evidence_excluding(&root, target, pathspec.as_deref(), &private_paths)
 }
 
 fn format_sessions(dir: &std::path::Path, current: Option<&str>) -> Result<String, String> {
@@ -873,7 +2749,14 @@ fn format_session_summaries(sessions: &[session::SessionSummary], current: Optio
 fn permission_mode_label(mode: Mode) -> (&'static str, &'static str) {
     match mode {
         Mode::Ask => ("ask", "prompt for unlisted paths"),
-        Mode::AutoAllow => ("auto-allow", "allow unlisted paths"),
+        Mode::Scoped => (
+            "scoped",
+            "non-prompting; reject paths outside current roots",
+        ),
+        Mode::AutoAllow => (
+            "DANGER: global filesystem bypass",
+            "allow every non-protected path without prompting",
+        ),
         Mode::Deny => ("deny", "reject unlisted paths"),
     }
 }
@@ -936,6 +2819,10 @@ fn format_session_status(
     } else {
         format!("{window} default")
     };
+    let window_provenance = context_window_provenance(&session.window_provenance);
+    let window_source = window_provenance.source.label();
+    let window_cache = window_provenance.cache.label();
+    let window_discovery = window_provenance.discovery.label();
     let session_id = terminal_inline(
         &session
             .session_id
@@ -979,7 +2866,7 @@ fn format_session_status(
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
         crate::cli::LONG_VERSION,
         gateway,
         shorten_home(&session.directory),
@@ -1005,21 +2892,39 @@ fn format_session_status(
 
 fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
     let (mode, behavior) = permission_mode_label(perms.mode());
-    let read_roots = perms.read_roots();
-    let write_roots = perms.write_roots();
+    let base_reads = perms.base_read_roots();
+    let base_writes = perms.base_write_roots();
+    let invocation_reads = perms.active_base_read_roots();
+    let invocation_writes = perms.active_base_write_roots();
+    let runtime_reads = perms.runtime_read_roots();
+    let runtime_writes = perms.runtime_write_roots();
     let mut out = format!("permissions:\n  mode         {mode} ({behavior})\n  read roots");
-    if read_roots.is_empty() {
+    if invocation_reads.is_empty() && runtime_reads.is_empty() {
         out.push_str("   none\n");
     } else {
         out.push('\n');
-        for root in read_roots {
-            let offload_dir = session.offload_dir.borrow();
-            let internal = offload_dir.as_deref().is_some_and(|path| root == path);
+        for root in &invocation_reads {
             out.push_str(&format!(
-                "    - {}{}\n",
-                shorten_home(&root),
-                if internal {
-                    " (internal session artifacts)"
+                "    - {} (invocation/base{})\n",
+                shorten_home(root),
+                if root == &session.directory {
+                    ", launch-directory read"
+                } else {
+                    ""
+                }
+            ));
+        }
+        for root in &runtime_reads {
+            let managed_artifact = session
+                .offload_dir
+                .borrow()
+                .as_deref()
+                .is_some_and(|path| path == root);
+            out.push_str(&format!(
+                "    - {} (session/runtime{})\n",
+                shorten_home(root),
+                if managed_artifact {
+                    ", Kitsu-managed artifacts"
                 } else {
                     ""
                 }
@@ -1027,15 +2932,45 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
         }
     }
     out.push_str("  write roots");
-    if write_roots.is_empty() {
+    if invocation_writes.is_empty() && runtime_writes.is_empty() {
         out.push_str("  none");
     } else {
         out.push('\n');
-        for (index, root) in write_roots.iter().enumerate() {
-            out.push_str(&format!("    - {}", shorten_home(root)));
-            if index + 1 < write_roots.len() {
-                out.push('\n');
-            }
+        for root in &invocation_writes {
+            out.push_str(&format!("    - {} (invocation/base)\n", shorten_home(root)));
+        }
+        for root in &runtime_writes {
+            out.push_str(&format!("    - {} (session/runtime)\n", shorten_home(root)));
+        }
+        out.pop();
+    }
+    let revoked_reads: Vec<_> = base_reads
+        .iter()
+        .filter(|root| !invocation_reads.contains(root))
+        .collect();
+    let revoked_writes: Vec<_> = base_writes
+        .iter()
+        .filter(|root| !invocation_writes.contains(root))
+        .collect();
+    out.push_str("\n  revoked invocation roots");
+    if revoked_reads.is_empty() && revoked_writes.is_empty() {
+        out.push_str(" none");
+    } else {
+        for root in revoked_reads {
+            out.push_str(&format!("\n    - {} (read)", shorten_home(root)));
+        }
+        for root in revoked_writes {
+            out.push_str(&format!("\n    - {} (write)", shorten_home(root)));
+        }
+        out.push_str("\n    reset/new session restores invocation roots");
+    }
+    let protected_reads = perms.protected_read_roots();
+    out.push_str("\n  protected reads");
+    if protected_reads.is_empty() {
+        out.push_str(" none");
+    } else {
+        for root in protected_reads {
+            out.push_str(&format!("\n    - {} (Kitsu-private)", shorten_home(&root)));
         }
     }
     let internal_reads = perms.internal_read_roots();
@@ -1059,10 +2994,52 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
     out.push_str("\n  commands     ");
     if let Some(mode) = session.command_mode {
         out.push_str(&format!(
-            "{mode}; separate exact argv/cwd approval; --yes has no effect"
+            "{mode}; separate exact argv/cwd approval; filesystem flags have no effect"
         ));
+        out.push_str(
+            "\n    cwd roots restrict only where a process starts; they are NOT host filesystem, network, or process sandboxes",
+        );
         for root in &session.command_roots {
             out.push_str(&format!("\n    - {}", shorten_home(root)));
+        }
+        let grants = session
+            .command_policy
+            .as_ref()
+            .map(|policy| policy.session_grants())
+            .unwrap_or_default();
+        out.push_str("\n    exact session grants");
+        if grants.is_empty() {
+            out.push_str(" none");
+        } else {
+            for (index, grant) in grants.iter().enumerate() {
+                let provenance = if session.invocation_command_grants.contains(grant) {
+                    "invocation/base"
+                } else {
+                    "session/runtime"
+                };
+                out.push_str(&format!(
+                    "\n      [{}] {} (cwd {}; {provenance})",
+                    index + 1,
+                    terminal_inline(&grant.display_argv()),
+                    shorten_home(&grant.cwd),
+                ));
+            }
+            out.push_str("\n      revoke with /revoke-command <number>");
+        }
+        let revoked_invocation = session
+            .invocation_command_grants
+            .iter()
+            .filter(|grant| !grants.contains(grant))
+            .collect::<Vec<_>>();
+        if !revoked_invocation.is_empty() {
+            out.push_str("\n    revoked invocation command grants");
+            for grant in revoked_invocation {
+                out.push_str(&format!(
+                    "\n      - {} (cwd {}; reset/new session restores it)",
+                    terminal_inline(&grant.display_argv()),
+                    shorten_home(&grant.cwd),
+                ));
+            }
         }
     } else {
         out.push_str("disabled (enable explicitly with --enable-commands)");
@@ -1113,6 +3090,16 @@ fn render_context_command(
         estimated
     };
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
+    let window_provenance = context_window_provenance(&session.window_provenance);
+    eprintln!(
+        "context window source: {}",
+        window_provenance.source.label()
+    );
+    eprintln!("context window cache: {}", window_provenance.cache.label());
+    eprintln!(
+        "context window discovery: {}",
+        window_provenance.discovery.label()
+    );
     let ledger = &state.compaction_ledger;
     if ledger.total_compactions > 0 {
         eprintln!(
@@ -1141,6 +3128,74 @@ fn render_context_command(
     } else {
         eprintln!("compaction: none yet; run /compact to compact eligible older exchanges");
     }
+}
+
+fn context_command_payload(
+    model: &str,
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) -> serde_json::Value {
+    let breakdown = ContextMeter::new().breakdown(messages);
+    let reported_window = session.window.get();
+    let window = reported_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let budget = ContextBudget::new(window, session.max_tokens);
+    let provenance = session.provenance.borrow();
+    let provenance_tokens: u64 = provenance.iter().map(|entry| entry.tokens).sum();
+    let estimated = provenance_tokens
+        .saturating_add(breakdown.user)
+        .saturating_add(breakdown.assistant)
+        .saturating_add(breakdown.tool_results);
+    let used = if state.meter.anchored(messages) {
+        state.meter.estimate(messages)
+    } else {
+        estimated
+    };
+    let window_provenance = context_window_provenance(&session.window_provenance);
+    let ledger = &state.compaction_ledger;
+    let last_compaction = ledger.last().map(|last| {
+        serde_json::json!({
+            "reason": format!("{:?}", last.reason),
+            "outcome": format!("{:?}", last.outcome),
+            "tokens_before": last.tokens_before,
+            "tokens_after": last.tokens_after,
+            "fallback_reason": last.fallback_reason.map(|reason| format!("{reason:?}")),
+        })
+    });
+    serde_json::json!({
+        "kind": "context",
+        "model": model,
+        "window": window,
+        "window_reported": reported_window.is_some(),
+        "effective_budget": budget.effective,
+        "used": used,
+        "remaining": budget.effective.saturating_sub(used),
+        "source": window_provenance.source.label(),
+        "cache": window_provenance.cache.label(),
+        "discovery": window_provenance.discovery.label(),
+        "roles": {
+            "user": breakdown.user,
+            "assistant": breakdown.assistant,
+            "tool_results": breakdown.tool_results,
+        },
+        "sources": provenance.iter().map(|entry| serde_json::json!({
+            "label": entry.label,
+            "tokens": entry.tokens,
+            "policy": entry.policy,
+            "why": entry.why,
+        })).collect::<Vec<_>>(),
+        "compaction": {
+            "total": ledger.total_compactions,
+            "manual": ledger.manual_compactions,
+            "automatic": ledger.automatic_compactions,
+            "summaries": ledger.summaries,
+            "trims": ledger.trims,
+            "tokens_saved": ledger.tokens_saved,
+            "exchanges_removed": ledger.exchanges_removed,
+            "tool_results_elided": ledger.tool_results_elided,
+            "last": last_compaction,
+        },
+    })
 }
 
 /// How long a discovered context window is trusted before re-discovering. A
@@ -1215,6 +3270,33 @@ fn legacy_profile_dir(base: &std::path::Path, config_path: &std::path::Path) -> 
     config_path.hash(&mut hasher);
     base.join("profiles")
         .join(format!("{:016x}", hasher.finish()))
+}
+
+/// Resolve a config-scoped state namespace without creating, renaming, or
+/// otherwise migrating anything. Provider-free inspection and doctor use this
+/// so merely looking at state remains read-only.
+fn runtime_state_dir_read_only(config_path: &std::path::Path) -> std::path::PathBuf {
+    let base = runtime_state_base();
+    let config = std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    let default_config = base.join("config.toml");
+    let default_config = std::fs::canonicalize(&default_config).unwrap_or(default_config);
+    if config == default_config {
+        return base;
+    }
+
+    let stable = base.join("profiles").join(stable_profile_key(&config));
+    if std::fs::symlink_metadata(&stable).is_ok() {
+        return stable;
+    }
+    let legacy = legacy_profile_dir(&base, &config);
+    let legacy_is_safe_dir = std::fs::symlink_metadata(&legacy)
+        .map(|metadata| metadata.file_type().is_dir() && !metadata.file_type().is_symlink())
+        .unwrap_or(false);
+    if legacy_is_safe_dir {
+        legacy
+    } else {
+        stable
+    }
 }
 
 fn runtime_state_dir(config_path: &std::path::Path) -> std::path::PathBuf {
@@ -1322,14 +3404,79 @@ fn redact_endpoint(endpoint: &str) -> String {
     terminal_inline(&display)
 }
 
-fn read_cached_context_window(path: &std::path::Path, key: &str) -> Option<u64> {
-    let text = std::fs::read_to_string(path).ok()?;
-    let cache: ContextWindowCache = serde_json::from_str(&text).ok()?;
-    let (window, fetched_at) = cache.entries.get(key)?;
-    (unix_now().saturating_sub(*fetched_at) < CONTEXT_WINDOW_CACHE_TTL_SECS).then_some(*window)
+struct CachedContextWindow {
+    window: Option<u64>,
+    state: ContextWindowCacheState,
 }
 
-fn write_cached_context_window(path: &std::path::Path, key: &str, window: u64) {
+fn inspect_cached_context_window_at(
+    path: &std::path::Path,
+    key: &str,
+    now: u64,
+) -> CachedContextWindow {
+    let text = match std::fs::read_to_string(path) {
+        Ok(text) => text,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return CachedContextWindow {
+                window: None,
+                state: ContextWindowCacheState::Miss,
+            };
+        }
+        Err(_) => {
+            return CachedContextWindow {
+                window: None,
+                state: ContextWindowCacheState::Unreadable,
+            };
+        }
+    };
+    let cache: ContextWindowCache = match serde_json::from_str(&text) {
+        Ok(cache) => cache,
+        Err(_) => {
+            return CachedContextWindow {
+                window: None,
+                state: ContextWindowCacheState::Unreadable,
+            };
+        }
+    };
+    let Some((window, fetched_at)) = cache.entries.get(key) else {
+        return CachedContextWindow {
+            window: None,
+            state: ContextWindowCacheState::Miss,
+        };
+    };
+    let age_secs = now.saturating_sub(*fetched_at);
+    if age_secs < CONTEXT_WINDOW_CACHE_TTL_SECS {
+        CachedContextWindow {
+            window: Some(*window),
+            state: ContextWindowCacheState::Fresh {
+                age_secs,
+                ttl_secs: CONTEXT_WINDOW_CACHE_TTL_SECS,
+            },
+        }
+    } else {
+        CachedContextWindow {
+            window: None,
+            state: ContextWindowCacheState::Stale {
+                age_secs,
+                ttl_secs: CONTEXT_WINDOW_CACHE_TTL_SECS,
+            },
+        }
+    }
+}
+
+fn inspect_cached_context_window(path: &std::path::Path, key: &str) -> CachedContextWindow {
+    inspect_cached_context_window_at(path, key, unix_now())
+}
+
+fn read_cached_context_window(path: &std::path::Path, key: &str) -> Option<u64> {
+    inspect_cached_context_window(path, key).window
+}
+
+fn write_cached_context_window(
+    path: &std::path::Path,
+    key: &str,
+    window: u64,
+) -> std::io::Result<()> {
     use std::io::Write;
     let mut cache: ContextWindowCache = std::fs::read_to_string(path)
         .ok()
@@ -1339,24 +3486,48 @@ fn write_cached_context_window(path: &std::path::Path, key: &str, window: u64) {
     cache.entries.retain(|key, _| key.starts_with("v2-fnv128-"));
     cache.entries.insert(key.to_string(), (window, unix_now()));
     if let Some(parent) = path.parent() {
-        let _ = std::fs::create_dir_all(parent);
+        std::fs::create_dir_all(parent)?;
     }
-    if let Ok(json) = serde_json::to_string(&cache) {
-        let mut options = std::fs::OpenOptions::new();
-        options.write(true).create(true).truncate(true);
-        #[cfg(unix)]
-        {
-            use std::os::unix::fs::OpenOptionsExt;
-            options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
-        }
-        if let Ok(mut file) = options.open(path) {
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::PermissionsExt;
-                let _ = file.set_permissions(std::fs::Permissions::from_mode(0o600));
-            }
-            let _ = file.write_all(json.as_bytes());
-        }
+    let json = serde_json::to_vec(&cache).map_err(std::io::Error::other)?;
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create(true).truncate(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600).custom_flags(libc::O_NOFOLLOW);
+    }
+    let mut file = options.open(path)?;
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        file.set_permissions(std::fs::Permissions::from_mode(0o600))?;
+    }
+    file.write_all(&json)?;
+    file.flush()
+}
+
+enum ContextWindowRefreshOutcome {
+    Cached(u64),
+    DiscoveredButNotCached(u64),
+    NoMetadata,
+}
+
+/// Perform one advisory context-window discovery and cache only a numeric
+/// result. Provider diagnostics are intentionally not accepted here, so an
+/// endpoint URL or response body can never enter the private cache.
+async fn refresh_cached_context_window(
+    provider: &OpenAICompatProvider,
+    model: &str,
+    path: &std::path::Path,
+    key: &str,
+) -> ContextWindowRefreshOutcome {
+    let Some(window) = provider.model_context_length(model).await else {
+        return ContextWindowRefreshOutcome::NoMetadata;
+    };
+    if write_cached_context_window(path, key, window).is_ok() {
+        ContextWindowRefreshOutcome::Cached(window)
+    } else {
+        ContextWindowRefreshOutcome::DiscoveredButNotCached(window)
     }
 }
 
@@ -1374,13 +3545,13 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             )
         } else {
             format!(
-                "config error: no config found at {}\n  start with: kitsu --config ./kitsu.toml chat\n  or copy the bundled config to ~/.kitsu/config.toml",
+                "config error: no config found at {}\n  start with: kitsu init\n  then check: kitsu --config ./kitsu.toml doctor\n  then chat: kitsu --config ./kitsu.toml chat\n  or copy the bundled config to ~/.kitsu/config.toml",
                 shorten_home(&path)
             )
         };
         return Err(CliError::user(message));
     }
-    let config = Config::load(&path).map_err(|e| CliError::user(e.to_string()))?;
+    let config = Config::load(&path).map_err(|error| CliError::user(safe_config_error(&error)))?;
     // Resolve the location now, but create it only when a command actually
     // needs durable state. In particular, provider-free/empty scripts should
     // continue to work in containers with a read-only HOME.
@@ -1415,6 +3586,11 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     let auth = build_auth(gateway).map_err(|e| CliError::user(e.to_string()))?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
+    let context_window_refresh = ContextWindowRefreshConfig {
+        cache_path: context_window_cache_path(&state_dir),
+        base_url: gateway.base_url.clone(),
+        models_path: models_path.clone(),
+    };
     let provider = Arc::new(OpenAICompatProvider::new(
         OpenAICompatConfig {
             base_url: gateway.base_url.clone(),
@@ -1440,8 +3616,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     );
 
     if let kitsu_providers::ExpiryStatus::Expired { since } = auth.expiry_status() {
-        let hint = gateway.auth.refresh_hint.clone().unwrap_or_default();
-        eprintln!("warning: gateway token expired (since {since}) - sending anyway. {hint}");
+        eprintln!(
+            "{}",
+            expired_auth_warning(&since, gateway.auth.refresh_hint.as_deref())
+        );
     }
 
     // Resolve the context window: explicit flag → profile → cached
@@ -1451,31 +3629,78 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     // cache (build_agent_config enforces the default, while `None` preserves
     // honest provenance in /status and /context).
     let context_window_pinned = cli.context_window.or(gateway.context_window).is_some();
-    let context_window = match cli.context_window.or(gateway.context_window) {
-        Some(w) => Some(w),
-        None => {
-            let cache_key =
-                context_window_cache_key(&gateway.base_url, models_path.as_deref(), &model);
-            let cache_path = context_window_cache_path(&state_dir);
-            let cached = read_cached_context_window(&cache_path, &cache_key);
-            match cached {
-                Some(w) => Some(w),
-                None => {
-                    let discovery_provider = provider.clone();
-                    let discovery_model = model.clone();
-                    tokio::spawn(async move {
-                        if let Some(window) = discovery_provider
-                            .model_context_length(&discovery_model)
-                            .await
-                        {
-                            write_cached_context_window(&cache_path, &cache_key, window);
-                        }
-                    });
-                    None
-                }
+    let mut cold_refresh = None;
+    let (context_window, context_window_provenance) = if let Some(window) = cli.context_window {
+        (
+            Some(window),
+            ContextWindowProvenance::pinned(ContextWindowSource::Cli),
+        )
+    } else if let Some(window) = gateway.context_window {
+        (
+            Some(window),
+            ContextWindowProvenance::pinned(ContextWindowSource::Profile),
+        )
+    } else {
+        let cache_key = context_window_refresh.cache_key(&model);
+        let cache_path = context_window_refresh.cache_path.clone();
+        let cached = inspect_cached_context_window(&cache_path, &cache_key);
+        match cached.window {
+            Some(window) => {
+                let age_secs = match cached.state {
+                    ContextWindowCacheState::Fresh { age_secs, .. } => age_secs,
+                    _ => 0,
+                };
+                (Some(window), ContextWindowProvenance::cached(age_secs))
+            }
+            None => {
+                let discovery = if models_path.is_some() {
+                    cold_refresh = Some((cache_path, cache_key));
+                    ContextWindowDiscoveryState::Pending
+                } else {
+                    ContextWindowDiscoveryState::Disabled
+                };
+                (
+                    None,
+                    ContextWindowProvenance::defaulted(cached.state, discovery),
+                )
             }
         }
     };
+    let context_window_provenance = Arc::new(std::sync::Mutex::new(context_window_provenance));
+    if let Some((cache_path, cache_key)) = cold_refresh {
+        let discovery_provider = provider.clone();
+        let discovery_model = model.clone();
+        let discovery_provenance = context_window_provenance.clone();
+        tokio::spawn(async move {
+            let discovery = match refresh_cached_context_window(
+                discovery_provider.as_ref(),
+                &discovery_model,
+                &cache_path,
+                &cache_key,
+            )
+            .await
+            {
+                ContextWindowRefreshOutcome::Cached(window) => {
+                    ContextWindowDiscoveryState::ReadyForNextRun { window }
+                }
+                ContextWindowRefreshOutcome::DiscoveredButNotCached(window) => {
+                    ContextWindowDiscoveryState::CompleteButNotCached { window }
+                }
+                ContextWindowRefreshOutcome::NoMetadata => {
+                    ContextWindowDiscoveryState::FinishedWithoutMetadata
+                }
+            };
+            let mut provenance = discovery_provenance
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            // `/model` or session resume can replace the running model while
+            // this advisory probe is in flight. Never relabel that newer
+            // model's provenance with the old model's completion.
+            if provenance.discovery == ContextWindowDiscoveryState::Pending {
+                provenance.discovery = discovery;
+            }
+        });
+    }
 
     Ok(ChatSetup {
         provider,
@@ -1488,7 +3713,32 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         model,
         context_window,
         context_window_pinned,
+        context_window_provenance,
+        context_window_refresh,
     })
+}
+
+fn filter_model_catalog(models: Vec<String>, filter: &str) -> Vec<String> {
+    let filter = filter.trim().to_lowercase();
+    let mut matched: Vec<String> = models
+        .into_iter()
+        .filter(|model| filter.is_empty() || model.to_lowercase().contains(&filter))
+        .collect();
+    matched.sort();
+    matched.dedup();
+    matched
+}
+
+fn empty_model_catalog_message(filter: &str) -> String {
+    let filter = filter.trim();
+    if filter.is_empty() {
+        "the gateway model catalog is empty".to_string()
+    } else {
+        format!(
+            "no models matched '{}' - retry without a filter to see the full catalog",
+            terminal_inline(filter)
+        )
+    }
 }
 
 async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
@@ -1499,7 +3749,7 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
             shorten_home(&path)
         )));
     }
-    let config = Config::load(&path).map_err(|error| CliError::user(error.to_string()))?;
+    let config = Config::load(&path).map_err(|error| CliError::user(safe_config_error(&error)))?;
     let (gateway_name, gateway) = config
         .select_gateway(cli.gateway.as_deref())
         .map_err(|error| CliError::user(error.to_string()))?;
@@ -1522,34 +3772,33 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         emit_jsonl(
             "run_started",
             serde_json::json!({"mode": "models", "gateway": gateway_name}),
-        );
+        )?;
     }
     let result = await_cancellable(provider.list_models())
         .await
         .ok_or_else(|| CliError::cancelled("model catalog request cancelled by Ctrl+C"))?;
-    let Some(models) =
-        result.map_err(|error| map_agent_error(kitsu_core::AgentError::Provider(error)))?
+    let Some(models) = result.map_err(|error| {
+        map_provider_error(
+            error,
+            ProviderOperation::ModelCatalog,
+            Some(cli.timeout_secs),
+        )
+    })?
     else {
         return Err(CliError::user(
             "this gateway does not expose a model catalog; configure models_path".to_string(),
         ));
     };
-    let filter_lower = filter.trim().to_lowercase();
-    let mut matched: Vec<String> = models
-        .into_iter()
-        .filter(|model| filter_lower.is_empty() || model.to_lowercase().contains(&filter_lower))
-        .collect();
-    matched.sort();
-    matched.dedup();
+    let matched = filter_model_catalog(models, filter);
     if cli.jsonl {
         let count = matched.len();
         emit_jsonl(
             "model_catalog",
-            serde_json::json!({"filter": filter, "models": matched, "count": count}),
-        );
-        emit_jsonl_summary("ok", 0, 0);
+            serde_json::json!({"filter": filter.trim(), "models": matched, "count": count}),
+        )?;
+        emit_jsonl_summary("ok", 0, 0)?;
     } else if matched.is_empty() {
-        eprintln!("no models matched '{}'", terminal_inline(filter));
+        eprintln!("{}", empty_model_catalog_message(filter));
     } else {
         for model in matched {
             println!("{}", terminal_inline(&model));
@@ -1578,8 +3827,8 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
     let mut agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
-    let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
-    agent_cfg.event_log = event_log.clone();
+    let event_log = live_agent_event_log(cli.jsonl, "ask:1");
+    agent_cfg.event_log = Some(event_log.clone());
     if cli.jsonl {
         emit_jsonl(
             "run_started",
@@ -1588,11 +3837,11 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 "gateway": setup.gateway_name,
                 "model": setup.model,
             }),
-        );
+        )?;
         emit_jsonl(
             "turn_started",
             serde_json::json!({"turn_id": "ask:1", "input": prompt}),
-        );
+        )?;
     }
 
     let mut state = kitsu_core::AgentSessionState::default();
@@ -1604,13 +3853,11 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         &mut state,
     )
     .await;
-    if let Some(log) = &event_log {
-        let assistant = match &outcome {
-            TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
-            _ => None,
-        };
-        emit_agent_trace("ask:1", log, assistant);
-    }
+    let assistant = match &outcome {
+        TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    finish_agent_trace(cli, "ask:1", &event_log, assistant)?;
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some(issue) = strict_turn_issue(&state.last_turn) {
@@ -1624,12 +3871,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                             "message": mapped.to_string(),
                             "exit_code": mapped.exit_code(),
                         }),
-                    );
+                    )?;
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": "ask:1", "status": "error"}),
-                    );
-                    emit_jsonl_summary("error", 1, 1);
+                    )?;
+                    emit_jsonl_summary("error", 1, 1)?;
                 }
                 return Err(mapped);
             }
@@ -1637,13 +3884,19 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "ok"}),
-                );
-                emit_jsonl_summary("ok", 0, 0);
+                )?;
+                emit_jsonl_summary("ok", 0, 0)?;
             }
             Ok(())
         }
         TurnOutcome::Completed(Err(error)) => {
-            let mapped = map_agent_error(error);
+            let mapped = map_agent_error(
+                error,
+                ProviderOperation::Chat {
+                    model: &setup.model,
+                },
+                Some(cli.timeout_secs),
+            );
             if cli.jsonl {
                 emit_jsonl(
                     "error",
@@ -1653,12 +3906,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                         "message": mapped.to_string(),
                         "exit_code": mapped.exit_code(),
                     }),
-                );
+                )?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "error"}),
-                );
-                emit_jsonl_summary("error", 1, usize::from(mapped.exit_code() == EXIT_PROVIDER));
+                )?;
+                emit_jsonl_summary("error", 1, usize::from(mapped.exit_code() == EXIT_PROVIDER))?;
             }
             Err(mapped)
         }
@@ -1673,12 +3926,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                         "message": mapped.to_string(),
                         "exit_code": mapped.exit_code(),
                     }),
-                );
+                )?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "cancelled"}),
-                );
-                emit_jsonl_summary("cancelled", 1, 0);
+                )?;
+                emit_jsonl_summary("cancelled", 1, 0)?;
             }
             Err(mapped)
         }
@@ -1692,18 +3945,41 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
     if tool_names.is_empty() {
         "You are kitsu, a concise, helpful CLI assistant.".to_string()
     } else {
-        format!(
-            "You are kitsu, a concise, helpful CLI assistant with these tools: {}. \
-             When the user refers to a local file or directory, USE these tools to inspect it \
-             directly — call fs_list_dir to see a directory's contents and fs_read_file to read a \
-             file. Do NOT ask the user to paste file contents or list filenames; read them \
-             yourself. Access is permission-gated, so simply attempt the tool call — the user is \
-             asked to approve paths as needed. When asked to generate or edit code or files, use \
-             fs_edit_file for exact localized changes or fs_write_file for full replacements. \
-             If command_exec is available, use its literal argv/cwd interface to run relevant \
-             builds, tests, and linters after edits; command approval is separate from file access.",
+        let has_read = tool_names.iter().any(|name| name == "fs_read_file");
+        let has_write = tool_names.iter().any(|name| name == "fs_write_file");
+        let has_edit = tool_names.iter().any(|name| name == "fs_edit_file");
+        let has_commands = tool_names.iter().any(|name| name == "command_exec");
+        let mut prompt = format!(
+            "You are kitsu, a concise, helpful CLI assistant with these tools: {}. ",
             tool_names.join(", ")
-        )
+        );
+        if has_read {
+            prompt.push_str(
+                "When the user refers to a local file or directory, use the available filesystem \
+                 tools to inspect it directly instead of asking them to paste its contents. ",
+            );
+        }
+        if has_edit {
+            prompt.push_str(
+                "For code or file changes, use fs_edit_file for exact localized edits or \
+                 fs_write_file for full replacements. ",
+            );
+        } else if has_write {
+            prompt.push_str(
+                "You have write-only filesystem authority: use fs_write_file to create or \
+                 replace content, and do not claim you can inspect existing files. ",
+            );
+        }
+        prompt.push_str(
+            "Filesystem access is permission-gated; attempt only tools actually listed above. ",
+        );
+        if has_commands {
+            prompt.push_str(
+                "Use command_exec's literal argv/cwd interface for relevant builds, tests, and \
+                 linters; command approval is separate from filesystem access.",
+            );
+        }
+        prompt.trim_end().to_string()
     }
 }
 
@@ -1719,6 +3995,7 @@ enum ScriptFailureKind {
     User,
     Provider,
     Cancelled,
+    JsonlOutput,
 }
 
 fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
@@ -1732,6 +4009,9 @@ fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
 
 fn transcript_line(prefix: &str, text: &str) {
     use std::io::Write;
+    if jsonl_requested() {
+        return;
+    }
     // Echoes are metadata, not assistant output. Keeping them with slash
     // diagnostics on stderr preserves clean pipeable stdout and deterministic
     // command/result ordering in captured scripts.
@@ -1741,30 +4021,92 @@ fn transcript_line(prefix: &str, text: &str) {
     let _ = stderr.flush();
 }
 
-fn emit_agent_trace(turn_id: &str, log: &kitsu_core::AgentEventLog, assistant: Option<&str>) {
+fn emit_agent_trace(
+    turn_id: &str,
+    log: &kitsu_core::AgentEventLog,
+    assistant: Option<&str>,
+) -> Result<(), CliError> {
     for event in log.take() {
-        if matches!(event, kitsu_core::AgentRuntimeEvent::TurnFinished { .. }) {
-            continue;
-        }
-        let Ok(serde_json::Value::Object(mut object)) = serde_json::to_value(event) else {
-            continue;
-        };
-        let kind = object
-            .remove("event")
-            .and_then(|value| value.as_str().map(str::to_string))
-            .unwrap_or_else(|| "runtime_event".to_string());
-        object.insert(
-            "turn_id".to_string(),
-            serde_json::Value::String(turn_id.to_string()),
-        );
-        emit_jsonl(&kind, serde_json::Value::Object(object));
+        emit_runtime_event(turn_id, &event)?;
     }
     if let Some(text) = assistant {
         emit_jsonl(
             "assistant",
             serde_json::json!({"turn_id": turn_id, "text": text}),
-        );
+        )?;
     }
+    Ok(())
+}
+
+fn emit_runtime_event(
+    turn_id: &str,
+    event: &kitsu_core::AgentRuntimeEvent,
+) -> Result<(), CliError> {
+    if matches!(event, kitsu_core::AgentRuntimeEvent::TurnFinished { .. }) {
+        return Ok(());
+    }
+    let Ok(serde_json::Value::Object(mut object)) = serde_json::to_value(event) else {
+        return Ok(());
+    };
+    let kind = object
+        .remove("event")
+        .and_then(|value| value.as_str().map(str::to_string))
+        .unwrap_or_else(|| "runtime_event".to_string());
+    object.insert(
+        "turn_id".to_string(),
+        serde_json::Value::String(turn_id.to_string()),
+    );
+    emit_jsonl(&kind, serde_json::Value::Object(object))
+}
+
+fn live_agent_event_log(jsonl: bool, turn_id: &str) -> kitsu_core::AgentEventLog {
+    let turn_id = turn_id.to_string();
+    kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
+        if jsonl {
+            // The process-long emitter retains a terminal write failure. The
+            // turn boundary below converts it into the required nonzero exit.
+            emit_runtime_event(&turn_id, event).is_ok()
+        } else if let Some(notice) = format_provider_attempt_notice(event) {
+            eprintln!("~ {notice}");
+            true
+        } else {
+            true
+        }
+    })
+}
+
+fn finish_agent_trace(
+    cli: &Cli,
+    turn_id: &str,
+    log: &kitsu_core::AgentEventLog,
+    assistant: Option<&str>,
+) -> Result<(), CliError> {
+    if log.has_live_observer() {
+        // Live observers already delivered every runtime record in causal
+        // order. Drain the retained copy and emit only the assistant payload.
+        let _ = log.take();
+        if cli.jsonl {
+            if let Some(error) = jsonl_output_failure() {
+                return Err(error);
+            }
+            if let Some(text) = assistant {
+                emit_jsonl(
+                    "assistant",
+                    serde_json::json!({"turn_id": turn_id, "text": text}),
+                )?;
+            }
+        }
+        return Ok(());
+    }
+    if cli.jsonl {
+        return emit_agent_trace(turn_id, log, assistant);
+    }
+    for event in log.take() {
+        if let Some(notice) = format_provider_attempt_notice(&event) {
+            eprintln!("~ {notice}");
+        }
+    }
+    Ok(())
 }
 
 fn strict_turn_issue(status: &kitsu_core::AgentTurnStatus) -> Option<String> {
@@ -1783,6 +4125,9 @@ fn strict_turn_issue(status: &kitsu_core::AgentTurnStatus) -> Option<String> {
 }
 
 fn report_cancelled_agents(ids: Vec<u64>) {
+    if jsonl_requested() {
+        return;
+    }
     if !ids.is_empty() {
         let ids = ids
             .iter()
@@ -1800,25 +4145,25 @@ fn background_agent_notice(
     let completed = current.terminal.saturating_sub(previous.terminal);
     if completed > 0 {
         return Some(if current.running == 0 {
-            format!("~ {completed} background agent(s) finished - /agents for results")
+            format!("{completed} background agent(s) finished - /agents for results")
         } else {
             format!(
-                "~ {completed} background agent(s) finished; {} still running - /agents to check",
+                "{completed} background agent(s) finished; {} still running - /agents to check",
                 current.running
             )
         });
     }
     if current.running > previous.running {
         Some(format!(
-            "~ {} background agent(s) running - /agents to check",
+            "{} background agent(s) running - /agents to check",
             current.running
         ))
     } else if current.running < previous.running {
         Some(if current.running == 0 {
-            "~ background agents finished - /agents for results".to_string()
+            "background agents finished - /agents for results".to_string()
         } else {
             format!(
-                "~ background agent finished; {} still running - /agents to check",
+                "background agent finished; {} still running - /agents to check",
                 current.running
             )
         })
@@ -1827,14 +4172,211 @@ fn background_agent_notice(
     }
 }
 
+fn agent_progress_status_label(status: subagent::AgentProgressStatus) -> &'static str {
+    match status {
+        subagent::AgentProgressStatus::Running => "running",
+        subagent::AgentProgressStatus::Done => "done",
+        subagent::AgentProgressStatus::Failed => "failed",
+        subagent::AgentProgressStatus::Cancelled => "cancelled",
+    }
+}
+
+fn terminal_agent_status_label(status: &subagent::AgentStatus) -> &'static str {
+    match status {
+        subagent::AgentStatus::Running => "running",
+        subagent::AgentStatus::Done(_) => "done",
+        subagent::AgentStatus::Failed(_) => "failed",
+        subagent::AgentStatus::Cancelled(_) => "cancelled",
+    }
+}
+
+fn format_jobs(registry: &subagent::AgentRegistry) -> String {
+    let snapshot = registry.progress_snapshot();
+    let mut output = format!(
+        "jobs: {} total | {} running | {} done | {} failed | {} cancelled\ncapacity: {} running slot(s), {} record slot(s) available",
+        snapshot.total,
+        snapshot.running,
+        snapshot.done,
+        snapshot.failed,
+        snapshot.cancelled,
+        snapshot.available_running_slots,
+        snapshot.available_record_slots,
+    );
+    if snapshot.agents.is_empty() {
+        output.push_str("\n  none");
+        return output;
+    }
+    for agent in snapshot.agents {
+        let model = if agent.telemetry.model.is_empty() {
+            "unknown".to_string()
+        } else {
+            terminal_inline(&agent.telemetry.model)
+        };
+        let activity = agent
+            .telemetry
+            .last_activity
+            .as_deref()
+            .map(terminal_inline)
+            .unwrap_or_else(|| "none".to_string());
+        let failure = agent
+            .telemetry
+            .failure_class
+            .map(|class| format!(" | failure {class}"))
+            .unwrap_or_default();
+        let bytes = agent
+            .result_bytes
+            .map(|bytes| format!(" | result {bytes} B"))
+            .unwrap_or_default();
+        output.push_str(&format!(
+            "\n  #{} [{}] {}\n      {:.1}s | model {} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+            agent.id,
+            agent_progress_status_label(agent.status),
+            terminal_inline(&agent.task),
+            agent.elapsed_ms as f64 / 1000.0,
+            model,
+            agent.telemetry.prompt_tokens,
+            agent.telemetry.completion_tokens,
+            agent.telemetry.total_tokens,
+            agent.telemetry.tool_count,
+            agent.telemetry.write_count,
+            activity,
+            failure,
+            bytes,
+        ));
+        if agent.telemetry.recent_activity.len() > 1 {
+            let recent = agent
+                .telemetry
+                .recent_activity
+                .iter()
+                .map(|activity| terminal_inline(activity))
+                .collect::<Vec<_>>()
+                .join(" -> ");
+            output.push_str(&format!("\n      recent {recent}"));
+        }
+        if matches!(agent.status, subagent::AgentProgressStatus::Running) {
+            output.push_str("\n      partial response text withheld until the job is terminal");
+        }
+    }
+    output
+}
+
+async fn handle_jobs_command(
+    registry: &Arc<subagent::AgentRegistry>,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    arg: &str,
+) -> bool {
+    let mut parts = arg.split_whitespace();
+    let action = parts.next().unwrap_or("list");
+    match action {
+        "list" if parts.next().is_none() => {
+            eprintln!("{}", format_jobs(registry));
+            true
+        }
+        "show" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs show <id>");
+                return false;
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs show <id>");
+                return false;
+            }
+            match registry.result(id) {
+                Some(text) => {
+                    eprintln!("#{id}:\n{}", kitsu_render::sanitize_terminal_text(&text));
+                    true
+                }
+                None => {
+                    eprintln!("no background job #{id}");
+                    false
+                }
+            }
+        }
+        "stop" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs stop <id>");
+                return false;
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs stop <id>");
+                return false;
+            }
+            match registry.cancel(id).await {
+                subagent::AgentCancelOutcome::Cancelled(status) => {
+                    report_write_checkpoints(journal.drain_and_take_reports().await);
+                    eprintln!("~ stopped and joined background job #{}", status.id);
+                    true
+                }
+                subagent::AgentCancelOutcome::AlreadyTerminal(status) => {
+                    eprintln!(
+                        "~ background job #{} is already {}",
+                        status.id,
+                        terminal_agent_status_label(&status.status)
+                    );
+                    true
+                }
+                subagent::AgentCancelOutcome::NotFound => {
+                    eprintln!("no background job #{id}");
+                    false
+                }
+            }
+        }
+        "stop-all" if parts.next().is_none() => {
+            let stopped = registry.cancel_all().await;
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            eprintln!("~ stopped and joined {} background job(s)", stopped.len());
+            true
+        }
+        "prune" => {
+            let Some(target) = parts.next() else {
+                eprintln!("usage: /jobs prune <id|all>");
+                return false;
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs prune <id|all>");
+                return false;
+            }
+            if target == "all" {
+                let pruned = registry.prune_terminal();
+                eprintln!("~ pruned {} terminal background job(s)", pruned.len());
+                return true;
+            }
+            let Ok(id) = target.parse::<u64>() else {
+                eprintln!("usage: /jobs prune <id|all>");
+                return false;
+            };
+            match registry.prune(id) {
+                subagent::AgentPruneOutcome::Pruned(_) => {
+                    eprintln!("~ pruned background job #{id}");
+                    true
+                }
+                subagent::AgentPruneOutcome::Running => {
+                    eprintln!("background job #{id} is still running; stop it first");
+                    false
+                }
+                subagent::AgentPruneOutcome::NotFound => {
+                    eprintln!("no background job #{id}");
+                    false
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: /jobs [list|show <id>|stop <id>|stop-all|prune <id|all>]");
+            false
+        }
+    }
+}
+
 async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason: &str) {
     let running = registry.running();
     if running == 0 {
         return;
     }
-    eprintln!(
-        "{reason}; waiting for {running} background agent(s) to finish (Ctrl+C cancels them)"
-    );
+    if !jsonl_requested() {
+        eprintln!(
+            "{reason}; waiting for {running} background agent(s) to finish (Ctrl+C cancels them)"
+        );
+    }
     let mut changes = registry.subscribe();
     while changes.borrow().running > 0 {
         tokio::select! {
@@ -1867,12 +4409,72 @@ fn format_write_checkpoint(report: &kitsu_tools::builtins::fs::JournalTurnReport
             change.first_changed_line
         ));
     }
-    output.push_str("\n  /undo restores this checkpoint if none of those files changed later");
+    if !report.unified_diff.trim().is_empty() {
+        output.push_str("\n\n  verified snapshot-derived diff");
+        if report.diff_truncated {
+            output.push_str(" (truncated)");
+        }
+        output.push_str(":\n");
+        output.push_str(
+            kitsu_render::sanitize_terminal_text(report.unified_diff.trim_end()).as_str(),
+        );
+    }
+    output.push_str(&format!(
+        "\n  /undo {} restores this checkpoint if its files still match",
+        report.id
+    ));
     output
 }
 
+fn format_checkpoint_summaries(
+    checkpoints: &[kitsu_tools::builtins::fs::JournalCheckpointSummary],
+) -> String {
+    if checkpoints.is_empty() {
+        return "no recoverable file checkpoints in this session".to_string();
+    }
+    let mut output = String::from("recoverable file checkpoints (oldest first):");
+    for checkpoint in checkpoints {
+        output.push_str(&format!(
+            "\n  #{}  {} ({} change{})",
+            checkpoint.id,
+            terminal_inline(&checkpoint.label),
+            checkpoint.change_count,
+            if checkpoint.change_count == 1 {
+                ""
+            } else {
+                "s"
+            },
+        ));
+        let shown = checkpoint.paths.iter().take(3);
+        for path in shown {
+            output.push_str(&format!("\n      {}", shorten_home(path)));
+        }
+        if checkpoint.paths.len() > 3 {
+            output.push_str(&format!(
+                "\n      ... and {} more path(s)",
+                checkpoint.paths.len() - 3
+            ));
+        }
+    }
+    output.push_str("\n  preview with /checkpoint <id>; restore with /undo <id>");
+    output
+}
+
+async fn undo_write_checkpoint(
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    perms: &Permissions,
+    id: Option<u64>,
+) -> Result<kitsu_tools::builtins::fs::JournalTurnReport, kitsu_tools::ToolError> {
+    match id {
+        Some(id) => journal.undo_checkpoint(perms, id).await,
+        None => journal.undo_last(perms).await,
+    }
+}
+
 fn report_write_checkpoint(report: kitsu_tools::builtins::fs::JournalTurnReport) {
-    eprintln!("{}", format_write_checkpoint(&report));
+    if !jsonl_requested() {
+        eprintln!("{}", format_write_checkpoint(&report));
+    }
 }
 
 fn report_write_checkpoints(
@@ -1908,6 +4510,7 @@ async fn run_scripted(
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
+    session_store: &Option<session::SessionStore>,
     allow_turn_errors: bool,
 ) -> Result<(), CliError> {
     let content = read_text_file_cancellable(std::path::PathBuf::from(path))
@@ -1925,9 +4528,14 @@ async fn run_scripted(
     let mut last_failed: Option<SubmittedPrompt> = None;
     macro_rules! stop_if_cancelled {
         ($kind:expr, $line:expr) => {
+            if $kind == ScriptFailureKind::JsonlOutput {
+                return Err(jsonl_output_failure().unwrap_or_else(|| {
+                    CliError::user("JSONL output failed without a retained error")
+                }));
+            }
             if $kind == ScriptFailureKind::Cancelled {
                 if cli.jsonl {
-                    emit_jsonl_summary("cancelled", failures + 1, provider_failures);
+                    emit_jsonl_summary("cancelled", failures + 1, provider_failures)?;
                 }
                 return Err(CliError::cancelled(format!(
                     "script cancelled at {path}:{}",
@@ -1976,7 +4584,10 @@ async fn run_scripted(
             )
             .await;
             match result {
-                Ok(()) => last_failed = None,
+                Ok(()) => {
+                    persist_session_required(session_store, session, model, messages)?;
+                    last_failed = None;
+                }
                 Err(kind) => {
                     stop_if_cancelled!(kind, line_number);
                     failures += 1;
@@ -1998,7 +4609,7 @@ async fn run_scripted(
                         "line": line_number,
                         "command": trimmed,
                     }),
-                );
+                )?;
             }
             let result = handle_slash(
                 rest,
@@ -2019,7 +4630,7 @@ async fn run_scripted(
             .await;
             let finish_command = |status: &str, error_message: Option<&str>, exit_code: i32| {
                 if !cli.jsonl {
-                    return;
+                    return Ok(());
                 }
                 if let Some(message) = error_message {
                     emit_jsonl(
@@ -2031,7 +4642,7 @@ async fn run_scripted(
                             "message": message,
                             "exit_code": exit_code,
                         }),
-                    );
+                    )?;
                 }
                 emit_jsonl(
                     "command_finished",
@@ -2040,13 +4651,41 @@ async fn run_scripted(
                         "command": trimmed,
                         "status": status,
                     }),
-                );
+                )?;
+                Ok::<(), CliError>(())
             };
+            macro_rules! persist_command_session {
+                () => {
+                    if let Err(error) =
+                        persist_session_required(session_store, session, model, messages)
+                    {
+                        finish_command(
+                            "error",
+                            Some(&format!("session persistence failed: {error}")),
+                            error.exit_code(),
+                        )?;
+                        return Err(error);
+                    }
+                };
+            }
             // Keep subagents in sync with any `/model` change in the script.
             *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
             match result {
-                SlashResult::Continue => {
-                    finish_command("ok", None, EXIT_USER);
+                SlashResult::Continue(output) => {
+                    persist_command_session!();
+                    if let Some(output) = output {
+                        if cli.jsonl {
+                            emit_jsonl(
+                                "command_result",
+                                serde_json::json!({
+                                    "line": line_number,
+                                    "command": trimmed,
+                                    "result": output,
+                                }),
+                            )?;
+                        }
+                    }
+                    finish_command("ok", None, EXIT_USER)?;
                     continue;
                 }
                 SlashResult::Cancelled => {
@@ -2060,41 +4699,46 @@ async fn run_scripted(
                                 "message": "command cancelled by Ctrl+C",
                                 "exit_code": EXIT_CANCELLED,
                             }),
-                        );
+                        )?;
                     }
-                    finish_command("cancelled", None, EXIT_CANCELLED);
+                    finish_command("cancelled", None, EXIT_CANCELLED)?;
                     if cli.jsonl {
-                        emit_jsonl_summary("cancelled", failures + 1, provider_failures);
+                        emit_jsonl_summary("cancelled", failures + 1, provider_failures)?;
                     }
                     return Err(CliError::cancelled(format!(
                         "script cancelled at {path}:{line_number}"
                     )));
                 }
                 SlashResult::Quit => {
-                    finish_command("ok", None, EXIT_USER);
+                    persist_command_session!();
+                    finish_command("ok", None, EXIT_USER)?;
                     break;
                 }
                 SlashResult::Error => {
                     failures += 1;
                     let message = format!("command failed: {trimmed}");
-                    finish_command("error", Some(&message), EXIT_USER);
-                    eprintln!(
-                        "{}:{line_number}: {}",
-                        terminal_inline(path),
-                        kitsu_render::sanitize_terminal_text(&message)
-                    );
+                    finish_command("error", Some(&message), EXIT_USER)?;
+                    if !cli.jsonl {
+                        eprintln!(
+                            "{}:{line_number}: {}",
+                            terminal_inline(path),
+                            kitsu_render::sanitize_terminal_text(&message)
+                        );
+                    }
                     continue;
                 }
                 SlashResult::ProviderFailure(detail) => {
                     failures += 1;
                     provider_failures += 1;
                     let message = format!("provider command failed: {trimmed}: {detail}");
-                    finish_command("error", Some(&message), EXIT_PROVIDER);
-                    eprintln!(
-                        "{}:{line_number}: {}",
-                        terminal_inline(path),
-                        kitsu_render::sanitize_terminal_text(&message)
-                    );
+                    finish_command("error", Some(&message), EXIT_PROVIDER)?;
+                    if !cli.jsonl {
+                        eprintln!(
+                            "{}:{line_number}: {}",
+                            terminal_inline(path),
+                            kitsu_render::sanitize_terminal_text(&message)
+                        );
+                    }
                     continue;
                 }
                 SlashResult::SubmitPrompt(prompt) => {
@@ -2121,18 +4765,19 @@ async fn run_scripted(
                     .await;
                     match result {
                         Ok(()) => {
+                            persist_command_session!();
                             last_failed = None;
-                            finish_command("ok", None, EXIT_USER);
+                            finish_command("ok", None, EXIT_USER)?;
                         }
                         Err(kind) => {
                             if kind == ScriptFailureKind::Cancelled {
-                                finish_command("cancelled", None, EXIT_CANCELLED);
+                                finish_command("cancelled", None, EXIT_CANCELLED)?;
                             }
                             stop_if_cancelled!(kind, line_number);
                             failures += 1;
                             provider_failures += usize::from(kind == ScriptFailureKind::Provider);
                             last_failed = Some(prompt);
-                            finish_command("error", None, EXIT_USER);
+                            finish_command("error", None, EXIT_USER)?;
                         }
                     }
                     continue;
@@ -2141,8 +4786,10 @@ async fn run_scripted(
                     let Some(prompt) = last_failed.clone() else {
                         failures += 1;
                         let message = "nothing to retry";
-                        finish_command("error", Some(message), EXIT_USER);
-                        eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                        finish_command("error", Some(message), EXIT_USER)?;
+                        if !cli.jsonl {
+                            eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                        }
                         continue;
                     };
                     let turn_tools = match prompt.tool_mode {
@@ -2168,23 +4815,24 @@ async fn run_scripted(
                     .await;
                     match result {
                         Ok(()) => {
+                            persist_command_session!();
                             last_failed = None;
-                            finish_command("ok", None, EXIT_USER);
+                            finish_command("ok", None, EXIT_USER)?;
                         }
                         Err(kind) => {
                             if kind == ScriptFailureKind::Cancelled {
-                                finish_command("cancelled", None, EXIT_CANCELLED);
+                                finish_command("cancelled", None, EXIT_CANCELLED)?;
                             }
                             stop_if_cancelled!(kind, line_number);
                             failures += 1;
                             provider_failures += usize::from(kind == ScriptFailureKind::Provider);
-                            finish_command("error", None, EXIT_USER);
+                            finish_command("error", None, EXIT_USER)?;
                         }
                     }
                     continue;
                 }
                 SlashResult::NewSession
-                | SlashResult::QueuePrompt(_)
+                | SlashResult::QueueAction(_)
                 | SlashResult::ResumeSession(_)
                 | SlashResult::ListSessions
                 | SlashResult::ForkSession(_)
@@ -2194,8 +4842,10 @@ async fn run_scripted(
                 | SlashResult::DeleteSession(_) => {
                     failures += 1;
                     let message = "session commands require interactive chat";
-                    finish_command("error", Some(message), EXIT_USER);
-                    eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                    finish_command("error", Some(message), EXIT_USER)?;
+                    if !cli.jsonl {
+                        eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                    }
                     continue;
                 }
             }
@@ -2219,7 +4869,10 @@ async fn run_scripted(
         )
         .await;
         match result {
-            Ok(()) => last_failed = None,
+            Ok(()) => {
+                persist_session_required(session_store, session, model, messages)?;
+                last_failed = None;
+            }
             Err(kind) => {
                 stop_if_cancelled!(kind, line_number);
                 failures += 1;
@@ -2232,13 +4885,17 @@ async fn run_scripted(
     if unfinished_agents > 0 {
         failures += 1;
         provider_failures += 1;
-        eprintln!(
-            "script ended with {unfinished_agents} unfinished background agent(s); detached work is not considered successful automation"
-        );
+        if !cli.jsonl {
+            eprintln!(
+                "script ended with {unfinished_agents} unfinished background agent(s); detached work is not considered successful automation"
+            );
+        }
         cancel_agents_and_report_writes(registry, 0, journal).await;
     }
     if failures > 0 {
-        eprintln!("script summary: {failures} failure(s)");
+        if !cli.jsonl {
+            eprintln!("script summary: {failures} failure(s)");
+        }
         if cli.jsonl {
             emit_jsonl_summary(
                 if allow_turn_errors {
@@ -2248,7 +4905,7 @@ async fn run_scripted(
                 },
                 failures,
                 provider_failures,
-            );
+            )?;
         }
         if !allow_turn_errors {
             let message = format!(
@@ -2261,7 +4918,7 @@ async fn run_scripted(
             });
         }
     } else if cli.jsonl {
-        emit_jsonl_summary("ok", 0, 0);
+        emit_jsonl_summary("ok", 0, 0)?;
     }
     Ok(())
 }
@@ -2290,16 +4947,19 @@ async fn run_scripted_turn(
         emit_jsonl(
             "turn_started",
             serde_json::json!({"turn_id": location, "input": display_input}),
-        );
+        )
+        .map_err(|_| ScriptFailureKind::JsonlOutput)?;
     }
     let expanded = match await_cancellable(attachments::expand(input, perms)).await {
         Some(Ok(expanded)) => expanded,
         Some(Err(error)) => {
-            eprintln!(
-                "{}: attachment error: {}",
-                terminal_inline(location),
-                terminal_inline(&error)
-            );
+            if !cli.jsonl {
+                eprintln!(
+                    "{}: attachment error: {}",
+                    terminal_inline(location),
+                    terminal_inline(&error)
+                );
+            }
             if cli.jsonl {
                 emit_jsonl(
                     "error",
@@ -2309,11 +4969,13 @@ async fn run_scripted_turn(
                         "message": error.to_string(),
                         "exit_code": EXIT_USER,
                     }),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": location, "status": "error"}),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             return Err(ScriptFailureKind::User);
         }
@@ -2327,16 +4989,18 @@ async fn run_scripted_turn(
                         "message": "attachment preflight cancelled by Ctrl+C",
                         "exit_code": EXIT_CANCELLED,
                     }),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": location, "status": "cancelled"}),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             return Err(ScriptFailureKind::Cancelled);
         }
     };
-    if !expanded.labels.is_empty() {
+    if !cli.jsonl && !expanded.labels.is_empty() {
         eprintln!("~ attached {} file(s):", expanded.labels.len());
         for label in &expanded.labels {
             eprintln!("  - {}", terminal_inline(label));
@@ -2356,8 +5020,8 @@ async fn run_scripted_turn(
         context_window.get(),
         offload_dir.clone(),
     );
-    let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
-    cfg.event_log = event_log.clone();
+    let event_log = live_agent_event_log(cli.jsonl, location);
+    cfg.event_log = Some(event_log.clone());
     let outcome = journal
         .scope_turn(
             &journal_turn.token,
@@ -2368,13 +5032,12 @@ async fn run_scripted_turn(
     if let Some(report) = journal.finish_attributed_turn(&journal_turn.token) {
         report_write_checkpoint(report);
     }
-    if let Some(log) = &event_log {
-        let assistant = match &outcome {
-            TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
-            _ => None,
-        };
-        emit_agent_trace(location, log, assistant);
-    }
+    let assistant = match &outcome {
+        TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+        _ => None,
+    };
+    finish_agent_trace(cli, location, &event_log, assistant)
+        .map_err(|_| ScriptFailureKind::JsonlOutput)?;
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some(issue) = strict_turn_issue(&state.last_turn) {
@@ -2388,25 +5051,29 @@ async fn run_scripted_turn(
                             "tool_errors": state.last_turn.tool_errors,
                             "exit_code": EXIT_PROVIDER,
                         }),
-                    );
+                    )
+                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": location, "status": "error"}),
-                    );
+                    )
+                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 }
                 *messages = messages_before;
                 *state = state_before;
                 cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
-                eprintln!(
-                    "{}: strict scripted turn failed: {issue}",
-                    terminal_inline(location)
-                );
-                eprintln!(
-                    "kitsu-context-rollback: incomplete turn removed from conversation state"
-                );
-                eprintln!(
-                    "~ failed turn rolled back; completed file changes, if any, remain on disk"
-                );
+                if !cli.jsonl {
+                    eprintln!(
+                        "{}: strict scripted turn failed: {issue}",
+                        terminal_inline(location)
+                    );
+                    eprintln!(
+                        "kitsu-context-rollback: incomplete turn removed from conversation state"
+                    );
+                    eprintln!(
+                        "~ failed turn rolled back; completed file changes, if any, remain on disk"
+                    );
+                }
                 Err(ScriptFailureKind::Provider)
             } else {
                 if cli.jsonl {
@@ -2417,7 +5084,8 @@ async fn run_scripted_turn(
                             "status": "ok",
                             "tool_errors": state.last_turn.tool_errors,
                         }),
-                    );
+                    )
+                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 }
                 Ok(())
             }
@@ -2434,18 +5102,24 @@ async fn run_scripted_turn(
                         "message": error_message,
                         "exit_code": if kind == ScriptFailureKind::Provider { EXIT_PROVIDER } else { EXIT_USER },
                     }),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": location, "status": "error"}),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             *messages = messages_before;
             *state = state_before;
             cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
-            eprintln!("{}: {error_message}", terminal_inline(location));
-            eprintln!("kitsu-context-rollback: failed turn removed from conversation state");
-            eprintln!("~ failed turn rolled back; completed file changes, if any, remain on disk");
+            if !cli.jsonl {
+                eprintln!("{}: {error_message}", terminal_inline(location));
+                eprintln!("kitsu-context-rollback: failed turn removed from conversation state");
+                eprintln!(
+                    "~ failed turn rolled back; completed file changes, if any, remain on disk"
+                );
+            }
             Err(kind)
         }
         TurnOutcome::Cancelled => {
@@ -2458,18 +5132,22 @@ async fn run_scripted_turn(
                         "message": "request cancelled by Ctrl+C",
                         "exit_code": EXIT_CANCELLED,
                     }),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": location, "status": "cancelled"}),
-                );
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             *messages = messages_before;
             *state = state_before;
             cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
-            eprintln!("{}: request cancelled by Ctrl+C", terminal_inline(location));
-            eprintln!("kitsu-context-rollback: cancelled turn removed from conversation state");
-            eprintln!("~ completed file changes, if any, remain on disk");
+            if !cli.jsonl {
+                eprintln!("{}: request cancelled by Ctrl+C", terminal_inline(location));
+                eprintln!("kitsu-context-rollback: cancelled turn removed from conversation state");
+                eprintln!("~ completed file changes, if any, remain on disk");
+            }
             Err(ScriptFailureKind::Cancelled)
         }
     }
@@ -2484,6 +5162,9 @@ enum TurnOutcome {
 #[derive(Default)]
 struct TypeaheadCaptureResult {
     captured: usize,
+    steering_errors: Vec<String>,
+    queue_notices: Vec<String>,
+    queue_errors: Vec<String>,
     eof: bool,
 }
 
@@ -2499,15 +5180,16 @@ struct TypeaheadCollector {
 
 #[cfg(unix)]
 impl TypeaheadCollector {
-    fn start(queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>) -> Self {
+    fn start(
+        queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
+        steering: prompt_queue::SteeringChannel,
+    ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let handle = std::thread::spawn(move || {
             let mut result = TypeaheadCaptureResult::default();
             while !thread_stop.load(Ordering::Acquire) {
-                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire)
-                    || queue.lock().expect("prompt queue").status().is_full()
-                {
+                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
                     std::thread::sleep(Duration::from_millis(25));
                     continue;
                 }
@@ -2553,8 +5235,50 @@ impl TypeaheadCollector {
                         if line.is_empty() {
                             continue;
                         }
-                        if queue.lock().expect("prompt queue").enqueue(line).is_ok() {
-                            result.captured += 1;
+                        if line == "/steer" || line.starts_with("/steer ") {
+                            let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
+                            if correction.is_empty() {
+                                result
+                                    .steering_errors
+                                    .push("steering correction cannot be empty".to_string());
+                                continue;
+                            }
+                            let Some(turn) = steering.active_turn() else {
+                                result.steering_errors.push(
+                                    "steering arrived after the foreground turn ended; it was not queued as a new prompt"
+                                        .to_string(),
+                                );
+                                continue;
+                            };
+                            match steering.steer(turn, correction) {
+                                Ok(_) => {}
+                                Err(error) => result.steering_errors.push(format!(
+                                    "{error} ({}-character correction was not converted into a future prompt)",
+                                    error.correction().text().chars().count()
+                                )),
+                            }
+                            continue;
+                        }
+                        if line == "/queue" || line.starts_with("/queue ") {
+                            let argument = line.strip_prefix("/queue").unwrap_or_default();
+                            match parse_queue_command(argument).and_then(|command| {
+                                execute_queue_command(
+                                    &mut queue.lock().expect("prompt queue"),
+                                    command,
+                                )
+                            }) {
+                                Ok(message) => result.queue_notices.push(message),
+                                Err(error) => result.queue_errors.push(error),
+                            }
+                            continue;
+                        }
+                        match queue.lock().expect("prompt queue").enqueue(line) {
+                            Ok(_) => result.captured += 1,
+                            Err(error) => result.queue_errors.push(format!(
+                                "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
+                                error.capacity(),
+                                error.prompt().chars().count(),
+                            )),
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -2583,7 +5307,10 @@ struct TypeaheadCollector;
 
 #[cfg(not(unix))]
 impl TypeaheadCollector {
-    fn start(_queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>) -> Self {
+    fn start(
+        _queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
+        _steering: prompt_queue::SteeringChannel,
+    ) -> Self {
         Self
     }
 
@@ -2673,50 +5400,97 @@ async fn run_turn_cancellable(
     }
 }
 
+enum InteractiveTurnOutcome {
+    Turn(TurnOutcome),
+    Steered(Vec<String>),
+}
+
+#[allow(clippy::too_many_arguments)]
+async fn run_turn_steerable(
+    provider: &OpenAICompatProvider,
+    tools: &Registry,
+    messages: &mut Vec<ChatMessage>,
+    cfg: &AgentConfig,
+    state: &mut kitsu_core::AgentSessionState,
+    steering: &prompt_queue::SteeringChannel,
+    turn: prompt_queue::SteeringTurnId,
+    mut corrections: prompt_queue::SteeringReceiver,
+) -> InteractiveTurnOutcome {
+    debug_assert_eq!(corrections.turn(), turn);
+    FOREGROUND_CANCELLED.store(false, Ordering::Release);
+    let future = run_agent_turn_with_state(provider, tools, messages, cfg, state);
+    tokio::pin!(future);
+    tokio::select! {
+        result = &mut future => {
+            let _ = steering.close_turn(turn);
+            FOREGROUND_CANCELLED.store(false, Ordering::Release);
+            InteractiveTurnOutcome::Turn(TurnOutcome::Completed(result))
+        }
+        _ = tokio::signal::ctrl_c() => {
+            let _ = steering.close_turn(turn);
+            FOREGROUND_CANCELLED.store(true, Ordering::Release);
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled)
+        }
+        correction = corrections.recv() => {
+            let _ = steering.close_turn(turn);
+            FOREGROUND_CANCELLED.store(true, Ordering::Release);
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            let mut texts = correction
+                .into_iter()
+                .map(prompt_queue::SteeringCorrection::into_text)
+                .collect::<Vec<_>>();
+            texts.extend(
+                corrections
+                    .drain_pending()
+                    .into_iter()
+                    .map(prompt_queue::SteeringCorrection::into_text),
+            );
+            InteractiveTurnOutcome::Steered(texts)
+        }
+    }
+}
+
 async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliError> {
     let ChatInvocation {
         first_prompt,
         allow_paths,
         allow_write,
+        allow_read_write,
         enable_commands,
         command_roots,
         allow_commands,
         script,
         resume,
+        persist_session: session_requested,
         no_session,
         allow_turn_errors,
+        initial_review,
     } = invocation;
     let setup = build_setup(cli).await?;
 
-    // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode (prompt
-    // on demand) with read access to the launch directory by default; scripted /
-    // piped runs are deny-by-default (or --yes to auto-approve). --allow-path /
-    // --allow-write pre-grant paths so those never prompt.
+    // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode
+    // (prompt on demand) with read access to the launch directory by default;
+    // scripted/piped runs are deny-by-default. --yes is non-prompting but keeps
+    // root confinement. Only the deliberately alarming bypass flag permits an
+    // enabled filesystem tool to operate outside current roots.
     let scripted = script.is_some();
-    let interactive = kitsu_render::stdin_is_tty() && !scripted;
+    let forced_one_shot = initial_review.is_some();
+    let interactive = kitsu_render::stdin_is_tty() && !scripted && !forced_one_shot;
+    let durable_session = !no_session && (interactive || session_requested || resume.is_some());
+    let command_requested =
+        enable_commands || !command_roots.is_empty() || !allow_commands.is_empty();
     if cli.jsonl && interactive {
         return Err(CliError::user(
             "--jsonl is an automation mode; use --script, pipe one prompt, or use `ask`"
                 .to_string(),
         ));
     }
-    if resume.is_some() && !interactive {
-        return Err(CliError::user(
-            "--resume requires an interactive TTY chat (it cannot be combined with --script or piped input)"
-                .to_string(),
-        ));
-    }
-    if cli.jsonl {
-        emit_jsonl(
-            "run_started",
-            serde_json::json!({
-                "mode": if scripted { "script" } else { "piped" },
-                "gateway": setup.gateway_name,
-                "model": setup.model,
-            }),
-        );
-    }
-    if interactive && !no_session {
+    if durable_session || command_requested {
         prepare_runtime_state_dir(&setup.state_dir).map_err(CliError::user)?;
     }
     let sessions_dir = setup.state_dir.join("sessions");
@@ -2727,6 +5501,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         ),
         None => None,
     };
+    let resumed_existing = resumed.is_some();
     if let Some(saved) = resumed.as_ref() {
         let current = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve current directory: {error}"))
@@ -2740,7 +5515,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )));
         }
     }
-    let mut session_store = if interactive && !no_session {
+    let mut session_store = if durable_session {
         Some(match resumed.as_ref() {
             Some(saved) => session::SessionStore::from_saved(sessions_dir.clone(), saved)
                 .map_err(CliError::user)?,
@@ -2749,25 +5524,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     } else {
         None
     };
-    let mode = if cli.yes {
+    let mode = if cli.dangerously_allow_all_filesystem {
         Mode::AutoAllow
+    } else if cli.yes {
+        Mode::Scoped
     } else if interactive {
         Mode::Ask
     } else {
         Mode::Deny
     };
-    // A write grant implies read access to the same directory: editing a file
-    // (the common case — regenerate then refine) requires reading it back
-    // first, and a write-only root that can never be read is a trap no one
-    // asks for on purpose.
     let mut read_roots: Vec<String> = allow_paths.to_vec();
-    read_roots.extend(allow_write.iter().cloned());
+    read_roots.extend(allow_read_write.iter().cloned());
+    let mut write_roots: Vec<String> = allow_write.to_vec();
+    write_roots.extend(allow_read_write.iter().cloned());
     if interactive {
         if let Ok(cwd) = std::env::current_dir() {
             read_roots.push(cwd.to_string_lossy().to_string());
         }
     }
-    let mut perms = Permissions::new(&read_roots, allow_write, mode)
+    let mut perms = Permissions::new(&read_roots, &write_roots, mode)
         .map_err(|e| CliError::user(e.to_string()))?;
     if mode == Mode::Ask {
         perms = perms.with_prompter(Arc::new(CliPrompter));
@@ -2780,8 +5555,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         .protect_write_path(&setup.config_path.to_string_lossy())
         .map_err(|error| CliError::user(format!("cannot protect Kitsu config: {error}")))?;
     // Reserve the intended location even in a stateless run where it does not
-    // exist yet. A broad --allow-write/--yes grant must not become permission
-    // to mutate Kitsu's state if background discovery creates it later.
+    // exist yet. A broad write root or explicit global bypass must not become
+    // permission to mutate Kitsu's state if background discovery creates it.
     perms
         .protect_read_path(&setup.state_dir.to_string_lossy())
         .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
@@ -2792,15 +5567,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // In interactive chat the tools are always available (permissions gate access
     // at call time). Non-interactively, register a tool only when it can actually
     // succeed — so scripted runs with no flags advertise nothing, and a read-only
-    // grant doesn't advertise fs_write_file only to always deny it. --yes is
-    // deliberately excluded here: it only relaxes the approval policy for tools
-    // that are otherwise registered, it never registers a tool by itself (that
-    // stays an explicit opt-in via --allow-path/--allow-write/interactive).
-    let can_read = interactive || !allow_paths.is_empty() || !allow_write.is_empty();
-    let can_write = interactive || !allow_write.is_empty();
+    // grant doesn't advertise fs_write_file only to always deny it. Approval
+    // flags are deliberately excluded: they change fallback policy but never
+    // create capabilities. --allow-write is genuinely write-only; callers who
+    // want edit/readback workflows opt into --allow-read-write explicitly.
+    let can_read = !forced_one_shot
+        && (interactive || !allow_paths.is_empty() || !allow_read_write.is_empty());
+    let can_write = interactive || !allow_write.is_empty() || !allow_read_write.is_empty();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
-    let command_requested =
-        enable_commands || !command_roots.is_empty() || !allow_commands.is_empty();
+    let command_artifact_sink =
+        command_requested.then(command_artifact::CommandArtifactSink::default);
     let explicit_command_grants: Vec<Vec<String>> = allow_commands
         .iter()
         .map(|encoded| {
@@ -2829,6 +5605,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .map_err(|error| CliError::user(format!("invalid command policy: {error}")))?;
         if interactive {
             policy = policy.with_prompter(Arc::new(CliCommandPrompter));
+        }
+        if let Some(sink) = command_artifact_sink.as_ref() {
+            policy = policy.with_output_artifact_sink(Arc::new(sink.clone()));
         }
         let policy = Arc::new(policy);
         for argv in &explicit_command_grants {
@@ -2876,7 +5655,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     )));
     // Registry of BACKGROUND subagents (Stage C), shared with the spawn_agent_bg /
     // agent_result tools and the `/agents` command.
-    let agent_registry = subagent::AgentRegistry::new();
+    let agent_registry =
+        subagent::AgentRegistry::with_limits(subagent::AgentRegistryLimits::default());
 
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
@@ -2937,29 +5717,45 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
-    // A per-session dir for offloading large tool results (Stage 2). Persistent
-    // interactive sessions keep artifacts beside the snapshot so `/resume`
-    // never reloads dead /tmp pointers; ephemeral runs remove their scratch dir.
-    let persistent_artifacts = session_store
-        .as_ref()
-        .map(session::SessionStore::artifacts_dir);
+    // Offloaded tool results and complete developer-command output share one
+    // protected destination for the active session boundary. Durable sessions
+    // keep generations beneath their sidecar; stateless command generations
+    // remain under protected state so a one-shot process never prints a dead
+    // path. Stateless non-command generations share a per-run temp namespace
+    // that is removed when this process exits.
     // A pointer is useful only when this registry also exposes fs_read_file.
     // In command-only automation, offloading would replace usable inline
     // command output with a path the model has no tool capable of reading.
-    let desired_offload = if tool_names.is_empty() || !can_resolve_offload_pointers(&tool_names) {
-        None
+    let model_can_read_artifacts = can_resolve_offload_pointers(&tool_names);
+    let artifact_storage_enabled =
+        !tool_names.is_empty() && (model_can_read_artifacts || command_policy.is_some());
+    let stateless_artifact_base = if command_policy.is_some() {
+        setup.state_dir.join("artifacts")
     } else {
-        Some(persistent_artifacts.clone().unwrap_or_else(|| {
-            std::env::temp_dir().join(format!("kitsu-offload-{}", std::process::id()))
-        }))
+        std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id()))
     };
+    let mut artifact_directories = ArtifactDirectoryAllocator::default();
     let offload_state = Rc::new(RefCell::new(None));
-    if let Err(error) = activate_offload_dir(&perms, &offload_state, desired_offload) {
-        eprintln!("warning: large tool-result offloading disabled: {error}");
+    if let Err(error) = rotate_artifact_storage(
+        &perms,
+        &offload_state,
+        command_artifact_sink.as_ref(),
+        || {
+            artifact_directory_for_boundary(
+                &mut artifact_directories,
+                artifact_storage_enabled,
+                session_store.as_ref(),
+                &stateless_artifact_base,
+            )
+        },
+    ) {
+        eprintln!("warning: private artifact storage disabled: {error}");
     }
-    let offload_dir = offload_state.borrow().clone();
-    let _offload_guard = if persistent_artifacts.is_none() {
-        offload_dir.clone().map(OffloadDirGuard)
+    let offload_dir = model_can_read_artifacts
+        .then(|| offload_state.borrow().clone())
+        .flatten();
+    let _offload_guard = if session_store.is_none() && command_policy.is_none() {
+        Some(OffloadDirGuard(stateless_artifact_base.clone()))
     } else {
         None
     };
@@ -2979,7 +5775,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 model,
                 cli,
                 context_window.get(),
-                offload_state.borrow().clone(),
+                model_can_read_artifacts
+                    .then(|| offload_state.borrow().clone())
+                    .flatten(),
             )
         }
     };
@@ -3113,6 +5911,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             };
             model = resumed_model;
             context_window.set(resumed_window);
+            if !setup.context_window_pinned {
+                *setup
+                    .context_window_provenance
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    ContextWindowProvenance::live_discovery(resumed_window);
+            }
         }
         if no_project {
             project_context_source = None;
@@ -3128,8 +5933,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             provenance = resumed_provenance(&saved, &fresh_provenance);
         }
         eprintln!(
-            "~ resumed session {} (filesystem permissions start fresh)",
-            saved.id
+            "~ resumed session {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
+            saved.id,
+            perms.base_read_roots().len(),
+            perms.base_write_roots().len(),
         );
         messages = restored_messages(&saved, &fresh_system_message, no_project);
         session_state.meter.invalidate();
@@ -3155,9 +5962,90 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             kitsu_tools::CommandMode::Ask => "ask",
             kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
         }),
+        command_policy: command_policy.clone(),
+        invocation_command_grants: command_policy
+            .as_ref()
+            .map(|policy| policy.session_grants())
+            .unwrap_or_default(),
         window: context_window.clone(),
+        window_provenance: setup.context_window_provenance.clone(),
+        window_refresh: setup.context_window_refresh.clone(),
         max_tokens: cli.max_output_tokens,
         provenance: RefCell::new(provenance),
+    };
+
+    if cli.jsonl {
+        emit_jsonl(
+            "run_started",
+            serde_json::json!({
+                "mode": if scripted {
+                    "script"
+                } else if forced_one_shot {
+                    "review"
+                } else {
+                    "piped"
+                },
+                "gateway": setup.gateway_name,
+                "model": model,
+                "session_id": session.session_id.borrow().clone(),
+                "resumed": resumed_existing,
+                "durable_session": durable_session,
+            }),
+        )?;
+    }
+
+    if durable_session && !interactive {
+        eprintln!(
+            "~ session {} autosave enabled (snapshots never store grants; invocation grants: {} read, {} write)",
+            terminal_inline(
+                session
+                    .session_id
+                    .borrow()
+                    .as_deref()
+                    .unwrap_or("unavailable")
+            ),
+            perms.base_read_roots().len(),
+            perms.base_write_roots().len(),
+        );
+        // A failed resume must not rewrite or merely bump the saved snapshot.
+        // New durable automation needs an initial snapshot so its announced ID
+        // is immediately discoverable; resumed automation saves only after its
+        // first successful turn/command.
+        if !resumed_existing {
+            persist_session_required(&session_store, &session, &model, &messages)?;
+        }
+    }
+
+    let mut initial_review_submission = if let Some(review) = initial_review {
+        report_write_checkpoints(write_journal.drain_and_take_reports().await);
+        let evidence =
+            authorized_workspace_review(&session, &perms, &write_journal, review.request)
+                .await
+                .map_err(|error| {
+                    CliError::user(format!("cannot prepare verified review: {error}"))
+                })?;
+        if review_evidence_is_empty(&evidence) {
+            return Err(CliError::user(format!(
+                "nothing to review for verified {}",
+                review_target_label(&evidence)
+            )));
+        }
+        if !cli.jsonl {
+            eprintln!("~ verified {}", review_target_label(&evidence));
+        }
+        let mut prompt = verified_review_prompt(&evidence);
+        if let Some(instructions) = review
+            .instructions
+            .as_deref()
+            .map(str::trim)
+            .filter(|instructions| !instructions.is_empty())
+        {
+            prompt.push_str("\n\nAdditional user review instructions:\n");
+            prompt.push_str(instructions);
+        }
+        Some(SubmittedPrompt::review(prompt))
+    } else {
+        None
     };
 
     // Scripted mode: run turns from a file non-interactively, then exit. Works
@@ -3178,23 +6066,31 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             &context_window,
             &live_mw,
             &agent_registry,
+            &session_store,
             allow_turn_errors,
         )
         .await;
     }
 
-    // Non-TTY stdin → one-shot, no interactive loop (development_plan.md).
-    if !kitsu_render::stdin_is_tty() {
-        let prompt = match first_prompt {
-            Some(p) => p.to_string(),
+    // Non-TTY stdin and explicit top-level review → one-shot, no interactive loop.
+    if forced_one_shot || !kitsu_render::stdin_is_tty() {
+        let submitted = match initial_review_submission.take() {
+            Some(review) => review,
             None => {
-                let buf = read_piped_stdin_cancellable()
-                    .await
-                    .ok_or_else(|| CliError::cancelled("stdin read cancelled by Ctrl+C"))?
-                    .map_err(|e| CliError::user(format!("failed to read stdin: {e}")))?;
-                buf.trim().to_string()
+                let prompt = match first_prompt {
+                    Some(p) => p.to_string(),
+                    None => {
+                        let buf = read_piped_stdin_cancellable()
+                            .await
+                            .ok_or_else(|| CliError::cancelled("stdin read cancelled by Ctrl+C"))?
+                            .map_err(|e| CliError::user(format!("failed to read stdin: {e}")))?;
+                        buf.trim().to_string()
+                    }
+                };
+                SubmittedPrompt::full(prompt)
             }
         };
+        let prompt = submitted.text.clone();
         if prompt.is_empty() {
             return Err(CliError::user(
                 "chat: no input (provide a prompt or pipe text on stdin)".to_string(),
@@ -3204,73 +6100,89 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             emit_jsonl(
                 "turn_started",
                 serde_json::json!({"turn_id": "piped:1", "input": &prompt}),
-            );
+            )?;
         }
-        let expanded = match await_cancellable(attachments::expand(&prompt, &perms)).await {
-            Some(Ok(expanded)) => expanded,
-            Some(Err(error)) => {
-                eprintln!("attachment error: {}", terminal_inline(&error));
-                let mapped = CliError::user(error);
-                if cli.jsonl {
-                    emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "kind": "attachment",
-                            "message": mapped.to_string(),
-                            "exit_code": mapped.exit_code(),
-                        }),
-                    );
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                    );
-                    emit_jsonl_summary("error", 1, 0);
+        let (expanded_text, attachment_labels) = if submitted.tool_mode == TurnToolMode::None {
+            (prompt.clone(), Vec::new())
+        } else {
+            match await_cancellable(attachments::expand(&prompt, &perms)).await {
+                Some(Ok(expanded)) => (expanded.text, expanded.labels),
+                Some(Err(error)) => {
+                    if !cli.jsonl {
+                        eprintln!("attachment error: {}", terminal_inline(&error));
+                    }
+                    let mapped = CliError::user(error);
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "attachment",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                        )?;
+                        emit_jsonl_summary("error", 1, 0)?;
+                    }
+                    return Err(mapped);
                 }
-                return Err(mapped);
-            }
-            None => {
-                let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
-                if cli.jsonl {
-                    emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "kind": "cancelled",
-                            "message": mapped.to_string(),
-                            "exit_code": mapped.exit_code(),
-                        }),
-                    );
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                    );
-                    emit_jsonl_summary("cancelled", 1, 0);
+                None => {
+                    let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "cancelled",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                        )?;
+                        emit_jsonl_summary("cancelled", 1, 0)?;
+                    }
+                    return Err(mapped);
                 }
-                return Err(mapped);
             }
         };
-        if !expanded.labels.is_empty() {
-            eprintln!("~ attached {} file(s):", expanded.labels.len());
-            for label in &expanded.labels {
+        if !cli.jsonl && !attachment_labels.is_empty() {
+            eprintln!("~ attached {} file(s):", attachment_labels.len());
+            for label in &attachment_labels {
                 eprintln!("  - {}", terminal_inline(label));
             }
         }
         let agent_watermark = agent_registry.watermark();
-        let journal_turn = write_journal.begin_attributed_turn(&prompt);
+        let journal_label = if submitted.tool_mode == TurnToolMode::None {
+            "verified review"
+        } else {
+            &prompt
+        };
+        let journal_turn = write_journal.begin_attributed_turn(journal_label);
         if let Some(previous) = journal_turn.previous {
             report_write_checkpoint(previous);
         }
-        messages.push(ChatMessage::user(expanded.text));
-        let mut cfg = base_cfg(model, cli);
-        let event_log = cli.jsonl.then(kitsu_core::AgentEventLog::default);
-        cfg.event_log = event_log.clone();
+        messages.push(ChatMessage::user(expanded_text));
+        let mut cfg = base_cfg(model.clone(), cli);
+        let event_log = live_agent_event_log(cli.jsonl, "piped:1");
+        cfg.event_log = Some(event_log.clone());
+        let no_tools = Registry::new();
+        let turn_tools = match submitted.tool_mode {
+            TurnToolMode::Full => &tools,
+            TurnToolMode::None => &no_tools,
+        };
         let outcome = write_journal
             .scope_turn(
                 &journal_turn.token,
                 run_turn_cancellable(
                     &setup.provider,
-                    &tools,
+                    turn_tools,
                     &mut messages,
                     &cfg,
                     &mut session_state,
@@ -3281,13 +6193,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
             report_write_checkpoint(report);
         }
-        if let Some(log) = &event_log {
-            let assistant = match &outcome {
-                TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
-                _ => None,
-            };
-            emit_agent_trace("piped:1", log, assistant);
-        }
+        let assistant = match &outcome {
+            TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
+            _ => None,
+        };
+        finish_agent_trace(cli, "piped:1", &event_log, assistant)?;
         return match outcome {
             TurnOutcome::Completed(Ok(_)) => {
                 let unfinished_agents = agent_registry.running();
@@ -3305,12 +6215,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 "message": mapped.to_string(),
                                 "exit_code": mapped.exit_code(),
                             }),
-                        );
+                        )?;
                         emit_jsonl(
                             "turn_finished",
                             serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        );
-                        emit_jsonl_summary("error", 1, 1);
+                        )?;
+                        emit_jsonl_summary("error", 1, 1)?;
                     }
                     return Err(mapped);
                 }
@@ -3331,12 +6241,33 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 "message": mapped.to_string(),
                                 "exit_code": mapped.exit_code(),
                             }),
-                        );
+                        )?;
                         emit_jsonl(
                             "turn_finished",
                             serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        );
-                        emit_jsonl_summary("error", 1, 1);
+                        )?;
+                        emit_jsonl_summary("error", 1, 1)?;
+                    }
+                    return Err(mapped);
+                }
+                if let Err(mapped) =
+                    persist_session_required(&session_store, &session, &model, &messages)
+                {
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "session",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                        )?;
+                        emit_jsonl_summary("error", 1, 0)?;
                     }
                     return Err(mapped);
                 }
@@ -3344,15 +6275,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": "piped:1", "status": "ok"}),
-                    );
-                    emit_jsonl_summary("ok", 0, 0);
+                    )?;
+                    emit_jsonl_summary("ok", 0, 0)?;
                 }
                 Ok(())
             }
             TurnOutcome::Completed(Err(error)) => {
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
-                let mapped = map_agent_error(error);
+                let mapped = map_agent_error(
+                    error,
+                    ProviderOperation::Chat { model: &model },
+                    Some(cli.timeout_secs),
+                );
                 if cli.jsonl {
                     emit_jsonl(
                         "error",
@@ -3362,16 +6297,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             "message": mapped.to_string(),
                             "exit_code": mapped.exit_code(),
                         }),
-                    );
+                    )?;
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                    );
+                    )?;
                     emit_jsonl_summary(
                         "error",
                         1,
                         usize::from(mapped.exit_code() == EXIT_PROVIDER),
-                    );
+                    )?;
                 }
                 Err(mapped)
             }
@@ -3388,12 +6323,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             "message": mapped.to_string(),
                             "exit_code": mapped.exit_code(),
                         }),
-                    );
+                    )?;
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                    );
-                    emit_jsonl_summary("cancelled", 1, 0);
+                    )?;
+                    emit_jsonl_summary("cancelled", 1, 0)?;
                 }
                 Err(mapped)
             }
@@ -3415,46 +6350,41 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     rl.set_helper(Some(ChatHelper {
         permissions: perms.clone(),
     }));
-    let agent_notification_task = if kitsu_render::plain_mode() {
+    let foreground_typeahead_active = Arc::new(AtomicBool::new(false));
+    let (deferred_notice_sender, deferred_notice_receiver) = std::sync::mpsc::channel::<String>();
+    let agent_notification_task = rl.create_external_printer().ok().map(|mut printer| {
         let mut changes = agent_registry.subscribe();
         let notification_journal = write_journal.clone();
-        Some(tokio::spawn(async move {
+        let typeahead_active = foreground_typeahead_active.clone();
+        let deferred = deferred_notice_sender.clone();
+        tokio::spawn(async move {
             let mut previous = *changes.borrow_and_update();
             while changes.changed().await.is_ok() {
                 let current = *changes.borrow_and_update();
                 if let Some(message) = background_agent_notice(previous, current) {
-                    eprintln!("\n{message}");
+                    let notice = kitsu_render::PromptSafeAsyncNotice::info(message);
+                    if typeahead_active.load(Ordering::Acquire)
+                        || notice.publish_with(|frame| printer.print(frame)).is_err()
+                    {
+                        let _ = deferred.send(notice.line());
+                    }
                 }
                 if current.terminal > previous.terminal {
                     for report in notification_journal.drain_and_take_reports().await {
-                        eprintln!("{}", format_write_checkpoint(&report));
+                        let notice = kitsu_render::PromptSafeAsyncNotice::info(
+                            format_write_checkpoint(&report),
+                        );
+                        if typeahead_active.load(Ordering::Acquire)
+                            || notice.publish_with(|frame| printer.print(frame)).is_err()
+                        {
+                            let _ = deferred.send(notice.line());
+                        }
                     }
                 }
                 previous = current;
             }
-        }))
-    } else {
-        rl.create_external_printer().ok().map(|mut printer| {
-            let mut changes = agent_registry.subscribe();
-            let notification_journal = write_journal.clone();
-            tokio::spawn(async move {
-                let mut previous = *changes.borrow_and_update();
-                while changes.changed().await.is_ok() {
-                    let current = *changes.borrow_and_update();
-                    if let Some(message) = background_agent_notice(previous, current) {
-                        let _ = printer.print(format!("\n{message}\n"));
-                    }
-                    if current.terminal > previous.terminal {
-                        for report in notification_journal.drain_and_take_reports().await {
-                            let _ =
-                                printer.print(format!("\n{}\n", format_write_checkpoint(&report)));
-                        }
-                    }
-                    previous = current;
-                }
-            })
         })
-    };
+    });
     let agent_notifications_live = agent_notification_task.is_some();
     let history_path = setup.state_dir.join("history");
     if !no_session {
@@ -3475,6 +6405,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let prompt_queue = Arc::new(std::sync::Mutex::new(prompt_queue::PromptQueue::new(
         PROMPT_QUEUE_CAPACITY,
     )));
+    let steering =
+        prompt_queue::SteeringChannel::new(STEERING_CAPACITY).expect("positive steering capacity");
     if let Some(first) = first_prompt {
         prompt_queue
             .lock()
@@ -3590,7 +6522,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             // swapped the model and re-discovered the window).
             *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
             match result {
-                SlashResult::Continue => {
+                SlashResult::Continue(_) => {
                     if slash_name == "clear" {
                         last_failed = None;
                     }
@@ -3612,19 +6544,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     break;
                 }
                 SlashResult::SubmitPrompt(prompt) => submitted = prompt,
-                SlashResult::QueuePrompt(prompt) => {
+                SlashResult::QueueAction(command) => {
                     let mut queue = prompt_queue.lock().expect("prompt queue");
-                    match prompt {
-                        Some(prompt) => match queue.enqueue(prompt) {
-                            Ok(status) => eprintln!("~ {status}"),
-                            Err(error) => eprintln!(
-                                "queue refused a {}-character prompt at capacity {}; finish a queued turn and try again",
-                                error.prompt().chars().count(),
-                                error.capacity()
-                            ),
-                        },
-                        None => eprintln!("~ {}", queue.status()),
-                    }
+                    apply_queue_command(&mut queue, command);
                     continue;
                 }
                 SlashResult::Retry => {
@@ -3671,32 +6593,31 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         &explicit_command_grants,
                         &session.directory,
                     );
-                    let desired_offload = if !can_resolve_offload_pointers(&session.tool_names) {
-                        None
-                    } else if let Some(store) = session_store.as_ref() {
-                        Some(store.artifacts_dir())
-                    } else {
-                        // `--no-session` keeps one private scratch directory,
-                        // but erases its old-session contents at the boundary.
-                        let current = session.offload_dir.borrow().clone();
-                        if let Some(dir) = current.as_ref() {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                        current
-                    };
-                    if let Err(error) =
-                        activate_offload_dir(&perms, &session.offload_dir, desired_offload)
-                    {
-                        eprintln!("warning: large tool-result offloading disabled: {error}");
+                    if let Err(error) = rotate_artifact_storage(
+                        &perms,
+                        &session.offload_dir,
+                        command_artifact_sink.as_ref(),
+                        || {
+                            artifact_directory_for_boundary(
+                                &mut artifact_directories,
+                                artifact_storage_enabled,
+                                session_store.as_ref(),
+                                &stateless_artifact_base,
+                            )
+                        },
+                    ) {
+                        eprintln!("warning: private artifact storage disabled: {error}");
                     }
                     persist_session(&session_store, &session, &model, &messages);
                     eprintln!(
-                        "~ started new session {}",
+                        "~ started new session {} (runtime grants reset; invocation grants retained: {} read, {} write)",
                         session
                             .session_id
                             .borrow()
                             .as_deref()
-                            .unwrap_or("(autosave disabled)")
+                            .unwrap_or("(autosave disabled)"),
+                        perms.base_read_roots().len(),
+                        perms.base_write_roots().len(),
                     );
                     continue;
                 }
@@ -3781,6 +6702,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     };
                     model = resumed_model;
                     context_window.set(resumed_window);
+                    if !setup.context_window_pinned {
+                        *session
+                            .window_provenance
+                            .lock()
+                            .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                            ContextWindowProvenance::live_discovery(resumed_window);
+                    }
                     if let Some(store) = resumed_store {
                         session_store = Some(store);
                         *session.session_id.borrow_mut() = Some(saved.id.clone());
@@ -3791,21 +6719,20 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         &explicit_command_grants,
                         &session.directory,
                     );
-                    let desired_offload = if !can_resolve_offload_pointers(&session.tool_names) {
-                        None
-                    } else if let Some(store) = session_store.as_ref() {
-                        Some(store.artifacts_dir())
-                    } else {
-                        let current = session.offload_dir.borrow().clone();
-                        if let Some(dir) = current.as_ref() {
-                            let _ = std::fs::remove_dir_all(dir);
-                        }
-                        current
-                    };
-                    if let Err(error) =
-                        activate_offload_dir(&perms, &session.offload_dir, desired_offload)
-                    {
-                        eprintln!("warning: large tool-result offloading disabled: {error}");
+                    if let Err(error) = rotate_artifact_storage(
+                        &perms,
+                        &session.offload_dir,
+                        command_artifact_sink.as_ref(),
+                        || {
+                            artifact_directory_for_boundary(
+                                &mut artifact_directories,
+                                artifact_storage_enabled,
+                                session_store.as_ref(),
+                                &stateless_artifact_base,
+                            )
+                        },
+                    ) {
+                        eprintln!("warning: private artifact storage disabled: {error}");
                     }
                     if no_project {
                         *session.project_context.borrow_mut() = None;
@@ -3831,8 +6758,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     *live_mw.lock().expect("live model/window") =
                         (model.clone(), context_window.get());
                     eprintln!(
-                        "~ resumed {} (runtime permissions reset; saved permissions are never restored)",
-                        saved.id
+                        "~ resumed {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
+                        saved.id,
+                        perms.base_read_roots().len(),
+                        perms.base_write_roots().len(),
                     );
                     continue;
                 }
@@ -3955,25 +6884,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             report_write_checkpoint(previous);
         }
         messages.push(ChatMessage::user(expanded.text));
-        let cfg = base_cfg(model.clone(), cli);
+        let mut cfg = base_cfg(model.clone(), cli);
+        let event_log = live_agent_event_log(false, "interactive");
+        cfg.event_log = Some(event_log.clone());
         let turn_tools = match submitted.tool_mode {
             TurnToolMode::Full => &tools,
             TurnToolMode::None => &no_tools,
         };
-        let typeahead = TypeaheadCollector::start(prompt_queue.clone());
+        // Publish the active steering token before stdin collection starts, so
+        // even an immediately submitted `/steer` targets this exact turn.
+        let (steering_turn, steering_receiver) = steering
+            .begin_turn()
+            .expect("interactive turns open steering sequentially");
+        foreground_typeahead_active.store(true, Ordering::Release);
+        let typeahead = TypeaheadCollector::start(prompt_queue.clone(), steering.clone());
         let turn_outcome = write_journal
             .scope_turn(
                 &journal_turn.token,
-                run_turn_cancellable(
+                run_turn_steerable(
                     &setup.provider,
                     turn_tools,
                     &mut messages,
                     &cfg,
                     &mut session_state,
+                    &steering,
+                    steering_turn,
+                    steering_receiver,
                 ),
             )
             .await;
         let captured = typeahead.finish();
+        foreground_typeahead_active.store(false, Ordering::Release);
+        while let Ok(notice) = deferred_notice_receiver.try_recv() {
+            eprintln!("{notice}");
+        }
         if captured.captured > 0 {
             let status = prompt_queue.lock().expect("prompt queue").status();
             eprintln!("~ captured type-ahead: {status}");
@@ -3982,12 +6926,26 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             exit_after_queue = true;
             eprintln!("~ end of input received; exiting after queued prompts finish");
         }
+        for error in captured.steering_errors {
+            eprintln!("steering refused: {}", terminal_inline(&error));
+        }
+        for notice in captured.queue_notices {
+            eprintln!("~ {}", kitsu_render::sanitize_terminal_text(&notice));
+        }
+        for error in captured.queue_errors {
+            eprintln!("queue refused: {}", terminal_inline(&error));
+        }
         report_write_checkpoints(write_journal.drain_and_take_reports().await);
         if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
             report_write_checkpoint(report);
         }
+        let assistant = match &turn_outcome {
+            InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Ok(text))) => Some(text.as_str()),
+            _ => None,
+        };
+        finish_agent_trace(cli, "interactive", &event_log, assistant)?;
         match turn_outcome {
-            TurnOutcome::Completed(Ok(text)) => {
+            InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Ok(text))) => {
                 last_failed = None;
                 // The model can return an empty completion for vague inputs;
                 // say so instead of looking hung.
@@ -3996,7 +6954,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 }
                 persist_session(&session_store, &session, &model, &messages);
             }
-            TurnOutcome::Completed(Err(e)) => {
+            InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(e))) => {
                 messages = messages_before;
                 session_state = state_before;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -4007,7 +6965,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     "~ failed turn rolled back; completed file changes, if any, remain on disk"
                 );
             }
-            TurnOutcome::Cancelled => {
+            InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled) => {
                 messages = messages_before;
                 session_state = state_before;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -4015,6 +6973,28 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 last_failed = Some(retry_prompt);
                 kitsu_render::finish_line();
                 eprintln!("^C (response cancelled; turn rolled back - /retry to try again)");
+                eprintln!("~ completed file changes, if any, remain on disk");
+            }
+            InteractiveTurnOutcome::Steered(corrections) => {
+                messages = messages_before;
+                session_state = state_before;
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                let mut restarted = retry_prompt;
+                restarted.text.push_str(
+                    "\n\n[User steering correction; restart this turn using the updated direction below.]",
+                );
+                for correction in &corrections {
+                    restarted.text.push_str("\n- ");
+                    restarted.text.push_str(correction);
+                }
+                last_failed = Some(restarted);
+                priority_command = Some("/retry".to_string());
+                kitsu_render::finish_line();
+                eprintln!(
+                    "~ steering accepted ({} correction(s)); partial response rolled back and the turn will restart before queued prompts",
+                    corrections.len()
+                );
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
         }
@@ -4064,13 +7044,13 @@ impl SubmittedPrompt {
 }
 
 enum SlashResult {
-    Continue,
+    Continue(Option<serde_json::Value>),
     Quit,
     Error,
     ProviderFailure(String),
     Cancelled,
     SubmitPrompt(SubmittedPrompt),
-    QueuePrompt(Option<String>),
+    QueueAction(QueueCommand),
     Retry,
     NewSession,
     ResumeSession(String),
@@ -4083,6 +7063,163 @@ enum SlashResult {
     ArchiveSession(String),
     RestoreSession(String),
     DeleteSession(String),
+}
+
+enum QueueCommand {
+    List,
+    Add(String),
+    Remove(usize),
+    Edit(usize, String),
+    Move { from: usize, to: usize },
+    Promote(usize),
+    Clear,
+}
+
+fn parse_queue_position(value: Option<&str>, usage: &str) -> Result<usize, String> {
+    let Some(position) = value.and_then(|value| value.parse::<usize>().ok()) else {
+        return Err(usage.to_string());
+    };
+    position
+        .checked_sub(1)
+        .ok_or_else(|| "queue positions start at 1".to_string())
+}
+
+fn parse_queue_command(arg: &str) -> Result<QueueCommand, String> {
+    let arg = arg.trim();
+    if arg.is_empty() || arg == "list" {
+        return Ok(QueueCommand::List);
+    }
+    let mut words = arg.split_whitespace();
+    match words.next().unwrap_or_default() {
+        "add" => {
+            let text = arg.strip_prefix("add").unwrap_or_default().trim();
+            if text.is_empty() {
+                Err("usage: /queue add <prompt>".to_string())
+            } else {
+                Ok(QueueCommand::Add(text.to_string()))
+            }
+        }
+        "remove" => {
+            let position = parse_queue_position(words.next(), "usage: /queue remove <number>")?;
+            if words.next().is_some() {
+                return Err("usage: /queue remove <number>".to_string());
+            }
+            Ok(QueueCommand::Remove(position))
+        }
+        "edit" => {
+            let position =
+                parse_queue_position(words.next(), "usage: /queue edit <number> <prompt>")?;
+            let mut split = arg.splitn(3, char::is_whitespace);
+            let _ = split.next();
+            let _ = split.next();
+            let replacement = split.next().unwrap_or_default().trim();
+            if replacement.is_empty() {
+                Err("usage: /queue edit <number> <prompt>".to_string())
+            } else {
+                Ok(QueueCommand::Edit(position, replacement.to_string()))
+            }
+        }
+        "move" => {
+            let from = parse_queue_position(words.next(), "usage: /queue move <from> <to>")?;
+            let to = parse_queue_position(words.next(), "usage: /queue move <from> <to>")?;
+            if words.next().is_some() {
+                return Err("usage: /queue move <from> <to>".to_string());
+            }
+            Ok(QueueCommand::Move { from, to })
+        }
+        "promote" => {
+            let position = parse_queue_position(words.next(), "usage: /queue promote <number>")?;
+            if words.next().is_some() {
+                return Err("usage: /queue promote <number>".to_string());
+            }
+            Ok(QueueCommand::Promote(position))
+        }
+        "clear" if words.next().is_none() => Ok(QueueCommand::Clear),
+        // Preserve the original `/queue <prompt>` shorthand.
+        _ => Ok(QueueCommand::Add(arg.to_string())),
+    }
+}
+
+fn queue_prompt_preview(prompt: &str) -> String {
+    let mut preview = terminal_inline(prompt)
+        .chars()
+        .take(120)
+        .collect::<String>();
+    if terminal_inline(prompt).chars().count() > 120 {
+        preview.push_str("...");
+    }
+    preview
+}
+
+fn execute_queue_command(
+    queue: &mut prompt_queue::PromptQueue,
+    command: QueueCommand,
+) -> Result<String, String> {
+    match command {
+        QueueCommand::List => {
+            let mut output = queue.status().to_string();
+            for (index, prompt) in queue.iter().enumerate() {
+                output.push_str(&format!(
+                    "\n  [{}] {}",
+                    index + 1,
+                    queue_prompt_preview(prompt)
+                ));
+            }
+            Ok(output)
+        }
+        QueueCommand::Add(prompt) => match queue.enqueue(prompt) {
+            Ok(status) => Ok(status.to_string()),
+            Err(error) => Err(format!(
+                    "queue refused a {}-character prompt at capacity {}; finish or remove a queued turn and try again",
+                    error.prompt().chars().count(),
+                    error.capacity()
+                )),
+        },
+        QueueCommand::Remove(index) => match queue.remove(index) {
+            Some(prompt) => Ok(format!(
+                "removed queued prompt [{}]: {}",
+                index + 1,
+                queue_prompt_preview(&prompt)
+            )),
+            None => Err(format!("queue position {} is out of range", index + 1)),
+        },
+        QueueCommand::Edit(index, replacement) => match queue.edit(index, replacement) {
+            Ok(_) => Ok(format!("edited queued prompt [{}]", index + 1)),
+            Err(error) => Err(format!(
+                    "{error}; {}-character replacement was not queued",
+                    error.replacement().chars().count()
+                )),
+        },
+        QueueCommand::Move { from, to } => match queue.reorder(from, to) {
+            Ok(()) => Ok(format!(
+                "moved queued prompt [{}] -> [{}]",
+                from + 1,
+                to + 1
+            )),
+            Err(error) => Err(error.to_string()),
+        },
+        QueueCommand::Promote(index) => match queue.promote(index) {
+            Ok(()) => Ok(format!("promoted queued prompt [{}] to run next", index + 1)),
+            Err(error) => Err(error.to_string()),
+        },
+        QueueCommand::Clear => {
+            let removed = queue.clear();
+            Ok(format!("cleared {} queued prompt(s)", removed.len()))
+        }
+    }
+}
+
+fn apply_queue_command(queue: &mut prompt_queue::PromptQueue, command: QueueCommand) -> bool {
+    match execute_queue_command(queue, command) {
+        Ok(message) => {
+            eprintln!("~ {message}");
+            true
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            false
+        }
+    }
 }
 
 fn edit_distance(left: &str, right: &str) -> usize {
@@ -4121,6 +7258,89 @@ fn slash_syntax(name: &str) -> String {
         .unwrap_or_else(|| format!("/{name}"))
 }
 
+async fn refresh_session_context_window(
+    model: &str,
+    provider: &OpenAICompatProvider,
+    session: &SessionInfo,
+    context_window: &Rc<Cell<Option<u64>>>,
+    context_window_pinned: bool,
+    jsonl: bool,
+) -> SlashResult {
+    if context_window_pinned {
+        let source = context_window_provenance(&session.window_provenance)
+            .source
+            .label();
+        if !jsonl {
+            eprintln!(
+                "context window is pinned by {source}; remove that setting before discovery refresh"
+            );
+        }
+        return SlashResult::Error;
+    }
+    if !session.window_refresh.enabled() {
+        if !jsonl {
+            eprintln!(
+                "context-window refresh is unavailable because models_path is not configured"
+            );
+        }
+        return SlashResult::Error;
+    }
+    let cache_key = session.window_refresh.cache_key(model);
+    let Some(outcome) = await_cancellable(refresh_cached_context_window(
+        provider,
+        model,
+        &session.window_refresh.cache_path,
+        &cache_key,
+    ))
+    .await
+    else {
+        if !jsonl {
+            eprintln!("^C (context-window refresh cancelled)");
+        }
+        return SlashResult::Cancelled;
+    };
+    let (window, cache_written) = match outcome {
+        ContextWindowRefreshOutcome::Cached(window) => (window, true),
+        ContextWindowRefreshOutcome::DiscoveredButNotCached(window) => (window, false),
+        ContextWindowRefreshOutcome::NoMetadata => {
+            session
+                .window_provenance
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .discovery = ContextWindowDiscoveryState::FinishedWithoutMetadata;
+            if !jsonl {
+                eprintln!(
+                    "context-window refresh returned no usable metadata (or the advisory request failed); the current window is unchanged"
+                );
+            }
+            return SlashResult::Error;
+        }
+    };
+    context_window.set(Some(window));
+    *session
+        .window_provenance
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        ContextWindowProvenance::refreshed(cache_written);
+    if !jsonl {
+        eprintln!(
+            "~ refreshed context window for {}: {window} tokens ({})",
+            terminal_inline(model),
+            if cache_written {
+                "cached for later runs"
+            } else {
+                "private cache write failed; current run updated"
+            }
+        );
+    }
+    SlashResult::Continue(Some(serde_json::json!({
+        "kind": "context_refresh",
+        "model": model,
+        "window": window,
+        "cache_written": cache_written,
+    })))
+}
+
 /// Handle a slash command (the leading `/` already stripped).
 #[allow(clippy::too_many_arguments)]
 async fn handle_slash(
@@ -4147,18 +7367,15 @@ async fn handle_slash(
         && matches!(
             name,
             "clear"
+                | "checkpoints"
                 | "compact"
-                | "context"
-                | "exit"
                 | "help"
                 | "new"
                 | "permissions"
-                | "quit"
                 | "retry"
                 | "sessions"
                 | "status"
                 | "tools"
-                | "undo"
         )
     {
         eprintln!("usage: {}", slash_syntax(name));
@@ -4166,16 +7383,78 @@ async fn handle_slash(
     }
 
     match name {
-        "quit" | "exit" => return SlashResult::Quit,
+        "quit" | "exit" => {
+            match arg {
+                "" => {}
+                "wait" => {
+                    await_background_agents(
+                        registry,
+                        "exit requested with wait while background jobs are running",
+                    )
+                    .await;
+                }
+                "cancel" => {
+                    let cancelled = registry.cancel_all().await;
+                    eprintln!(
+                        "~ cancelled and joined {} background job(s) before exit",
+                        cancelled.len()
+                    );
+                }
+                _ => {
+                    eprintln!("usage: /{name} [wait|cancel]");
+                    return SlashResult::Error;
+                }
+            }
+            return SlashResult::Quit;
+        }
         "" | "help" => {
             eprintln!("{}", slash_help(model));
         }
-        "status" => eprintln!(
-            "{}",
-            format_session_status(model, messages, session, perms, registry, state)
-        ),
-        "permissions" => eprintln!("{}", format_permissions(perms, session)),
-        "context" => render_context_command(model, messages, session, state),
+        "status" => {
+            let text = format_session_status(model, messages, session, perms, registry, state);
+            if !cli.jsonl {
+                eprintln!("{text}");
+            }
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "status",
+                "text": text,
+            })));
+        }
+        "permissions" => {
+            let text = format_permissions(perms, session);
+            if !cli.jsonl {
+                eprintln!("{text}");
+            }
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "permissions",
+                "text": text,
+            })));
+        }
+        "context" => match arg {
+            "" => {
+                if !cli.jsonl {
+                    render_context_command(model, messages, session, state);
+                }
+                return SlashResult::Continue(Some(context_command_payload(
+                    model, messages, session, state,
+                )));
+            }
+            "refresh" => {
+                return refresh_session_context_window(
+                    model,
+                    provider,
+                    session,
+                    context_window,
+                    context_window_pinned,
+                    cli.jsonl,
+                )
+                .await;
+            }
+            _ => {
+                eprintln!("usage: {}", slash_syntax("context"));
+                return SlashResult::Error;
+            }
+        },
         "compact" => {
             let cfg = build_agent_config(
                 model.clone(),
@@ -4231,13 +7510,46 @@ async fn handle_slash(
                 }
             }
         }
+        "checkpoints" => {
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            eprintln!(
+                "{}",
+                format_checkpoint_summaries(&journal.checkpoint_summaries())
+            );
+        }
+        "checkpoint" => {
+            let id = match parse_exact_checkpoint_id(arg) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("usage: /checkpoint <id> ({})", terminal_inline(&error));
+                    return SlashResult::Error;
+                }
+            };
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            match journal.checkpoint_preview(id) {
+                Some(report) => eprintln!("{}", format_write_checkpoint(&report)),
+                None => {
+                    eprintln!(
+                        "checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints"
+                    );
+                    return SlashResult::Error;
+                }
+            }
+        }
         "undo" => {
+            let id = match parse_optional_checkpoint_id(arg) {
+                Ok(id) => id,
+                Err(error) => {
+                    eprintln!("usage: /undo [id] ({})", terminal_inline(&error));
+                    return SlashResult::Error;
+                }
+            };
             if registry.running() > 0 {
                 eprintln!("undo blocked while background agents are running; use /agents and wait for them to finish");
                 return SlashResult::Error;
             }
             report_write_checkpoints(journal.drain_and_take_reports().await);
-            match journal.undo_last(perms).await {
+            match undo_write_checkpoint(journal, perms, id).await {
                 Ok(report) => {
                     eprintln!(
                         "~ restored checkpoint #{} ({}):",
@@ -4249,33 +7561,77 @@ async fn handle_slash(
                     }
                 }
                 Err(error) => {
-                    eprintln!("undo failed: {error}");
+                    eprintln!("undo failed: {}", terminal_inline(&error.to_string()));
                     return SlashResult::Error;
                 }
             }
         }
-        "diff" => match authorized_workspace_diff(session, perms, arg).await {
-            Ok(diff) => kitsu_render::render_diff(&diff),
-            Err(error) => {
-                eprintln!("cannot show diff: {error}");
-                return SlashResult::Error;
+        "diff" => {
+            let request = match parse_review_request(arg) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!(
+                        "usage: /diff {REVIEW_SCOPE_USAGE} ({})",
+                        terminal_inline(&error)
+                    );
+                    return SlashResult::Error;
+                }
+            };
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            match authorized_workspace_review(session, perms, journal, request).await {
+                Ok(evidence) => {
+                    if !cli.jsonl {
+                        eprintln!("~ verified {}", review_target_label(&evidence));
+                    }
+                    if !cli.jsonl {
+                        kitsu_render::render_diff(&evidence.diff);
+                    }
+                    return SlashResult::Continue(Some(serde_json::json!({
+                        "kind": "diff",
+                        "target": evidence.target,
+                        "resolved_revision": evidence.resolved_revision,
+                        "merge_base": evidence.merge_base,
+                        "truncated": evidence.truncated,
+                        "diff": evidence.diff,
+                    })));
+                }
+                Err(error) => {
+                    eprintln!("cannot show diff: {}", terminal_inline(&error));
+                    return SlashResult::Error;
+                }
             }
-        },
-        "review" => match authorized_workspace_diff(session, perms, arg).await {
-            Ok(diff) if diff == "(working tree clean)" => {
-                eprintln!("nothing to review: working tree clean");
-                return SlashResult::Error;
+        }
+        "review" => {
+            let request = match parse_review_request(arg) {
+                Ok(request) => request,
+                Err(error) => {
+                    eprintln!(
+                        "usage: /review {REVIEW_SCOPE_USAGE} ({})",
+                        terminal_inline(&error)
+                    );
+                    return SlashResult::Error;
+                }
+            };
+            report_write_checkpoints(journal.drain_and_take_reports().await);
+            match authorized_workspace_review(session, perms, journal, request).await {
+                Ok(evidence) if review_evidence_is_empty(&evidence) => {
+                    eprintln!(
+                        "nothing to review for verified {}",
+                        review_target_label(&evidence)
+                    );
+                    return SlashResult::Error;
+                }
+                Ok(evidence) => {
+                    return SlashResult::SubmitPrompt(SubmittedPrompt::review(
+                        verified_review_prompt(&evidence),
+                    ));
+                }
+                Err(error) => {
+                    eprintln!("cannot review diff: {}", terminal_inline(&error));
+                    return SlashResult::Error;
+                }
             }
-            Ok(diff) => {
-                return SlashResult::SubmitPrompt(SubmittedPrompt::review(format!(
-                    "Review the following verified working-tree diff. Focus on correctness, security, regressions, and missing tests. Report findings by severity with file/line references. Do not claim anything outside this exact diff.\n\n```diff\n{diff}\n```"
-                )));
-            }
-            Err(error) => {
-                eprintln!("cannot review diff: {error}");
-                return SlashResult::Error;
-            }
-        },
+        }
         "new" => return SlashResult::NewSession,
         "fork" => {
             return SlashResult::ForkSession((!arg.is_empty()).then(|| arg.to_string()));
@@ -4318,7 +7674,19 @@ async fn handle_slash(
             });
         }
         "queue" => {
-            return SlashResult::QueuePrompt((!arg.is_empty()).then(|| arg.to_string()));
+            return match parse_queue_command(arg) {
+                Ok(command) => SlashResult::QueueAction(command),
+                Err(error) => {
+                    eprintln!("{error}");
+                    SlashResult::Error
+                }
+            };
+        }
+        "steer" => {
+            eprintln!(
+                "/steer is accepted only while a response is running; enter `/steer <correction>` as type-ahead during that turn"
+            );
+            return SlashResult::Error;
         }
         "retry" => return SlashResult::Retry,
         "sessions" => return SlashResult::ListSessions,
@@ -4332,24 +7700,26 @@ async fn handle_slash(
                 eprintln!("  - {name}");
             }
             if session.tool_names.is_empty() {
-                eprintln!("  none - pre-grant --allow-path/--allow-write for scripted runs");
+                eprintln!(
+                    "  none - pre-grant --allow-path, --allow-write, or --allow-read-write for scripted runs"
+                );
             }
         }
         "agents" => {
-            if arg.is_empty() {
-                eprintln!("{}", kitsu_render::sanitize_terminal_text(&registry.list()));
-            } else if let Ok(id) = arg.parse::<u64>() {
-                match registry.result(id) {
-                    Some(text) => {
-                        eprintln!("#{id}:\n{}", kitsu_render::sanitize_terminal_text(&text))
-                    }
-                    None => {
-                        eprintln!("no background agent #{id}");
-                        return SlashResult::Error;
-                    }
-                }
+            let command = if arg.is_empty() {
+                "list".to_string()
+            } else if arg.parse::<u64>().is_ok() {
+                format!("show {arg}")
             } else {
-                eprintln!("usage: /agents [id]");
+                eprintln!("usage: /agents [id] (or use /jobs for controls)");
+                return SlashResult::Error;
+            };
+            if !handle_jobs_command(registry, journal, &command).await {
+                return SlashResult::Error;
+            }
+        }
+        "jobs" => {
+            if !handle_jobs_command(registry, journal, arg).await {
                 return SlashResult::Error;
             }
         }
@@ -4376,7 +7746,7 @@ async fn handle_slash(
                             .any(|message| message.content.starts_with(&marker))
                         {
                             eprintln!("~ skill '{}' is already loaded", terminal_inline(&s.name));
-                            return SlashResult::Continue;
+                            return SlashResult::Continue(None);
                         }
                         let loaded = skills::load_skill(s);
                         if !s.links.is_empty() {
@@ -4397,12 +7767,15 @@ async fn handle_slash(
                 eprintln!("^C (model catalog request cancelled)");
                 return SlashResult::Cancelled;
             };
-            match result {
-                Ok(true) => {}
-                Ok(false) => return SlashResult::Error,
-                Err(ProviderError::Auth(_)) => return SlashResult::Error,
-                Err(error) => return SlashResult::ProviderFailure(error.to_string()),
-            }
+            return match finish_slash_model_catalog(result, cli.timeout_secs) {
+                Ok(models) => SlashResult::Continue(Some(serde_json::json!({
+                    "kind": "model_catalog",
+                    "filter": arg,
+                    "count": models.len(),
+                    "models": models,
+                }))),
+                Err(result) => result,
+            };
         }
         "allow" => {
             if arg.is_empty() {
@@ -4420,6 +7793,30 @@ async fn handle_slash(
                         eprintln!("{e}");
                         return SlashResult::Error;
                     }
+                }
+            }
+        }
+        "allow-read-write" => {
+            if arg.is_empty() {
+                eprintln!("usage: /allow-read-write <path> (grant both read and write access)");
+                return SlashResult::Error;
+            }
+            let read_enabled = session.tool_names.iter().any(|name| name == "fs_read_file");
+            let write_enabled = session
+                .tool_names
+                .iter()
+                .any(|name| name == "fs_write_file");
+            if !read_enabled || !write_enabled {
+                eprintln!(
+                    "combined read/write tools are disabled in this run - restart with --allow-read-write <path> (scripted/piped chat cannot add tools after startup)"
+                );
+                return SlashResult::Error;
+            }
+            match perms.grant_read_write_root(arg) {
+                Ok(p) => eprintln!("~ read/write access granted: {}", p.display()),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return SlashResult::Error;
                 }
             }
         }
@@ -4444,6 +7841,74 @@ async fn handle_slash(
                         return SlashResult::Error;
                     }
                 }
+            }
+        }
+        "revoke-read" => {
+            if arg.is_empty() {
+                eprintln!("usage: /revoke-read <exact-root>");
+                return SlashResult::Error;
+            }
+            if let Some(error) = dangerous_bypass_revocation_error(perms.mode(), "read") {
+                eprintln!("{error}");
+                return SlashResult::Error;
+            }
+            match perms.revoke_read_root(arg) {
+                Ok(revoked) => eprintln!(
+                    "~ read root revoked for this session ({}) - /permissions shows remaining coverage",
+                    revoked.description()
+                ),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return SlashResult::Error;
+                }
+            }
+        }
+        "revoke-write" => {
+            if arg.is_empty() {
+                eprintln!("usage: /revoke-write <exact-root>");
+                return SlashResult::Error;
+            }
+            if let Some(error) = dangerous_bypass_revocation_error(perms.mode(), "write") {
+                eprintln!("{error}");
+                return SlashResult::Error;
+            }
+            match perms.revoke_write_root(arg) {
+                Ok(revoked) => eprintln!(
+                    "~ write root revoked for this session ({}) - /permissions shows remaining coverage",
+                    revoked.description()
+                ),
+                Err(e) => {
+                    eprintln!("{e}");
+                    return SlashResult::Error;
+                }
+            }
+        }
+        "revoke-command" => {
+            let Ok(index) = arg.parse::<usize>() else {
+                eprintln!("usage: /revoke-command <number> (see /permissions)");
+                return SlashResult::Error;
+            };
+            let Some(policy) = session.command_policy.as_ref() else {
+                eprintln!("commands are disabled in this run");
+                return SlashResult::Error;
+            };
+            let grants = policy.session_grants();
+            let Some(grant) = index.checked_sub(1).and_then(|index| grants.get(index)) else {
+                eprintln!(
+                    "no command grant #{index}; /permissions lists {} active grant(s)",
+                    grants.len()
+                );
+                return SlashResult::Error;
+            };
+            if policy.revoke_exact_grant(grant) {
+                eprintln!(
+                    "~ revoked command grant #{index}: {} (cwd {})",
+                    terminal_inline(&grant.display_argv()),
+                    shorten_home(&grant.cwd),
+                );
+            } else {
+                eprintln!("command grant #{index} changed before it could be revoked; retry");
+                return SlashResult::Error;
             }
         }
         "save" => {
@@ -4507,24 +7972,39 @@ async fn handle_slash(
                     eprintln!("^C (model catalog request cancelled)");
                     return SlashResult::Cancelled;
                 };
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => return SlashResult::Error,
-                    Err(ProviderError::Auth(_)) => return SlashResult::Error,
-                    Err(error) => return SlashResult::ProviderFailure(error.to_string()),
-                }
+                return match finish_slash_model_catalog(result, cli.timeout_secs) {
+                    Ok(models) => SlashResult::Continue(Some(serde_json::json!({
+                        "kind": "model_catalog",
+                        "filter": filter,
+                        "count": models.len(),
+                        "models": models,
+                    }))),
+                    Err(result) => result,
+                };
             } else {
                 let Some(catalog) = await_cancellable(provider.list_models()).await else {
                     eprintln!("^C (model validation cancelled)");
                     return SlashResult::Cancelled;
                 };
-                if let Ok(Some(models)) = catalog {
-                    if !models.iter().any(|candidate| candidate == arg) {
-                        eprintln!(
-                            "model '{}' is not in the gateway catalog - run /models",
-                            terminal_inline(arg)
+                match catalog {
+                    Ok(Some(models)) => {
+                        let models = filter_model_catalog(models, "");
+                        if !models.iter().any(|candidate| candidate == arg) {
+                            eprintln!(
+                                "model '{}' is not in the gateway catalog - run /models",
+                                terminal_inline(arg)
+                            );
+                            return SlashResult::Error;
+                        }
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        return report_slash_provider_error(
+                            "could not validate model",
+                            error,
+                            ProviderOperation::ModelCatalog,
+                            cli.timeout_secs,
                         );
-                        return SlashResult::Error;
                     }
                 }
                 // An explicit --context-window flag or gateway-profile
@@ -4535,7 +8015,11 @@ async fn handle_slash(
                 // place: carrying over the OLD model's discovered window (or
                 // lack thereof) would otherwise budget against the wrong limit.
                 let note = if context_window_pinned {
-                    " (context window pinned by --context-window / config; unchanged)".to_string()
+                    let provenance = context_window_provenance(&session.window_provenance);
+                    format!(
+                        " (context window pinned by {}; unchanged)",
+                        provenance.source.label()
+                    )
                 } else {
                     let Some(discovered) =
                         await_cancellable(provider.model_context_length(arg)).await
@@ -4544,6 +8028,11 @@ async fn handle_slash(
                         return SlashResult::Cancelled;
                     };
                     context_window.set(discovered);
+                    *session
+                        .window_provenance
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                        ContextWindowProvenance::live_discovery(discovered);
                     match discovered {
                         Some(w) => format!(" (context window: {w} tokens)"),
                         None => format!(
@@ -4572,7 +8061,7 @@ async fn handle_slash(
             return SlashResult::Error;
         }
     }
-    SlashResult::Continue
+    SlashResult::Continue(None)
 }
 
 /// For `/save`: if the text contains fenced ``` code blocks, return the
@@ -4610,22 +8099,16 @@ fn extract_code_or_text(text: &str) -> String {
 async fn list_models_and_print(
     provider: &OpenAICompatProvider,
     filter: &str,
-) -> Result<bool, ProviderError> {
+) -> Result<Option<Vec<String>>, ProviderError> {
     match provider.list_models().await {
         Ok(Some(models)) => {
-            let filter = filter.trim().to_lowercase();
-            let matched: Vec<&String> = models
-                .iter()
-                .filter(|m| filter.is_empty() || m.to_lowercase().contains(&filter))
-                .collect();
+            let filter = filter.trim();
+            let matched = filter_model_catalog(models, filter);
             let total = matched.len();
             if filter.is_empty() {
                 eprintln!("~ {total} model(s) available:");
             } else {
-                eprintln!(
-                    "~ {total} model(s) matching '{}':",
-                    terminal_inline(&filter)
-                );
+                eprintln!("~ {total} model(s) matching '{}':", terminal_inline(filter));
             }
             const CAP: usize = 40;
             for m in matched.iter().take(CAP) {
@@ -4639,23 +8122,51 @@ async fn list_models_and_print(
             }
             if total > 0 {
                 eprintln!("switch with: /model <id>");
-                Ok(true)
             } else {
-                eprintln!("no matches - run /models without a filter to see the full catalog");
-                Ok(false)
+                eprintln!("{}", empty_model_catalog_message(filter));
             }
+            // A zero-match search is a successful catalog query, just like the
+            // standalone `kitsu models <filter>` command. Only an unavailable
+            // catalog returns false.
+            Ok(Some(matched))
         }
         Ok(None) => {
             eprintln!("this gateway does not expose a model list (its models_path is empty)");
-            Ok(false)
+            Ok(None)
         }
-        Err(e) => {
-            eprintln!(
-                "could not fetch models: {}",
-                terminal_inline(&e.to_string())
-            );
-            Err(e)
-        }
+        Err(error) => Err(error),
+    }
+}
+
+fn report_slash_provider_error(
+    prefix: &str,
+    error: ProviderError,
+    operation: ProviderOperation<'_>,
+    timeout_secs: u64,
+) -> SlashResult {
+    let user_error = matches!(error, ProviderError::Auth(_));
+    let message = safe_provider_error_message(&error, operation, Some(timeout_secs));
+    eprintln!("{}: {}", terminal_inline(prefix), message);
+    if user_error {
+        SlashResult::Error
+    } else {
+        SlashResult::ProviderFailure(message)
+    }
+}
+
+fn finish_slash_model_catalog(
+    result: Result<Option<Vec<String>>, ProviderError>,
+    timeout_secs: u64,
+) -> Result<Vec<String>, SlashResult> {
+    match result {
+        Ok(Some(models)) => Ok(models),
+        Ok(None) => Err(SlashResult::Error),
+        Err(error) => Err(report_slash_provider_error(
+            "could not fetch models",
+            error,
+            ProviderOperation::ModelCatalog,
+            timeout_secs,
+        )),
     }
 }
 
@@ -4787,21 +8298,27 @@ impl CommandPrompter for CliCommandPrompter {
     fn ask(&self, req: &CommandApprovalRequest) -> CommandDecision {
         use std::io::Write;
         let _input_guard = ApprovalInputGuard::enter();
-        if kitsu_render::plain_mode() {
-            eprint!(
-                "\ncommand permission> run {}\n  cwd: {}\n  timeout: {} ms\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
-                terminal_inline(&req.display_argv()),
-                terminal_inline(&req.cwd),
-                req.timeout_ms
-            );
-        } else {
-            eprint!(
-                "\x1b[?2004l\ncommand permission> run {}\n  cwd: {}\n  timeout: {} ms\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
-                terminal_inline(&req.display_argv()),
-                terminal_inline(&req.cwd),
-                req.timeout_ms
-            );
+        if !kitsu_render::plain_mode() {
+            eprint!("\x1b[?2004l");
         }
+        let resolution = match req.executable.resolution {
+            kitsu_tools::CommandExecutableResolution::AmbientPath => "ambient PATH lookup",
+            kitsu_tools::CommandExecutableResolution::InvocationPath => "invocation path",
+        };
+        let observed = req
+            .executable
+            .observed_path
+            .as_deref()
+            .map(terminal_inline)
+            .unwrap_or_else(|| "not observed".to_string());
+        eprint!(
+            "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+            terminal_inline(&req.display_argv()),
+            terminal_inline(&req.cwd),
+            terminal_inline(&req.executable.invocation),
+            req.timeout_ms,
+            terminal_inline(req.authority_notice()),
+        );
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
             return CommandDecision::Deny;
@@ -4875,7 +8392,9 @@ fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
             expires_env: auth.expires_env.clone(),
             header: auth.header.clone(),
             scheme: auth.scheme.clone(),
-            refresh_hint: auth.refresh_hint.clone(),
+            // Store only display-safe guidance in the runtime auth provider so
+            // every later Missing/Unauthorized error is safe by construction.
+            refresh_hint: safe_auth_refresh_hint(auth.refresh_hint.as_deref()),
         }),
         other => {
             return Err(ConfigError::UnsupportedAuthMethod {
@@ -4886,52 +8405,43 @@ fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
     Ok(provider)
 }
 
-/// Render an agent error for the interactive/scripted chat loop. When the
-/// gateway rejected the model id (ISSUE-004: a `/model` typo, or a model the
-/// gateway doesn't serve), add an actionable hint naming the model and pointing
-/// at `/model`, instead of dumping the raw HTTP 404 JSON.
+/// Render an agent error for every chat mode through the same bounded provider
+/// diagnostic. This deliberately never renders provider body/URL text.
 fn chat_error_message(e: kitsu_core::AgentError, model: &str, timeout_secs: u64) -> String {
-    if let kitsu_core::AgentError::Provider(ProviderError::Http { status, body }) = &e {
-        let looks_like_bad_model =
-            *status == 404 || (body.contains("model") && body.to_lowercase().contains("not found"));
-        if looks_like_bad_model {
-            let model = terminal_inline(model);
-            let body = kitsu_render::sanitize_terminal_text(body);
-            return format!(
-                "gateway rejected model '{model}' (HTTP {status}) - run /model <valid-id> and \
-                 check the gateway's available models.\n  detail: {body}"
-            );
-        }
-    }
-    if matches!(
-        &e,
-        kitsu_core::AgentError::Provider(ProviderError::Timeout)
-    ) {
-        return format!(
-            "request timed out after {timeout_secs}s - raise the budget with \
-             --timeout-secs <n> (e.g. --timeout-secs {}) for slower or tool-heavy turns, \
-             especially on local models.",
-            timeout_secs.saturating_mul(3).max(180)
-        );
-    }
-    kitsu_render::sanitize_terminal_text(&map_agent_error(e).to_string())
+    kitsu_render::sanitize_terminal_text(
+        &map_agent_error(e, ProviderOperation::Chat { model }, Some(timeout_secs)).to_string(),
+    )
 }
 
 /// Map an agent/provider error to the right exit code (design §6).
-fn map_agent_error(e: kitsu_core::AgentError) -> CliError {
+fn map_agent_error(
+    e: kitsu_core::AgentError,
+    operation: ProviderOperation<'_>,
+    timeout_secs: Option<u64>,
+) -> CliError {
     match e {
-        kitsu_core::AgentError::Provider(pe) => match pe {
-            // Missing token is a user/auth-config problem → exit 1.
-            ProviderError::Auth(ae) => CliError::user(ae.to_string()),
-            // Gateway rejected the token → exit 2.
-            ProviderError::Unauthorized { .. } => CliError::provider(pe.to_string()),
-            other => CliError::provider(other.to_string()),
-        },
+        kitsu_core::AgentError::Provider(error) => {
+            map_provider_error(error, operation, timeout_secs)
+        }
         kitsu_core::AgentError::Loop(msg) => CliError::provider(format!("agent loop error: {msg}")),
         context_error @ (kitsu_core::AgentError::ContextOverflow { .. }
         | kitsu_core::AgentError::ContextWindowUnknown) => {
             CliError::user(context_error.to_string())
         }
+    }
+}
+
+fn map_provider_error(
+    error: ProviderError,
+    operation: ProviderOperation<'_>,
+    timeout_secs: Option<u64>,
+) -> CliError {
+    let user_error = matches!(error, ProviderError::Auth(_));
+    let message = safe_provider_error_message(&error, operation, timeout_secs);
+    if user_error {
+        CliError::user(message)
+    } else {
+        CliError::provider(message)
     }
 }
 
@@ -5000,6 +8510,232 @@ mod tests {
     }
 
     #[test]
+    fn review_request_parser_supports_scopes_and_literal_backcompat_paths() {
+        assert_eq!(
+            parse_review_request("").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Working,
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse_review_request("src/a file.rs").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Working,
+                path: Some("src/a file.rs".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_review_request("working src/lib.rs").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Working,
+                path: Some("src/lib.rs".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_review_request("staged src/a file.rs").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Staged,
+                path: Some("src/a file.rs".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_review_request("unstaged").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Unstaged,
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse_review_request("base origin/main crates/kitsu").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Base("origin/main".to_string()),
+                path: Some("crates/kitsu".to_string()),
+            }
+        );
+        assert_eq!(
+            parse_review_request("commit HEAD~2").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Commit("HEAD~2".to_string()),
+                path: None,
+            }
+        );
+        assert_eq!(
+            parse_review_request("checkpoint 42 src/lib.rs").unwrap(),
+            ReviewRequest {
+                scope: ReviewScope::Checkpoint(42),
+                path: Some("src/lib.rs".to_string()),
+            }
+        );
+
+        assert!(parse_review_request("base").is_err());
+        assert!(parse_review_request("commit").is_err());
+        assert!(parse_review_request("checkpoint nope").is_err());
+        assert!(parse_review_request("checkpoint 0").is_err());
+    }
+
+    #[test]
+    fn checkpoint_command_ids_are_exact_and_review_prompt_has_no_tools() {
+        assert_eq!(parse_exact_checkpoint_id("7").unwrap(), 7);
+        assert_eq!(parse_optional_checkpoint_id("").unwrap(), None);
+        assert_eq!(parse_optional_checkpoint_id("7").unwrap(), Some(7));
+        assert!(parse_exact_checkpoint_id("7 trailing").is_err());
+        let invalid = parse_checkpoint_id("7\u{1b}]0;owned\u{7}").unwrap_err();
+        assert!(!invalid.contains('\u{1b}'));
+        assert!(!invalid.contains('\u{7}'));
+
+        let evidence = workspace::ReviewEvidence {
+            target: "base:main".to_string(),
+            resolved_revision: Some("a".repeat(40)),
+            merge_base: Some("b".repeat(40)),
+            diff: "diff --git a/a b/a\n-old\n+new".to_string(),
+            truncated: false,
+        };
+        let prompt = SubmittedPrompt::review(verified_review_prompt(&evidence));
+        assert_eq!(prompt.tool_mode, TurnToolMode::None);
+        assert!(prompt.text.contains("target base:main"));
+        assert!(prompt.text.contains("merge base"));
+        assert!(prompt.text.contains("-old\n+new"));
+    }
+
+    #[test]
+    fn checkpoint_formatter_shows_verified_diff_and_exact_recovery_command() {
+        let path = std::path::PathBuf::from("/tmp/review-file.rs");
+        let diff = "diff --git a/review-file.rs b/review-file.rs\n--- a/review-file.rs\n+++ b/review-file.rs\n@@ -1 +1 @@\n-old\n+new\n";
+        let report = kitsu_tools::builtins::fs::JournalTurnReport {
+            id: 19,
+            label: "verified edit".to_string(),
+            changes: vec![kitsu_tools::builtins::fs::JournalChangeReport {
+                path,
+                change: "updated",
+                before_bytes: Some(4),
+                after_bytes: 4,
+                first_changed_line: 1,
+                unified_diff: diff.to_string(),
+                diff_truncated: false,
+            }],
+            unified_diff: diff.to_string(),
+            diff_truncated: false,
+        };
+        let rendered = format_write_checkpoint(&report);
+        assert!(rendered.contains("verified snapshot-derived diff"));
+        assert!(rendered.contains("-old\n+new"));
+        assert!(rendered.contains("/undo 19"));
+        assert!(!rendered.contains("/undo restores"));
+    }
+
+    async fn record_test_checkpoint(
+        journal: &kitsu_tools::builtins::fs::WriteJournal,
+        policy: Arc<Permissions>,
+        label: &str,
+        path: &std::path::Path,
+        before: &str,
+        after: &str,
+    ) -> kitsu_tools::builtins::fs::JournalTurnReport {
+        let start = journal.begin_attributed_turn(label);
+        assert!(start.previous.is_none());
+        let (_, handler) =
+            kitsu_tools::builtins::fs::write_file_tool_with_journal(policy, Some(journal.clone()));
+        let args = serde_json::json!({
+            "path": path,
+            "content": after,
+            "expected_previous_content": before,
+        })
+        .to_string();
+        journal
+            .scope_turn(&start.token, handler(args))
+            .await
+            .expect("journaled write");
+        journal.drain_mutations().await;
+        journal
+            .finish_attributed_turn(&start.token)
+            .expect("checkpoint")
+    }
+
+    #[tokio::test]
+    async fn checkpoint_preview_and_selected_undo_use_the_requested_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let first = directory.path().join("first.txt");
+        let second = directory.path().join("second.txt");
+        std::fs::write(&first, "first-before").unwrap();
+        std::fs::write(&second, "second-before").unwrap();
+        let root = directory.path().to_string_lossy().to_string();
+        let policy = Arc::new(
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap(),
+        );
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+
+        let first_report = record_test_checkpoint(
+            &journal,
+            policy.clone(),
+            "first",
+            &first,
+            "first-before",
+            "first-after",
+        )
+        .await;
+        let second_report = record_test_checkpoint(
+            &journal,
+            policy.clone(),
+            "second",
+            &second,
+            "second-before",
+            "second-after",
+        )
+        .await;
+
+        assert_eq!(
+            journal.checkpoint_preview(first_report.id),
+            Some(first_report.clone())
+        );
+        undo_write_checkpoint(&journal, &policy, Some(first_report.id))
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first-before");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second-after");
+        assert_eq!(journal.checkpoints(), vec![second_report.clone()]);
+
+        undo_write_checkpoint(&journal, &policy, None)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second-before");
+        assert!(journal.checkpoints().is_empty());
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn private_path_identity_recognizes_a_symlink_alias() {
+        let directory = tempfile::tempdir().unwrap();
+        let private = directory.path().join("private");
+        let alias = directory.path().join("alias");
+        std::fs::create_dir(&private).unwrap();
+        std::fs::write(private.join("session.json"), "secret").unwrap();
+        std::os::unix::fs::symlink(&private, &alias).unwrap();
+
+        assert!(path_is_within(&private.join("session.json"), &alias));
+        assert!(!path_is_within(
+            directory.path().join("public.txt").as_path(),
+            &alias
+        ));
+    }
+
+    #[test]
+    fn write_only_system_prompt_does_not_claim_read_or_edit_authority() {
+        let prompt = chat_system_prompt(&["fs_write_file".to_string()]);
+        assert!(prompt.contains("write-only filesystem authority"));
+        assert!(!prompt.contains("fs_read_file"));
+        assert!(!prompt.contains("fs_edit_file"));
+
+        let combined = chat_system_prompt(&[
+            "fs_read_file".to_string(),
+            "fs_write_file".to_string(),
+            "fs_edit_file".to_string(),
+        ]);
+        assert!(combined.contains("fs_edit_file for exact localized edits"));
+    }
+
+    #[test]
     fn coalesced_background_completion_still_has_a_notice() {
         let previous = subagent::AgentRegistrySnapshot {
             generation: 1,
@@ -5036,6 +8772,8 @@ mod tests {
             id: 1,
             label: "prompt\nforged-checkpoint\u{1b}]0;owned\u{7}".to_string(),
             changes: Vec::new(),
+            unified_diff: String::new(),
+            diff_truncated: false,
         };
         let checkpoint = format_write_checkpoint(&report);
         assert!(!checkpoint.contains('\u{1b}'));
@@ -5068,6 +8806,255 @@ mod tests {
             redact_endpoint("http://localhost:11434/v1/chat/completions"),
             "http://localhost:11434/v1/chat/completions"
         );
+    }
+
+    #[test]
+    fn provider_errors_are_actionable_without_provider_controlled_details() {
+        let secrets = [
+            "user:token@example.invalid",
+            "api_key=super-secret",
+            "provider-body-secret",
+        ];
+        let errors = [
+            ProviderError::Connection(
+                "request failed for https://user:token@example.invalid/?api_key=super-secret"
+                    .to_string(),
+            ),
+            ProviderError::InvalidResponse("provider-body-secret".to_string()),
+            ProviderError::Http {
+                status: 500,
+                body: "provider-body-secret".to_string(),
+            },
+            ProviderError::Unauthorized {
+                status: 401,
+                hint: Some("provider-body-secret".to_string()),
+            },
+        ];
+        for error in &errors {
+            let message = safe_provider_error_message(
+                error,
+                ProviderOperation::Chat {
+                    model: "safe-model",
+                },
+                Some(17),
+            );
+            for secret in secrets {
+                assert!(!message.contains(secret), "leaked {secret}: {message}");
+            }
+            assert!(message.contains('-'), "diagnostic should include a remedy");
+        }
+
+        let timeout = chat_error_message(
+            kitsu_core::AgentError::Provider(ProviderError::Timeout),
+            "safe-model",
+            17,
+        );
+        assert!(timeout.contains("chat request timed out after 17s"));
+        assert!(timeout.contains("--timeout-secs"));
+        let catalog = safe_provider_error_message(
+            &ProviderError::Timeout,
+            ProviderOperation::ModelCatalog,
+            Some(17),
+        );
+        assert!(catalog.contains("model catalog request timed out after 17s"));
+
+        let missing = safe_provider_error_message(
+            &ProviderError::Auth(kitsu_providers::AuthError::Missing {
+                env: "HF_TOKEN".to_string(),
+                hint: Some("run `refresh-token` to renew access".to_string()),
+            }),
+            ProviderOperation::Chat {
+                model: "safe-model",
+            },
+            Some(17),
+        );
+        assert!(missing.contains("$HF_TOKEN"));
+        assert!(missing.contains("refresh-token"));
+        assert!(safe_auth_refresh_hint(Some(
+            "visit https://user:secret@example.invalid/?token=secret"
+        ))
+        .is_none());
+
+        let bad_model = safe_provider_error_message(
+            &ProviderError::Http {
+                status: 404,
+                body: "provider-body-secret".to_string(),
+            },
+            ProviderOperation::Chat {
+                model: "bad\nmodel\u{1b}]0;owned\u{7}",
+            },
+            Some(17),
+        );
+        assert!(bad_model.contains("HTTP 404"));
+        assert!(!bad_model.contains("provider-body-secret"));
+        assert!(!bad_model.contains('\n'));
+        assert!(!bad_model.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn refresh_hints_reject_common_credential_forms_on_every_rendering_path() {
+        let unsafe_hints = [
+            "paste hf_kitsuRefreshCredential123",
+            "use sk-kitsuRefreshCredential123",
+            "set api-key=kitsuRefreshCredential123",
+            "set api_key: kitsuRefreshCredential123",
+            "token=kitsuRefreshCredential123",
+            "token: kitsuRefreshCredential123",
+            "token_kitsuRefreshCredential123",
+            "Authorization: Bearer kitsuRefreshCredential123",
+        ];
+
+        for hint in unsafe_hints {
+            assert!(
+                safe_auth_refresh_hint(Some(hint)).is_none(),
+                "unsafe hint was accepted: {hint}"
+            );
+
+            let missing = safe_provider_error_message(
+                &ProviderError::Auth(kitsu_providers::AuthError::Missing {
+                    env: "HF_TOKEN".to_string(),
+                    hint: Some(hint.to_string()),
+                }),
+                ProviderOperation::Chat {
+                    model: "safe-model",
+                },
+                Some(17),
+            );
+            let unauthorized = safe_provider_error_message(
+                &ProviderError::Unauthorized {
+                    status: 401,
+                    hint: Some(hint.to_string()),
+                },
+                ProviderOperation::ModelCatalog,
+                Some(17),
+            );
+            let expired = expired_auth_warning("2026-01-01T00:00:00Z", Some(hint));
+            for rendered in [&missing, &unauthorized, &expired] {
+                assert!(
+                    !rendered.contains("kitsuRefreshCredential123"),
+                    "credential-bearing hint leaked: {rendered}"
+                );
+                assert!(
+                    !rendered.contains("configured refresh hint"),
+                    "unsafe hint label was rendered: {rendered}"
+                );
+            }
+        }
+
+        let safe_hint = "run `refresh-token` to renew access";
+        assert_eq!(
+            safe_auth_refresh_hint(Some(safe_hint)).as_deref(),
+            Some(safe_hint)
+        );
+        assert!(
+            expired_auth_warning("2026-01-01T00:00:00Z", Some(safe_hint)).contains("refresh-token")
+        );
+    }
+
+    #[test]
+    fn model_catalog_filter_is_sorted_deduplicated_and_no_match_is_successful() {
+        let models = vec![
+            "zeta".to_string(),
+            "Alpha-Coder".to_string(),
+            "beta-coder".to_string(),
+            "Alpha-Coder".to_string(),
+        ];
+        assert_eq!(
+            filter_model_catalog(models.clone(), " CODER "),
+            vec!["Alpha-Coder".to_string(), "beta-coder".to_string()]
+        );
+        assert_eq!(
+            filter_model_catalog(models, ""),
+            vec![
+                "Alpha-Coder".to_string(),
+                "beta-coder".to_string(),
+                "zeta".to_string(),
+            ]
+        );
+        assert!(filter_model_catalog(vec!["alpha".to_string()], "missing").is_empty());
+        let catalog = match finish_slash_model_catalog(Ok(Some(vec!["alpha".to_string()])), 17) {
+            Ok(catalog) => catalog,
+            Err(_) => panic!("available catalog should succeed"),
+        };
+        assert_eq!(catalog, vec!["alpha".to_string()]);
+        assert_eq!(
+            empty_model_catalog_message(" Missing "),
+            "no models matched 'Missing' - retry without a filter to see the full catalog"
+        );
+    }
+
+    #[test]
+    fn context_cache_reports_fresh_stale_missing_and_unreadable_states() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("context.json");
+        let key = "v2-fnv128-test";
+        let mut cache = ContextWindowCache::default();
+        cache.entries.insert(key.to_string(), (32_768, 1_000));
+        std::fs::write(&path, serde_json::to_vec(&cache).unwrap()).unwrap();
+
+        let fresh = inspect_cached_context_window_at(&path, key, 1_090);
+        assert_eq!(fresh.window, Some(32_768));
+        assert_eq!(
+            fresh.state,
+            ContextWindowCacheState::Fresh {
+                age_secs: 90,
+                ttl_secs: CONTEXT_WINDOW_CACHE_TTL_SECS,
+            }
+        );
+
+        let stale =
+            inspect_cached_context_window_at(&path, key, 1_000 + CONTEXT_WINDOW_CACHE_TTL_SECS);
+        assert_eq!(stale.window, None);
+        assert!(matches!(stale.state, ContextWindowCacheState::Stale { .. }));
+
+        let missing = inspect_cached_context_window_at(&path, "another-key", 1_090);
+        assert_eq!(missing.window, None);
+        assert_eq!(missing.state, ContextWindowCacheState::Miss);
+
+        std::fs::write(&path, b"not-json").unwrap();
+        let unreadable = inspect_cached_context_window_at(&path, key, 1_090);
+        assert_eq!(unreadable.window, None);
+        assert_eq!(unreadable.state, ContextWindowCacheState::Unreadable);
+    }
+
+    #[test]
+    fn context_provenance_names_source_cache_age_ttl_and_discovery_state() {
+        let cli = ContextWindowProvenance::pinned(ContextWindowSource::Cli);
+        assert_eq!(cli.source.label(), "CLI --context-window");
+        assert_eq!(cli.cache.label(), "not consulted");
+
+        let cached = ContextWindowProvenance::cached(3_661);
+        assert_eq!(cached.source.label(), "disk cache");
+        assert_eq!(cached.cache.label(), "fresh (age 1h 1m; TTL 1d)");
+
+        let pending = ContextWindowProvenance::defaulted(
+            ContextWindowCacheState::Miss,
+            ContextWindowDiscoveryState::Pending,
+        );
+        assert_eq!(pending.source.label(), "conservative default");
+        assert!(pending.discovery.label().contains("in progress"));
+        assert!(pending.discovery.label().contains("next run"));
+    }
+
+    #[test]
+    fn human_provider_attempt_notice_is_safe_and_complete() {
+        let event = kitsu_core::AgentRuntimeEvent::ProviderAttempt {
+            round: 2,
+            attempt: 1,
+            max_attempts: 3,
+            category: kitsu_providers::ProviderAttemptCategory::RateLimited,
+            status: Some(429),
+            outcome: kitsu_providers::ProviderAttemptOutcome::RetryScheduled,
+            terminal: false,
+            retry_delay_ms: Some(750),
+            retry_after_used: true,
+            remaining_deadline_ms: 12_500,
+        };
+        let notice = format_provider_attempt_notice(&event).unwrap();
+        assert!(notice.contains("attempt 1/3"));
+        assert!(notice.contains("rate limited; HTTP 429"));
+        assert!(notice.contains("retry in 750ms (Retry-After)"));
+        assert!(notice.contains("12500ms deadline remaining"));
     }
 
     #[test]
@@ -5151,6 +9138,53 @@ mod tests {
     }
 
     #[test]
+    fn queue_commands_are_one_based_editable_and_backward_compatible() {
+        assert!(matches!(
+            parse_queue_command("").unwrap(),
+            QueueCommand::List
+        ));
+        assert!(matches!(
+            parse_queue_command("legacy prompt").unwrap(),
+            QueueCommand::Add(prompt) if prompt == "legacy prompt"
+        ));
+        assert!(matches!(
+            parse_queue_command("remove 2").unwrap(),
+            QueueCommand::Remove(1)
+        ));
+        assert!(matches!(
+            parse_queue_command("edit 3 replacement text").unwrap(),
+            QueueCommand::Edit(2, replacement) if replacement == "replacement text"
+        ));
+        assert!(matches!(
+            parse_queue_command("move 4 1").unwrap(),
+            QueueCommand::Move { from: 3, to: 0 }
+        ));
+        assert!(matches!(
+            parse_queue_command("promote 2").unwrap(),
+            QueueCommand::Promote(1)
+        ));
+        assert!(parse_queue_command("remove 0").is_err());
+        assert!(parse_queue_command("edit 1").is_err());
+
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        assert!(apply_queue_command(
+            &mut queue,
+            QueueCommand::Add("one".to_string())
+        ));
+        assert!(apply_queue_command(
+            &mut queue,
+            QueueCommand::Add("two".to_string())
+        ));
+        assert!(apply_queue_command(
+            &mut queue,
+            QueueCommand::Edit(1, "TWO".to_string())
+        ));
+        assert!(apply_queue_command(&mut queue, QueueCommand::Promote(1)));
+        assert_eq!(queue.iter().collect::<Vec<_>>(), vec!["TWO", "one"]);
+        assert_eq!(queue_prompt_preview("unsafe\n\x1b]0;title\x07"), "unsafe ");
+    }
+
+    #[test]
     #[serial]
     fn project_profile_migrates_the_legacy_unstable_key() {
         let home = tempfile::tempdir().unwrap();
@@ -5195,6 +9229,112 @@ mod tests {
         assert_eq!(*state.borrow(), Some(new.clone()));
         assert!(perms.read_roots().iter().any(|root| root == &new));
         assert!(!perms.read_roots().iter().any(|root| root == old.path()));
+    }
+
+    #[tokio::test]
+    async fn session_artifact_rotation_is_fresh_revokes_old_read_and_preserves_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let private_state = root.path().join("state");
+        std::fs::create_dir_all(&private_state).unwrap();
+        let base = private_state
+            .join("sessions")
+            .join("same-session.artifacts");
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        perms
+            .protect_read_path(&private_state.to_string_lossy())
+            .unwrap();
+        perms
+            .protect_write_path(&private_state.to_string_lossy())
+            .unwrap();
+        let state = Rc::new(RefCell::new(None));
+        let sink = command_artifact::CommandArtifactSink::default();
+        let mut allocator = ArtifactDirectoryAllocator::default();
+
+        rotate_artifact_storage(&perms, &state, Some(&sink), || {
+            allocator.allocate(&base).map(Some)
+        })
+        .unwrap();
+        let old = state.borrow().clone().unwrap();
+        let evidence = old.join("command-output-0.txt");
+        std::fs::write(&evidence, "recoverable evidence").unwrap();
+        assert_eq!(sink.directory(), Some(old.clone()));
+        assert_eq!(perms.check_read(&evidence).await.unwrap(), evidence);
+
+        perms.reset_runtime_grants();
+        rotate_artifact_storage(&perms, &state, Some(&sink), || {
+            allocator.allocate(&base).map(Some)
+        })
+        .unwrap();
+        let new = state.borrow().clone().unwrap();
+        let current = new.join("tool-result.txt");
+        std::fs::write(&current, "current evidence").unwrap();
+
+        assert_ne!(old, new, "a session boundary must never reuse authority");
+        assert_eq!(sink.directory(), Some(new.clone()));
+        assert_eq!(
+            std::fs::read_to_string(&evidence).unwrap(),
+            "recoverable evidence"
+        );
+        assert!(matches!(
+            perms.check_read(&evidence).await,
+            Err(kitsu_tools::ToolError::PolicyDenied(_))
+        ));
+        assert_eq!(perms.check_read(&current).await.unwrap(), current);
+        assert_eq!(perms.internal_read_roots(), vec![new]);
+    }
+
+    #[tokio::test]
+    async fn failed_artifact_rotation_leaves_no_stale_sink_or_read_authority() {
+        let root = tempfile::tempdir().unwrap();
+        let private_state = root.path().join("state");
+        std::fs::create_dir_all(&private_state).unwrap();
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        perms
+            .protect_read_path(&private_state.to_string_lossy())
+            .unwrap();
+        perms
+            .protect_write_path(&private_state.to_string_lossy())
+            .unwrap();
+        let state = Rc::new(RefCell::new(None));
+        let sink = command_artifact::CommandArtifactSink::default();
+        let old = private_state.join("old");
+        activate_offload_dir(&perms, &state, Some(old.clone())).unwrap();
+        sink.set_directory(Some(old.clone()));
+        let evidence = old.join("old.txt");
+        std::fs::write(&evidence, "old").unwrap();
+
+        perms.reset_runtime_grants();
+        let error = rotate_artifact_storage(&perms, &state, Some(&sink), || {
+            Err("synthetic allocation failure".to_string())
+        })
+        .unwrap_err();
+
+        assert_eq!(error, "synthetic allocation failure");
+        assert!(state.borrow().is_none());
+        assert!(sink.directory().is_none());
+        assert!(matches!(
+            perms.check_read(&evidence).await,
+            Err(kitsu_tools::ToolError::PolicyDenied(_))
+        ));
+        assert_eq!(std::fs::read_to_string(evidence).unwrap(), "old");
+    }
+
+    #[test]
+    fn artifact_allocator_skips_an_existing_generation_instead_of_reusing_it() {
+        let root = tempfile::tempdir().unwrap();
+        let occupied = root.path().join(format!("runtime-{}-0", jsonl_run_id()));
+        std::fs::create_dir(&occupied).unwrap();
+        std::fs::write(occupied.join("prior.txt"), "prior session").unwrap();
+        let mut allocator = ArtifactDirectoryAllocator::default();
+
+        let allocated = allocator.allocate(root.path()).unwrap();
+
+        assert_ne!(allocated, occupied);
+        assert!(allocated.is_dir());
+        assert_eq!(
+            std::fs::read_to_string(occupied.join("prior.txt")).unwrap(),
+            "prior session"
+        );
     }
 
     #[tokio::test]
@@ -5297,6 +9437,19 @@ mod tests {
 
         assert!(policy.is_granted(&explicit[0], root.path()));
         assert!(!policy.is_granted(&live_only, root.path()));
+    }
+
+    #[test]
+    fn dangerous_global_bypass_refuses_misleading_root_revocation() {
+        for access in ["read", "write"] {
+            let error = dangerous_bypass_revocation_error(Mode::AutoAllow, access).unwrap();
+            assert!(error.contains(&format!("cannot revoke {access} roots")));
+            assert!(error.contains("--dangerously-allow-all-filesystem"));
+            assert!(error.contains("restart without the dangerous flag"));
+        }
+        assert!(dangerous_bypass_revocation_error(Mode::Ask, "read").is_none());
+        assert!(dangerous_bypass_revocation_error(Mode::Scoped, "write").is_none());
+        assert!(dangerous_bypass_revocation_error(Mode::Deny, "read").is_none());
     }
 
     #[test]

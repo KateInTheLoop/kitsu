@@ -3,14 +3,14 @@
 
 use clap::{Parser, Subcommand};
 
-/// Commit + date this binary was built from — `-V` shows the plain semver,
-/// `--version` shows this too, so a stale binary vs. the docs/source next to
-/// it is self-diagnosing instead of surfacing as an unexplained CLI error.
+/// Commit + source commit date embedded in this binary — `-V` shows the plain
+/// semver, while `--version` shows this provenance too. The date is deliberately
+/// not called a build date: reproducible builds derive it from Git history.
 pub const LONG_VERSION: &str = concat!(
     env!("CARGO_PKG_VERSION"),
     " (",
     env!("KITSU_GIT_SHA"),
-    ", built ",
+    ", source commit ",
     env!("KITSU_BUILD_DATE"),
     ")"
 );
@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
-    after_help = "QUICK START:\n  kitsu --config ./kitsu.toml chat\n  kitsu --gateway ollama chat\n  kitsu chat  # after installing ~/.kitsu/config.toml\n\nConfiguration: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+    after_help = "GET STARTED:\n  kitsu init\n  kitsu doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
 pub struct Cli {
     /// Gateway profile to use (from [gateways.<name>] in the config).
@@ -46,6 +46,16 @@ pub struct Cli {
     /// this mode.
     #[arg(long, global = true)]
     pub jsonl: bool,
+
+    /// Use stable ASCII terminal markers and disable color/animation. The
+    /// KITSU_PLAIN and NO_COLOR environment variables remain supported.
+    #[arg(long, global = true)]
+    pub plain: bool,
+
+    /// Keep styled output but replace animated waiting indicators with a
+    /// visible static status. KITSU_REDUCED_MOTION remains supported.
+    #[arg(long, global = true)]
+    pub reduced_motion: bool,
 
     /// Sampling temperature. Omitted from the request unless set — some models
     /// (e.g. newer Anthropic models on Bedrock) reject a `temperature` field.
@@ -78,16 +88,26 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub max_output_tokens: Option<u32>,
 
-    /// Auto-approve filesystem tool access without prompting (for
-    /// non-interactive or scripted runs): once a tool is registered (via
-    /// --allow-path/--allow-write, or interactively), every path it touches is
-    /// approved with NO confinement to those roots — this removes the
-    /// approval step entirely, it does not scope it. --allow-path/--allow-write
-    /// alone (without --yes) is what confines access to specific directories.
-    /// --yes never registers filesystem tools by itself and never enables or
-    /// approves developer commands. Use with care.
-    #[arg(long, global = true)]
+    /// Never prompt for filesystem access. Enabled filesystem tools remain
+    /// confined to explicit/current read and write roots; requests outside
+    /// those roots are denied. This never registers a tool or approves a
+    /// developer command.
+    #[arg(
+        long,
+        global = true,
+        conflicts_with = "dangerously_allow_all_filesystem"
+    )]
     pub yes: bool,
+
+    /// DANGER: let enabled filesystem tools access every non-protected path
+    /// without prompting. This is a global host-filesystem bypass, not root
+    /// confinement. It does not register tools or approve developer commands.
+    #[arg(
+        long = "dangerously-allow-all-filesystem",
+        global = true,
+        conflicts_with = "yes"
+    )]
+    pub dangerously_allow_all_filesystem: bool,
 
     /// The model's context window in tokens. Overrides the gateway profile's
     /// `context_window` and any value discovered from `/v1/models`. Set this for
@@ -121,18 +141,93 @@ pub struct Cli {
 
 #[derive(Debug, Subcommand)]
 pub enum Command {
+    /// Create a no-secret starter configuration without overwriting a file.
+    Init {
+        /// Destination. Defaults to --config when supplied, otherwise
+        /// ./kitsu.toml.
+        #[arg(long, value_name = "PATH")]
+        path: Option<std::path::PathBuf>,
+
+        /// Emit one JSON result instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run read-only configuration, auth, cache, and runtime diagnostics.
+    Doctor {
+        /// Also contact the configured model-catalog endpoint. Offline checks
+        /// are the default and never access the network.
+        #[arg(long)]
+        online: bool,
+
+        /// Emit one JSON report instead of human text.
+        #[arg(long)]
+        json: bool,
+    },
     /// Ask a single question and stream the answer (one user turn).
     Ask {
         /// The prompt to send.
         prompt: String,
     },
-    /// List models advertised by the selected gateway without requiring a
-    /// configured or guessed model id.
+    /// Review host-verified repository evidence in a tool-free model turn.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu review\n  kitsu review --staged\n  kitsu review --base main crates/kitsu\n  kitsu --jsonl review --commit HEAD --instructions 'Focus on API compatibility'\n\nExactly one scope flag may be used. Private Kitsu state is excluded, revision arguments are validated, and the model receives no tools during the review turn."
+    )]
+    Review {
+        /// Optional literal repository-relative path filter.
+        path: Option<String>,
+
+        /// Review only staged changes.
+        #[arg(long, conflicts_with_all = ["unstaged", "base", "commit"])]
+        staged: bool,
+
+        /// Review unstaged changes plus untracked text files.
+        #[arg(long, conflicts_with_all = ["staged", "base", "commit"])]
+        unstaged: bool,
+
+        /// Review changes from the merge base with this revision.
+        #[arg(long, value_name = "REV", conflicts_with_all = ["staged", "unstaged", "commit"])]
+        base: Option<String>,
+
+        /// Review one commit's verified diff.
+        #[arg(long, value_name = "REV", conflicts_with_all = ["staged", "unstaged", "base"])]
+        commit: Option<String>,
+
+        /// Append user-owned focus instructions after the verified evidence.
+        #[arg(long, value_name = "TEXT")]
+        instructions: Option<String>,
+
+        /// Resume and autosave a saved review conversation by id or `last`.
+        #[arg(long, value_name = "ID", default_missing_value = "last", num_args = 0..=1)]
+        resume: Option<String>,
+
+        /// Persist this one-shot review as a new saved session.
+        #[arg(long, conflicts_with = "resume")]
+        session: bool,
+    },
+    /// List models advertised by the selected gateway.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu models\n  kitsu models qwen\n  kitsu --gateway huggingface models coder\n\nThe optional filter is a case-insensitive substring. Model IDs printed here can be passed to --model or /model."
+    )]
     Models {
         /// Optional case-insensitive substring filter.
         filter: Option<String>,
     },
-    /// Interactive chat REPL with multi-turn history and optional tools.
+    /// Manage saved conversations without contacting a provider.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu sessions\n  kitsu sessions --json\n  kitsu sessions show <id>\n  kitsu sessions resume last\n  kitsu sessions export <id> chat.md\n\nThe config path selects the isolated session namespace; the config file does not need to parse or even exist for list/show operations."
+    )]
+    Sessions {
+        /// Emit one JSON result instead of human text.
+        #[arg(long, global = true)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<SessionCommand>,
+    },
+    /// Interactive chat, scripted multi-turn work, or one piped turn.
+    #[command(
+        after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
+    )]
     Chat {
         /// Optional first prompt; queued as the first turn. In non-TTY mode
         /// (piped stdin) this (or stdin) is the single turn.
@@ -149,6 +244,12 @@ pub enum Command {
         #[arg(long = "allow-write", value_name = "PATH")]
         allow_write: Vec<String>,
 
+        /// Pre-grant both model reads and writes under this path (repeatable).
+        /// Use this explicit combined capability for read-modify-write work;
+        /// --allow-write alone remains write-only.
+        #[arg(long = "allow-read-write", value_name = "PATH")]
+        allow_read_write: Vec<String>,
+
         /// Explicitly enable the guarded developer-command tool. Commands have
         /// an independent approval policy and are never authorized by --yes or
         /// filesystem grants.
@@ -156,7 +257,8 @@ pub enum Command {
         enable_commands: bool,
 
         /// Constrain command working directories to this existing directory
-        /// (repeatable). Implies --enable-commands. With no explicit root,
+        /// (repeatable). This is a cwd restriction, NOT a filesystem, network,
+        /// or process sandbox. Implies --enable-commands. With no explicit root,
         /// --enable-commands uses the launch directory.
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
@@ -174,13 +276,19 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         script: Option<String>,
 
-        /// Resume a saved interactive session by id, or use `last`. Permission
-        /// grants are intentionally not restored.
+        /// Resume and autosave a saved session by id, or use `last`. Works in
+        /// interactive, scripted, and piped chat. Saved permission grants are
+        /// intentionally never restored.
         #[arg(long, value_name = "ID", default_missing_value = "last", num_args = 0..=1)]
         resume: Option<String>,
 
+        /// Persist a new scripted or piped chat and autosave successful turns.
+        /// Interactive chat already persists by default; --resume implies this.
+        #[arg(long, conflicts_with_all = ["resume", "no_session"])]
+        session: bool,
+
         /// Disable automatic local session snapshots for this chat.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "resume")]
         no_session: bool,
 
         /// Preserve the legacy script behavior of exiting 0 even when one or
@@ -188,4 +296,43 @@ pub enum Command {
         #[arg(long)]
         allow_turn_errors: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// List saved sessions (the default when no action is given).
+    List,
+    /// Show one saved session and its bounded transcript.
+    Show {
+        /// Exact session id, or `last`.
+        id: String,
+    },
+    /// Resume in interactive chat, or print an exact command outside a TTY.
+    Resume {
+        /// Session id; defaults to `last`.
+        #[arg(default_value = "last")]
+        id: String,
+    },
+    /// Clone a saved session under a fresh id without carrying permissions.
+    Fork {
+        /// Session id; defaults to `last`.
+        #[arg(default_value = "last")]
+        id: String,
+    },
+    /// Export a saved session without overwriting the destination.
+    Export {
+        /// Exact session id, or `last`.
+        id: String,
+        /// New output file; an artifact sidecar may be created beside it.
+        destination: std::path::PathBuf,
+        /// Human-readable Markdown or the complete JSON snapshot.
+        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
+        format: String,
+    },
+    /// Move an exact inactive session into recoverable archive storage.
+    Archive { id: String },
+    /// Restore an exact archived session id.
+    Restore { id: String },
+    /// Permanently delete an exact inactive live session id.
+    Delete { id: String },
 }

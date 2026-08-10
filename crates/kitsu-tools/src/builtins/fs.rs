@@ -92,12 +92,135 @@ pub fn write_unique_private_text_file(
     write_unique_private_text_file_with_sequence(directory, stem, content, &PRIVATE_FILE_SEQUENCE)
 }
 
+/// A host-owned streaming artifact which is retained only after [`Self::finish`].
+///
+/// The file is allocated with an exclusive create and, on Unix, a pinned
+/// no-follow directory handle and mode `0600`. Dropping or explicitly aborting
+/// an unfinished writer removes the partial artifact. This type is deliberately
+/// a Rust host API rather than a model-callable tool.
+#[derive(Debug)]
+pub struct PrivateArtifactWriter {
+    path: PathBuf,
+    file: Option<std::fs::File>,
+    #[cfg(unix)]
+    directory: std::fs::File,
+    #[cfg(unix)]
+    name: CString,
+    active: bool,
+}
+
+impl PrivateArtifactWriter {
+    /// The final protected path. The path may be referenced externally only
+    /// after [`Self::finish`] succeeds.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Flush and durably retain the artifact, returning its protected path.
+    /// Any failure leaves the writer armed for cleanup during `Drop`.
+    pub fn finish(mut self) -> std::io::Result<PathBuf> {
+        let file = self
+            .file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("private artifact writer is no longer active"))?;
+        file.flush()?;
+        file.sync_all()?;
+        #[cfg(unix)]
+        self.directory.sync_all()?;
+        self.file.take();
+        self.active = false;
+        Ok(self.path.clone())
+    }
+
+    /// Remove a partial artifact immediately. A failed cleanup is retried once
+    /// when the writer is dropped and is also returned to the caller.
+    pub fn abort(&mut self) -> std::io::Result<()> {
+        self.cleanup()
+    }
+
+    fn cleanup(&mut self) -> std::io::Result<()> {
+        if !self.active {
+            return Ok(());
+        }
+        self.file.take();
+
+        #[cfg(unix)]
+        let result = {
+            let status =
+                unsafe { libc::unlinkat(self.directory.as_raw_fd(), self.name.as_ptr(), 0) };
+            if status == 0 {
+                let _ = self.directory.sync_all();
+                Ok(())
+            } else {
+                let error = std::io::Error::last_os_error();
+                if error.kind() == std::io::ErrorKind::NotFound {
+                    Ok(())
+                } else {
+                    Err(error)
+                }
+            }
+        };
+
+        #[cfg(not(unix))]
+        let result = match std::fs::remove_file(&self.path) {
+            Ok(()) => Ok(()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+            Err(error) => Err(error),
+        };
+
+        if result.is_ok() {
+            self.active = false;
+        }
+        result
+    }
+}
+
+impl Write for PrivateArtifactWriter {
+    fn write(&mut self, buffer: &[u8]) -> std::io::Result<usize> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("private artifact writer is no longer active"))?
+            .write(buffer)
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file
+            .as_mut()
+            .ok_or_else(|| std::io::Error::other("private artifact writer is no longer active"))?
+            .flush()
+    }
+}
+
+impl Drop for PrivateArtifactWriter {
+    fn drop(&mut self) {
+        let _ = self.cleanup();
+    }
+}
+
+/// Allocate a unique private artifact for incremental host-side writes.
+pub fn create_unique_private_artifact(
+    directory: &Path,
+    stem: &str,
+) -> std::io::Result<PrivateArtifactWriter> {
+    create_unique_private_artifact_with_sequence(directory, stem, &PRIVATE_FILE_SEQUENCE)
+}
+
 fn write_unique_private_text_file_with_sequence(
     directory: &Path,
     stem: &str,
     content: &str,
     sequence: &AtomicU64,
 ) -> std::io::Result<PathBuf> {
+    let mut writer = create_unique_private_artifact_with_sequence(directory, stem, sequence)?;
+    writer.write_all(content.as_bytes())?;
+    writer.finish()
+}
+
+fn create_unique_private_artifact_with_sequence(
+    directory: &Path,
+    stem: &str,
+    sequence: &AtomicU64,
+) -> std::io::Result<PrivateArtifactWriter> {
     if stem.is_empty()
         || !stem
             .bytes()
@@ -138,18 +261,24 @@ fn write_unique_private_text_file_with_sequence(
                 }
                 return Err(error);
             }
-            let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
-            if let Err(error) = file
-                .write_all(content.as_bytes())
-                .and_then(|_| file.sync_all())
-            {
+            if unsafe { libc::fchmod(fd, 0o600) } < 0 {
+                let error = std::io::Error::last_os_error();
+                unsafe {
+                    libc::close(fd);
+                }
                 unsafe {
                     libc::unlinkat(directory_file.as_raw_fd(), c_name.as_ptr(), 0);
                 }
                 return Err(error);
             }
-            let _ = directory_file.sync_all();
-            return Ok(directory.join(name));
+            let file = unsafe { std::fs::File::from_raw_fd(fd) };
+            return Ok(PrivateArtifactWriter {
+                path: directory.join(name),
+                file: Some(file),
+                directory: directory_file,
+                name: c_name,
+                active: true,
+            });
         }
     }
 
@@ -167,15 +296,12 @@ fn write_unique_private_text_file_with_sequence(
             let mut options = std::fs::OpenOptions::new();
             options.write(true).create_new(true);
             match options.open(&path) {
-                Ok(mut file) => {
-                    if let Err(error) = file
-                        .write_all(content.as_bytes())
-                        .and_then(|_| file.sync_all())
-                    {
-                        let _ = std::fs::remove_file(&path);
-                        return Err(error);
-                    }
-                    return Ok(path);
+                Ok(file) => {
+                    return Ok(PrivateArtifactWriter {
+                        path,
+                        file: Some(file),
+                        active: true,
+                    })
                 }
                 Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => continue,
                 Err(error) => return Err(error),
@@ -838,6 +964,10 @@ where
 struct WriteFileArgs {
     path: String,
     content: String,
+    /// Exact content the caller previously observed. Replacing an existing
+    /// file requires this precondition; creation and no-op writes omit it.
+    #[serde(default)]
+    expected_previous_content: Option<String>,
 }
 
 static WRITE_SEQUENCE: AtomicU64 = AtomicU64::new(0);
@@ -845,6 +975,8 @@ static JOURNAL_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 static JOURNAL_TURN_SEQUENCE: AtomicU64 = AtomicU64::new(1);
 
 const JOURNAL_TURN_LIMIT: usize = 32;
+/// Maximum retained verified diff evidence in one change/checkpoint report.
+pub const MAX_JOURNAL_DIFF_BYTES: usize = 64 * 1024;
 
 #[derive(Clone, Debug)]
 struct FileSnapshot {
@@ -989,6 +1121,10 @@ pub struct JournalChangeReport {
     pub before_bytes: Option<usize>,
     pub after_bytes: usize,
     pub first_changed_line: usize,
+    /// Unified diff derived from the exact snapshots retained by the journal.
+    /// Untrusted terminal controls are escaped before this string is stored.
+    pub unified_diff: String,
+    pub diff_truncated: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -996,6 +1132,19 @@ pub struct JournalTurnReport {
     pub id: u64,
     pub label: String,
     pub changes: Vec<JournalChangeReport>,
+    /// Bounded concatenation of the per-change verified unified diffs.
+    pub unified_diff: String,
+    pub diff_truncated: bool,
+}
+
+/// Metadata-only checkpoint row for list UIs. Full evidence is available from
+/// [`WriteJournal::checkpoint_preview`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalCheckpointSummary {
+    pub id: u64,
+    pub label: String,
+    pub change_count: usize,
+    pub paths: Vec<PathBuf>,
 }
 
 impl WriteJournal {
@@ -1124,6 +1273,53 @@ impl WriteJournal {
         self.inner.lock().expect("write journal").history.len()
     }
 
+    /// Snapshot all recoverable checkpoints in creation order. Reports expose
+    /// verified paths and byte metadata but never the retained file contents.
+    pub fn checkpoints(&self) -> Vec<JournalTurnReport> {
+        self.inner
+            .lock()
+            .expect("write journal")
+            .history
+            .iter()
+            .cloned()
+            .map(turn_report)
+            .collect()
+    }
+
+    /// Snapshot recoverable checkpoints without cloning retained diff bodies
+    /// into a list UI.
+    pub fn checkpoint_summaries(&self) -> Vec<JournalCheckpointSummary> {
+        self.inner
+            .lock()
+            .expect("write journal")
+            .history
+            .iter()
+            .map(|turn| JournalCheckpointSummary {
+                id: turn.id,
+                label: turn.label.clone(),
+                change_count: turn.changes.len(),
+                paths: turn
+                    .changes
+                    .iter()
+                    .map(|change| change.path.clone())
+                    .collect(),
+            })
+            .collect()
+    }
+
+    /// Return one recoverable checkpoint with bounded, snapshot-derived diff
+    /// evidence. Missing/evicted checkpoint IDs return `None`.
+    pub fn checkpoint_preview(&self, id: u64) -> Option<JournalTurnReport> {
+        self.inner
+            .lock()
+            .expect("write journal")
+            .history
+            .iter()
+            .find(|turn| turn.id == id)
+            .cloned()
+            .map(turn_report)
+    }
+
     fn begin_mutation(&self) -> (MutationLease, Option<JournalAttribution>) {
         self.mutations.in_flight.fetch_add(1, Ordering::AcqRel);
         let attribution = JOURNAL_ATTRIBUTION
@@ -1200,6 +1396,29 @@ impl WriteJournal {
     /// file object and metadata written by that checkpoint. Permission checks
     /// and all conflict checks complete before the first restore is attempted.
     pub async fn undo_last(&self, policy: &Permissions) -> Result<JournalTurnReport, ToolError> {
+        let id = {
+            let state = self.inner.lock().expect("write journal");
+            if state.active.is_some() {
+                return Err(ToolError::ExecError(
+                    "cannot undo while a model turn is still active".to_string(),
+                ));
+            }
+            state.history.back().map(|turn| turn.id).ok_or_else(|| {
+                ToolError::InvalidArgs("nothing to undo in this session".to_string())
+            })?
+        };
+        self.undo_checkpoint(policy, id).await
+    }
+
+    /// Restore one selected checkpoint if every affected target still matches
+    /// that checkpoint's exact post-write identity, metadata, and content.
+    /// Selecting an older disjoint checkpoint is safe; a later write to the
+    /// same path necessarily fails the identity/content precondition.
+    pub async fn undo_checkpoint(
+        &self,
+        policy: &Permissions,
+        id: u64,
+    ) -> Result<JournalTurnReport, ToolError> {
         let turn = {
             let state = self.inner.lock().expect("write journal");
             if state.active.is_some() {
@@ -1207,9 +1426,16 @@ impl WriteJournal {
                     "cannot undo while a model turn is still active".to_string(),
                 ));
             }
-            state.history.back().cloned().ok_or_else(|| {
-                ToolError::InvalidArgs("nothing to undo in this session".to_string())
-            })?
+            state
+                .history
+                .iter()
+                .find(|turn| turn.id == id)
+                .cloned()
+                .ok_or_else(|| {
+                    ToolError::InvalidArgs(format!(
+                        "undo checkpoint {id} is not available in this session"
+                    ))
+                })?
         };
 
         let mut authorized_paths = Vec::with_capacity(turn.changes.len());
@@ -1390,34 +1616,230 @@ fn first_changed_line(before: Option<&[u8]>, after: &[u8]) -> usize {
         + 1
 }
 
+const JOURNAL_DIFF_TRUNCATION_MARKER: &str = "\n...[checkpoint diff truncated at 64 KiB]\n";
+
+fn truncate_journal_diff(diff: &mut String, limit: usize) -> bool {
+    if diff.len() <= limit {
+        return false;
+    }
+    if limit == 0 {
+        diff.clear();
+        return true;
+    }
+    let marker = if limit >= JOURNAL_DIFF_TRUNCATION_MARKER.len() {
+        JOURNAL_DIFF_TRUNCATION_MARKER
+    } else {
+        ""
+    };
+    let mut boundary = limit.saturating_sub(marker.len());
+    while !diff.is_char_boundary(boundary) {
+        boundary = boundary.saturating_sub(1);
+    }
+    diff.truncate(boundary);
+    diff.push_str(marker);
+    true
+}
+
+fn cap_journal_diff(diff: &mut String) -> bool {
+    truncate_journal_diff(diff, MAX_JOURNAL_DIFF_BYTES)
+}
+
+/// Escape every untrusted control character while preserving printable
+/// Unicode. Newlines used by the unified-diff grammar are added separately.
+fn terminal_safe_diff_atom(value: &str) -> String {
+    use std::fmt::Write as _;
+
+    let mut safe = String::with_capacity(value.len());
+    for character in value.chars() {
+        match character {
+            '\t' => safe.push_str("\\t"),
+            '\r' => safe.push_str("\\r"),
+            '\n' => safe.push_str("\\n"),
+            character if character.is_control() => {
+                let _ = write!(safe, "\\u{{{:x}}}", u32::from(character));
+            }
+            character => safe.push(character),
+        }
+    }
+    safe
+}
+
+fn text_lines(bytes: &[u8]) -> Option<(Vec<&str>, bool)> {
+    let text = std::str::from_utf8(bytes).ok()?;
+    let trailing_newline = text.ends_with('\n');
+    let lines = if text.is_empty() {
+        Vec::new()
+    } else {
+        text.split_terminator('\n').collect()
+    };
+    Some((lines, trailing_newline))
+}
+
+fn push_unified_line(
+    output: &mut String,
+    prefix: char,
+    line: &str,
+    is_final_line: bool,
+    trailing_newline: bool,
+) {
+    output.push(prefix);
+    output.push_str(&terminal_safe_diff_atom(line));
+    output.push('\n');
+    if is_final_line && !trailing_newline {
+        output.push_str("\\ No newline at end of file\n");
+    }
+}
+
+fn verified_change_diff(change: &JournalChange) -> (String, bool) {
+    use std::fmt::Write as _;
+
+    let path = terminal_safe_diff_atom(&change.path.to_string_lossy());
+    let mut diff = String::new();
+    if change.before.is_some() {
+        let _ = writeln!(diff, "--- a/{path}");
+    } else {
+        diff.push_str("--- /dev/null\n");
+    }
+    let _ = writeln!(diff, "+++ b/{path}");
+
+    let before_bytes = change
+        .before
+        .as_ref()
+        .map(|snapshot| snapshot.content.as_slice())
+        .unwrap_or_default();
+    let Some((before, before_trailing_newline)) = text_lines(before_bytes) else {
+        diff.push_str("Binary file changed (content omitted)\n");
+        let truncated = cap_journal_diff(&mut diff);
+        return (diff, truncated);
+    };
+    let Some((after, after_trailing_newline)) = text_lines(&change.after.content) else {
+        diff.push_str("Binary file changed (content omitted)\n");
+        let truncated = cap_journal_diff(&mut diff);
+        return (diff, truncated);
+    };
+
+    let mut prefix = before
+        .iter()
+        .zip(after.iter())
+        .take_while(|(left, right)| left == right)
+        .count();
+    let newline_changed = before_trailing_newline != after_trailing_newline;
+    if newline_changed && prefix == before.len().min(after.len()) && prefix > 0 {
+        prefix -= 1;
+    }
+    let mut suffix = before[prefix..]
+        .iter()
+        .rev()
+        .zip(after[prefix..].iter().rev())
+        .take_while(|(left, right)| left == right)
+        .count();
+    if newline_changed {
+        suffix = suffix.min(before.len().min(after.len()).saturating_sub(prefix + 1));
+    }
+    let old_changed_end = before.len().saturating_sub(suffix);
+    let new_changed_end = after.len().saturating_sub(suffix);
+    let context_start = prefix.saturating_sub(3);
+    let old_context_end = old_changed_end.saturating_add(3).min(before.len());
+    let new_context_end = new_changed_end.saturating_add(3).min(after.len());
+    let old_count = old_context_end.saturating_sub(context_start);
+    let new_count = new_context_end.saturating_sub(context_start);
+    let old_start = if old_count == 0 { 0 } else { context_start + 1 };
+    let new_start = if new_count == 0 { 0 } else { context_start + 1 };
+    let _ = writeln!(
+        diff,
+        "@@ -{old_start},{old_count} +{new_start},{new_count} @@"
+    );
+
+    for (index, line) in before[context_start..prefix].iter().enumerate() {
+        let absolute = context_start + index;
+        push_unified_line(
+            &mut diff,
+            ' ',
+            line,
+            absolute + 1 == before.len(),
+            before_trailing_newline,
+        );
+    }
+    for (index, line) in before[prefix..old_changed_end].iter().enumerate() {
+        let absolute = prefix + index;
+        push_unified_line(
+            &mut diff,
+            '-',
+            line,
+            absolute + 1 == before.len(),
+            before_trailing_newline,
+        );
+    }
+    for (index, line) in after[prefix..new_changed_end].iter().enumerate() {
+        let absolute = prefix + index;
+        push_unified_line(
+            &mut diff,
+            '+',
+            line,
+            absolute + 1 == after.len(),
+            after_trailing_newline,
+        );
+    }
+    for (index, line) in before[old_changed_end..old_context_end].iter().enumerate() {
+        let absolute = old_changed_end + index;
+        push_unified_line(
+            &mut diff,
+            ' ',
+            line,
+            absolute + 1 == before.len(),
+            before_trailing_newline,
+        );
+    }
+
+    let truncated = cap_journal_diff(&mut diff);
+    (diff, truncated)
+}
+
 fn turn_report(turn: JournalTurn) -> JournalTurnReport {
+    let mut changes = Vec::with_capacity(turn.changes.len());
+    let mut unified_diff = String::new();
+    let mut diff_truncated = false;
+    let mut per_change_budget = MAX_JOURNAL_DIFF_BYTES;
+    for change in turn.changes {
+        let (change_diff, raw_change_truncated) = verified_change_diff(&change);
+        if !unified_diff.is_empty() && !unified_diff.ends_with('\n') {
+            unified_diff.push('\n');
+        }
+        unified_diff.push_str(&change_diff);
+        diff_truncated |= raw_change_truncated;
+        let mut reported_change_diff = change_diff;
+        let budget_truncated = truncate_journal_diff(&mut reported_change_diff, per_change_budget);
+        per_change_budget = per_change_budget.saturating_sub(reported_change_diff.len());
+        changes.push(JournalChangeReport {
+            first_changed_line: first_changed_line(
+                change
+                    .before
+                    .as_ref()
+                    .map(|snapshot| snapshot.content.as_slice()),
+                &change.after.content,
+            ),
+            path: change.path,
+            change: if change.before.is_some() {
+                "updated"
+            } else {
+                "created"
+            },
+            before_bytes: change
+                .before
+                .as_ref()
+                .map(|snapshot| snapshot.content.len()),
+            after_bytes: change.after.content.len(),
+            unified_diff: reported_change_diff,
+            diff_truncated: raw_change_truncated || budget_truncated,
+        });
+    }
+    diff_truncated |= cap_journal_diff(&mut unified_diff);
     JournalTurnReport {
         id: turn.id,
         label: turn.label,
-        changes: turn
-            .changes
-            .into_iter()
-            .map(|change| JournalChangeReport {
-                first_changed_line: first_changed_line(
-                    change
-                        .before
-                        .as_ref()
-                        .map(|snapshot| snapshot.content.as_slice()),
-                    &change.after.content,
-                ),
-                path: change.path,
-                change: if change.before.is_some() {
-                    "updated"
-                } else {
-                    "created"
-                },
-                before_bytes: change
-                    .before
-                    .as_ref()
-                    .map(|snapshot| snapshot.content.len()),
-                after_bytes: change.after.content.len(),
-            })
-            .collect(),
+        changes,
+        unified_diff,
+        diff_truncated,
     }
 }
 
@@ -2414,15 +2836,20 @@ pub fn write_file_tool_with_journal(
     let descriptor = ToolDescriptor {
         name: "fs_write_file".to_string(),
         description:
-            "Create or overwrite a UTF-8 text file at a write-allowed path with the given \
-                      content. Use this to generate code or other files. The parent directory must \
-                      already exist. Returns the path written and byte count."
+            "Create a UTF-8 text file, or replace one only when its exact previously-read \
+                      content is supplied as expected_previous_content. Use fs_edit_file for \
+                      focused edits. The parent directory must already exist. Returns the path, \
+                      byte count, and observed change."
                 .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
                 "path": {"type": "string", "description": "File path to write (created or overwritten)"},
-                "content": {"type": "string", "description": "Full UTF-8 file contents"}
+                "content": {"type": "string", "description": "Full UTF-8 file contents"},
+                "expected_previous_content": {
+                    "type": "string",
+                    "description": "Exact full content previously read from an existing target. Required to replace it; omit only when creating a new file or when content is already unchanged."
+                }
             },
             "required": ["path", "content"]
         }),
@@ -2465,8 +2892,8 @@ const CHAT_TEMPLATE_TOKENS: &[&str] = &[
 fn content_quality_warning(content: &str) -> Option<&'static str> {
     if CHAT_TEMPLATE_TOKENS.iter().any(|tok| content.contains(tok)) {
         return Some(
-            "content contains a raw chat-template token (e.g. <|im_start|>) — \
-             the model likely emitted its own control tokens instead of real content",
+            "content contains a raw model chat-template control marker — \
+             the model likely emitted protocol text instead of real file content",
         );
     }
     let plausible_source_file = content.len() > 200;
@@ -2489,10 +2916,14 @@ async fn write_file_run_with_journal(
     let a: WriteFileArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
     policy.check_write_size(a.content.len())?;
+    if let Some(expected) = a.expected_previous_content.as_deref() {
+        policy.check_write_size(expected.len())?;
+    }
     let target = policy.check_write(Path::new(&a.path)).await?;
     let bytes = a.content.len();
     let quality_warning = content_quality_warning(&a.content);
     let display = target.display().to_string();
+    let expected_previous = a.expected_previous_content.map(String::into_bytes);
     let content = a.content.into_bytes();
     let written = target.clone();
     let blocking_journal = journal.cloned();
@@ -2519,6 +2950,28 @@ async fn write_file_run_with_journal(
                 .is_some_and(|existing| existing.content == content)
             {
                 return Ok(("unchanged", previous_bytes));
+            }
+            match (previous.as_ref(), expected_previous.as_deref()) {
+                (Some(existing), Some(expected)) if existing.content == expected => {}
+                (Some(_), Some(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidData,
+                        "write conflict: existing file no longer matches expected_previous_content; file was not modified",
+                    ));
+                }
+                (Some(_), None) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        "write conflict: replacing an existing file requires expected_previous_content; read it first or use fs_edit_file",
+                    ));
+                }
+                (None, Some(_)) => {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::NotFound,
+                        "write conflict: expected an existing file but the target is absent; file was not created",
+                    ));
+                }
+                (None, None) => {}
             }
             let change = if previous.is_none() {
                 "created"
@@ -2577,11 +3030,12 @@ pub fn edit_file_tool_with_journal(
 ) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_edit_file".to_string(),
-        description: "Replace exact UTF-8 text in an existing file at a write-allowed path. \
+        description:
+            "Replace exact UTF-8 text in an existing file at a read- and write-allowed path. \
                       old_text is a precondition and must occur exactly once unless replace_all \
                       is true. The edit is refused without changing the file if the precondition \
                       does not match or the file changes before commit."
-            .to_string(),
+                .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
@@ -2626,7 +3080,15 @@ async fn edit_file_run_with_journal(
     // Reject an obviously oversized replacement before doing any file IO. The
     // complete post-edit content is checked again below.
     policy.check_write_size(a.new_text.len())?;
-    let target = policy.check_write(Path::new(&a.path)).await?;
+    let requested = Path::new(&a.path);
+    let authorized_read_target = policy.check_read(requested).await?;
+    let target = policy.check_write(requested).await?;
+    if authorized_read_target != target {
+        return Err(ToolError::PolicyDenied(format!(
+            "edit denied: target '{}' changed while read and write authority were checked",
+            requested.display()
+        )));
+    }
     let display = target.display().to_string();
     let read_target = target.clone();
     let max_bytes = policy.max_bytes();
@@ -2757,6 +3219,60 @@ mod tests {
         assert_ne!(first, second);
         assert_eq!(std::fs::read_to_string(first).unwrap(), "first");
         assert_eq!(std::fs::read_to_string(second).unwrap(), "second");
+    }
+
+    #[test]
+    fn private_artifact_writer_streams_and_retains_only_after_finish() {
+        let dir = tempfile::tempdir().unwrap();
+        let sequence = AtomicU64::new(0);
+        let mut writer =
+            create_unique_private_artifact_with_sequence(dir.path(), "command", &sequence).unwrap();
+        let path = writer.path().to_path_buf();
+        writer.write_all(b"stdout: first\n").unwrap();
+        writer.write_all(b"stderr: second\n").unwrap();
+
+        let retained = writer.finish().unwrap();
+        assert_eq!(retained, path);
+        assert_eq!(
+            std::fs::read(&retained).unwrap(),
+            b"stdout: first\nstderr: second\n"
+        );
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(retained).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[test]
+    fn unfinished_private_artifact_is_removed_on_drop_or_abort() {
+        let dir = tempfile::tempdir().unwrap();
+        let sequence = AtomicU64::new(0);
+        let dropped_path = {
+            let mut writer =
+                create_unique_private_artifact_with_sequence(dir.path(), "drop", &sequence)
+                    .unwrap();
+            writer.write_all(b"partial").unwrap();
+            let path = writer.path().to_path_buf();
+            assert!(path.exists());
+            path
+        };
+        assert!(!dropped_path.exists());
+
+        let mut writer =
+            create_unique_private_artifact_with_sequence(dir.path(), "abort", &sequence).unwrap();
+        writer.write_all(b"partial").unwrap();
+        let aborted_path = writer.path().to_path_buf();
+        writer.abort().unwrap();
+        assert!(!aborted_path.exists());
+        assert_eq!(
+            writer.write_all(b"late").unwrap_err().kind(),
+            std::io::ErrorKind::Other
+        );
     }
 
     #[cfg(unix)]
@@ -3255,7 +3771,11 @@ mod tests {
 
     #[test]
     fn content_quality_warning_flags_chat_template_tokens() {
-        assert!(content_quality_warning("<|im_start|>system\nhi").is_some());
+        let warning = content_quality_warning("<|im_start|>system\nhi")
+            .expect("chat-template marker should be flagged");
+        assert!(CHAT_TEMPLATE_TOKENS
+            .iter()
+            .all(|token| !warning.contains(token)));
         assert!(content_quality_warning("normal code, no tokens here").is_none());
     }
 
@@ -3267,8 +3787,8 @@ mod tests {
         // A real multi-line file (actual newlines) is never flagged, even if
         // it also happens to contain the literal two-char sequence "\n" as text
         // (e.g. documenting an escape sequence).
-        let real_file = "fn main() {\n    println!(\"a literal \\\\n in a string\");\n}\n"
-            .repeat(6);
+        let real_file =
+            "fn main() {\n    println!(\"a literal \\\\n in a string\");\n}\n".repeat(6);
         assert!(content_quality_warning(&real_file).is_none());
 
         // Short content is never flagged regardless of shape (avoids false
@@ -3302,7 +3822,8 @@ mod tests {
         std::fs::write(&target, "old").unwrap();
         let args = serde_json::json!({
             "path": target.to_string_lossy(),
-            "content": "new"
+            "content": "new",
+            "expected_previous_content": "old"
         })
         .to_string();
 
@@ -3316,10 +3837,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn edit_file_replaces_one_exact_match_and_reports_metadata() {
+    async fn write_file_requires_an_exact_precondition_for_replacement() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
         let policy = Permissions::for_roots(&[], &[root]).unwrap();
+        let target = dir.path().join("existing.txt");
+        std::fs::write(&target, "user-current").unwrap();
+
+        let missing = serde_json::json!({
+            "path": target,
+            "content": "model-new"
+        })
+        .to_string();
+        let error = write_file_run(&policy, &missing).await.unwrap_err();
+        assert!(error.to_string().contains("expected_previous_content"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user-current");
+
+        let stale = serde_json::json!({
+            "path": target,
+            "content": "model-new",
+            "expected_previous_content": "stale-model-read"
+        })
+        .to_string();
+        let error = write_file_run(&policy, &stale).await.unwrap_err();
+        assert!(error.to_string().contains("no longer matches"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), "user-current");
+    }
+
+    #[tokio::test]
+    async fn write_file_refuses_creation_when_existing_content_was_expected() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy = Permissions::for_roots(&[], &[root]).unwrap();
+        let target = dir.path().join("missing.txt");
+        let args = serde_json::json!({
+            "path": target,
+            "content": "model-new",
+            "expected_previous_content": "previous"
+        })
+        .to_string();
+
+        let error = write_file_run(&policy, &args).await.unwrap_err();
+        assert!(error.to_string().contains("target is absent"));
+        assert!(!target.exists());
+    }
+
+    #[tokio::test]
+    async fn edit_file_replaces_one_exact_match_and_reports_metadata() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
         let target = dir.path().join("existing.txt");
         std::fs::write(&target, "alpha\nbeta\ngamma\n").unwrap();
         let args = serde_json::json!({
@@ -3342,10 +3911,61 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn edit_file_requires_read_authority_for_the_write_target() {
+        let readable = tempfile::tempdir().unwrap();
+        let writable = tempfile::tempdir().unwrap();
+        let read_root = readable.path().to_string_lossy().to_string();
+        let write_root = writable.path().to_string_lossy().to_string();
+        let policy = Permissions::for_roots(&[read_root], &[write_root]).unwrap();
+        let target = writable.path().join("write-only.txt");
+        let original = "private current contents";
+        std::fs::write(&target, original).unwrap();
+        let args = serde_json::json!({
+            "path": target,
+            "old_text": "private",
+            "new_text": "exposed"
+        })
+        .to_string();
+
+        let error = edit_file_run(&policy, &args).await.unwrap_err();
+
+        assert!(matches!(error, ToolError::PolicyDenied(_)));
+        assert!(error.to_string().contains("read denied"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    }
+
+    #[tokio::test]
+    async fn edit_file_honors_read_revocation_before_inspecting_the_target() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+        let target = dir.path().join("revoked.txt");
+        let original = "secret before revocation";
+        std::fs::write(&target, original).unwrap();
+        policy.revoke_read_root(&root).unwrap();
+        let args = serde_json::json!({
+            "path": target,
+            "old_text": "secret",
+            "new_text": "changed"
+        })
+        .to_string();
+
+        let error = edit_file_run(&policy, &args).await.unwrap_err();
+
+        assert!(matches!(error, ToolError::PolicyDenied(_)));
+        assert!(error.to_string().contains("read denied"));
+        assert_eq!(std::fs::read_to_string(&target).unwrap(), original);
+    }
+
+    #[tokio::test]
     async fn edit_file_refuses_missing_or_ambiguous_preconditions_without_writing() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
-        let policy = Permissions::for_roots(&[], &[root]).unwrap();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
         let target = dir.path().join("existing.txt");
         let original = "same\nmiddle\nsame\n";
         std::fs::write(&target, original).unwrap();
@@ -3367,7 +3987,9 @@ mod tests {
     async fn edit_file_replace_all_is_explicit_and_size_checked() {
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().to_string();
-        let policy = Permissions::for_roots(&[], &[root]).unwrap();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
         let target = dir.path().join("existing.txt");
         std::fs::write(&target, "same middle same").unwrap();
         let args = serde_json::json!({
@@ -3654,7 +4276,8 @@ mod tests {
         let journal = WriteJournal::new();
         let args = serde_json::json!({
             "path": target,
-            "content": "after\nline two\n"
+            "content": "after\nline two\n",
+            "expected_previous_content": "before\nline two\n"
         })
         .to_string();
         let report = run_journaled_write(&journal, &policy, "edit tracked", &args).await;
@@ -3680,6 +4303,90 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn journal_report_contains_verified_bounded_unified_diff_and_preview_apis() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("review.txt");
+        std::fs::write(&target, "before\nshared\n").unwrap();
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "after\nshared\n",
+            "expected_previous_content": "before\nshared\n"
+        })
+        .to_string();
+        let report = run_journaled_write(&journal, &policy, "verified edit", &args).await;
+
+        assert!(report.unified_diff.contains("--- a/"));
+        assert!(report.unified_diff.contains("+++ b/"));
+        assert!(report.unified_diff.contains("@@ -1,2 +1,2 @@"));
+        assert!(report.unified_diff.contains("-before\n"));
+        assert!(report.unified_diff.contains("+after\n"));
+        assert!(!report.diff_truncated);
+        assert_eq!(report.changes[0].unified_diff, report.unified_diff);
+
+        let summaries = journal.checkpoint_summaries();
+        assert_eq!(summaries.len(), 1);
+        assert_eq!(summaries[0].id, report.id);
+        assert_eq!(summaries[0].change_count, 1);
+        assert_eq!(summaries[0].paths, vec![target]);
+        assert_eq!(journal.checkpoint_preview(report.id), Some(report.clone()));
+        assert!(journal.checkpoint_preview(report.id + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_diff_escapes_terminal_controls_and_is_checkpoint_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("large.txt");
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+        let mut content = "\u{1b}]0;forged-title\u{7}\u{009b}31m".to_string();
+        content.push_str(&"x".repeat(MAX_JOURNAL_DIFF_BYTES * 2));
+        let args = serde_json::json!({"path": target, "content": content}).to_string();
+        let report = run_journaled_write(&journal, &policy, "large control edit", &args).await;
+
+        assert!(report.diff_truncated);
+        assert!(report.unified_diff.len() <= MAX_JOURNAL_DIFF_BYTES);
+        assert!(report.unified_diff.contains("checkpoint diff truncated"));
+        assert!(report.unified_diff.contains("\\u{1b}"));
+        assert!(report.unified_diff.contains("\\u{7}"));
+        assert!(report.unified_diff.contains("\\u{9b}"));
+        assert!(!report
+            .unified_diff
+            .chars()
+            .any(|character| character != '\n' && character.is_control()));
+        let retained_change_diff_bytes: usize = report
+            .changes
+            .iter()
+            .map(|change| change.unified_diff.len())
+            .sum();
+        assert!(retained_change_diff_bytes <= MAX_JOURNAL_DIFF_BYTES);
+    }
+
+    #[tokio::test]
+    async fn journal_diff_represents_a_trailing_newline_only_change() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("newline.txt");
+        std::fs::write(&target, "same line").unwrap();
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "same line\n",
+            "expected_previous_content": "same line"
+        })
+        .to_string();
+        let report = run_journaled_write(&journal, &policy, "newline", &args).await;
+
+        assert!(report.unified_diff.contains("-same line\n"));
+        assert!(report.unified_diff.contains("+same line\n"));
+        assert!(report.unified_diff.contains("\\ No newline at end of file"));
+    }
+
+    #[tokio::test]
     async fn journal_undo_removes_created_file() {
         let dir = tempfile::tempdir().unwrap();
         let target = dir.path().join("created.txt");
@@ -3701,7 +4408,12 @@ mod tests {
         let policy =
             Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
         let journal = WriteJournal::new();
-        let args = serde_json::json!({"path": target, "content": "model"}).to_string();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "model",
+            "expected_previous_content": "before"
+        })
+        .to_string();
         run_journaled_write(&journal, &policy, "model edit", &args).await;
         std::fs::write(&target, "user edit").unwrap();
 
@@ -3719,7 +4431,12 @@ mod tests {
         let policy =
             Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
         let journal = WriteJournal::new();
-        let args = serde_json::json!({"path": target, "content": "model"}).to_string();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "model",
+            "expected_previous_content": "before"
+        })
+        .to_string();
         run_journaled_write(&journal, &policy, "model edit", &args).await;
 
         let mut permissions = std::fs::metadata(&target).unwrap().permissions();
@@ -3744,7 +4461,12 @@ mod tests {
         let policy =
             Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
         let journal = WriteJournal::new();
-        let args = serde_json::json!({"path": target, "content": "model"}).to_string();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "model",
+            "expected_previous_content": "before"
+        })
+        .to_string();
         run_journaled_write(&journal, &policy, "model edit", &args).await;
 
         let old_identity = file_identity(&std::fs::metadata(&target).unwrap());
@@ -3918,16 +4640,24 @@ mod tests {
         let foreground = journal.begin_attributed_turn("foreground");
         journal
             .scope_turn(&foreground.token, async {
-                let first =
-                    serde_json::json!({"path": target, "content": "foreground-1"}).to_string();
+                let first = serde_json::json!({
+                    "path": target,
+                    "content": "foreground-1",
+                    "expected_previous_content": "original"
+                })
+                .to_string();
                 write_file_run_with_journal(&policy, Some(&journal), &first)
                     .await
                     .unwrap();
 
                 let background_policy = policy.clone();
                 let background_journal = journal.clone();
-                let background =
-                    serde_json::json!({"path": target, "content": "background"}).to_string();
+                let background = serde_json::json!({
+                    "path": target,
+                    "content": "background",
+                    "expected_previous_content": "foreground-1"
+                })
+                .to_string();
                 tokio::spawn(async move {
                     write_file_run_with_journal(
                         &background_policy,
@@ -3940,8 +4670,12 @@ mod tests {
                 .await
                 .unwrap();
 
-                let last =
-                    serde_json::json!({"path": target, "content": "foreground-2"}).to_string();
+                let last = serde_json::json!({
+                    "path": target,
+                    "content": "foreground-2",
+                    "expected_previous_content": "background"
+                })
+                .to_string();
                 write_file_run_with_journal(&policy, Some(&journal), &last)
                     .await
                     .unwrap();
@@ -3976,11 +4710,18 @@ mod tests {
         let start = journal.begin_attributed_turn("multiple writes");
         journal
             .scope_turn(&start.token, async {
+                let mut expected = "original";
                 for content in ["first", "second"] {
-                    let args = serde_json::json!({"path": target, "content": content}).to_string();
+                    let args = serde_json::json!({
+                        "path": target,
+                        "content": content,
+                        "expected_previous_content": expected
+                    })
+                    .to_string();
                     write_file_run_with_journal(&policy, Some(&journal), &args)
                         .await
                         .unwrap();
+                    expected = content;
                 }
             })
             .await;
@@ -3991,5 +4732,57 @@ mod tests {
 
         journal.undo_last(&policy).await.unwrap();
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "original");
+    }
+
+    #[tokio::test]
+    async fn selected_undo_restores_an_older_disjoint_checkpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let first = dir.path().join("first.txt");
+        let second = dir.path().join("second.txt");
+        std::fs::write(&first, "first-before").unwrap();
+        std::fs::write(&second, "second-before").unwrap();
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+
+        let first_args = serde_json::json!({
+            "path": first,
+            "content": "first-after",
+            "expected_previous_content": "first-before"
+        })
+        .to_string();
+        let first_report =
+            run_journaled_write(&journal, &policy, "first change", &first_args).await;
+        let second_args = serde_json::json!({
+            "path": second,
+            "content": "second-after",
+            "expected_previous_content": "second-before"
+        })
+        .to_string();
+        let second_report =
+            run_journaled_write(&journal, &policy, "second change", &second_args).await;
+
+        assert_eq!(
+            journal
+                .checkpoints()
+                .iter()
+                .map(|report| report.id)
+                .collect::<Vec<_>>(),
+            vec![first_report.id, second_report.id]
+        );
+        journal
+            .undo_checkpoint(&policy, first_report.id)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&first).unwrap(), "first-before");
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second-after");
+        assert_eq!(journal.checkpoints(), vec![second_report.clone()]);
+
+        journal
+            .undo_checkpoint(&policy, second_report.id)
+            .await
+            .unwrap();
+        assert_eq!(std::fs::read_to_string(&second).unwrap(), "second-before");
+        assert!(journal.checkpoints().is_empty());
     }
 }

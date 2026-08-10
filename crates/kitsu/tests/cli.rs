@@ -226,6 +226,270 @@ auth = { method = "none" }
         .stderr(predicate::str::contains("cannot create runtime state").not());
 }
 
+#[test]
+fn test_init_is_no_clobber_and_doctor_is_read_only_json() {
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("project").join("kitsu.toml");
+
+    let mut init = base_cmd(home.path());
+    let output = init
+        .args(["init", "--path", &config.to_string_lossy(), "--json"])
+        .output()
+        .expect("run init");
+    assert!(output.status.success(), "{:?}", output);
+    let initialized: serde_json::Value = serde_json::from_slice(&output.stdout).expect("init JSON");
+    assert_eq!(initialized["created"], true);
+    assert_eq!(initialized["contains_credentials"], false);
+    let contents = fs::read_to_string(&config).expect("starter config");
+    assert!(contents.contains("auth = { method = \"none\" }"));
+    assert!(!contents.to_lowercase().contains("token ="));
+
+    let mut second = base_cmd(home.path());
+    second
+        .args(["init", "--path", &config.to_string_lossy()])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("refusing to overwrite"));
+    assert_eq!(
+        fs::read_to_string(&config).expect("unchanged config"),
+        contents
+    );
+
+    // The config is deliberately outside ~/.kitsu. Offline doctor must inspect
+    // the prospective isolated state namespace without creating ~/.kitsu.
+    assert!(!home.path().join(".kitsu").exists());
+    let mut doctor = base_cmd(home.path());
+    let output = doctor
+        .args(["--config", &config.to_string_lossy(), "doctor", "--json"])
+        .output()
+        .expect("run doctor");
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["read_only"], true);
+    assert_eq!(report["config"]["parse_ok"], true);
+    assert_eq!(report["gateway"]["name"], "ollama");
+    assert_eq!(report["auth"]["credential_present"], true);
+    assert_eq!(report["online"]["requested"], false);
+    assert!(!home.path().join(".kitsu").exists());
+}
+
+#[test]
+fn test_doctor_never_echoes_static_or_malformed_config_secrets() {
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor.toml");
+    const SECRET: &str = "DOCTOR_SECRET_MUST_NOT_LEAK";
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test-model"
+context_window = 8192
+auth = {{ method = "static", token = "{SECRET}" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    let mut valid = base_cmd(home.path());
+    let output = valid
+        .args(["--config", &config.to_string_lossy(), "doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(SECRET));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["auth"]["credential_present"], true);
+    assert!(report["auth"]["status"]
+        .as_str()
+        .unwrap()
+        .contains("value hidden"));
+
+    fs::write(
+        &config,
+        format!("default_gateway = \"example\" trailing {SECRET}\n"),
+    )
+    .unwrap();
+    let mut malformed = base_cmd(home.path());
+    let output = malformed
+        .args(["--config", &config.to_string_lossy(), "doctor", "--json"])
+        .output()
+        .unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(SECRET));
+    assert!(combined.contains("source excerpt withheld"));
+}
+
+#[test]
+fn test_malformed_config_never_echoes_credentials_in_any_chat_surface() {
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("malformed-credentials.toml");
+    const SECRETS: [&str; 4] = [
+        "hf_KitsuMalformedCredential123",
+        "sk-KitsuMalformedCredential123",
+        "api-key=KitsuMalformedCredential123",
+        "token=KitsuMalformedCredential123",
+    ];
+    // toml's native diagnostic includes this entire source line. Each command
+    // must instead render only location metadata and the withheld-source note.
+    fs::write(
+        &config,
+        format!(
+            "default_gateway = \"example\"\ncredential = \"{}\" \"{}\" \"{}\" \"{}\"\n",
+            SECRETS[0], SECRETS[1], SECRETS[2], SECRETS[3]
+        ),
+    )
+    .expect("write malformed config");
+
+    let invocations: [(&str, &[&str]); 4] = [
+        ("ask", &["ask", "hello"]),
+        ("chat", &["chat"]),
+        ("review", &["review"]),
+        ("models", &["models"]),
+    ];
+    for jsonl in [false, true] {
+        for (name, args) in invocations {
+            let mut cmd = base_cmd(home.path());
+            cmd.arg("--config").arg(&config);
+            if jsonl {
+                cmd.arg("--jsonl");
+            }
+            let output = cmd.args(args).output().expect("run kitsu");
+            assert_eq!(
+                output.status.code(),
+                Some(1),
+                "{name} (jsonl={jsonl}) unexpectedly succeeded: {output:?}"
+            );
+            let combined = format!(
+                "{}{}",
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&output.stderr)
+            );
+            for secret in SECRETS {
+                assert!(
+                    !combined.contains(secret),
+                    "{name} (jsonl={jsonl}) leaked {secret}: {combined}"
+                );
+            }
+            assert!(
+                combined.contains("TOML parse failed at line 2"),
+                "{name} (jsonl={jsonl}) lost safe location context: {combined}"
+            );
+            assert!(
+                combined.contains("source excerpt withheld"),
+                "{name} (jsonl={jsonl}) omitted redaction notice: {combined}"
+            );
+            if jsonl {
+                assert!(
+                    output.stderr.is_empty(),
+                    "JSONL diagnostic escaped to stderr: {combined}"
+                );
+            } else {
+                assert!(
+                    output.stdout.is_empty(),
+                    "human diagnostic escaped to stdout: {combined}"
+                );
+            }
+        }
+    }
+}
+
+#[test]
+fn test_sessions_missing_namespace_is_provider_free_and_friendly() {
+    let home = TempDir::new().expect("temp home");
+    let missing_config = home.path().join("does-not-exist.toml");
+
+    let mut human = base_cmd(home.path());
+    human
+        .args(["--config", &missing_config.to_string_lossy(), "sessions"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no saved sessions for config"));
+
+    let mut json = base_cmd(home.path());
+    let output = json
+        .args([
+            "--config",
+            &missing_config.to_string_lossy(),
+            "sessions",
+            "--json",
+        ])
+        .output()
+        .expect("list sessions");
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    assert!(!home.path().join(".kitsu").exists());
+
+    let mut show = base_cmd(home.path());
+    show.args([
+        "--config",
+        &missing_config.to_string_lossy(),
+        "sessions",
+        "show",
+        "last",
+    ])
+    .assert()
+    .failure()
+    .code(1)
+    .stderr(predicate::str::contains(
+        "no saved sessions in this config directory",
+    ));
+}
+
+#[test]
+fn test_script_session_flags_reject_ambiguous_no_session() {
+    let home = TempDir::new().expect("temp home");
+    let script = home.path().join("empty.txt");
+    fs::write(&script, "").unwrap();
+
+    let mut new_session = base_cmd(home.path());
+    new_session
+        .args([
+            "chat",
+            "--session",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("cannot be used with"));
+
+    let mut resume = base_cmd(home.path());
+    resume
+        .args([
+            "chat",
+            "--resume",
+            "last",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
 // --- happy path against wiremock --------------------------------------------
 
 /// design §6 acceptance: with a valid token and a mock gateway, `kitsu ask` exits
@@ -281,6 +545,245 @@ async fn test_ask_against_mock() {
     })
     .await
     .expect("spawned kitsu process should join");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"saved answer"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let first_script = home.path().join("first.txt");
+    let second_script = home.path().join("second.txt");
+    let export = home.path().join("fork.json");
+    fs::write(&first_script, "first saved turn\n").unwrap();
+    fs::write(&second_script, "second saved turn\n").unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut first = base_cmd(&home_path);
+        let output = first
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "chat",
+                "--session",
+                "--allow-path",
+                &home_path.to_string_lossy(),
+                "--script",
+                &first_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("first scripted session");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(String::from_utf8_lossy(&output.stderr).contains("autosave enabled"));
+
+        let mut list = base_cmd(&home_path);
+        let output = list
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list sessions");
+        assert!(output.status.success(), "{:?}", output);
+        let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let id = listed[0]["id"].as_str().expect("session id").to_string();
+        assert_eq!(listed[0]["turns"], 1);
+
+        let mut second = base_cmd(&home_path);
+        let output = second
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "chat",
+                "--resume",
+                &id,
+                "--script",
+                &second_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("resume scripted session");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(stderr.contains("saved grants were not restored"));
+        assert!(stderr.contains("invocation grants retained: 0 read, 0 write"));
+
+        let mut show = base_cmd(&home_path);
+        let output = show
+            .args(["sessions", "--json", "show", &id])
+            .output()
+            .expect("show session");
+        assert!(output.status.success(), "{:?}", output);
+        let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(saved["id"], id);
+        assert!(saved.get("permissions").is_none());
+        let transcript = saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("first saved turn"));
+        assert!(transcript.contains("second saved turn"));
+
+        // In a non-TTY, resume is a provider-free command resolver rather than
+        // an accidental chat launch.
+        let mut resume = base_cmd(&home_path);
+        let output = resume
+            .args(["sessions", "--json", "resume", "last"])
+            .output()
+            .expect("resolve resume command");
+        assert!(output.status.success(), "{:?}", output);
+        let resume: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(resume["launched"], false);
+        assert_eq!(resume["session_id"], id);
+        assert_eq!(resume["argv"][3], "chat");
+
+        let mut fork = base_cmd(&home_path);
+        let output = fork
+            .args(["sessions", "--json", "fork", &id])
+            .output()
+            .expect("fork session");
+        assert!(output.status.success(), "{:?}", output);
+        let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let forked_id = forked["session"]["id"].as_str().unwrap().to_string();
+        assert_ne!(forked_id, id);
+        assert_eq!(forked["permissions_restored"], false);
+
+        let mut export_cmd = base_cmd(&home_path);
+        export_cmd
+            .args([
+                "sessions",
+                "--json",
+                "export",
+                &forked_id,
+                &export.to_string_lossy(),
+                "--format",
+                "json",
+            ])
+            .assert()
+            .success();
+        assert!(export.is_file());
+
+        let mut archive = base_cmd(&home_path);
+        archive
+            .args(["sessions", "archive", &forked_id])
+            .assert()
+            .success();
+        let mut restore = base_cmd(&home_path);
+        restore
+            .args(["sessions", "restore", &forked_id])
+            .assert()
+            .success();
+        let mut delete = base_cmd(&home_path);
+        delete
+            .args(["sessions", "delete", &forked_id])
+            .assert()
+            .success();
+
+        let mut final_list = base_cmd(&home_path);
+        let output = final_list
+            .args(["sessions", "--json"])
+            .output()
+            .expect("final list");
+        let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["id"], id);
+    })
+    .await
+    .expect("spawned session lifecycle should join");
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_doctor_online_reachability_is_explicit_and_machine_readable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "doctor-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-online.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "doctor-model"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run online doctor");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["requested"], true);
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["models"], 1);
+    })
+    .await
+    .expect("online doctor process should join");
+
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -343,9 +846,98 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         assert_eq!(events.last().unwrap()["type"], "final_summary");
         assert_eq!(events.last().unwrap()["status"], "ok");
         assert!(!stdout.lines().any(|line| !line.starts_with('{')));
+        assert!(
+            output.stderr.is_empty(),
+            "routine diagnostics leaked to JSONL stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
     })
     .await
     .unwrap();
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_script_happy_path_has_no_transcript_or_routine_stderr() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "quiet answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("quiet-jsonl.txt");
+    fs::write(&script, "/context\nhello from script\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args(["--jsonl", "chat", "--script", &script_path, "--no-session"]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(
+        output.stderr.is_empty(),
+        "JSONL script leaked human stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("one JSON object per line"))
+        .collect();
+    assert!(events
+        .iter()
+        .any(|event| { event["type"] == "assistant" && event["text"] == "quiet answer" }));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "ok");
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[serial]
+fn test_jsonl_output_failure_on_dev_full_is_nonzero_and_actionable() {
+    use std::process::Stdio;
+
+    let home = TempDir::new().unwrap();
+    let full = fs::OpenOptions::new()
+        .write(true)
+        .open("/dev/full")
+        .expect("Linux /dev/full");
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    cmd.env("HOME", home.path())
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .args(["--jsonl", "--max-rounds", "not-a-number", "ask", "hello"])
+        .stdout(Stdio::from(full));
+
+    let output = cmd.output().unwrap();
+    assert_eq!(output.status.code(), Some(1));
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("JSONL output failed") && stderr.contains("write failed"),
+        "unexpected stderr: {stderr}"
+    );
 }
 
 #[tokio::test]
@@ -546,16 +1138,20 @@ async fn test_jsonl_sigint_emits_cancelled_turn_and_summary() {
             "run_started",
             "turn_started",
             "provider_request",
+            "provider_attempt",
             "error",
             "turn_finished",
             "final_summary",
         ]
     );
-    assert_eq!(events[3]["kind"], "cancelled");
-    assert_eq!(events[3]["exit_code"], 130);
-    assert_eq!(events[4]["status"], "cancelled");
+    assert_eq!(events[3]["category"], "cancelled");
+    assert_eq!(events[3]["outcome"], "cancelled");
+    assert_eq!(events[3]["terminal"], true);
+    assert_eq!(events[4]["kind"], "cancelled");
+    assert_eq!(events[4]["exit_code"], 130);
     assert_eq!(events[5]["status"], "cancelled");
-    assert_eq!(events[5]["cancelled_failures"], 1);
+    assert_eq!(events[6]["status"], "cancelled");
+    assert_eq!(events[6]["cancelled_failures"], 1);
 }
 
 #[cfg(unix)]
@@ -780,16 +1376,19 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
             "command_started",
             "turn_started",
             "provider_request",
+            "provider_attempt",
             "error",
             "turn_finished",
             "command_finished",
             "final_summary",
         ]
     );
-    assert_eq!(events[4]["kind"], "cancelled");
-    assert_eq!(events[5]["status"], "cancelled");
+    assert_eq!(events[4]["category"], "cancelled");
+    assert_eq!(events[4]["outcome"], "cancelled");
+    assert_eq!(events[5]["kind"], "cancelled");
     assert_eq!(events[6]["status"], "cancelled");
     assert_eq!(events[7]["status"], "cancelled");
+    assert_eq!(events[8]["status"], "cancelled");
 }
 
 #[tokio::test]
@@ -1131,15 +1730,11 @@ async fn test_chat_tool_round_reads_file() {
     drop(work);
 }
 
-/// `--allow-write <dir>` alone (no `--allow-path`) must still let the model
-/// read a file back from that same directory — editing an existing file is
-/// read-then-write, and a write-only grant that can never be read back is a
-/// trap nobody asks for. Regression test for a dogfooding finding where a
-/// scripted edit turn failed at the read step with PolicyDenied even though
-/// the user had explicitly granted write access to the exact same directory.
+/// The explicit combined capability supports read-modify-write workflows
+/// without making the plainly named `--allow-write` flag disclose old content.
 #[tokio::test]
 #[serial]
-async fn test_allow_write_implies_read_of_same_root() {
+async fn test_allow_read_write_supports_readback() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -1197,8 +1792,7 @@ async fn test_allow_write_implies_read_of_same_root() {
     tokio::task::spawn_blocking(move || {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-        // --allow-write only — no --allow-path.
-        cmd.args(["chat", "--gateway", "example", "--allow-write", &allow]);
+        cmd.args(["chat", "--gateway", "example", "--allow-read-write", &allow]);
         cmd.write_stdin("read the note\n");
         cmd.assert()
             .success()
@@ -1207,6 +1801,108 @@ async fn test_allow_write_implies_read_of_same_root() {
     .await
     .expect("spawned kitsu chat tool round should join");
     drop(work);
+}
+
+#[test]
+fn test_allow_write_registers_only_write_capability() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("write root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/tools\n/permissions\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "chat",
+        "--allow-write",
+        &work.path().to_string_lossy(),
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("fs_write_file"))
+        .stderr(predicate::str::contains("fs_read_file").not())
+        .stderr(predicate::str::contains("fs_edit_file").not())
+        .stderr(predicate::str::contains("read roots   none"))
+        .stderr(predicate::str::contains("(invocation/base)"));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_yes_cannot_write_outside_explicit_root() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let allowed = TempDir::new().expect("allowed root");
+    let outside = TempDir::new().expect("outside root");
+    let escaped = outside.path().join("must-not-exist.txt");
+    let tool_args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"escaped\"}}"#,
+        escaped.to_string_lossy().replace('\\', "\\\\")
+    );
+    let request_write = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_write","type":"function","function":{{"name":"fs_write_file","arguments":"{tool_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#
+            .to_string(),
+        "data: [DONE]".to_string(),
+        "".to_string(),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(request_write),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    let final_answer = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"done"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(final_answer),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let allowed_path = allowed.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+            "--yes",
+            "--gateway",
+            "example",
+            "chat",
+            "--allow-write",
+            &allowed_path.to_string_lossy(),
+        ]);
+        cmd.write_stdin("write outside the root\n");
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains("tool call(s) failed"));
+    })
+    .await
+    .expect("spawned scoped chat should join");
+
+    assert!(!escaped.exists(), "--yes escaped its explicit write root");
 }
 
 // --- --max-rounds flag + usage surfacing ------------------------------------
@@ -1868,6 +2564,221 @@ async fn test_review_turn_does_not_offer_or_execute_write_tools() {
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn test_top_level_review_is_verified_tool_free_and_jsonl_framed() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "verified review complete"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 3, "total_tokens": 24}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("review-me.rs"), "fn reviewed() {}\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+
+    let mut human = base_cmd(home.path());
+    human
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "review",
+            "--instructions",
+            "focus on public API compatibility",
+        ]);
+    human
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("verified review complete"))
+        .stderr(predicate::str::contains("verified target working"));
+
+    let mut machine = base_cmd(home.path());
+    let output = machine
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "review",
+            "--instructions",
+            "focus on public API compatibility",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events[0]["type"], "run_started");
+    assert_eq!(events[0]["mode"], "review");
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "ok");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("tools")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(true),
+            "top-level review advertised tools: {body}"
+        );
+        let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.contains("review-me.rs"));
+        assert!(prompt.contains("focus on public API compatibility"));
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_jsonl_command_exec_reports_native_metadata_and_retains_private_artifact() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let argv = vec!["/bin/echo".to_string(), "KITSU_COMMAND_OK".to_string()];
+    let tool_args = serde_json::json!({
+        "argv": argv,
+        "cwd": work.path().to_string_lossy(),
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "command_call_1",
+                        "type": "function",
+                        "function": {"name": "command_exec", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "command checked"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let allow_command = serde_json::to_string(&vec![
+        "/bin/echo".to_string(),
+        "KITSU_COMMAND_OK".to_string(),
+    ])
+    .unwrap();
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--enable-commands",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "--allow-command",
+            &allow_command,
+            "run the approved command",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "tool_started")
+        .expect("native tool_started event");
+    assert_eq!(started["name"], "command_exec");
+    assert_eq!(started["command"]["argv"][0], "/bin/echo");
+    assert_eq!(
+        started["command"]["cwd"],
+        work.path().to_string_lossy().as_ref()
+    );
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("native tool_finished event");
+    assert_eq!(finished["command"]["termination"], "exited");
+    assert_eq!(finished["command"]["exit_code"], 0);
+    assert_eq!(finished["command"]["stdout_bytes"], 17);
+    assert_eq!(finished["command"]["stdout_tail"], "KITSU_COMMAND_OK\\n");
+    let artifact = finished["command"]["artifact"]["reference"]
+        .as_str()
+        .expect("host-owned artifact reference");
+    assert!(
+        Path::new(artifact).exists(),
+        "one-shot command artifact should remain readable after process exit: {artifact}"
+    );
+    let artifact_text = fs::read_to_string(artifact).unwrap();
+    assert!(artifact_text.contains("KITSU_COMMAND_OK"));
+    assert!(artifact_text.contains("kitsu.command-output.v1"));
+    assert_eq!(events.last().unwrap()["status"], "ok");
+}
+
 #[test]
 fn test_project_context_source_is_disclosed_and_can_be_disabled() {
     let home = TempDir::new().expect("temp home");
@@ -2026,7 +2937,7 @@ fn test_yes_does_not_enable_commands_but_explicit_command_flags_do() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), "http://127.0.0.1:1");
     let script_path = home.path().join("tools.txt");
-    fs::write(&script_path, "/tools\n/quit\n").unwrap();
+    fs::write(&script_path, "/tools\n/permissions\n/quit\n").unwrap();
 
     let mut autoapprove_only = base_cmd(home.path());
     autoapprove_only.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
@@ -2050,7 +2961,10 @@ fn test_yes_does_not_enable_commands_but_explicit_command_flags_do() {
     commands_enabled
         .assert()
         .success()
-        .stderr(predicate::str::contains("command_exec"));
+        .stderr(predicate::str::contains("command_exec"))
+        .stderr(predicate::str::contains(
+            "NOT host filesystem, network, or process sandboxes",
+        ));
 
     let mut exact_pregrant = base_cmd(home.path());
     exact_pregrant.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
@@ -2064,6 +2978,133 @@ fn test_yes_does_not_enable_commands_but_explicit_command_flags_do() {
         .assert()
         .success()
         .stderr(predicate::str::contains("command_exec"));
+}
+
+#[test]
+fn test_yes_is_scoped_and_global_filesystem_bypass_is_explicit() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("write root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/permissions\n/quit\n").unwrap();
+    let root = work.path().to_string_lossy().to_string();
+    let script_path = script.to_string_lossy().to_string();
+
+    let mut scoped = base_cmd(home.path());
+    scoped.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--yes",
+        "chat",
+        "--allow-write",
+        &root,
+        "--script",
+        &script_path,
+    ]);
+    scoped
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("mode         scoped"))
+        .stderr(predicate::str::contains("global filesystem bypass").not());
+
+    let mut bypass = base_cmd(home.path());
+    bypass.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--dangerously-allow-all-filesystem",
+        "chat",
+        "--allow-write",
+        &root,
+        "--script",
+        &script_path,
+    ]);
+    bypass
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("DANGER: global filesystem bypass"));
+
+    let mut conflicting = base_cmd(home.path());
+    conflicting.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--yes",
+        "--dangerously-allow-all-filesystem",
+        "chat",
+        "--allow-write",
+        &root,
+        "--script",
+        &script_path,
+    ]);
+    conflicting
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn test_slash_grant_provenance_and_revoke_are_visible() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("combined root");
+    let root = work.path().to_string_lossy();
+    let script = home.path().join("revoke.txt");
+    fs::write(
+        &script,
+        format!(
+            "/revoke-read {root}\n/revoke-write {root}\n/permissions\n/allow-read-write {root}\n/permissions\n/quit\n"
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "chat",
+        "--allow-read-write",
+        &root,
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "read root revoked for this session (invocation)",
+        ))
+        .stderr(predicate::str::contains(
+            "write root revoked for this session (invocation)",
+        ))
+        .stderr(predicate::str::contains("revoked invocation roots"))
+        .stderr(predicate::str::contains("read/write access granted"))
+        .stderr(predicate::str::contains("(session/runtime)"));
+}
+
+#[test]
+fn test_global_filesystem_bypass_refuses_misleading_slash_revocation() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let work = TempDir::new().expect("granted root");
+    let root = work.path().to_string_lossy();
+    let script = home.path().join("dangerous-revoke.txt");
+    fs::write(
+        &script,
+        format!("/revoke-read {root}\n/revoke-write {root}\n/quit\n"),
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--dangerously-allow-all-filesystem",
+        "chat",
+        "--allow-read-write",
+        &root,
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "cannot revoke read roots while --dangerously-allow-all-filesystem is active",
+        ))
+        .stderr(predicate::str::contains(
+            "cannot revoke write roots while --dangerously-allow-all-filesystem is active",
+        ))
+        .stderr(predicate::str::contains(
+            "restart without the dangerous flag",
+        ));
 }
 
 // --- /models command --------------------------------------------------------
@@ -2250,6 +3291,9 @@ auth = {{ method = "none" }}
     assert_eq!(summary["user_failures"], 0);
 }
 
+/// Provider response bodies are untrusted and may contain credentials or
+/// terminal controls. The centralized diagnostic retains only the safe status
+/// class and an actionable remedy.
 #[tokio::test]
 #[serial]
 async fn test_models_slash_error_sanitizes_provider_body() {
@@ -2294,7 +3338,9 @@ auth = {{ method = "none" }}
         cmd.assert()
             .failure()
             .code(2)
-            .stderr(predicate::str::contains("catalog unavailable"))
+            .stderr(predicate::str::contains("HTTP 503"))
+            .stderr(predicate::str::contains("gateway is unavailable"))
+            .stderr(predicate::str::contains("catalog unavailable").not())
             .stderr(predicate::str::contains("\u{1b}").not())
             .stderr(predicate::str::contains("https://evil.invalid").not());
     })
@@ -2474,6 +3520,107 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
     })
     .await
     .expect("join");
+}
+
+#[test]
+#[serial]
+fn test_jsonl_script_query_results_are_structured_and_framed() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("queries.txt");
+    fs::write(&script, "/status\n/permissions\n/context\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("query script");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 3);
+    assert_eq!(results[0]["result"]["kind"], "status");
+    assert_eq!(results[1]["result"]["kind"], "permissions");
+    assert_eq!(results[2]["result"]["kind"], "context");
+    assert_eq!(results[2]["result"]["model"], "example-model-v1");
+    let started = events
+        .iter()
+        .filter(|event| event["type"] == "command_started")
+        .count();
+    let finished = events
+        .iter()
+        .filter(|event| event["type"] == "command_finished")
+        .count();
+    assert_eq!(started, 4);
+    assert_eq!(finished, started, "every slash frame must close");
+}
+
+#[test]
+#[serial]
+fn test_jsonl_run_started_reports_resolved_session_and_model() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("session-query.txt");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+    let script_path = script.to_string_lossy().to_string();
+
+    let run = |extra: &[&str]| {
+        let mut cmd = base_cmd(home.path());
+        let mut args = vec!["--jsonl", "chat"];
+        args.extend_from_slice(extra);
+        args.extend(["--script", script_path.as_str()]);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(args)
+            .output()
+            .expect("session query");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(
+            output.stderr.is_empty(),
+            "JSONL must suppress durable/resume/project-context notices: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .find(|event| event["type"] == "run_started")
+            .expect("run_started")
+    };
+
+    let created = run(&["--session", "--model", "saved-model"]);
+    let id = created["session_id"]
+        .as_str()
+        .expect("new durable session id")
+        .to_string();
+    assert_eq!(created["model"], "saved-model");
+    assert_eq!(created["resumed"], false);
+    assert_eq!(created["durable_session"], true);
+
+    let resumed = run(&["--resume", &id]);
+    assert_eq!(resumed["session_id"], id);
+    assert_eq!(resumed["model"], "saved-model");
+    assert_eq!(resumed["resumed"], true);
+    assert_eq!(resumed["durable_session"], true);
 }
 
 /// `/skills` discovers and lists a LOCAL project skill (index end-to-end). No

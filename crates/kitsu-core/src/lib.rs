@@ -9,7 +9,7 @@ pub mod orchestrator;
 pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 pub use orchestrator::{
     compact_context, run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentError,
-    AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus, CompactionLedger,
-    CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord, CompactionReport,
-    ContextUnit, SummaryFallbackReason, TurnCompletion,
+    AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus, CommandRuntimeInvocation,
+    CommandRuntimeResult, CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason,
+    CompactionRecord, CompactionReport, ContextUnit, SummaryFallbackReason, TurnCompletion,
 };

@@ -71,7 +71,7 @@ The subagent inherits, so it's as capable as the parent (minus recursion):
 | Inherited | How |
 |---|---|
 | Provider + model | shared (the same gateway connection) |
-| **Permissions** | the **same `Permissions`** (`Arc`) — same allowlists, same prompt; grants made in either propagate. No escalation: a subagent can't read/write what the parent couldn't. |
+| **Permissions** | the **same `Permissions`** (`Arc`) and live allowlists. Foreground synchronous subagents may use the foreground approval flow; detached agents never claim stdin and must use existing grants. No escalation: a subagent cannot read/write what the parent could not. |
 | Tools (fs read/write, grep) | same registry entries |
 | **Skills** | the skill index + `skill` tool, and any `--skill` preloads |
 | Context budget | same window / compaction mode |
@@ -110,7 +110,8 @@ crashes the parent turn.
 ## 3. Security summary
 
 - **No privilege escalation:** subagents share the parent's `Permissions`; they
-  can't touch paths the parent couldn't, and writes still prompt.
+  cannot touch paths the parent could not. Detached writes outside existing
+  grants fail closed rather than opening a competing terminal prompt.
 - **Bounded recursion:** depth-1 (no `spawn_agent` in subagents) + max-rounds.
 - **No new network surface:** subagents use the same provider; no auto-fetch, no
   new endpoints.

@@ -41,7 +41,7 @@ pub struct SavedSession {
     pub messages: Vec<ChatMessage>,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionSummary {
     pub id: String,
     pub updated_at: String,

@@ -1,6 +1,8 @@
 //! kitsu-render — terminal rendering. MVP: stream text fragments to stdout.
 //! Full UX (palette, code blocks, spinners) is later phases (design §8).
 
+pub mod jsonl;
+
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
@@ -12,6 +14,8 @@ const CSI: char = '\u{009b}';
 const OSC: char = '\u{009d}';
 const ST: char = '\u{009c}';
 static ASSISTANT_OUTPUT_WRITTEN: AtomicBool = AtomicBool::new(false);
+static FORCE_PLAIN: AtomicBool = AtomicBool::new(false);
+static FORCE_REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 enum EscapeState {
@@ -173,9 +177,23 @@ fn stderr_is_tty() -> bool {
 
 /// Whether terminal decoration should be replaced with stable ASCII output.
 pub fn plain_mode() -> bool {
-    std::env::var_os("KITSU_PLAIN").is_some()
+    FORCE_PLAIN.load(Ordering::Relaxed)
+        || std::env::var_os("KITSU_PLAIN").is_some()
         || std::env::var_os("NO_COLOR").is_some()
         || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+}
+
+/// Configure process-wide terminal accessibility overrides before worker
+/// threads or renderers are started. Environment variables remain supported;
+/// these flags make the same behavior discoverable from the CLI.
+pub fn configure_terminal_modes(plain: bool, reduced_motion: bool) {
+    FORCE_PLAIN.store(plain, Ordering::Relaxed);
+    FORCE_REDUCED_MOTION.store(reduced_motion, Ordering::Relaxed);
+}
+
+fn reduced_motion_mode() -> bool {
+    FORCE_REDUCED_MOTION.load(Ordering::Relaxed)
+        || std::env::var_os("KITSU_REDUCED_MOTION").is_some()
 }
 
 fn stderr_style() -> bool {
@@ -343,6 +361,118 @@ pub fn prompt_string() -> String {
     }
 }
 
+/// Severity of a notice produced while an interactive input prompt may be
+/// visible. Markers are deliberately ASCII in every mode.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AsyncNoticeLevel {
+    Info,
+    Success,
+    Warning,
+    Error,
+}
+
+/// Sanitized, complete-line payload for a redraw-capable prompt printer.
+///
+/// Constructing a notice does not write to the terminal. Interactive callers
+/// pass [`Self::prompt_frame`] to their editor's external-printer/redraw API in
+/// both plain and styled modes; this avoids an asynchronous `eprintln!` cutting
+/// through the user's current input buffer. Non-interactive callers can use
+/// [`Self::write_line`] between prompts.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PromptSafeAsyncNotice {
+    level: AsyncNoticeLevel,
+    message: String,
+}
+
+impl PromptSafeAsyncNotice {
+    pub fn new(level: AsyncNoticeLevel, message: impl Into<String>) -> Self {
+        Self {
+            level,
+            message: message.into(),
+        }
+    }
+
+    pub fn info(message: impl Into<String>) -> Self {
+        Self::new(AsyncNoticeLevel::Info, message)
+    }
+
+    pub fn success(message: impl Into<String>) -> Self {
+        Self::new(AsyncNoticeLevel::Success, message)
+    }
+
+    pub fn warning(message: impl Into<String>) -> Self {
+        Self::new(AsyncNoticeLevel::Warning, message)
+    }
+
+    pub fn error(message: impl Into<String>) -> Self {
+        Self::new(AsyncNoticeLevel::Error, message)
+    }
+
+    pub fn level(&self) -> AsyncNoticeLevel {
+        self.level
+    }
+
+    /// One sanitized physical line using the current stderr/plain mode.
+    pub fn line(&self) -> String {
+        self.line_with_mode(stderr_style(), plain_mode())
+    }
+
+    /// Payload expected by a redraw-capable external printer. The surrounding
+    /// newlines delimit the notice; the printer owns prompt restoration.
+    pub fn prompt_frame(&self) -> String {
+        format!("\n{}\n", self.line())
+    }
+
+    /// Deliver through an editor-specific redraw callback without coupling the
+    /// renderer to a particular line-editing crate.
+    pub fn publish_with<E>(
+        &self,
+        mut redraw: impl FnMut(String) -> Result<(), E>,
+    ) -> Result<(), E> {
+        redraw(self.prompt_frame())
+    }
+
+    /// Write a complete sanitized line where no interactive prompt is live.
+    pub fn write_line<W: Write>(&self, destination: &mut W) -> io::Result<()> {
+        self.write_line_with_mode(destination, stderr_style(), plain_mode())
+    }
+
+    /// Deterministic destination-aware variant for adapters and tests.
+    pub fn write_line_with_mode<W: Write>(
+        &self,
+        destination: &mut W,
+        styled: bool,
+        plain: bool,
+    ) -> io::Result<()> {
+        writeln!(destination, "{}", self.line_with_mode(styled, plain))?;
+        destination.flush()
+    }
+
+    fn line_with_mode(&self, styled: bool, plain: bool) -> String {
+        let message = if plain {
+            sanitize_plain_inline(&self.message)
+        } else {
+            sanitize_terminal_inline(&self.message)
+        };
+        let (marker, label) = match self.level {
+            AsyncNoticeLevel::Info => ("~", ""),
+            AsyncNoticeLevel::Success => ("+", ""),
+            AsyncNoticeLevel::Warning => ("!", "warning: "),
+            AsyncNoticeLevel::Error => ("!", "error: "),
+        };
+        let line = format!("{marker} {label}{message}");
+        if !styled || plain {
+            return line;
+        }
+        match self.level {
+            AsyncNoticeLevel::Info => format!("{}", line.truecolor(255, 140, 0)),
+            AsyncNoticeLevel::Success => format!("{}", line.green()),
+            AsyncNoticeLevel::Warning => format!("{}", line.yellow()),
+            AsyncNoticeLevel::Error => format!("{}", line.red()),
+        }
+    }
+}
+
 /// A "vibing kitsu" spinner shown on stderr while the model is working (the wait
 /// before the first token). Animates a cat/fox kaomoji in fox-orange on a TTY.
 /// A redirected/piped stderr gets a periodic plain-text heartbeat instead of
@@ -397,11 +527,7 @@ impl Spinner {
     /// inert handle on a non-TTY. Plain and reduced-motion terminals get a
     /// visible static status instead of losing progress feedback entirely.
     pub fn start() -> Self {
-        let mode = spinner_mode(
-            stderr_is_tty(),
-            plain_mode(),
-            std::env::var_os("KITSU_REDUCED_MOTION").is_some(),
-        );
+        let mode = spinner_mode(stderr_is_tty(), plain_mode(), reduced_motion_mode());
         match mode {
             SpinnerMode::Heartbeat => {
                 let handle = tokio::spawn(async move {
@@ -871,8 +997,8 @@ mod tests {
     use super::{
         context_lines, format_message, grouped_count, human_turn_stats, sanitize_plain_inline,
         sanitize_terminal_inline, sanitize_terminal_text, spinner_mode, static_spinner_line,
-        write_turn_stats, write_turn_stats_with_mode, RenderMode, SpinnerMode,
-        TerminalTextSanitizer,
+        write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel, PromptSafeAsyncNotice,
+        RenderMode, SpinnerMode, TerminalTextSanitizer,
     };
 
     #[test]
@@ -915,6 +1041,46 @@ mod tests {
             sanitize_terminal_inline("model\nspoofed\trow\x1b[2J"),
             "model spoofed row"
         );
+    }
+
+    #[test]
+    fn async_notice_is_one_sanitized_line_in_plain_and_styled_modes() {
+        let notice =
+            PromptSafeAsyncNotice::warning("agent done\nforged row\tfield\u{1b}]0;owned\u{7}");
+        let plain = notice.line_with_mode(false, true);
+        assert_eq!(plain, "! warning: agent done forged row field");
+        assert!(!plain.contains('\n'));
+        assert!(!plain.contains('\u{1b}'));
+
+        let styled = notice.line_with_mode(true, false);
+        assert!(styled.contains('\u{1b}'));
+        assert_eq!(
+            sanitize_terminal_text(&styled),
+            "! warning: agent done forged row field"
+        );
+        assert_eq!(notice.level(), AsyncNoticeLevel::Warning);
+    }
+
+    #[test]
+    fn async_notice_external_frame_is_delivered_as_one_redraw_operation() {
+        let notice = PromptSafeAsyncNotice::info("background agent finished");
+        let mut delivered = Vec::new();
+        notice
+            .publish_with(|frame| {
+                delivered.push(frame);
+                Ok::<(), std::convert::Infallible>(())
+            })
+            .unwrap();
+        assert_eq!(delivered.len(), 1);
+        assert!(delivered[0].starts_with('\n'));
+        assert!(delivered[0].ends_with('\n'));
+        assert_eq!(delivered[0].lines().count(), 2);
+
+        let mut raw = Vec::new();
+        PromptSafeAsyncNotice::error("failed")
+            .write_line_with_mode(&mut raw, false, true)
+            .unwrap();
+        assert_eq!(String::from_utf8(raw).unwrap(), "! error: failed\n");
     }
 
     #[test]

@@ -70,6 +70,14 @@ kitsu --config ./kitsu.toml ask "Explain a mutex in one sentence."
 kitsu --config ./kitsu.toml chat
 ```
 
+For a minimal no-secret Ollama profile instead, initialize a new file and check
+it before chatting:
+
+```bash
+kitsu init                         # creates ./kitsu.toml; never overwrites
+kitsu --config ./kitsu.toml doctor # offline, read-only diagnostics
+```
+
 Point at a different gateway with `--gateway`:
 
 ```bash
@@ -129,6 +137,14 @@ mkdir -p ~/.kitsu
 cp kitsu.toml ~/.kitsu/config.toml
 ```
 
+`kitsu init` writes a credential-free starter to `./kitsu.toml` (or
+`--path`, then `--config`) using no-clobber creation. `kitsu doctor`
+reports config lookup and parse status, selected gateway/model,
+credential-variable presence (never its value), context/cache provenance,
+project context, runtime-state writability, and tool policy without changing
+state or contacting a provider. Add `doctor --online` to opt into a
+model-catalog reachability request.
+
 Input history and interactive conversation snapshots live in private Kitsu state
 under `~/.kitsu/` (project-local configs get an isolated, stable versioned profile
 there, never a `sessions/` directory in the project). State is created lazily, so
@@ -137,6 +153,27 @@ stateless scripted runs also work with a read-only home directory. Resume with
 stored, but the full conversation and tool transcript is—use `--no-session` when
 that text may contain secrets. Active config/state paths are excluded from model
 file tools and verified diffs.
+
+Scripted and piped chat stay stateless unless continuity is explicit:
+`chat --session` creates and autosaves a new conversation, while
+`chat --resume <id|last>` restores and autosaves an existing one. Successful
+automation turns are checkpointed as they complete. Resume resets runtime grants,
+never restores saved grants, and retains only roots explicitly supplied by the
+current invocation.
+
+Session inventory and lifecycle do not require a provider or even a parseable
+config file; the resolved config path only selects the isolated namespace:
+
+```bash
+kitsu sessions
+kitsu sessions show last --json
+kitsu sessions fork last
+kitsu sessions export last conversation.md
+kitsu sessions archive <exact-id>
+kitsu sessions restore <exact-id>
+kitsu sessions delete <exact-id>
+kitsu sessions resume last --json  # prints exact argv outside interactive chat
+```
 
 ---
 
@@ -415,11 +452,18 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 
 | Command | Description |
 |---|---|
+| `init [--path PATH]` | Create a no-secret starter config without overwriting an existing file. |
+| `doctor [--online]` | Run read-only diagnostics; network reachability is explicitly opt-in. |
 | `ask <prompt>` | Ask a single question; stream the answer. |
+| `review [path]` | Run one tool-free review over host-verified working/staged/unstaged/base/commit evidence; supports JSONL, focus instructions, and opt-in session continuity. |
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
+| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `resume` launches chat on a TTY or emits exact argv otherwise. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
 **Global flags** (apply to any command)
+
+`--version` reports the package version, Git commit, and source-commit date.
+The date is provenance from Git history, not the wall-clock build time.
 
 | Flag | Default | Description |
 |---|---|---|
@@ -428,11 +472,14 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--config <path>` | see resolution order | Path to the config file. |
 | `--no-stream` | off | Request a single non-streamed completion. |
 | `--jsonl` | off | Emit versioned `kitsu.chat.v1` JSON Lines events. Interactive TTY chat and human help/version output are rejected so stdout stays machine-only. |
+| `--plain` | off | Use stable ASCII markers and disable color and animation. |
+| `--reduced-motion` | off | Keep styled output but replace animated waiting indicators with a static status. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
 | `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, and streamed body reads. Local-model tool-calling rounds routinely need more; raise it (e.g. `300`) for tool-heavy work. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
-| `--yes` | off | Auto-approve enabled filesystem requests with **no confinement** to `--allow-path`/`--allow-write` roots — use with care. Never enables tools by itself, and never approves developer commands. |
+| `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
+| `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
 | `--context-window <n>` | profile/cache, else `8192` | Override the model context window. A cold metadata lookup runs asynchronously and never delays the first inference. |
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
@@ -444,11 +491,13 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 |---|---|
 | `--allow-path <PATH>` | Allow read-only filesystem tools under `PATH` (repeatable). See [Tools in chat](#tools-in-chat). |
 | `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
+| `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
-| `--command-root <PATH>` | Restrict command working directories to an existing root (repeatable; implies `--enable-commands`). |
+| `--command-root <PATH>` | Restrict command working directories to an existing root (repeatable; implies `--enable-commands`). This is a cwd restriction, not a host sandbox. |
 | `--allow-command <JSON_ARGV>` | Pre-approve one exact argv in the launch directory, e.g. `'["cargo","test"]'` (repeatable). |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
-| `--resume [ID]` | Resume an autosaved interactive session; omit the ID for `last`. Filesystem permissions are not restored. |
+| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
+| `--session` | Explicitly create and autosave a new scripted or piped session. |
 | `--no-session` | Disable conversation snapshots and prompt-history persistence for this chat. |
 | `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. |
 
@@ -459,6 +508,11 @@ kitsu --gateway openai ask "Summarize the CAP theorem."
 kitsu --gateway anthropic --model claude-opus-4-8 ask --max-output-tokens 2000 "..."
 echo "explain this error" | kitsu --gateway ollama chat        # one-shot via stdin
 kitsu --gateway ollama chat "let's pair on a bug"              # interactive
+kitsu --gateway ollama chat --session --script turns.txt       # durable script
+kitsu --gateway ollama chat --resume last --script more.txt    # durable continuation
+kitsu --gateway ollama review --base main --instructions "focus on API compatibility"
+kitsu --gateway ollama --jsonl review --staged                 # machine-framed review
+kitsu sessions --json                                          # provider-free inventory
 ```
 
 ---
@@ -481,25 +535,43 @@ prompt for approval. `a` (always) adds that directory to the session allowlist s
 it won't ask again.
 
 - **Pre-grant** paths so they never prompt: `--allow-path <dir>` (reads),
-  `--allow-write <dir>` (writes). Both repeatable and independent — e.g. read a
-  whole repo but confine generated files to one scratch dir.
-- **In-session grants:** `/allow <path>` and `/allow-write <path>`.
+  `--allow-write <dir>` (writes), or `--allow-read-write <dir>` (both). They are
+  repeatable. Read and write authority stay independent unless the combined
+  flag is used — e.g. read a whole repo but confine generated files to one
+  scratch dir.
+- **In-session grants:** `/allow <path>`, `/allow-write <path>`, and
+  `/allow-read-write <path>`. `/revoke-read <exact-root>` and
+  `/revoke-write <exact-root>` remove a displayed root for the current session;
+  a session reset restores invocation roots but never saved-session grants.
 - **Non-interactive** (`--script`/piped): capabilities are absent unless their
   paths are pre-granted (or the session is interactive). `--yes` never
-  registers a tool by itself and never approves developer commands — but once
-  a filesystem tool *is* registered, `--yes` approves it for **any**
-  non-protected path, not just the `--allow-path`/`--allow-write` roots you
-  granted. It is not a scoped "auto-approve within my sandbox" switch; it
-  removes the approval step entirely. To confine writes to one directory
-  without prompting, pass `--allow-write <dir>` **without** `--yes`.
+  registers a tool by itself and never approves developer commands. It also
+  never removes confinement: unlisted paths are denied without prompting. The
+  old unrestricted behavior requires the unmistakable
+  `--dangerously-allow-all-filesystem` flag and still cannot bypass Kitsu-private
+  path protections.
+- **Background agents** inherit current explicit/session grants but never own
+  the foreground terminal and therefore cannot open filesystem or command
+  approval prompts. Pre-grant the exact authority they need; an ungranted
+  background operation fails closed without consuming stdin.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
 - Kitsu's config, snapshots, history, caches, and private runtime state remain
-  protected from model writes even when a broader parent root is granted.
+  protected from model reads and writes even when a broader parent root or the
+  dangerous global bypass is active. Narrow Kitsu-managed artifact reads are
+  listed separately by `/permissions` and cannot be revoked as user grants.
 - Developer commands use a separate policy, literal argv (never a shell string),
   approved working-directory roots, bounded output, and timeout/cancellation.
-  Enable them explicitly with `--enable-commands`.
+  Enable them explicitly with `--enable-commands`. Command roots restrict only
+  where a process starts; they are not filesystem, network, or process sandboxes.
+  `/permissions` numbers exact argv/cwd grants with invocation/runtime
+  provenance; `/revoke-command <number>` removes one for the current session.
+  A session grant is bound to the observed executable identity and is revoked
+  if the executable or its `PATH` resolution changes before reuse.
+  Full stdout/stderr is written to a unique `0600` JSONL artifact under protected
+  Kitsu state (or the active session artifact directory), while the model and
+  JSONL event receive bounded head/tail previews and truthful byte counts.
 
 Enter `/` to show all commands, or type a slash prefix and press Tab to complete
 it. Completion and `/help` share the same command registry, so their descriptions
@@ -512,19 +584,25 @@ Slash commands inside the REPL:
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
 | `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
-| `/diff [path]` | Show the verified staged, unstaged, and untracked workspace diff. This is read from Git/the filesystem, not assistant prose. |
-| `/review [path]` | Ask the model to review that verified diff in a no-tools turn (it cannot edit or inspect beyond the supplied evidence). |
-| `/permissions` | Show the current permission mode and canonical read/write roots. |
+| `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. |
+| `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. The top-level `kitsu review` provides the noninteractive form. |
+| `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
+| `/permissions` | Show effective filesystem authority with invocation/session provenance, revoked invocation roots, protected/internal reads, protected writes, and the command non-sandbox warning. |
 | `/tools` | Show enabled tools and the effective permission behavior. |
 | `/allow <path>` | Grant read access to a path for the rest of the session (no more prompts there). |
 | `/allow-write <path>` | Grant write access to a path for the rest of the session. |
+| `/allow-read-write <path>` | Grant both read and write access for the rest of the session. |
+| `/revoke-read <exact-root>` | Revoke an exact displayed read root for this session. |
+| `/revoke-write <exact-root>` | Revoke an exact displayed write root for this session. |
+| `/revoke-command <number>` | Revoke a numbered exact argv/cwd grant shown by `/permissions`. |
 | `/skills [filter]` | List available local skills, optionally filtered by name. |
 | `/skill <name>` | Load a skill's instructions into the conversation context. |
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
-| `/context` | Show detailed context utilization and provenance. |
+| `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
-| `/agents [id]` | List background agents, or show one agent's result. |
-| `/queue [prompt]` | Show the bounded eight-prompt FIFO or append a prompt. On Unix, complete lines submitted during generation are captured and run in order. |
+| `/jobs [list\|show ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job capacity, model/elapsed/usage/tool/write activity, retrieve results, cancel+join work, or prune terminal records. `/agents [id]` remains an alias. |
+| `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
+| `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |
 | `/sessions` | List saved sessions. |
@@ -534,10 +612,10 @@ Slash commands inside the REPL:
 | `/archive <id>` | Move an inactive session into recoverable private archive storage. |
 | `/restore <id>` | Restore an archived session. |
 | `/delete <id>` | Permanently delete an exact inactive live-session ID. |
-| `/undo` | Restore the latest model-write checkpoint only when its files still match. |
+| `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
-| `/quit` (or `/exit`) | Exit. |
+| `/quit [wait\|cancel]` (or `/exit`) | Exit only when jobs are done, explicitly wait, or cancel+join them first. |
 
 ### Coding workflows: paste & file generation
 
@@ -547,6 +625,8 @@ Slash commands inside the REPL:
 - **Generate files** two ways: let the model call `fs_write_file` (grant it with
   `--allow-write <dir>`), or ask for code and run `/save out.rs` to write the
   last response's code blocks yourself.
+- **Edit existing files** with explicit readback authority by using
+  `--allow-read-write <dir>` (or separate read and write roots).
 - **Attach files** with `@path`, `@path:line`, or `@path:start-end`. Expansion is
   permission checked, no-follow, UTF-8 only, deduplicated, and bounded to 32 KiB
   of selected content per file / 64 KiB total; a small line range can come from a
@@ -582,14 +662,15 @@ exits `130`. `Ctrl+D` or `/quit` does not silently discard live background agent
 Completed filesystem side effects are never pretended away after cancellation—
 inspect them with `/diff` or restore a safe checkpoint with `/undo`. Interactive
 type-ahead collection is Unix-only: complete lines entered during generation are
-captured in an eight-prompt visible FIFO. On other platforms `/queue <prompt>`
+captured in an eight-prompt visible FIFO. A line beginning `/steer ` instead
+targets the active turn and never leaks into a later prompt. On other platforms `/queue <prompt>`
 still works, but Kitsu does not actively collect terminal type-ahead while a turn
 is running.
 
-For simple or accessible terminal output, set `NO_COLOR=1`, `KITSU_PLAIN=1`, or
+For simple or accessible terminal output, pass `--plain` or set `NO_COLOR=1`, `KITSU_PLAIN=1`, or
 `TERM=dumb`. Renderer-owned banners, progress, tool activity, context meters, and
 permission prompts then use stable ASCII without styling escapes; arbitrary
-Unicode in model output and paths is preserved. Set `KITSU_REDUCED_MOTION=1` to
+Unicode in model output and paths is preserved. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
 replace the animated wait indicator with a visible static status.
 
 ---
