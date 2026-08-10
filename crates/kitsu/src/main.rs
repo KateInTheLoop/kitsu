@@ -2756,7 +2756,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     } else {
         Mode::Deny
     };
+    // A write grant implies read access to the same directory: editing a file
+    // (the common case — regenerate then refine) requires reading it back
+    // first, and a write-only root that can never be read is a trap no one
+    // asks for on purpose.
     let mut read_roots: Vec<String> = allow_paths.to_vec();
+    read_roots.extend(allow_write.iter().cloned());
     if interactive {
         if let Ok(cwd) = std::env::current_dir() {
             read_roots.push(cwd.to_string_lossy().to_string());
@@ -2787,8 +2792,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // In interactive chat the tools are always available (permissions gate access
     // at call time). Non-interactively, register a tool only when it can actually
     // succeed — so scripted runs with no flags advertise nothing, and a read-only
-    // grant doesn't advertise fs_write_file only to always deny it.
-    let can_read = interactive || !allow_paths.is_empty();
+    // grant doesn't advertise fs_write_file only to always deny it. --yes is
+    // deliberately excluded here: it only relaxes the approval policy for tools
+    // that are otherwise registered, it never registers a tool by itself (that
+    // stays an explicit opt-in via --allow-path/--allow-write/interactive).
+    let can_read = interactive || !allow_paths.is_empty() || !allow_write.is_empty();
     let can_write = interactive || !allow_write.is_empty();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
     let command_requested =

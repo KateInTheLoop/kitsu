@@ -1131,6 +1131,84 @@ async fn test_chat_tool_round_reads_file() {
     drop(work);
 }
 
+/// `--allow-write <dir>` alone (no `--allow-path`) must still let the model
+/// read a file back from that same directory — editing an existing file is
+/// read-then-write, and a write-only grant that can never be read back is a
+/// trap nobody asks for. Regression test for a dogfooding finding where a
+/// scripted edit turn failed at the read step with PolicyDenied even though
+/// the user had explicitly granted write access to the exact same directory.
+#[tokio::test]
+#[serial]
+async fn test_allow_write_implies_read_of_same_root() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+
+    let work = TempDir::new().expect("work dir");
+    let file = work.path().join("note.txt");
+    fs::write(&file, "SECRET_MARKER_43").expect("write note");
+    let file_str = file.to_string_lossy().to_string();
+
+    let tool_args = format!(r#"{{\"path\":\"{}\"}}"#, file_str.replace('\\', "\\\\"));
+    let sse_round1 = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_1","type":"function","function":{{"name":"fs_read_file","arguments":"{tool_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        "".to_string(),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_round1),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let sse_round2 = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"the file says SECRET_MARKER_43"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_round2),
+        )
+        .mount(&server)
+        .await;
+
+    let base_url = server.uri();
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &base_url);
+    let home_path = home.path().to_path_buf();
+    let allow = work.path().to_string_lossy().to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        // --allow-write only — no --allow-path.
+        cmd.args(["chat", "--gateway", "example", "--allow-write", &allow]);
+        cmd.write_stdin("read the note\n");
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("SECRET_MARKER_43"));
+    })
+    .await
+    .expect("spawned kitsu chat tool round should join");
+    drop(work);
+}
+
 // --- --max-rounds flag + usage surfacing ------------------------------------
 
 /// The global `--max-rounds` flag parses and a normal turn completes under it,
