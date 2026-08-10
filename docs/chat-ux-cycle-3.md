@@ -164,6 +164,13 @@ gets a stable final result contract.
 9. [Provider and model UX](chat-ux-cycle-3-audits/raw/09-provider-models.md)
 10. [Official Codex DX comparison](chat-ux-cycle-3-audits/raw/10-codex-comparison.md)
 
+Post-integration evidence:
+
+- [Automation release audit](chat-ux-cycle-3-audits/11-automation-release-audit.md)
+- [Jobs and steering review](chat-ux-cycle-3-audits/12-jobs-steering-post-integration.md)
+- [Release security audit](chat-ux-cycle-3-audits/13-release-security.md)
+- [Final release review](chat-ux-cycle-3-audits/14-final-release-review.md)
+
 ## Rebase checkpoint
 
 At audit start and after all ten reports, the repository had no remote, no
