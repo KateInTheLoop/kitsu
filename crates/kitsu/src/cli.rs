@@ -3,10 +3,23 @@
 
 use clap::{Parser, Subcommand};
 
+/// Commit + date this binary was built from — `-V` shows the plain semver,
+/// `--version` shows this too, so a stale binary vs. the docs/source next to
+/// it is self-diagnosing instead of surfacing as an unexplained CLI error.
+pub const LONG_VERSION: &str = concat!(
+    env!("CARGO_PKG_VERSION"),
+    " (",
+    env!("KITSU_GIT_SHA"),
+    ", built ",
+    env!("KITSU_BUILD_DATE"),
+    ")"
+);
+
 #[derive(Debug, Parser)]
 #[command(
     name = "kitsu",
     version,
+    long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
     after_help = "QUICK START:\n  kitsu --config ./kitsu.toml chat\n  kitsu --gateway ollama chat\n  kitsu chat  # after installing ~/.kitsu/config.toml\n\nConfiguration: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
