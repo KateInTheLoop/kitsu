@@ -430,7 +430,7 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `--jsonl` | off | Emit versioned `kitsu.chat.v1` JSON Lines events. Interactive TTY chat and human help/version output are rejected so stdout stays machine-only. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
-| `--timeout-secs <n>` | `60` | Total inference deadline, including retries, backoff, and streamed body reads. |
+| `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, and streamed body reads. Local-model tool-calling rounds routinely need more; raise it (e.g. `300`) for tool-heavy work. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Auto-approve enabled filesystem requests; it never enables tools or approves developer commands. |
 | `--context-window <n>` | profile/cache, else `8192` | Override the model context window. A cold metadata lookup runs asynchronously and never delays the first inference. |
