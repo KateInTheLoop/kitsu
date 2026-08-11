@@ -113,32 +113,44 @@ registers `command_exec`; roots come from `--command-root` or the launch
 directory. It accepts a literal argv array and an explicit cwd—never a shell
 string—and returns bounded stdout/stderr plus exit, signal, timeout, truncation,
 elapsed-time metadata, safe head/tail previews, and a retained protected `0600`
-full-output artifact. Interactive invocations have their own approval
+full-output artifact. The completed serialized artifact is capped at 16 MiB,
+including JSONL framing and hex expansion; it reports separately how many raw
+stdout/stderr bytes were retained, marks truncation, and keeps draining both
+child pipes. Interactive invocations have their own approval
 prompt; automation must use exact `--allow-command` grants. `--yes` and
 filesystem grants do not approve commands. Command roots constrain only the
 requested working directory: approved processes retain the ambient host user's
 filesystem, network, environment, and process authority and are not sandboxed.
 Session grants also bind the executable observed at approval time; replacement
 or changed `PATH` resolution invalidates the grant before execution.
+Windows command execution currently fails closed before approval because Kitsu
+does not yet have loader-equivalent extension resolution and executable-image
+validation; it never substitutes a pathname-only fingerprint.
 Default command timeout is 120 seconds, the requestable maximum is 600 seconds,
-and retained stdout and stderr are each capped at 64 KiB.
+retained stdout and stderr are each capped at 64 KiB.
 
 `/jobs` exposes bounded running/record capacity, status, elapsed time, model,
 usage, tool/write counts, safe recent activity, failure class, full terminal
 result retrieval, cancel+join, and pruning. `/agents` remains a compatibility
-alias. Background notices use a redraw-safe external printer in plain and
-styled modes.
+alias. Styled mode uses a redraw-safe external printer; literal plain/assistive
+input defers notices until the current line is submitted. Any terminal result
+not opened through `/jobs show` is surfaced before a session switch or exit.
+Scripted JSONL emits the same retained evidence as `background_result`; an
+unacknowledged failed detached job makes strict automation fail.
 
 ### `@file` attachments
 
-Prompts may contain `@path`, `@path:line`, or `@path:start-end`. Before the user
-turn is committed, each mention passes the normal canonical read policy and
-protected-path checks. Attachments are regular UTF-8 text only, reject NUL/binary
-data, are deduplicated, and are delimited as untrusted data in the expanded
-prompt. Selected content is capped at 32 KiB per attachment and 64 KiB per
+Prompts may contain `@path`, `@path:line`, `@path:start-end`, or
+`@path#Lstart-Lend`. Sentence punctuation, parentheses, and quoted paths such as
+`@"docs/my guide.md":10-20` are accepted. Before the user turn is committed,
+each mention passes the normal canonical read policy and protected-path checks.
+Attachments are regular UTF-8 text only, reject NUL/binary data, and are
+deduplicated. Selected content is capped at 32 KiB per attachment and 64 KiB per
 prompt. A bounded line range streams from a larger file without retaining the
-whole file, and reading stops after the requested end line. Kitsu prints the
-canonical attachment/range summary. `/retry` re-reads the submitted mentions.
+whole file, and reading stops after the requested end line. The expanded prompt
+uses one length-prefixed JSON value so file content cannot spoof attachment
+boundaries. Kitsu prints the canonical attachment/range summary. `/retry`
+re-reads the submitted mentions.
 
 ## Sessions and artifacts
 
@@ -158,6 +170,11 @@ saved before the next one; a save failure makes the automation command fail.
 `--no-session` conflicts with both continuity forms. Resume/new-session
 boundaries drop runtime grants and restore current invocation roots; no saved
 session can restore authority.
+A newly requested durable session is not published until its first successful
+model turn or a slash command that changes durable conversation/model state.
+Failed, empty, and query-only starts therefore cannot displace a productive
+conversation from `last`; legacy zero-turn snapshots remain addressable by
+exact ID.
 
 The top-level lifecycle/inventory commands operate without constructing a
 provider or parsing the selected config. The resolved config path chooses the
@@ -233,14 +250,17 @@ strict by default; `--allow-turn-errors` accepts partial completion.
 machine-readable documents for management workflows. They reject `--jsonl`,
 whose event protocol is reserved for model-turn automation.
 
-`--jsonl` is the machine protocol. It disables provider streaming and emits one
-`kitsu.chat.v1` JSON object per stdout line: run/turn/command framing,
-provider/tool/usage events, assistant text, typed errors, and exactly one
-`final_summary`. It rejects interactive TTY chat and human help/version output.
-Human diagnostics may still use stderr, but the event stream contains enough
-status and counts to determine the run outcome. Error events classify ordinary
-failures as `user`, `provider`, or `cancelled`; specialized turn/tool errors may
-use a more specific kind.
+`--jsonl` is the machine protocol. Provider streaming remains enabled unless
+`--no-stream` is set, and safe committed fragments become ordered
+`assistant_delta` events. It emits one `kitsu.chat.v1` JSON object per stdout
+line: run/turn/command framing, provider/tool/usage events, assistant text,
+typed errors, and exactly one `final_summary`. It rejects interactive TTY chat
+and human help/version output. Human diagnostics may still use stderr, but the
+event stream contains enough status and counters to determine the run outcome.
+Error events distinguish user/provider/cancelled failures, ordinary tool
+failures, and local policy denials. Status, permissions, context, diff, model,
+compaction, session-inventory, skill, and job commands return typed
+`command_result` payloads rather than requiring stderr parsing.
 
 Without JSONL, stdout contains assistant text only. Human metadata is on stderr;
 redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
@@ -248,8 +268,8 @@ redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
 | Exit | Meaning |
 |---:|---|
 | `0` | Success, including a partial script explicitly accepted with `--allow-turn-errors`. |
-| `1` | CLI/input/config/missing-auth, attachment, permission/policy, context-fit, or slash-command failure. |
-| `2` | Provider/HTTP/timeout/agent-loop failure, or a strict incomplete turn caused by output truncation, exhausted rounds, or failed tool calls. |
+| `1` | CLI/input/config/missing-auth, attachment, permission/policy, local tool, context-fit, or slash-command failure. |
+| `2` | Provider/HTTP/timeout/agent-loop failure, or a strict incomplete turn caused by output truncation or exhausted rounds. |
 | `130` | Ctrl+C cancellation. |
 
 ## Terminal and portability notes
@@ -257,16 +277,22 @@ redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
 `KITSU_PLAIN=1`, `NO_COLOR=1`, or `TERM=dumb` selects plain rendering.
 Renderer-owned banners, progress, context tables, telemetry, tool activity, and
 approval prompts then use ASCII structural markers without ANSI/OSC styling.
-Model output is always stripped of terminal control strings, but arbitrary safe
-Unicode in model text, paths, and user data is preserved. `KITSU_REDUCED_MOTION=1`
-uses a visible static status instead of the animated spinner.
+The interactive prompt uses canonical line input without raw mode, cursor
+control, bracketed-paste negotiation, completion, or history editing; notices
+are deferred until a line returns. Model output is always stripped of terminal
+control strings, but arbitrary safe Unicode in model text, paths, and user data
+is preserved. `KITSU_REDUCED_MOTION=1` uses a visible static status instead of
+the animated spinner.
 
 Unix builds additionally use descriptor-bound command cwd, process-group command
 cancellation, and descriptor-relative no-follow mutation/session operations.
 Portable branches validate paths and snapshots and cancel/reap the direct child,
 but retain platform pathname races and cannot kill an entire descendant process
 group. Operations requiring an unavailable race-free atomic primitive fail
-closed rather than weakening the conflict guarantee.
+closed rather than weakening the conflict guarantee. In particular, implicit
+project context, filesystem skills, and `@file` attachment reads/completion are
+disabled on non-Unix platforms until equivalent component-pinned traversal is
+available.
 
 ## Verification boundary
 

@@ -15,6 +15,11 @@
 //! expansion. The child has no stdin, stdout and stderr are drained into
 //! independently bounded buffers, and both timeout and caller-future
 //! cancellation kill and reap the child.
+//!
+//! Windows command execution currently fails closed before approval. Kitsu
+//! cannot yet bind Windows extension/PATH resolution to loader-equivalent
+//! executable validation, so accepting a pathname-derived fingerprint there
+//! would misstate the authority actually exercised by `CreateProcess`.
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -39,6 +44,9 @@ pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
 pub const DEFAULT_MAX_COMMAND_TIMEOUT: Duration = Duration::from_secs(600);
 /// Maximum retained bytes for each of stdout and stderr under the default policy.
 pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
+/// Maximum completed serialized bytes for an optional command-output artifact.
+/// Pipes continue to be drained after the sink reaches this cap.
+pub const DEFAULT_COMMAND_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
 /// Time allowed for captured pipes to reach EOF after the direct child exits.
 /// A detached descendant must not make command completion unbounded.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -91,9 +99,10 @@ pub struct CommandExecutableIdentity {
 /// Filesystem identity bound to an exact session command grant.
 ///
 /// Unix records include device/inode identity and metadata that changes on
-/// replacement or in-place modification. Other platforms retain the canonical
-/// path, length, modification time, and readonly state as a best-effort
-/// fingerprint.
+/// replacement or in-place modification. Supported non-Windows platforms
+/// retain the canonical path, length, modification time, and readonly state as
+/// a best-effort fingerprint. Windows does not issue fingerprints and command
+/// execution therefore fails closed.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandExecutableFingerprint {
     pub canonical_path: PathBuf,
@@ -190,6 +199,9 @@ pub struct CommandArtifactRequest {
     pub cwd: String,
     pub timeout_ms: u64,
     pub executable: CommandExecutableIdentity,
+    /// Hard ceiling for the completed persistent artifact representation,
+    /// including framing/encoding metadata rather than only raw pipe bytes.
+    pub limit_bytes: u64,
 }
 
 /// Which captured command pipe produced an artifact chunk.
@@ -211,6 +223,14 @@ pub struct CommandArtifactCompletion {
     pub stderr_bytes: u64,
     pub stdout_capture_complete: bool,
     pub stderr_capture_complete: bool,
+    /// Aggregate raw stdout/stderr bytes offered by the command layer. A sink
+    /// whose encoding reaches the serialized ceiling earlier must return its
+    /// authoritative retained count in [`CommandOutputArtifact`].
+    pub captured_bytes: u64,
+    /// True when the command layer omitted additional raw bytes at its own cap.
+    /// Sinks may additionally report encoding/framing truncation on output.
+    pub truncated: bool,
+    pub limit_bytes: u64,
 }
 
 /// Opaque, host-controlled reference to a completed full-output artifact.
@@ -220,6 +240,15 @@ pub struct CommandArtifactCompletion {
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandOutputArtifact {
     pub reference: String,
+    #[serde(default)]
+    pub captured_bytes: u64,
+    #[serde(default)]
+    pub truncated: bool,
+    #[serde(default)]
+    pub limit_bytes: u64,
+    /// Exact bytes in the completed persistent artifact representation.
+    #[serde(default)]
+    pub artifact_bytes: u64,
 }
 
 /// One host-owned full-output artifact being streamed.
@@ -238,17 +267,20 @@ pub trait CommandOutputArtifactWriter: Send + Sync {
     ) -> std::io::Result<CommandOutputArtifact>;
 
     /// Remove or quarantine an incomplete artifact after capture/finalization
-    /// failure. Implementations that retain partial output should override this.
-    fn abort(&self) -> std::io::Result<()> {
-        Ok(())
-    }
+    /// failure. This is required rather than defaulting to a no-op: callers may
+    /// report the sink's result, so `Ok(())` must be an implementation-owned
+    /// assertion that cleanup was actually attempted successfully.
+    fn abort(&self) -> std::io::Result<()>;
 }
 
 /// Optional host hook for protected full command output.
 ///
 /// The command tool remains safe-by-default: no artifact is created unless the
 /// embedding frontend explicitly installs a sink on [`CommandPolicy`]. A sink
-/// failure never stops pipe draining or strands a child process.
+/// must enforce [`CommandArtifactRequest::limit_bytes`] against its completed
+/// persistent representation (including encoding/framing overhead) and return
+/// truthful [`CommandOutputArtifact`] counters. A sink failure never stops pipe
+/// draining or strands a child process.
 pub trait CommandOutputArtifactSink: Send + Sync {
     fn begin(
         &self,
@@ -263,6 +295,8 @@ pub struct CommandLimits {
     max_timeout: Duration,
     /// Retained bytes per stream. Pipes continue to be drained after this cap.
     max_output_bytes: usize,
+    /// Completed serialized byte cap for the optional artifact sink.
+    max_artifact_bytes: usize,
 }
 
 impl CommandLimits {
@@ -290,6 +324,7 @@ impl CommandLimits {
             default_timeout,
             max_timeout,
             max_output_bytes,
+            max_artifact_bytes: DEFAULT_COMMAND_ARTIFACT_BYTES,
         })
     }
 
@@ -304,6 +339,20 @@ impl CommandLimits {
     pub fn max_output_bytes(self) -> usize {
         self.max_output_bytes
     }
+
+    pub fn max_artifact_bytes(self) -> usize {
+        self.max_artifact_bytes
+    }
+
+    pub fn with_max_artifact_bytes(mut self, max_artifact_bytes: usize) -> Result<Self, ToolError> {
+        if max_artifact_bytes == 0 {
+            return Err(ToolError::InvalidArgs(
+                "command artifact cap must be greater than zero".to_string(),
+            ));
+        }
+        self.max_artifact_bytes = max_artifact_bytes;
+        Ok(self)
+    }
 }
 
 impl Default for CommandLimits {
@@ -312,6 +361,7 @@ impl Default for CommandLimits {
             default_timeout: DEFAULT_COMMAND_TIMEOUT,
             max_timeout: DEFAULT_MAX_COMMAND_TIMEOUT,
             max_output_bytes: DEFAULT_COMMAND_OUTPUT_BYTES,
+            max_artifact_bytes: DEFAULT_COMMAND_ARTIFACT_BYTES,
         }
     }
 }
@@ -550,6 +600,9 @@ impl CommandPolicy {
         validate_argv(argv)?;
         let cwd = self.resolve_cwd(cwd)?;
         let executable = self.observe_executable(argv, &cwd);
+        if executable.fingerprint.is_none() {
+            return Err(unresolved_executable(argv, &cwd));
+        }
         self.insert_grant(argv.to_vec(), cwd.clone(), executable);
         Ok(cwd)
     }
@@ -607,6 +660,9 @@ impl CommandPolicy {
             return false;
         };
         let executable = self.observe_executable(argv, &cwd);
+        if executable.fingerprint.is_none() {
+            return false;
+        }
         self.match_grant(argv, &cwd, &executable) == GrantMatch::Current
     }
 
@@ -646,6 +702,9 @@ impl CommandPolicy {
         let cwd = self.resolve_cwd(requested_cwd)?;
         let authorized_cwd = AuthorizedCwd::bind(self, requested_cwd, cwd.clone())?;
         let executable = self.observe_executable(argv, &cwd);
+        if executable.fingerprint.is_none() {
+            return Err(unresolved_executable(argv, &cwd));
+        }
         let grant_match = self.match_grant(argv, &cwd, &executable);
         if grant_match == GrantMatch::Current {
             return Ok(AuthorizedCommand {
@@ -853,87 +912,100 @@ fn observe_executable_with_path(
 }
 
 fn fingerprint_executable(candidate: &Path) -> Option<CommandExecutableFingerprint> {
-    let canonical_path = std::fs::canonicalize(candidate).ok()?;
-    let metadata = std::fs::metadata(&canonical_path).ok()?;
-    if !metadata.is_file() {
-        return None;
-    }
-    #[cfg(unix)]
+    #[cfg(windows)]
     {
-        use std::os::unix::fs::PermissionsExt;
-        if metadata.permissions().mode() & 0o111 == 0 {
+        // Rust's Windows process launcher applies platform-specific executable
+        // resolution which is not equivalent to canonicalizing one apparent
+        // path. Until the policy can reproduce that selection and validate a
+        // loader-accepted image, a fingerprint would be false authority.
+        let _ = candidate;
+        None
+    }
+
+    #[cfg(not(windows))]
+    {
+        let canonical_path = std::fs::canonicalize(candidate).ok()?;
+        let metadata = std::fs::metadata(&canonical_path).ok()?;
+        if !metadata.is_file() {
             return None;
         }
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if metadata.permissions().mode() & 0o111 == 0 {
+                return None;
+            }
+        }
+
+        #[cfg(unix)]
+        let (
+            modified_unix_seconds,
+            modified_subsec_nanos,
+            unix_device,
+            unix_inode,
+            unix_mode,
+            unix_uid,
+            unix_gid,
+            unix_changed_seconds,
+            unix_changed_nanos,
+        ) = {
+            use std::os::unix::fs::MetadataExt;
+            (
+                Some(metadata.mtime()),
+                u32::try_from(metadata.mtime_nsec()).ok(),
+                Some(metadata.dev()),
+                Some(metadata.ino()),
+                Some(metadata.mode()),
+                Some(metadata.uid()),
+                Some(metadata.gid()),
+                Some(metadata.ctime()),
+                Some(metadata.ctime_nsec()),
+            )
+        };
+        #[cfg(not(unix))]
+        let (
+            modified_unix_seconds,
+            modified_subsec_nanos,
+            unix_device,
+            unix_inode,
+            unix_mode,
+            unix_uid,
+            unix_gid,
+            unix_changed_seconds,
+            unix_changed_nanos,
+        ) = {
+            let modified = metadata
+                .modified()
+                .ok()
+                .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
+            (
+                modified.and_then(|duration| i64::try_from(duration.as_secs()).ok()),
+                modified.map(|duration| duration.subsec_nanos()),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+            )
+        };
+
+        Some(CommandExecutableFingerprint {
+            canonical_path,
+            length: metadata.len(),
+            readonly: metadata.permissions().readonly(),
+            modified_unix_seconds,
+            modified_subsec_nanos,
+            unix_device,
+            unix_inode,
+            unix_mode,
+            unix_uid,
+            unix_gid,
+            unix_changed_seconds,
+            unix_changed_nanos,
+        })
     }
-
-    #[cfg(unix)]
-    let (
-        modified_unix_seconds,
-        modified_subsec_nanos,
-        unix_device,
-        unix_inode,
-        unix_mode,
-        unix_uid,
-        unix_gid,
-        unix_changed_seconds,
-        unix_changed_nanos,
-    ) = {
-        use std::os::unix::fs::MetadataExt;
-        (
-            Some(metadata.mtime()),
-            u32::try_from(metadata.mtime_nsec()).ok(),
-            Some(metadata.dev()),
-            Some(metadata.ino()),
-            Some(metadata.mode()),
-            Some(metadata.uid()),
-            Some(metadata.gid()),
-            Some(metadata.ctime()),
-            Some(metadata.ctime_nsec()),
-        )
-    };
-    #[cfg(not(unix))]
-    let (
-        modified_unix_seconds,
-        modified_subsec_nanos,
-        unix_device,
-        unix_inode,
-        unix_mode,
-        unix_uid,
-        unix_gid,
-        unix_changed_seconds,
-        unix_changed_nanos,
-    ) = {
-        let modified = metadata
-            .modified()
-            .ok()
-            .and_then(|time| time.duration_since(std::time::UNIX_EPOCH).ok());
-        (
-            modified.and_then(|duration| i64::try_from(duration.as_secs()).ok()),
-            modified.map(|duration| duration.subsec_nanos()),
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-            None,
-        )
-    };
-
-    Some(CommandExecutableFingerprint {
-        canonical_path,
-        length: metadata.len(),
-        readonly: metadata.permissions().readonly(),
-        modified_unix_seconds,
-        modified_subsec_nanos,
-        unix_device,
-        unix_inode,
-        unix_mode,
-        unix_uid,
-        unix_gid,
-        unix_changed_seconds,
-        unix_changed_nanos,
-    })
 }
 
 fn display_argv(argv: &[String]) -> String {
@@ -961,11 +1033,23 @@ fn executable_changed(argv: &[String], cwd: &Path) -> ToolError {
 }
 
 fn unresolved_executable(argv: &[String], cwd: &Path) -> ToolError {
-    ToolError::PolicyDenied(format!(
-        "the executable identity for command {} in '{}' could not be resolved; refusing unbound execution",
-        display_argv(argv),
-        cwd.display()
-    ))
+    #[cfg(windows)]
+    {
+        ToolError::PolicyDenied(format!(
+            "the executable identity for command {} in '{}' could not be resolved securely on Windows; loader-equivalent extension and executable validation is unavailable, so Kitsu is refusing unbound execution",
+            display_argv(argv),
+            cwd.display()
+        ))
+    }
+
+    #[cfg(not(windows))]
+    {
+        ToolError::PolicyDenied(format!(
+            "the executable identity for command {} in '{}' could not be resolved; refusing unbound execution",
+            display_argv(argv),
+            cwd.display()
+        ))
+    }
 }
 
 fn duration_millis(duration: Duration) -> u64 {
@@ -1035,9 +1119,55 @@ pub struct CommandOutput {
     /// Host-owned full-output reference, when a frontend installed a sink.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<CommandOutputArtifact>,
-    /// Artifact failure is reported without discarding the completed command.
+    /// Artifact failures and cancellation cleanup status are reported without
+    /// discarding the command's bounded output metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_error: Option<String>,
+}
+
+/// Live, bounded command progress observer used by frontends to retain truthful
+/// metadata when their outer agent future is cancelled. Snapshots always use
+/// `termination=cancelled` until the ordinary command result returns; they
+/// contain only the same bounded previews exposed by [`CommandOutput`].
+#[derive(Clone)]
+pub struct CommandProgressSink(Arc<dyn Fn(CommandOutput) + Send + Sync + 'static>);
+
+impl CommandProgressSink {
+    pub fn new<F>(observer: F) -> Self
+    where
+        F: Fn(CommandOutput) + Send + Sync + 'static,
+    {
+        Self(Arc::new(observer))
+    }
+
+    fn record(&self, snapshot: CommandOutput) {
+        (self.0)(snapshot);
+    }
+}
+
+impl std::fmt::Debug for CommandProgressSink {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CommandProgressSink")
+            .finish_non_exhaustive()
+    }
+}
+
+tokio::task_local! {
+    static COMMAND_PROGRESS_SINK: CommandProgressSink;
+}
+
+/// Scope one tool future to a bounded live command observer. Non-command tools
+/// simply never publish a snapshot, so the orchestrator can install this only
+/// when the invocation was recognized as `command_exec`.
+pub async fn scope_command_progress<F>(sink: CommandProgressSink, future: F) -> F::Output
+where
+    F: std::future::Future,
+{
+    COMMAND_PROGRESS_SINK.scope(sink, future).await
+}
+
+fn current_command_progress_sink() -> Option<CommandProgressSink> {
+    COMMAND_PROGRESS_SINK.try_with(Clone::clone).ok()
 }
 
 #[derive(Debug, Clone)]
@@ -1102,23 +1232,48 @@ impl BoundedBytes {
 
 struct ArtifactCapture {
     writer: Arc<dyn CommandOutputArtifactWriter>,
-    first_error: Mutex<Option<String>>,
+    limit_bytes: u64,
+    state: Mutex<ArtifactCaptureState>,
+}
+
+#[derive(Clone, Default)]
+struct ArtifactCaptureState {
+    first_error: Option<String>,
+    captured_bytes: u64,
+    truncated: bool,
 }
 
 impl ArtifactCapture {
-    fn new(writer: Arc<dyn CommandOutputArtifactWriter>) -> Self {
+    fn new(writer: Arc<dyn CommandOutputArtifactWriter>, limit_bytes: usize) -> Self {
         Self {
             writer,
-            first_error: Mutex::new(None),
+            limit_bytes: u64::try_from(limit_bytes).unwrap_or(u64::MAX),
+            state: Mutex::new(ArtifactCaptureState::default()),
         }
     }
 
     fn write(&self, stream: CommandOutputStream, chunk: &[u8]) {
-        if self.first_error.lock().unwrap().is_some() {
+        let mut state = self.state.lock().unwrap();
+        if state.first_error.is_some() {
             return;
         }
-        if let Err(error) = self.writer.write_chunk(stream, chunk) {
-            *self.first_error.lock().unwrap() = Some(error.to_string());
+        let remaining = self.limit_bytes.saturating_sub(state.captured_bytes);
+        let retained = chunk
+            .len()
+            .min(usize::try_from(remaining).unwrap_or(usize::MAX));
+        if retained < chunk.len() {
+            state.truncated = true;
+        }
+        if retained == 0 {
+            return;
+        }
+        match self.writer.write_chunk(stream, &chunk[..retained]) {
+            Ok(()) => {
+                state.captured_bytes = state
+                    .captured_bytes
+                    .saturating_add(u64::try_from(retained).unwrap_or(u64::MAX));
+            }
+            Err(error) => state.first_error = Some(error.to_string()),
         }
     }
 
@@ -1126,7 +1281,8 @@ impl ArtifactCapture {
         &self,
         completion: &CommandArtifactCompletion,
     ) -> (Option<CommandOutputArtifact>, Option<String>) {
-        if let Some(error) = self.first_error.lock().unwrap().clone() {
+        let state = self.state.lock().unwrap().clone();
+        if let Some(error) = state.first_error {
             // Do not bless a partial artifact with a completed reference. The
             // writer's abort hook owns cleanup.
             let error = match self.writer.abort() {
@@ -1135,8 +1291,25 @@ impl ArtifactCapture {
             };
             return (None, Some(error));
         }
-        match self.writer.complete(completion) {
-            Ok(artifact) => (Some(artifact), None),
+        let mut completion = *completion;
+        completion.captured_bytes = state.captured_bytes;
+        completion.truncated = state.truncated;
+        completion.limit_bytes = self.limit_bytes;
+        match self.writer.complete(&completion) {
+            Ok(mut artifact) => {
+                // The sink knows its encoded persistent representation. The
+                // command layer additionally caps raw bytes offered to it; if
+                // that independent cap fired, retain the stricter status.
+                artifact.truncated |= state.truncated;
+                artifact.limit_bytes = self.limit_bytes;
+                let status = artifact.truncated.then(|| {
+                    format!(
+                        "command-output artifact reached the {}-byte serialized safety limit; remaining command output was drained but omitted",
+                        self.limit_bytes
+                    )
+                });
+                (Some(artifact), status)
+            }
             Err(error) => {
                 let error = match self.writer.abort() {
                     Ok(()) => error.to_string(),
@@ -1148,6 +1321,10 @@ impl ArtifactCapture {
             }
         }
     }
+
+    fn abort(&self) -> std::io::Result<()> {
+        self.writer.abort()
+    }
 }
 
 async fn capture_bounded<R>(
@@ -1155,6 +1332,7 @@ async fn capture_bounded<R>(
     captured: Arc<Mutex<BoundedBytes>>,
     artifact: Option<Arc<ArtifactCapture>>,
     output_stream: CommandOutputStream,
+    progress: Arc<CommandProgressCapture>,
 ) -> std::io::Result<()>
 where
     R: AsyncRead + Unpin,
@@ -1169,6 +1347,7 @@ where
             artifact.write(output_stream, &buffer[..read]);
         }
         captured.lock().unwrap().retain(&buffer[..read]);
+        progress.record();
     }
     Ok(())
 }
@@ -1212,6 +1391,127 @@ fn bounded_text(output: BoundedBytes) -> BoundedText {
         retained_bytes,
         truncated,
         complete: output.complete,
+    }
+}
+
+struct CommandProgressCapture {
+    sink: Option<CommandProgressSink>,
+    argv: Vec<String>,
+    cwd: String,
+    executable: CommandExecutableIdentity,
+    ambient_authority: CommandAmbientAuthority,
+    started: Instant,
+    stdout: Arc<Mutex<BoundedBytes>>,
+    stderr: Arc<Mutex<BoundedBytes>>,
+    artifact_error: Mutex<Option<String>>,
+}
+
+#[derive(Clone)]
+struct CommandCaptureContext {
+    artifact: Option<Arc<ArtifactCapture>>,
+    stdout: Arc<Mutex<BoundedBytes>>,
+    stderr: Arc<Mutex<BoundedBytes>>,
+    progress: Arc<CommandProgressCapture>,
+}
+
+impl CommandProgressCapture {
+    fn record(&self) {
+        let Some(sink) = &self.sink else {
+            return;
+        };
+        let mut stdout = self.stdout.lock().unwrap().clone();
+        let mut stderr = self.stderr.lock().unwrap().clone();
+        // This is a live cancellation snapshot, never a claim that EOF was
+        // observed. Marking the captures incomplete also makes bounded_text
+        // disclose that its retained bytes are only the observed prefix/tail.
+        stdout.complete = false;
+        stderr.complete = false;
+        let stdout = bounded_text(stdout);
+        let stderr = bounded_text(stderr);
+        sink.record(CommandOutput {
+            argv: self.argv.clone(),
+            cwd: self.cwd.clone(),
+            executable: self.executable.clone(),
+            ambient_authority: self.ambient_authority,
+            termination: CommandTermination::Cancelled,
+            success: false,
+            exit_code: None,
+            signal: None,
+            stdout: stdout.text,
+            stderr: stderr.text,
+            stdout_bytes: stdout.total_bytes,
+            stderr_bytes: stderr.total_bytes,
+            stdout_retained_bytes: stdout.retained_bytes,
+            stderr_retained_bytes: stderr.retained_bytes,
+            stdout_truncated: stdout.truncated,
+            stderr_truncated: stderr.truncated,
+            stdout_capture_complete: false,
+            stderr_capture_complete: false,
+            elapsed_ms: duration_millis(self.started.elapsed()),
+            artifact: None,
+            artifact_error: self.artifact_error.lock().unwrap().clone(),
+        });
+    }
+
+    fn append_artifact_status(&self, status: String) {
+        let mut artifact_error = self.artifact_error.lock().unwrap();
+        match artifact_error.as_mut() {
+            Some(existing) => {
+                existing.push_str("; ");
+                existing.push_str(&status);
+            }
+            None => *artifact_error = Some(status),
+        }
+    }
+}
+
+/// Publishes one final live snapshot and synchronously invokes the host's
+/// artifact abort hook if the command future disappears before returning its
+/// ordinary structured result.
+struct CommandCancellationGuard {
+    progress: Arc<CommandProgressCapture>,
+    artifact: Option<Arc<ArtifactCapture>>,
+    armed: bool,
+}
+
+impl CommandCancellationGuard {
+    fn new(progress: Arc<CommandProgressCapture>, artifact: Option<Arc<ArtifactCapture>>) -> Self {
+        Self {
+            progress,
+            artifact,
+            armed: true,
+        }
+    }
+
+    fn disarm(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for CommandCancellationGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        let status = match &self.artifact {
+            Some(artifact) => match artifact.abort() {
+                Ok(()) => {
+                    "command cancelled; full-output artifact cleanup requested; sink reported \
+                     success, but cleanup was not independently verified"
+                        .to_string()
+                }
+                Err(error) => format!(
+                    "command cancelled; full-output artifact cleanup requested; sink reported \
+                     failure: {error}"
+                ),
+            },
+            None => {
+                "command cancelled; no full-output artifact was created; no cleanup was required"
+                    .to_string()
+            }
+        };
+        self.progress.append_artifact_status(status);
+        self.progress.record();
     }
 }
 
@@ -1378,8 +1678,7 @@ impl Drop for PipeReaderTasks {
 async fn supervise_child(
     child: tokio::process::Child,
     timeout: Duration,
-    max_output_bytes: usize,
-    artifact: Option<Arc<ArtifactCapture>>,
+    capture: CommandCaptureContext,
 ) -> std::io::Result<SupervisedOutput> {
     let mut child = ChildReaperLease::new(child)?;
     let stdout = child
@@ -1390,20 +1689,26 @@ async fn supervise_child(
         .stderr
         .take()
         .ok_or_else(|| std::io::Error::other("child stderr was not captured"))?;
-    let stdout_capture = Arc::new(Mutex::new(BoundedBytes::new(max_output_bytes)));
-    let stderr_capture = Arc::new(Mutex::new(BoundedBytes::new(max_output_bytes)));
+    let CommandCaptureContext {
+        artifact,
+        stdout: stdout_capture,
+        stderr: stderr_capture,
+        progress,
+    } = capture;
     let mut reader_tasks = PipeReaderTasks {
         stdout: tokio::spawn(capture_bounded(
             stdout,
             stdout_capture.clone(),
             artifact.clone(),
             CommandOutputStream::Stdout,
+            progress.clone(),
         )),
         stderr: tokio::spawn(capture_bounded(
             stderr,
             stderr_capture.clone(),
             artifact,
             CommandOutputStream::Stderr,
+            progress,
         )),
     };
 
@@ -1460,8 +1765,7 @@ async fn run_supervised_command(
     requested_cwd: &Path,
     policy: &CommandPolicy,
     timeout: Duration,
-    max_output_bytes: usize,
-    artifact: Option<Arc<ArtifactCapture>>,
+    capture: CommandCaptureContext,
 ) -> Result<SupervisedOutput, ToolError> {
     let executable = authorized
         .executable
@@ -1523,7 +1827,7 @@ async fn run_supervised_command(
         return Err(executable_changed(argv, &authorized.cwd.canonical));
     }
     let child = command.spawn().map_err(command_failed)?;
-    supervise_child(child, timeout, max_output_bytes, artifact)
+    supervise_child(child, timeout, capture)
         .await
         .map_err(command_failed)
 }
@@ -1585,10 +1889,17 @@ pub async fn execute_command(
         cwd: authorized.cwd.canonical.display().to_string(),
         timeout_ms: duration_millis(timeout),
         executable: executable.clone(),
+        limit_bytes: u64::try_from(limits.max_artifact_bytes).unwrap_or(u64::MAX),
     };
     let (artifact, artifact_begin_error) = match policy.artifact_sink.as_ref() {
         Some(sink) => match sink.begin(&artifact_request) {
-            Ok(writer) => (Some(Arc::new(ArtifactCapture::new(writer))), None),
+            Ok(writer) => (
+                Some(Arc::new(ArtifactCapture::new(
+                    writer,
+                    limits.max_artifact_bytes,
+                ))),
+                None,
+            ),
             Err(error) => {
                 // Full-output capture is optional observability. A host sink
                 // outage must not revoke an otherwise authorized command or
@@ -1599,14 +1910,34 @@ pub async fn execute_command(
         None => (None, None),
     };
     let started = Instant::now();
+    let stdout_capture = Arc::new(Mutex::new(BoundedBytes::new(limits.max_output_bytes)));
+    let stderr_capture = Arc::new(Mutex::new(BoundedBytes::new(limits.max_output_bytes)));
+    let progress = Arc::new(CommandProgressCapture {
+        sink: current_command_progress_sink(),
+        argv: args.argv.clone(),
+        cwd: authorized.cwd.canonical.display().to_string(),
+        executable: executable.clone(),
+        ambient_authority: policy.ambient_authority(),
+        started,
+        stdout: stdout_capture.clone(),
+        stderr: stderr_capture.clone(),
+        artifact_error: Mutex::new(artifact_begin_error.clone()),
+    });
+    let cancellation_guard = CommandCancellationGuard::new(progress.clone(), artifact.clone());
+    progress.record();
+    let capture = CommandCaptureContext {
+        artifact: artifact.clone(),
+        stdout: stdout_capture,
+        stderr: stderr_capture,
+        progress,
+    };
     let captured = run_supervised_command(
         &args.argv,
         &authorized,
         Path::new(&args.cwd),
         policy,
         timeout,
-        limits.max_output_bytes,
-        artifact.clone(),
+        capture,
     )
     .await?;
     let elapsed_ms = duration_millis(started.elapsed());
@@ -1645,11 +1976,15 @@ pub async fn execute_command(
         stderr_bytes: stderr.total_bytes,
         stdout_capture_complete: stdout.complete,
         stderr_capture_complete: stderr.complete,
+        captured_bytes: 0,
+        truncated: false,
+        limit_bytes: u64::try_from(limits.max_artifact_bytes).unwrap_or(u64::MAX),
     };
     let (output_artifact, artifact_completion_error) = artifact
         .map(|artifact| artifact.complete(&completion))
         .unwrap_or((None, None));
     let artifact_error = artifact_begin_error.or(artifact_completion_error);
+    cancellation_guard.disarm();
 
     Ok(CommandOutput {
         argv: args.argv,
@@ -1767,6 +2102,7 @@ mod tests {
         stdout: Mutex<Vec<u8>>,
         stderr: Mutex<Vec<u8>>,
         completion: Mutex<Option<CommandArtifactCompletion>>,
+        aborted: AtomicUsize,
         fail_writes: bool,
     }
 
@@ -1789,7 +2125,16 @@ mod tests {
             *self.completion.lock().unwrap() = Some(*completion);
             Ok(CommandOutputArtifact {
                 reference: "session-artifact:command-1".to_string(),
+                captured_bytes: completion.captured_bytes,
+                truncated: completion.truncated,
+                limit_bytes: completion.limit_bytes,
+                artifact_bytes: completion.captured_bytes,
             })
+        }
+
+        fn abort(&self) -> std::io::Result<()> {
+            self.aborted.fetch_add(1, Ordering::Relaxed);
+            Ok(())
         }
     }
 
@@ -1855,11 +2200,12 @@ mod tests {
         }
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn command_root_does_not_itself_grant_execution() {
         let dir = tempfile::tempdir().unwrap();
         let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
-        let invocation = args(&["definitely-not-run"], dir.path());
+        let invocation = args(&["/bin/echo", "definitely-not-run"], dir.path());
 
         assert!(matches!(
             execute_command(&policy, invocation).await,
@@ -1947,6 +2293,7 @@ mod tests {
         assert!(!displaced.join("cwd-owned").exists());
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn session_approval_is_exact_for_argv_and_canonical_cwd() {
         let dir = tempfile::tempdir().unwrap();
@@ -1960,11 +2307,11 @@ mod tests {
                 prompts: prompts.clone(),
             }));
 
-        let first = args(&["definitely-missing", "one"], dir.path());
+        let first = args(&["/bin/echo", "one"], dir.path());
         let _ = execute_command(&policy, first.clone()).await;
         let _ = execute_command(&policy, first).await;
-        let _ = execute_command(&policy, args(&["definitely-missing", "two"], dir.path())).await;
-        let _ = execute_command(&policy, args(&["definitely-missing", "one"], &child)).await;
+        let _ = execute_command(&policy, args(&["/bin/echo", "two"], dir.path())).await;
+        let _ = execute_command(&policy, args(&["/bin/echo", "one"], &child)).await;
 
         assert_eq!(prompts.load(Ordering::Relaxed), 3);
     }
@@ -2056,6 +2403,7 @@ mod tests {
         );
     }
 
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn background_scope_never_calls_the_interactive_command_prompter() {
         let dir = tempfile::tempdir().unwrap();
@@ -2069,7 +2417,7 @@ mod tests {
 
         let result = crate::scope_without_interactive_prompts(execute_command(
             &policy,
-            args(&["unapproved-background-command"], dir.path()),
+            args(&["/bin/echo", "unapproved-background-command"], dir.path()),
         ))
         .await;
 
@@ -2083,13 +2431,13 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn an_approved_unresolved_executable_is_never_run_without_an_identity() {
+    async fn unresolved_executable_is_rejected_before_prompt_or_session_grant() {
         let dir = tempfile::tempdir().unwrap();
         let prompts = Arc::new(AtomicUsize::new(0));
         let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
             .unwrap()
             .with_prompter(Arc::new(FixedPrompter {
-                decision: CommandDecision::AllowOnce,
+                decision: CommandDecision::AllowForSession,
                 prompts: prompts.clone(),
             }));
 
@@ -2103,17 +2451,20 @@ mod tests {
             result,
             Err(ToolError::PolicyDenied(message)) if message.contains("refusing unbound execution")
         ));
-        assert_eq!(prompts.load(Ordering::Relaxed), 1);
+        assert_eq!(prompts.load(Ordering::Relaxed), 0);
+        assert!(policy.session_grants().is_empty());
+        assert!(!policy.is_granted(&["definitely-unresolved-command".to_string()], dir.path()));
     }
 
+    #[cfg(not(windows))]
     #[test]
     fn exact_command_grants_are_inspectable_sorted_and_individually_revocable() {
         let dir = tempfile::tempdir().unwrap();
         let child = dir.path().join("child");
         std::fs::create_dir(&child).unwrap();
         let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
-        let alpha = vec!["tool".to_string(), "alpha".to_string()];
-        let zeta = vec!["tool".to_string(), "zeta".to_string()];
+        let alpha = vec!["/bin/echo".to_string(), "alpha".to_string()];
+        let zeta = vec!["/bin/echo".to_string(), "zeta".to_string()];
         policy.grant_command(&zeta, dir.path()).unwrap();
         policy.grant_command(&alpha, dir.path()).unwrap();
         policy.grant_command(&alpha, dir.path()).unwrap();
@@ -2125,7 +2476,7 @@ mod tests {
         assert_eq!(grants[0].argv, alpha);
         assert_eq!(grants[1].argv, zeta);
         assert_eq!(grants[2].cwd, std::fs::canonicalize(&child).unwrap());
-        assert_eq!(grants[2].display_argv(), r#""tool" "alpha""#);
+        assert_eq!(grants[2].display_argv(), r#""/bin/echo" "alpha""#);
 
         assert_eq!(
             policy
@@ -2148,6 +2499,55 @@ mod tests {
         assert_eq!(policy.session_grants(), vec![grants[1].clone()]);
     }
 
+    #[test]
+    fn exact_pregrant_rejects_an_unresolved_or_non_executable_program() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
+
+        for program in ["missing-program", "plain-file"] {
+            if program == "plain-file" {
+                std::fs::write(dir.path().join(program), "not executable").unwrap();
+            }
+            let argv = vec![format!("./{program}")];
+            let error = policy
+                .grant_command(&argv, dir.path())
+                .expect_err("a dead exact grant must be rejected at configuration time");
+            assert!(matches!(
+                error,
+                ToolError::PolicyDenied(message)
+                    if message.contains("could not be resolved")
+                        && message.contains("refusing unbound execution")
+            ));
+        }
+        assert!(policy.session_grants().is_empty());
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_command_authority_fails_closed_without_loader_equivalent_validation() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
+        let executable = std::env::current_exe().unwrap();
+        let argv = vec![executable.to_string_lossy().into_owned()];
+
+        assert!(
+            fingerprint_executable(&executable).is_none(),
+            "even a known executable must not receive an untruthful pathname fingerprint"
+        );
+        let error = policy
+            .grant_command(&argv, dir.path())
+            .expect_err("Windows commands must fail closed before a secure resolver exists");
+        assert!(matches!(
+            error,
+            ToolError::PolicyDenied(message)
+                if message.contains("resolved securely on Windows")
+                    && message.contains("loader-equivalent")
+                    && message.contains("refusing unbound execution")
+        ));
+        assert!(policy.session_grants().is_empty());
+    }
+
+    #[cfg(not(windows))]
     #[tokio::test]
     async fn allow_once_does_not_create_a_session_grant() {
         let dir = tempfile::tempdir().unwrap();
@@ -2158,7 +2558,7 @@ mod tests {
                 decision: CommandDecision::AllowOnce,
                 prompts: prompts.clone(),
             }));
-        let invocation = args(&["definitely-missing"], dir.path());
+        let invocation = args(&["/bin/echo", "allow-once"], dir.path());
 
         let _ = execute_command(&policy, invocation.clone()).await;
         let _ = execute_command(&policy, invocation).await;
@@ -2324,6 +2724,10 @@ mod tests {
             Some("session-artifact:command-1")
         );
         assert_eq!(output.artifact_error, None);
+        let artifact = output.artifact.as_ref().unwrap();
+        assert_eq!(artifact.captured_bytes, 18);
+        assert!(!artifact.truncated);
+        assert_eq!(artifact.limit_bytes, DEFAULT_COMMAND_ARTIFACT_BYTES as u64);
         assert_eq!(sink.requests.lock().unwrap().len(), 1);
         let completion = writer.completion.lock().unwrap().unwrap();
         assert_eq!(completion.stdout_bytes, 9);
@@ -2331,6 +2735,71 @@ mod tests {
         assert_eq!(completion.termination, CommandTermination::Exited);
         assert!(completion.stdout_capture_complete);
         assert!(completion.stderr_capture_complete);
+        assert_eq!(completion.captured_bytes, 18);
+        assert!(!completion.truncated);
+        assert_eq!(
+            completion.limit_bytes,
+            DEFAULT_COMMAND_ARTIFACT_BYTES as u64
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn artifact_cap_omits_excess_while_pipes_continue_to_drain() {
+        let dir = tempfile::tempdir().unwrap();
+        let argv = [
+            "/bin/sh",
+            "-c",
+            "printf 123456789abc; printf ABCDEFGHIJKL >&2",
+        ];
+        let limits = CommandLimits::new(Duration::from_secs(1), Duration::from_secs(1), 4)
+            .unwrap()
+            .with_max_artifact_bytes(10)
+            .unwrap();
+        let writer = Arc::new(MemoryArtifact::default());
+        let sink = Arc::new(MemoryArtifactSink {
+            writer: writer.clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
+            .unwrap()
+            .with_limits(limits)
+            .with_output_artifact_sink(sink);
+        let argv = argv
+            .iter()
+            .map(|argument| (*argument).to_string())
+            .collect::<Vec<_>>();
+        policy.grant_command(&argv, dir.path()).unwrap();
+
+        let output = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv,
+                cwd: root(&dir),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output.stdout_bytes, 12);
+        assert_eq!(output.stderr_bytes, 12);
+        assert!(output.stdout_capture_complete);
+        assert!(output.stderr_capture_complete);
+        let captured = writer.stdout.lock().unwrap().len() + writer.stderr.lock().unwrap().len();
+        assert_eq!(captured, 10);
+        let artifact = output.artifact.as_ref().unwrap();
+        assert_eq!(artifact.captured_bytes, 10);
+        assert!(artifact.truncated);
+        assert_eq!(artifact.limit_bytes, 10);
+        assert!(output.artifact_error.as_deref().is_some_and(|status| {
+            status.contains("10-byte serialized safety limit")
+                && status.contains("drained but omitted")
+        }));
+        let completion = writer.completion.lock().unwrap().unwrap();
+        assert_eq!(completion.captured_bytes, 10);
+        assert!(completion.truncated);
+        assert_eq!(completion.limit_bytes, 10);
     }
 
     #[cfg(unix)]
@@ -2499,8 +2968,15 @@ mod tests {
             cwd: root(&dir),
             timeout_ms: None,
         };
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = snapshots.clone();
+        let progress = CommandProgressSink::new(move |snapshot| {
+            observed.lock().unwrap().push(snapshot);
+        });
         let task_policy = policy.clone();
-        let task = tokio::spawn(async move { execute_command(&task_policy, invocation).await });
+        let task = tokio::spawn(async move {
+            scope_command_progress(progress, execute_command(&task_policy, invocation)).await
+        });
 
         for _ in 0..100 {
             if pid_file.exists() {
@@ -2516,6 +2992,92 @@ mod tests {
         task.abort();
         assert!(task.await.unwrap_err().is_cancelled());
 
+        let snapshot = snapshots.lock().unwrap().last().cloned().unwrap();
+        assert!(snapshot.artifact.is_none());
+        assert!(snapshot.artifact_error.as_deref().is_some_and(|status| {
+            status.contains("no full-output artifact was created")
+                && status.contains("no cleanup was required")
+        }));
+
+        wait_until_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn cancellation_snapshot_preserves_output_and_reports_unverified_artifact_cleanup() {
+        let dir = tempfile::tempdir().unwrap();
+        let pid_file = dir.path().join("pid-progress");
+        let ready_file = dir.path().join("ready-progress");
+        let argv = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "echo $$ > \"$1\"; printf partial-out; printf partial-err >&2; : > \"$2\"; exec sleep 30"
+                .to_string(),
+            "sh".to_string(),
+            pid_file.to_string_lossy().into_owned(),
+            ready_file.to_string_lossy().into_owned(),
+        ];
+        let writer = Arc::new(MemoryArtifact::default());
+        let sink = Arc::new(MemoryArtifactSink {
+            writer: writer.clone(),
+            requests: Mutex::new(Vec::new()),
+        });
+        let policy = Arc::new(
+            CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
+                .unwrap()
+                .with_output_artifact_sink(sink),
+        );
+        policy.grant_command(&argv, dir.path()).unwrap();
+        let invocation = CommandExecArgs {
+            argv,
+            cwd: root(&dir),
+            timeout_ms: None,
+        };
+        let snapshots = Arc::new(Mutex::new(Vec::new()));
+        let observed = snapshots.clone();
+        let progress = CommandProgressSink::new(move |snapshot| {
+            observed.lock().unwrap().push(snapshot);
+        });
+        let task = tokio::spawn(async move {
+            scope_command_progress(progress, execute_command(&policy, invocation)).await
+        });
+
+        for _ in 0..100 {
+            if ready_file.exists() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert!(
+            ready_file.exists(),
+            "command should publish its partial output"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        let pid = std::fs::read_to_string(&pid_file)
+            .unwrap()
+            .trim()
+            .parse::<i32>()
+            .unwrap();
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+
+        let snapshot = snapshots.lock().unwrap().last().cloned().unwrap();
+        assert_eq!(snapshot.termination, CommandTermination::Cancelled);
+        assert!(snapshot.stdout.contains("partial-out"));
+        assert!(snapshot.stderr.contains("partial-err"));
+        assert!(snapshot.stdout_bytes >= "partial-out".len() as u64);
+        assert!(snapshot.stderr_bytes >= "partial-err".len() as u64);
+        assert!(snapshot.executable.observed_path.is_some());
+        assert!(!snapshot.stdout_capture_complete);
+        assert!(!snapshot.stderr_capture_complete);
+        assert!(snapshot.artifact.is_none());
+        assert!(snapshot.artifact_error.as_deref().is_some_and(|status| {
+            status.contains("cleanup requested")
+                && status.contains("not independently verified")
+                && !status.contains("cleanup completed")
+        }));
+        assert_eq!(writer.aborted.load(Ordering::Relaxed), 1);
+        assert!(writer.completion.lock().unwrap().is_none());
         wait_until_reaped(pid).await;
     }
 

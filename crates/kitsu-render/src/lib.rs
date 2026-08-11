@@ -41,6 +41,51 @@ struct TerminalTextSanitizer {
     state: EscapeState,
 }
 
+fn is_bidi_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        // Arabic Letter Mark, left/right marks, embeddings, overrides, and
+        // isolates. These characters can make an untrusted model/path/status
+        // appear to say something different from its logical byte order.
+        '\u{061c}'
+            | '\u{200e}'..='\u{200f}'
+            | '\u{202a}'..='\u{202e}'
+            | '\u{2066}'..='\u{2069}'
+            // Deprecated directional controls are still interpreted by some
+            // terminal stacks and should be made visible too.
+            | '\u{206a}'..='\u{206f}'
+    )
+}
+
+fn is_invisible_format_control(ch: char) -> bool {
+    matches!(
+        ch,
+        // Unicode Cf characters which are invisible/zero-width or change how
+        // adjacent glyphs are joined. Variation selectors are intentionally
+        // not included: they are marks rather than format controls and are
+        // needed for ordinary emoji presentation.
+        '\u{00ad}'
+            | '\u{0600}'..='\u{0605}'
+            | '\u{06dd}'
+            | '\u{070f}'
+            | '\u{0890}'..='\u{0891}'
+            | '\u{08e2}'
+            | '\u{180e}'
+            | '\u{17b4}'..='\u{17b5}'
+            | '\u{200b}'..='\u{200d}'
+            | '\u{2060}'..='\u{2064}'
+            | '\u{feff}'
+            | '\u{fff9}'..='\u{fffb}'
+            | '\u{110bd}'
+            | '\u{110cd}'
+            | '\u{13430}'..='\u{1345f}'
+            | '\u{1bca0}'..='\u{1bca3}'
+            | '\u{1d173}'..='\u{1d17a}'
+            | '\u{e0001}'
+            | '\u{e0020}'..='\u{e007f}'
+    )
+}
+
 impl TerminalTextSanitizer {
     fn push(&mut self, input: &str) -> String {
         let mut output = String::with_capacity(input.len());
@@ -56,6 +101,22 @@ impl TerminalTextSanitizer {
                     '\u{0090}' | '\u{0098}' | '\u{009e}' | '\u{009f}' => {
                         self.state = EscapeState::ControlString;
                     }
+                    // Do not silently preserve directional controls: an ASCII
+                    // marker exposes the exact logical character without
+                    // letting a terminal reorder the surrounding text.
+                    _ if is_bidi_format_control(ch) => {
+                        output.push_str(&format!("[U+{:04X}]", ch as u32));
+                    }
+                    // Unicode line/paragraph separators are printable scalar
+                    // values but several terminal/front-end stacks treat them
+                    // as physical row boundaries.
+                    '\u{2028}' | '\u{2029}' => {
+                        output.push_str(&format!("[U+{:04X}]", ch as u32));
+                    }
+                    // Other Unicode format controls are invisible and carry no
+                    // useful terminal content. Drop them rather than allowing
+                    // zero-width names/statuses to spoof visible identifiers.
+                    _ if is_invisible_format_control(ch) => {}
                     '\n' | '\t' => output.push(ch),
                     _ if !ch.is_control() => output.push(ch),
                     _ => {}
@@ -522,6 +583,11 @@ fn static_spinner_line(styled: bool) -> String {
     }
 }
 
+fn write_static_spinner<W: Write>(destination: &mut W, styled: bool) -> io::Result<()> {
+    writeln!(destination, "{}", static_spinner_line(styled))?;
+    destination.flush()
+}
+
 impl Spinner {
     /// Start the animation (must be called within a tokio runtime). Returns an
     /// inert handle on a non-TTY. Plain and reduced-motion terminals get a
@@ -554,18 +620,22 @@ impl Spinner {
                 // A newline keeps plain mode escape-free; unlike a cursor-
                 // controlled status this line intentionally remains in the
                 // transcript when the response starts.
-                eprintln!("{}", static_spinner_line(false));
+                let _ = write_static_spinner(&mut io::stderr(), false);
                 return Self {
                     handle: None,
                     clear_line: false,
                 };
             }
             SpinnerMode::StaticStyled => {
-                eprint!("\r{}", static_spinner_line(true));
-                let _ = io::stderr().flush();
+                // Reduced-motion output is a complete physical line. Leaving a
+                // carriage-return status pending allowed an asynchronous
+                // provider/job notice to merge into it before `clear()` ran.
+                // A newline is stable for screen readers and cannot be spliced
+                // with the next notice.
+                let _ = write_static_spinner(&mut io::stderr(), true);
                 return Self {
                     handle: None,
-                    clear_line: true,
+                    clear_line: false,
                 };
             }
             SpinnerMode::Animated => {}
@@ -997,8 +1067,8 @@ mod tests {
     use super::{
         context_lines, format_message, grouped_count, human_turn_stats, sanitize_plain_inline,
         sanitize_terminal_inline, sanitize_terminal_text, spinner_mode, static_spinner_line,
-        write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel, PromptSafeAsyncNotice,
-        RenderMode, SpinnerMode, TerminalTextSanitizer,
+        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
+        PromptSafeAsyncNotice, RenderMode, SpinnerMode, TerminalTextSanitizer,
     };
 
     #[test]
@@ -1033,6 +1103,17 @@ mod tests {
             sanitize_terminal_text("狐 says:\tこんにちは\n🦊"),
             "狐 says:\tこんにちは\n🦊"
         );
+    }
+
+    #[test]
+    fn exposes_bidi_controls_and_removes_invisible_format_controls() {
+        let input = "model-\u{202e}gpj.exe\u{202c}-\u{200b}safe\u{200d}\u{2028}row";
+        assert_eq!(
+            sanitize_terminal_text(input),
+            "model-[U+202E]gpj.exe[U+202C]-safe[U+2028]row"
+        );
+        assert!(!sanitize_terminal_text(input).contains('\u{202e}'));
+        assert!(!sanitize_terminal_text(input).contains('\u{200b}'));
     }
 
     #[test]
@@ -1229,5 +1310,18 @@ mod tests {
             sanitize_terminal_text(&styled_status),
             "  * kitsu is thinking"
         );
+        // `Spinner::start` emits both static modes with `eprintln!`; unlike an
+        // animated cursor line, neither remains pending for a notice to merge.
+        assert!(matches!(
+            spinner_mode(true, false, true),
+            SpinnerMode::StaticStyled
+        ));
+        let mut output = Vec::new();
+        write_static_spinner(&mut output, true).unwrap();
+        assert_eq!(
+            sanitize_terminal_text(std::str::from_utf8(&output).unwrap()),
+            "  * kitsu is thinking\n"
+        );
+        assert!(!output.contains(&b'\r'));
     }
 }

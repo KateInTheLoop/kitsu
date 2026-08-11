@@ -11,7 +11,7 @@ use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
 use crate::auth::AuthProvider;
-use crate::error::ProviderError;
+use crate::error::{ProviderError, ProviderResponsePart};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
@@ -328,6 +328,17 @@ fn finish_from_str(s: &str) -> FinishReason {
 /// an arbitrarily large `Vec` allocation.
 const MAX_STREAMED_TOOL_CALLS: usize = 64;
 
+// Provider responses are untrusted network input. These ceilings are generous
+// relative to ordinary chat traffic while ensuring no endpoint can make Kitsu
+// grow a String/Vec without bound. They deliberately describe decoded wire
+// bytes, not tokens: byte accounting remains exact for malformed UTF-8 too.
+const MAX_COMPLETION_BODY_BYTES: usize = 8 * 1024 * 1024;
+const MAX_MODEL_CATALOG_BODY_BYTES: usize = 2 * 1024 * 1024;
+const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
+const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
+const MAX_SSE_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+
 /// Accumulates streamed tool-call deltas by index.
 #[derive(Default)]
 struct ToolCallAcc {
@@ -360,42 +371,78 @@ struct SseDecoder {
     usage: Option<Usage>,
     /// Set once `data: [DONE]` is seen; later lines are ignored.
     saw_done: bool,
+    /// At least one choice carried semantic completion data (text, a tool call,
+    /// or an explicit finish reason). Usage-only chunks are valid, but they
+    /// cannot turn an otherwise empty/error payload into a successful answer.
+    saw_semantic_choice: bool,
+    /// Exact wire bytes admitted across all chunks.
+    received_bytes: usize,
 }
 
 impl SseDecoder {
     /// Feed a chunk of bytes; return any deltas that became ready (text only —
     /// tool calls + the terminal `Done` are emitted by [`Self::finalize`]).
-    fn push_bytes(&mut self, bytes: &[u8]) -> Vec<ChatDelta> {
+    fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<ChatDelta>, ProviderError> {
         let mut out = Vec::new();
-        self.buf.extend_from_slice(bytes);
-        while let Some(pos) = self.buf.iter().position(|&b| b == b'\n') {
-            let line: Vec<u8> = self.buf.drain(..=pos).collect();
-            let line = String::from_utf8_lossy(&line);
-            self.process_line(line.trim(), &mut out);
+        self.received_bytes = self
+            .received_bytes
+            .checked_add(bytes.len())
+            .filter(|total| *total <= MAX_SSE_STREAM_BYTES)
+            .ok_or(ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::SseStream,
+                limit_bytes: MAX_SSE_STREAM_BYTES,
+            })?;
+
+        // Process one newline-bounded segment at a time. Checking before each
+        // append means a large reqwest chunk containing many small SSE records
+        // is accepted without ever transiently growing the line buffer beyond
+        // its own independent ceiling.
+        for segment in bytes.split_inclusive(|byte| *byte == b'\n') {
+            if self.buf.len().saturating_add(segment.len()) > MAX_SSE_LINE_BYTES {
+                return Err(ProviderError::ResponseTooLarge {
+                    part: ProviderResponsePart::SseLine,
+                    limit_bytes: MAX_SSE_LINE_BYTES,
+                });
+            }
+            self.buf.extend_from_slice(segment);
+            if segment.last() == Some(&b'\n') {
+                let line = std::mem::take(&mut self.buf);
+                let line = String::from_utf8_lossy(&line);
+                self.process_line(line.trim(), &mut out)?;
+            }
         }
-        out
+        Ok(out)
     }
 
     /// Parse one SSE line, pushing any ready text delta and updating accumulators.
-    fn process_line(&mut self, line: &str, out: &mut Vec<ChatDelta>) {
+    fn process_line(&mut self, line: &str, out: &mut Vec<ChatDelta>) -> Result<(), ProviderError> {
         if self.saw_done {
-            return;
+            return Ok(());
         }
         let Some(data) = line.strip_prefix("data:") else {
-            return;
+            return Ok(());
         };
         let data = data.trim();
         if data == "[DONE]" {
             self.saw_done = true;
-            return;
+            return Ok(());
         }
         if data.is_empty() {
-            return;
+            return Ok(());
         }
-        let chunk: StreamChunk = match serde_json::from_str(data) {
-            Ok(c) => c,
-            Err(_) => return, // tolerate keep-alives / non-JSON comments
-        };
+        let value: serde_json::Value = serde_json::from_str(data).map_err(|_| {
+            ProviderError::InvalidResponse("malformed JSON in SSE data record".to_string())
+        })?;
+        if value.get("error").is_some() {
+            return Err(ProviderError::InvalidResponse(
+                "provider returned an error object in a successful SSE response".to_string(),
+            ));
+        }
+        let chunk: StreamChunk = serde_json::from_value(value).map_err(|_| {
+            ProviderError::InvalidResponse(
+                "invalid completion object in SSE data record".to_string(),
+            )
+        })?;
         // Usage typically rides the final chunk (which often has empty choices);
         // capture it regardless of whether this chunk also carries a delta.
         if let Some(u) = chunk.usage {
@@ -404,8 +451,16 @@ impl SseDecoder {
             }
         }
         let Some(choice) = chunk.choices.into_iter().next() else {
-            return;
+            return Ok(());
         };
+        let semantic_choice = choice
+            .delta
+            .content
+            .as_ref()
+            .is_some_and(|text| !text.is_empty())
+            || !choice.delta.tool_calls.is_empty()
+            || choice.finish_reason.is_some();
+        self.saw_semantic_choice |= semantic_choice;
         if let Some(text) = choice.delta.content {
             if !text.is_empty() {
                 out.push(ChatDelta::Text(text));
@@ -431,6 +486,13 @@ impl SseDecoder {
                     }
                 }
                 if let Some(args) = f.arguments {
+                    if acc.args.len().saturating_add(args.len()) > MAX_STREAMED_TOOL_ARGUMENT_BYTES
+                    {
+                        return Err(ProviderError::ResponseTooLarge {
+                            part: ProviderResponsePart::ToolArguments,
+                            limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+                        });
+                    }
                     acc.args.push_str(&args);
                 }
             }
@@ -438,16 +500,28 @@ impl SseDecoder {
         if let Some(fr) = choice.finish_reason {
             self.finish = Some(finish_from_str(&fr));
         }
+        Ok(())
     }
 
-    /// Stream ended: flush any trailing partial line, then emit accumulated
-    /// tool calls and the terminal `Done`.
-    fn finalize(mut self) -> Vec<ChatDelta> {
+    /// Stream ended: flush any trailing partial line, validate that the provider
+    /// explicitly ended the semantic response, then emit accumulated tool calls
+    /// and the terminal `Done`.
+    fn finalize(mut self) -> Result<Vec<ChatDelta>, ProviderError> {
         let mut out = Vec::new();
         if !self.buf.is_empty() {
             let rest = std::mem::take(&mut self.buf);
             let line = String::from_utf8_lossy(&rest).to_string();
-            self.process_line(line.trim(), &mut out);
+            self.process_line(line.trim(), &mut out)?;
+        }
+        if !self.saw_done && self.finish.is_none() {
+            return Err(ProviderError::InvalidResponse(
+                "SSE stream ended without data: [DONE] or an explicit finish_reason".to_string(),
+            ));
+        }
+        if !self.saw_semantic_choice {
+            return Err(ProviderError::InvalidResponse(
+                "SSE completion ended without a semantic choice".to_string(),
+            ));
         }
         for acc in std::mem::take(&mut self.accs) {
             if !acc.name.is_empty() || !acc.id.is_empty() {
@@ -458,7 +532,7 @@ impl SseDecoder {
             out.push(ChatDelta::Usage(usage));
         }
         out.push(ChatDelta::Done(self.finish.unwrap_or(FinishReason::Stop)));
-        out
+        Ok(out)
     }
 }
 
@@ -473,6 +547,7 @@ enum SseState {
         stream: ByteStream,
         dec: SseDecoder,
         queue: std::collections::VecDeque<ChatDelta>,
+        attempt_guard: ResponseBodyAttemptGuard,
     },
     Draining {
         queue: std::collections::VecDeque<ChatDelta>,
@@ -482,11 +557,30 @@ enum SseState {
 
 /// Parse a non-streaming completion JSON into a vec of ChatDelta.
 fn parse_completion(body: &str) -> Result<Vec<ChatDelta>, ProviderError> {
-    let resp: CompletionResponse = serde_json::from_str(body)
+    let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| ProviderError::InvalidResponse(format!("malformed completion JSON: {e}")))?;
+    if value.get("error").is_some() {
+        return Err(ProviderError::InvalidResponse(
+            "provider returned an error object in a successful completion response".to_string(),
+        ));
+    }
+    let resp: CompletionResponse = serde_json::from_value(value)
+        .map_err(|e| ProviderError::InvalidResponse(format!("invalid completion object: {e}")))?;
     let mut out = Vec::new();
     let finish = match resp.choices.into_iter().next() {
         Some(choice) => {
+            let semantic_choice = choice
+                .message
+                .content
+                .as_ref()
+                .is_some_and(|text| !text.is_empty())
+                || !choice.message.tool_calls.is_empty()
+                || choice.finish_reason.is_some();
+            if !semantic_choice {
+                return Err(ProviderError::InvalidResponse(
+                    "completion response contained an empty choice".to_string(),
+                ));
+            }
             if let Some(text) = choice.message.content {
                 if !text.is_empty() {
                     out.push(ChatDelta::Text(text));
@@ -509,7 +603,11 @@ fn parse_completion(body: &str) -> Result<Vec<ChatDelta>, ProviderError> {
                 .map(finish_from_str)
                 .unwrap_or(FinishReason::Stop)
         }
-        None => FinishReason::Stop,
+        None => {
+            return Err(ProviderError::InvalidResponse(
+                "completion response did not contain a choice".to_string(),
+            ));
+        }
     };
     // Surface usage (if reported) just before the terminal marker.
     if let Some(usage) = resp.usage {
@@ -527,6 +625,34 @@ fn map_send_error(e: reqwest::Error) -> ProviderError {
     } else {
         ProviderError::Connection(e.to_string())
     }
+}
+
+/// Consume one HTTP response under an exact provider-controlled byte ceiling.
+/// Content-Length is only an early rejection hint; streamed accounting remains
+/// authoritative because the header can be absent or dishonest.
+async fn read_response_bounded(
+    response: reqwest::Response,
+    part: ProviderResponsePart,
+    limit_bytes: usize,
+) -> Result<String, ProviderError> {
+    if response
+        .content_length()
+        .and_then(|length| usize::try_from(length).ok())
+        .is_some_and(|length| length > limit_bytes)
+    {
+        return Err(ProviderError::ResponseTooLarge { part, limit_bytes });
+    }
+
+    let mut body = Vec::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(map_send_error)?;
+        if body.len().saturating_add(chunk.len()) > limit_bytes {
+            return Err(ProviderError::ResponseTooLarge { part, limit_bytes });
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// A gateway-provided retry delay is useful, but it is still untrusted input.
@@ -657,10 +783,8 @@ fn status_category(status: StatusCode) -> ProviderAttemptCategory {
     }
 }
 
-fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) {
-    if let Some(telemetry) = telemetry {
-        telemetry.record(event);
-    }
+fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) -> bool {
+    telemetry.map_or(true, |telemetry| telemetry.record(event))
 }
 
 /// Ensures an admitted physical send remains observable when its async future
@@ -720,6 +844,165 @@ impl Drop for InFlightAttemptGuard {
     }
 }
 
+/// Extends a successful physical send through its response-body lifecycle.
+/// A 2xx header is intentionally non-terminal: only a fully read and decoded
+/// body is success. Dropping an unconsumed/partially consumed stream records a
+/// terminal cancellation, while explicit failures disarm this guard after
+/// recording their precise bounded category.
+struct ResponseBodyAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+    attempt: u32,
+    max_attempts: u32,
+    status: u16,
+    started: tokio::time::Instant,
+    timeout: Duration,
+    armed: bool,
+}
+
+impl ResponseBodyAttemptGuard {
+    fn new(
+        telemetry: Option<&ProviderTelemetrySink>,
+        attempt: u32,
+        max_attempts: u32,
+        status: u16,
+        started: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            telemetry: telemetry.cloned(),
+            attempt,
+            max_attempts,
+            status,
+            started,
+            timeout,
+            armed: true,
+        }
+    }
+
+    fn completed(mut self) {
+        self.record(
+            ProviderAttemptCategory::Success,
+            ProviderAttemptOutcome::BodyCompleted,
+        );
+        self.armed = false;
+    }
+
+    fn failed(mut self, error: &ProviderError) {
+        let category = match error {
+            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
+            ProviderError::Connection(_) => ProviderAttemptCategory::Connection,
+            ProviderError::ResponseTooLarge { .. } => ProviderAttemptCategory::ResponseTooLarge,
+            _ => ProviderAttemptCategory::InvalidResponse,
+        };
+        self.record(category, ProviderAttemptOutcome::BodyFailed);
+        self.armed = false;
+    }
+
+    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
+        record_attempt(
+            self.telemetry.as_ref(),
+            ProviderAttemptEvent {
+                attempt: self.attempt,
+                max_attempts: self.max_attempts,
+                category,
+                status: Some(self.status),
+                outcome,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
+            },
+        );
+    }
+}
+
+impl Drop for ResponseBodyAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.record(
+            ProviderAttemptCategory::Cancelled,
+            ProviderAttemptOutcome::Cancelled,
+        );
+    }
+}
+
+/// Keeps a nonterminal `RetryScheduled` disposition observable if the caller
+/// cancels while waiting to start the next physical attempt. This guard is only
+/// installed after a retry event with `terminal=false`; paths which already
+/// emitted `DeadlineExceeded` must not install it or they would double-report a
+/// terminal disposition.
+struct RetryBackoffAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+    attempt: u32,
+    max_attempts: u32,
+    started: tokio::time::Instant,
+    timeout: Duration,
+    armed: bool,
+}
+
+impl RetryBackoffAttemptGuard {
+    fn new(
+        telemetry: Option<&ProviderTelemetrySink>,
+        attempt: u32,
+        max_attempts: u32,
+        started: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            telemetry: telemetry.cloned(),
+            attempt,
+            max_attempts,
+            started,
+            timeout,
+            armed: true,
+        }
+    }
+
+    fn completed(mut self) {
+        self.armed = false;
+    }
+
+    fn deadline_exceeded(mut self) {
+        self.record(
+            ProviderAttemptCategory::Timeout,
+            ProviderAttemptOutcome::DeadlineExceeded,
+        );
+        self.armed = false;
+    }
+
+    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
+        record_attempt(
+            self.telemetry.as_ref(),
+            ProviderAttemptEvent {
+                attempt: self.attempt,
+                max_attempts: self.max_attempts,
+                category,
+                // The next attempt was scheduled but no HTTP response exists.
+                status: None,
+                outcome,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
+            },
+        );
+    }
+}
+
+impl Drop for RetryBackoffAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.record(
+            ProviderAttemptCategory::Cancelled,
+            ProviderAttemptOutcome::Cancelled,
+        );
+    }
+}
+
 /// Sleep only while the total request budget permits. If the requested delay
 /// reaches the deadline, return Timeout instead of starting a doomed attempt.
 async fn sleep_before_retry(
@@ -736,6 +1019,55 @@ async fn sleep_before_retry(
     Ok(())
 }
 
+/// Wait after a nonterminal retry disposition while preserving exactly one
+/// later terminal disposition if the wait is cancelled or loses the deadline.
+async fn sleep_before_retry_observed(
+    started: tokio::time::Instant,
+    timeout: Duration,
+    delay: Duration,
+    guard: RetryBackoffAttemptGuard,
+) -> Result<(), ProviderError> {
+    match sleep_before_retry(started, timeout, delay).await {
+        Ok(()) => {
+            // A timer may wake late under scheduler pressure. Recheck before
+            // disarming the only guard for the scheduled attempt; otherwise
+            // the loop's next admission check could return a bare Timeout with
+            // no terminal disposition.
+            if remaining_request_time(started, timeout).is_some() {
+                guard.completed();
+                Ok(())
+            } else {
+                guard.deadline_exceeded();
+                Err(ProviderError::Timeout)
+            }
+        }
+        Err(error) => {
+            guard.deadline_exceeded();
+            Err(error)
+        }
+    }
+}
+
+fn finish_sse(
+    dec: SseDecoder,
+    mut queue: std::collections::VecDeque<ChatDelta>,
+    attempt_guard: ResponseBodyAttemptGuard,
+) -> Option<(Result<ChatDelta, ProviderError>, SseState)> {
+    match dec.finalize() {
+        Ok(deltas) => {
+            attempt_guard.completed();
+            queue.extend(deltas);
+            queue
+                .pop_front()
+                .map(|delta| (Ok(delta), SseState::Draining { queue }))
+        }
+        Err(error) => {
+            attempt_guard.failed(&error);
+            Some((Err(error), SseState::Done))
+        }
+    }
+}
+
 /// One step of the streaming SSE state machine for `stream::unfold`. Yields the
 /// next `ChatDelta` (or a `ProviderError` for a mid-stream wire failure), or
 /// `None` when fully drained.
@@ -745,31 +1077,63 @@ async fn sse_step(state: SseState) -> Option<(Result<ChatDelta, ProviderError>, 
             mut stream,
             mut dec,
             mut queue,
+            attempt_guard,
         } => {
             // Drain anything already decoded before reading more bytes.
             if let Some(d) = queue.pop_front() {
-                return Some((Ok(d), SseState::Reading { stream, dec, queue }));
+                return Some((
+                    Ok(d),
+                    SseState::Reading {
+                        stream,
+                        dec,
+                        queue,
+                        attempt_guard,
+                    },
+                ));
             }
+            let attempt_guard = attempt_guard;
             loop {
                 match stream.next().await {
                     Some(Ok(bytes)) => {
-                        for d in dec.push_bytes(&bytes) {
-                            queue.push_back(d);
+                        match dec.push_bytes(&bytes) {
+                            Ok(deltas) => {
+                                for d in deltas {
+                                    queue.push_back(d);
+                                }
+                            }
+                            Err(error) => {
+                                attempt_guard.failed(&error);
+                                return Some((Err(error), SseState::Done));
+                            }
+                        }
+                        // `[DONE]` ends the semantic response. Do not require a
+                        // compatible gateway to close or finish draining its
+                        // HTTP body before the completed answer is usable.
+                        if dec.saw_done {
+                            return finish_sse(dec, queue, attempt_guard);
                         }
                         if let Some(d) = queue.pop_front() {
-                            return Some((Ok(d), SseState::Reading { stream, dec, queue }));
+                            return Some((
+                                Ok(d),
+                                SseState::Reading {
+                                    stream,
+                                    dec,
+                                    queue,
+                                    attempt_guard,
+                                },
+                            ));
                         }
                         // No complete line yet — keep reading.
                     }
                     Some(Err(e)) => {
-                        return Some((Err(map_send_error(e)), SseState::Done));
+                        let error = map_send_error(e);
+                        attempt_guard.failed(&error);
+                        return Some((Err(error), SseState::Done));
                     }
                     None => {
-                        // Wire closed: flush trailing line + tool calls + Done.
-                        let mut rest: std::collections::VecDeque<ChatDelta> = dec.finalize().into();
-                        return rest
-                            .pop_front()
-                            .map(|d| (Ok(d), SseState::Draining { queue: rest }));
+                        // Wire EOF is successful only when a finish reason was
+                        // already observed (or a trailing `[DONE]` is flushed).
+                        return finish_sse(dec, queue, attempt_guard);
                     }
                 }
             }
@@ -878,9 +1242,20 @@ impl OpenAICompatProvider {
         // the first place. A body-read failure on success IS load-bearing (the
         // caller needs that body to parse the actual data), so it still errors.
         let text = if status.is_success() {
-            resp.text().await.map_err(map_send_error)?
+            read_response_bounded(
+                resp,
+                ProviderResponsePart::ModelCatalogBody,
+                MAX_MODEL_CATALOG_BODY_BYTES,
+            )
+            .await?
         } else {
-            resp.text().await.unwrap_or_default()
+            match read_response_bounded(resp, ProviderResponsePart::ErrorBody, MAX_ERROR_BODY_BYTES)
+                .await
+            {
+                Ok(text) => text,
+                Err(error @ ProviderError::ResponseTooLarge { .. }) => return Err(error),
+                Err(_) => String::new(),
+            }
         };
         Ok((status, text))
     }
@@ -999,7 +1374,7 @@ impl Provider for OpenAICompatProvider {
         // Number of retries already completed; the physical attempt exposed to
         // telemetry is therefore always `attempt + 1`.
         let mut attempt: u32 = 0;
-        let response = loop {
+        let (response, final_attempt) = loop {
             let remaining =
                 remaining_request_time(started, self.timeout).ok_or(ProviderError::Timeout)?;
             let physical_attempt = attempt.saturating_add(1);
@@ -1038,7 +1413,7 @@ impl Provider for OpenAICompatProvider {
                         let remaining_after = remaining_request_time(started, self.timeout);
                         let can_retry =
                             remaining_after.is_some_and(|remaining| decision.delay < remaining);
-                        record_attempt(
+                        let observer_ready = record_attempt(
                             telemetry.as_ref(),
                             ProviderAttemptEvent {
                                 attempt: physical_attempt,
@@ -1051,41 +1426,76 @@ impl Provider for OpenAICompatProvider {
                                     ProviderAttemptOutcome::DeadlineExceeded
                                 },
                                 terminal: !can_retry,
-                                retry_delay_ms: Some(duration_millis(decision.delay)),
-                                retry_after_used: decision.retry_after_used,
+                                retry_delay_ms: can_retry.then(|| duration_millis(decision.delay)),
+                                retry_after_used: can_retry && decision.retry_after_used,
                                 remaining_deadline_ms: remaining_after
                                     .map(duration_millis)
                                     .unwrap_or(0),
                             },
                         );
                         drop(resp);
+                        if !observer_ready {
+                            // Close the already-published nonterminal retry
+                            // disposition in the retained trace, but never make
+                            // the newly scheduled physical send.
+                            if can_retry {
+                                drop(RetryBackoffAttemptGuard::new(
+                                    telemetry.as_ref(),
+                                    physical_attempt.saturating_add(1),
+                                    max_attempts,
+                                    started,
+                                    self.timeout,
+                                ));
+                            }
+                            return Err(ProviderError::Connection(
+                                "provider telemetry sink stopped the request".to_string(),
+                            ));
+                        }
                         if !can_retry {
                             sleep_before_retry(started, self.timeout, decision.delay).await?;
                             return Err(ProviderError::Timeout);
                         }
-                        sleep_before_retry(started, self.timeout, decision.delay).await?;
+                        let backoff_guard = RetryBackoffAttemptGuard::new(
+                            telemetry.as_ref(),
+                            physical_attempt.saturating_add(1),
+                            max_attempts,
+                            started,
+                            self.timeout,
+                        );
+                        sleep_before_retry_observed(
+                            started,
+                            self.timeout,
+                            decision.delay,
+                            backoff_guard,
+                        )
+                        .await?;
                         attempt = retry_number;
                         continue;
                     }
-                    record_attempt(
-                        telemetry.as_ref(),
-                        ProviderAttemptEvent {
-                            attempt: physical_attempt,
-                            max_attempts,
-                            category: status_category(status),
-                            status: Some(status.as_u16()),
-                            outcome: if status.is_success() {
-                                ProviderAttemptOutcome::ResponseAccepted
-                            } else {
-                                ProviderAttemptOutcome::Rejected
+                    // A success status is not a completed inference. Its one
+                    // terminal attempt event is delayed until the body is read
+                    // and decoded (or fails/is cancelled). Final non-success
+                    // statuses have no successful body lifecycle to await.
+                    if !status.is_success() {
+                        record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: status_category(status),
+                                status: Some(status.as_u16()),
+                                outcome: ProviderAttemptOutcome::Rejected,
+                                terminal: true,
+                                retry_delay_ms: None,
+                                retry_after_used: false,
+                                remaining_deadline_ms: remaining_deadline_millis(
+                                    started,
+                                    self.timeout,
+                                ),
                             },
-                            terminal: true,
-                            retry_delay_ms: None,
-                            retry_after_used: false,
-                            remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
-                        },
-                    );
-                    break resp;
+                        );
+                    }
+                    break (resp, physical_attempt);
                 }
                 Err(e) => {
                     if e.is_timeout() && attempt < self.retries {
@@ -1096,7 +1506,7 @@ impl Provider for OpenAICompatProvider {
                         );
                         let remaining_after = remaining_request_time(started, self.timeout);
                         let can_retry = remaining_after.is_some_and(|remaining| delay < remaining);
-                        record_attempt(
+                        let observer_ready = record_attempt(
                             telemetry.as_ref(),
                             ProviderAttemptEvent {
                                 attempt: physical_attempt,
@@ -1109,18 +1519,40 @@ impl Provider for OpenAICompatProvider {
                                     ProviderAttemptOutcome::DeadlineExceeded
                                 },
                                 terminal: !can_retry,
-                                retry_delay_ms: Some(duration_millis(delay)),
+                                retry_delay_ms: can_retry.then(|| duration_millis(delay)),
                                 retry_after_used: false,
                                 remaining_deadline_ms: remaining_after
                                     .map(duration_millis)
                                     .unwrap_or(0),
                             },
                         );
+                        if !observer_ready {
+                            if can_retry {
+                                drop(RetryBackoffAttemptGuard::new(
+                                    telemetry.as_ref(),
+                                    physical_attempt.saturating_add(1),
+                                    max_attempts,
+                                    started,
+                                    self.timeout,
+                                ));
+                            }
+                            return Err(ProviderError::Connection(
+                                "provider telemetry sink stopped the request".to_string(),
+                            ));
+                        }
                         if !can_retry {
                             sleep_before_retry(started, self.timeout, delay).await?;
                             return Err(ProviderError::Timeout);
                         }
-                        sleep_before_retry(started, self.timeout, delay).await?;
+                        let backoff_guard = RetryBackoffAttemptGuard::new(
+                            telemetry.as_ref(),
+                            physical_attempt.saturating_add(1),
+                            max_attempts,
+                            started,
+                            self.timeout,
+                        );
+                        sleep_before_retry_observed(started, self.timeout, delay, backoff_guard)
+                            .await?;
                         attempt = retry_number;
                         continue;
                     }
@@ -1156,12 +1588,26 @@ impl Provider for OpenAICompatProvider {
         }
         if !status.is_success() {
             // Read body for diagnostics; never contains the (sensitive) token.
-            let body = response.text().await.unwrap_or_default();
+            let body = read_response_bounded(
+                response,
+                ProviderResponsePart::ErrorBody,
+                MAX_ERROR_BODY_BYTES,
+            )
+            .await?;
             return Err(ProviderError::Http {
                 status: status.as_u16(),
                 body,
             });
         }
+
+        let attempt_guard = ResponseBodyAttemptGuard::new(
+            telemetry.as_ref(),
+            final_attempt,
+            max_attempts,
+            status.as_u16(),
+            started,
+            self.timeout,
+        );
 
         if req.stream {
             // Real streaming: drive the SSE decoder across wire chunks so text
@@ -1174,12 +1620,32 @@ impl Provider for OpenAICompatProvider {
                 stream: byte_stream,
                 dec: SseDecoder::default(),
                 queue: std::collections::VecDeque::new(),
+                attempt_guard,
             };
             let s = stream::unfold(init, sse_step);
             Ok(s.boxed())
         } else {
-            let text = response.text().await.map_err(map_send_error)?;
-            let deltas = parse_completion(&text)?;
+            let text = match read_response_bounded(
+                response,
+                ProviderResponsePart::CompletionBody,
+                MAX_COMPLETION_BODY_BYTES,
+            )
+            .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    attempt_guard.failed(&error);
+                    return Err(error);
+                }
+            };
+            let deltas = match parse_completion(&text) {
+                Ok(deltas) => deltas,
+                Err(error) => {
+                    attempt_guard.failed(&error);
+                    return Err(error);
+                }
+            };
+            attempt_guard.completed();
             let s = stream::iter(deltas.into_iter().map(Ok));
             Ok(s.boxed())
         }

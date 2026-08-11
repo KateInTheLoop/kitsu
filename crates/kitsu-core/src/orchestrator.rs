@@ -9,9 +9,9 @@ use kitsu_providers::{
     ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink, Role, ToolCall,
 };
 use kitsu_tools::{
-    CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
-    CommandExecutableResolution, CommandOutput, CommandOutputArtifact, CommandTermination,
-    Registry,
+    scope_command_progress, CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
+    CommandExecutableResolution, CommandOutput, CommandOutputArtifact, CommandProgressSink,
+    CommandTermination, Registry,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -60,11 +60,19 @@ pub struct AgentConfig {
     pub event_log: Option<AgentEventLog>,
 }
 
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRequestPurpose {
+    Inference,
+    Compaction,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentRuntimeEvent {
     ProviderRequest {
         round: u32,
+        purpose: ProviderRequestPurpose,
         message_count: usize,
         tools_offered: usize,
     },
@@ -73,6 +81,7 @@ pub enum AgentRuntimeEvent {
     /// attempt events, never additional logical request events.
     ProviderAttempt {
         round: u32,
+        purpose: ProviderRequestPurpose,
         attempt: u32,
         max_attempts: u32,
         category: ProviderAttemptCategory,
@@ -83,8 +92,13 @@ pub enum AgentRuntimeEvent {
         retry_after_used: bool,
         remaining_deadline_ms: u64,
     },
+    /// Assistant text safe for immediate frontend display. Text is emitted as
+    /// chunks when no tools were offered. Tool-capable rounds are buffered and
+    /// emitted only after text-protocol tool JSON has been ruled out.
+    AssistantDelta { round: u32, text: String },
     Usage {
         round: u32,
+        purpose: ProviderRequestPurpose,
         prompt_tokens: u64,
         completion_tokens: u64,
         total_tokens: u64,
@@ -118,6 +132,7 @@ pub enum AgentRuntimeEvent {
         success: bool,
         completion: String,
         tool_errors: u32,
+        policy_errors: u32,
     },
 }
 
@@ -242,12 +257,14 @@ fn abort_if_event_sink_failed(cfg: &AgentConfig) -> Result<(), AgentError> {
 fn provider_telemetry_sink(
     log: Option<&AgentEventLog>,
     round: u32,
+    purpose: ProviderRequestPurpose,
 ) -> Option<ProviderTelemetrySink> {
     log.map(|log| {
         let log = log.clone();
-        ProviderTelemetrySink::new(move |event| {
+        ProviderTelemetrySink::with_fallible_observer(move |event| {
             log.record(AgentRuntimeEvent::ProviderAttempt {
                 round,
+                purpose,
                 attempt: event.attempt,
                 max_attempts: event.max_attempts,
                 category: event.category,
@@ -258,6 +275,7 @@ fn provider_telemetry_sink(
                 retry_after_used: event.retry_after_used,
                 remaining_deadline_ms: event.remaining_deadline_ms,
             });
+            !log.abort_requested()
         })
     })
 }
@@ -277,6 +295,7 @@ struct PendingToolEvent {
     call_id: String,
     name: String,
     command: Option<CommandRuntimeInvocation>,
+    command_progress: Option<std::sync::Arc<std::sync::Mutex<Option<CommandOutput>>>>,
     started: std::time::Instant,
 }
 
@@ -290,6 +309,9 @@ impl ToolEventGuard {
     ) -> Self {
         let pending = log.map(|log| {
             let command = command_runtime_invocation(name, args);
+            let command_progress = command
+                .as_ref()
+                .map(|_| std::sync::Arc::new(std::sync::Mutex::new(None)));
             log.record(AgentRuntimeEvent::ToolStarted {
                 round,
                 call_id: call_id.to_string(),
@@ -307,10 +329,18 @@ impl ToolEventGuard {
                 call_id: call_id.to_string(),
                 name: name.to_string(),
                 command,
+                command_progress,
                 started: std::time::Instant::now(),
             }
         });
         Self { pending }
+    }
+
+    fn command_progress_sink(&self) -> Option<CommandProgressSink> {
+        let progress = self.pending.as_ref()?.command_progress.as_ref()?.clone();
+        Some(CommandProgressSink::new(move |snapshot| {
+            *progress.lock().expect("command progress") = Some(snapshot);
+        }))
     }
 
     fn finish(mut self, success: bool, output: &str) {
@@ -339,6 +369,11 @@ impl ToolEventGuard {
 impl Drop for ToolEventGuard {
     fn drop(&mut self) {
         if let Some(pending) = self.pending.take() {
+            let observed_command = pending
+                .command_progress
+                .as_ref()
+                .and_then(|progress| progress.lock().expect("command progress").clone())
+                .map(command_runtime_result_from_output);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -346,17 +381,18 @@ impl Drop for ToolEventGuard {
                 success: false,
                 cancelled: true,
                 output: "[cancelled: tool execution interrupted]".to_string(),
-                command: pending.command.as_ref().map(|invocation| {
-                    let executable_name = invocation.argv.first().cloned().unwrap_or_default();
-                    let executable_path = std::path::Path::new(&executable_name);
-                    let executable_resolution = if executable_path.is_absolute()
-                        || executable_path.components().count() > 1
-                    {
-                        CommandExecutableResolution::InvocationPath
-                    } else {
-                        CommandExecutableResolution::AmbientPath
-                    };
-                    CommandRuntimeResult {
+                command: observed_command.or_else(|| {
+                    pending.command.as_ref().map(|invocation| {
+                        let executable_name = invocation.argv.first().cloned().unwrap_or_default();
+                        let executable_path = std::path::Path::new(&executable_name);
+                        let executable_resolution = if executable_path.is_absolute()
+                            || executable_path.components().count() > 1
+                        {
+                            CommandExecutableResolution::InvocationPath
+                        } else {
+                            CommandExecutableResolution::AmbientPath
+                        };
+                        CommandRuntimeResult {
                         termination: CommandTermination::Cancelled,
                         success: false,
                         exit_code: None,
@@ -385,11 +421,12 @@ impl Drop for ToolEventGuard {
                         ambient_authority: CommandAmbientAuthority::CURRENT,
                         artifact: None,
                         artifact_error: Some(
-                            "command cancelled; unfinished full-output artifact was not published \
-                             and cleanup was requested"
+                            "command cancelled before full-output artifact state was observed; \
+                             cleanup requirement is unverified and no cleanup is claimed"
                                 .to_string(),
                         ),
                     }
+                    })
                 }),
             });
         }
@@ -635,6 +672,8 @@ pub enum TurnCompletion {
 pub struct AgentTurnStatus {
     pub completion: TurnCompletion,
     pub tool_errors: u32,
+    /// Subset of `tool_errors` caused by an explicit local authority denial.
+    pub policy_errors: u32,
 }
 
 /// Run one user turn through the agent loop, with no state persisted across
@@ -695,6 +734,7 @@ where
             success: result.is_ok(),
             completion: completion.to_string(),
             tool_errors: state.last_turn.tool_errors,
+            policy_errors: state.last_turn.policy_errors,
         });
     }
     // The orchestrator owns assistant rendering and the end-of-turn boundary so
@@ -763,6 +803,15 @@ where
             // (2) max-rounds backstop: stop gracefully, note it, return text.
             last_assistant_text.push_str("\n[stopped: max tool rounds reached]");
             turn_status.completion = TurnCompletion::MaxRounds;
+            if cfg.stream && !last_assistant_text.is_empty() {
+                if let Some(log) = &cfg.event_log {
+                    log.record(AgentRuntimeEvent::AssistantDelta {
+                        round: round.saturating_sub(1).max(1),
+                        text: last_assistant_text.clone(),
+                    });
+                }
+                abort_if_event_sink_failed(cfg)?;
+            }
             return Ok(last_assistant_text);
         }
 
@@ -810,6 +859,7 @@ where
             turn_usage,
             compact_failures,
             compaction_ledger,
+            round,
             CompactionReason::ContextTargetExceeded,
             false,
         )
@@ -834,6 +884,7 @@ where
         if let Some(log) = &cfg.event_log {
             log.record(AgentRuntimeEvent::ProviderRequest {
                 round,
+                purpose: ProviderRequestPurpose::Inference,
                 message_count: req.messages.len(),
                 tools_offered: req.tools.as_ref().map_or(0, Vec::len),
             });
@@ -849,10 +900,21 @@ where
         };
 
         // 401/403 surface here (or as the first stream item) as a hard error.
-        let mut stream = provider
-            .chat_stream_with_telemetry(req, provider_telemetry_sink(cfg.event_log.as_ref(), round))
-            .await?;
+        let stream_result = provider
+            .chat_stream_with_telemetry(
+                req,
+                provider_telemetry_sink(
+                    cfg.event_log.as_ref(),
+                    round,
+                    ProviderRequestPurpose::Inference,
+                ),
+            )
+            .await;
+        // A fallible observer can revoke retries while the provider future is
+        // still inside its transport loop. Prefer that local automation error
+        // over the adapter's private stop signal.
         abort_if_event_sink_failed(cfg)?;
+        let mut stream = stream_result?;
 
         let mut assistant_text = String::new();
         let mut tool_calls: Vec<ToolCall> = Vec::new();
@@ -870,7 +932,16 @@ where
                     // answers (below). The final round withholds tools, so final
                     // answers still stream live.
                     if cfg.stream && !tools_were_offered {
-                        kitsu_render::print_fragment(&t);
+                        if !cfg.quiet {
+                            kitsu_render::print_fragment(&t);
+                        }
+                        if let Some(log) = &cfg.event_log {
+                            log.record(AgentRuntimeEvent::AssistantDelta {
+                                round,
+                                text: t.clone(),
+                            });
+                        }
+                        abort_if_event_sink_failed(cfg)?;
                     }
                     assistant_text.push_str(&t);
                 }
@@ -886,6 +957,7 @@ where
                     if let Some(log) = &cfg.event_log {
                         log.record(AgentRuntimeEvent::Usage {
                             round,
+                            purpose: ProviderRequestPurpose::Inference,
                             prompt_tokens: u.prompt_tokens,
                             completion_tokens: u.completion_tokens,
                             total_tokens: u.total_tokens,
@@ -920,10 +992,23 @@ where
         // reasoning before a STRUCTURED tool call, and terminal answers, print
         // normally (previously over-suppressed, hiding read/grep output).
         if cfg.stream && tools_were_offered && !synthesized_call {
-            kitsu_render::print_message(&assistant_text);
+            if !cfg.quiet {
+                kitsu_render::print_message(&assistant_text);
+            }
+            // Text accompanying a structured tool call is intermediate
+            // narration, not the committed answer returned by this turn. Keep
+            // the human narration, but do not label it as assistant output in
+            // automation: concatenated deltas must reproduce `assistant.text`.
+            if tool_calls.is_empty() && !assistant_text.is_empty() {
+                if let Some(log) = &cfg.event_log {
+                    log.record(AgentRuntimeEvent::AssistantDelta {
+                        round,
+                        text: assistant_text.clone(),
+                    });
+                }
+                abort_if_event_sink_failed(cfg)?;
+            }
         }
-
-        last_assistant_text = assistant_text.clone();
 
         // Record the assistant turn. When we synthesized a call from text, store
         // empty content so the raw tool-call JSON doesn't pollute the history.
@@ -932,6 +1017,7 @@ where
         } else {
             assistant_text.clone()
         };
+        last_assistant_text = assistant_content.clone();
         messages.push(ChatMessage::assistant(
             assistant_content,
             tool_calls.clone(),
@@ -945,7 +1031,17 @@ where
                 // letting a cut-off answer masquerade as a complete one.
                 FinishReason::Length => {
                     tracing::warn!("response truncated: model hit its output length limit");
-                    assistant_text.push_str("\n[truncated: model output length limit reached]");
+                    const MARKER: &str = "\n[truncated: model output length limit reached]";
+                    assistant_text.push_str(MARKER);
+                    if cfg.stream {
+                        if let Some(log) = &cfg.event_log {
+                            log.record(AgentRuntimeEvent::AssistantDelta {
+                                round,
+                                text: MARKER.to_string(),
+                            });
+                        }
+                        abort_if_event_sink_failed(cfg)?;
+                    }
                     turn_status.completion = TurnCompletion::LengthLimited;
                     return Ok(assistant_text);
                 }
@@ -980,7 +1076,13 @@ where
             );
             abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
-            let (content, is_err) = match tools.run(&tc.tool_name, tc.args.clone()).await {
+            let tool_result = match tool_event.command_progress_sink() {
+                Some(sink) => {
+                    scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone())).await
+                }
+                None => tools.run(&tc.tool_name, tc.args.clone()).await,
+            };
+            let (content, is_err) = match tool_result {
                 Ok(out) => {
                     consecutive_failures.remove(&sig); // a success resets the streak
                     (out, false)
@@ -995,6 +1097,9 @@ where
                         force_final_next = true;
                     }
                     turn_status.tool_errors = turn_status.tool_errors.saturating_add(1);
+                    if matches!(e, kitsu_tools::ToolError::PolicyDenied(_)) {
+                        turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
+                    }
                     (
                         serde_json::json!({ "error": e.kind(), "detail": e.to_string() })
                             .to_string(),
@@ -1157,7 +1262,11 @@ fn command_runtime_invocation(name: &str, args: &str) -> Option<CommandRuntimeIn
 
 fn command_runtime_result(output: &str) -> Option<CommandRuntimeResult> {
     let output = serde_json::from_str::<CommandOutput>(output).ok()?;
-    Some(CommandRuntimeResult {
+    Some(command_runtime_result_from_output(output))
+}
+
+fn command_runtime_result_from_output(output: CommandOutput) -> CommandRuntimeResult {
+    CommandRuntimeResult {
         termination: output.termination,
         success: output.success,
         exit_code: output.exit_code,
@@ -1177,7 +1286,7 @@ fn command_runtime_result(output: &str) -> Option<CommandRuntimeResult> {
         ambient_authority: output.ambient_authority,
         artifact: output.artifact,
         artifact_error: output.artifact_error,
-    })
+    }
 }
 
 fn terminal_safe_inline(value: &str) -> String {
@@ -1358,10 +1467,10 @@ fn format_command_result(output: &CommandOutput) -> String {
             bounded_human_value(&artifact.reference, 160)
         ));
     }
-    if let Some(error) = &output.artifact_error {
+    if let Some(status) = &output.artifact_error {
         fields.push(format!(
-            "artifact error={:?}",
-            bounded_human_value(error, 160)
+            "artifact status={:?}",
+            bounded_human_value(status, 160)
         ));
     }
     fields.join(" | ")
@@ -1572,6 +1681,7 @@ where
         &mut usage,
         &mut state.compact_failures,
         &mut state.compaction_ledger,
+        1,
         CompactionReason::ManualRequest,
         true,
     )
@@ -1605,6 +1715,7 @@ where
         turn_usage,
         compact_failures,
         &mut CompactionLedger::default(),
+        1,
         CompactionReason::ContextTargetExceeded,
         false,
     )
@@ -1636,6 +1747,7 @@ async fn enforce_context_budget_recording<P>(
     turn_usage: &mut kitsu_providers::Usage,
     compact_failures: &mut u32,
     ledger: &mut CompactionLedger,
+    round: u32,
     reason: CompactionReason,
     force: bool,
 ) -> Result<CompactionReport, AgentError>
@@ -1801,8 +1913,9 @@ where
                     turn_usage,
                     meter,
                     &mut progress,
+                    round,
                 )
-                .await;
+                .await?;
             }
         }
     }
@@ -2056,11 +2169,13 @@ async fn summarize_or_fallback<P>(
     turn_usage: &mut kitsu_providers::Usage,
     meter: &mut ContextMeter,
     progress: &mut CompactionProgress,
-) where
+    round: u32,
+) -> Result<(), AgentError>
+where
     P: Provider,
 {
     let Some(span) = compaction_span(messages) else {
-        return;
+        return Ok(());
     };
 
     let fallback = if *failures >= MAX_COMPACT_FAILURES {
@@ -2076,12 +2191,32 @@ async fn summarize_or_fallback<P>(
                 if ensure_chat_request_fits(&req, cfg, &cold_meter).is_err() {
                     Some(SummaryFallbackReason::RequestTooLarge)
                 } else {
-                    match collect_text(provider, req).await {
+                    if let Some(log) = &cfg.event_log {
+                        log.record(AgentRuntimeEvent::ProviderRequest {
+                            round,
+                            purpose: ProviderRequestPurpose::Compaction,
+                            message_count: req.messages.len(),
+                            tools_offered: 0,
+                        });
+                    }
+                    abort_if_event_sink_failed(cfg)?;
+                    let collection = collect_text(
+                        provider,
+                        req,
+                        provider_telemetry_sink(
+                            cfg.event_log.as_ref(),
+                            round,
+                            ProviderRequestPurpose::Compaction,
+                        ),
+                    )
+                    .await;
+                    abort_if_event_sink_failed(cfg)?;
+                    match collection {
                         SummaryTextCollection::Complete { text, usage }
                             if !text.trim().is_empty() =>
                         {
                             if let Some(usage) = usage {
-                                turn_usage.add(usage);
+                                record_compaction_usage(cfg, round, turn_usage, usage)?;
                             }
                             if let Some((rebuilt, output_shortened)) = fit_summary_rebuild(
                                 messages,
@@ -2100,21 +2235,21 @@ async fn summarize_or_fallback<P>(
                                 if !cfg.quiet {
                                     kitsu_render::compaction_boundary();
                                 }
-                                return;
+                                return Ok(());
                             }
                             *failures = failures.saturating_add(1);
                             Some(SummaryFallbackReason::ResponseTooLarge)
                         }
                         SummaryTextCollection::Complete { usage, .. } => {
                             if let Some(usage) = usage {
-                                turn_usage.add(usage);
+                                record_compaction_usage(cfg, round, turn_usage, usage)?;
                             }
                             *failures = failures.saturating_add(1);
                             Some(SummaryFallbackReason::ProviderFailure)
                         }
                         SummaryTextCollection::Failed { reason, usage } => {
                             if let Some(usage) = usage {
-                                turn_usage.add(usage);
+                                record_compaction_usage(cfg, round, turn_usage, usage)?;
                             }
                             *failures = failures.saturating_add(1);
                             Some(reason)
@@ -2137,6 +2272,26 @@ async fn summarize_or_fallback<P>(
         progress.outcome = Some(CompactionOutcome::SummaryFallbackTrim);
         progress.fallback_reason = fallback;
     }
+    Ok(())
+}
+
+fn record_compaction_usage(
+    cfg: &AgentConfig,
+    round: u32,
+    turn_usage: &mut kitsu_providers::Usage,
+    usage: kitsu_providers::Usage,
+) -> Result<(), AgentError> {
+    turn_usage.add(usage);
+    if let Some(log) = &cfg.event_log {
+        log.record(AgentRuntimeEvent::Usage {
+            round,
+            purpose: ProviderRequestPurpose::Compaction,
+            prompt_tokens: usage.prompt_tokens,
+            completion_tokens: usage.completion_tokens,
+            total_tokens: usage.total_tokens,
+        });
+    }
+    abort_if_event_sink_failed(cfg)
 }
 
 enum SummaryTextCollection {
@@ -2155,8 +2310,12 @@ enum SummaryTextCollection {
 /// calls, and explicitly terminates with `Done(Stop)`. This prevents partial
 /// text before a stream error, length cutoff, or bare EOF from being installed
 /// as durable conversation history.
-async fn collect_text<P: Provider>(provider: &P, req: ChatRequest) -> SummaryTextCollection {
-    let mut stream = match provider.chat_stream(req).await {
+async fn collect_text<P: Provider>(
+    provider: &P,
+    req: ChatRequest,
+    telemetry: Option<ProviderTelemetrySink>,
+) -> SummaryTextCollection {
+    let mut stream = match provider.chat_stream_with_telemetry(req, telemetry).await {
         Ok(stream) => stream,
         Err(_) => {
             return SummaryTextCollection::Failed {

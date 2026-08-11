@@ -157,9 +157,13 @@ file tools and verified diffs.
 Scripted and piped chat stay stateless unless continuity is explicit:
 `chat --session` creates and autosaves a new conversation, while
 `chat --resume <id|last>` restores and autosaves an existing one. Successful
-automation turns are checkpointed as they complete. Resume resets runtime grants,
-never restores saved grants, and retains only roots explicitly supplied by the
-current invocation.
+automation turns are checkpointed as they complete; a new durable run does not
+publish an empty snapshot before its first successful model turn or a slash
+command that changes durable conversation/model state. Query-only scripts do
+not create zero-turn sessions. `last` prefers the newest conversation with a
+real user turn over legacy zero-turn snapshots.
+Resume resets runtime grants, never restores saved grants, and retains only
+roots explicitly supplied by the current invocation.
 
 Session inventory and lifecycle do not require a provider or even a parseable
 config file; the resolved config path only selects the isolated namespace:
@@ -483,7 +487,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--context-window <n>` | profile/cache, else `8192` | Override the model context window. A cold metadata lookup runs asynchronously and never delays the first inference. |
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
-| `--no-project-context` | off | Do not discover or send project `llms.txt`/`AGENTS.md` context or local skills. |
+| `--no-project-context` | off | Do not discover or send project `llms.txt`/`AGENTS.md` context or project skills. User skills remain available, including explicit `--skill` preloads. |
 
 **Chat-only flags**
 
@@ -553,7 +557,10 @@ it won't ask again.
 - **Background agents** inherit current explicit/session grants but never own
   the foreground terminal and therefore cannot open filesystem or command
   approval prompts. Pre-grant the exact authority they need; an ungranted
-  background operation fails closed without consuming stdin.
+  background operation fails closed without consuming stdin. Results not opened
+  through `/jobs show` are printed before a session switch or interactive exit,
+  after live jobs have been joined. Scripted JSONL emits unopened terminal work
+  as `background_result`; an unseen failed job makes strict automation nonzero.
 - Access is **deny-by-default** at the boundary; paths are canonicalized (writes
   canonicalize the parent), so `..`/symlink traversal is rejected. Generated
   files are capped at 1 MiB. `repo_grep` needs `rg` (ripgrep) on your `PATH`.
@@ -569,9 +576,12 @@ it won't ask again.
   provenance; `/revoke-command <number>` removes one for the current session.
   A session grant is bound to the observed executable identity and is revoked
   if the executable or its `PATH` resolution changes before reuse.
-  Full stdout/stderr is written to a unique `0600` JSONL artifact under protected
-  Kitsu state (or the active session artifact directory), while the model and
-  JSONL event receive bounded head/tail previews and truthful byte counts.
+  Windows command execution currently fails closed before approval until Kitsu
+  can reproduce loader-equivalent extension and executable-image validation.
+  The completed protected JSONL artifact is capped at 16 MiB including framing
+  and encoding expansion. Kitsu keeps draining after that ceiling and reports
+  raw captured bytes, exact serialized bytes, and truncation; the model and
+  JSONL event receive smaller bounded head/tail previews.
 
 Enter `/` to show all commands, or type a slash prefix and press Tab to complete
 it. Completion and `/help` share the same command registry, so their descriptions
@@ -627,7 +637,9 @@ Slash commands inside the REPL:
   last response's code blocks yourself.
 - **Edit existing files** with explicit readback authority by using
   `--allow-read-write <dir>` (or separate read and write roots).
-- **Attach files** with `@path`, `@path:line`, or `@path:start-end`. Expansion is
+- **Attach files** with `@path`, `@path:line`, or `@path:start-end` (also
+  `@path#Lstart-Lend`); sentence punctuation and quoted paths such as
+  `@"docs/my guide.md":10-20` are accepted. Expansion is
   permission checked, no-follow, UTF-8 only, deduplicated, and bounded to 32 KiB
   of selected content per file / 64 KiB total; a small line range can come from a
   larger file without buffering the whole file. Tab completion only exposes
@@ -646,15 +658,18 @@ kitsu --gateway ollama chat --allow-write ./out --script gen.txt
 ```
 
 Script failures include the file and line, roll the failed conversation turn
-back, and return exit `1` (command/input/auth setup) or `2` (provider,
-truncation, exhausted rounds, or a failed tool call). Use `--allow-turn-errors`
-only when partial success is intentional.
+back, and return exit `1` (command/input/auth setup, tool failure, or local
+policy denial) or `2` (provider, truncation, or exhausted rounds). Use
+`--allow-turn-errors` only when partial success is intentional.
 
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
 output, typed errors, and exactly one `final_summary`. Human stderr is not needed
-to determine the outcome. JSONL deliberately uses non-streaming provider
-responses so a partial text fragment can never corrupt event framing.
+to determine the outcome. Provider streaming remains enabled unless
+`--no-stream` is set; committed text arrives in ordered, JSON-escaped
+`assistant_delta` records whose concatenation matches the final assistant event.
+Status, permissions, context, diff, model, compaction, session-inventory, skill,
+and job slash commands emit typed `command_result` objects.
 
 `Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
 idle prompt it clears input. Automation emits a structured cancelled event and
@@ -667,11 +682,15 @@ targets the active turn and never leaks into a later prompt. On other platforms 
 still works, but Kitsu does not actively collect terminal type-ahead while a turn
 is running.
 
-For simple or accessible terminal output, pass `--plain` or set `NO_COLOR=1`, `KITSU_PLAIN=1`, or
-`TERM=dumb`. Renderer-owned banners, progress, tool activity, context meters, and
-permission prompts then use stable ASCII without styling escapes; arbitrary
-Unicode in model output and paths is preserved. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to
-replace the animated wait indicator with a visible static status.
+For simple or accessible terminal output, pass `--plain` or set `NO_COLOR=1`,
+`KITSU_PLAIN=1`, or `TERM=dumb`. Renderer-owned banners, progress, tool activity,
+context meters, and permission prompts then use stable ASCII without styling
+escapes; arbitrary safe Unicode in model output and paths is preserved. The
+interactive prompt also becomes a literal canonical line reader with no raw
+mode, cursor control, bracketed-paste toggles, completion, or history editing;
+asynchronous notices wait for the submitted line instead of splitting typed
+input. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to replace the
+animated wait indicator with a visible static status.
 
 ---
 
@@ -732,6 +751,9 @@ and `/context`. Pass `--no-project-context` (or set
 `KITSU_NO_PROJECT_CONTEXT=1`) to disable, including when resuming a session (the
 saved project-bearing system message is replaced). kitsu ships its own `llms.txt`, so any
 `llms.txt`-aware tool — including kitsu — can understand the repo.
+On Unix, discovery and reads are descriptor-relative and reject symlink
+retargeting. Platforms without that secure traversal primitive fail closed and
+do not load implicit project files.
 
 ---
 
@@ -756,11 +778,14 @@ always: false
 - **Discovery:** `.kitsu/skills/*/SKILL.md` (project, walking up to the git root)
   and `~/.kitsu/skills/*/SKILL.md` (user). kitsu ships a couple under
   `.kitsu/skills/` as examples. Symlinked skill roots, directories, and
-  `SKILL.md` files are ignored rather than widening read authority.
+  `SKILL.md` files are ignored rather than widening read authority. User skills
+  win duplicate names; `/skills` reports origins and ignored duplicates.
 - **On demand:** only the index (`name — description`) is always in context; the
   model loads a skill's body by calling the `skill` tool when a task matches, or
   you run `/skill <name>`. `/skills [filter]` lists them. `--skill <name>`
-  preloads one up front (works for `ask` too, and for spawned agents).
+  preloads one up front (works for `ask` too, for spawned agents, and with
+  `--no-project-context`). A project skill's `always: true` body still requires
+  an explicit load; only user-controlled always skills are injected up front.
 - **Bundled files & links:** a skill dir can ship UTF-8 resource files
   (checklists, templates). Kitsu captures them through no-follow file
   descriptors during discovery (32 KiB each / 64 KiB total) and includes that
@@ -771,7 +796,10 @@ always: false
   a tool-enabled agent is exactly what the permission model prevents). To use one
   from GitHub, `git clone` it into `~/.kitsu/skills/`. A skill's text is context,
   not privileged: every action it suggests still goes through permissions.
-- Disable auto-loading (skills + `llms.txt`) with `KITSU_NO_PROJECT_CONTEXT=1`.
+- Disable project context and project-skill discovery with
+  `KITSU_NO_PROJECT_CONTEXT=1`; user skills remain available. Filesystem skill
+  discovery currently fails closed on non-Unix platforms where Kitsu cannot pin
+  every path component during the read.
 
 ---
 
@@ -790,10 +818,13 @@ always: false
   **stderr**, so stdout stays clean for piping and scripts remain compatible.
 - **Exit codes:** `0` success (including accepted partial scripts with
   `--allow-turn-errors`), `1` CLI/input/config/missing-auth or other user-policy
-  failure, `2` provider/HTTP/timeout or strict incomplete turn (length limit,
-  exhausted rounds, failed tool call), and `130` Ctrl+C cancellation.
+  failure (including local tool failures and policy denials), `2`
+  provider/HTTP/timeout or strict incomplete turn (length limit or exhausted
+  rounds), and `130` Ctrl+C cancellation.
 - **Platform hardening:** Unix uses descriptor-bound command working directories,
   process-group cancellation, and descriptor-relative no-follow file/session
   operations. Portable branches retain validation and direct-child cancellation,
   but cannot close every pathname race or terminate an entire descendant process
-  group; unsupported atomic primitives fail closed.
+  group. Implicit project context, filesystem skills, and `@file` attachment
+  reads/completion fail closed when secure component traversal is unavailable;
+  unsupported atomic primitives likewise fail closed.

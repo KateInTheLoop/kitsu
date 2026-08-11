@@ -40,36 +40,70 @@ guarantees requires a new schema identifier.
   whether continuity was resumed, and whether successful work is durable.
 - A turn begins with `turn_started` and ends with exactly one `turn_finished`.
 - `provider_request` represents one logical model request in an agent round.
-- Each started physical HTTP send for that logical request produces one
-  `provider_attempt`, immediately after it completes or is cancelled. A retry
-  adds an attempt event; it does not add another `provider_request`.
+- Provider requests, attempts, and usage carry `purpose: "inference"` for the
+  answer-producing loop or `purpose: "compaction"` for a hidden summarizer
+  call. A scripted manual `/compact` associates those records with its `line`
+  and `command`, between `command_started` and `command_finished`; automatic
+  compaction uses the surrounding `turn_id` and round.
+- Each completed physical HTTP send produces one `provider_attempt`
+  disposition. It is nonterminal only when `retry_scheduled` commits to a later
+  attempt; final rejection, transport/body failure, success, and cancellation
+  are terminal. If that scheduled attempt is cancelled or loses the deadline
+  during backoff, a statusless terminal event for its attempt number closes the
+  earlier nonterminal disposition even though no HTTP send began. Retries never
+  add another `provider_request`.
+- Streaming text that is safe to display appears as ordered `assistant_delta`
+  records. Text from a tool-capable round is held until Kitsu has ruled out a
+  text-protocol tool call, so raw tool JSON is never mislabeled as an answer.
+  Concatenating one turn's deltas reproduces its committed `assistant.text`.
 - `tool_started` is followed by exactly one matching `tool_finished`, including
   cancellation.
+- A detached job whose terminal result was not already consumed is emitted as a
+  `background_result` before `final_summary`; successful detached work is never
+  silently lost when a script exits. An unacknowledged failed job also makes
+  strict automation nonzero.
 - Script query commands may place one structured `command_result` between their
   matching `command_started` and `command_finished`; status, permissions,
-  context, diff, and model-catalog queries never disappear into human stderr.
+  context, diff, model-catalog, model-switch, compaction, session inventory,
+  skills, and background-job results never disappear into human stderr. Status,
+  permissions, and session inventory retain a compatibility `text` field
+  alongside typed fields. Job mutations report both whether state changed and
+  the resulting bounded registry snapshot.
 - `assistant` follows that turn's runtime events when final text is available.
 - `final_summary` is the final event for a normally writable sink.
 
 `final_summary.status` is `ok` when every requested operation succeeded,
 `partial` when failures were explicitly accepted with `--allow-turn-errors`,
 `error` for an unsuccessful run, and `cancelled` after interruption.
+Its counters distinguish provider/incomplete-model failures, ordinary tool
+failures, local policy denials, user/command failures, and cancellations.
+Local tool and policy failures exit 1; provider or incomplete-model failures
+exit 2.
 
 Events associated with a turn carry `turn_id`. Provider and tool runtime events
-also carry the one-based agent `round`.
+also carry the one-based agent `round`. Provider operations initiated by a
+scripted slash command instead carry the command's one-based `line` and exact
+`command`, so automation never needs a synthetic turn identity.
 
 Command tools use native structured telemetry rather than making consumers
 parse nested JSON strings. Their `args`/`output` fields contain stable
 `[structured command ...]` placeholders and the optional `command` object
 contains argv/cwd/timeout, termination, elapsed time, byte/truncation counters,
 safe output tails, executable-resolution provenance, ambient-authority flags,
-and any host-owned full-output artifact reference.
+and any host-owned full-output artifact reference. Artifact capture has a
+separate serialized-file byte ceiling while stdout/stderr continue draining.
+`captured_bytes` is raw command data retained in the artifact,
+`artifact_bytes` is the exact completed on-disk JSONL size including framing and
+hex/JSON expansion, and `limit_bytes` bounds that serialized size. `truncated`
+discloses omitted output independently of the smaller inline preview.
 
 If cancellation drops an active command, its matching `tool_finished` carries
 `cancelled: true` and native `command.termination: "cancelled"`. Captures are
-marked incomplete, no unfinished artifact is published, and `artifact_error`
-confirms that cleanup was requested. Cleanup is best-effort on process failure,
-so the protocol does not falsely claim that an unlink was verified.
+marked incomplete and no unfinished artifact is published. The legacy-named
+`artifact_error` field is an artifact-status diagnostic: it distinguishes no
+artifact/no cleanup, a sink-reported cleanup request whose result was not
+independently verified, and a cleanup failure. It never claims that an unlink
+was verified when the executor cannot prove it.
 
 ## Safe provider-attempt telemetry
 
@@ -79,10 +113,12 @@ deadline, and outcome. It never contains URLs, headers, tokens, request bodies,
 prompts, response bodies, or model text.
 
 `terminal` means no later physical send will occur for that logical request.
-`response_accepted` means the retry loop accepted a successful HTTP response;
-the returned streaming body can still report a later decoding or connection
-error. `retry_after_used` is true only when a valid `Retry-After` value governed
-the selected delay rather than the local exponential-backoff floor.
+The OpenAI-compatible transport does not call header acceptance terminal
+success: `body_completed` is the successful terminal outcome, while a bounded
+read/decoding failure is `body_failed`. `response_accepted` remains reserved for
+adapters that expose a separate nonterminal header phase. `retry_after_used` is
+true only when a valid `Retry-After` value governed the selected delay rather
+than the local exponential-backoff floor.
 An in-flight send interrupted by caller cancellation uses the `cancelled`
 category and outcome, with no status or retry delay.
 

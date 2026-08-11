@@ -9,20 +9,48 @@
 //! (user) — never fetched from the network (prompt-injection into a tool-enabled
 //! agent). A skill's text is context, not privileged: every tool action it
 //! suggests still goes through the permission model.
+//! Filesystem skill discovery currently requires Unix descriptor-relative,
+//! no-follow traversal. Other platforms return an empty skill set until an
+//! equivalent handle-relative, no-reparse implementation is available.
 
-use std::collections::HashSet;
+#[cfg(unix)]
+use std::collections::HashMap;
+#[cfg(unix)]
 use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use kitsu_providers::ToolDescriptor;
-#[cfg(test)]
-use kitsu_tools::Permissions;
-use kitsu_tools::{HandlerFn, ToolError};
+#[cfg(unix)]
+use kitsu_tools::TrustedImplicitReadRoot;
+use kitsu_tools::{HandlerFn, Permissions, ToolError};
 
+#[cfg(unix)]
 const MAX_SKILL_MANIFEST_BYTES: usize = 256 * 1024;
+#[cfg(unix)]
 const MAX_SKILL_RESOURCE_BYTES: usize = 32 * 1024;
+#[cfg(unix)]
 const MAX_SKILL_RESOURCES_TOTAL_BYTES: usize = 64 * 1024;
+
+#[cfg(unix)]
+#[derive(Default)]
+struct SkillCollection {
+    skills: Vec<Skill>,
+    sources: Vec<SkillSource>,
+    duplicates: Vec<SkillDuplicate>,
+    seen: HashMap<String, usize>,
+}
+
+#[cfg(unix)]
+impl SkillCollection {
+    fn into_skill_set(self) -> SkillSet {
+        SkillSet {
+            skills: self.skills,
+            sources: self.sources,
+            duplicates: self.duplicates,
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 struct SkillResource {
@@ -36,7 +64,9 @@ pub struct Skill {
     pub name: String,
     pub description: String,
     pub when_to_use: String,
-    /// Load the body up front rather than on demand (use sparingly).
+    /// Request loading the body up front rather than on demand. Honored
+    /// automatically only for user-origin skills; project skills require an
+    /// explicit `/skill`, `--skill`, or tool load.
     pub always: bool,
     pub body: String,
     /// Declared reference links — surfaced to the user, never auto-fetched.
@@ -52,6 +82,42 @@ pub struct Skill {
 #[derive(Debug, Default, Clone)]
 pub struct SkillSet {
     skills: Vec<Skill>,
+    sources: Vec<SkillSource>,
+    duplicates: Vec<SkillDuplicate>,
+}
+
+/// Trust boundary from which a skill was discovered.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SkillOrigin {
+    /// Repository-controlled `.kitsu/skills` content.
+    Project,
+    /// User-controlled `~/.kitsu/skills` content.
+    User,
+}
+
+impl SkillOrigin {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::User => "user",
+        }
+    }
+}
+
+/// Exact manifest provenance retained for a selected or shadowed skill.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillSource {
+    pub origin: SkillOrigin,
+    pub manifest: PathBuf,
+}
+
+/// A duplicate name which was ignored in favor of an earlier, more trusted
+/// source. Keeping both origins makes shadowing visible to the UI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SkillDuplicate {
+    pub name: String,
+    pub selected: SkillSource,
+    pub ignored: SkillSource,
 }
 
 impl SkillSet {
@@ -67,6 +133,37 @@ impl SkillSet {
         self.skills.iter().map(|s| s.name.as_str()).collect()
     }
 
+    pub fn source(&self, name: &str) -> Option<&SkillSource> {
+        self.skills
+            .iter()
+            .position(|skill| skill.name == name)
+            .and_then(|index| self.sources.get(index))
+    }
+
+    pub fn duplicates(&self) -> &[SkillDuplicate] {
+        &self.duplicates
+    }
+
+    fn provenance_suffix(&self, skill: &Skill) -> String {
+        let Some(source) = self.source(&skill.name) else {
+            return String::new();
+        };
+        let mut notes = vec![source.origin.as_str().to_string()];
+        if source.origin == SkillOrigin::Project && skill.always {
+            notes.push("always requires explicit load".to_string());
+        }
+        let ignored: Vec<&str> = self
+            .duplicates()
+            .iter()
+            .filter(|duplicate| duplicate.name == skill.name)
+            .map(|duplicate| duplicate.ignored.origin.as_str())
+            .collect();
+        if !ignored.is_empty() {
+            notes.push(format!("duplicate {} ignored", ignored.join("/")));
+        }
+        format!(" [{}]", notes.join("; "))
+    }
+
     /// One line per skill for the always-on system-prompt index.
     pub fn index(&self, filter: &str) -> String {
         let f = filter.trim().to_lowercase();
@@ -77,7 +174,14 @@ impl SkillSet {
                     || s.name.to_lowercase().contains(&f)
                     || s.description.to_lowercase().contains(&f)
             })
-            .map(|s| format!("- {} — {}", s.name, s.description))
+            .map(|skill| {
+                format!(
+                    "- {}{} — {}",
+                    skill.name,
+                    self.provenance_suffix(skill),
+                    skill.description
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -100,7 +204,14 @@ impl SkillSet {
                     || skill.name.to_lowercase().contains(&f)
                     || skill.description.to_lowercase().contains(&f)
             })
-            .map(|skill| format!("- {} — {}", inline(&skill.name), inline(&skill.description)))
+            .map(|skill| {
+                format!(
+                    "- {}{} — {}",
+                    inline(&skill.name),
+                    inline(&self.provenance_suffix(skill)),
+                    inline(&skill.description)
+                )
+            })
             .collect::<Vec<_>>()
             .join("\n")
     }
@@ -109,43 +220,95 @@ impl SkillSet {
     pub fn always_bodies(&self) -> String {
         self.skills
             .iter()
-            .filter(|s| s.always && !s.body.is_empty())
+            .filter(|skill| {
+                skill.always
+                    && !skill.body.is_empty()
+                    && self
+                        .source(&skill.name)
+                        .map_or(true, |source| source.origin != SkillOrigin::Project)
+            })
             .map(load_skill)
             .collect::<Vec<_>>()
             .join("\n\n")
     }
 
-    /// Discover skills: project (`.kitsu/skills/*` walking up to the git/project
-    /// root) then user (`~/.kitsu/skills/*`). Project wins on name collision.
-    /// Returns empty when `disabled` (tests / `KITSU_NO_PROJECT_CONTEXT`).
-    pub fn discover(start: &Path, disabled: bool) -> SkillSet {
-        if disabled {
-            return SkillSet::default();
-        }
-        let mut skills = Vec::new();
-        let mut seen = HashSet::new();
+    /// Discover user skills and, unless `no_project` is set, project skills.
+    /// User skills win name collisions so repository content cannot shadow an
+    /// explicitly requested `--skill`; every ignored origin remains available
+    /// through [`Self::duplicates`]. Project `always: true` bodies are indexed
+    /// but never injected automatically (they require `/skill`/`--skill`/tool
+    /// loading). `no_project` does not disable user skills on supported Unix
+    /// platforms. Non-Unix platforms return an empty set until secure
+    /// no-reparse traversal is implemented.
+    pub fn discover(start: &Path, no_project: bool, permissions: &Permissions) -> SkillSet {
+        let user_skills = std::env::var_os("HOME")
+            .map(PathBuf::from)
+            .filter(|home| !home.as_os_str().is_empty())
+            .map(|home| home.join(".kitsu").join("skills"));
+        Self::discover_from(start, no_project, user_skills.as_deref(), permissions)
+    }
 
-        let mut dir = Some(start);
-        while let Some(d) = dir {
-            collect_from(&d.join(".kitsu").join("skills"), &mut skills, &mut seen);
-            if d.join(".git").exists() {
-                break;
-            }
-            dir = d.parent();
+    fn discover_from(
+        start: &Path,
+        no_project: bool,
+        user_skills: Option<&Path>,
+        permissions: &Permissions,
+    ) -> SkillSet {
+        #[cfg(not(unix))]
+        {
+            let _ = (start, no_project, user_skills, permissions);
+            SkillSet::default()
         }
-        if let Some(home) = std::env::var_os("HOME") {
-            let home = PathBuf::from(home);
-            if !home.as_os_str().is_empty() {
-                collect_from(&home.join(".kitsu").join("skills"), &mut skills, &mut seen);
+
+        #[cfg(unix)]
+        {
+            let mut collection = SkillCollection::default();
+
+            // User-controlled skills are the trusted default and win collisions.
+            if let Some(user_skills) = user_skills {
+                if let Ok(trusted_root) =
+                    permissions.authorize_trusted_implicit_read_root(user_skills)
+                {
+                    collect_from(
+                        user_skills,
+                        SkillOrigin::User,
+                        &mut collection,
+                        permissions,
+                        Some(&trusted_root),
+                    );
+                }
             }
+            if !no_project {
+                let mut dir = Some(start);
+                while let Some(d) = dir {
+                    collect_from(
+                        &d.join(".kitsu").join("skills"),
+                        SkillOrigin::Project,
+                        &mut collection,
+                        permissions,
+                        None,
+                    );
+                    if std::fs::symlink_metadata(d.join(".git")).is_ok() {
+                        break;
+                    }
+                    dir = d.parent();
+                }
+            }
+            collection.into_skill_set()
         }
-        SkillSet { skills }
     }
 }
 
 /// Read every `<dir>/*/SKILL.md`, parsing and appending skills whose name hasn't
 /// been seen yet.
-fn collect_from(dir: &Path, skills: &mut Vec<Skill>, seen: &mut HashSet<String>) {
+#[cfg(unix)]
+fn collect_from(
+    dir: &Path,
+    origin: SkillOrigin,
+    collection: &mut SkillCollection,
+    permissions: &Permissions,
+    trusted_root: Option<&TrustedImplicitReadRoot>,
+) {
     // Skill roots and their `.kitsu` parent are configuration boundaries, not
     // shortcuts to arbitrary filesystem locations. Ignore symlinked roots so a
     // repository cannot redirect discovery outside the project or user skill
@@ -173,42 +336,67 @@ fn collect_from(dir: &Path, skills: &mut Vec<Skill>, seen: &mut HashSet<String>)
     paths.sort(); // deterministic order
     for p in paths {
         let md = p.join("SKILL.md");
-        let Some(content) = read_regular_utf8_no_follow(&md, MAX_SKILL_MANIFEST_BYTES) else {
+        let Some(content) =
+            read_regular_utf8_no_follow(&md, MAX_SKILL_MANIFEST_BYTES, permissions, trusted_root)
+        else {
             continue;
         };
         let mut skill = parse(&content, &p);
-        skill.resources = collect_resources(&p);
-        if !skill.name.is_empty() && seen.insert(skill.name.clone()) {
-            skills.push(skill);
+        skill.resources = collect_resources(&p, permissions, trusted_root);
+        if skill.name.is_empty() {
+            continue;
+        }
+        let source = SkillSource {
+            origin,
+            manifest: md,
+        };
+        if let Some(index) = collection.seen.get(&skill.name).copied() {
+            if let Some(selected) = collection.sources.get(index).cloned() {
+                collection.duplicates.push(SkillDuplicate {
+                    name: skill.name,
+                    selected,
+                    ignored: source,
+                });
+            }
+        } else {
+            let index = collection.skills.len();
+            collection.seen.insert(skill.name.clone(), index);
+            collection.skills.push(skill);
+            collection.sources.push(source);
         }
     }
 }
 
-fn read_regular_utf8_no_follow(path: &Path, max_bytes: usize) -> Option<String> {
-    read_regular_utf8_no_follow_with_hook(path, max_bytes, || {})
+#[cfg(unix)]
+fn read_regular_utf8_no_follow(
+    path: &Path,
+    max_bytes: usize,
+    permissions: &Permissions,
+    trusted_root: Option<&TrustedImplicitReadRoot>,
+) -> Option<String> {
+    read_regular_utf8_no_follow_with_hook(path, max_bytes, permissions, trusted_root, || {})
 }
 
+#[cfg(unix)]
 fn read_regular_utf8_no_follow_with_hook<F>(
     path: &Path,
     max_bytes: usize,
+    permissions: &Permissions,
+    trusted_root: Option<&TrustedImplicitReadRoot>,
     after_open: F,
 ) -> Option<String>
 where
     F: FnOnce(),
 {
-    #[cfg(unix)]
     let file = crate::attachments::open_regular_file_no_follow(path).ok()?;
 
-    #[cfg(not(unix))]
-    let file = {
-        let metadata = std::fs::symlink_metadata(path).ok()?;
-        if metadata.file_type().is_symlink() || !metadata.file_type().is_file() {
-            return None;
-        }
-        std::fs::OpenOptions::new().read(true).open(path).ok()?
-    };
-
     after_open();
+    match trusted_root {
+        Some(trusted_root) => trusted_root
+            .validate_opened_file(path, &file, permissions)
+            .ok()?,
+        None => permissions.validate_trusted_opened_read(path, &file).ok()?,
+    }
     let mut bytes = Vec::with_capacity(max_bytes.min(8 * 1024));
     file.take(max_bytes.saturating_add(1) as u64)
         .read_to_end(&mut bytes)
@@ -219,7 +407,12 @@ where
     String::from_utf8(bytes).ok()
 }
 
-fn collect_resources(dir: &Path) -> Vec<SkillResource> {
+#[cfg(unix)]
+fn collect_resources(
+    dir: &Path,
+    permissions: &Permissions,
+    trusted_root: Option<&TrustedImplicitReadRoot>,
+) -> Vec<SkillResource> {
     let Ok(entries) = std::fs::read_dir(dir) else {
         return Vec::new();
     };
@@ -239,7 +432,8 @@ fn collect_resources(dir: &Path) -> Vec<SkillResource> {
             break;
         }
         let cap = remaining.min(MAX_SKILL_RESOURCE_BYTES);
-        let Some(content) = read_regular_utf8_no_follow(&path, cap) else {
+        let Some(content) = read_regular_utf8_no_follow(&path, cap, permissions, trusted_root)
+        else {
             continue;
         };
         let Some(name) = path
@@ -382,6 +576,10 @@ pub fn skill_tool(skills: Arc<SkillSet>) -> (ToolDescriptor, HandlerFn) {
 mod tests {
     use super::*;
 
+    fn permissions() -> Permissions {
+        Permissions::for_roots(&[], &[]).unwrap()
+    }
+
     const SAMPLE: &str = "---\nname: code-review\ndescription: Review a diff for bugs.\n\
 when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep 1. Read the file.\n";
 
@@ -437,6 +635,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                     resources: Vec::new(),
                 },
             ],
+            ..SkillSet::default()
         };
         assert_eq!(set.names(), vec!["a", "review"]);
         assert!(set.index("").contains("- a — does A"));
@@ -458,6 +657,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                 dir: PathBuf::new(),
                 resources: Vec::new(),
             }],
+            ..SkillSet::default()
         };
         let rendered = set.terminal_index("");
         assert!(!rendered.contains('\n'));
@@ -466,6 +666,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         assert!(rendered.contains("safe forged"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_finds_project_skills_and_stops_at_git_root() {
         let root = tempfile::tempdir().unwrap();
@@ -480,23 +681,93 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         let sub = root.path().join("crates/x");
         std::fs::create_dir_all(&sub).unwrap();
 
-        let set = SkillSet::discover(&sub, false);
+        let set = SkillSet::discover_from(&sub, false, None, &permissions());
         assert!(set.get("greet").is_some());
         assert_eq!(set.get("greet").unwrap().description, "say hi");
     }
 
     #[test]
-    fn discover_disabled_returns_empty() {
+    fn no_project_discovery_omits_project_skills() {
         let root = tempfile::tempdir().unwrap();
-        assert!(SkillSet::discover(root.path(), true).is_empty());
+        let sk = root.path().join(".kitsu/skills/project-only-cycle-four");
+        std::fs::create_dir_all(&sk).unwrap();
+        std::fs::write(
+            sk.join("SKILL.md"),
+            "---\nname: project-only-cycle-four\n---\nbody",
+        )
+        .unwrap();
+        assert!(
+            SkillSet::discover_from(root.path(), true, None, &permissions())
+                .get("project-only-cycle-four")
+                .is_none()
+        );
     }
 
+    #[cfg(unix)]
     #[test]
-    fn collect_from_first_wins_on_name_collision() {
-        // The first source collected (project, before user) wins a name clash.
+    fn no_project_discovery_keeps_explicit_user_skill_namespace() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let user_skills = root.path().join("user-skills");
+        std::fs::create_dir_all(project.join(".git")).unwrap();
+        let project_skill = project.join(".kitsu/skills/shared");
+        let user_skill = user_skills.join("shared");
+        std::fs::create_dir_all(&project_skill).unwrap();
+        std::fs::create_dir_all(&user_skill).unwrap();
+        std::fs::write(
+            project_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: PROJECT\n---\nproject",
+        )
+        .unwrap();
+        std::fs::write(
+            user_skill.join("SKILL.md"),
+            "---\nname: shared\ndescription: USER\n---\nuser",
+        )
+        .unwrap();
+
+        let set = SkillSet::discover_from(&project, true, Some(&user_skills), &permissions());
+
+        assert_eq!(set.get("shared").unwrap().description, "USER");
+        assert_eq!(set.source("shared").unwrap().origin, SkillOrigin::User);
+        assert!(set.duplicates().is_empty(), "project discovery is disabled");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_skills_remain_available_inside_the_protected_default_state_root() {
+        let root = tempfile::tempdir().unwrap();
+        let state = root.path().join(".kitsu");
+        let user_skills = state.join("skills");
+        let skill = user_skills.join("trusted-user-skill");
+        let project = root.path().join("project");
+        std::fs::create_dir_all(&skill).unwrap();
+        std::fs::create_dir(&project).unwrap();
+        std::fs::write(
+            skill.join("SKILL.md"),
+            "---\nname: trusted-user-skill\ndescription: available\n---\nUSER BODY",
+        )
+        .unwrap();
+        std::fs::write(skill.join("checklist.txt"), "USER RESOURCE").unwrap();
+        let permissions = Permissions::for_roots(&[], &[]).unwrap();
+        permissions
+            .protect_read_path(&state.to_string_lossy())
+            .unwrap();
+
+        let set = SkillSet::discover_from(&project, true, Some(&user_skills), &permissions);
+
+        let loaded = load_skill(set.get("trusted-user-skill").unwrap());
+        assert!(loaded.contains("USER BODY"));
+        assert!(loaded.contains("USER RESOURCE"));
+        assert!(permissions.read_roots().is_empty());
+        assert!(permissions.runtime_read_roots().is_empty());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn user_source_wins_collision_and_duplicate_origins_are_retained() {
         let d1 = tempfile::tempdir().unwrap();
         let d2 = tempfile::tempdir().unwrap();
-        for (d, desc) in [(&d1, "PROJECT"), (&d2, "USER")] {
+        for (d, desc) in [(&d1, "USER"), (&d2, "PROJECT")] {
             let s = d.path().join("dup");
             std::fs::create_dir_all(&s).unwrap();
             std::fs::write(
@@ -505,12 +776,75 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
             )
             .unwrap();
         }
-        let mut skills = Vec::new();
-        let mut seen = HashSet::new();
-        collect_from(d1.path(), &mut skills, &mut seen);
-        collect_from(d2.path(), &mut skills, &mut seen);
-        assert_eq!(skills.len(), 1, "the duplicate name is collected once");
-        assert_eq!(skills[0].description, "PROJECT", "first source wins");
+        let mut collection = SkillCollection::default();
+        collect_from(
+            d1.path(),
+            SkillOrigin::User,
+            &mut collection,
+            &permissions(),
+            None,
+        );
+        collect_from(
+            d2.path(),
+            SkillOrigin::Project,
+            &mut collection,
+            &permissions(),
+            None,
+        );
+        assert_eq!(
+            collection.skills.len(),
+            1,
+            "the duplicate name is collected once"
+        );
+        assert_eq!(
+            collection.skills[0].description, "USER",
+            "trusted user source wins"
+        );
+        let set = collection.into_skill_set();
+        assert_eq!(set.source("dup").unwrap().origin, SkillOrigin::User);
+        assert_eq!(set.duplicates().len(), 1);
+        assert_eq!(set.duplicates()[0].ignored.origin, SkillOrigin::Project);
+        assert!(set.terminal_index("").contains("duplicate project ignored"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_always_body_requires_explicit_load() {
+        let root = tempfile::tempdir().unwrap();
+        let user_root = root.path().join("user");
+        let project_root = root.path().join("project");
+        for (dir, name) in [(&user_root, "user-auto"), (&project_root, "project-auto")] {
+            let skill = dir.join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\nalways: true\n---\n{name}-body"),
+            )
+            .unwrap();
+        }
+        let mut collection = SkillCollection::default();
+        collect_from(
+            &user_root,
+            SkillOrigin::User,
+            &mut collection,
+            &permissions(),
+            None,
+        );
+        collect_from(
+            &project_root,
+            SkillOrigin::Project,
+            &mut collection,
+            &permissions(),
+            None,
+        );
+        let set = collection.into_skill_set();
+
+        assert!(set.always_bodies().contains("user-auto-body"));
+        assert!(!set.always_bodies().contains("project-auto-body"));
+        assert!(load_skill(set.get("project-auto").unwrap()).contains("project-auto-body"));
+        assert!(set
+            .index("")
+            .contains("project; always requires explicit load"));
     }
 
     #[tokio::test]
@@ -527,6 +861,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
                 dir: dir.path().to_path_buf(),
                 resources: Vec::new(),
             }],
+            ..SkillSet::default()
         });
         let (desc, handler) = skill_tool(set);
         assert_eq!(desc.name, "skill");
@@ -536,6 +871,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         assert!(handler("not json".to_string()).await.is_err());
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn load_skill_captures_resources_without_granting_filesystem_access() {
         let dir = tempfile::tempdir().unwrap();
@@ -559,7 +895,7 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         assert!(perms.check_read(&checklist).await.is_err());
 
         let mut skill = skill;
-        skill.resources = collect_resources(&skdir);
+        skill.resources = collect_resources(&skdir, &permissions(), None);
         let out = load_skill(&skill);
         assert!(out.contains("checklist.md"), "bundled file is listed");
         assert!(out.contains("1. check"), "bundled contents are captured");
@@ -568,6 +904,29 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         // Loading does not widen filesystem authority; resources are served
         // from the bounded discovery snapshot instead.
         assert!(perms.check_read(&checklist).await.is_err());
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn filesystem_skill_discovery_fails_closed_without_secure_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let user_skills = root.path().join("user-skills");
+        for (base, name) in [
+            (project.join(".kitsu/skills"), "project-skill"),
+            (user_skills.clone(), "user-skill"),
+        ] {
+            let skill = base.join(name);
+            std::fs::create_dir_all(&skill).unwrap();
+            std::fs::write(
+                skill.join("SKILL.md"),
+                format!("---\nname: {name}\n---\nbody"),
+            )
+            .unwrap();
+        }
+
+        let set = SkillSet::discover_from(&project, false, Some(&user_skills), &permissions());
+        assert!(set.is_empty());
     }
 
     #[cfg(unix)]
@@ -595,9 +954,52 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         )
         .unwrap();
 
-        let set = SkillSet::discover(root.path(), false);
+        let set = SkillSet::discover_from(root.path(), false, None, &permissions());
         assert!(set.get("escaped-dir").is_none());
         assert!(set.get("linked-manifest").is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_rejects_outside_hard_linked_manifests_and_resources() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let skills = project.join(".kitsu/skills");
+        let outside = root.path().join("outside");
+        std::fs::create_dir_all(&skills).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(project.join(".git")).unwrap();
+
+        let outside_manifest = outside.join("unrelated-manifest.txt");
+        let outside_resource = outside.join("unrelated-resource.txt");
+        std::fs::write(
+            &outside_manifest,
+            "---\nname: leaked-manifest\ndescription: secret\n---\nPRIVATE MANIFEST",
+        )
+        .unwrap();
+        std::fs::write(&outside_resource, "PRIVATE RESOURCE").unwrap();
+        let permissions = permissions();
+
+        let linked = skills.join("linked");
+        std::fs::create_dir(&linked).unwrap();
+        std::fs::hard_link(&outside_manifest, linked.join("SKILL.md")).unwrap();
+
+        let safe = skills.join("safe");
+        std::fs::create_dir(&safe).unwrap();
+        std::fs::write(
+            safe.join("SKILL.md"),
+            "---\nname: safe\ndescription: safe\n---\nSAFE BODY",
+        )
+        .unwrap();
+        std::fs::hard_link(&outside_resource, safe.join("secret.txt")).unwrap();
+
+        let set = SkillSet::discover_from(&project, false, None, &permissions);
+
+        assert!(set.get("leaked-manifest").is_none());
+        let loaded = load_skill(set.get("safe").unwrap());
+        assert!(loaded.contains("SAFE BODY"));
+        assert!(!loaded.contains("PRIVATE RESOURCE"));
+        assert!(!loaded.contains("secret.txt"));
     }
 
     #[cfg(unix)]
@@ -615,11 +1017,12 @@ when_to_use: When asked to review code.\nalways: false\n---\n# Code review\nStep
         std::fs::write(&manifest, "AUTHORIZED").unwrap();
         std::fs::write(outside.join("SKILL.md"), "PRIVATE").unwrap();
 
-        let content = read_regular_utf8_no_follow_with_hook(&manifest, 1024, || {
-            std::fs::rename(&skill_dir, &moved).unwrap();
-            symlink(&outside, &skill_dir).unwrap();
-        })
-        .unwrap();
+        let content =
+            read_regular_utf8_no_follow_with_hook(&manifest, 1024, &permissions(), None, || {
+                std::fs::rename(&skill_dir, &moved).unwrap();
+                symlink(&outside, &skill_dir).unwrap();
+            })
+            .unwrap();
 
         assert_eq!(content, "AUTHORIZED");
     }

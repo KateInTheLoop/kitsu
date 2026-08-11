@@ -119,6 +119,12 @@ impl PrivateArtifactWriter {
     /// Flush and durably retain the artifact, returning its protected path.
     /// Any failure leaves the writer armed for cleanup during `Drop`.
     pub fn finish(mut self) -> std::io::Result<PathBuf> {
+        self.finish_in_place()
+    }
+
+    /// In-place form of [`Self::finish`] for owners that must retain explicit
+    /// cleanup authority after a flush or durability failure.
+    pub fn finish_in_place(&mut self) -> std::io::Result<PathBuf> {
         let file = self
             .file
             .as_mut()
@@ -359,10 +365,7 @@ fn open_read_file(path: &Path) -> std::io::Result<std::fs::File> {
     }
 }
 
-fn read_authorized_file(path: &Path, max_bytes: usize) -> std::io::Result<CappedText> {
-    read_authorized_file_with_hook(path, max_bytes, || {})
-}
-
+#[cfg(test)]
 fn read_authorized_file_with_hook<F>(
     path: &Path,
     max_bytes: usize,
@@ -412,11 +415,26 @@ pub fn read_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
 }
 
 async fn read_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    read_file_run_with_hook(policy, args, || {}).await
+}
+
+async fn read_file_run_with_hook<F>(
+    policy: &Permissions,
+    args: &str,
+    before_open: F,
+) -> Result<String, ToolError>
+where
+    F: FnOnce(),
+{
     let a: ReadFileArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-    let canon = policy.check_read(Path::new(&a.path)).await?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
     let max_bytes = policy.max_bytes();
-    let content = tokio::task::spawn_blocking(move || read_authorized_file(&canon, max_bytes))
+    before_open();
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
@@ -3398,6 +3416,39 @@ mod tests {
         );
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn read_file_rejects_a_final_hard_link_swapped_after_authorization() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let private = dir.path().join("private");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        let target = allowed.join("target.txt");
+        let secret = private.join("session.json");
+        std::fs::write(&target, "AUTHORIZED").unwrap();
+        std::fs::write(&secret, "PRIVATE").unwrap();
+        let policy =
+            Permissions::for_roots(&[allowed.to_string_lossy().into_owned()], &[]).unwrap();
+        policy
+            .protect_read_path(&private.to_string_lossy())
+            .unwrap();
+        let args = serde_json::json!({"path": target}).to_string();
+
+        let error = read_file_run_with_hook(&policy, &args, || {
+            std::fs::remove_file(&target).unwrap();
+            std::fs::hard_link(&secret, &target).unwrap();
+            std::fs::remove_file(&secret).unwrap();
+        })
+        .await
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::PolicyDenied(message) if message.contains("changed after authorization")
+        ));
+    }
+
     #[tokio::test]
     async fn read_file_bad_args_is_invalid() {
         let policy = Permissions::for_roots(&[], &[]).expect("perms");
@@ -3493,8 +3544,6 @@ mod tests {
         std::fs::write(&secret, "TRANSCRIPT_SECRET").unwrap();
         let artifacts = private.join("artifacts");
         std::fs::create_dir(&artifacts).unwrap();
-        let artifact = artifacts.join("result.txt");
-        std::fs::write(&artifact, "TRUSTED_RESULT").unwrap();
         let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
         policy
             .protect_read_path(&private.to_string_lossy())
@@ -3502,6 +3551,8 @@ mod tests {
         policy
             .allow_internal_read_root(&artifacts.to_string_lossy())
             .unwrap();
+        let artifact = artifacts.join("result.txt");
+        std::fs::write(&artifact, "TRUSTED_RESULT").unwrap();
 
         let list = list_dir_run(&policy, &serde_json::json!({"path": root}).to_string())
             .await
