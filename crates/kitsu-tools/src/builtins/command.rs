@@ -1,14 +1,15 @@
 //! Guarded developer-command execution.
 //!
 //! Command execution is intentionally a separate authority from filesystem
-//! [`crate::permissions::Permissions`]. A command root only constrains the
-//! process working directory; it does not sandbox the child process or grant
-//! any command. An approved child retains Kitsu's ambient operating-system and
-//! environment authority. Every exact `(argv, canonical cwd)` invocation must
-//! be pre-granted or approved through a [`CommandPrompter`]. A session grant
-//! also records the executable path and filesystem identity observed when it
-//! was approved; a changed or retargeted executable invalidates that grant.
-//! There is deliberately no auto-allow mode.
+//! [`crate::permissions::Permissions`]. Every exact `(argv, canonical cwd)`
+//! invocation must be pre-granted or approved through a [`CommandPrompter`],
+//! and that approval is only one gate: production execution additionally
+//! requires fail-closed operating-system containment. On Linux, Kitsu launches
+//! through bubblewrap with writable approved command roots, a small read-only
+//! runtime, isolated network/PID/IPC/UTS namespaces, and a fixed minimal
+//! environment. A session grant records the executable path and filesystem
+//! identity observed when it was approved; a changed or retargeted executable
+//! invalidates that grant. There is deliberately no auto-allow mode.
 //!
 //! Input is an argv array, not a command-line string. Kitsu invokes the
 //! requested program directly without an intermediary shell or argument
@@ -16,12 +17,13 @@
 //! independently bounded buffers, and both timeout and caller-future
 //! cancellation kill and reap the child.
 //!
-//! Windows command execution currently fails closed before approval. Kitsu
-//! cannot yet bind Windows extension/PATH resolution to loader-equivalent
-//! executable validation, so accepting a pathname-derived fingerprint there
-//! would misstate the authority actually exercised by `CreateProcess`.
+//! Unsupported platforms and Linux hosts where the containment backend is
+//! absent or unusable fail closed before approval with an inspectable typed
+//! status. Windows also cannot yet bind extension/PATH resolution to
+//! loader-equivalent executable validation.
 
 use std::collections::VecDeque;
+use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::{ExitStatus, Stdio};
 use std::sync::{Arc, Mutex, RwLock};
@@ -47,6 +49,23 @@ pub const DEFAULT_COMMAND_OUTPUT_BYTES: usize = 64 * 1024;
 /// Maximum completed serialized bytes for an optional command-output artifact.
 /// Pipes continue to be drained after the sink reaches this cap.
 pub const DEFAULT_COMMAND_ARTIFACT_BYTES: usize = 16 * 1024 * 1024;
+/// Default Linux containment executable. It is fingerprinted during preflight
+/// and revalidated before every launch.
+pub const DEFAULT_BUBBLEWRAP_PATH: &str = "/usr/bin/bwrap";
+/// Fixed environment visible inside a default contained command.
+pub const COMMAND_CONTAINMENT_ENVIRONMENT: &[(&str, &str)] = &[
+    ("HOME", "/tmp/kitsu-home"),
+    ("LANG", "C.UTF-8"),
+    ("LC_ALL", "C.UTF-8"),
+    ("LOGNAME", "kitsu"),
+    (
+        "PATH",
+        "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin",
+    ),
+    ("TERM", "dumb"),
+    ("TMPDIR", "/tmp"),
+    ("USER", "kitsu"),
+];
 /// Time allowed for captured pipes to reach EOF after the direct child exits.
 /// A detached descendant must not make command completion unbounded.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -129,29 +148,185 @@ pub struct CommandGrantedExecutable {
     pub fingerprint: Option<CommandExecutableFingerprint>,
 }
 
-/// Ambient operating-system authority retained by an approved command.
+/// Production command-containment implementation selected by policy.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandContainmentBackendKind {
+    Bubblewrap,
+}
+
+/// Host-owned containment configuration. Tool arguments cannot modify it.
 ///
-/// Command roots constrain only the initial cwd. They are not a filesystem,
-/// network, process, credential, or environment sandbox.
+/// Additional runtime roots are mounted read-only. They are intended for
+/// language runtimes/toolchains that are not installed below `/usr`; selecting
+/// a broad directory can disclose its readable contents to approved commands,
+/// so frontends should display every configured path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommandContainmentConfig {
+    bubblewrap_path: PathBuf,
+    readonly_runtime_roots: Vec<PathBuf>,
+}
+
+impl Default for CommandContainmentConfig {
+    fn default() -> Self {
+        Self {
+            bubblewrap_path: PathBuf::from(DEFAULT_BUBBLEWRAP_PATH),
+            readonly_runtime_roots: Vec::new(),
+        }
+    }
+}
+
+impl CommandContainmentConfig {
+    pub fn bubblewrap_path(&self) -> &Path {
+        &self.bubblewrap_path
+    }
+
+    pub fn readonly_runtime_roots(&self) -> &[PathBuf] {
+        &self.readonly_runtime_roots
+    }
+
+    /// Select a bubblewrap executable. Availability and filesystem identity are
+    /// checked by [`CommandPolicy::containment_status`] and again at launch.
+    pub fn with_bubblewrap_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.bubblewrap_path = path.into();
+        self
+    }
+
+    /// Add one explicit read-only runtime directory. `/` is never accepted as
+    /// a runtime root; use narrow toolchain directories and never a credential
+    /// or whole-home directory.
+    pub fn with_readonly_runtime_root(
+        mut self,
+        path: impl AsRef<Path>,
+    ) -> Result<Self, CommandContainmentError> {
+        let requested = path.as_ref();
+        let canonical = std::fs::canonicalize(requested).map_err(|error| {
+            CommandContainmentError::new(
+                CommandContainmentUnavailableReason::InvalidConfiguration,
+                format!(
+                    "read-only runtime root '{}' is not accessible: {error}",
+                    requested.display()
+                ),
+            )
+        })?;
+        if canonical == Path::new("/") || !canonical.is_dir() {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::InvalidConfiguration,
+                format!(
+                    "read-only runtime root '{}' must be a directory narrower than '/'",
+                    requested.display()
+                ),
+            ));
+        }
+        insert_minimal_root(&mut self.readonly_runtime_roots, canonical);
+        Ok(self)
+    }
+}
+
+/// Stable reason a mandatory containment backend cannot be used.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum CommandContainmentUnavailableReason {
+    UnsupportedPlatform,
+    BackendMissing,
+    BackendNotExecutable,
+    BackendProbeFailed,
+    BackendChanged,
+    RuntimeUnavailable,
+    ExecutableOutsideVisibleRoots,
+    InvalidConfiguration,
+}
+
+/// Typed, actionable containment failure suitable for a doctor/status UI.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandContainmentError {
+    pub backend: CommandContainmentBackendKind,
+    pub reason: CommandContainmentUnavailableReason,
+    pub detail: String,
+}
+
+impl CommandContainmentError {
+    fn new(reason: CommandContainmentUnavailableReason, detail: String) -> Self {
+        Self {
+            backend: CommandContainmentBackendKind::Bubblewrap,
+            reason,
+            detail,
+        }
+    }
+}
+
+impl std::fmt::Display for CommandContainmentError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "mandatory command containment ({:?}) is unavailable: {}; install/enable bubblewrap or disable the command tool",
+            self.reason, self.detail
+        )
+    }
+}
+
+impl std::error::Error for CommandContainmentError {}
+
+/// Verified containment capabilities and the exact host-controlled exposure.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct CommandContainmentReady {
+    pub backend: CommandContainmentBackendKind,
+    pub backend_path: PathBuf,
+    pub writable_command_roots: Vec<PathBuf>,
+    pub readonly_runtime_roots: Vec<PathBuf>,
+    pub environment: Vec<(String, String)>,
+    pub network_isolated: bool,
+    pub pid_isolated: bool,
+    pub ipc_isolated: bool,
+    pub uts_isolated: bool,
+}
+
+/// Cached policy-level preflight state. `Unavailable` always means execution
+/// will be denied before an approval prompt is shown.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "status", rename_all = "snake_case")]
+pub enum CommandContainmentStatus {
+    Ready(CommandContainmentReady),
+    Unavailable(CommandContainmentError),
+}
+
+impl CommandContainmentStatus {
+    pub fn is_ready(&self) -> bool {
+        matches!(self, Self::Ready(_))
+    }
+
+    pub fn error(&self) -> Option<&CommandContainmentError> {
+        match self {
+            Self::Ready(_) => None,
+            Self::Unavailable(error) => Some(error),
+        }
+    }
+}
+
+/// Operating-system authority retained by a successfully contained command.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 pub struct CommandAmbientAuthority {
+    /// False: host variables are cleared and replaced with a fixed allowlist.
     pub inherits_environment: bool,
+    /// True for mutable host filesystem authority. The inspected containment
+    /// status separately lists required read-only runtime mounts.
     pub filesystem_confined_to_command_roots: bool,
+    /// True: the contained process receives a separate network namespace.
     pub network_confined: bool,
     pub executable_identity_pinned: bool,
 }
 
 impl CommandAmbientAuthority {
     pub const CURRENT: Self = Self {
-        inherits_environment: true,
-        filesystem_confined_to_command_roots: false,
-        network_confined: false,
+        inherits_environment: false,
+        filesystem_confined_to_command_roots: true,
+        network_confined: true,
         executable_identity_pinned: false,
     };
 
     /// Concise wording suitable for an approval UI.
     pub const fn notice(self) -> &'static str {
-        "cwd roots are not a sandbox: the command inherits Kitsu's ambient filesystem, network, process, and environment authority; session approval binds and revalidates the observed executable identity but does not use an immutable executable handle"
+        "the command runs in mandatory OS containment: approved command roots are writable, required runtime paths are read-only, network/PID/IPC/UTS namespaces are isolated, and only a fixed non-secret environment is supplied; executable identity is revalidated but not launched from an immutable handle"
     }
 }
 
@@ -403,6 +578,64 @@ struct AuthorizedCommand {
     executable: CommandGrantedExecutable,
 }
 
+/// Descriptor-bound command root retained for the policy lifetime. Linux
+/// containment mounts clones of these descriptors, so a rename/symlink swap
+/// cannot redirect bubblewrap to a different host directory.
+#[derive(Debug)]
+struct BoundCommandRoot {
+    canonical: PathBuf,
+    #[cfg(target_os = "linux")]
+    directory: std::fs::File,
+}
+
+impl BoundCommandRoot {
+    fn bind(canonical: PathBuf) -> Result<Self, ToolError> {
+        #[cfg(target_os = "linux")]
+        let directory = open_directory(&canonical).map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "command root '{}' could not be bound for containment: {error}",
+                canonical.display()
+            ))
+        })?;
+        Ok(Self {
+            canonical,
+            #[cfg(target_os = "linux")]
+            directory,
+        })
+    }
+
+    fn revalidate(&self) -> Result<(), ToolError> {
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let descriptor = self.directory.metadata().map_err(|error| {
+                ToolError::PolicyDenied(format!(
+                    "command root '{}' descriptor is unavailable: {error}",
+                    self.canonical.display()
+                ))
+            })?;
+            let path = std::fs::metadata(&self.canonical).map_err(|_| {
+                ToolError::PolicyDenied(format!(
+                    "command root '{}' changed after policy construction; refusing to execute",
+                    self.canonical.display()
+                ))
+            })?;
+            if !descriptor.is_dir()
+                || !path.is_dir()
+                || descriptor.dev() != path.dev()
+                || descriptor.ino() != path.ino()
+            {
+                return Err(ToolError::PolicyDenied(format!(
+                    "command root '{}' changed after policy construction; refusing to execute",
+                    self.canonical.display()
+                )));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum GrantMatch {
     Missing,
@@ -512,6 +745,481 @@ fn cwd_changed_after_authorization(requested: &Path) -> ToolError {
     ))
 }
 
+#[derive(Clone)]
+struct ContainmentBackendReady {
+    backend_path: PathBuf,
+    readonly_runtime_roots: Vec<PathBuf>,
+    fingerprint: CommandExecutableFingerprint,
+}
+
+struct ContainedLaunch {
+    program: PathBuf,
+    arguments: Vec<OsString>,
+    argv0: Option<OsString>,
+    inherited_paths: Vec<std::fs::File>,
+    shell_signal_status: bool,
+    #[cfg(test)]
+    direct_cwd: Option<PathBuf>,
+}
+
+trait CommandContainmentBackend: Send + Sync {
+    fn preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError>;
+
+    fn refresh(&self);
+
+    fn prepare(
+        &self,
+        policy: &CommandPolicy,
+        authorized: &AuthorizedCommand,
+        argv: &[String],
+    ) -> Result<ContainedLaunch, CommandContainmentError>;
+}
+
+struct BubblewrapBackend {
+    config: CommandContainmentConfig,
+    cached_preflight: Mutex<Option<Result<ContainmentBackendReady, CommandContainmentError>>>,
+}
+
+impl BubblewrapBackend {
+    fn new(config: CommandContainmentConfig) -> Self {
+        Self {
+            config,
+            cached_preflight: Mutex::new(None),
+        }
+    }
+
+    fn run_preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
+        #[cfg(not(target_os = "linux"))]
+        {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::UnsupportedPlatform,
+                format!(
+                    "{} has no reviewed command-containment backend",
+                    std::env::consts::OS
+                ),
+            ));
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            let configured = &self.config.bubblewrap_path;
+            if !configured.is_absolute() {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::InvalidConfiguration,
+                    format!("bubblewrap path '{}' is not absolute", configured.display()),
+                ));
+            }
+            if !configured.exists() {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendMissing,
+                    format!("bubblewrap was not found at '{}'", configured.display()),
+                ));
+            }
+            let fingerprint = fingerprint_executable(configured).ok_or_else(|| {
+                CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendNotExecutable,
+                    format!(
+                        "bubblewrap at '{}' is not a regular executable",
+                        configured.display()
+                    ),
+                )
+            })?;
+            let help = std::process::Command::new(&fingerprint.canonical_path)
+                .arg("--help")
+                .env_clear()
+                .stdin(Stdio::null())
+                .output()
+                .map_err(|error| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::BackendProbeFailed,
+                        format!("could not inspect bubblewrap capabilities: {error}"),
+                    )
+                })?;
+            if !help.status.success()
+                || !String::from_utf8_lossy(&help.stdout).contains("--bind-fd")
+                || !String::from_utf8_lossy(&help.stdout).contains("--disable-userns")
+            {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendProbeFailed,
+                    "bubblewrap lacks required descriptor mounts or nested-user-namespace disabling"
+                        .to_string(),
+                ));
+            }
+            let runtime_mounts = runtime_mount_paths(&self.config)?;
+            let true_path = [Path::new("/usr/bin/true"), Path::new("/bin/true")]
+                .into_iter()
+                .find(|path| path.is_file())
+                .ok_or_else(|| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::RuntimeUnavailable,
+                        "neither /usr/bin/true nor /bin/true is available for the containment probe"
+                            .to_string(),
+                    )
+                })?;
+            let mut arguments = base_bubblewrap_arguments(&runtime_mounts);
+            arguments.push(OsString::from("--"));
+            arguments.push(true_path.as_os_str().to_os_string());
+            let output = std::process::Command::new(&fingerprint.canonical_path)
+                .args(&arguments)
+                .env_clear()
+                .stdin(Stdio::null())
+                .stdout(Stdio::null())
+                .stderr(Stdio::piped())
+                .output()
+                .map_err(|error| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::BackendProbeFailed,
+                        format!("could not start bubblewrap capability probe: {error}"),
+                    )
+                })?;
+            if !output.status.success() {
+                let detail = safe_backend_diagnostic(&output.stderr);
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendProbeFailed,
+                    format!(
+                        "bubblewrap could not create the required mount/network/PID/IPC/UTS namespaces{}",
+                        if detail.is_empty() {
+                            String::new()
+                        } else {
+                            format!(": {detail}")
+                        }
+                    ),
+                ));
+            }
+            if fingerprint_executable(&fingerprint.canonical_path).as_ref() != Some(&fingerprint) {
+                return Err(CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::BackendChanged,
+                    "bubblewrap changed during containment preflight".to_string(),
+                ));
+            }
+            Ok(ContainmentBackendReady {
+                backend_path: fingerprint.canonical_path.clone(),
+                readonly_runtime_roots: runtime_mounts,
+                fingerprint,
+            })
+        }
+    }
+}
+
+impl CommandContainmentBackend for BubblewrapBackend {
+    fn preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
+        let mut cached = self.cached_preflight.lock().unwrap();
+        if let Some(result) = cached.as_ref() {
+            return result.clone();
+        }
+        let result = self.run_preflight();
+        *cached = Some(result.clone());
+        result
+    }
+
+    fn refresh(&self) {
+        *self.cached_preflight.lock().unwrap() = None;
+    }
+
+    fn prepare(
+        &self,
+        policy: &CommandPolicy,
+        authorized: &AuthorizedCommand,
+        argv: &[String],
+    ) -> Result<ContainedLaunch, CommandContainmentError> {
+        let ready = self.preflight()?;
+        if fingerprint_executable(&ready.backend_path).as_ref() != Some(&ready.fingerprint) {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::BackendChanged,
+                format!(
+                    "bubblewrap at '{}' changed after preflight",
+                    ready.backend_path.display()
+                ),
+            ));
+        }
+        let executable = authorized.executable.fingerprint.as_ref().ok_or_else(|| {
+            CommandContainmentError::new(
+                CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
+                "approved executable has no validated path".to_string(),
+            )
+        })?;
+        let executable_visible = policy
+            .command_roots
+            .iter()
+            .chain(ready.readonly_runtime_roots.iter())
+            .any(|root| executable.canonical_path.starts_with(root));
+        if !executable_visible {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
+                format!(
+                    "approved executable '{}' is outside every command/runtime root; add its narrow toolchain directory as a read-only runtime root",
+                    executable.canonical_path.display()
+                ),
+            ));
+        }
+
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = (policy, authorized, argv, executable);
+            Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::UnsupportedPlatform,
+                "bubblewrap containment is Linux-only".to_string(),
+            ))
+        }
+
+        #[cfg(target_os = "linux")]
+        {
+            use std::os::fd::AsRawFd;
+
+            let mut arguments = base_bubblewrap_arguments(&[]);
+            let mut inherited_paths = Vec::with_capacity(
+                ready
+                    .readonly_runtime_roots
+                    .len()
+                    .saturating_add(policy.bound_command_roots.len())
+                    .saturating_add(1),
+            );
+            for runtime in &ready.readonly_runtime_roots {
+                let descriptor = open_containment_path(runtime).map_err(|error| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::RuntimeUnavailable,
+                        format!(
+                            "cannot bind read-only runtime path '{}': {error}",
+                            runtime.display()
+                        ),
+                    )
+                })?;
+                arguments.push(OsString::from("--ro-bind-fd"));
+                arguments.push(OsString::from(descriptor.as_raw_fd().to_string()));
+                arguments.push(runtime.as_os_str().to_os_string());
+                inherited_paths.push(descriptor);
+            }
+            for root in &policy.bound_command_roots {
+                root.revalidate().map_err(containment_policy_error)?;
+                let directory = root.directory.try_clone().map_err(|error| {
+                    CommandContainmentError::new(
+                        CommandContainmentUnavailableReason::RuntimeUnavailable,
+                        format!(
+                            "cannot clone descriptor for command root '{}': {error}",
+                            root.canonical.display()
+                        ),
+                    )
+                })?;
+                arguments.push(OsString::from("--bind-fd"));
+                arguments.push(OsString::from(directory.as_raw_fd().to_string()));
+                arguments.push(root.canonical.as_os_str().to_os_string());
+                inherited_paths.push(directory);
+            }
+            // Rebind the exact descriptor-authorized cwd last. This preserves
+            // its filesystem identity even if an ancestor is renamed between
+            // the final revalidation and bubblewrap's mount setup.
+            let cwd = authorized.cwd.directory.try_clone().map_err(|error| {
+                CommandContainmentError::new(
+                    CommandContainmentUnavailableReason::RuntimeUnavailable,
+                    format!("cannot clone approved cwd descriptor: {error}"),
+                )
+            })?;
+            arguments.push(OsString::from("--bind-fd"));
+            arguments.push(OsString::from(cwd.as_raw_fd().to_string()));
+            arguments.push(authorized.cwd.canonical.as_os_str().to_os_string());
+            inherited_paths.push(cwd);
+            arguments.push(OsString::from("--chdir"));
+            arguments.push(authorized.cwd.canonical.as_os_str().to_os_string());
+            arguments.push(OsString::from("--argv0"));
+            arguments.push(OsString::from(&argv[0]));
+            arguments.push(OsString::from("--"));
+            arguments.push(executable.canonical_path.as_os_str().to_os_string());
+            arguments.extend(argv[1..].iter().map(OsString::from));
+            Ok(ContainedLaunch {
+                program: ready.backend_path,
+                arguments,
+                argv0: None,
+                inherited_paths,
+                // Bubblewrap documents 128+signal as the contained child's
+                // signal termination encoding.
+                shell_signal_status: true,
+                #[cfg(test)]
+                direct_cwd: None,
+            })
+        }
+    }
+}
+
+#[cfg(test)]
+struct DirectTestContainmentBackend;
+
+#[cfg(test)]
+impl CommandContainmentBackend for DirectTestContainmentBackend {
+    fn preflight(&self) -> Result<ContainmentBackendReady, CommandContainmentError> {
+        let path = std::env::current_exe().map_err(|error| {
+            CommandContainmentError::new(
+                CommandContainmentUnavailableReason::BackendProbeFailed,
+                error.to_string(),
+            )
+        })?;
+        let fingerprint = fingerprint_executable(&path).ok_or_else(|| {
+            CommandContainmentError::new(
+                CommandContainmentUnavailableReason::BackendProbeFailed,
+                "test executable could not be fingerprinted".to_string(),
+            )
+        })?;
+        Ok(ContainmentBackendReady {
+            backend_path: path,
+            readonly_runtime_roots: Vec::new(),
+            fingerprint,
+        })
+    }
+
+    fn refresh(&self) {}
+
+    fn prepare(
+        &self,
+        _policy: &CommandPolicy,
+        authorized: &AuthorizedCommand,
+        argv: &[String],
+    ) -> Result<ContainedLaunch, CommandContainmentError> {
+        let executable = authorized
+            .executable
+            .fingerprint
+            .as_ref()
+            .expect("authorized test command is resolved");
+        Ok(ContainedLaunch {
+            program: executable.canonical_path.clone(),
+            arguments: argv[1..].iter().map(OsString::from).collect(),
+            argv0: Some(OsString::from(&argv[0])),
+            inherited_paths: Vec::new(),
+            shell_signal_status: false,
+            direct_cwd: Some(authorized.cwd.canonical.clone()),
+        })
+    }
+}
+
+fn containment_policy_error(error: ToolError) -> CommandContainmentError {
+    CommandContainmentError::new(
+        CommandContainmentUnavailableReason::InvalidConfiguration,
+        error.to_string(),
+    )
+}
+
+fn containment_denied(error: CommandContainmentError) -> ToolError {
+    ToolError::PolicyDenied(error.to_string())
+}
+
+#[cfg(target_os = "linux")]
+fn runtime_mount_paths(
+    config: &CommandContainmentConfig,
+) -> Result<Vec<PathBuf>, CommandContainmentError> {
+    let mut mounts = Vec::new();
+    for path in ["/usr", "/bin", "/lib", "/lib64", "/sbin"] {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            mounts.push(path);
+        }
+    }
+    for path in ["/etc/ld.so.cache", "/etc/ld.so.conf", "/etc/ld.so.conf.d"] {
+        let path = PathBuf::from(path);
+        if path.exists() {
+            mounts.push(path);
+        }
+    }
+    for configured in &config.readonly_runtime_roots {
+        let current = std::fs::canonicalize(configured).map_err(|error| {
+            CommandContainmentError::new(
+                CommandContainmentUnavailableReason::RuntimeUnavailable,
+                format!(
+                    "read-only runtime root '{}' is no longer accessible: {error}",
+                    configured.display()
+                ),
+            )
+        })?;
+        if &current != configured || !current.is_dir() {
+            return Err(CommandContainmentError::new(
+                CommandContainmentUnavailableReason::RuntimeUnavailable,
+                format!(
+                    "read-only runtime root '{}' changed after configuration",
+                    configured.display()
+                ),
+            ));
+        }
+        if !mounts.iter().any(|root| current.starts_with(root)) {
+            mounts.push(current);
+        }
+    }
+    Ok(mounts)
+}
+
+#[cfg(target_os = "linux")]
+fn base_bubblewrap_arguments(runtime_mounts: &[PathBuf]) -> Vec<OsString> {
+    let mut arguments = [
+        "--die-with-parent",
+        "--new-session",
+        "--unshare-user",
+        "--unshare-net",
+        "--unshare-pid",
+        "--unshare-ipc",
+        "--unshare-uts",
+        "--unshare-cgroup-try",
+        "--disable-userns",
+        "--hostname",
+        "kitsu",
+        "--cap-drop",
+        "ALL",
+        "--proc",
+        "/proc",
+        "--dev",
+        "/dev",
+        "--tmpfs",
+        "/tmp",
+        "--dir",
+        "/tmp/kitsu-home",
+        "--dir",
+        "/etc",
+    ]
+    .into_iter()
+    .map(OsString::from)
+    .collect::<Vec<_>>();
+    for path in runtime_mounts {
+        arguments.push(OsString::from("--ro-bind"));
+        arguments.push(path.as_os_str().to_os_string());
+        arguments.push(path.as_os_str().to_os_string());
+    }
+    arguments.push(OsString::from("--clearenv"));
+    for (name, value) in COMMAND_CONTAINMENT_ENVIRONMENT {
+        arguments.push(OsString::from("--setenv"));
+        arguments.push(OsString::from(name));
+        arguments.push(OsString::from(value));
+    }
+    arguments
+}
+
+#[cfg(target_os = "linux")]
+fn open_containment_path(path: &Path) -> std::io::Result<std::fs::File> {
+    use std::ffi::CString;
+    use std::os::unix::ffi::OsStrExt;
+
+    let path = CString::new(path.as_os_str().as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "containment path contains a NUL byte",
+        )
+    })?;
+    // SAFETY: `path` is a live NUL-terminated string. O_PATH pins the selected
+    // filesystem object without opening its content and ownership transfers to
+    // the returned File exactly once.
+    let descriptor = unsafe { libc::open(path.as_ptr(), libc::O_PATH | libc::O_CLOEXEC) };
+    if descriptor == -1 {
+        Err(std::io::Error::last_os_error())
+    } else {
+        // SAFETY: successful `open` returned one uniquely owned descriptor.
+        Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+    }
+}
+
+fn safe_backend_diagnostic(bytes: &[u8]) -> String {
+    String::from_utf8_lossy(bytes)
+        .chars()
+        .filter(|character| !character.is_control() || *character == ' ')
+        .take(240)
+        .collect::<String>()
+        .trim()
+        .to_string()
+}
+
 /// Standalone authority for developer commands.
 ///
 /// Construction does not enable a tool by itself; callers must explicitly
@@ -519,11 +1227,14 @@ fn cwd_changed_after_authorization(requested: &Path) -> ToolError {
 /// [`super::register_command_tool`](crate::builtins::register_command_tool)).
 pub struct CommandPolicy {
     command_roots: Vec<PathBuf>,
+    bound_command_roots: Vec<BoundCommandRoot>,
     grants: RwLock<Vec<CommandGrantInfo>>,
     mode: CommandMode,
     prompter: Option<Arc<dyn CommandPrompter>>,
     limits: CommandLimits,
     artifact_sink: Option<Arc<dyn CommandOutputArtifactSink>>,
+    containment_config: CommandContainmentConfig,
+    containment_backend: Arc<dyn CommandContainmentBackend>,
     #[cfg(test)]
     executable_search_path: RwLock<Option<std::ffi::OsString>>,
 }
@@ -544,13 +1255,28 @@ impl CommandPolicy {
             }
             insert_minimal_root(&mut roots, canonical);
         }
+        let bound_command_roots = roots
+            .iter()
+            .cloned()
+            .map(BoundCommandRoot::bind)
+            .collect::<Result<Vec<_>, _>>()?;
+        let containment_config = CommandContainmentConfig::default();
+        #[cfg(not(test))]
+        let containment_backend: Arc<dyn CommandContainmentBackend> =
+            Arc::new(BubblewrapBackend::new(containment_config.clone()));
+        #[cfg(test)]
+        let containment_backend: Arc<dyn CommandContainmentBackend> =
+            Arc::new(DirectTestContainmentBackend);
         Ok(Self {
             command_roots: roots,
+            bound_command_roots,
             grants: RwLock::new(Vec::new()),
             mode,
             prompter: None,
             limits: CommandLimits::default(),
             artifact_sink: None,
+            containment_backend,
+            containment_config,
             #[cfg(test)]
             executable_search_path: RwLock::new(None),
         })
@@ -572,6 +1298,54 @@ impl CommandPolicy {
     /// Disabled by default; the model cannot request or choose the destination.
     pub fn with_output_artifact_sink(mut self, sink: Arc<dyn CommandOutputArtifactSink>) -> Self {
         self.artifact_sink = Some(sink);
+        self
+    }
+
+    /// Replace the host-owned mandatory containment configuration. This never
+    /// disables containment; an unusable configuration is exposed through
+    /// [`Self::containment_status`] and every execution fails closed.
+    pub fn with_containment_config(mut self, config: CommandContainmentConfig) -> Self {
+        self.containment_backend = Arc::new(BubblewrapBackend::new(config.clone()));
+        self.containment_config = config;
+        self
+    }
+
+    pub fn containment_config(&self) -> &CommandContainmentConfig {
+        &self.containment_config
+    }
+
+    /// Preflight the mandatory backend once and return a cached, inspectable
+    /// status suitable for `/permissions`, `/doctor`, or startup diagnostics.
+    pub fn containment_status(&self) -> CommandContainmentStatus {
+        match self.containment_backend.preflight() {
+            Ok(ready) => CommandContainmentStatus::Ready(CommandContainmentReady {
+                backend: CommandContainmentBackendKind::Bubblewrap,
+                backend_path: ready.backend_path,
+                writable_command_roots: self.command_roots.clone(),
+                readonly_runtime_roots: ready.readonly_runtime_roots,
+                environment: COMMAND_CONTAINMENT_ENVIRONMENT
+                    .iter()
+                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .collect(),
+                network_isolated: true,
+                pid_isolated: true,
+                ipc_isolated: true,
+                uts_isolated: true,
+            }),
+            Err(error) => CommandContainmentStatus::Unavailable(error),
+        }
+    }
+
+    /// Discard the cached probe and inspect the currently configured backend
+    /// again. Existing exact command grants are preserved.
+    pub fn refresh_containment_status(&self) -> CommandContainmentStatus {
+        self.containment_backend.refresh();
+        self.containment_status()
+    }
+
+    #[cfg(test)]
+    fn with_test_containment(mut self) -> Self {
+        self.containment_backend = Arc::new(DirectTestContainmentBackend);
         self
     }
 
@@ -1526,6 +2300,7 @@ struct SupervisedOutput {
     termination: SupervisedTermination,
     stdout: BoundedBytes,
     stderr: BoundedBytes,
+    shell_signal_status: bool,
 }
 
 /// Owns a child while it is supervised. A dedicated standard thread is
@@ -1679,6 +2454,7 @@ async fn supervise_child(
     child: tokio::process::Child,
     timeout: Duration,
     capture: CommandCaptureContext,
+    shell_signal_status: bool,
 ) -> std::io::Result<SupervisedOutput> {
     let mut child = ChildReaperLease::new(child)?;
     let stdout = child
@@ -1756,6 +2532,7 @@ async fn supervise_child(
         termination: termination?,
         stdout,
         stderr,
+        shell_signal_status,
     })
 }
 
@@ -1767,67 +2544,66 @@ async fn run_supervised_command(
     timeout: Duration,
     capture: CommandCaptureContext,
 ) -> Result<SupervisedOutput, ToolError> {
-    let executable = authorized
-        .executable
-        .fingerprint
-        .as_ref()
-        .ok_or_else(|| unresolved_executable(argv, &authorized.cwd.canonical))?;
-    let mut command = tokio::process::Command::new(&executable.canonical_path);
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::CommandExt;
-        command.as_std_mut().arg0(&argv[0]);
+    // These remain the final pathname checks before spawning the reviewed
+    // containment backend. Bubblewrap receives descriptor-bound root/cwd
+    // mounts, while the inner executable retains the existing narrow
+    // check-to-exec race truthfully described by `pinned=false`.
+    authorized.cwd.revalidate(policy, requested_cwd)?;
+    for root in &policy.bound_command_roots {
+        root.revalidate()?;
     }
+    if policy.observe_executable(argv, &authorized.cwd.canonical) != authorized.executable {
+        return Err(executable_changed(argv, &authorized.cwd.canonical));
+    }
+    let launch = policy
+        .containment_backend
+        .prepare(policy, authorized, argv)
+        .map_err(containment_denied)?;
+    let mut command = tokio::process::Command::new(&launch.program);
     command
-        .args(&argv[1..])
+        .args(&launch.arguments)
+        .env_clear()
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
+    for (name, value) in COMMAND_CONTAINMENT_ENVIRONMENT {
+        command.env(name, value);
+    }
     #[cfg(unix)]
     {
+        use std::os::unix::process::CommandExt;
+
         command.process_group(0);
-        let directory = authorized
-            .cwd
-            .directory
-            .try_clone()
-            .map_err(command_failed)?;
-        // SAFETY: the closure calls only `fchdir`, which is async-signal-safe,
-        // using a descriptor owned by the closure and inherited across fork.
-        // O_CLOEXEC closes it when the approved program is executed.
+        if let Some(argv0) = &launch.argv0 {
+            command.as_std_mut().arg0(argv0);
+        }
+        let inherited_paths = launch.inherited_paths;
+        // SAFETY: `fcntl` is async-signal-safe. Clearing FD_CLOEXEC is required
+        // only for descriptor arguments consumed by bubblewrap during setup;
+        // bubblewrap closes them before executing the contained command.
         unsafe {
             command.pre_exec(move || {
-                if libc::fchdir(directory.as_raw_fd()) == -1 {
-                    Err(std::io::Error::last_os_error())
-                } else {
-                    Ok(())
+                for path in &inherited_paths {
+                    let descriptor = path.as_raw_fd();
+                    let flags = libc::fcntl(descriptor, libc::F_GETFD);
+                    if flags == -1
+                        || libc::fcntl(descriptor, libc::F_SETFD, flags & !libc::FD_CLOEXEC) == -1
+                    {
+                        return Err(std::io::Error::last_os_error());
+                    }
                 }
+                Ok(())
             });
         }
     }
-    #[cfg(not(unix))]
-    command.current_dir(&authorized.cwd.canonical);
-    // Do not let inherited dynamic-loader overrides affect approved programs.
-    for variable in [
-        "LD_PRELOAD",
-        "LD_LIBRARY_PATH",
-        "DYLD_INSERT_LIBRARIES",
-        "DYLD_LIBRARY_PATH",
-    ] {
-        command.env_remove(variable);
+    #[cfg(test)]
+    if let Some(cwd) = launch.direct_cwd {
+        command.current_dir(cwd);
     }
-
-    // These are deliberately the final pathname checks before spawn. Unix then
-    // changes directory by the already-authorized descriptor; the executable
-    // is launched by the canonical target observed during authorization.
-    // Platforms still retain a narrow executable check-to-spawn race because
-    // std::process does not execute an already-open immutable handle.
-    authorized.cwd.revalidate(policy, requested_cwd)?;
-    if policy.observe_executable(argv, &authorized.cwd.canonical) != authorized.executable {
-        return Err(executable_changed(argv, &authorized.cwd.canonical));
-    }
+    let shell_signal_status = launch.shell_signal_status;
     let child = command.spawn().map_err(command_failed)?;
-    supervise_child(child, timeout, capture)
+    supervise_child(child, timeout, capture, shell_signal_status)
         .await
         .map_err(command_failed)
 }
@@ -1880,6 +2656,12 @@ pub async fn execute_command(
 ) -> Result<CommandOutput, ToolError> {
     let limits = policy.limits();
     let timeout = requested_timeout(args.timeout_ms, limits)?;
+    // Containment is independent of approval and checked first so an unusable
+    // host never asks a person to approve a command it cannot run safely.
+    policy
+        .containment_backend
+        .preflight()
+        .map_err(containment_denied)?;
     let authorized = policy
         .authorize(&args.argv, Path::new(&args.cwd), timeout)
         .await?;
@@ -1944,19 +2726,34 @@ pub async fn execute_command(
     let stdout = bounded_text(captured.stdout);
     let stderr = bounded_text(captured.stderr);
 
+    let shell_signal_status = captured.shell_signal_status;
     let (termination, success, exit_code, signal) = match captured.termination {
         SupervisedTermination::Natural(status) => {
-            let termination = if status.code().is_some() {
-                CommandTermination::Exited
+            if shell_signal_status {
+                if let Some(code) = status.code().filter(|code| (129..=255).contains(code)) {
+                    let signal = code - 128;
+                    (CommandTermination::Signaled, false, None, Some(signal))
+                } else {
+                    (
+                        CommandTermination::Exited,
+                        status.success(),
+                        status.code(),
+                        None,
+                    )
+                }
             } else {
-                CommandTermination::Signaled
-            };
-            (
-                termination,
-                status.success(),
-                status.code(),
-                exit_signal(&status),
-            )
+                let termination = if status.code().is_some() {
+                    CommandTermination::Exited
+                } else {
+                    CommandTermination::Signaled
+                };
+                (
+                    termination,
+                    status.success(),
+                    status.code(),
+                    exit_signal(&status),
+                )
+            }
         }
         SupervisedTermination::TimedOut(status) => (
             CommandTermination::TimedOut,
@@ -2018,12 +2815,14 @@ pub fn command_exec_tool(policy: Arc<CommandPolicy>) -> (ToolDescriptor, Handler
     let descriptor = ToolDescriptor {
         name: "command_exec".to_string(),
         description: "Run one explicitly approved developer command as a literal argv array. \
-                      Kitsu invokes the program directly without an intermediary shell. cwd is \
-                      required and must be inside an approved command root, but that root is not \
-                      a filesystem or network sandbox: the process retains Kitsu's ambient OS \
-                      authority and environment. Session approval binds the observed executable \
-                      filesystem identity and is revoked if it changes. Returns bounded head/tail \
-                      stdout/stderr previews, truthful byte \
+                      Kitsu never parses a shell command string. cwd is required and must be \
+                      inside an approved command root. Exact approval is separate from mandatory \
+                      OS containment: writable access is limited to approved command roots, \
+                      runtime mounts are read-only, network/PID/IPC/UTS namespaces are isolated, \
+                      and the environment is cleared to a fixed non-secret allowlist. Missing or \
+                      unsupported containment fails closed. Session approval binds the observed \
+                      executable filesystem identity and is revoked if it changes. Returns \
+                      bounded head/tail stdout/stderr previews, truthful byte \
                       counts, and structured exit, signal, or timeout metadata."
             .to_string(),
         parameters: serde_json::json!({
@@ -2597,7 +3396,8 @@ mod tests {
     ) -> CommandPolicy {
         let policy = CommandPolicy::new(&[root(dir)], CommandMode::Deny)
             .unwrap()
-            .with_limits(limits);
+            .with_limits(limits)
+            .with_test_containment();
         let argv = argv
             .iter()
             .map(|arg| (*arg).to_string())
@@ -2880,15 +3680,15 @@ mod tests {
     }
 
     #[test]
-    fn authority_api_truthfully_labels_mutable_ambient_execution() {
+    fn authority_api_truthfully_labels_contained_execution() {
         let dir = tempfile::tempdir().unwrap();
         let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny).unwrap();
         let authority = policy.ambient_authority();
-        assert!(authority.inherits_environment);
-        assert!(!authority.filesystem_confined_to_command_roots);
-        assert!(!authority.network_confined);
+        assert!(!authority.inherits_environment);
+        assert!(authority.filesystem_confined_to_command_roots);
+        assert!(authority.network_confined);
         assert!(!authority.executable_identity_pinned);
-        assert!(authority.notice().contains("not a sandbox"));
+        assert!(authority.notice().contains("mandatory OS containment"));
 
         let argv = vec!["definitely-unresolved-program".to_string()];
         let executable = observe_executable(&argv, dir.path());
@@ -2899,6 +3699,179 @@ mod tests {
         assert_eq!(executable.identity.observed_path, None);
         assert!(!executable.identity.pinned);
         assert_eq!(executable.fingerprint, None);
+    }
+
+    #[tokio::test]
+    async fn missing_containment_backend_is_typed_and_denied_before_approval() {
+        let dir = tempfile::tempdir().unwrap();
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let missing = dir.path().join("missing-bwrap");
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::AllowOnce,
+                prompts: prompts.clone(),
+            }))
+            .with_containment_config(
+                CommandContainmentConfig::default().with_bubblewrap_path(&missing),
+            );
+
+        let status = policy.containment_status();
+        let CommandContainmentStatus::Unavailable(error) = status else {
+            panic!("missing backend must be unavailable")
+        };
+        assert_eq!(
+            error.reason,
+            CommandContainmentUnavailableReason::BackendMissing
+        );
+        assert!(error.detail.contains(&missing.display().to_string()));
+
+        let result = execute_command(&policy, args(&["/usr/bin/true"], dir.path())).await;
+        assert!(matches!(
+            result,
+            Err(ToolError::PolicyDenied(message))
+                if message.contains("mandatory command containment")
+                    && message.contains("BackendMissing")
+        ));
+        assert_eq!(prompts.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_plan_clears_environment_and_requests_all_required_namespaces() {
+        let arguments = base_bubblewrap_arguments(&[])
+            .into_iter()
+            .map(|argument| argument.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for required in [
+            "--unshare-net",
+            "--unshare-pid",
+            "--unshare-ipc",
+            "--unshare-uts",
+            "--clearenv",
+            "--disable-userns",
+        ] {
+            assert!(arguments.iter().any(|argument| argument == required));
+        }
+        assert!(!arguments
+            .iter()
+            .any(|argument| argument.contains("TOKEN") || argument.contains("SECRET")));
+        let clear = arguments
+            .iter()
+            .position(|argument| argument == "--clearenv")
+            .unwrap();
+        let first_set = arguments
+            .iter()
+            .position(|argument| argument == "--setenv")
+            .unwrap();
+        assert!(clear < first_set);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn live_containment_blocks_outside_reads_network_host_processes_and_secrets() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let secret_path = outside.path().join("host-secret.txt");
+        std::fs::write(&secret_path, "HOST_SECRET_BODY").unwrap();
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default());
+        let CommandContainmentStatus::Ready(ready) = policy.containment_status() else {
+            eprintln!(
+                "skipping live containment assertions: {:?}",
+                policy.containment_status()
+            );
+            return;
+        };
+        assert!(ready.network_isolated && ready.pid_isolated && ready.ipc_isolated);
+        assert!(ready.uts_isolated);
+        assert_eq!(
+            ready.environment.len(),
+            COMMAND_CONTAINMENT_ENVIRONMENT.len()
+        );
+
+        let outside_read = vec![
+            "/usr/bin/cat".to_string(),
+            secret_path.to_string_lossy().into_owned(),
+        ];
+        policy.grant_command(&outside_read, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv: outside_read,
+                cwd: root(&allowed),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!output.success);
+        assert!(!output.stdout.contains("HOST_SECRET_BODY"));
+        assert!(!output.stderr.contains("HOST_SECRET_BODY"));
+
+        // SAFETY: this unique test-only variable is not read by other tests;
+        // production launch uses env_clear and never enumerates the host env.
+        unsafe { std::env::set_var("KITSU_CONTAINMENT_TEST_SECRET", "DO_NOT_INHERIT") };
+        let environment = vec!["/usr/bin/env".to_string()];
+        policy.grant_command(&environment, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv: environment,
+                cwd: root(&allowed),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        // SAFETY: restore the process environment after the scoped assertion.
+        unsafe { std::env::remove_var("KITSU_CONTAINMENT_TEST_SECRET") };
+        assert!(output.success);
+        assert!(!output.stdout.contains("KITSU_CONTAINMENT_TEST_SECRET"));
+        assert!(output.stdout.contains("HOME=/tmp/kitsu-home"));
+
+        let network = vec![
+            "/usr/bin/python3".to_string(),
+            "-c".to_string(),
+            "import socket; s=socket.socket(); s.settimeout(.2);\ntry: s.connect(('1.1.1.1',53)); print('reachable')\nexcept OSError: print('isolated')"
+                .to_string(),
+        ];
+        policy.grant_command(&network, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv: network,
+                cwd: root(&allowed),
+                timeout_ms: Some(2_000),
+            },
+        )
+        .await
+        .unwrap();
+        assert!(output.success, "{}", output.stderr);
+        assert_eq!(output.stdout.trim(), "isolated");
+
+        let host_pid = std::process::id().to_string();
+        let process = vec![
+            "/bin/sh".to_string(),
+            "-c".to_string(),
+            "if [ -e \"/proc/$1\" ]; then printf visible; else printf isolated; fi".to_string(),
+            "sh".to_string(),
+            host_pid,
+        ];
+        policy.grant_command(&process, allowed.path()).unwrap();
+        let output = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv: process,
+                cwd: root(&allowed),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(output.success, "{}", output.stderr);
+        assert_eq!(output.stdout, "isolated");
     }
 
     #[cfg(unix)]
@@ -2960,7 +3933,8 @@ mod tests {
                 .with_limits(
                     CommandLimits::new(Duration::from_secs(30), Duration::from_secs(30), 64)
                         .unwrap(),
-                ),
+                )
+                .with_test_containment(),
         );
         policy.grant_command(&argv, dir.path()).unwrap();
         let invocation = CommandExecArgs {
@@ -3025,7 +3999,8 @@ mod tests {
         let policy = Arc::new(
             CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
                 .unwrap()
-                .with_output_artifact_sink(sink),
+                .with_output_artifact_sink(sink)
+                .with_test_containment(),
         );
         policy.grant_command(&argv, dir.path()).unwrap();
         let invocation = CommandExecArgs {
@@ -3100,7 +4075,8 @@ mod tests {
                 .with_limits(
                     CommandLimits::new(Duration::from_secs(30), Duration::from_secs(30), 64)
                         .unwrap(),
-                ),
+                )
+                .with_test_containment(),
         );
         policy.grant_command(&argv, dir.path()).unwrap();
         let invocation = CommandExecArgs {

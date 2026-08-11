@@ -42,6 +42,8 @@ static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
 static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
+static ACTIVE_QUIT_CANCEL: AtomicBool = AtomicBool::new(false);
+static ASSISTIVE_INPUT_INTERRUPTED: AtomicBool = AtomicBool::new(false);
 const PROMPT_QUEUE_CAPACITY: usize = 8;
 const STEERING_CAPACITY: usize = 4;
 
@@ -1267,7 +1269,8 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
     });
     let mut auth_report = serde_json::json!({
         "method": "unavailable",
-        "credential_present": false,
+        "credential_present": null,
+        "credential_required": null,
         "status": "unavailable until config and gateway are valid",
     });
     let cache_path = context_window_cache_path(&state_dir);
@@ -1292,6 +1295,8 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
     };
     let mut online_report = serde_json::json!({
         "requested": online,
+        "scope": "model_catalog_only",
+        "chat_route_probed": false,
         "status": if online { "not run" } else { "not requested (offline default)" },
     });
 
@@ -1359,7 +1364,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                     }
                 };
                 let (credential_present, auth_status) = match gateway.auth.method.as_str() {
-                    "none" => (true, "no credential required".to_string()),
+                    "none" => (None, "no credential required".to_string()),
                     "bearer-env" => {
                         let present = std::env::var_os(&gateway.auth.env)
                             .is_some_and(|value| !value.is_empty());
@@ -1368,7 +1373,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                                 .push(format!("auth variable {} is not present", gateway.auth.env));
                         }
                         (
-                            present,
+                            Some(present),
                             format!(
                                 "bearer variable {} is {}",
                                 gateway.auth.env,
@@ -1383,7 +1388,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                             .as_deref()
                             .is_some_and(|token| !token.trim().is_empty());
                         (
-                            present,
+                            Some(present),
                             if present {
                                 "static credential is configured (value hidden)".to_string()
                             } else {
@@ -1391,7 +1396,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                             },
                         )
                     }
-                    other => (false, format!("unsupported auth method {other}")),
+                    other => (Some(false), format!("unsupported auth method {other}")),
                 };
                 auth_report = serde_json::json!({
                     "method": gateway.auth.method,
@@ -1401,6 +1406,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                         None
                     },
                     "credential_present": credential_present,
+                    "credential_required": gateway.auth.method != "none",
                     "valid": auth_valid,
                     "status": auth_status,
                 });
@@ -1437,7 +1443,11 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                             "requested": true,
                             "status": issue,
                         });
-                    } else if !flavor_ok || !auth_valid || !credential_present || model.is_none() {
+                    } else if !flavor_ok
+                        || !auth_valid
+                        || credential_present == Some(false)
+                        || model.is_none()
+                    {
                         let issue = "online provider check was requested but skipped: fix gateway, model, or auth diagnostics first".to_string();
                         issues.push(issue.clone());
                         online_report = serde_json::json!({
@@ -1472,6 +1482,8 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                                 }
                                 online_report = serde_json::json!({
                                     "requested": true,
+                                    "scope": "model_catalog_only",
+                                    "chat_route_probed": false,
                                     "status": "reachable",
                                     "models": models.len(),
                                     "effective_model": effective_model,
@@ -1540,7 +1552,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
         "online": online_report,
         "tool_policy": {
             "filesystem": filesystem_policy,
-            "commands": "disabled unless explicitly enabled; command roots restrict cwd and are not a sandbox",
+            "commands": "disabled unless explicitly enabled; enabled commands require exact approval plus mandatory fail-closed OS containment",
             "scripted_tools": "not registered unless a filesystem capability or command policy is explicit",
         },
         "blocking_issues": issues,
@@ -1799,9 +1811,13 @@ fn preload_skills(cli: &Cli, skillset: &skills::SkillSet) -> Option<String> {
     }
     let mut out = String::new();
     for name in &cli.skill {
-        match skillset.get(name) {
-            Some(s) => out.push_str(&format!("{}\n\n", skills::load_skill(s))),
-            None => eprintln!("~ no skill named '{}' (skipped)", terminal_inline(name)),
+        match skillset.load_with_snapshot(name) {
+            Ok(loaded) => out.push_str(&format!("{}\n\n", loaded.text)),
+            Err(error) => eprintln!(
+                "~ cannot preload skill '{}': {} (skipped)",
+                terminal_inline(name),
+                terminal_inline(&error.to_string())
+            ),
         }
     }
     let out = out.trim().to_string();
@@ -1811,6 +1827,84 @@ fn preload_skills(cli: &Cli, skillset: &skills::SkillSet) -> Option<String> {
         eprintln!("~ preloaded {} skill(s)", cli.skill.len());
         Some(out)
     }
+}
+
+const LOADED_SKILL_PREFIX: &str = "[Loaded skill: ";
+const SKILL_SNAPSHOT_PREFIX: &str = "[Skill snapshot: ";
+
+fn loaded_skill_name(content: &str) -> Option<&str> {
+    let rest = content.strip_prefix(LOADED_SKILL_PREFIX)?;
+    let end = rest.find("]\n")?;
+    let name = &rest[..end];
+    (!name.is_empty()).then_some(name)
+}
+
+fn loaded_skill_snapshot(content: &str) -> Option<skills::SkillContentSnapshot> {
+    let snapshot_line = content.lines().nth(1)?;
+    let encoded = snapshot_line
+        .strip_prefix(SKILL_SNAPSHOT_PREFIX)?
+        .strip_suffix(']')?;
+    serde_json::from_str(encoded).ok()
+}
+
+fn loaded_skill_message(name: &str, loaded: &skills::LoadedSkill) -> ChatMessage {
+    match serde_json::to_string(&loaded.snapshot) {
+        Ok(snapshot) => ChatMessage::user(format!(
+            "{LOADED_SKILL_PREFIX}{name}]\n{SKILL_SNAPSHOT_PREFIX}{snapshot}]\n\n{}",
+            loaded.text
+        )),
+        // A non-UTF-8 host path can make a PathBuf snapshot non-serializable.
+        // Retain the bounded loaded text; resume treats this as a legacy record
+        // and revalidates it rather than crashing or trusting stale content.
+        Err(_) => ChatMessage::user(format!("{LOADED_SKILL_PREFIX}{name}]\n\n{}", loaded.text)),
+    }
+}
+
+/// Rebuild persisted `/skill` context from current descriptor-pinned sources.
+/// Saved skill text is evidence, never authority: missing sources are removed,
+/// changed hashes/resources are replaced, and every drift is disclosed.
+fn refresh_loaded_skill_messages(
+    messages: &mut Vec<ChatMessage>,
+    skillset: &skills::SkillSet,
+) -> Vec<String> {
+    let mut refreshed = Vec::with_capacity(messages.len());
+    let mut notices = Vec::new();
+    for message in std::mem::take(messages) {
+        let Some(name) = (matches!(message.role, kitsu_providers::Role::User))
+            .then(|| loaded_skill_name(&message.content))
+            .flatten()
+        else {
+            refreshed.push(message);
+            continue;
+        };
+        match skillset.load_with_snapshot(name) {
+            Ok(current) => {
+                if let Some(previous) = loaded_skill_snapshot(&message.content) {
+                    let drift = previous.drift_from(&current.snapshot);
+                    if !drift.is_empty() {
+                        notices.push(format!(
+                            "refreshed loaded skill '{}' after {} changed",
+                            name,
+                            drift
+                                .iter()
+                                .map(|change| change.field.as_str())
+                                .collect::<Vec<_>>()
+                                .join(", ")
+                        ));
+                    }
+                } else if message.content != loaded_skill_message(name, &current).content {
+                    notices.push(format!(
+                        "refreshed legacy loaded skill '{}' and captured current provenance",
+                        name
+                    ));
+                }
+                refreshed.push(loaded_skill_message(name, &current));
+            }
+            Err(error) => notices.push(format!("removed saved loaded skill '{}': {}", name, error)),
+        }
+    }
+    *messages = refreshed;
+    notices
 }
 
 /// Register the base tool set (fs read/write, grep, skill) shared by the main
@@ -1940,6 +2034,7 @@ fn build_agent_config(
     context_window: Option<u64>,
     offload_dir: Option<std::path::PathBuf>,
 ) -> AgentConfig {
+    let reasoning_effort = cli_reasoning_effort(cli);
     AgentConfig {
         model,
         max_rounds: cli.max_rounds,
@@ -1952,10 +2047,35 @@ fn build_agent_config(
         offload_dir,
         stream: !cli.no_stream,
         temperature: cli.temperature,
+        reasoning_effort,
         max_tokens: cli.max_output_tokens,
         compaction: compaction_mode(cli),
         quiet: cli.jsonl,
         event_log: None,
+    }
+}
+
+fn cli_reasoning_effort(cli: &Cli) -> Option<kitsu_providers::ReasoningEffort> {
+    cli.reasoning_effort.as_deref().map(|effort| match effort {
+        "none" => kitsu_providers::ReasoningEffort::None,
+        "minimal" => kitsu_providers::ReasoningEffort::Minimal,
+        "low" => kitsu_providers::ReasoningEffort::Low,
+        "medium" => kitsu_providers::ReasoningEffort::Medium,
+        "high" => kitsu_providers::ReasoningEffort::High,
+        "xhigh" => kitsu_providers::ReasoningEffort::XHigh,
+        _ => unreachable!("clap validates reasoning effort"),
+    })
+}
+
+fn reasoning_effort_label(effort: Option<kitsu_providers::ReasoningEffort>) -> &'static str {
+    match effort {
+        None => "gateway default",
+        Some(kitsu_providers::ReasoningEffort::None) => "none",
+        Some(kitsu_providers::ReasoningEffort::Minimal) => "minimal",
+        Some(kitsu_providers::ReasoningEffort::Low) => "low",
+        Some(kitsu_providers::ReasoningEffort::Medium) => "medium",
+        Some(kitsu_providers::ReasoningEffort::High) => "high",
+        Some(kitsu_providers::ReasoningEffort::XHigh) => "xhigh",
     }
 }
 
@@ -2060,6 +2180,11 @@ impl SlashCommandSpec {
 /// the registry too so discoverability never depends on reading documentation.
 const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
+        name: "agent",
+        args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
+        description: "inspect and control one background agent thread",
+    },
+    SlashCommandSpec {
         name: "agents",
         args: "[id]",
         description: "backward-compatible alias for /jobs",
@@ -2083,6 +2208,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "archive",
         args: "<id>",
         description: "archive an inactive saved conversation",
+    },
+    SlashCommandSpec {
+        name: "artifacts",
+        args: "[list|prune <id|all>]",
+        description: "inspect or prune retained command-output artifacts",
     },
     SlashCommandSpec {
         name: "checkpoint",
@@ -2141,8 +2271,8 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|show <id>|stop <id>|stop-all|prune <id|all>]",
-        description: "inspect and control background jobs",
+        args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|close <id>]",
+        description: "inspect, steer, stop, and close background agent threads",
     },
     SlashCommandSpec {
         name: "model",
@@ -2165,6 +2295,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show filesystem access policy",
     },
     SlashCommandSpec {
+        name: "profiles",
+        args: "",
+        description: "show available specialist background-agent profiles",
+    },
+    SlashCommandSpec {
         name: "queue",
         args: "[list|add|remove|edit|move|promote|clear]",
         description: "inspect or edit the bounded prompt queue",
@@ -2173,6 +2308,11 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "quit",
         args: "[wait|cancel]",
         description: "exit, wait for jobs, or cancel and join them",
+    },
+    SlashCommandSpec {
+        name: "reasoning",
+        args: "[default|none|minimal|low|medium|high|xhigh]",
+        description: "show or change reasoning effort for subsequent turns",
     },
     SlashCommandSpec {
         name: "restore",
@@ -2318,15 +2458,55 @@ fn read_assistive_line_from<R: std::io::BufRead, W: std::io::Write>(
     Ok(Some(line))
 }
 
+#[cfg(unix)]
+fn read_assistive_stdin_line(prompt: &str) -> std::io::Result<Option<String>> {
+    use std::io::Write;
+
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(terminal_inline(prompt).as_bytes())?;
+    stderr.flush()?;
+    ASSISTIVE_INPUT_INTERRUPTED.store(false, Ordering::Release);
+    loop {
+        if ASSISTIVE_INPUT_INTERRUPTED.swap(false, Ordering::AcqRel) {
+            return Err(std::io::Error::from(std::io::ErrorKind::Interrupted));
+        }
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: the initialized pollfd lives for the call and Kitsu does not
+        // close process stdin. Canonical mode ensures a readable descriptor
+        // contains a complete submitted line (or EOF).
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            return Err(std::io::Error::last_os_error());
+        }
+        if ready == 0 {
+            continue;
+        }
+        return read_assistive_line_from(&mut std::io::stdin().lock(), &mut std::io::sink(), "");
+    }
+}
+
 fn read_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     prompt: &str,
     assistive: bool,
 ) -> ChatReadline {
     if assistive {
-        let stdin = std::io::stdin();
-        let stderr = std::io::stderr();
-        return match read_assistive_line_from(&mut stdin.lock(), &mut stderr.lock(), prompt) {
+        #[cfg(unix)]
+        let result = read_assistive_stdin_line(prompt);
+        #[cfg(not(unix))]
+        let result = {
+            let stdin = std::io::stdin();
+            let stderr = std::io::stderr();
+            read_assistive_line_from(&mut stdin.lock(), &mut stderr.lock(), prompt)
+        };
+        return match result {
             Ok(Some(line)) => ChatReadline::Line(line),
             Ok(None) => ChatReadline::Eof,
             Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {
@@ -2437,10 +2617,13 @@ struct SessionInfo {
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
     command_policy: Option<Arc<kitsu_tools::CommandPolicy>>,
+    command_artifact_sink: Option<command_artifact::CommandArtifactSink>,
     invocation_command_grants: Vec<kitsu_tools::CommandGrantInfo>,
+    agent_profiles: Arc<subagent::profile::AgentProfileCatalog>,
     permissions: Arc<Permissions>,
     autosave_dirty: Cell<bool>,
     window: Rc<Cell<Option<u64>>>,
+    reasoning_effort: Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     window_provenance: Arc<std::sync::Mutex<ContextWindowProvenance>>,
     window_refresh: ContextWindowRefreshConfig,
     max_tokens: Option<u32>,
@@ -2636,39 +2819,15 @@ fn reset_command_session(
     }
 }
 
-fn resumed_provenance(
-    saved: &session::SavedSession,
-    current_sources: &[CtxEntry],
-) -> Vec<CtxEntry> {
-    let mut provenance = vec![CtxEntry::new(
-        "resumed system context",
-        saved
-            .messages
-            .first()
-            .map(|message| estimate_str(&message.content))
-            .unwrap_or(0),
-        "resumed",
-        format!("saved session {}", saved.id),
-    )];
-    provenance.extend(
-        current_sources
-            .iter()
-            .filter(|entry| entry.label.starts_with("tool schemas"))
-            .cloned(),
-    );
-    provenance
-}
-
 fn restored_messages(
     saved: &session::SavedSession,
     fresh_system: &ChatMessage,
-    omit_saved_project_context: bool,
 ) -> Vec<ChatMessage> {
     let mut messages = saved.messages.clone();
-    if omit_saved_project_context && !messages.is_empty() {
-        // A saved system message may contain llms.txt/AGENTS.md text. Replacing
-        // it (rather than merely hiding its provenance) makes the opt-out a
-        // real request boundary on resumed sessions too.
+    if !messages.is_empty() {
+        // Capabilities, skills, project context, and their budgets belong to
+        // the current invocation. Never replay a saved system prompt whose
+        // tool/schema/skill claims may no longer match the active boundary.
         messages[0] = fresh_system.clone();
     }
     messages
@@ -3125,9 +3284,10 @@ fn format_session_status(
         .unwrap_or_else(|| "none".to_string());
 
     format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
         crate::cli::LONG_VERSION,
         gateway,
+        reasoning_effort_label(session.reasoning_effort.get()),
         shorten_home(&session.directory),
         shorten_home(&session.config_path),
         shorten_home(&session.state_dir),
@@ -3195,6 +3355,7 @@ fn session_status_payload(
             "id": session_id,
             "gateway": session.gateway,
             "model": model,
+            "reasoning_effort": reasoning_effort_label(session.reasoning_effort.get()),
             "cwd": session.directory,
             "config_path": session.config_path,
             "state_dir": session.state_dir,
@@ -3397,7 +3558,7 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
             "{mode}; separate exact argv/cwd approval; filesystem flags have no effect"
         ));
         out.push_str(
-            "\n    cwd roots restrict only where a process starts; they are NOT host filesystem, network, or process sandboxes",
+            "\n    exact approval is followed by mandatory OS containment; cwd roots are writable mounts, runtime roots are read-only, and network/process namespaces are isolated",
         );
         for root in &session.command_roots {
             out.push_str(&format!("\n    - {}", shorten_home(root)));
@@ -3447,6 +3608,30 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
                     "\n          {}",
                     format_command_grant_identity(grant)
                 ));
+            }
+        }
+        if let Some(policy) = session.command_policy.as_ref() {
+            match policy.containment_status() {
+                kitsu_tools::CommandContainmentStatus::Ready(ready) => {
+                    out.push_str(&format!(
+                        "\n    OS containment ready: {:?} at {}; network/PID/IPC/UTS isolated; fixed environment",
+                        ready.backend,
+                        shorten_home(&ready.backend_path),
+                    ));
+                    for root in ready.writable_command_roots {
+                        out.push_str(&format!("\n      rw {}", shorten_home(&root)));
+                    }
+                    for root in ready.readonly_runtime_roots {
+                        out.push_str(&format!("\n      ro {}", shorten_home(&root)));
+                    }
+                }
+                kitsu_tools::CommandContainmentStatus::Unavailable(error) => {
+                    out.push_str(&format!(
+                        "\n    OS containment unavailable ({:?}): {}",
+                        error.reason,
+                        terminal_inline(&error.detail),
+                    ));
+                }
             }
         }
     } else {
@@ -3526,6 +3711,10 @@ fn permissions_payload(
         .filter(|grant| !active_grants.contains(grant))
         .map(|grant| command_grant_payload(grant, "revoked_invocation"))
         .collect::<Vec<_>>();
+    let containment = session
+        .command_policy
+        .as_ref()
+        .map(|policy| policy.containment_status());
 
     serde_json::json!({
         "kind": "permissions",
@@ -3555,6 +3744,7 @@ fn permissions_payload(
             "exact_grants": command_grants,
             "revoked_invocation_grants": revoked_command_grants,
             "ambient_authority_notice": session.command_mode.map(|_| kitsu_tools::CommandAmbientAuthority::CURRENT.notice()),
+            "containment": containment,
         },
     })
 }
@@ -4408,6 +4598,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
+                finish_assistant_disposition(cli, "ask:1", false, Some(&issue))?;
                 let mapped = if kind == ScriptFailureKind::Provider {
                     CliError::provider(format!("incomplete turn: {issue}"))
                 } else {
@@ -4444,6 +4635,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 }
                 return Err(mapped);
             }
+            finish_assistant_disposition(cli, "ask:1", true, None)?;
             if cli.jsonl {
                 emit_jsonl(
                     "turn_finished",
@@ -4459,6 +4651,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             Ok(())
         }
         TurnOutcome::Completed(Err(error)) => {
+            finish_assistant_disposition(
+                cli,
+                "ask:1",
+                false,
+                Some("the model turn failed before commit"),
+            )?;
             let mapped = map_agent_error(
                 error,
                 ProviderOperation::Chat {
@@ -4485,6 +4683,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             Err(mapped)
         }
         TurnOutcome::Cancelled => {
+            finish_assistant_disposition(
+                cli,
+                "ask:1",
+                false,
+                Some("the model turn was cancelled before commit"),
+            )?;
             let mapped = CliError::cancelled("request cancelled by Ctrl+C");
             if cli.jsonl {
                 emit_jsonl(
@@ -4738,6 +4942,36 @@ fn finish_agent_trace(
     Ok(())
 }
 
+/// Close the provisional assistant-output transaction after local strictness
+/// checks. Streamed deltas remain useful for live UIs, but this terminal record
+/// makes it impossible for automation to mistake rolled-back text for a
+/// committed answer. Human mode visibly invalidates discarded output.
+fn finish_assistant_disposition(
+    cli: &Cli,
+    turn_id: &str,
+    committed: bool,
+    reason: Option<&str>,
+) -> Result<(), CliError> {
+    if cli.jsonl {
+        emit_jsonl(
+            "assistant_disposition",
+            serde_json::json!({
+                "turn_id": turn_id,
+                "status": if committed { "committed" } else { "discarded" },
+                "reason": reason,
+            }),
+        )?;
+    } else if !committed {
+        eprintln!(
+            "~ provisional assistant output, if any, was DISCARDED and was not committed{}",
+            reason
+                .map(|reason| format!(": {}", terminal_inline(reason)))
+                .unwrap_or_default()
+        );
+    }
+    Ok(())
+}
+
 fn strict_turn_failure(
     status: &kitsu_core::AgentTurnStatus,
 ) -> Option<(ScriptFailureKind, String)> {
@@ -4936,6 +5170,10 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
             })
         })
         .collect::<Vec<_>>();
+    let threads = registry.thread_snapshot_dtos();
+    debug_assert!(threads
+        .iter()
+        .all(|thread| thread.validate_default().is_ok()));
     serde_json::json!({
         "generation": snapshot.generation,
         "total": snapshot.total,
@@ -4948,6 +5186,7 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
         "available_running_slots": snapshot.available_running_slots,
         "available_record_slots": snapshot.available_record_slots,
         "agents": agents,
+        "threads": threads,
     })
 }
 
@@ -4958,6 +5197,47 @@ fn terminal_job_payload(status: &subagent::AgentTerminalStatus) -> serde_json::V
         "status": terminal_agent_status_label(&status.status),
         "joined": status.joined,
     })
+}
+
+fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> String {
+    let mut output = format!(
+        "agent #{} [{:?}] | model {} | profile {} | {:.1}s\n  task: {}\n  steering: {} ({} pending) | handoff: {:?}",
+        snapshot.id,
+        snapshot.phase,
+        terminal_inline(&snapshot.model),
+        snapshot
+            .profile
+            .as_deref()
+            .map(terminal_inline)
+            .unwrap_or_else(|| "default".to_string()),
+        snapshot.elapsed_ms as f64 / 1000.0,
+        terminal_inline(&snapshot.task),
+        if snapshot.steering_open { "open" } else { "closed" },
+        snapshot.pending_steering,
+        snapshot.handoff,
+    );
+    if snapshot.timeline.entries.is_empty() {
+        output.push_str("\n  timeline: no retained events");
+    } else {
+        output.push_str("\n  bounded redacted timeline:");
+        for entry in &snapshot.timeline.entries {
+            output.push_str(&format!(
+                "\n    [{} +{:.1}s {:?}] {}{}",
+                entry.sequence,
+                entry.elapsed_ms as f64 / 1000.0,
+                entry.kind,
+                kitsu_render::sanitize_terminal_text(&entry.text),
+                if entry.truncated { " [truncated]" } else { "" },
+            ));
+        }
+        if snapshot.timeline.dropped_entries > 0 {
+            output.push_str(&format!(
+                "\n    ... {} older event(s) omitted by the thread budget",
+                snapshot.timeline.dropped_entries
+            ));
+        }
+    }
+    output
 }
 
 async fn handle_jobs_command(
@@ -4986,23 +5266,86 @@ async fn handle_jobs_command(
                 eprintln!("usage: /jobs show <id>");
                 return Err(());
             }
-            match registry.result(id) {
-                Some(text) => {
-                    eprintln!("#{id}:\n{}", kitsu_render::sanitize_terminal_text(&text));
+            let Some(thread) = registry.thread_snapshot(id) else {
+                eprintln!("no background job #{id}");
+                return Err(());
+            };
+            eprintln!("{}", format_agent_thread(&thread));
+            let result = registry.peek_result(id);
+            if !matches!(thread.phase, subagent::thread::AgentThreadPhase::Running) {
+                if let Some(result) = result.as_deref() {
+                    eprintln!(
+                        "\nresult:\n{}",
+                        kitsu_render::sanitize_terminal_text(result)
+                    );
+                }
+                let _ = registry.acknowledge_result(id);
+            }
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "show",
+                "changed": false,
+                "id": id,
+                "thread": subagent::thread::AgentThreadSnapshotDto::from_snapshot(&thread),
+                "result": result,
+                "handoff": registry.handoff_state(id),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
+        }
+        "steer" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs steer <id> <correction>");
+                return Err(());
+            };
+            let correction = parts.collect::<Vec<_>>().join(" ");
+            if correction.trim().is_empty() {
+                eprintln!("usage: /jobs steer <id> <correction>");
+                return Err(());
+            }
+            match registry.steer(id, &correction) {
+                Ok(receipt) => {
+                    eprintln!(
+                        "~ steering queued for background agent #{} (sequence {}; {} pending)",
+                        receipt.id, receipt.sequence, receipt.pending
+                    );
                     Ok(serde_json::json!({
                         "kind": "jobs",
-                        "action": "show",
-                        "changed": false,
-                        "id": id,
-                        "result": text,
+                        "action": "steer",
+                        "changed": true,
+                        "receipt": {
+                            "id": receipt.id,
+                            "sequence": receipt.sequence,
+                            "pending": receipt.pending,
+                        },
                         "snapshot": jobs_snapshot_payload(registry),
                     }))
                 }
-                None => {
-                    eprintln!("no background job #{id}");
+                Err(error) => {
+                    eprintln!("cannot steer background agent #{id}: {error}");
                     Err(())
                 }
             }
+        }
+        "close-steering" => {
+            let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
+                eprintln!("usage: /jobs close-steering <id>");
+                return Err(());
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /jobs close-steering <id>");
+                return Err(());
+            }
+            let outcome = registry.close_steering(id);
+            let changed = matches!(outcome, subagent::AgentSteeringCloseOutcome::Closed);
+            eprintln!("~ background agent #{id} steering: {outcome:?}");
+            Ok(serde_json::json!({
+                "kind": "jobs",
+                "action": "close_steering",
+                "changed": changed,
+                "id": id,
+                "outcome": format!("{outcome:?}").to_lowercase(),
+                "snapshot": jobs_snapshot_payload(registry),
+            }))
         }
         "stop" => {
             let Some(id) = parts.next().and_then(|value| value.parse::<u64>().ok()) else {
@@ -5013,7 +5356,7 @@ async fn handle_jobs_command(
                 eprintln!("usage: /jobs stop <id>");
                 return Err(());
             }
-            match registry.cancel(id).await {
+            match registry.stop(id).await {
                 subagent::AgentCancelOutcome::Cancelled(status) => {
                     report_write_checkpoints(journal.drain_and_take_reports().await);
                     eprintln!("~ stopped and joined background job #{}", status.id);
@@ -5058,7 +5401,7 @@ async fn handle_jobs_command(
                 "snapshot": jobs_snapshot_payload(registry),
             }))
         }
-        "prune" => {
+        "prune" | "close" => {
             let Some(target) = parts.next() else {
                 eprintln!("usage: /jobs prune <id|all>");
                 return Err(());
@@ -5083,7 +5426,7 @@ async fn handle_jobs_command(
                 eprintln!("usage: /jobs prune <id|all>");
                 return Err(());
             };
-            match registry.prune(id) {
+            match registry.close(id) {
                 subagent::AgentPruneOutcome::Pruned(status) => {
                     eprintln!("~ pruned background job #{id}");
                     Ok(serde_json::json!({
@@ -5105,10 +5448,173 @@ async fn handle_jobs_command(
             }
         }
         _ => {
-            eprintln!("usage: /jobs [list|show <id>|stop <id>|stop-all|prune <id|all>]");
+            eprintln!("usage: /jobs [list|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
             Err(())
         }
     }
+}
+
+fn command_artifact_payload(sink: &command_artifact::CommandArtifactSink) -> serde_json::Value {
+    let quota = sink.quota();
+    let usage = sink.usage();
+    let artifacts = sink
+        .list()
+        .into_iter()
+        .map(|artifact| {
+            serde_json::json!({
+                "id": artifact.id,
+                "path": artifact.reference,
+                "artifact_bytes": artifact.artifact_bytes,
+                "captured_bytes": artifact.captured_bytes,
+                "truncated": artifact.truncated,
+                "limit_bytes": artifact.limit_bytes,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "kind": "command_artifacts",
+        "quota": {
+            "max_count": quota.max_count,
+            "max_total_bytes": quota.max_total_bytes,
+            "overflow": format!("{:?}", quota.overflow).to_lowercase(),
+        },
+        "usage": {
+            "retained_count": usage.retained_count,
+            "retained_bytes": usage.retained_bytes,
+            "in_flight_count": usage.in_flight_count,
+            "reserved_bytes": usage.reserved_bytes,
+            "available_count": usage.available_count(),
+            "available_bytes": usage.available_bytes(),
+        },
+        "artifacts": artifacts,
+    })
+}
+
+fn format_command_artifacts(sink: &command_artifact::CommandArtifactSink) -> String {
+    let usage = sink.usage();
+    let mut output = format!(
+        "command artifacts: {} retained / {} in flight | {} retained bytes / {} reserved bytes | {} slots and {} bytes available",
+        usage.retained_count,
+        usage.in_flight_count,
+        usage.retained_bytes,
+        usage.reserved_bytes,
+        usage.available_count(),
+        usage.available_bytes(),
+    );
+    for artifact in sink.list() {
+        output.push_str(&format!(
+            "\n  #{}  {} ({} bytes; {} captured{}; cap {})",
+            artifact.id,
+            shorten_home(&artifact.reference),
+            artifact.artifact_bytes,
+            artifact.captured_bytes,
+            if artifact.truncated {
+                ", truncated"
+            } else {
+                ""
+            },
+            artifact.limit_bytes,
+        ));
+    }
+    if usage.retained_count == 0 {
+        output.push_str("\n  none");
+    } else {
+        output.push_str("\n  prune with /artifacts prune <id|all>");
+    }
+    output
+}
+
+fn handle_command_artifacts(
+    sink: Option<&command_artifact::CommandArtifactSink>,
+    arg: &str,
+) -> Result<serde_json::Value, ()> {
+    let Some(sink) = sink else {
+        eprintln!("command artifacts are disabled because the command tool is not enabled");
+        return Err(());
+    };
+    let mut parts = arg.split_whitespace();
+    match parts.next().unwrap_or("list") {
+        "list" if parts.next().is_none() => {
+            eprintln!("{}", format_command_artifacts(sink));
+            Ok(command_artifact_payload(sink))
+        }
+        "prune" => {
+            let Some(target) = parts.next() else {
+                eprintln!("usage: /artifacts prune <id|all>");
+                return Err(());
+            };
+            if parts.next().is_some() {
+                eprintln!("usage: /artifacts prune <id|all>");
+                return Err(());
+            }
+            let removed = if target == "all" {
+                sink.prune_all()
+            } else {
+                let Ok(id) = target.parse::<u64>() else {
+                    eprintln!("usage: /artifacts prune <id|all>");
+                    return Err(());
+                };
+                sink.prune(id)
+                    .map(|artifact| artifact.into_iter().collect())
+            };
+            match removed {
+                Ok(removed) => {
+                    eprintln!("~ pruned {} command artifact(s)", removed.len());
+                    let mut payload = command_artifact_payload(sink);
+                    payload["action"] = serde_json::Value::String("prune".to_string());
+                    payload["removed"] =
+                        serde_json::json!(removed.iter().map(|a| a.id).collect::<Vec<_>>());
+                    Ok(payload)
+                }
+                Err(error) => {
+                    eprintln!(
+                        "cannot prune command artifacts: {}",
+                        terminal_inline(&error.to_string())
+                    );
+                    Err(())
+                }
+            }
+        }
+        _ => {
+            eprintln!("usage: /artifacts [list|prune <id|all>]");
+            Err(())
+        }
+    }
+}
+
+fn agent_profiles_payload(catalog: &subagent::profile::AgentProfileCatalog) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "agent_profiles",
+        "count": catalog.len(),
+        "profiles": catalog.to_dto().profiles,
+    })
+}
+
+fn format_agent_profiles(catalog: &subagent::profile::AgentProfileCatalog) -> String {
+    if catalog.is_empty() {
+        return "no background-agent profiles are available".to_string();
+    }
+    let mut output = String::from("background-agent profiles:");
+    for profile in catalog.iter() {
+        let tool_policy = if profile.tool_policy.is_tool_free() {
+            "none".to_string()
+        } else {
+            format!("{:?}", profile.tool_policy)
+        };
+        output.push_str(&format!(
+            "\n  {} | model {} | reasoning {:?} | tools {}",
+            terminal_inline(&profile.name),
+            profile
+                .model
+                .as_deref()
+                .map(terminal_inline)
+                .unwrap_or_else(|| "current".to_string()),
+            profile.reasoning_effort,
+            tool_policy,
+        ));
+    }
+    output.push_str("\n  background agents select one with spawn_agent_bg({task, profile})");
+    output
 }
 
 async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason: &str) {
@@ -5524,10 +6030,19 @@ async fn run_scripted_body(
     session_store: &Option<session::SessionStore>,
     status: &mut ScriptRunStatus,
 ) -> Result<(), CliError> {
-    let content = read_text_file_cancellable(std::path::PathBuf::from(path))
-        .await
-        .ok_or_else(|| CliError::cancelled(format!("script read cancelled: {path}")))?
-        .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
+    let content = tokio::time::timeout(
+        Duration::from_secs(cli.timeout_secs),
+        read_text_file_cancellable(std::path::PathBuf::from(path)),
+    )
+    .await
+    .map_err(|_| {
+        CliError::user(format!(
+            "script read exceeded the {}s end-to-end deadline: {path}",
+            cli.timeout_secs
+        ))
+    })?
+    .ok_or_else(|| CliError::cancelled(format!("script read cancelled: {path}")))?
+    .map_err(|e| CliError::user(format!("cannot read script '{path}': {e}")))?;
     // One session state for the whole script — the context-meter anchor and
     // compaction circuit breaker persist across turns, matching interactive chat
     // (a script is a multi-turn session, not a series of independent one-shots).
@@ -5592,6 +6107,7 @@ async fn run_scripted_body(
                 offload_dir,
                 &mut state,
                 context_window,
+                &session.reasoning_effort,
                 registry,
                 &format!("{path}:{line_number}"),
             )
@@ -5779,6 +6295,7 @@ async fn run_scripted_body(
                         offload_dir,
                         &mut state,
                         context_window,
+                        &session.reasoning_effort,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -5828,6 +6345,7 @@ async fn run_scripted_body(
                         offload_dir,
                         &mut state,
                         context_window,
+                        &session.reasoning_effort,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -5920,6 +6438,7 @@ async fn run_scripted_body(
             offload_dir,
             &mut state,
             context_window,
+            &session.reasoning_effort,
             registry,
             &format!("{path}:{line_number}"),
         )
@@ -5955,6 +6474,7 @@ async fn run_scripted_turn(
     offload_dir: &Option<std::path::PathBuf>,
     state: &mut kitsu_core::AgentSessionState,
     context_window: &Rc<Cell<Option<u64>>>,
+    reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
 ) -> Result<(), ScriptFailureKind> {
@@ -6036,6 +6556,7 @@ async fn run_scripted_turn(
         context_window.get(),
         offload_dir.clone(),
     );
+    cfg.reasoning_effort = reasoning_effort.get();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
     let outcome = journal
@@ -6057,6 +6578,8 @@ async fn run_scripted_turn(
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
+                finish_assistant_disposition(cli, location, false, Some(&issue))
+                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 if cli.jsonl {
                     emit_jsonl(
                         "error",
@@ -6098,6 +6621,8 @@ async fn run_scripted_turn(
                 }
                 Err(kind)
             } else {
+                finish_assistant_disposition(cli, location, true, None)
+                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 if cli.jsonl {
                     emit_jsonl(
                         "turn_finished",
@@ -6114,6 +6639,13 @@ async fn run_scripted_turn(
             }
         }
         TurnOutcome::Completed(Err(e)) => {
+            finish_assistant_disposition(
+                cli,
+                location,
+                false,
+                Some("the model turn failed before commit"),
+            )
+            .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             let kind = script_failure_kind(&e);
             let error_message = chat_error_message(e, model, cli.timeout_secs);
             if cli.jsonl {
@@ -6153,6 +6685,13 @@ async fn run_scripted_turn(
             Err(kind)
         }
         TurnOutcome::Cancelled => {
+            finish_assistant_disposition(
+                cli,
+                location,
+                false,
+                Some("the model turn was cancelled before commit"),
+            )
+            .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             if cli.jsonl {
                 emit_jsonl(
                     "error",
@@ -6189,12 +6728,97 @@ enum TurnOutcome {
     Cancelled,
 }
 
+enum TypeaheadOutcome {
+    Notice(String),
+    SteeringError(String),
+    QueueError(String),
+}
+
+#[cfg(unix)]
+fn handle_active_jobs_command(
+    registry: &Arc<subagent::AgentRegistry>,
+    runtime: &tokio::runtime::Handle,
+    argument: &str,
+) -> Result<String, String> {
+    let mut parts = argument.split_whitespace();
+    match parts.next().unwrap_or("list") {
+        "list" if parts.next().is_none() => Ok(format_jobs(registry)),
+        "show" => {
+            let id = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "usage: /jobs show <id>".to_string())?;
+            if parts.next().is_some() {
+                return Err("usage: /jobs show <id>".to_string());
+            }
+            let snapshot = registry
+                .thread_snapshot(id)
+                .ok_or_else(|| format!("no background job #{id}"))?;
+            let mut output = format_agent_thread(&snapshot);
+            if snapshot.phase != subagent::thread::AgentThreadPhase::Running {
+                if let Some(result) = registry.peek_result(id) {
+                    output.push_str("\n\nresult:\n");
+                    output.push_str(&kitsu_render::sanitize_terminal_text(&result));
+                }
+                let _ = registry.acknowledge_result(id);
+            }
+            Ok(output)
+        }
+        "steer" => {
+            let id = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "usage: /jobs steer <id> <correction>".to_string())?;
+            let correction = parts.collect::<Vec<_>>().join(" ");
+            if correction.is_empty() {
+                return Err("usage: /jobs steer <id> <correction>".to_string());
+            }
+            let receipt = registry
+                .steer(id, &correction)
+                .map_err(|error| error.to_string())?;
+            Ok(format!(
+                "steering queued for agent #{} (sequence {}; {} pending)",
+                receipt.id, receipt.sequence, receipt.pending
+            ))
+        }
+        "stop" => {
+            let id = parts
+                .next()
+                .and_then(|value| value.parse::<u64>().ok())
+                .ok_or_else(|| "usage: /jobs stop <id>".to_string())?;
+            if parts.next().is_some() {
+                return Err("usage: /jobs stop <id>".to_string());
+            }
+            match runtime.block_on(registry.stop(id)) {
+                subagent::AgentCancelOutcome::Cancelled(status) => {
+                    Ok(format!("stopped and joined background job #{}", status.id))
+                }
+                subagent::AgentCancelOutcome::AlreadyTerminal(status) => Ok(format!(
+                    "background job #{} is already {}",
+                    status.id,
+                    terminal_agent_status_label(&status.status)
+                )),
+                subagent::AgentCancelOutcome::NotFound => Err(format!("no background job #{id}")),
+            }
+        }
+        "stop-all" if parts.next().is_none() => {
+            let stopped = runtime.block_on(registry.cancel_all());
+            Ok(format!(
+                "stopped and joined {} background job(s)",
+                stopped.len()
+            ))
+        }
+        _ => Err(
+            "active-turn controls: /jobs [list|show <id>|steer <id> <text>|stop <id>|stop-all]"
+                .to_string(),
+        ),
+    }
+}
+
 #[derive(Default)]
 struct TypeaheadCaptureResult {
     captured: usize,
-    steering_errors: Vec<String>,
-    queue_notices: Vec<String>,
-    queue_errors: Vec<String>,
+    outcomes: Vec<TypeaheadOutcome>,
     eof: bool,
 }
 
@@ -6213,9 +6837,11 @@ impl TypeaheadCollector {
     fn start(
         queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         steering: prompt_queue::SteeringChannel,
+        registry: Arc<subagent::AgentRegistry>,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
+        let runtime = tokio::runtime::Handle::current();
         let handle = std::thread::spawn(move || {
             let mut result = TypeaheadCaptureResult::default();
             while !thread_stop.load(Ordering::Acquire) {
@@ -6268,25 +6894,44 @@ impl TypeaheadCollector {
                         if line == "/steer" || line.starts_with("/steer ") {
                             let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
                             if correction.is_empty() {
-                                result
-                                    .steering_errors
-                                    .push("steering correction cannot be empty".to_string());
+                                result.outcomes.push(TypeaheadOutcome::SteeringError(
+                                    "steering correction cannot be empty".to_string(),
+                                ));
                                 continue;
                             }
                             let Some(turn) = steering.active_turn() else {
-                                result.steering_errors.push(
+                                result.outcomes.push(TypeaheadOutcome::SteeringError(
                                     "steering arrived after the foreground turn ended; it was not queued as a new prompt"
                                         .to_string(),
-                                );
+                                ));
                                 continue;
                             };
                             match steering.steer(turn, correction) {
                                 Ok(_) => {}
-                                Err(error) => result.steering_errors.push(format!(
+                                Err(error) => result.outcomes.push(TypeaheadOutcome::SteeringError(format!(
                                     "{error} ({}-character correction was not converted into a future prompt)",
                                     error.correction().text().chars().count()
-                                )),
+                                ))),
                             }
+                            continue;
+                        }
+                        if line == "/jobs" || line.starts_with("/jobs ") {
+                            let argument = line.strip_prefix("/jobs").unwrap_or_default().trim();
+                            match handle_active_jobs_command(&registry, &runtime, argument) {
+                                Ok(message) => {
+                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
+                                }
+                                Err(error) => {
+                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
+                                }
+                            }
+                            continue;
+                        }
+                        if line == "/quit cancel" || line == "/exit cancel" {
+                            ACTIVE_QUIT_CANCEL.store(true, Ordering::Release);
+                            result.outcomes.push(TypeaheadOutcome::Notice(
+                                "exit cancellation accepted; stopping the foreground turn and all background agents".to_string(),
+                            ));
                             continue;
                         }
                         if line == "/queue" || line.starts_with("/queue ") {
@@ -6297,18 +6942,22 @@ impl TypeaheadCollector {
                                     command,
                                 )
                             }) {
-                                Ok(message) => result.queue_notices.push(message),
-                                Err(error) => result.queue_errors.push(error),
+                                Ok(message) => {
+                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
+                                }
+                                Err(error) => {
+                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
+                                }
                             }
                             continue;
                         }
                         match queue.lock().expect("prompt queue").enqueue(line) {
                             Ok(_) => result.captured += 1,
-                            Err(error) => result.queue_errors.push(format!(
+                            Err(error) => result.outcomes.push(TypeaheadOutcome::QueueError(format!(
                                 "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
                                 error.capacity(),
                                 error.prompt().chars().count(),
-                            )),
+                            ))),
                         }
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
@@ -6340,6 +6989,7 @@ impl TypeaheadCollector {
     fn start(
         _queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         _steering: prompt_queue::SteeringChannel,
+        _registry: Arc<subagent::AgentRegistry>,
     ) -> Self {
         Self
     }
@@ -6433,6 +7083,13 @@ async fn run_turn_cancellable(
 enum InteractiveTurnOutcome {
     Turn(TurnOutcome),
     Steered(Vec<String>),
+    QuitCancelled,
+}
+
+async fn wait_for_active_quit_cancel() {
+    while !ACTIVE_QUIT_CANCEL.load(Ordering::Acquire) {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -6448,6 +7105,7 @@ async fn run_turn_steerable(
 ) -> InteractiveTurnOutcome {
     debug_assert_eq!(corrections.turn(), turn);
     FOREGROUND_CANCELLED.store(false, Ordering::Release);
+    ACTIVE_QUIT_CANCEL.store(false, Ordering::Release);
     let future = run_agent_turn_with_state(provider, tools, messages, cfg, state);
     tokio::pin!(future);
     tokio::select! {
@@ -6481,6 +7139,14 @@ async fn run_turn_steerable(
                     .map(prompt_queue::SteeringCorrection::into_text),
             );
             InteractiveTurnOutcome::Steered(texts)
+        }
+        _ = wait_for_active_quit_cancel() => {
+            let _ = steering.close_turn(turn);
+            FOREGROUND_CANCELLED.store(true, Ordering::Release);
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+            InteractiveTurnOutcome::QuitCancelled
         }
     }
 }
@@ -6605,8 +7271,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         && (interactive || !allow_paths.is_empty() || !allow_read_write.is_empty());
     let can_write = interactive || !allow_write.is_empty() || !allow_read_write.is_empty();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
-    let command_artifact_sink =
-        command_requested.then(command_artifact::CommandArtifactSink::default);
+    let command_artifact_sink = command_requested.then(|| {
+        let quota = command_artifact::CommandArtifactQuota::new(
+            command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
+            command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
+            command_artifact::CommandArtifactOverflowPolicy::PruneOldest,
+        )
+        .expect("non-zero built-in command artifact quota");
+        command_artifact::CommandArtifactSink::with_quota(quota)
+    });
     let explicit_command_grants: Vec<Vec<String>> = allow_commands
         .iter()
         .map(|encoded| {
@@ -6676,6 +7349,62 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         Arc::new(t)
     };
 
+    // Specialist profiles are requests that are intersected with the current
+    // invocation's real authority. `reviewer` receives only the already-
+    // authorized read surface; `reasoning` receives an intentionally empty
+    // registry and therefore works without dummy filesystem grants.
+    let reviewer_tools = {
+        let mut tools = Registry::new();
+        register_base_tools(
+            &mut tools,
+            &perms,
+            &skillset,
+            can_read,
+            false,
+            &write_journal,
+            None,
+        );
+        Arc::new(tools)
+    };
+    let reasoning_tools = Arc::new(Registry::new());
+    let mut profile_catalog = subagent::profile::AgentProfileCatalog::new();
+    profile_catalog
+        .insert(subagent::profile::AgentProfile {
+            name: "reviewer".to_string(),
+            model: None,
+            reasoning_effort: subagent::profile::AgentReasoningEffort::High,
+            instructions: "Review the delegated evidence critically. Do not modify files or run developer commands; return concrete, prioritized findings.".to_string(),
+            tool_policy: subagent::profile::AgentToolPolicy::AllowList(
+                reviewer_tools
+                    .descriptors()
+                    .iter()
+                    .map(|descriptor| descriptor.name.clone())
+                    .collect(),
+            ),
+            permission_defaults: subagent::profile::AgentPermissionDefaults {
+                inherit_session: true,
+                ..Default::default()
+            },
+        })
+        .expect("built-in reviewer profile is valid");
+    profile_catalog
+        .insert(subagent::profile::AgentProfile::reasoning_only(
+            "reasoning",
+            "Reason from the supplied task only. You have no local tools or inherited filesystem/command authority; return a concise self-contained conclusion.",
+        ))
+        .expect("built-in reasoning profile is valid");
+    let profile_catalog = Arc::new(profile_catalog);
+    // Building a validated round-trip DTO here keeps the persistence contract
+    // exercised even though this release ships only immutable built-ins.
+    let profile_catalog = Arc::new(
+        subagent::profile::AgentProfileCatalog::from_dto(profile_catalog.to_dto())
+            .expect("built-in profile catalog round-trips"),
+    );
+    let profile_tools = Arc::new(std::collections::HashMap::from([
+        ("reviewer".to_string(), reviewer_tools),
+        ("reasoning".to_string(), reasoning_tools),
+    ]));
+
     // The live (model, window) subagents should use, kept in sync with `/model`
     // (see the loop below) so a subagent never runs the session's initial model
     // against a stale window.
@@ -6685,8 +7414,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     )));
     // Registry of BACKGROUND subagents (Stage C), shared with the spawn_agent_bg /
     // agent_result tools and the `/agents` command.
-    let agent_registry =
-        subagent::AgentRegistry::with_limits(subagent::AgentRegistryLimits::default());
+    let agent_registry = subagent::AgentRegistry::with_limits_and_thread_limits(
+        subagent::AgentRegistryLimits::default(),
+        subagent::thread::AgentThreadLimits::default(),
+    )
+    .map_err(|error| CliError::user(format!("invalid background-thread limits: {error}")))?;
 
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
@@ -6700,51 +7432,50 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         &write_journal,
         command_policy.as_ref(),
     );
-    if can_read || can_write || command_policy.is_some() {
-        let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
-        sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
-        let sub_system = if skillset.is_empty() {
-            String::new()
-        } else {
-            format!(
-                "You have these skills (call the `skill` tool to load one when a task matches):\n{}",
-                skillset.index("")
-            )
-        };
-        // Stage A: synchronous single delegation.
-        let (d, h) = subagent::spawn_agent_tool(
-            setup.provider.clone(),
-            sub_tools.clone(),
-            sub_cfg.clone(),
-            live_mw.clone(),
-            sub_system.clone(),
-        );
-        tools.register_with_descriptor(d, h);
-        // Stage B: fan several isolated subagents out in parallel.
-        let (d, h) = subagent::spawn_agents_tool(
-            setup.provider.clone(),
-            sub_tools.clone(),
-            sub_cfg.clone(),
-            live_mw.clone(),
-            sub_system.clone(),
-        );
-        tools.register_with_descriptor(d, h);
-        // Stage C: detached background subagent (runs quiet so it doesn't corrupt
-        // the prompt) + a tool to fetch its result by id.
-        let mut bg_cfg = sub_cfg;
-        bg_cfg.quiet = true;
-        let (d, h) = subagent::spawn_agent_bg_tool(
-            setup.provider.clone(),
-            sub_tools.clone(),
-            bg_cfg,
-            live_mw.clone(),
-            sub_system,
-            agent_registry.clone(),
-        );
-        tools.register_with_descriptor(d, h);
-        let (d, h) = subagent::agent_result_tool(agent_registry.clone());
-        tools.register_with_descriptor(d, h);
-    }
+    let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
+    sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
+    let sub_system = if skillset.is_empty() {
+        String::new()
+    } else {
+        format!(
+            "You have these skills (call the `skill` tool to load one when a task matches):\n{}",
+            skillset.index("")
+        )
+    };
+    // Stage A: synchronous single delegation.
+    let (d, h) = subagent::spawn_agent_tool(
+        setup.provider.clone(),
+        sub_tools.clone(),
+        sub_cfg.clone(),
+        live_mw.clone(),
+        sub_system.clone(),
+    );
+    tools.register_with_descriptor(d, h);
+    // Stage B: fan several isolated subagents out in parallel.
+    let (d, h) = subagent::spawn_agents_tool(
+        setup.provider.clone(),
+        sub_tools.clone(),
+        sub_cfg.clone(),
+        live_mw.clone(),
+        sub_system.clone(),
+    );
+    tools.register_with_descriptor(d, h);
+    // Stage C: detached background subagent (runs quiet so it doesn't corrupt
+    // the prompt) + a tool to fetch its result by id.
+    let mut bg_cfg = sub_cfg;
+    bg_cfg.quiet = true;
+    let (d, h) = subagent::spawn_agent_bg_tool(
+        setup.provider.clone(),
+        sub_tools.clone(),
+        bg_cfg,
+        live_mw.clone(),
+        sub_system,
+        agent_registry.clone(),
+        subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
+    );
+    tools.register_with_descriptor(d, h);
+    let (d, h) = subagent::agent_result_tool(agent_registry.clone());
+    tools.register_with_descriptor(d, h);
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
     // Offloaded tool results and complete developer-command output share one
@@ -6797,18 +7528,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // gateway would reject the oversized request instead of kitsu proactively
     // trimming to fit the new model's real limit.
     let context_window = Rc::new(Cell::new(setup.context_window));
+    let reasoning_effort = Rc::new(Cell::new(cli_reasoning_effort(cli)));
     let base_cfg = {
         let context_window = context_window.clone();
+        let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
         move |model: String, cli: &Cli| {
-            build_agent_config(
+            let mut config = build_agent_config(
                 model,
                 cli,
                 context_window.get(),
                 model_can_read_artifacts
                     .then(|| offload_state.borrow().clone())
                     .flatten(),
-            )
+            );
+            config.reasoning_effort = reasoning_effort.get();
+            config
         }
     };
     // Persists the context-meter anchor and compaction circuit breaker across
@@ -6912,6 +7647,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // `/new` starts from the context assembled for this invocation, rather than
     // inheriting an older resumed session's system prompt.
     let fresh_system_message = messages[0].clone();
+    let mut resumed_context_refreshed = false;
+    let mut resumed_skill_changes = Vec::new();
     if let Some(saved) = resumed {
         if saved.gateway != setup.gateway_name {
             return Err(CliError::user(format!(
@@ -6949,18 +7686,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     ContextWindowProvenance::live_discovery(resumed_window);
             }
         }
-        if no_project {
-            project_context_source = None;
-            provenance = fresh_provenance.clone();
-            if saved.project_context.is_some() {
-                eprintln!("~ omitted saved project context because --no-project-context is active");
-            }
-        } else {
-            project_context_source = saved
-                .project_context
-                .as_deref()
-                .map(std::path::PathBuf::from);
-            provenance = resumed_provenance(&saved, &fresh_provenance);
+        project_context_source = fresh_project_context_source.clone();
+        provenance = fresh_provenance.clone();
+        if no_project && saved.project_context.is_some() {
+            eprintln!("~ omitted saved project context because --no-project-context is active");
+        }
+        let system_context_changed = saved.messages.first() != Some(&fresh_system_message);
+        messages = restored_messages(&saved, &fresh_system_message);
+        resumed_skill_changes = refresh_loaded_skill_messages(&mut messages, &skillset);
+        resumed_context_refreshed = system_context_changed || !resumed_skill_changes.is_empty();
+        if resumed_context_refreshed {
+            eprintln!(
+                "~ rebuilt saved system context from current tools, project metadata, and bounded skill provenance"
+            );
+        }
+        for change in &resumed_skill_changes {
+            eprintln!("~ {}", terminal_inline(change));
         }
         eprintln!(
             "~ resumed session {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
@@ -6968,7 +7709,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             perms.base_read_roots().len(),
             perms.base_write_roots().len(),
         );
-        messages = restored_messages(&saved, &fresh_system_message, no_project);
         session_state.meter.invalidate();
     }
     *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
@@ -6993,13 +7733,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
         }),
         command_policy: command_policy.clone(),
+        command_artifact_sink: command_artifact_sink.clone(),
         invocation_command_grants: command_policy
             .as_ref()
             .map(|policy| policy.session_grants())
             .unwrap_or_default(),
+        agent_profiles: profile_catalog,
         permissions: perms.clone(),
         autosave_dirty: Cell::new(false),
         window: context_window.clone(),
+        reasoning_effort: reasoning_effort.clone(),
         window_provenance: setup.context_window_provenance.clone(),
         window_refresh: setup.context_window_refresh.clone(),
         max_tokens: cli.max_output_tokens,
@@ -7022,13 +7765,22 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 "session_id": session.session_id.borrow().clone(),
                 "resumed": resumed_existing,
                 "durable_session": durable_session,
+                "session_snapshot_state": if !durable_session {
+                    "disabled"
+                } else if resumed_existing {
+                    "resumable"
+                } else {
+                    "pending_until_first_success"
+                },
+                "system_context_refreshed": resumed_context_refreshed,
+                "skill_context_changes": resumed_skill_changes,
             }),
         )?;
     }
 
     if durable_session && !interactive {
         eprintln!(
-            "~ session {} autosave enabled (snapshots never store grants; invocation grants: {} read, {} write)",
+            "~ session {} autosave planned; a new id becomes resumable after the first successful turn or state-changing command (snapshots never store grants; invocation grants: {} read, {} write)",
             terminal_inline(
                 session
                     .session_id
@@ -7103,16 +7855,28 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
 
     // Non-TTY stdin and explicit top-level review → one-shot, no interactive loop.
     if forced_one_shot || !kitsu_render::stdin_is_tty() {
+        let one_shot_deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_secs(cli.timeout_secs))
+            .ok_or_else(|| CliError::user("--timeout-secs is too large"))?;
         let submitted = match initial_review_submission.take() {
             Some(review) => review,
             None => {
                 let prompt = match first_prompt {
                     Some(p) => p.to_string(),
                     None => {
-                        let buf = read_piped_stdin_cancellable()
-                            .await
-                            .ok_or_else(|| CliError::cancelled("stdin read cancelled by Ctrl+C"))?
-                            .map_err(|e| CliError::user(format!("failed to read stdin: {e}")))?;
+                        let buf = tokio::time::timeout_at(
+                            one_shot_deadline,
+                            read_piped_stdin_cancellable(),
+                        )
+                        .await
+                        .map_err(|_| {
+                            CliError::user(format!(
+                                "stdin read exceeded the {}s end-to-end deadline",
+                                cli.timeout_secs
+                            ))
+                        })?
+                        .ok_or_else(|| CliError::cancelled("stdin read cancelled by Ctrl+C"))?
+                        .map_err(|e| CliError::user(format!("failed to read stdin: {e}")))?;
                         buf.trim().to_string()
                     }
                 };
@@ -7134,9 +7898,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let (expanded_text, attachment_labels) = if submitted.tool_mode == TurnToolMode::None {
             (prompt.clone(), Vec::new())
         } else {
-            match await_cancellable(attachments::expand(&prompt, &perms)).await {
-                Some(Ok(expanded)) => (expanded.text, expanded.labels),
-                Some(Err(error)) => {
+            match tokio::time::timeout_at(
+                one_shot_deadline,
+                await_cancellable(attachments::expand(&prompt, &perms)),
+            )
+            .await
+            {
+                Ok(Some(Ok(expanded))) => (expanded.text, expanded.labels),
+                Ok(Some(Err(error))) => {
                     if !cli.jsonl {
                         eprintln!("attachment error: {}", terminal_inline(&error));
                     }
@@ -7159,7 +7928,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     return Err(mapped);
                 }
-                None => {
+                Ok(None) => {
                     let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
                     if cli.jsonl {
                         emit_jsonl(
@@ -7176,6 +7945,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
                         )?;
                         emit_jsonl_summary("cancelled", 1, 0)?;
+                    }
+                    return Err(mapped);
+                }
+                Err(_) => {
+                    let mapped = CliError::provider(format!(
+                        "attachment preflight exceeded the {}s end-to-end deadline",
+                        cli.timeout_secs
+                    ));
+                    if cli.jsonl {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "deadline",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                        )?;
+                        emit_jsonl_summary("error", 1, 1)?;
                     }
                     return Err(mapped);
                 }
@@ -7206,8 +7998,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             TurnToolMode::Full => &tools,
             TurnToolMode::None => &no_tools,
         };
-        let outcome = write_journal
-            .scope_turn(
+        let outcome = match tokio::time::timeout_at(
+            one_shot_deadline,
+            write_journal.scope_turn(
                 &journal_turn.token,
                 run_turn_cancellable(
                     &setup.provider,
@@ -7216,8 +8009,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     &cfg,
                     &mut session_state,
                 ),
-            )
-            .await;
+            ),
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(_) => TurnOutcome::Completed(Err(kitsu_core::AgentError::Provider(
+                ProviderError::Timeout,
+            ))),
+        };
         report_write_checkpoints(write_journal.drain_and_take_reports().await);
         if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
             report_write_checkpoint(report);
@@ -7231,6 +8031,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             TurnOutcome::Completed(Ok(_)) => {
                 let unfinished_agents = agent_registry.running();
                 if unfinished_agents > 0 {
+                    finish_assistant_disposition(
+                        cli,
+                        "piped:1",
+                        false,
+                        Some("unfinished background agents made the turn incomplete"),
+                    )?;
                     cancel_agents_and_report_writes(&agent_registry, 0, &write_journal).await;
                     let mapped = CliError::provider(format!(
                         "piped turn ended with {unfinished_agents} unfinished background agent(s)"
@@ -7254,6 +8060,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     return Err(mapped);
                 }
                 if let Some((kind, issue)) = strict_turn_failure(&session_state.last_turn) {
+                    finish_assistant_disposition(cli, "piped:1", false, Some(&issue))?;
                     cancel_agents_and_report_writes(
                         &agent_registry,
                         agent_watermark,
@@ -7299,6 +8106,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 if let Err(mapped) =
                     persist_session_required(&session_store, &session, &model, &messages)
                 {
+                    finish_assistant_disposition(cli, "piped:1", true, None)?;
                     if cli.jsonl {
                         emit_jsonl(
                             "error",
@@ -7317,6 +8125,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     return Err(mapped);
                 }
+                finish_assistant_disposition(cli, "piped:1", true, None)?;
                 if cli.jsonl {
                     emit_jsonl(
                         "turn_finished",
@@ -7332,6 +8141,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 Ok(())
             }
             TurnOutcome::Completed(Err(error)) => {
+                finish_assistant_disposition(
+                    cli,
+                    "piped:1",
+                    false,
+                    Some("the model turn failed before commit"),
+                )?;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let mapped = map_agent_error(
@@ -7362,6 +8177,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 Err(mapped)
             }
             TurnOutcome::Cancelled => {
+                finish_assistant_disposition(
+                    cli,
+                    "piped:1",
+                    false,
+                    Some("the model turn was cancelled before commit"),
+                )?;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let mapped = CliError::cancelled("request cancelled by Ctrl+C");
@@ -7390,6 +8211,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // one turn. Plain/accessibility modes must not make rustyline emit the
     // bracketed-paste terminal control sequences they promise to suppress.
     let assistive_input = kitsu_render::plain_mode();
+    let assistive_signal_task = assistive_input.then(|| {
+        tokio::spawn(async {
+            loop {
+                if tokio::signal::ctrl_c().await.is_err() {
+                    break;
+                }
+                ASSISTIVE_INPUT_INTERRUPTED.store(true, Ordering::Release);
+            }
+        })
+    });
     let rl_config = rustyline::Config::builder()
         .bracketed_paste(bracketed_paste_enabled(assistive_input))
         .completion_type(rustyline::CompletionType::List)
@@ -7631,6 +8462,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     surface_unobserved_background_results(&agent_registry);
+                    while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
                         eprintln!(
                             "new session cancelled because the current session could not be saved"
@@ -7735,6 +8567,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     surface_unobserved_background_results(&agent_registry);
+                    while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
                         eprintln!(
                             "resume cancelled because the current session could not be saved"
@@ -7801,23 +8634,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     ) {
                         eprintln!("warning: private artifact storage disabled: {error}");
                     }
-                    if no_project {
-                        *session.project_context.borrow_mut() = None;
-                        *session.provenance.borrow_mut() = fresh_provenance.clone();
-                        if saved.project_context.is_some() {
-                            eprintln!(
-                                "~ omitted saved project context because --no-project-context is active"
-                            );
-                        }
-                    } else {
-                        *session.project_context.borrow_mut() = saved
-                            .project_context
-                            .as_deref()
-                            .map(std::path::PathBuf::from);
-                        *session.provenance.borrow_mut() =
-                            resumed_provenance(&saved, &fresh_provenance);
+                    *session.project_context.borrow_mut() = fresh_project_context_source.clone();
+                    *session.provenance.borrow_mut() = fresh_provenance.clone();
+                    if no_project && saved.project_context.is_some() {
+                        eprintln!(
+                            "~ omitted saved project context because --no-project-context is active"
+                        );
                     }
-                    messages = restored_messages(&saved, &fresh_system_message, no_project);
+                    let system_context_changed =
+                        saved.messages.first() != Some(&fresh_system_message);
+                    messages = restored_messages(&saved, &fresh_system_message);
+                    let skill_changes = refresh_loaded_skill_messages(&mut messages, &skillset);
+                    if system_context_changed || !skill_changes.is_empty() {
+                        eprintln!(
+                            "~ rebuilt saved system context from current tools, project metadata, and bounded skill provenance"
+                        );
+                    }
+                    for change in skill_changes {
+                        eprintln!("~ {}", terminal_inline(&change));
+                    }
                     session_state = kitsu_core::AgentSessionState::default();
                     last_failed = None;
                     agent_registry.reset();
@@ -7964,7 +8799,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .begin_turn()
             .expect("interactive turns open steering sequentially");
         foreground_typeahead_active.store(true, Ordering::Release);
-        let typeahead = TypeaheadCollector::start(prompt_queue.clone(), steering.clone());
+        let typeahead = TypeaheadCollector::start(
+            prompt_queue.clone(),
+            steering.clone(),
+            agent_registry.clone(),
+        );
         let turn_outcome = write_journal
             .scope_turn(
                 &journal_turn.token,
@@ -7993,14 +8832,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             exit_after_queue = true;
             eprintln!("~ end of input received; exiting after queued prompts finish");
         }
-        for error in captured.steering_errors {
-            eprintln!("steering refused: {}", terminal_inline(&error));
-        }
-        for notice in captured.queue_notices {
-            eprintln!("~ {}", kitsu_render::sanitize_terminal_text(&notice));
-        }
-        for error in captured.queue_errors {
-            eprintln!("queue refused: {}", terminal_inline(&error));
+        for outcome in captured.outcomes {
+            match outcome {
+                TypeaheadOutcome::Notice(notice) => {
+                    eprintln!("~ {}", kitsu_render::sanitize_terminal_text(&notice));
+                }
+                TypeaheadOutcome::SteeringError(error) => {
+                    eprintln!("steering refused: {}", terminal_inline(&error));
+                }
+                TypeaheadOutcome::QueueError(error) => {
+                    eprintln!("queue refused: {}", terminal_inline(&error));
+                }
+            }
         }
         report_write_checkpoints(write_journal.drain_and_take_reports().await);
         if let Some(report) = write_journal.finish_attributed_turn(&journal_turn.token) {
@@ -8022,6 +8865,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 persist_session(&session_store, &session, &model, &messages);
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(e))) => {
+                finish_assistant_disposition(
+                    cli,
+                    "interactive",
+                    false,
+                    Some("the model turn failed before commit"),
+                )?;
                 messages = messages_before;
                 session_state = state_before;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -8033,6 +8882,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 );
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled) => {
+                finish_assistant_disposition(
+                    cli,
+                    "interactive",
+                    false,
+                    Some("the model turn was cancelled before commit"),
+                )?;
                 messages = messages_before;
                 session_state = state_before;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -8043,6 +8898,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
             InteractiveTurnOutcome::Steered(corrections) => {
+                finish_assistant_disposition(
+                    cli,
+                    "interactive",
+                    false,
+                    Some("the partial turn was replaced by a steering correction"),
+                )?;
                 messages = messages_before;
                 session_state = state_before;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -8061,6 +8922,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 eprintln!(
                     "~ steering accepted ({} correction(s)); partial response rolled back and the turn will restart before queued prompts",
                     corrections.len()
+                );
+                eprintln!("~ completed file changes, if any, remain on disk");
+            }
+            InteractiveTurnOutcome::QuitCancelled => {
+                finish_assistant_disposition(
+                    cli,
+                    "interactive",
+                    false,
+                    Some("the foreground turn was cancelled by /quit cancel"),
+                )?;
+                messages = messages_before;
+                session_state = state_before;
+                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
+                    .await;
+                let stopped = agent_registry.cancel_all().await;
+                let removed = prompt_queue.lock().expect("prompt queue").clear();
+                exit_after_queue = true;
+                last_failed = None;
+                kitsu_render::finish_line();
+                eprintln!(
+                    "~ exit cancellation completed: foreground rolled back, {} background job(s) joined, {} queued prompt(s) cleared",
+                    stopped.len(),
+                    removed.len()
                 );
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
@@ -8083,6 +8967,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let _ = rl.save_history(&history_path);
     }
     if let Some(task) = agent_notification_task {
+        task.abort();
+    }
+    if let Some(task) = assistive_signal_task {
         task.abort();
     }
     Ok(())
@@ -8377,6 +9264,8 @@ fn skill_catalog_payload(skillset: &skills::SkillSet, filter: &str) -> serde_jso
         "filter": filter,
         "count": entries.len(),
         "skills": entries,
+        "source_snapshots": skillset.source_snapshots(),
+        "omissions": skillset.omissions(),
     })
 }
 
@@ -8511,6 +9400,7 @@ async fn handle_slash(
                 | "help"
                 | "new"
                 | "permissions"
+                | "profiles"
                 | "retry"
                 | "sessions"
                 | "status"
@@ -8547,7 +9437,18 @@ async fn handle_slash(
             return SlashResult::Quit;
         }
         "" | "help" => {
-            eprintln!("{}", slash_help(model));
+            let text = slash_help(model);
+            eprintln!("{text}");
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "help",
+                "model": model,
+                "text": text,
+                "commands": SLASH_COMMANDS.iter().map(|spec| serde_json::json!({
+                    "name": spec.name,
+                    "syntax": spec.syntax(),
+                    "description": spec.description,
+                })).collect::<Vec<_>>(),
+            })));
         }
         "status" => {
             let text = format_session_status(model, messages, session, perms, registry, state);
@@ -8597,6 +9498,7 @@ async fn handle_slash(
                 context_window.get(),
                 session.offload_dir.borrow().clone(),
             );
+            cfg.reasoning_effort = session.reasoning_effort.get();
             cfg.event_log = runtime_log.cloned();
             let messages_before = messages.clone();
             let state_before = state.clone();
@@ -8653,10 +9555,18 @@ async fn handle_slash(
         }
         "checkpoints" => {
             report_write_checkpoints(journal.drain_and_take_reports().await);
-            eprintln!(
-                "{}",
-                format_checkpoint_summaries(&journal.checkpoint_summaries())
-            );
+            let checkpoints = journal.checkpoint_summaries();
+            eprintln!("{}", format_checkpoint_summaries(&checkpoints));
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "checkpoints",
+                "count": checkpoints.len(),
+                "checkpoints": checkpoints.iter().map(|checkpoint| serde_json::json!({
+                    "id": checkpoint.id,
+                    "label": checkpoint.label,
+                    "change_count": checkpoint.change_count,
+                    "paths": checkpoint.paths,
+                })).collect::<Vec<_>>(),
+            })));
         }
         "checkpoint" => {
             let id = match parse_exact_checkpoint_id(arg) {
@@ -8668,7 +9578,23 @@ async fn handle_slash(
             };
             report_write_checkpoints(journal.drain_and_take_reports().await);
             match journal.checkpoint_preview(id) {
-                Some(report) => eprintln!("{}", format_write_checkpoint(&report)),
+                Some(report) => {
+                    eprintln!("{}", format_write_checkpoint(&report));
+                    return SlashResult::Continue(Some(serde_json::json!({
+                        "kind": "checkpoint",
+                        "id": report.id,
+                        "label": report.label,
+                        "unified_diff": report.unified_diff,
+                        "diff_truncated": report.diff_truncated,
+                        "changes": report.changes.iter().map(|change| serde_json::json!({
+                            "path": change.path,
+                            "change": change.change,
+                            "before_bytes": change.before_bytes,
+                            "after_bytes": change.after_bytes,
+                            "first_changed_line": change.first_changed_line,
+                        })).collect::<Vec<_>>(),
+                    })));
+                }
                 None => {
                     eprintln!(
                         "checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints"
@@ -8824,6 +9750,36 @@ async fn handle_slash(
                 }
             };
         }
+        "reasoning" => {
+            let selected = match arg {
+                "" => session.reasoning_effort.get(),
+                "default" => None,
+                "none" => Some(kitsu_providers::ReasoningEffort::None),
+                "minimal" => Some(kitsu_providers::ReasoningEffort::Minimal),
+                "low" => Some(kitsu_providers::ReasoningEffort::Low),
+                "medium" => Some(kitsu_providers::ReasoningEffort::Medium),
+                "high" => Some(kitsu_providers::ReasoningEffort::High),
+                "xhigh" => Some(kitsu_providers::ReasoningEffort::XHigh),
+                _ => {
+                    eprintln!("usage: {}", slash_syntax("reasoning"));
+                    return SlashResult::Error;
+                }
+            };
+            if !arg.is_empty() {
+                session.reasoning_effort.set(selected);
+                eprintln!(
+                    "~ reasoning effort set to {} for subsequent turns",
+                    reasoning_effort_label(selected)
+                );
+            } else {
+                eprintln!("reasoning effort: {}", reasoning_effort_label(selected));
+            }
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "reasoning",
+                "changed": !arg.is_empty(),
+                "effort": reasoning_effort_label(selected),
+            })));
+        }
         "steer" => {
             eprintln!(
                 "/steer is accepted only while a response is running; enter `/steer <correction>` as type-ahead during that turn"
@@ -8846,6 +9802,24 @@ async fn handle_slash(
                     "  none - pre-grant --allow-path, --allow-write, or --allow-read-write for scripted runs"
                 );
             }
+            return SlashResult::Continue(Some(serde_json::json!({
+                "kind": "tools",
+                "count": session.tool_names.len(),
+                "tools": session.tool_names,
+                "permission_mode": mode,
+                "permission_behavior": behavior,
+            })));
+        }
+        "artifacts" => {
+            return match handle_command_artifacts(session.command_artifact_sink.as_ref(), arg) {
+                Ok(payload) => SlashResult::Continue(Some(payload)),
+                Err(()) => SlashResult::Error,
+            };
+        }
+        "profiles" => {
+            let text = format_agent_profiles(&session.agent_profiles);
+            eprintln!("{text}");
+            return SlashResult::Continue(Some(agent_profiles_payload(&session.agent_profiles)));
         }
         "agents" => {
             let command = if arg.is_empty() {
@@ -8859,6 +9833,15 @@ async fn handle_slash(
             return match handle_jobs_command(registry, journal, &command).await {
                 Ok(mut payload) => {
                     payload["alias"] = serde_json::Value::String("agents".to_string());
+                    SlashResult::Continue(Some(payload))
+                }
+                Err(()) => SlashResult::Error,
+            };
+        }
+        "agent" => {
+            return match handle_jobs_command(registry, journal, arg).await {
+                Ok(mut payload) => {
+                    payload["alias"] = serde_json::Value::String("agent".to_string());
                     SlashResult::Continue(Some(payload))
                 }
                 Err(()) => SlashResult::Error,
@@ -8898,13 +9881,25 @@ async fn handle_slash(
                                 skillset, s, false,
                             )));
                         }
-                        let loaded = skills::load_skill(s);
+                        let loaded = match skillset.load_with_snapshot(&s.name) {
+                            Ok(loaded) => loaded,
+                            Err(error) => {
+                                eprintln!(
+                                    "cannot load skill '{}': {}",
+                                    terminal_inline(&s.name),
+                                    terminal_inline(&error.to_string())
+                                );
+                                return SlashResult::Error;
+                            }
+                        };
                         if !s.links.is_empty() {
                             eprintln!("~ {} reference link(s) (not fetched)", s.links.len());
                         }
-                        messages.push(ChatMessage::user(format!("{marker}\n\n{loaded}")));
+                        messages.push(loaded_skill_message(&s.name, &loaded));
                         eprintln!("~ loaded skill '{}'", terminal_inline(&s.name));
-                        return SlashResult::Continue(Some(skill_load_payload(skillset, s, true)));
+                        let mut payload = skill_load_payload(skillset, s, true);
+                        payload["snapshot"] = serde_json::json!(loaded.snapshot);
+                        return SlashResult::Continue(Some(payload));
                     }
                     None => {
                         eprintln!("no skill named '{}' - try /skills", terminal_inline(arg));
@@ -10728,10 +11723,55 @@ mod tests {
         };
         let fresh = ChatMessage::system("FRESH_WITHOUT_PROJECT_CONTEXT");
 
-        let restored = restored_messages(&saved, &fresh, true);
+        let restored = restored_messages(&saved, &fresh);
         assert_eq!(restored[0], fresh);
         assert_eq!(restored[1], saved.messages[1]);
         assert!(!restored[0].content.contains("SECRET_PROJECT_CONTEXT"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn resume_revalidates_loaded_skill_snapshots_and_replaces_stale_text() {
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir(root.path().join(".git")).unwrap();
+        let skill_dir = root.path().join(".kitsu/skills/review");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        let manifest = skill_dir.join("SKILL.md");
+        std::fs::write(
+            &manifest,
+            "---\nname: review\ndescription: review code\n---\nOLD_SKILL_BODY\n",
+        )
+        .unwrap();
+        let permissions = Permissions::for_roots(&[], &[]).unwrap();
+        let before = skills::SkillSet::discover(root.path(), false, &permissions);
+        let loaded = before.load_with_snapshot("review").unwrap();
+        let mut messages = vec![
+            ChatMessage::system("fresh system"),
+            loaded_skill_message("review", &loaded),
+            ChatMessage::user("ordinary conversation"),
+        ];
+
+        std::fs::write(
+            &manifest,
+            "---\nname: review\ndescription: review code\n---\nNEW_SKILL_BODY\n",
+        )
+        .unwrap();
+        let current = skills::SkillSet::discover(root.path(), false, &permissions);
+        let notices = refresh_loaded_skill_messages(&mut messages, &current);
+
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("manifest_hash"));
+        assert!(messages[1].content.contains("NEW_SKILL_BODY"));
+        assert!(!messages[1].content.contains("OLD_SKILL_BODY"));
+        assert_eq!(messages[2].content, "ordinary conversation");
+
+        std::fs::remove_dir_all(skill_dir).unwrap();
+        let absent = skills::SkillSet::discover(root.path(), false, &permissions);
+        let notices = refresh_loaded_skill_messages(&mut messages, &absent);
+        assert_eq!(notices.len(), 1);
+        assert!(notices[0].contains("removed saved loaded skill"));
+        assert_eq!(messages.len(), 2);
+        assert_eq!(messages[1].content, "ordinary conversation");
     }
 
     #[test]

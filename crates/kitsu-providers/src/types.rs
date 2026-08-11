@@ -101,7 +101,24 @@ pub struct ChatRequest {
     pub tools: Option<Vec<ToolDescriptor>>,
     pub stream: bool,
     pub temperature: Option<f32>,
+    /// Optional OpenAI-compatible reasoning-effort hint. Gateways that support
+    /// reasoning models receive this as `reasoning_effort`; ordinary models may
+    /// ignore it when omitted.
+    pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: Option<u32>,
+}
+
+/// Common OpenAI-compatible reasoning-effort levels.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ReasoningEffort {
+    None,
+    Minimal,
+    Low,
+    Medium,
+    High,
+    #[serde(rename = "xhigh")]
+    XHigh,
 }
 
 /// Why the model stopped generating.

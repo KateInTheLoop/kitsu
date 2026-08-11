@@ -406,7 +406,11 @@ fn test_init_is_no_clobber_and_doctor_is_read_only_json() {
     assert_eq!(report["read_only"], true);
     assert_eq!(report["config"]["parse_ok"], true);
     assert_eq!(report["gateway"]["name"], "ollama");
-    assert_eq!(report["auth"]["credential_present"], true);
+    assert_eq!(report["auth"]["credential_required"], false);
+    assert_eq!(
+        report["auth"]["credential_present"],
+        serde_json::Value::Null
+    );
     assert_eq!(report["online"]["requested"], false);
     assert!(!home.path().join(".kitsu").exists());
 }
@@ -737,7 +741,7 @@ async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
             "stderr: {}",
             String::from_utf8_lossy(&output.stderr)
         );
-        assert!(String::from_utf8_lossy(&output.stderr).contains("autosave enabled"));
+        assert!(String::from_utf8_lossy(&output.stderr).contains("autosave planned"));
 
         let mut list = base_cmd(&home_path);
         let output = list
@@ -1053,7 +1057,7 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
     tokio::task::spawn_blocking(move || {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-        cmd.args(["--jsonl", "ask", "hello"]);
+        cmd.args(["--jsonl", "--reasoning-effort", "high", "ask", "hello"]);
         let output = cmd.output().unwrap();
         assert!(
             output.status.success(),
@@ -1095,6 +1099,12 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
             })
             .collect::<String>();
         assert_eq!(deltas, events[assistant_index]["text"]);
+        let disposition_index = events
+            .iter()
+            .position(|event| event["type"] == "assistant_disposition")
+            .expect("terminal assistant disposition");
+        assert!(assistant_index < disposition_index);
+        assert_eq!(events[disposition_index]["status"], "committed");
         assert_eq!(events.last().unwrap()["type"], "final_summary");
         assert_eq!(events.last().unwrap()["status"], "ok");
         assert!(!stdout.lines().any(|line| !line.starts_with('{')));
@@ -1114,6 +1124,88 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         request["stream"], true,
         "JSONL must preserve provider streaming"
     );
+    assert_eq!(request["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_jsonl_partial_stream_failure_discards_provisional_assistant_output() {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // Write two HTTP chunks with a gap so the first assistant fragment reaches
+    // the runtime observer before malformed provider data fails the stream.
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        let (mut socket, _) = listener.accept().await.unwrap();
+        let mut request = Vec::new();
+        let mut buffer = [0_u8; 2048];
+        while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+            let read = socket.read(&mut buffer).await.unwrap();
+            assert!(read > 0, "client closed before sending request headers");
+            request.extend_from_slice(&buffer[..read]);
+        }
+        socket
+            .write_all(
+                b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+            )
+            .await
+            .unwrap();
+        let first = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"provisional\"},\"finish_reason\":null}]}\n\n";
+        socket
+            .write_all(format!("{:x}\r\n", first.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.write_all(first).await.unwrap();
+        socket.write_all(b"\r\n").await.unwrap();
+        socket.flush().await.unwrap();
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        let malformed = b"data: {not-json}\n\n";
+        socket
+            .write_all(format!("{:x}\r\n", malformed.len()).as_bytes())
+            .await
+            .unwrap();
+        socket.write_all(malformed).await.unwrap();
+        socket.write_all(b"\r\n0\r\n\r\n").await.unwrap();
+    });
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "ask", "fail after a fragment"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let delta = events
+        .iter()
+        .position(|event| event["type"] == "assistant_delta" && event["text"] == "provisional")
+        .unwrap_or_else(|| panic!("provisional fragment missing: {events:#?}"));
+    let disposition = events
+        .iter()
+        .position(|event| event["type"] == "assistant_disposition")
+        .expect("discard disposition");
+    let error = events
+        .iter()
+        .position(|event| event["type"] == "error")
+        .expect("provider error");
+    assert!(delta < disposition && disposition < error);
+    assert_eq!(events[disposition]["status"], "discarded");
+    assert!(!events.iter().any(|event| event["type"] == "assistant"));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "error");
+    server.await.unwrap();
 }
 
 #[tokio::test]
@@ -1277,13 +1369,15 @@ fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
             "run_started",
             "turn_started",
             "provider_request",
+            "assistant_disposition",
             "error",
             "turn_finished",
             "final_summary",
         ]
     );
-    assert_eq!(events[3]["exit_code"], 1);
-    assert_eq!(events[5]["user_failures"], 1);
+    assert_eq!(events[3]["status"], "discarded");
+    assert_eq!(events[4]["exit_code"], 1);
+    assert_eq!(events[6]["user_failures"], 1);
 }
 
 #[test]
@@ -1406,6 +1500,7 @@ async fn test_jsonl_sigint_emits_cancelled_turn_and_summary() {
             "turn_started",
             "provider_request",
             "provider_attempt",
+            "assistant_disposition",
             "error",
             "turn_finished",
             "final_summary",
@@ -1414,11 +1509,12 @@ async fn test_jsonl_sigint_emits_cancelled_turn_and_summary() {
     assert_eq!(events[3]["category"], "cancelled");
     assert_eq!(events[3]["outcome"], "cancelled");
     assert_eq!(events[3]["terminal"], true);
-    assert_eq!(events[4]["kind"], "cancelled");
-    assert_eq!(events[4]["exit_code"], 130);
-    assert_eq!(events[5]["status"], "cancelled");
+    assert_eq!(events[4]["status"], "discarded");
+    assert_eq!(events[5]["kind"], "cancelled");
+    assert_eq!(events[5]["exit_code"], 130);
     assert_eq!(events[6]["status"], "cancelled");
-    assert_eq!(events[6]["cancelled_failures"], 1);
+    assert_eq!(events[7]["status"], "cancelled");
+    assert_eq!(events[7]["cancelled_failures"], 1);
 }
 
 #[cfg(unix)]
@@ -1644,6 +1740,7 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
             "turn_started",
             "provider_request",
             "provider_attempt",
+            "assistant_disposition",
             "error",
             "turn_finished",
             "command_finished",
@@ -1652,10 +1749,11 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
     );
     assert_eq!(events[4]["category"], "cancelled");
     assert_eq!(events[4]["outcome"], "cancelled");
-    assert_eq!(events[5]["kind"], "cancelled");
-    assert_eq!(events[6]["status"], "cancelled");
+    assert_eq!(events[5]["status"], "discarded");
+    assert_eq!(events[6]["kind"], "cancelled");
     assert_eq!(events[7]["status"], "cancelled");
     assert_eq!(events[8]["status"], "cancelled");
+    assert_eq!(events[9]["status"], "cancelled");
 }
 
 #[tokio::test]
@@ -1914,6 +2012,108 @@ async fn test_chat_piped_stdin_one_shot() {
     })
     .await
     .expect("spawned kitsu chat should join");
+}
+
+/// A positional chat prompt is authoritative input and must not wait for an
+/// unrelated piped stdin handle to reach EOF.
+#[tokio::test]
+#[serial]
+async fn test_chat_positional_prompt_ignores_held_open_stdin() {
+    use std::process::Stdio;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("positional prompt"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "positional complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("kitsu"));
+    cmd.env("HOME", home.path())
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--no-stream",
+            "--timeout-secs",
+            "2",
+            "chat",
+            "positional prompt",
+        ])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let held_stdin = child.stdin.take().expect("keep stdin open");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("positional prompt must not wait for stdin EOF")
+    .unwrap();
+    drop(held_stdin);
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(String::from_utf8_lossy(&output.stdout).contains("positional complete"));
+    server.verify().await;
+}
+
+/// Piped prompt acquisition consumes the same bounded one-shot budget as the
+/// later provider turn rather than waiting forever or starting a fresh timer.
+#[tokio::test]
+#[serial]
+async fn test_chat_piped_input_obeys_end_to_end_deadline() {
+    use std::process::Stdio;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin("kitsu"));
+    cmd.env("HOME", home.path())
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--jsonl", "--timeout-secs", "1", "chat"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    let held_stdin = child.stdin.take().expect("keep stdin open");
+    let output = tokio::time::timeout(
+        std::time::Duration::from_secs(3),
+        tokio::task::spawn_blocking(move || child.wait_with_output().unwrap()),
+    )
+    .await
+    .expect("piped input must be bounded by --timeout-secs")
+    .unwrap();
+    drop(held_stdin);
+    assert_eq!(output.status.code(), Some(1));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(events.first().unwrap()["type"], "run_started");
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("end-to-end deadline"))
+    }));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
 }
 
 // --- chat: end-to-end tool round --------------------------------------------
@@ -3470,9 +3670,7 @@ fn test_yes_does_not_enable_commands_but_explicit_command_flags_do() {
         .assert()
         .success()
         .stderr(predicate::str::contains("command_exec"))
-        .stderr(predicate::str::contains(
-            "NOT host filesystem, network, or process sandboxes",
-        ));
+        .stderr(predicate::str::contains("mandatory OS containment"));
 
     let mut exact_pregrant = base_cmd(home.path());
     exact_pregrant.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
@@ -4118,6 +4316,49 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .count();
     assert_eq!(started, 9);
     assert_eq!(finished, started, "every slash frame must close");
+}
+
+#[test]
+#[serial]
+fn test_jsonl_profiles_and_reasoning_controls_are_structured() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("profiles.txt");
+    fs::write(&script, "/profiles\n/reasoning high\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["--jsonl", "chat", "--script", &script.to_string_lossy()])
+        .output()
+        .expect("profile query script");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let results = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 2);
+    assert_eq!(results[0]["result"]["kind"], "agent_profiles");
+    assert_eq!(results[0]["result"]["count"], 2);
+    let names = results[0]["result"]["profiles"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|profile| profile["name"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert!(names.contains(&"reasoning"));
+    assert!(names.contains(&"reviewer"));
+    assert_eq!(results[1]["result"]["kind"], "reasoning");
+    assert_eq!(results[1]["result"]["changed"], true);
+    assert_eq!(results[1]["result"]["effort"], "high");
 }
 
 #[tokio::test]

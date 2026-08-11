@@ -6,7 +6,7 @@ use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
 use futures::StreamExt;
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
-    ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink, Role, ToolCall,
+    ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink, ReasoningEffort, Role, ToolCall,
 };
 use kitsu_tools::{
     scope_command_progress, CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
@@ -40,6 +40,8 @@ pub struct AgentConfig {
     pub offload_dir: Option<std::path::PathBuf>,
     pub stream: bool,
     pub temperature: Option<f32>,
+    /// Optional reasoning-effort hint forwarded to compatible gateways.
+    pub reasoning_effort: Option<ReasoningEffort>,
     /// Max output tokens per response. `None` lets the gateway apply its own
     /// (often small, e.g. 4096) default — which silently truncates long outputs
     /// like code reviews. Set this to lift the cap.
@@ -591,6 +593,7 @@ impl Default for AgentConfig {
             offload_dir: None,
             stream: true,
             temperature: None,
+            reasoning_effort: None,
             max_tokens: None,
             compaction: CompactionMode::Trim,
             quiet: false,
@@ -873,6 +876,7 @@ where
             tools: offered_tools,
             stream: cfg.stream,
             temperature: cfg.temperature,
+            reasoning_effort: cfg.reasoning_effort,
             max_tokens: cfg.max_tokens,
         };
 
@@ -2104,6 +2108,7 @@ fn bounded_summary_request(
             tools: None,
             stream: false,
             temperature: cfg.temperature,
+            reasoning_effort: cfg.reasoning_effort,
             max_tokens: Some(max_tokens),
         },
         shortened,

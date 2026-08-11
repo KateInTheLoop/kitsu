@@ -120,6 +120,8 @@ struct WireRequest<'a> {
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
     #[serde(skip_serializing_if = "Option::is_none")]
+    reasoning_effort: Option<crate::ReasoningEffort>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
 }
 
@@ -232,6 +234,7 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
             None
         },
         temperature: req.temperature,
+        reasoning_effort: req.reasoning_effort,
         max_tokens: req.max_tokens,
     }
 }

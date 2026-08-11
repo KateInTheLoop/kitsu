@@ -1,0 +1,1112 @@
+//! Bounded, redacted state for one detached-agent thread.
+//!
+//! The durable view intentionally contains no tool arguments, tool results,
+//! provider bodies, call identifiers, or the registry's unbounded terminal
+//! result field. It can retain bounded/redacted assistant text and is suitable
+//! for UI inspection and local persistence after
+//! [`AgentThreadSnapshotDto::validate`] succeeds.
+
+use std::collections::VecDeque;
+use std::fmt;
+use std::time::Instant;
+
+use kitsu_core::{AgentRuntimeEvent, ProviderRequestPurpose};
+use kitsu_providers::{ProviderAttemptCategory, ProviderAttemptOutcome};
+use serde::{Deserialize, Serialize};
+use tokio::sync::mpsc;
+
+pub const AGENT_THREAD_SCHEMA_VERSION: u32 = 1;
+pub const DEFAULT_AGENT_TIMELINE_EVENTS: usize = 128;
+pub const DEFAULT_AGENT_TIMELINE_BYTES: usize = 64 * 1024;
+pub const DEFAULT_AGENT_TIMELINE_ENTRY_BYTES: usize = 4 * 1024;
+pub const DEFAULT_AGENT_STEERING_CAPACITY: usize = 8;
+pub const DEFAULT_AGENT_STEERING_BYTES: usize = 8 * 1024;
+
+const MAX_AGENT_TIMELINE_EVENTS: usize = 2_048;
+const MAX_AGENT_TIMELINE_BYTES: usize = 2 * 1024 * 1024;
+const MAX_AGENT_TIMELINE_ENTRY_BYTES: usize = 64 * 1024;
+const MAX_AGENT_STEERING_CAPACITY: usize = 64;
+const MAX_AGENT_STEERING_BYTES: usize = 64 * 1024;
+const MIN_AGENT_TIMELINE_BYTES: usize = 64;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentThreadLimits {
+    pub max_events: usize,
+    pub max_bytes: usize,
+    pub max_entry_bytes: usize,
+    pub steering_capacity: usize,
+    pub max_steering_bytes: usize,
+}
+
+impl Default for AgentThreadLimits {
+    fn default() -> Self {
+        Self {
+            max_events: DEFAULT_AGENT_TIMELINE_EVENTS,
+            max_bytes: DEFAULT_AGENT_TIMELINE_BYTES,
+            max_entry_bytes: DEFAULT_AGENT_TIMELINE_ENTRY_BYTES,
+            steering_capacity: DEFAULT_AGENT_STEERING_CAPACITY,
+            max_steering_bytes: DEFAULT_AGENT_STEERING_BYTES,
+        }
+    }
+}
+
+impl AgentThreadLimits {
+    pub fn validate(self) -> Result<Self, AgentThreadLimitError> {
+        if !(1..=MAX_AGENT_TIMELINE_EVENTS).contains(&self.max_events) {
+            return Err(AgentThreadLimitError(
+                "max_events",
+                MAX_AGENT_TIMELINE_EVENTS,
+            ));
+        }
+        if !(MIN_AGENT_TIMELINE_BYTES..=MAX_AGENT_TIMELINE_BYTES).contains(&self.max_bytes) {
+            return Err(AgentThreadLimitError("max_bytes", MAX_AGENT_TIMELINE_BYTES));
+        }
+        if !(1..=MAX_AGENT_TIMELINE_ENTRY_BYTES).contains(&self.max_entry_bytes)
+            || self.max_entry_bytes > self.max_bytes
+        {
+            return Err(AgentThreadLimitError(
+                "max_entry_bytes",
+                MAX_AGENT_TIMELINE_ENTRY_BYTES,
+            ));
+        }
+        if !(1..=MAX_AGENT_STEERING_CAPACITY).contains(&self.steering_capacity) {
+            return Err(AgentThreadLimitError(
+                "steering_capacity",
+                MAX_AGENT_STEERING_CAPACITY,
+            ));
+        }
+        if !(1..=MAX_AGENT_STEERING_BYTES).contains(&self.max_steering_bytes) {
+            return Err(AgentThreadLimitError(
+                "max_steering_bytes",
+                MAX_AGENT_STEERING_BYTES,
+            ));
+        }
+        Ok(self)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentThreadLimitError(&'static str, usize);
+
+impl fmt::Display for AgentThreadLimitError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            formatter,
+            "invalid agent thread {} (hard maximum {})",
+            self.0, self.1
+        )
+    }
+}
+
+impl std::error::Error for AgentThreadLimitError {}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentTimelineKind {
+    UserTask,
+    Assistant,
+    Provider,
+    Tool,
+    Usage,
+    Steering,
+    Lifecycle,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTimelineEntry {
+    pub sequence: u64,
+    pub elapsed_ms: u64,
+    pub kind: AgentTimelineKind,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub round: Option<u32>,
+    pub text: String,
+    pub truncated: bool,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentTimelineSnapshot {
+    pub entries: Vec<AgentTimelineEntry>,
+    pub dropped_entries: u64,
+    pub retained_bytes: usize,
+    pub closed: bool,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentThreadPhase {
+    Running,
+    Done,
+    Failed,
+    Cancelled,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AgentHandoffState {
+    Unavailable,
+    Ready,
+    Acknowledged,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentThreadSnapshot {
+    pub id: u64,
+    pub task: String,
+    pub model: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub profile: Option<String>,
+    pub phase: AgentThreadPhase,
+    pub handoff: AgentHandoffState,
+    pub elapsed_ms: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_bytes: Option<usize>,
+    pub steering_open: bool,
+    pub pending_steering: usize,
+    pub timeline: AgentTimelineSnapshot,
+}
+
+/// Versioned persistence representation. It deliberately mirrors only the
+/// sanitized snapshot, never a runnable handle, permission grant, raw tool
+/// event, steering sender, or unbounded terminal result field. Bounded
+/// assistant timeline text remains visible.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct AgentThreadSnapshotDto {
+    pub schema_version: u32,
+    pub thread: AgentThreadSnapshot,
+}
+
+impl AgentThreadSnapshotDto {
+    pub fn from_snapshot(snapshot: &AgentThreadSnapshot) -> Self {
+        Self {
+            schema_version: AGENT_THREAD_SCHEMA_VERSION,
+            thread: snapshot.clone(),
+        }
+    }
+
+    pub fn validate(&self, limits: AgentThreadLimits) -> Result<(), AgentThreadDtoError> {
+        let limits = limits
+            .validate()
+            .map_err(|error| AgentThreadDtoError(error.to_string()))?;
+        if self.schema_version != AGENT_THREAD_SCHEMA_VERSION {
+            return Err(AgentThreadDtoError(format!(
+                "unsupported agent thread schema {}; expected {}",
+                self.schema_version, AGENT_THREAD_SCHEMA_VERSION
+            )));
+        }
+        if self.thread.timeline.entries.len() > limits.max_events {
+            return Err(AgentThreadDtoError(
+                "agent thread timeline exceeds its event limit".to_string(),
+            ));
+        }
+        let mut retained_bytes = 0usize;
+        let mut prior_sequence = None;
+        for entry in &self.thread.timeline.entries {
+            if entry.text.len() > limits.max_entry_bytes
+                || sanitize_and_redact_text(&entry.text) != entry.text
+            {
+                return Err(AgentThreadDtoError(
+                    "agent thread timeline contains oversized or unsafe text".to_string(),
+                ));
+            }
+            if prior_sequence.is_some_and(|prior| entry.sequence <= prior) {
+                return Err(AgentThreadDtoError(
+                    "agent thread timeline sequence is not strictly increasing".to_string(),
+                ));
+            }
+            prior_sequence = Some(entry.sequence);
+            retained_bytes = retained_bytes.saturating_add(entry.text.len());
+        }
+        if retained_bytes != self.thread.timeline.retained_bytes
+            || retained_bytes > limits.max_bytes
+            || self.thread.pending_steering > limits.steering_capacity
+        {
+            return Err(AgentThreadDtoError(
+                "agent thread timeline accounting is invalid".to_string(),
+            ));
+        }
+        if self.thread.task.len() > limits.max_entry_bytes
+            || self.thread.model.len() > limits.max_entry_bytes
+            || sanitize_and_redact_text(&self.thread.task) != self.thread.task
+            || sanitize_and_redact_text(&self.thread.model) != self.thread.model
+            || self.thread.profile.as_ref().is_some_and(|profile| {
+                profile.len() > 256 || sanitize_and_redact_text(profile) != *profile
+            })
+        {
+            return Err(AgentThreadDtoError(
+                "agent thread metadata contains oversized or unsafe text".to_string(),
+            ));
+        }
+        let terminal = self.thread.phase != AgentThreadPhase::Running;
+        if terminal != self.thread.timeline.closed
+            || (terminal && self.thread.handoff == AgentHandoffState::Unavailable)
+            || (!terminal && self.thread.handoff != AgentHandoffState::Unavailable)
+            || (terminal && self.thread.steering_open)
+        {
+            return Err(AgentThreadDtoError(
+                "agent thread lifecycle state is inconsistent".to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn validate_default(&self) -> Result<(), AgentThreadDtoError> {
+        self.validate(AgentThreadLimits::default())
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentThreadDtoError(String);
+
+impl fmt::Display for AgentThreadDtoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.0)
+    }
+}
+
+impl std::error::Error for AgentThreadDtoError {}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSteeringMessage {
+    pub sequence: u64,
+    pub correction: String,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct AgentSteeringReceipt {
+    pub id: u64,
+    pub sequence: u64,
+    pub pending: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum AgentSteeringErrorKind {
+    UnknownAgent,
+    NotRunning,
+    Closed,
+    Empty,
+    TooLarge,
+    Full,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AgentSteeringError {
+    pub id: u64,
+    pub kind: AgentSteeringErrorKind,
+    pub limit: Option<usize>,
+}
+
+impl AgentSteeringError {
+    pub(crate) fn new(id: u64, kind: AgentSteeringErrorKind, limit: Option<usize>) -> Self {
+        Self { id, kind, limit }
+    }
+}
+
+impl fmt::Display for AgentSteeringError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            AgentSteeringErrorKind::UnknownAgent => {
+                write!(formatter, "no background agent #{}", self.id)
+            }
+            AgentSteeringErrorKind::NotRunning => {
+                write!(
+                    formatter,
+                    "background agent #{} is no longer running",
+                    self.id
+                )
+            }
+            AgentSteeringErrorKind::Closed => {
+                write!(
+                    formatter,
+                    "background agent #{} is closed to steering",
+                    self.id
+                )
+            }
+            AgentSteeringErrorKind::Empty => formatter.write_str("steering correction is empty"),
+            AgentSteeringErrorKind::TooLarge => write!(
+                formatter,
+                "steering correction exceeds the {}-byte limit",
+                self.limit.unwrap_or_default()
+            ),
+            AgentSteeringErrorKind::Full => write!(
+                formatter,
+                "background agent #{} steering queue is full",
+                self.id
+            ),
+        }
+    }
+}
+
+impl std::error::Error for AgentSteeringError {}
+
+/// Receiver owned by exactly one running nested-agent loop. Each record gets a
+/// distinct channel, so a correction can never be consumed by another agent.
+pub struct AgentThreadRuntime {
+    receiver: mpsc::Receiver<AgentSteeringMessage>,
+}
+
+impl AgentThreadRuntime {
+    pub async fn recv_steering(&mut self) -> Option<AgentSteeringMessage> {
+        self.receiver.recv().await
+    }
+
+    #[cfg(test)]
+    pub fn try_recv_steering(&mut self) -> Result<AgentSteeringMessage, mpsc::error::TryRecvError> {
+        self.receiver.try_recv()
+    }
+}
+
+pub(crate) struct AgentThreadState {
+    task: String,
+    model: String,
+    profile: Option<String>,
+    phase: AgentThreadPhase,
+    handoff: AgentHandoffState,
+    result_bytes: Option<usize>,
+    steering_sender: Option<mpsc::Sender<AgentSteeringMessage>>,
+    steering_capacity: usize,
+    max_steering_bytes: usize,
+    next_steering_sequence: u64,
+    timeline: AgentTimeline,
+}
+
+impl AgentThreadState {
+    pub(crate) fn new(
+        task: &str,
+        model: &str,
+        profile: Option<&str>,
+        limits: AgentThreadLimits,
+    ) -> (Self, AgentThreadRuntime) {
+        let limits = limits.validate().expect("validated agent thread limits");
+        let (sender, receiver) = mpsc::channel(limits.steering_capacity);
+        let mut timeline = AgentTimeline::new(limits);
+        timeline.push(AgentTimelineKind::UserTask, None, task);
+        (
+            Self {
+                task: sanitize_and_truncate(task, limits.max_entry_bytes).0,
+                model: sanitize_and_truncate(
+                    &safe_inline_label(model, 256),
+                    limits.max_entry_bytes,
+                )
+                .0,
+                profile: profile.map(|name| safe_inline_label(name, 64)),
+                phase: AgentThreadPhase::Running,
+                handoff: AgentHandoffState::Unavailable,
+                result_bytes: None,
+                steering_sender: Some(sender),
+                steering_capacity: limits.steering_capacity,
+                max_steering_bytes: limits.max_steering_bytes,
+                next_steering_sequence: 0,
+                timeline,
+            },
+            AgentThreadRuntime { receiver },
+        )
+    }
+
+    pub(crate) fn record_runtime_event(&mut self, event: &AgentRuntimeEvent) {
+        if self.phase != AgentThreadPhase::Running {
+            return;
+        }
+        match event {
+            AgentRuntimeEvent::ProviderRequest { round, purpose, .. } => self.timeline.push(
+                AgentTimelineKind::Provider,
+                Some(*round),
+                &format!("{} request started", purpose_label(*purpose)),
+            ),
+            AgentRuntimeEvent::ProviderAttempt {
+                round,
+                attempt,
+                max_attempts,
+                category,
+                outcome,
+                ..
+            } => self.timeline.push(
+                AgentTimelineKind::Provider,
+                Some(*round),
+                &format!(
+                    "attempt {attempt}/{max_attempts}: {}, {}",
+                    category_label(*category),
+                    outcome_label(*outcome)
+                ),
+            ),
+            AgentRuntimeEvent::AssistantDelta { round, text } => {
+                self.timeline
+                    .push(AgentTimelineKind::Assistant, Some(*round), text);
+            }
+            AgentRuntimeEvent::Usage {
+                round,
+                prompt_tokens,
+                completion_tokens,
+                total_tokens,
+                ..
+            } => self.timeline.push(
+                AgentTimelineKind::Usage,
+                Some(*round),
+                &format!(
+                    "usage: {prompt_tokens} prompt, {completion_tokens} completion, {total_tokens} total tokens"
+                ),
+            ),
+            AgentRuntimeEvent::ToolStarted { round, name, .. } => self.timeline.push(
+                AgentTimelineKind::Tool,
+                Some(*round),
+                &format!("tool {} started", safe_inline_label(name, 128)),
+            ),
+            AgentRuntimeEvent::ToolFinished {
+                round,
+                name,
+                success,
+                cancelled,
+                ..
+            } => {
+                let outcome = if *cancelled {
+                    "cancelled"
+                } else if *success {
+                    "finished"
+                } else {
+                    "failed"
+                };
+                self.timeline.push(
+                    AgentTimelineKind::Tool,
+                    Some(*round),
+                    &format!("tool {} {outcome}", safe_inline_label(name, 128)),
+                );
+            }
+            AgentRuntimeEvent::TurnFinished {
+                success,
+                tool_errors,
+                policy_errors,
+                ..
+            } => self.timeline.push(
+                AgentTimelineKind::Lifecycle,
+                None,
+                &format!(
+                    "turn {}; {tool_errors} tool errors, {policy_errors} policy errors",
+                    if *success { "completed" } else { "failed" }
+                ),
+            ),
+        }
+    }
+
+    pub(crate) fn submit_steering(
+        &mut self,
+        id: u64,
+        correction: &str,
+    ) -> Result<AgentSteeringReceipt, AgentSteeringError> {
+        if self.phase != AgentThreadPhase::Running {
+            return Err(AgentSteeringError::new(
+                id,
+                AgentSteeringErrorKind::NotRunning,
+                None,
+            ));
+        }
+        if correction.len() > self.max_steering_bytes {
+            return Err(AgentSteeringError::new(
+                id,
+                AgentSteeringErrorKind::TooLarge,
+                Some(self.max_steering_bytes),
+            ));
+        }
+        let correction = sanitize_and_redact_text(correction).trim().to_string();
+        if correction.is_empty() {
+            return Err(AgentSteeringError::new(
+                id,
+                AgentSteeringErrorKind::Empty,
+                None,
+            ));
+        }
+        let Some(sender) = self.steering_sender.as_ref() else {
+            return Err(AgentSteeringError::new(
+                id,
+                AgentSteeringErrorKind::Closed,
+                None,
+            ));
+        };
+        let sequence = self.next_steering_sequence.saturating_add(1);
+        let message = AgentSteeringMessage {
+            sequence,
+            correction: correction.clone(),
+        };
+        match sender.try_send(message) {
+            Ok(()) => {
+                self.next_steering_sequence = sequence;
+                let pending = self.steering_capacity.saturating_sub(sender.capacity());
+                self.timeline.push(
+                    AgentTimelineKind::Steering,
+                    None,
+                    &format!("correction #{sequence} queued: {correction}"),
+                );
+                Ok(AgentSteeringReceipt {
+                    id,
+                    sequence,
+                    pending,
+                })
+            }
+            Err(mpsc::error::TrySendError::Full(_)) => Err(AgentSteeringError::new(
+                id,
+                AgentSteeringErrorKind::Full,
+                Some(self.steering_capacity),
+            )),
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                self.steering_sender = None;
+                Err(AgentSteeringError::new(
+                    id,
+                    AgentSteeringErrorKind::Closed,
+                    None,
+                ))
+            }
+        }
+    }
+
+    pub(crate) fn steering_applied(&mut self, sequence: u64) -> bool {
+        if self.phase == AgentThreadPhase::Running {
+            self.timeline.push(
+                AgentTimelineKind::Lifecycle,
+                None,
+                &format!("steering correction #{sequence} applied"),
+            );
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn close_steering(&mut self, reason: &str) -> bool {
+        let was_open = self.steering_sender.take().is_some();
+        if was_open && self.phase == AgentThreadPhase::Running {
+            self.timeline.push(
+                AgentTimelineKind::Lifecycle,
+                None,
+                &format!("steering closed: {}", safe_inline_label(reason, 256)),
+            );
+        }
+        was_open
+    }
+
+    pub(crate) fn finish(&mut self, phase: AgentThreadPhase, result_bytes: usize) {
+        if self.phase != AgentThreadPhase::Running {
+            return;
+        }
+        debug_assert_ne!(phase, AgentThreadPhase::Running);
+        self.phase = phase;
+        self.result_bytes = Some(result_bytes);
+        self.handoff = AgentHandoffState::Ready;
+        self.steering_sender = None;
+        self.timeline.push(
+            AgentTimelineKind::Lifecycle,
+            None,
+            match phase {
+                AgentThreadPhase::Done => "agent completed; result ready for handoff",
+                AgentThreadPhase::Failed => "agent failed; result ready for handoff",
+                AgentThreadPhase::Cancelled => "agent cancelled; result ready for handoff",
+                AgentThreadPhase::Running => unreachable!(),
+            },
+        );
+        self.timeline.closed = true;
+    }
+
+    pub(crate) fn acknowledge_handoff(&mut self) -> bool {
+        if self.handoff == AgentHandoffState::Ready {
+            self.handoff = AgentHandoffState::Acknowledged;
+            true
+        } else {
+            false
+        }
+    }
+
+    pub(crate) fn handoff(&self) -> AgentHandoffState {
+        self.handoff
+    }
+
+    pub(crate) fn snapshot(&self, id: u64, elapsed_ms: u64) -> AgentThreadSnapshot {
+        let pending_steering = self.steering_sender.as_ref().map_or(0, |sender| {
+            self.steering_capacity.saturating_sub(sender.capacity())
+        });
+        AgentThreadSnapshot {
+            id,
+            task: self.task.clone(),
+            model: self.model.clone(),
+            profile: self.profile.clone(),
+            phase: self.phase,
+            handoff: self.handoff,
+            elapsed_ms,
+            result_bytes: self.result_bytes,
+            steering_open: self.steering_sender.is_some(),
+            pending_steering,
+            timeline: self.timeline.snapshot(),
+        }
+    }
+}
+
+struct AgentTimeline {
+    started_at: Instant,
+    limits: AgentThreadLimits,
+    entries: VecDeque<AgentTimelineEntry>,
+    dropped_entries: u64,
+    retained_bytes: usize,
+    next_sequence: u64,
+    closed: bool,
+}
+
+impl AgentTimeline {
+    fn new(limits: AgentThreadLimits) -> Self {
+        Self {
+            started_at: Instant::now(),
+            limits,
+            entries: VecDeque::new(),
+            dropped_entries: 0,
+            retained_bytes: 0,
+            next_sequence: 0,
+            closed: false,
+        }
+    }
+
+    fn push(&mut self, kind: AgentTimelineKind, round: Option<u32>, text: &str) {
+        if self.closed {
+            return;
+        }
+        let (text, truncated) = sanitize_and_truncate(text, self.limits.max_entry_bytes);
+        self.next_sequence = self.next_sequence.saturating_add(1);
+        self.retained_bytes = self.retained_bytes.saturating_add(text.len());
+        self.entries.push_back(AgentTimelineEntry {
+            sequence: self.next_sequence,
+            elapsed_ms: elapsed_ms(self.started_at),
+            kind,
+            round,
+            text,
+            truncated,
+        });
+        while self.entries.len() > self.limits.max_events
+            || self.retained_bytes > self.limits.max_bytes
+        {
+            let Some(dropped) = self.entries.pop_front() else {
+                break;
+            };
+            self.retained_bytes = self.retained_bytes.saturating_sub(dropped.text.len());
+            self.dropped_entries = self.dropped_entries.saturating_add(1);
+        }
+    }
+
+    fn snapshot(&self) -> AgentTimelineSnapshot {
+        AgentTimelineSnapshot {
+            entries: self.entries.iter().cloned().collect(),
+            dropped_entries: self.dropped_entries,
+            retained_bytes: self.retained_bytes,
+            closed: self.closed,
+        }
+    }
+}
+
+fn elapsed_ms(started_at: Instant) -> u64 {
+    u64::try_from(started_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn purpose_label(purpose: ProviderRequestPurpose) -> &'static str {
+    match purpose {
+        ProviderRequestPurpose::Inference => "inference",
+        ProviderRequestPurpose::Compaction => "compaction",
+    }
+}
+
+fn category_label(category: ProviderAttemptCategory) -> &'static str {
+    match category {
+        ProviderAttemptCategory::Success => "success",
+        ProviderAttemptCategory::RateLimited => "rate limited",
+        ProviderAttemptCategory::Unavailable => "unavailable",
+        ProviderAttemptCategory::Authentication => "authentication",
+        ProviderAttemptCategory::ClientError => "client error",
+        ProviderAttemptCategory::ServerError => "server error",
+        ProviderAttemptCategory::UnexpectedStatus => "unexpected status",
+        ProviderAttemptCategory::Timeout => "timeout",
+        ProviderAttemptCategory::Connection => "connection",
+        ProviderAttemptCategory::ResponseTooLarge => "response too large",
+        ProviderAttemptCategory::InvalidResponse => "invalid response",
+        ProviderAttemptCategory::Cancelled => "cancelled",
+    }
+}
+
+fn outcome_label(outcome: ProviderAttemptOutcome) -> &'static str {
+    match outcome {
+        ProviderAttemptOutcome::ResponseAccepted => "accepted",
+        ProviderAttemptOutcome::BodyCompleted => "body completed",
+        ProviderAttemptOutcome::BodyFailed => "body failed",
+        ProviderAttemptOutcome::RetryScheduled => "retry scheduled",
+        ProviderAttemptOutcome::Rejected => "rejected",
+        ProviderAttemptOutcome::TransportFailed => "transport failed",
+        ProviderAttemptOutcome::DeadlineExceeded => "deadline exceeded",
+        ProviderAttemptOutcome::Cancelled => "cancelled",
+    }
+}
+
+pub(crate) fn safe_inline_label(value: &str, max_chars: usize) -> String {
+    let value = sanitize_and_redact_text(value);
+    let mut output = String::new();
+    let mut prior_space = false;
+    let mut truncated = false;
+    for character in value.chars() {
+        let character = if character.is_whitespace() {
+            ' '
+        } else {
+            character
+        };
+        if character == ' ' && prior_space {
+            continue;
+        }
+        if output.chars().count() == max_chars {
+            truncated = true;
+            break;
+        }
+        prior_space = character == ' ';
+        output.push(character);
+    }
+    let output = output.trim();
+    if output.is_empty() {
+        "unknown".to_string()
+    } else if truncated {
+        format!("{output}…")
+    } else {
+        output.to_string()
+    }
+}
+
+fn sanitize_and_truncate(value: &str, max_bytes: usize) -> (String, bool) {
+    let value = sanitize_and_redact_text(value);
+    if value.len() <= max_bytes {
+        return (value, false);
+    }
+    if max_bytes == 0 {
+        return (String::new(), true);
+    }
+    const ELLIPSIS: &str = "…";
+    let suffix = if max_bytes >= ELLIPSIS.len() {
+        ELLIPSIS
+    } else {
+        ""
+    };
+    let mut end = max_bytes.saturating_sub(suffix.len());
+    while end > 0 && !value.is_char_boundary(end) {
+        end -= 1;
+    }
+    let mut output = value[..end].to_string();
+    output.push_str(suffix);
+    (output, true)
+}
+
+/// Strip terminal controls and redact common credential forms before text can
+/// enter a durable snapshot. This is defense in depth, not an authorization
+/// boundary; callers must still avoid submitting secrets as agent prompts.
+pub(crate) fn sanitize_and_redact_text(value: &str) -> String {
+    let sanitized = kitsu_render::sanitize_terminal_text(value);
+    let mut output = redact_url_userinfo(&redact_known_prefixes(&sanitized));
+    for keyword in [
+        "api_key",
+        "apikey",
+        "access_token",
+        "auth_token",
+        "authorization",
+        "password",
+        "secret",
+        "token",
+    ] {
+        output = redact_assignment(&output, keyword);
+    }
+    redact_bearer(&output)
+}
+
+fn redact_known_prefixes(value: &str) -> String {
+    const PREFIXES: [&str; 11] = [
+        "github_pat_",
+        "hf_",
+        "sk-",
+        "ghp_",
+        "gho_",
+        "glpat-",
+        "npm_",
+        "xoxb-",
+        "xoxp-",
+        "AKIA",
+        "AIza",
+    ];
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let tail = &value[index..];
+        let Some(prefix) = PREFIXES.iter().find(|prefix| tail.starts_with(**prefix)) else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+            continue;
+        };
+        let mut end = index + prefix.len();
+        while end < value.len() {
+            let character = value[end..].chars().next().expect("non-empty tail");
+            if !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        // Short words such as "hf_model" are ordinary identifiers. Credential
+        // prefixes are redacted only when followed by a plausible secret body.
+        if end.saturating_sub(index + prefix.len()) >= 8 {
+            output.push_str("<redacted>");
+            index = end;
+        } else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+        }
+    }
+    output
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = value[search..].find("://") {
+        let authority_start = search + relative + 3;
+        let authority_end = value[authority_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                matches!(character, '/' | '?' | '#' | ' ' | '\n' | '\t')
+                    .then_some(authority_start + offset)
+            })
+            .unwrap_or(value.len());
+        if let Some(relative_at) = value[authority_start..authority_end].rfind('@') {
+            let at = authority_start + relative_at;
+            output.push_str(&value[copied..authority_start]);
+            output.push_str("<redacted>");
+            output.push_str(&value[at..authority_end]);
+            copied = authority_end;
+        }
+        search = authority_end;
+        if search == value.len() {
+            break;
+        }
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_assignment(value: &str, keyword: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find(keyword) {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_keyword = start + keyword.len();
+        let after_ok = after_keyword == lowercase.len()
+            || !lowercase.as_bytes()[after_keyword].is_ascii_alphanumeric();
+        if !before_ok || !after_ok {
+            search = after_keyword;
+            continue;
+        }
+        let mut delimiter = after_keyword;
+        while delimiter < value.len() && value.as_bytes()[delimiter].is_ascii_whitespace() {
+            delimiter += 1;
+        }
+        if delimiter == value.len() || !matches!(value.as_bytes()[delimiter], b'=' | b':') {
+            search = after_keyword;
+            continue;
+        }
+        let mut secret_start = delimiter + 1;
+        while secret_start < value.len()
+            && (value.as_bytes()[secret_start].is_ascii_whitespace()
+                || matches!(value.as_bytes()[secret_start], b'\'' | b'"'))
+        {
+            secret_start += 1;
+        }
+        let mut end = secret_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(
+                value.as_bytes()[end],
+                b',' | b';' | b'&' | b'\'' | b'"' | b'}' | b']'
+            )
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..secret_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_bearer(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find("bearer") {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let mut token_start = start + "bearer".len();
+        if !before_ok
+            || token_start == value.len()
+            || !value.as_bytes()[token_start].is_ascii_whitespace()
+        {
+            search = token_start;
+            continue;
+        }
+        while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
+            token_start += 1;
+        }
+        let mut end = token_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(value.as_bytes()[end], b',' | b';' | b'\'' | b'"')
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..token_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn tiny_limits() -> AgentThreadLimits {
+        AgentThreadLimits {
+            max_events: 3,
+            max_bytes: 128,
+            max_entry_bytes: 64,
+            steering_capacity: 1,
+            max_steering_bytes: 32,
+        }
+    }
+
+    #[test]
+    fn credential_redaction_handles_tokens_assignments_bearer_and_url_userinfo() {
+        let rendered = sanitize_and_redact_text(
+            "hf_abcdefghijklmnopqrstuvwxyz token=plain-secret Bearer abc.def.ghi \
+             https://user:password@example.invalid/private AKIA1234567890ABCDEF",
+        );
+        for secret in [
+            "hf_abcdefghijklmnopqrstuvwxyz",
+            "plain-secret",
+            "abc.def.ghi",
+            "user:password",
+            "AKIA1234567890ABCDEF",
+        ] {
+            assert!(!rendered.contains(secret), "leaked {secret}: {rendered}");
+        }
+        assert!(rendered.contains("https://<redacted>@example.invalid/private"));
+    }
+
+    #[test]
+    fn timeline_is_bounded_redacted_and_excludes_tool_payloads() {
+        let secret = "hf_abcdefghijklmnopqrstuvwxyz123456";
+        let (mut state, _runtime) = AgentThreadState::new(
+            &format!("review token={secret}"),
+            "model",
+            None,
+            tiny_limits(),
+        );
+        state.record_runtime_event(&AgentRuntimeEvent::ToolStarted {
+            round: 1,
+            call_id: "private-call-id".to_string(),
+            name: "read_file".to_string(),
+            args: format!(r#"{{"password":"{secret}"}}"#),
+            command: None,
+        });
+        state.record_runtime_event(&AgentRuntimeEvent::ToolFinished {
+            round: 1,
+            call_id: "private-call-id".to_string(),
+            name: "read_file".to_string(),
+            success: true,
+            cancelled: false,
+            output: format!("file contained {secret}"),
+            command: None,
+        });
+        state.record_runtime_event(&AgentRuntimeEvent::AssistantDelta {
+            round: 1,
+            text: format!("done; bearer {secret}\u{1b}[31m"),
+        });
+        state.record_runtime_event(&AgentRuntimeEvent::AssistantDelta {
+            round: 1,
+            text: "tail".repeat(30),
+        });
+        let snapshot = state.snapshot(7, 12);
+        let encoded = serde_json::to_string(&snapshot).unwrap();
+        assert!(snapshot.timeline.entries.len() <= tiny_limits().max_events);
+        assert!(snapshot.timeline.retained_bytes <= tiny_limits().max_bytes);
+        assert!(snapshot.timeline.dropped_entries > 0);
+        assert!(!encoded.contains(secret));
+        assert!(!encoded.contains("private-call-id"));
+        assert!(!encoded.contains("password"));
+        assert!(!encoded.contains("file contained"));
+        assert!(!encoded.contains("\u{1b}"));
+        assert!(snapshot
+            .timeline
+            .entries
+            .iter()
+            .any(|entry| entry.truncated));
+    }
+
+    #[tokio::test]
+    async fn steering_is_targeted_bounded_and_closes() {
+        let (mut first, mut first_runtime) =
+            AgentThreadState::new("one", "model", None, tiny_limits());
+        let (mut second, mut second_runtime) =
+            AgentThreadState::new("two", "model", None, tiny_limits());
+        let receipt = first.submit_steering(1, "focus on parser").unwrap();
+        assert_eq!(receipt.id, 1);
+        assert_eq!(
+            first.submit_steering(1, "queue is full").unwrap_err().kind,
+            AgentSteeringErrorKind::Full
+        );
+        assert!(matches!(
+            second_runtime.try_recv_steering(),
+            Err(mpsc::error::TryRecvError::Empty)
+        ));
+        let correction = first_runtime.recv_steering().await.unwrap();
+        assert_eq!(correction.correction, "focus on parser");
+        assert!(first.steering_applied(correction.sequence));
+        assert!(first.close_steering("user closed thread"));
+        assert!(first_runtime.recv_steering().await.is_none());
+        assert_eq!(
+            first.submit_steering(1, "late").unwrap_err().kind,
+            AgentSteeringErrorKind::Closed
+        );
+
+        second.finish(AgentThreadPhase::Cancelled, 9);
+        assert!(second_runtime.recv_steering().await.is_none());
+        assert_eq!(second.handoff(), AgentHandoffState::Ready);
+        assert!(second.acknowledge_handoff());
+        assert_eq!(second.handoff(), AgentHandoffState::Acknowledged);
+    }
+
+    #[test]
+    fn persistence_dto_round_trip_rejects_unsafe_or_inconsistent_data() {
+        let limits = tiny_limits();
+        let (mut state, _runtime) = AgentThreadState::new("task", "model", None, limits);
+        state.record_runtime_event(&AgentRuntimeEvent::AssistantDelta {
+            round: 1,
+            text: "safe response".to_string(),
+        });
+        state.finish(AgentThreadPhase::Done, 13);
+        let snapshot = state.snapshot(1, 5);
+        let encoded =
+            serde_json::to_string(&AgentThreadSnapshotDto::from_snapshot(&snapshot)).unwrap();
+        let dto: AgentThreadSnapshotDto = serde_json::from_str(&encoded).unwrap();
+        dto.validate(limits).unwrap();
+
+        let mut invalid = dto;
+        invalid.thread.timeline.retained_bytes += 1;
+        assert!(invalid.validate(limits).is_err());
+    }
+}

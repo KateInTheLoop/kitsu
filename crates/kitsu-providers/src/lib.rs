@@ -12,7 +12,8 @@ pub use telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
 pub use types::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
+    ChatDelta, ChatMessage, ChatRequest, FinishReason, ReasoningEffort, Role, ToolCall,
+    ToolDescriptor, Usage,
 };
 
 use futures::stream::BoxStream;

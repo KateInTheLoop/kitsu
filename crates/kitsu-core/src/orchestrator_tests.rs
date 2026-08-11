@@ -233,6 +233,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         offload_dir: None,
         stream: false,
         temperature: None,
+        reasoning_effort: None,
         max_tokens: None,
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
