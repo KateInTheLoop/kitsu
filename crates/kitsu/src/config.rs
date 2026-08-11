@@ -12,6 +12,11 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub default_gateway: Option<String>,
+    /// Register the model-callable `workspace_diff` evidence tool in chat when
+    /// the launch directory is a Git worktree (docs/workspace-diff-tool.md).
+    /// `false` disables registration entirely, like `--no-workspace-evidence`.
+    #[serde(default)]
+    pub workspace_evidence: Option<bool>,
     #[serde(default)]
     pub gateways: BTreeMap<String, Gateway>,
 }

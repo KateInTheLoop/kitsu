@@ -155,6 +155,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_project_context: bool,
 
+    /// Do not register the model-callable `workspace_diff` tool for this run.
+    /// The tool discloses bounded host-verified diff evidence (like /review)
+    /// and never grants filesystem access; with this flag the model is not
+    /// told the tool exists. The config key `workspace_evidence = false`
+    /// disables it permanently.
+    #[arg(long, global = true)]
+    pub no_workspace_evidence: bool,
+
     /// Preload a named skill's instructions for this run (repeatable). Works for
     /// `ask` and `chat` — the skill body is injected up front so it's available
     /// immediately (and to spawned agents), not just discovered on demand. See

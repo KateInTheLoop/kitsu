@@ -1913,6 +1913,9 @@ struct ChatSetup {
     endpoint: String,
     auth_status: String,
     model: String,
+    /// Config-level opt-out for the model-callable `workspace_diff` evidence
+    /// tool (docs/workspace-diff-tool.md). Defaults to enabled.
+    workspace_evidence: bool,
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
@@ -3722,9 +3725,13 @@ fn evidence_disclosure_line(evidence: &workspace::ReviewEvidence, model: &str) -
     )
 }
 
-fn evidence_disclosure_payload(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
-    serde_json::json!({
-        "kind": "review_disclosure",
+/// The shared disclosure record: one field set for every surface that puts
+/// host-verified evidence into the model prompt, so consumers audit `/review`
+/// and `workspace_diff` disclosures with one shape.
+fn evidence_disclosure_fields(
+    evidence: &workspace::ReviewEvidence,
+) -> serde_json::Map<String, serde_json::Value> {
+    let serde_json::Value::Object(fields) = serde_json::json!({
         "target": evidence.target,
         "resolved_revision": evidence.resolved_revision,
         "merge_base": evidence.merge_base,
@@ -3732,7 +3739,200 @@ fn evidence_disclosure_payload(evidence: &workspace::ReviewEvidence) -> serde_js
         "evidence_bytes": evidence.diff.len(),
         "model_disclosed": true,
         "model_read_root_granted": false,
-    })
+    }) else {
+        unreachable!("json! object literal");
+    };
+    fields
+}
+
+fn evidence_disclosure_payload(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
+    let mut fields = evidence_disclosure_fields(evidence);
+    fields.insert("kind".to_string(), "review_disclosure".into());
+    serde_json::Value::Object(fields)
+}
+
+/// Turn-scoped JSONL event for a `workspace_diff` tool disclosure — the same
+/// record `/review` emits as a command-frame result, generalized to the tool
+/// surface (docs/workspace-diff-tool.md).
+fn workspace_evidence_disclosure_event(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
+    let mut fields = evidence_disclosure_fields(evidence);
+    fields.insert("source".to_string(), "workspace_diff".into());
+    serde_json::Value::Object(fields)
+}
+
+/// Parse the model-supplied `workspace_diff` arguments. Mirrors `/diff`'s
+/// scopes minus `checkpoint` (a human surface over Kitsu's own write journal).
+/// Parsed manually so a malformed scope gets a precise, correctable error
+/// instead of an untagged-enum shrug.
+fn parse_workspace_diff_request(args: &str) -> Result<ReviewRequest, String> {
+    const SCOPE_USAGE: &str = "expected \"working\", \"staged\", \"unstaged\", \
+                               {\"base\": REV}, or {\"commit\": REV}";
+    let args = args.trim();
+    let parsed: serde_json::Value = if args.is_empty() {
+        serde_json::json!({})
+    } else {
+        serde_json::from_str(args).map_err(|error| format!("invalid JSON arguments: {error}"))?
+    };
+    let serde_json::Value::Object(parsed) = parsed else {
+        return Err("arguments must be a JSON object".to_string());
+    };
+    for key in parsed.keys() {
+        if key != "scope" && key != "path" {
+            return Err(format!(
+                "unknown argument '{key}'; expected scope and/or path"
+            ));
+        }
+    }
+    let path = match parsed.get("path") {
+        None | Some(serde_json::Value::Null) => None,
+        Some(serde_json::Value::String(path)) => {
+            let path = path.trim();
+            (!path.is_empty()).then(|| path.to_string())
+        }
+        Some(_) => return Err("path must be a string".to_string()),
+    };
+    let scope = match parsed.get("scope") {
+        None | Some(serde_json::Value::Null) => ReviewScope::Working,
+        Some(serde_json::Value::String(scope)) => match scope.as_str() {
+            "working" => ReviewScope::Working,
+            "staged" => ReviewScope::Staged,
+            "unstaged" => ReviewScope::Unstaged,
+            other => return Err(format!("unknown scope \"{other}\"; {SCOPE_USAGE}")),
+        },
+        Some(serde_json::Value::Object(scope)) => {
+            if scope.len() != 1 {
+                return Err(format!(
+                    "scope object must have exactly one key; {SCOPE_USAGE}"
+                ));
+            }
+            let (key, value) = scope.iter().next().expect("checked non-empty");
+            let revision = value
+                .as_str()
+                .map(str::trim)
+                .filter(|revision| !revision.is_empty())
+                .ok_or_else(|| format!("scope.{key} must be a non-empty revision string"))?;
+            match key.as_str() {
+                "base" => ReviewScope::Base(revision.to_string()),
+                "commit" => ReviewScope::Commit(revision.to_string()),
+                other => return Err(format!("unknown scope key \"{other}\"; {SCOPE_USAGE}")),
+            }
+        }
+        Some(_) => return Err(format!("invalid scope; {SCOPE_USAGE}")),
+    };
+    Ok(ReviewRequest { scope, path })
+}
+
+/// The model-callable `workspace_diff` tool: a bounded DISCLOSURE of
+/// host-gathered diff evidence to the provider, exactly like `/review` — never
+/// a filesystem read by the model. It consults no model read root, creates
+/// none, and excludes Kitsu-private paths identically to `/diff`; every call
+/// prints/emits the standing disclosure announcement. Returns `None` (tool not
+/// registered) when the directory is not inside a Git worktree or the worktree
+/// sits inside Kitsu-private state. Design: docs/workspace-diff-tool.md.
+fn workspace_diff_tool(
+    directory: &std::path::Path,
+    private: Vec<std::path::PathBuf>,
+    perms: &Permissions,
+    live_mw: &subagent::LiveModelWindow,
+) -> Option<(kitsu_providers::ToolDescriptor, kitsu_tools::HandlerFn)> {
+    let authority =
+        Arc::new(WorkspaceEvidenceAuthority::for_workspace_tool(directory, private, perms).ok()?);
+    let descriptor = kitsu_providers::ToolDescriptor {
+        name: "workspace_diff".to_string(),
+        description: "Fetch the user's git diff for this workspace as host-verified evidence. \
+                      Kitsu's own git gathers it (this is not filesystem access and needs no \
+                      read permission), bounds it to 256 KiB (`truncated` discloses the cap), \
+                      excludes Kitsu-private files, and announces the disclosure to the user. \
+                      Use it whenever the user asks about their changes."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "scope": {
+                    "description": "Diff scope: \"working\" (default: working tree vs HEAD, \
+                                    including untracked files), \"staged\", \"unstaged\", \
+                                    {\"base\": REV} (changes since the merge base with REV), or \
+                                    {\"commit\": REV} (one commit's diff).",
+                    "anyOf": [
+                        {"type": "string", "enum": ["working", "staged", "unstaged"]},
+                        {
+                            "type": "object",
+                            "properties": {"base": {"type": "string"}},
+                            "required": ["base"],
+                            "additionalProperties": false
+                        },
+                        {
+                            "type": "object",
+                            "properties": {"commit": {"type": "string"}},
+                            "required": ["commit"],
+                            "additionalProperties": false
+                        }
+                    ]
+                },
+                "path": {
+                    "type": "string",
+                    "description": "Optional repository-relative path filter."
+                }
+            }
+        }),
+    };
+    let live_mw = live_mw.clone();
+    let handler: kitsu_tools::HandlerFn = Box::new(move |args: String| {
+        let authority = authority.clone();
+        let live_mw = live_mw.clone();
+        Box::pin(async move {
+            let request =
+                parse_workspace_diff_request(&args).map_err(kitsu_tools::ToolError::InvalidArgs)?;
+            let target = match request.scope {
+                ReviewScope::Working => workspace::ReviewTarget::WorkingTree,
+                ReviewScope::Staged => workspace::ReviewTarget::Staged,
+                ReviewScope::Unstaged => workspace::ReviewTarget::Unstaged,
+                ReviewScope::Base(revision) => workspace::ReviewTarget::Base(revision),
+                ReviewScope::Commit(revision) => workspace::ReviewTarget::Commit(revision),
+                ReviewScope::Checkpoint(_) => {
+                    unreachable!("workspace_diff has no checkpoint scope")
+                }
+            };
+            let pathspec = authority
+                .pathspec(request.path.as_deref())
+                .map_err(kitsu_tools::ToolError::InvalidArgs)?;
+            authority.notice_private_exclusions();
+            let evidence = workspace::review_evidence_excluding(
+                &authority.root,
+                target,
+                pathspec.as_deref(),
+                &authority.private,
+            )
+            .map_err(kitsu_tools::ToolError::ExecError)?;
+            // The standing rule: evidence disclosure is announced at the moment
+            // it happens, on every surface. Returning the diff as this tool's
+            // result puts it into the model prompt, so this call IS the
+            // disclosure.
+            let model = live_mw
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .0
+                .clone();
+            eprintln!("{}", evidence_disclosure_line(&evidence, &model));
+            if jsonl_requested() {
+                // A failed emit is retained by the process-long emitter and
+                // converted to the required nonzero exit at the turn boundary.
+                let _ = emit_jsonl(
+                    "workspace_evidence_disclosure",
+                    workspace_evidence_disclosure_event(&evidence),
+                );
+            }
+            Ok(serde_json::json!({
+                "target": evidence.target,
+                "resolved_revision": evidence.resolved_revision,
+                "merge_base": evidence.merge_base,
+                "truncated": evidence.truncated,
+                "diff": evidence.diff,
+            })
+            .to_string())
+        })
+    });
+    Some((descriptor, handler))
 }
 
 fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
@@ -3758,6 +3958,7 @@ fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
 /// root — that would turn it into an arbitrary-read primitive.
 struct WorkspaceEvidenceAuthority {
     root: std::path::PathBuf,
+    directory: std::path::PathBuf,
     private: Vec<std::path::PathBuf>,
 }
 
@@ -3765,7 +3966,8 @@ impl WorkspaceEvidenceAuthority {
     /// Live git evidence: requires a worktree, since that is what `git` reads.
     fn for_session(session: &SessionInfo, perms: &Permissions) -> Result<Self, String> {
         Self::bind(
-            session,
+            &session.directory,
+            private_workspace_paths(session),
             perms,
             workspace::repository_root(&session.directory)?,
         )
@@ -3778,11 +3980,31 @@ impl WorkspaceEvidenceAuthority {
         let root = workspace::repository_root(&session.directory).unwrap_or_else(|_| {
             std::fs::canonicalize(&session.directory).unwrap_or_else(|_| session.directory.clone())
         });
-        Self::bind(session, perms, root)
+        Self::bind(
+            &session.directory,
+            private_workspace_paths(session),
+            perms,
+            root,
+        )
+    }
+
+    /// Send-safe form for the model-callable `workspace_diff` tool: the same
+    /// worktree and protected-state guards, bound to snapshot paths instead of
+    /// a `SessionInfo` (whose interior cells are not `Send`). `private` must be
+    /// a directory-level superset of `private_workspace_paths` for the whole
+    /// process lifetime, so per-boundary offload rotation cannot open a gap.
+    fn for_workspace_tool(
+        directory: &std::path::Path,
+        private: Vec<std::path::PathBuf>,
+        perms: &Permissions,
+    ) -> Result<Self, String> {
+        let root = workspace::repository_root(directory)?;
+        Self::bind(directory, private, perms, root)
     }
 
     fn bind(
-        session: &SessionInfo,
+        directory: &std::path::Path,
+        private: Vec<std::path::PathBuf>,
         perms: &Permissions,
         root: std::path::PathBuf,
     ) -> Result<Self, String> {
@@ -3798,18 +4020,15 @@ impl WorkspaceEvidenceAuthority {
         }
         Ok(Self {
             root,
-            private: private_workspace_paths(session),
+            directory: directory.to_path_buf(),
+            private,
         })
     }
 
     /// Resolve a user-typed path against the bound root. Rejects `..` escapes
     /// and anything outside the repository before any I/O (workspace.rs).
-    fn pathspec(
-        &self,
-        session: &SessionInfo,
-        path: Option<&str>,
-    ) -> Result<Option<String>, String> {
-        workspace::pathspec_from_directory(&self.root, &session.directory, path.unwrap_or(""))
+    fn pathspec(&self, path: Option<&str>) -> Result<Option<String>, String> {
+        workspace::pathspec_from_directory(&self.root, &self.directory, path.unwrap_or(""))
     }
 
     /// One concise line for `/permissions` when there is no evidence root.
@@ -3847,7 +4066,7 @@ fn authorized_workspace_review(
         let report = journal.checkpoint_preview(id).ok_or_else(|| {
             format!("checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints")
         })?;
-        let pathspec = authority.pathspec(session, request.path.as_deref())?;
+        let pathspec = authority.pathspec(request.path.as_deref())?;
         return workspace::review_evidence_excluding(
             &authority.root,
             workspace::ReviewTarget::Checkpoint(report),
@@ -3864,7 +4083,7 @@ fn authorized_workspace_review(
         ReviewScope::Commit(revision) => workspace::ReviewTarget::Commit(revision),
         ReviewScope::Checkpoint(_) => unreachable!("checkpoint scope handled above"),
     };
-    let pathspec = authority.pathspec(session, request.path.as_deref())?;
+    let pathspec = authority.pathspec(request.path.as_deref())?;
     authority.notice_private_exclusions();
     workspace::review_evidence_excluding(
         &authority.root,
@@ -4349,14 +4568,23 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
         }
     }
     out.push_str("\n  host evidence");
+    let has_workspace_diff_tool = session
+        .tool_names
+        .iter()
+        .any(|name| name == "workspace_diff");
     match WorkspaceEvidenceAuthority::for_session(session, perms) {
         Ok(authority) => {
             out.push_str(&format!(
-                "\n    - {} (git worktree; /diff, /review, kitsu review)",
-                shorten_home(&authority.root)
+                "\n    - {} (git worktree; /diff, /review, kitsu review{})",
+                shorten_home(&authority.root),
+                if has_workspace_diff_tool {
+                    ", workspace_diff tool"
+                } else {
+                    ""
+                }
             ));
             out.push_str(
-                "\n      host-only: read by Kitsu's own git, never a model read root, never a model tool target",
+                "\n      host-only: read by Kitsu's own git, never a model read root, never a model filesystem target",
             );
             for path in &authority.private {
                 out.push_str(&format!(
@@ -4368,6 +4596,11 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
                 "\n      write checkpoints are replayed from Kitsu's own verified snapshots, including changes written outside this root",
             );
             out.push_str("\n      /review discloses one bounded diff per command; /diff never leaves this terminal");
+            if has_workspace_diff_tool {
+                out.push_str(
+                    "\n      workspace_diff discloses one bounded diff per model call, announced each time; disable with --no-workspace-evidence",
+                );
+            }
         }
         Err(_) => {
             out.push_str(&format!(
@@ -4584,14 +4817,28 @@ fn permissions_payload(
         .command_policy
         .as_ref()
         .map(|policy| policy.containment_status());
+    let has_workspace_diff_tool = session
+        .tool_names
+        .iter()
+        .any(|name| name == "workspace_diff");
     let host_evidence = match WorkspaceEvidenceAuthority::for_session(session, perms) {
-        Ok(authority) => serde_json::json!({
-            "repository_root": authority.root,
-            "consumers": ["diff", "review", "checkpoint"],
-            "model_read_root": false,
-            "prompt_disclosure": "explicit_user_command_only",
-            "excluded_private_paths": json_paths(authority.private),
-        }),
+        Ok(authority) => {
+            let mut consumers = vec!["diff", "review", "checkpoint"];
+            if has_workspace_diff_tool {
+                consumers.push("workspace_diff");
+            }
+            serde_json::json!({
+                "repository_root": authority.root,
+                "consumers": consumers,
+                "model_read_root": false,
+                "prompt_disclosure": if has_workspace_diff_tool {
+                    "user_command_or_workspace_diff_tool"
+                } else {
+                    "explicit_user_command_only"
+                },
+                "excluded_private_paths": json_paths(authority.private),
+            })
+        }
         Err(_) => serde_json::json!({
             "repository_root": serde_json::Value::Null,
             "consumers": ["checkpoint"],
@@ -5312,6 +5559,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         endpoint,
         auth_status,
         model,
+        workspace_evidence: config.workspace_evidence.unwrap_or(true),
         context_window,
         context_window_pinned,
         context_window_provenance,
@@ -5711,6 +5959,7 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         let has_edit = tool_names.iter().any(|name| name == "fs_edit_file");
         let has_commands = tool_names.iter().any(|name| name == "command_exec");
         let has_spawn = tool_names.iter().any(|name| name == "spawn_agent_bg");
+        let has_workspace_diff = tool_names.iter().any(|name| name == "workspace_diff");
         let mut prompt = format!(
             "You are kitsu, a concise, helpful CLI assistant with these tools: {}. ",
             tool_names.join(", ")
@@ -5782,6 +6031,11 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         if has_spawn {
             prompt.push_str(
                 "Use spawn_agent_bg only for explicitly parallel or long-running work; answer simple requests directly. ",
+            );
+        }
+        if has_workspace_diff {
+            prompt.push_str(
+                "Use workspace_diff to fetch the user's verified git diff (scope working/staged/unstaged, {\"base\": REV}, or {\"commit\": REV}) whenever they ask about their changes — do not ask them to paste diffs or spawn agents to run git for this. ",
             );
         }
         prompt.trim_end().to_string()
@@ -9135,6 +9389,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     tools.register_with_descriptor(d, h);
     let (d, h) = subagent::agent_result_tool(agent_registry.clone());
     tools.register_with_descriptor(d, h);
+    // The model-callable `workspace_diff` evidence tool: a bounded disclosure
+    // of host-gathered diff bytes (like /review), never a model filesystem
+    // read, so it is independent of can_read and grants no root. Main
+    // conversation only: review one-shots stay tool-free as documented, and
+    // subagent registries are untouched (disclosure announcements are a
+    // top-level conversation contract). The private-path snapshot is a
+    // directory-level superset of `private_workspace_paths` for the whole
+    // process (offload generations always land under the state dir, a session
+    // sidecar beneath it, or the stateless temp base), so per-boundary
+    // rotation cannot open an exclusion gap.
+    if setup.workspace_evidence && !cli.no_workspace_evidence && !forced_one_shot {
+        let launch_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        let private_evidence_paths = vec![
+            setup.config_path.clone(),
+            setup.state_dir.clone(),
+            std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id())),
+        ];
+        if let Some((d, h)) =
+            workspace_diff_tool(&launch_dir, private_evidence_paths, &perms, &live_mw)
+        {
+            tools.register_with_descriptor(d, h);
+        }
+    }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();
 
     // Offloaded tool results and complete developer-command output share one
@@ -10778,6 +11055,7 @@ enum SlashResult {
     DeleteSession(String),
 }
 
+#[derive(Debug)]
 enum QueueCommand {
     List,
     Add(String),
@@ -10848,9 +11126,36 @@ fn parse_queue_command(arg: &str) -> Result<QueueCommand, String> {
             Ok(QueueCommand::Promote(position))
         }
         "clear" if words.next().is_none() => Ok(QueueCommand::Clear),
-        // Preserve the original `/queue <prompt>` shorthand.
-        _ => Ok(QueueCommand::Add(arg.to_string())),
+        // Preserve the original `/queue <prompt>` shorthand — but a single
+        // word one edit away from a subaction is far more likely a typo than
+        // a deliberate one-word prompt, and silently queueing "lst" as a
+        // prompt would be worse than pausing to ask. Multi-word input is
+        // always a prompt.
+        word => {
+            if words.next().is_none() {
+                if let Some(suggestion) = closest_queue_subcommand(word) {
+                    return Err(format!(
+                        "unknown /queue action '{word}' - did you mean '/queue {suggestion}'? (or /queue add {word} to queue it as a prompt)"
+                    ));
+                }
+            }
+            Ok(QueueCommand::Add(arg.to_string()))
+        }
     }
+}
+
+/// Deliberately stricter than `closest_jobs_subcommand` (distance <= 2, exact
+/// mismatch only): `/queue`'s bare-prompt shorthand means a false positive
+/// here rejects a legitimate one-word prompt, so only near-certain typos get
+/// intercepted.
+fn closest_queue_subcommand(name: &str) -> Option<&'static str> {
+    const SUBCOMMANDS: &[&str] = &["list", "add", "remove", "edit", "move", "promote", "clear"];
+    SUBCOMMANDS
+        .iter()
+        .map(|&cmd| (edit_distance(name, cmd), cmd))
+        .min()
+        .filter(|(distance, _)| (1..=2).contains(distance))
+        .map(|(_, cmd)| cmd)
 }
 
 fn queue_prompt_preview(prompt: &str) -> String {
@@ -13125,6 +13430,234 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_with_workspace_diff_teaches_fetching_verified_diffs() {
+        let environment = PromptEnvironment::default();
+        let prompt = chat_system_prompt(&["workspace_diff".to_string()], &environment);
+        assert!(
+            prompt.contains("Use workspace_diff to fetch the user's verified git diff"),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains("do not ask them to paste diffs or spawn agents to run git"),
+            "{prompt}"
+        );
+
+        let prompt_without = chat_system_prompt(&["fs_read_file".to_string()], &environment);
+        assert!(!prompt_without.contains("workspace_diff"));
+    }
+
+    #[test]
+    fn workspace_diff_args_parse_every_documented_scope() {
+        let working = parse_workspace_diff_request("").unwrap();
+        assert_eq!(working.scope, ReviewScope::Working);
+        assert_eq!(working.path, None);
+        let defaulted = parse_workspace_diff_request("{}").unwrap();
+        assert_eq!(defaulted.scope, ReviewScope::Working);
+        let explicit = parse_workspace_diff_request(r#"{"scope":"working"}"#).unwrap();
+        assert_eq!(explicit.scope, ReviewScope::Working);
+        let staged = parse_workspace_diff_request(r#"{"scope":"staged","path":"src"}"#).unwrap();
+        assert_eq!(staged.scope, ReviewScope::Staged);
+        assert_eq!(staged.path.as_deref(), Some("src"));
+        let unstaged = parse_workspace_diff_request(r#"{"scope":"unstaged"}"#).unwrap();
+        assert_eq!(unstaged.scope, ReviewScope::Unstaged);
+        let base = parse_workspace_diff_request(r#"{"scope":{"base":"main"}}"#).unwrap();
+        assert_eq!(base.scope, ReviewScope::Base("main".to_string()));
+        let commit = parse_workspace_diff_request(r#"{"scope":{"commit":"HEAD~1"}}"#).unwrap();
+        assert_eq!(commit.scope, ReviewScope::Commit("HEAD~1".to_string()));
+        // Null and blank optionals degrade to the defaults, not errors.
+        let nulls = parse_workspace_diff_request(r#"{"scope":null,"path":null}"#).unwrap();
+        assert_eq!(nulls.scope, ReviewScope::Working);
+        assert_eq!(nulls.path, None);
+        let blank_path = parse_workspace_diff_request(r#"{"path":"  "}"#).unwrap();
+        assert_eq!(blank_path.path, None);
+    }
+
+    #[test]
+    fn workspace_diff_args_reject_malformed_scopes_with_named_errors() {
+        // There is no model-facing checkpoint scope: checkpoints replay
+        // Kitsu's own write journal and stay a human surface.
+        let checkpoint = parse_workspace_diff_request(r#"{"scope":"checkpoint"}"#).unwrap_err();
+        assert!(checkpoint.contains("unknown scope"), "{checkpoint}");
+        let unknown = parse_workspace_diff_request(r#"{"scope":"everything"}"#).unwrap_err();
+        assert!(
+            unknown.contains("unknown scope \"everything\""),
+            "{unknown}"
+        );
+        let both =
+            parse_workspace_diff_request(r#"{"scope":{"base":"a","commit":"b"}}"#).unwrap_err();
+        assert!(both.contains("exactly one key"), "{both}");
+        let wrong_key = parse_workspace_diff_request(r#"{"scope":{"branch":"main"}}"#).unwrap_err();
+        assert!(
+            wrong_key.contains("unknown scope key \"branch\""),
+            "{wrong_key}"
+        );
+        let empty_rev = parse_workspace_diff_request(r#"{"scope":{"base":"  "}}"#).unwrap_err();
+        assert!(empty_rev.contains("non-empty revision"), "{empty_rev}");
+        let numeric_scope = parse_workspace_diff_request(r#"{"scope":7}"#).unwrap_err();
+        assert!(numeric_scope.contains("invalid scope"), "{numeric_scope}");
+        let extra_key =
+            parse_workspace_diff_request(r#"{"scope":"working","paths":"src"}"#).unwrap_err();
+        assert!(
+            extra_key.contains("unknown argument 'paths'"),
+            "{extra_key}"
+        );
+        let non_object = parse_workspace_diff_request(r#""working""#).unwrap_err();
+        assert!(non_object.contains("JSON object"), "{non_object}");
+        let bad_json = parse_workspace_diff_request("scope=working").unwrap_err();
+        assert!(bad_json.contains("invalid JSON arguments"), "{bad_json}");
+    }
+
+    #[test]
+    fn workspace_diff_tool_registers_only_inside_a_worktree_outside_private_state() {
+        let perms = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let live_mw: subagent::LiveModelWindow =
+            Arc::new(std::sync::Mutex::new(("test-model".to_string(), None)));
+
+        // Not a git worktree: no tool.
+        let plain = tempfile::tempdir().unwrap();
+        assert!(
+            workspace_diff_tool(plain.path(), Vec::new(), &perms, &live_mw).is_none(),
+            "registered outside a worktree"
+        );
+
+        // A worktree inside protected Kitsu state: refused, no tool.
+        let protected = tempfile::tempdir().unwrap();
+        perms
+            .protect_read_path(&protected.path().to_string_lossy())
+            .unwrap();
+        let inside = protected.path().join("repo");
+        std::fs::create_dir_all(&inside).unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(&inside)
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        assert!(
+            workspace_diff_tool(&inside, Vec::new(), &perms, &live_mw).is_none(),
+            "registered inside Kitsu-private state"
+        );
+
+        // An ordinary worktree registers, and the descriptor mirrors /diff's
+        // scopes (minus checkpoint).
+        let repo = tempfile::tempdir().unwrap();
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(["init", "--quiet"])
+            .status()
+            .unwrap()
+            .success());
+        let (descriptor, _handler) = workspace_diff_tool(repo.path(), Vec::new(), &perms, &live_mw)
+            .expect("worktree registers workspace_diff");
+        assert_eq!(descriptor.name, "workspace_diff");
+        let schema = descriptor.parameters.to_string();
+        for scope in ["working", "staged", "unstaged", "base", "commit"] {
+            assert!(schema.contains(scope), "schema misses {scope}: {schema}");
+        }
+        assert!(!schema.contains("checkpoint"), "{schema}");
+    }
+
+    #[tokio::test]
+    async fn workspace_diff_tool_returns_bounded_evidence_and_excludes_private_paths() {
+        let repo = tempfile::tempdir().unwrap();
+        let git = |args: &[&str]| {
+            assert!(std::process::Command::new("git")
+                .arg("-C")
+                .arg(repo.path())
+                .args(args)
+                .status()
+                .unwrap()
+                .success());
+        };
+        git(&["init", "--quiet"]);
+        std::fs::write(repo.path().join("code.txt"), "before\n").unwrap();
+        git(&["add", "."]);
+        git(&[
+            "-c",
+            "user.name=Test",
+            "-c",
+            "user.email=test@example.com",
+            "commit",
+            "--quiet",
+            "-m",
+            "base",
+        ]);
+        std::fs::write(repo.path().join("code.txt"), "after\n").unwrap();
+        // A Kitsu-private file inside the worktree must never appear in the
+        // disclosed evidence.
+        let private_dir = repo.path().join(".kitsu-state");
+        std::fs::create_dir_all(&private_dir).unwrap();
+        std::fs::write(private_dir.join("secret.txt"), "SECRET-BYTES\n").unwrap();
+
+        let perms = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let live_mw: subagent::LiveModelWindow =
+            Arc::new(std::sync::Mutex::new(("test-model".to_string(), None)));
+        let (_descriptor, handler) =
+            workspace_diff_tool(repo.path(), vec![private_dir.clone()], &perms, &live_mw)
+                .expect("worktree registers workspace_diff");
+
+        let result = handler(r#"{"scope":"working"}"#.to_string()).await.unwrap();
+        let payload: serde_json::Value = serde_json::from_str(&result).unwrap();
+        let diff = payload["diff"].as_str().unwrap();
+        assert!(diff.contains("+after"), "{diff}");
+        assert!(!diff.contains("SECRET-BYTES"), "{diff}");
+        assert!(!diff.contains("secret.txt"), "{diff}");
+        assert_eq!(payload["truncated"], false);
+        assert_eq!(payload["target"], "working_tree");
+
+        // The path argument narrows inside the repository; escapes are
+        // rejected before any I/O with an InvalidArgs error.
+        let filtered = handler(r#"{"scope":"working","path":"code.txt"}"#.to_string())
+            .await
+            .unwrap();
+        let filtered: serde_json::Value = serde_json::from_str(&filtered).unwrap();
+        assert!(filtered["diff"].as_str().unwrap().contains("+after"));
+        let escape = handler(r#"{"path":"../outside"}"#.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            matches!(escape, kitsu_tools::ToolError::InvalidArgs(_)),
+            "{escape}"
+        );
+    }
+
+    #[tokio::test]
+    async fn workspace_diff_tool_disclosure_matches_review_disclosure_shape() {
+        let evidence = workspace::ReviewEvidence {
+            target: "working_tree".to_string(),
+            resolved_revision: None,
+            merge_base: None,
+            truncated: false,
+            diff: "diff --git a/x b/x\n".to_string(),
+        };
+        let review = evidence_disclosure_payload(&evidence);
+        let tool = workspace_evidence_disclosure_event(&evidence);
+        // One auditable shape across both disclosure surfaces: identical
+        // fields except the discriminators.
+        let review_fields: std::collections::BTreeSet<&str> = review
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != "kind")
+            .collect();
+        let tool_fields: std::collections::BTreeSet<&str> = tool
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != "source")
+            .collect();
+        assert_eq!(review_fields, tool_fields);
+        assert_eq!(tool["source"], "workspace_diff");
+        assert_eq!(tool["model_disclosed"], true);
+        assert_eq!(tool["model_read_root_granted"], false);
+        assert_eq!(tool["evidence_bytes"], evidence.diff.len());
+    }
+
+    #[test]
     fn strict_turn_failure_commits_recovered_tool_errors() {
         // Recovered: an early failure, but the final tool round was clean.
         let recovered = kitsu_core::AgentTurnStatus {
@@ -13470,6 +14003,127 @@ mod tests {
         assert!(empty_model_catalog_message("test").contains("—"));
     }
 
+    /// Cycle-9 item 5, thickened: the syntax column is capped, every
+    /// two-column row starts its description at the same column, and a
+    /// long-arg command wraps to its own line with the description indented
+    /// beneath it instead of blowing the column out.
+    #[test]
+    fn slash_help_caps_the_syntax_column_and_wraps_long_commands() {
+        const CAP: usize = 50;
+        let long_syntaxes: Vec<String> = SLASH_COMMANDS
+            .iter()
+            .filter(|spec| spec.alias_of.is_none())
+            .map(|spec| spec.syntax())
+            .filter(|syntax| syntax.len() > CAP)
+            .collect();
+        assert!(
+            !long_syntaxes.is_empty(),
+            "fixture rot: no command exercises the wrapping branch"
+        );
+
+        let help = slash_help("test-model", false);
+        let lines: Vec<&str> = help.lines().collect();
+        for syntax in &long_syntaxes {
+            let position = lines
+                .iter()
+                .position(|line| *line == format!("  {syntax}"))
+                .unwrap_or_else(|| panic!("long command '{syntax}' must wrap onto its own line"));
+            let continuation = lines[position + 1];
+            assert!(
+                continuation.starts_with("    ") && !continuation.starts_with("     "),
+                "wrapped description must be indented exactly four spaces: {continuation:?}"
+            );
+        }
+
+        // With the wrapping branch exercised, the column width is the cap, so
+        // every two-column row must start its description at exactly column
+        // 2 + CAP + 2 — never at a column dictated by the longest command.
+        let mut two_column_rows = 0;
+        for line in &lines {
+            if !line.starts_with("  /") {
+                continue; // headings, wrapped continuations, the model footer
+            }
+            if long_syntaxes
+                .iter()
+                .any(|syntax| *line == format!("  {syntax}"))
+            {
+                continue; // wrapped syntax-only line, checked above
+            }
+            two_column_rows += 1;
+            let chars: Vec<char> = line.chars().collect();
+            assert!(
+                chars.len() > 2 + CAP + 2,
+                "two-column row lost its description: {line:?}"
+            );
+            assert_eq!(
+                (chars[2 + CAP], chars[2 + CAP + 1]),
+                (' ', ' '),
+                "syntax overflowed its capped column: {line:?}"
+            );
+            assert_ne!(
+                chars[2 + CAP + 2],
+                ' ',
+                "description must start exactly at the shared column: {line:?}"
+            );
+        }
+        assert!(two_column_rows > 10, "fixture rot: {two_column_rows} rows");
+    }
+
+    /// Cycle-9 session search, thickened: matching is case-insensitive over
+    /// both id and preview, non-matching filters produce the guided empty
+    /// state naming the filter, and the current-session marker survives
+    /// filtering.
+    #[test]
+    fn session_filtering_matches_id_and_preview_case_insensitively() {
+        let summaries = vec![
+            session::SessionSummary {
+                id: "s-alpha-1".to_string(),
+                updated_at: "now".to_string(),
+                model: "m".to_string(),
+                gateway: "g".to_string(),
+                directory: "/tmp/a".to_string(),
+                preview: "Refactor the PARSER module".to_string(),
+                turns: 1,
+            },
+            session::SessionSummary {
+                id: "s-Beta-2".to_string(),
+                updated_at: "now".to_string(),
+                model: "m".to_string(),
+                gateway: "g".to_string(),
+                directory: "/tmp/b".to_string(),
+                preview: "unrelated work".to_string(),
+                turns: 2,
+            },
+        ];
+
+        // Case-insensitive id match, either direction.
+        let by_id = filter_sessions(&summaries, "BETA");
+        assert_eq!(by_id.len(), 1);
+        assert_eq!(by_id[0].id, "s-Beta-2");
+        // Case-insensitive preview match.
+        let by_preview = filter_sessions(&summaries, "parser");
+        assert_eq!(by_preview.len(), 1);
+        assert_eq!(by_preview[0].id, "s-alpha-1");
+        // Whitespace-only filters behave like no filter.
+        assert_eq!(filter_sessions(&summaries, "   ").len(), 2);
+
+        // A non-matching filter produces the guided empty state naming the
+        // filter, not the bare "no saved sessions" message.
+        let miss = format_session_summaries(&[], None, "zeta");
+        assert!(miss.contains("no sessions matched 'zeta'"), "{miss}");
+        assert!(miss.contains("/sessions"), "{miss}");
+        assert!(!miss.contains("no saved sessions"), "{miss}");
+
+        // The current-session marker survives filtering.
+        let listed = format_session_summaries(
+            &filter_sessions(&summaries, "beta"),
+            Some("s-Beta-2"),
+            "beta",
+        );
+        assert!(listed.contains(" * s-Beta-2"), "{listed}");
+        assert!(!listed.contains("s-alpha-1"), "{listed}");
+    }
+
     #[test]
     fn doctor_catalog_reason_is_bounded_and_only_exposes_catalog_parse_structure() {
         let malformed =
@@ -13684,6 +14338,35 @@ mod tests {
                 0o700
             );
         }
+    }
+
+    #[test]
+    fn queue_typos_suggest_the_closest_subaction_without_breaking_the_shorthand() {
+        // A one-word near-miss is intercepted with the fix and the escape
+        // hatch, instead of being silently queued as a prompt.
+        let error = parse_queue_command("lst").unwrap_err();
+        assert!(error.contains("did you mean '/queue list'"), "{error}");
+        assert!(error.contains("/queue add lst"), "{error}");
+        assert!(matches!(
+            parse_queue_command("clera").unwrap_err(),
+            error if error.contains("did you mean '/queue clear'")
+        ));
+        // Multi-word input is always a prompt, even when the first word is
+        // one edit from a subaction.
+        assert!(matches!(
+            parse_queue_command("lists the reasons to refactor").unwrap(),
+            QueueCommand::Add(prompt) if prompt == "lists the reasons to refactor"
+        ));
+        // A single word far from every subaction stays a queued prompt.
+        assert!(matches!(
+            parse_queue_command("refactor").unwrap(),
+            QueueCommand::Add(prompt) if prompt == "refactor"
+        ));
+        // Exact subactions are untouched.
+        assert!(matches!(
+            parse_queue_command("clear").unwrap(),
+            QueueCommand::Clear
+        ));
     }
 
     #[test]

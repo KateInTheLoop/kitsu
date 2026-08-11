@@ -3435,7 +3435,7 @@ fn test_diff_from_subdirectory_resolves_filter_without_grants() {
         .stderr(predicate::str::contains("read roots   none"))
         .stderr(predicate::str::contains("host evidence"))
         .stderr(predicate::str::contains(
-            "never a model read root, never a model tool target",
+            "never a model read root, never a model filesystem target",
         ));
 
     // A read grant neither widens nor narrows the host-evidence scope.
@@ -3860,6 +3860,33 @@ fn test_unknown_script_command_is_echoed_suggested_and_nonzero() {
         .stderr(predicate::str::contains("command> /statsu"))
         .stderr(predicate::str::contains("did you mean /status"))
         .stderr(predicate::str::contains("typo.txt:1"));
+}
+
+/// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is
+/// intercepted with a close-match suggestion and an escape hatch, instead of
+/// being silently queued as a prompt.
+#[test]
+#[serial]
+fn test_queue_subaction_typo_suggests_close_match_instead_of_queueing() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("queue-typo.txt");
+    fs::write(&script_path, "/queue lst\n").unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    cmd.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("did you mean '/queue list'"))
+        .stderr(predicate::str::contains("/queue add lst"))
+        .stderr(predicate::str::contains("1 / 8 prompts queued").not());
 }
 
 #[test]
@@ -6676,10 +6703,16 @@ fn test_diff_jsonl_reports_host_only_evidence() {
         permissions["result"]["host_evidence"]["model_read_root"],
         false
     );
+    // The workspace_diff tool is registered in this worktree, so prompt
+    // disclosure can also be initiated by an announced model tool call.
     assert_eq!(
         permissions["result"]["host_evidence"]["prompt_disclosure"],
-        "explicit_user_command_only"
+        "user_command_or_workspace_diff_tool"
     );
+    assert!(permissions["result"]["host_evidence"]["consumers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workspace_diff")));
     assert!(permissions["result"]["host_evidence"]["repository_root"].is_string());
     assert!(
         permissions["result"]["filesystem"]["read"]["active_invocation"]
@@ -7174,4 +7207,385 @@ fn test_artifacts_prune_skips_live_generation() {
         .success()
         .stdout(predicate::str::contains("removed 1 generation(s)"));
     assert!(!live.exists());
+}
+
+// --- cycle 10: model-callable workspace_diff evidence tool -------------------
+
+/// Prepare a git repo with one committed file that has an uncommitted edit.
+fn init_dirty_repo(repo: &Path) {
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(repo.join("code.txt"), "before\n").unwrap();
+    git(&["add", "code.txt"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(repo.join("code.txt"), "after\n").unwrap();
+}
+
+/// The cycle-9 gap, closed: in a chat with no filesystem grants the model can
+/// call `workspace_diff` and receive the host-verified diff, the disclosure is
+/// announced like /review's, and no read root exists before or after.
+#[tokio::test]
+#[serial]
+async fn test_workspace_diff_tool_discloses_evidence_in_scripted_chat() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "diff_call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "workspace_diff",
+                            "arguments": "{\"scope\":\"working\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "your uncommitted change replaces before with after"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("explain.txt");
+    fs::write(
+        &script,
+        "explain what my uncommitted changes do\n/permissions\n/quit\n",
+    )
+    .unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script_path = script.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--no-stream",
+                "chat",
+                "--script",
+                &script_path.to_string_lossy(),
+            ])
+            .output()
+            .expect("run scripted workspace_diff chat");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The call surfaces like every other tool receipt, and the standing
+        // disclosure rule applies at the moment of disclosure.
+        assert!(stderr.contains("workspace_diff"), "{stderr}");
+        assert!(
+            stderr.contains("bytes of host-verified evidence to example-model-v1"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("no read root granted"), "{stderr}");
+        // The diff-backed answer reached the transcript.
+        assert!(
+            stdout.contains("your uncommitted change replaces before with after"),
+            "{stdout}"
+        );
+        // Still zero model read roots; /permissions names the tool as a
+        // host-evidence consumer.
+        assert!(stderr.contains("read roots   none"), "{stderr}");
+        assert!(stderr.contains("workspace_diff tool"), "{stderr}");
+        assert!(
+            stderr.contains("workspace_diff discloses one bounded diff per model call"),
+            "{stderr}"
+        );
+    })
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    // The tool is advertised and the system prompt teaches the model to fetch
+    // verified diffs itself instead of flailing.
+    let tools = first["tools"].as_array().expect("advertised tools");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "workspace_diff"),
+        "{first}"
+    );
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("Use workspace_diff to fetch the user's verified git diff"),
+        "{system}"
+    );
+    // The tool result fed back to the model carries the actual diff bytes.
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_message = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result message");
+    let content = tool_message["content"].as_str().unwrap();
+    assert!(content.contains("+after"), "{content}");
+    assert!(content.contains("\"target\":\"working_tree\""), "{content}");
+}
+
+/// JSONL framing: the workspace_diff call is a normal tool frame, and the
+/// disclosure is a `workspace_evidence_disclosure` event between
+/// `tool_started` and `tool_finished`, shaped like `review_disclosure`.
+#[tokio::test]
+#[serial]
+async fn test_workspace_diff_jsonl_emits_disclosure_event_between_tool_frames() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "diff_call_1",
+                        "type": "function",
+                        "function": {"name": "workspace_diff", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "explained"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("explain.txt");
+    fs::write(&script, "explain my changes\n/quit\n").unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script_path = script.clone();
+    let events = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--script",
+                &script_path.to_string_lossy(),
+            ])
+            .output()
+            .expect("run jsonl workspace_diff chat");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+
+    let started = events
+        .iter()
+        .position(|event| event["type"] == "tool_started" && event["name"] == "workspace_diff")
+        .expect("tool_started for workspace_diff");
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "tool_finished" && event["name"] == "workspace_diff")
+        .expect("tool_finished for workspace_diff");
+    let disclosure = events
+        .iter()
+        .position(|event| event["type"] == "workspace_evidence_disclosure")
+        .expect("workspace_evidence_disclosure event");
+    assert!(started < disclosure && disclosure < finished);
+
+    let disclosure = &events[disclosure];
+    assert_eq!(disclosure["schema"], "kitsu.chat.v1");
+    assert_eq!(disclosure["source"], "workspace_diff");
+    assert_eq!(disclosure["target"], "working_tree");
+    assert_eq!(disclosure["model_disclosed"], true);
+    assert_eq!(disclosure["model_read_root_granted"], false);
+    assert_eq!(disclosure["truncated"], false);
+    assert!(disclosure["evidence_bytes"].as_u64().unwrap() > 0);
+
+    // The tool result inside the frame carries the diff; no permission or
+    // grant event appears anywhere in the stream.
+    let finished = &events[finished];
+    assert!(finished["output"].as_str().unwrap().contains("+after"));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "permission_prompt"));
+}
+
+/// Both opt-outs unregister the tool entirely, and a non-worktree directory
+/// never registers it in the first place.
+#[test]
+#[serial]
+fn test_no_workspace_evidence_flag_and_config_unregister_the_tool() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("tools.txt");
+    fs::write(&script, "/tools\n/quit\n").unwrap();
+
+    // Baseline: the worktree registers the tool.
+    let mut with_tool = base_cmd(home.path());
+    with_tool
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    with_tool
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff"));
+
+    // Flag opt-out.
+    let mut flagged = base_cmd(home.path());
+    flagged
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--no-workspace-evidence",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    flagged
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
+
+    // Config opt-out.
+    let config_path = home.path().join(".kitsu/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("workspace_evidence = false\n{config}"),
+    )
+    .unwrap();
+    let mut configured = base_cmd(home.path());
+    configured
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    configured
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
+
+    // Outside a git worktree there is nothing to disclose: not registered.
+    fs::write(&config_path, config).unwrap();
+    let plain = TempDir::new().unwrap();
+    let plain_script = plain.path().join("tools.txt");
+    fs::write(&plain_script, "/tools\n/quit\n").unwrap();
+    let mut no_worktree = base_cmd(home.path());
+    no_worktree
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(plain.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &plain_script.to_string_lossy(),
+        ]);
+    no_worktree
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
 }
