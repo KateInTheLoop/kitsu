@@ -378,8 +378,11 @@ pub enum ArtifactCommand {
 
 #[derive(Debug, Subcommand)]
 pub enum SessionCommand {
-    /// List saved sessions (the default when no action is given).
-    List,
+    /// List saved sessions (the default when no action is given). Optional filter is a case-insensitive substring matched against session id and preview text.
+    List {
+        /// Optional case-insensitive substring filter over session id and preview text.
+        filter: Option<String>,
+    },
     /// Show one saved session and its bounded transcript.
     Show {
         /// Exact session id, or `last`.

@@ -1945,8 +1945,9 @@ impl SessionStore {
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         let id = if selector == "last" || selector.is_empty() {
-            preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?
+            preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
+                "no saved sessions — start one with kitsu chat --session or /new".to_string()
+            })?
         } else if valid_id(selector) {
             selector.to_string()
         } else {
@@ -1986,8 +1987,9 @@ impl SessionStore {
     pub fn fork(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         let mut forked = if selector == "last" || selector.is_empty() {
-            let id = preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
+            let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
+                "no saved sessions — start one with kitsu chat --session or /new".to_string()
+            })?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
             directory.read_saved(selector)?
@@ -2065,8 +2067,9 @@ impl SessionStore {
     ) -> Result<PathBuf, String> {
         let directory = open_session_directory(dir)?;
         let mut saved = if selector == "last" || selector.is_empty() {
-            let id = preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
+            let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
+                "no saved sessions — start one with kitsu chat --session or /new".to_string()
+            })?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
             directory.read_saved(selector)?
