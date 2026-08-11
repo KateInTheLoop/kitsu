@@ -1,6 +1,6 @@
 # Kitsu — supported functionality
 
-> Status: 2026-08-10. This is a source- and test-backed description of the
+> Status: 2026-08-11. This is a source- and test-backed description of the
 > current CLI. Hosted-provider availability, credentials, billing, and the
 > quality of a particular model remain external to this contract.
 
@@ -150,7 +150,19 @@ environment are isolated, and capabilities are dropped. Backend absence,
 replacement, or unsupported platforms fail closed before a prompt or child
 launch.
 Session grants also bind the executable observed at approval time; replacement
-or changed `PATH` resolution invalidates the grant before execution.
+or changed `PATH` resolution invalidates the grant before execution. The
+approved executable's own directory is a second, independent containment root
+requirement on top of the cwd root; a denial for a toolchain outside every
+`--command-root` names the exact missing directory and the flag to add.
+Contained commands receive a fixed non-secret environment (`PATH`, `HOME`,
+`LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`); `--command-env
+NAME[=VALUE]` opts one variable at a time into that set (bare `NAME` reads
+kitsu's own environment and is refused for secret-shaped names; `NAME=value`
+always allows an explicit literal), which is what makes interpreter-based
+toolchains (pytest, npm test, ...) with an env-driven module search path work
+under mandatory containment. Every exact `--allow-command` pregrant is also
+named verbatim (argv and cwd) in the system prompt sent to the model, so it
+can call one directly instead of guessing an invocation.
 Windows command execution currently fails closed before approval because Kitsu
 does not yet have equivalent containment, loader-extension resolution, and
 executable-image validation; it never substitutes a pathname-only fingerprint.
@@ -203,7 +215,9 @@ Scripted and piped chat are stateless by default. `--session` explicitly
 creates a durable conversation, and `--resume [id|last]` resumes and autosaves
 in interactive, scripted, or piped modes. Each successful automation turn is
 saved before the next one; a save failure makes the automation command fail.
-`--no-session` conflicts with both continuity forms. Resume/new-session
+`--resume` already implies `--session`, so passing both explicitly is a
+harmless no-op confirmation rather than an error; `--no-session` conflicts
+with both continuity forms. Resume/new-session
 boundaries drop runtime grants and restore current invocation roots; no saved
 session can restore authority.
 A newly requested durable session is not published until its first successful

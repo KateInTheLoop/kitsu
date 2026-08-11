@@ -74,6 +74,13 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   `command permission>` byte-exact forms.
 - **Context meter**: filled `■` cells in FOX (AMBER >=80%, EMBER >=95%),
   empty `□` dimmed; plain `[####----]`.
+- **Agent deck**: `/jobs` and `/agent` share one `◈ agent deck — N total · N
+  running · N done · N failed · N cancelled · N running slot(s) free · N
+  record slot(s) free` receipt line, then per-row status, or `no background
+  agents` when empty. `/profiles` uses the same `◈` receipt header with rows
+  prefixed `◆` (tool-capable / inherits session grants) or `◇` (reasoning-only
+  / no tools), reusing the tool-call/tool-result glyphs to signal capability
+  level rather than tool activity.
 - **`/help`**: grouped under six headings (session; context & history; files,
   diffs & checkpoints; agents & jobs; permissions; models & reasoning) from
   the single command registry; aliases fold into their parent row as

@@ -117,6 +117,17 @@ guarantees requires a new schema identifier.
   `true`) and `discarded_ms`: steering does not append to the running attempt,
   it drops it and restarts the worker on a fresh transcript, discarding that
   many milliseconds of elapsed work. Completed file effects survive.
+  When containment is `ready`, `commands.containment.environment` (cycle 8)
+  lists every `(name, value)` pair the contained command actually receives —
+  the fixed non-secret base set plus any `--command-env` pass-through, merged
+  (pass-through wins on a name collision) — and
+  `commands.containment.passthrough_environment` lists just the names of the
+  caller-approved pass-through entries, a subset of the names in
+  `environment`. A value for a secret-shaped name (case-insensitive
+  `KEY`/`TOKEN`/`SECRET`/`PASSWORD` substring) is reported as `"<redacted>"`
+  in both the JSONL event and `/permissions` text even though the contained
+  process receives the real value — this is a disclosure-surface redaction,
+  not a containment change.
   An agent profile's `reasoning_effort` may be `"inherit"` — the default — which
   means the spawn sends **no** `reasoning_effort` request field and keeps the
   parent invocation's policy (itself omitted unless `--reasoning-effort` was

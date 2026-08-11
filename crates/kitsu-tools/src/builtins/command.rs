@@ -66,6 +66,42 @@ pub const COMMAND_CONTAINMENT_ENVIRONMENT: &[(&str, &str)] = &[
     ("TMPDIR", "/tmp"),
     ("USER", "kitsu"),
 ];
+/// Case-insensitive substring markers that make an environment variable name
+/// look like it could hold a secret. A bare `--command-env NAME` pass-through
+/// (which silently forwards whatever value kitsu's own process happens to
+/// hold under that name) is refused for a matching name; the explicit
+/// `--command-env NAME=value` form is always allowed regardless of name,
+/// since the caller is typing the literal value onto the command line rather
+/// than asking kitsu to forward an ambient one.
+pub const SECRET_LIKE_ENV_NAME_MARKERS: &[&str] = &["KEY", "TOKEN", "SECRET", "PASSWORD"];
+
+/// True if `name` contains one of [`SECRET_LIKE_ENV_NAME_MARKERS`] as a
+/// case-insensitive substring.
+pub fn env_name_looks_secret(name: &str) -> bool {
+    let upper = name.to_ascii_uppercase();
+    SECRET_LIKE_ENV_NAME_MARKERS
+        .iter()
+        .any(|marker| upper.contains(marker))
+}
+
+/// Merge the fixed base containment environment with caller-approved
+/// pass-through entries. Pass-through entries override a base var of the
+/// same name (last one wins) rather than duplicating it, so e.g. an explicit
+/// `--command-env HOME=/real/project/.venv`-style override behaves
+/// predictably instead of leaving two conflicting `--setenv HOME` values.
+fn merged_containment_environment(extra: &[(String, String)]) -> Vec<(String, String)> {
+    let mut merged: Vec<(String, String)> = COMMAND_CONTAINMENT_ENVIRONMENT
+        .iter()
+        .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+        .collect();
+    for (name, value) in extra {
+        match merged.iter_mut().find(|(existing, _)| existing == name) {
+            Some(slot) => slot.1 = value.clone(),
+            None => merged.push((name.clone(), value.clone())),
+        }
+    }
+    merged
+}
 /// Time allowed for captured pipes to reach EOF after the direct child exits.
 /// A detached descendant must not make command completion unbounded.
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
@@ -274,7 +310,20 @@ pub struct CommandContainmentReady {
     pub backend_path: PathBuf,
     pub writable_command_roots: Vec<PathBuf>,
     pub readonly_runtime_roots: Vec<PathBuf>,
+    /// The fixed base set plus any caller-approved `--command-env`
+    /// pass-through entries, merged (pass-through wins on a name collision).
+    /// Values for secret-shaped names (see [`env_name_looks_secret`]) are
+    /// redacted here even though the contained process receives the real
+    /// value — this field feeds durable disclosure surfaces (`/permissions`,
+    /// JSONL), not the launch itself.
     pub environment: Vec<(String, String)>,
+    /// Names only (never values) of the pass-through entries approved for
+    /// this policy, in the order they were granted. A subset of the names in
+    /// `environment` — present even when a value was redacted above, so a
+    /// JSONL consumer can see exactly which variables were opted in without
+    /// needing to diff against the fixed base set.
+    #[serde(default)]
+    pub passthrough_environment: Vec<String>,
     pub network_isolated: bool,
     pub pid_isolated: bool,
     pub ipc_isolated: bool,
@@ -856,7 +905,7 @@ impl BubblewrapBackend {
                             .to_string(),
                     )
                 })?;
-            let mut arguments = base_bubblewrap_arguments(&runtime_mounts);
+            let mut arguments = base_bubblewrap_arguments(&runtime_mounts, &[]);
             arguments.push(OsString::from("--"));
             arguments.push(true_path.as_os_str().to_os_string());
             let output = std::process::Command::new(&fingerprint.canonical_path)
@@ -944,10 +993,15 @@ impl CommandContainmentBackend for BubblewrapBackend {
             .chain(ready.readonly_runtime_roots.iter())
             .any(|root| executable.canonical_path.starts_with(root));
         if !executable_visible {
+            let toolchain_dir = executable
+                .canonical_path
+                .parent()
+                .map(|dir| dir.display().to_string())
+                .unwrap_or_else(|| executable.canonical_path.display().to_string());
             return Err(CommandContainmentError::new(
                 CommandContainmentUnavailableReason::ExecutableOutsideVisibleRoots,
                 format!(
-                    "approved executable '{}' is outside every command/runtime root; add its narrow toolchain directory as a read-only runtime root",
+                    "approved executable '{}' is outside every command/runtime root; its own directory is a separate root requirement on top of the cwd root — add it with `--command-root {toolchain_dir}`",
                     executable.canonical_path.display()
                 ),
             ));
@@ -966,7 +1020,7 @@ impl CommandContainmentBackend for BubblewrapBackend {
         {
             use std::os::fd::AsRawFd;
 
-            let mut arguments = base_bubblewrap_arguments(&[]);
+            let mut arguments = base_bubblewrap_arguments(&[], &policy.passthrough_environment);
             let mut inherited_paths = Vec::with_capacity(
                 ready
                     .readonly_runtime_roots
@@ -1144,7 +1198,10 @@ fn runtime_mount_paths(
 }
 
 #[cfg(target_os = "linux")]
-fn base_bubblewrap_arguments(runtime_mounts: &[PathBuf]) -> Vec<OsString> {
+fn base_bubblewrap_arguments(
+    runtime_mounts: &[PathBuf],
+    extra_env: &[(String, String)],
+) -> Vec<OsString> {
     let mut arguments = [
         "--die-with-parent",
         "--new-session",
@@ -1179,7 +1236,7 @@ fn base_bubblewrap_arguments(runtime_mounts: &[PathBuf]) -> Vec<OsString> {
         arguments.push(path.as_os_str().to_os_string());
     }
     arguments.push(OsString::from("--clearenv"));
-    for (name, value) in COMMAND_CONTAINMENT_ENVIRONMENT {
+    for (name, value) in merged_containment_environment(extra_env) {
         arguments.push(OsString::from("--setenv"));
         arguments.push(OsString::from(name));
         arguments.push(OsString::from(value));
@@ -1235,6 +1292,11 @@ pub struct CommandPolicy {
     artifact_sink: Option<Arc<dyn CommandOutputArtifactSink>>,
     containment_config: CommandContainmentConfig,
     containment_backend: Arc<dyn CommandContainmentBackend>,
+    /// Opt-in, explicit environment pass-through on top of the fixed base set
+    /// (deny-by-default otherwise: nothing else is inherited from the host).
+    /// Resolved and secret-name-checked by the caller (the CLI layer) before
+    /// reaching here; see [`env_name_looks_secret`].
+    passthrough_environment: Vec<(String, String)>,
     #[cfg(test)]
     executable_search_path: RwLock<Option<std::ffi::OsString>>,
 }
@@ -1277,6 +1339,7 @@ impl CommandPolicy {
             artifact_sink: None,
             containment_backend,
             containment_config,
+            passthrough_environment: Vec::new(),
             #[cfg(test)]
             executable_search_path: RwLock::new(None),
         })
@@ -1314,6 +1377,23 @@ impl CommandPolicy {
         &self.containment_config
     }
 
+    /// Opt-in, explicit environment variables layered on top of the fixed
+    /// non-secret containment base set (`--command-env` at the CLI). This
+    /// never widens deny-by-default host inheritance: only exactly these
+    /// caller-approved name/value pairs are added, on top of the same fixed
+    /// base every contained command already receives. A later entry with the
+    /// same name as an earlier one (or a base var) overrides it.
+    pub fn with_passthrough_environment(mut self, entries: Vec<(String, String)>) -> Self {
+        self.passthrough_environment = entries;
+        self
+    }
+
+    /// The exact pass-through entries this policy was constructed with (not
+    /// including the fixed base set).
+    pub fn passthrough_environment(&self) -> &[(String, String)] {
+        &self.passthrough_environment
+    }
+
     /// Preflight the mandatory backend once and return a cached, inspectable
     /// status suitable for `/permissions`, `/doctor`, or startup diagnostics.
     pub fn containment_status(&self) -> CommandContainmentStatus {
@@ -1323,9 +1403,21 @@ impl CommandPolicy {
                 backend_path: ready.backend_path,
                 writable_command_roots: self.command_roots.clone(),
                 readonly_runtime_roots: ready.readonly_runtime_roots,
-                environment: COMMAND_CONTAINMENT_ENVIRONMENT
+                environment: merged_containment_environment(&self.passthrough_environment)
+                    .into_iter()
+                    .map(|(name, value)| {
+                        let value = if env_name_looks_secret(&name) {
+                            "<redacted>".to_string()
+                        } else {
+                            value
+                        };
+                        (name, value)
+                    })
+                    .collect(),
+                passthrough_environment: self
+                    .passthrough_environment
                     .iter()
-                    .map(|(name, value)| ((*name).to_string(), (*value).to_string()))
+                    .map(|(name, _)| name.clone())
                     .collect(),
                 network_isolated: true,
                 pid_isolated: true,
@@ -2567,7 +2659,11 @@ async fn run_supervised_command(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .kill_on_drop(true);
-    for (name, value) in COMMAND_CONTAINMENT_ENVIRONMENT {
+    // Bubblewrap's own `--clearenv`/`--setenv` argv is what actually governs
+    // the contained child's environment (see `base_bubblewrap_arguments`);
+    // this loop matters for the non-bwrap test containment backend, which
+    // execs the target program directly using this outer `Command`.
+    for (name, value) in merged_containment_environment(&policy.passthrough_environment) {
         command.env(name, value);
     }
     #[cfg(unix)]
@@ -3701,6 +3797,77 @@ mod tests {
         assert_eq!(executable.fingerprint, None);
     }
 
+    #[test]
+    fn secret_like_env_names_are_detected_case_insensitively() {
+        for name in [
+            "API_KEY",
+            "my_token",
+            "AWS_SECRET_ACCESS_KEY",
+            "DB_PASSWORD",
+            "Password",
+        ] {
+            assert!(env_name_looks_secret(name), "{name} should look secret");
+        }
+        for name in [
+            "PYTHONPATH",
+            "NODE_PATH",
+            "VIRTUAL_ENV",
+            "CARGO_HOME",
+            "HOME",
+        ] {
+            assert!(
+                !env_name_looks_secret(name),
+                "{name} should not look secret"
+            );
+        }
+    }
+
+    #[test]
+    fn containment_status_discloses_passthrough_names_but_redacts_secret_shaped_values() {
+        let dir = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::Deny)
+            .unwrap()
+            .with_passthrough_environment(vec![
+                (
+                    "MY_API_KEY".to_string(),
+                    "sk-live-should-not-leak".to_string(),
+                ),
+                ("PYTHONPATH".to_string(), "/some/safe/path".to_string()),
+            ]);
+        let CommandContainmentStatus::Ready(ready) = policy.containment_status() else {
+            panic!("test containment backend must report ready");
+        };
+        assert_eq!(
+            ready.passthrough_environment,
+            vec!["MY_API_KEY".to_string(), "PYTHONPATH".to_string()]
+        );
+        let value_of = |name: &str| {
+            ready
+                .environment
+                .iter()
+                .find(|(candidate, _)| candidate == name)
+                .map(|(_, value)| value.clone())
+        };
+        assert_eq!(value_of("MY_API_KEY").as_deref(), Some("<redacted>"));
+        assert_eq!(value_of("PYTHONPATH").as_deref(), Some("/some/safe/path"));
+        // The fixed base set is untouched and still fully disclosed.
+        assert_eq!(value_of("HOME").as_deref(), Some("/tmp/kitsu-home"));
+    }
+
+    #[test]
+    fn passthrough_environment_overrides_a_same_named_base_var() {
+        let merged = merged_containment_environment(&[(
+            "HOME".to_string(),
+            "/tmp/kitsu-passthrough-home".to_string(),
+        )]);
+        assert_eq!(merged.len(), COMMAND_CONTAINMENT_ENVIRONMENT.len());
+        let home = merged
+            .iter()
+            .find(|(name, _)| name == "HOME")
+            .map(|(_, value)| value.as_str());
+        assert_eq!(home, Some("/tmp/kitsu-passthrough-home"));
+    }
+
     #[tokio::test]
     async fn missing_containment_backend_is_typed_and_denied_before_approval() {
         let dir = tempfile::tempdir().unwrap();
@@ -3739,7 +3906,7 @@ mod tests {
     #[cfg(target_os = "linux")]
     #[test]
     fn bubblewrap_plan_clears_environment_and_requests_all_required_namespaces() {
-        let arguments = base_bubblewrap_arguments(&[])
+        let arguments = base_bubblewrap_arguments(&[], &[])
             .into_iter()
             .map(|argument| argument.to_string_lossy().into_owned())
             .collect::<Vec<_>>();
@@ -3765,6 +3932,180 @@ mod tests {
             .position(|argument| argument == "--setenv")
             .unwrap();
         assert!(clear < first_set);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn bubblewrap_plan_lets_passthrough_env_override_a_base_var() {
+        let arguments = base_bubblewrap_arguments(
+            &[],
+            &[(
+                "HOME".to_string(),
+                "/tmp/kitsu-passthrough-home".to_string(),
+            )],
+        )
+        .into_iter()
+        .map(|argument| argument.to_string_lossy().into_owned())
+        .collect::<Vec<_>>();
+        // Exactly one --setenv HOME survives (the pass-through value), not two
+        // conflicting ones.
+        let home_positions = arguments
+            .iter()
+            .enumerate()
+            .filter(|(_, argument)| *argument == "HOME")
+            .map(|(index, _)| index)
+            .collect::<Vec<_>>();
+        assert_eq!(home_positions.len(), 1);
+        assert_eq!(
+            arguments[home_positions[0] + 1],
+            "/tmp/kitsu-passthrough-home"
+        );
+    }
+
+    /// Regression for cycle-8 audit gap 1: mandatory containment's fixed
+    /// environment breaks interpreter-based toolchains whose module search
+    /// path is env-driven (PYTHONPATH/HOME-derived user-site, NODE_PATH,
+    /// etc.), *even when every relevant directory is already mounted* as a
+    /// command root. Reproduced here with a minimal stand-in for the audit's
+    /// `pytest` failure (`ModuleNotFoundError` from a script whose importable
+    /// module lives outside the working directory) rather than depending on
+    /// a real pytest installation being present on the test host. Confirms
+    /// the root cause is the environment, not a missing mount: the "before"
+    /// run already has the module's directory bind-mounted as a command root
+    /// and still fails; only adding the explicit `--command-env` PYTHONPATH
+    /// pass-through fixes it.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn command_env_passthrough_fixes_interpreter_module_resolution() {
+        let workdir = tempfile::tempdir().unwrap();
+        let moddir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            moddir.path().join("kitsu_passthrough_probe.py"),
+            "VALUE = \"kitsu-passthrough-ok\"\n",
+        )
+        .unwrap();
+        let python3 = Path::new("/usr/bin/python3");
+        if !python3.is_file() {
+            eprintln!("skipping: /usr/bin/python3 not present on this host");
+            return;
+        }
+        let argv = vec![
+            "/usr/bin/python3".to_string(),
+            "-c".to_string(),
+            "import kitsu_passthrough_probe; print(kitsu_passthrough_probe.VALUE)".to_string(),
+        ];
+
+        // Before: the module's directory IS mounted (as a second command
+        // root), but nothing tells the interpreter to look there. This is
+        // exactly the audit's finding — more roots did not help.
+        let policy = CommandPolicy::new(&[root(&workdir), root(&moddir)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default());
+        let CommandContainmentStatus::Ready(_) = policy.containment_status() else {
+            eprintln!(
+                "skipping live containment assertions: {:?}",
+                policy.containment_status()
+            );
+            return;
+        };
+        policy.grant_command(&argv, workdir.path()).unwrap();
+        let before = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv: argv.clone(),
+                cwd: root(&workdir),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(!before.success);
+        assert!(
+            before.stderr.contains("ModuleNotFoundError"),
+            "{}",
+            before.stderr
+        );
+
+        // After: the identical grant/mounts, plus one opt-in --command-env
+        // PYTHONPATH pass-through naming the already-mounted directory.
+        let policy = CommandPolicy::new(&[root(&workdir), root(&moddir)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default())
+            .with_passthrough_environment(vec![(
+                "PYTHONPATH".to_string(),
+                moddir.path().to_string_lossy().into_owned(),
+            )]);
+        policy.grant_command(&argv, workdir.path()).unwrap();
+        let after = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv,
+                cwd: root(&workdir),
+                timeout_ms: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(after.success, "{}", after.stderr);
+        assert_eq!(after.stdout.trim(), "kitsu-passthrough-ok");
+    }
+
+    /// Regression for cycle-8 audit gap 2: an approved executable whose own
+    /// directory isn't separately visible to the sandbox must be denied with
+    /// a message that names the missing directory and the exact flag
+    /// (`--command-root <dir>`) that fixes it, not just the bare executable
+    /// path.
+    #[cfg(target_os = "linux")]
+    #[tokio::test]
+    async fn executable_outside_visible_roots_names_the_missing_dir_and_the_fix() {
+        let cwd_dir = tempfile::tempdir().unwrap();
+        let toolchain_dir = tempfile::tempdir().unwrap();
+        let probe = toolchain_dir.path().join("kitsu-probe-tool");
+        write_test_executable(&probe, "unreachable");
+        let argv = vec![probe.to_string_lossy().into_owned()];
+
+        // Only cwd_dir is a command root — toolchain_dir (the executable's
+        // own directory) is deliberately withheld, matching the audit's
+        // repro of a CI author following the documented pregrant recipe
+        // verbatim without also granting the toolchain directory.
+        let policy = CommandPolicy::new(&[root(&cwd_dir)], CommandMode::Deny)
+            .unwrap()
+            .with_containment_config(CommandContainmentConfig::default());
+        let CommandContainmentStatus::Ready(_) = policy.containment_status() else {
+            eprintln!(
+                "skipping live containment assertions: {:?}",
+                policy.containment_status()
+            );
+            return;
+        };
+        policy.grant_command(&argv, cwd_dir.path()).unwrap();
+        let result = execute_command(
+            &policy,
+            CommandExecArgs {
+                argv,
+                cwd: root(&cwd_dir),
+                timeout_ms: None,
+            },
+        )
+        .await;
+        let Err(ToolError::PolicyDenied(message)) = result else {
+            panic!("expected PolicyDenied, got {result:?}");
+        };
+        assert!(
+            message.contains(&toolchain_dir.path().display().to_string()),
+            "{message}"
+        );
+        assert!(
+            message.contains(&format!(
+                "--command-root {}",
+                toolchain_dir.path().display()
+            )),
+            "{message}"
+        );
+        assert!(
+            message.contains("ExecutableOutsideVisibleRoots"),
+            "{message}"
+        );
     }
 
     #[cfg(target_os = "linux")]
