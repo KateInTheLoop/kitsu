@@ -22,6 +22,7 @@
     { "$ref": "#/$defs/command_finished" },
     { "$ref": "#/$defs/context_window_mismatch" },
     { "$ref": "#/$defs/workspace_evidence_disclosure" },
+    { "$ref": "#/$defs/rollback_retained_changes" },
     { "$ref": "#/$defs/error" },
     { "$ref": "#/$defs/final_summary" },
     { "$ref": "#/$defs/forward_compatible_event" }
@@ -145,7 +146,8 @@
             "artifact_bytes": { "type": "integer", "minimum": 0 }
           }
         },
-        "artifact_error": { "type": "string" }
+        "artifact_error": { "type": "string" },
+        "containment_hint": { "type": "string" }
       }
     },
     "run_started": {
@@ -563,6 +565,31 @@
         }
       ]
     },
+    "rollback_retained_changes": {
+      "description": "A failed/cancelled turn's conversation state was rolled back while completed file changes it made remain on disk. Emitted after that turn's turn_finished; a host-authored briefing message enumerating the retained paths was injected into the surviving conversation state (note_injected). Paths are bounded to a fixed cap; omitted_paths counts the rest. No diff bodies are included.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["checkpoints", "change_count", "paths", "note_injected"],
+          "properties": {
+            "type": { "const": "rollback_retained_changes" },
+            "turn_id": { "type": "string", "minLength": 1 },
+            "checkpoints": {
+              "type": "array",
+              "items": { "type": "integer", "minimum": 0 }
+            },
+            "change_count": { "type": "integer", "minimum": 1 },
+            "paths": {
+              "type": "array",
+              "items": { "type": "string" }
+            },
+            "omitted_paths": { "type": "integer", "minimum": 0 },
+            "note_injected": { "const": true }
+          }
+        }
+      ]
+    },
     "forward_compatible_event": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -590,6 +617,7 @@
                   "command_finished",
                   "context_window_mismatch",
                   "workspace_evidence_disclosure",
+                  "rollback_retained_changes",
                   "error",
                   "final_summary"
                 ]

@@ -69,6 +69,16 @@ guarantees requires a new schema identifier.
   and exit code 2 — `committed_partial` changes only how the delivered text is
   classified, never the failure status. Scripted (`--script`) turns keep strict
   `discarded` rollback so later turns continue from consistent history.
+- `rollback_retained_changes` is emitted after a turn's `turn_finished` when
+  that turn failed (or was cancelled) and was rolled back out of conversation
+  state while completed file changes it made remain on disk. It carries the
+  verified `checkpoints` ids, `change_count`, a bounded `paths` list (plus
+  `omitted_paths` for the rest), and `note_injected: true`: a host-authored
+  system message enumerating the same retained paths was appended to the
+  surviving conversation state so the next turn's model knows about edits it
+  no longer remembers making. No diff bodies are included; when the
+  `workspace_diff` tool is registered the note points the model at it for
+  exact contents.
 - `context_window_mismatch` is emitted at most once per resolved window when a
   provider usage report shows the server accepted markedly fewer prompt tokens
   than the request was estimated to contain — evidence that the server's real
@@ -179,6 +189,14 @@ separate serialized-file byte ceiling while stdout/stderr continue draining.
 `artifact_bytes` is the exact completed on-disk JSONL size including framing and
 hex/JSON expansion, and `limit_bytes` bounds that serialized size. `truncated`
 discloses omitted output independently of the smaller inline preview.
+
+When a contained command exits nonzero and its bounded output matches a
+missing-module/missing-command shape (`No module named`, `command not found`,
+…), the optional `command.containment_hint` field carries a bounded
+host-authored diagnosis naming the likely cause (the mandatory containment
+environment) and the concrete remedies (`--command-env`, `--command-root`).
+The same text reaches the model-visible tool result and the human receipt; it
+is advisory only and never changes the command's status fields.
 
 If cancellation drops an active command, its matching `tool_finished` carries
 `cancelled: true` and native `command.termination: "cancelled"`. Captures are

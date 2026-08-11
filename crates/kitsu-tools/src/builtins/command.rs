@@ -1989,6 +1989,14 @@ pub struct CommandOutput {
     /// discarding the command's bounded output metadata.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_error: Option<String>,
+    /// Host-authored diagnosis appended when a contained command exits nonzero
+    /// with output matching a missing-module/missing-command shape — a failure
+    /// that on pip-user/npm-style toolchains is usually caused by the mandatory
+    /// containment environment (fixed env allowlist, no host home mount), not
+    /// by the project. Names the concrete remedies (`--command-env`,
+    /// `--command-root`) so the model can self-correct instead of giving up.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment_hint: Option<String>,
 }
 
 /// Live, bounded command progress observer used by frontends to retain truthful
@@ -2316,6 +2324,7 @@ impl CommandProgressCapture {
             elapsed_ms: duration_millis(self.started.elapsed()),
             artifact: None,
             artifact_error: self.artifact_error.lock().unwrap().clone(),
+            containment_hint: None,
         });
     }
 
@@ -2878,6 +2887,8 @@ pub async fn execute_command(
         .unwrap_or((None, None));
     let artifact_error = artifact_begin_error.or(artifact_completion_error);
     cancellation_guard.disarm();
+    let containment_hint =
+        containment_failure_hint(termination, success, &stdout.text, &stderr.text);
 
     Ok(CommandOutput {
         argv: args.argv,
@@ -2901,7 +2912,48 @@ pub async fn execute_command(
         elapsed_ms,
         artifact: output_artifact,
         artifact_error,
+        containment_hint,
     })
+}
+
+/// Toolchain-failure shapes that, inside mandatory containment, usually mean
+/// the sandbox environment (fixed env allowlist, unmounted host home) rather
+/// than the project is at fault. Matched against the bounded output previews
+/// of a nonzero natural exit only.
+const CONTAINMENT_HINT_SHAPES: [&str; 5] = [
+    "No module named",
+    "ModuleNotFoundError",
+    "command not found",
+    ": not found",
+    "Cannot find module",
+];
+
+/// Diagnose a contained command failure that matches a missing-module or
+/// missing-command shape. The hint is host-authored, bounded, and names the
+/// concrete remedies, mirroring the outside-root executable denial's style.
+/// It reaches both the human receipt and the model-visible tool result via
+/// [`CommandOutput::containment_hint`].
+fn containment_failure_hint(
+    termination: CommandTermination,
+    success: bool,
+    stdout: &str,
+    stderr: &str,
+) -> Option<String> {
+    if success || termination != CommandTermination::Exited {
+        return None;
+    }
+    let shape = CONTAINMENT_HINT_SHAPES
+        .iter()
+        .find(|shape| stderr.contains(*shape) || stdout.contains(*shape))?;
+    Some(format!(
+        "output matches '{shape}' — this is often the containment environment, not the \
+         project: contained commands run with a fixed non-secret environment and no host \
+         home directory, so user-level installs (e.g. pip's ~/.local user-site) are \
+         invisible even when the same command works on the host. If it works outside \
+         kitsu, pass the interpreter's search path with `--command-env` (e.g. \
+         `--command-env PYTHONPATH=<host site-packages dir>`) and/or expose the \
+         toolchain's directory with `--command-root <dir>`"
+    ))
 }
 
 /// Build the advertised `command_exec` tool bound to an explicit command
@@ -4025,6 +4077,14 @@ mod tests {
             "{}",
             before.stderr
         );
+        // Cycle-10 G2: the failure shape must carry a host-authored hint that
+        // names the likely cause (containment env) and both remedies.
+        let hint = before
+            .containment_hint
+            .as_deref()
+            .expect("missing-module failure inside containment must carry a hint");
+        assert!(hint.contains("--command-env"), "{hint}");
+        assert!(hint.contains("--command-root"), "{hint}");
 
         // After: the identical grant/mounts, plus one opt-in --command-env
         // PYTHONPATH pass-through naming the already-mounted directory.
@@ -4048,6 +4108,67 @@ mod tests {
         .unwrap();
         assert!(after.success, "{}", after.stderr);
         assert_eq!(after.stdout.trim(), "kitsu-passthrough-ok");
+        assert!(
+            after.containment_hint.is_none(),
+            "successful commands must not carry a containment hint"
+        );
+    }
+
+    /// Cycle-10 G2: the failure-shape matcher fires only on a nonzero natural
+    /// exit whose output matches a missing-module/missing-command shape, and
+    /// the hint names both remedies. Successes, signals, and unrelated
+    /// failures stay hint-free so the receipt is not polluted.
+    #[test]
+    fn containment_hint_matches_only_missing_toolchain_shapes() {
+        let hint = containment_failure_hint(
+            CommandTermination::Exited,
+            false,
+            "",
+            "/usr/bin/python3: No module named pytest\n",
+        )
+        .expect("missing-module stderr must produce a hint");
+        assert!(hint.contains("No module named"), "{hint}");
+        assert!(hint.contains("--command-env"), "{hint}");
+        assert!(hint.contains("--command-root"), "{hint}");
+
+        let shell = containment_failure_hint(
+            CommandTermination::Exited,
+            false,
+            "sh: 1: pytest: not found\n",
+            "",
+        );
+        assert!(shell.is_some(), "shell not-found stdout must also match");
+
+        assert!(
+            containment_failure_hint(
+                CommandTermination::Exited,
+                true,
+                "No module named anything",
+                ""
+            )
+            .is_none(),
+            "successful exits never hint"
+        );
+        assert!(
+            containment_failure_hint(
+                CommandTermination::Signaled,
+                false,
+                "",
+                "No module named pytest"
+            )
+            .is_none(),
+            "signals are not exit-shape failures"
+        );
+        assert!(
+            containment_failure_hint(
+                CommandTermination::Exited,
+                false,
+                "",
+                "assert 1 == 2 failed"
+            )
+            .is_none(),
+            "ordinary failures stay hint-free"
+        );
     }
 
     /// Regression for cycle-8 audit gap 2: an approved executable whose own

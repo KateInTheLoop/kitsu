@@ -3272,6 +3272,136 @@ async fn test_failed_script_turn_is_transactionally_rolled_back() {
     );
 }
 
+/// Cycle-10 G1 acceptance: a strict scripted turn that completes a file write
+/// and then fails is rolled back, but the retained on-disk change is not
+/// orphaned — the next turn's request carries a host-authored note naming the
+/// written path (so the model can name its own edits without re-reading
+/// blind), stderr says what was retained, and the end-of-run summary repeats
+/// the count.
+#[tokio::test]
+#[serial]
+async fn test_rolled_back_turn_briefs_next_turn_about_retained_file_changes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().unwrap();
+    let written = repo.path().join("retained.txt");
+    let write_args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"RETAINED-CONTENT-SENTINEL\"}}"#,
+        written.to_string_lossy().replace('\\', "\\\\")
+    );
+    let write_round = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_write","type":"function","function":{{"name":"fs_write_file","arguments":"{write_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        String::new(),
+    ]
+    .join("\n\n");
+    let denied_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_denied","type":"function","function":{"name":"fs_read_file","arguments":"{\"path\":\"/etc/hostname\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let finish_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"attempt finished"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let second_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"second turn done"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let sse = if body.contains("SECOND_TURN_PROMPT") {
+                second_round.clone()
+            } else if body.contains("PolicyDenied") {
+                finish_round.clone()
+            } else if body.contains("\"role\":\"tool\"") {
+                denied_round.clone()
+            } else {
+                write_round.clone()
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse)
+        })
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("retained.txt.script");
+    fs::write(&script_path, "WRITE_THEN_FAIL_PROMPT\nSECOND_TURN_PROMPT\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script = script_path.to_string_lossy().to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.current_dir(&repo_path);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--allow-read-write",
+            &repo_path.to_string_lossy(),
+            "--script",
+            &script,
+        ]);
+        cmd.assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("failed turn rolled back"))
+            .stderr(predicate::str::contains(
+                "file change(s) from the rolled-back turn remain on disk",
+            ))
+            .stderr(predicate::str::contains(
+                "file change(s) from rolled-back turn(s) remain on disk",
+            ));
+    })
+    .await
+    .expect("join");
+
+    // Ground truth: the write from the rolled-back turn is still on disk.
+    assert_eq!(
+        fs::read_to_string(&written).expect("retained write must survive the rollback"),
+        "RETAINED-CONTENT-SENTINEL"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let recovery = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("SECOND_TURN_PROMPT"))
+        .expect("second turn request");
+    let body = String::from_utf8_lossy(&recovery.body);
+    assert!(
+        body.contains("failed turn retained file changes"),
+        "next turn was not briefed about retained changes: {body}"
+    );
+    assert!(
+        body.contains("retained.txt"),
+        "the briefing must name the retained path: {body}"
+    );
+    assert!(
+        !body.contains("WRITE_THEN_FAIL_PROMPT"),
+        "rolled-back turn content leaked into the next turn: {body}"
+    );
+}
+
 #[test]
 fn test_unterminated_script_block_is_line_aware_and_nonzero() {
     let home = TempDir::new().expect("temp home");

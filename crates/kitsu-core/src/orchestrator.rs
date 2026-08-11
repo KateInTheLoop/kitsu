@@ -128,7 +128,7 @@ pub enum AgentRuntimeEvent {
         /// `command` instead of embedding minified JSON here.
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        command: Option<CommandRuntimeResult>,
+        command: Option<Box<CommandRuntimeResult>>,
     },
     TurnFinished {
         success: bool,
@@ -170,6 +170,10 @@ pub struct CommandRuntimeResult {
     pub artifact: Option<CommandOutputArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_error: Option<String>,
+    /// Host-authored containment remediation hint for missing-module/command
+    /// failure shapes (see `CommandOutput::containment_hint`). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment_hint: Option<String>,
 }
 
 type AgentEventObserver =
@@ -350,7 +354,8 @@ impl ToolEventGuard {
             let command = pending
                 .command
                 .as_ref()
-                .and_then(|_| command_runtime_result(output));
+                .and_then(|_| command_runtime_result(output))
+                .map(Box::new);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -375,7 +380,8 @@ impl Drop for ToolEventGuard {
                 .command_progress
                 .as_ref()
                 .and_then(|progress| progress.lock().expect("command progress").clone())
-                .map(command_runtime_result_from_output);
+                .map(command_runtime_result_from_output)
+                .map(Box::new);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -384,17 +390,21 @@ impl Drop for ToolEventGuard {
                 cancelled: true,
                 output: "[cancelled: tool execution interrupted]".to_string(),
                 command: observed_command.or_else(|| {
-                    pending.command.as_ref().map(|invocation| {
-                        let executable_name = invocation.argv.first().cloned().unwrap_or_default();
-                        let executable_path = std::path::Path::new(&executable_name);
-                        let executable_resolution = if executable_path.is_absolute()
-                            || executable_path.components().count() > 1
-                        {
-                            CommandExecutableResolution::InvocationPath
-                        } else {
-                            CommandExecutableResolution::AmbientPath
-                        };
-                        CommandRuntimeResult {
+                    pending
+                        .command
+                        .as_ref()
+                        .map(|invocation| {
+                            let executable_name =
+                                invocation.argv.first().cloned().unwrap_or_default();
+                            let executable_path = std::path::Path::new(&executable_name);
+                            let executable_resolution = if executable_path.is_absolute()
+                                || executable_path.components().count() > 1
+                            {
+                                CommandExecutableResolution::InvocationPath
+                            } else {
+                                CommandExecutableResolution::AmbientPath
+                            };
+                            CommandRuntimeResult {
                         termination: CommandTermination::Cancelled,
                         success: false,
                         exit_code: None,
@@ -427,8 +437,10 @@ impl Drop for ToolEventGuard {
                              cleanup requirement is unverified and no cleanup is claimed"
                                 .to_string(),
                         ),
+                        containment_hint: None,
                     }
-                    })
+                        })
+                        .map(Box::new)
                 }),
             });
         }
@@ -1407,6 +1419,7 @@ fn command_runtime_result_from_output(output: CommandOutput) -> CommandRuntimeRe
         ambient_authority: output.ambient_authority,
         artifact: output.artifact,
         artifact_error: output.artifact_error,
+        containment_hint: output.containment_hint,
     }
 }
 
@@ -1625,16 +1638,22 @@ fn format_command_result(output: &CommandOutput) -> String {
         output.stderr_truncated,
         output.stderr_capture_complete,
     );
-    if let Some(artifact) = &output.artifact {
-        fields.push(format!(
-            "full output={:?}",
-            bounded_human_value(&artifact.reference, 160)
-        ));
-    }
     if let Some(status) = &output.artifact_error {
         fields.push(format!(
             "artifact status={:?}",
             bounded_human_value(status, 160)
+        ));
+    }
+    if let Some(hint) = &output.containment_hint {
+        fields.push(format!("hint: {}", bounded_human_value(hint, 480)));
+    }
+    // The artifact path is the one pointer to the complete output, so it is
+    // never elided (every other field is bounded instead) and stays last:
+    // when a terminal wraps the receipt, the line ends with a copyable path.
+    if let Some(artifact) = &output.artifact {
+        fields.push(format!(
+            "full output={:?}",
+            terminal_safe_inline(&artifact.reference)
         ));
     }
     fields.join(" | ")
