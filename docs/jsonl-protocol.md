@@ -61,6 +61,21 @@ guarantees requires a new schema identifier.
   consumers must treat both as provisional until the matching
   `assistant_disposition` says `committed`. Strict tool/policy or incomplete-turn
   rollback instead closes them as `discarded` with an optional reason.
+- When the inference deadline (`--timeout-secs`) expires after real streamed
+  output was already delivered, the one-shot paths (`ask`, piped chat, review)
+  do not destroy it: a final marker delta (`[stopped: deadline expired …]`) and
+  an `assistant` payload are emitted, and the disposition closes as
+  `committed_partial` with a reason. The turn still ends with an `error` event
+  and exit code 2 — `committed_partial` changes only how the delivered text is
+  classified, never the failure status. Scripted (`--script`) turns keep strict
+  `discarded` rollback so later turns continue from consistent history.
+- `context_window_mismatch` is emitted at most once per resolved window when a
+  provider usage report shows the server accepted markedly fewer prompt tokens
+  than the request was estimated to contain — evidence that the server's real
+  context window is smaller than the resolved one and the input was silently
+  truncated. It carries `reported_prompt_tokens`, `estimated_sent_tokens`, and
+  `resolved_window` (plus `turn_id` when turn-scoped). Kitsu never rewrites the
+  resolved window from this evidence; `/context` reports it as provenance.
 - `tool_started` is followed by exactly one matching `tool_finished`, including
   cancellation.
 - A detached job whose terminal result was not already consumed is emitted as a
@@ -81,8 +96,11 @@ guarantees requires a new schema identifier.
 - `final_summary` is the final event for a normally writable sink.
 
 `final_summary.status` is `ok` when every requested operation succeeded,
-`partial` when failures were explicitly accepted with `--allow-turn-errors`,
-`error` for an unsuccessful run, and `cancelled` after interruption.
+`partial` when failures were explicitly accepted with `--allow-turn-errors`
+and at least one turn or command succeeded, `error` for an unsuccessful run,
+and `cancelled` after interruption. `--allow-turn-errors` accepts partial
+success only: a script where every turn and command failed still ends with a
+run-level error and a nonzero exit.
 Its counters distinguish provider/incomplete-model failures, ordinary tool
 failures, local policy denials, user/command failures, and cancellations.
 Local tool and policy failures exit 1; provider or incomplete-model failures

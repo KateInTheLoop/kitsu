@@ -2707,20 +2707,41 @@ async fn test_invalid_model_friendly_error() {
 #[tokio::test]
 #[serial]
 async fn test_script_allow_turn_errors_preserves_zero_exit() {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // --allow-turn-errors accepts PARTIAL success: one turn fails, one turn
+    // succeeds, and the script still exits 0 with a failure summary.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
+        .and(body_string_contains("will fail"))
         .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"still works"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .with_priority(10)
         .mount(&server)
         .await;
 
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), &server.uri());
     let script_path = home.path().join("allow-errors.txt");
-    fs::write(&script_path, "will fail\n").unwrap();
+    fs::write(&script_path, "will fail\nthis one works\n").unwrap();
     let script = script_path.to_string_lossy().to_string();
     let home_path = home.path().to_path_buf();
 
@@ -2737,7 +2758,157 @@ async fn test_script_allow_turn_errors_preserves_zero_exit() {
         ]);
         cmd.assert()
             .success()
+            .stdout(predicate::str::contains("still works"))
             .stderr(predicate::str::contains("script summary: 1 failure"));
+    })
+    .await
+    .expect("join");
+}
+
+/// `--allow-turn-errors` accepts partial success, not total failure: a script
+/// where every turn failed must still exit nonzero.
+#[tokio::test]
+#[serial]
+async fn test_script_allow_turn_errors_all_failed_exits_nonzero() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("all-failed.txt");
+    fs::write(&script_path, "will fail\n").unwrap();
+    let script = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script,
+            "--allow-turn-errors",
+        ]);
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "all 1 turn(s) or command(s) failed",
+            ));
+    })
+    .await
+    .expect("join");
+}
+
+/// F2 (cycle 6): a tool error the model recovers from within the turn (failed
+/// call, then a corrected successful call, then a final answer) must COMMIT in
+/// strict scripted mode — the turn is judged by its final state, not by the
+/// cumulative error count.
+#[tokio::test]
+#[serial]
+async fn test_scripted_recovered_tool_error_commits_turn() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Round 3: after the successful read result ("median-ok") is fed back,
+    // finish with the answer.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("median-ok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "recovered and finished"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Round 2: the first tool call failed; retry with corrected arguments.
+    let data_path_holder = TempDir::new().unwrap();
+    let data_path = data_path_holder.path().join("data.txt");
+    fs::write(&data_path, "median-ok").unwrap();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "retry_ok",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_read_file",
+                            "arguments": serde_json::json!({"path": data_path}).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    // Round 1: a malformed tool call that fails locally (bad arguments).
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "first_try",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("recover.script");
+    fs::write(&script, "read the data file\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let allowed = data_path_holder.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--allow-path",
+            &allowed.to_string_lossy(),
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("recovered and finished"))
+            .stderr(predicate::str::contains(
+                "1 earlier tool error(s) were recovered within the turn",
+            ))
+            .stderr(predicate::str::contains("strict scripted turn failed").not());
     })
     .await
     .expect("join");
@@ -5050,4 +5221,432 @@ auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
     })
     .await
     .expect("join");
+}
+
+// --- deadline expiry preserves delivered partial output (cycle 6) ------------
+
+/// SSE server that streams one real fragment and then stalls until the client
+/// gives up, so the inference deadline expires mid-answer. Serves any number
+/// of connections; abort the returned handle when done.
+async fn spawn_stalling_sse_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let fragment = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer under deadline\"},\"finish_reason\":null}]}\n\n";
+                let _ = socket
+                    .write_all(format!("{:x}\r\n", fragment.len()).as_bytes())
+                    .await;
+                let _ = socket.write_all(fragment).await;
+                let _ = socket.write_all(b"\r\n").await;
+                let _ = socket.flush().await;
+                // Stall: never finish the body. The client's deadline fires.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+        }
+    });
+    (address, server)
+}
+
+/// Human mode: a deadline that expires mid-stream keeps the delivered partial
+/// answer, closes it with an in-band truncation marker plus a trailing newline
+/// (so stderr never fuses onto the stream), and reports a partial notice
+/// instead of DISCARDED scare text. The exit code stays 2.
+#[tokio::test]
+#[serial]
+async fn test_ask_timeout_preserves_partial_streamed_answer() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--timeout-secs", "2", "ask", "long question"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.contains("partial answer under deadline"),
+        "delivered partial text must be kept: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("[stopped: deadline expired - answer is partial]"),
+        "stdout must carry an in-band truncation marker: {stdout:?}"
+    );
+    assert!(
+        stdout.ends_with('\n'),
+        "the partial stream must be newline-terminated: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("timed out after 2s - the answer above is partial"),
+        "stderr must explain the partial outcome: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("DISCARDED"),
+        "delivered output must not be labeled DISCARDED: {stderr:?}"
+    );
+}
+
+/// JSONL mode: the same expiry closes the provisional-output transaction as
+/// `committed_partial` with a final `assistant` payload matching the delta
+/// concatenation, while the turn still fails (error event, exit 2).
+#[tokio::test]
+#[serial]
+async fn test_jsonl_ask_timeout_emits_committed_partial_disposition() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "--timeout-secs", "2", "ask", "long question"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let deltas: String = events
+        .iter()
+        .filter(|event| event["type"] == "assistant_delta")
+        .map(|event| event["text"].as_str().unwrap())
+        .collect();
+    let assistant = events
+        .iter()
+        .position(|event| event["type"] == "assistant")
+        .expect("partial assistant payload must be emitted");
+    assert_eq!(events[assistant]["text"].as_str().unwrap(), deltas);
+    assert!(deltas.contains("partial answer under deadline"));
+    assert!(deltas.ends_with("[stopped: deadline expired - answer is partial]"));
+    let disposition = events
+        .iter()
+        .position(|event| event["type"] == "assistant_disposition")
+        .expect("disposition must close the transaction");
+    assert_eq!(events[disposition]["status"], "committed_partial");
+    assert!(events[disposition]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("timed out after 2s"));
+    let error = events
+        .iter()
+        .position(|event| event["type"] == "error")
+        .expect("the turn still fails");
+    assert_eq!(events[error]["exit_code"], 2);
+    assert!(assistant < disposition && disposition < error);
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "error");
+}
+
+/// The one-shot piped path (here: top-level `review`, which streams without
+/// tools) gets the same honest partial outcome on deadline expiry.
+#[tokio::test]
+#[serial]
+async fn test_review_timeout_preserves_partial_streamed_answer() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("review-me.rs"), "fn reviewed() {}\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--timeout-secs",
+                "2",
+                "review",
+                "--instructions",
+                "review the working tree",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("partial answer under deadline"));
+    assert!(stdout.contains("[stopped: deadline expired - answer is partial]"));
+    assert!(stderr.contains("timed out after 2s - the answer above is partial"));
+    assert!(!stderr.contains("DISCARDED"));
+}
+
+// --- context-window runtime cross-check (cycle 6) ----------------------------
+
+fn window_mismatch_sse() -> String {
+    [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"generic answer"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"data: {"choices":[],"usage":{"prompt_tokens":4096,"completion_tokens":2,"total_tokens":4098}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n")
+}
+
+/// When the provider reports accepting far fewer prompt tokens than the sent
+/// estimate (the shape of a server clamping to a smaller real window), human
+/// mode warns once on stderr without failing the turn.
+#[tokio::test]
+#[serial]
+async fn test_context_window_mismatch_warns_on_stderr() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let big_prompt = "review this attachment ".repeat(1000); // ~23k chars ≈ 5.7k tokens
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["ask", &big_prompt])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("context window mismatch suspected"),
+        "stderr must warn about the truncating server window: {stderr:?}"
+    );
+    assert!(stderr.contains("accepted 4096"));
+}
+
+/// JSONL mode surfaces the same evidence as a typed event.
+#[tokio::test]
+#[serial]
+async fn test_jsonl_context_window_mismatch_emits_typed_event() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let big_prompt = "review this attachment ".repeat(1000);
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "ask", &big_prompt])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let mismatch = events
+        .iter()
+        .find(|event| event["type"] == "context_window_mismatch")
+        .unwrap_or_else(|| panic!("typed mismatch event missing: {events:#?}"));
+    assert_eq!(mismatch["reported_prompt_tokens"], 4096);
+    assert_eq!(mismatch["resolved_window"], 8192);
+    assert!(mismatch["estimated_sent_tokens"].as_u64().unwrap() > 4096);
+    assert_eq!(events.last().unwrap()["status"], "ok");
+}
+
+/// A scripted `/context` after the mismatch turn carries the evidence in its
+/// provenance payload, and the stderr warning fires exactly once.
+#[tokio::test]
+#[serial]
+async fn test_context_command_surfaces_window_runtime_evidence() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("mismatch.script");
+    let big_prompt = "review this attachment ".repeat(1000).replace('\n', " ");
+    fs::write(&script, format!("{big_prompt}\n/context\n")).unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "chat", "--script", &script_path])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "context_window_mismatch")
+            .count(),
+        1,
+        "the mismatch warning must fire exactly once: {events:#?}"
+    );
+    let context = events
+        .iter()
+        .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "context")
+        .expect("scripted /context result");
+    let evidence = &context["result"]["runtime_evidence"];
+    assert_eq!(evidence["reported_prompt_tokens"], 4096);
+    assert_eq!(evidence["resolved_window"], 8192);
+}
+
+/// Gap 1 (cycle 6): the system prompt sent to the provider must tell the model
+/// its working directory and every granted root with its authority, and steer
+/// it to explore instead of asking the user for paths.
+#[tokio::test]
+#[serial]
+async fn test_piped_chat_system_prompt_names_cwd_and_granted_roots() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let granted = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let workdir_path = workdir.path().to_path_buf();
+    let granted_path = granted.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&workdir_path)
+            .args([
+                "--gateway",
+                "example",
+                "chat",
+                "--allow-path",
+                &granted_path.to_string_lossy(),
+                "Explain this codebase",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("Current working directory:"),
+        "system prompt must name the cwd: {system:?}"
+    );
+    // Paths may be canonicalized for display; assert on the directory name.
+    let granted_name = granted.path().file_name().unwrap().to_string_lossy();
+    assert!(
+        system.contains(&format!("{granted_name} (read-only)")),
+        "system prompt must list the granted root with its authority: {system:?}"
+    );
+    assert!(
+        system.contains("explore the granted roots"),
+        "system prompt must steer the model to explore: {system:?}"
+    );
 }

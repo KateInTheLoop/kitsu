@@ -661,6 +661,46 @@ pub struct AgentSessionState {
     /// still show partial/recovered answers, while strict scripted callers can
     /// reject incomplete automation without scraping display markers.
     pub last_turn: AgentTurnStatus,
+    /// Runtime evidence that the serving backend's real context window is
+    /// smaller than the resolved one (see [`ContextWindowEvidence`]). This is
+    /// backend telemetry, not conversation state: callers that roll a failed
+    /// turn back should preserve it.
+    pub window_evidence: Option<ContextWindowEvidence>,
+}
+
+/// Evidence, gathered from a provider `usage` report, that the server accepted
+/// markedly fewer prompt tokens than the request was estimated to contain —
+/// the signature of a gateway silently truncating input to a context window
+/// smaller than the resolved one (e.g. a config claiming 8192 while Ollama
+/// serves `num_ctx = 4096`). Kitsu records the discrepancy, warns once, and
+/// surfaces it in `/context` provenance; it never silently rewrites the
+/// resolved window, because token estimates are heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindowEvidence {
+    /// `prompt_tokens` from the provider's usage report.
+    pub reported_prompt_tokens: u64,
+    /// Kitsu's preflight estimate for the request that produced the report.
+    pub estimated_sent_tokens: u64,
+    /// The resolved window the request was budgeted against.
+    pub resolved_window: u64,
+    /// The one-time warning for this evidence has already been emitted.
+    pub warned: bool,
+}
+
+/// Truncation heuristic for [`ContextWindowEvidence`]. Estimates are chars/4
+/// fuzzy, so a bare `reported < estimated` would cry wolf on every model whose
+/// tokenizer beats the heuristic. Require the reported count to fall below the
+/// resolved window AND either miss the estimate by a wide margin (>= 1/8 of the
+/// estimate, minimum 256 tokens) or sit exactly on a power-of-two boundary of
+/// at least 2048 — the shape of a clamped server-side `num_ctx`.
+fn context_window_shortfall(reported: u64, estimated_sent: u64, window: u64) -> bool {
+    if reported == 0 || reported >= window || reported >= estimated_sent {
+        return false;
+    }
+    let shortfall = estimated_sent - reported;
+    let wide_margin = shortfall >= (estimated_sent / 8).max(256);
+    let clamped_boundary = reported.is_power_of_two() && reported >= 2048;
+    wide_margin || clamped_boundary
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -677,6 +717,12 @@ pub struct AgentTurnStatus {
     pub tool_errors: u32,
     /// Subset of `tool_errors` caused by an explicit local authority denial.
     pub policy_errors: u32,
+    /// Tool errors in the LAST round that executed tool calls. Zero when the
+    /// model recovered from earlier failures in a later round — the normal
+    /// agentic retry pattern (e.g. an `fs_edit_file` precondition conflict
+    /// followed by a corrected, successful edit). Strict callers should judge
+    /// the turn's final state by this, not by the cumulative `tool_errors`.
+    pub final_round_tool_errors: u32,
 }
 
 /// Run one user turn through the agent loop, with no state persisted across
@@ -783,6 +829,7 @@ where
         compact_failures,
         compaction_ledger,
         last_turn: turn_status,
+        window_evidence,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
@@ -884,7 +931,11 @@ where
         // edit adds another message or tool mutation between compaction and
         // request construction, this check fails locally instead of leaking an
         // oversized request to the gateway.
-        ensure_chat_request_fits(&req, cfg, meter)?;
+        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter)?;
+        // Token-denominated estimate of the request being sent, kept so the
+        // usage report below can be cross-checked against what left the door.
+        let sent_estimate_tokens =
+            (sent_measurement.unit == ContextUnit::Tokens).then_some(sent_measurement.used);
         if let Some(log) = &cfg.event_log {
             log.record(AgentRuntimeEvent::ProviderRequest {
                 round,
@@ -958,6 +1009,26 @@ where
                     // ContextMeter::anchor_includes_schema).
                     meter.record(u.prompt_tokens, sent_len, tools_were_offered);
                     turn_usage.add(u);
+                    // Cross-check the resolved window against runtime truth:
+                    // a usage report far below the sent estimate (and below
+                    // the window) means the server truncated the prompt to a
+                    // smaller real window. Record once per resolved window;
+                    // the CLI warns and surfaces it in /context provenance.
+                    if let (Some(window), Some(sent_estimate)) =
+                        (cfg.context_window, sent_estimate_tokens)
+                    {
+                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window)
+                            && window_evidence
+                                .map_or(true, |evidence| evidence.resolved_window != window)
+                        {
+                            *window_evidence = Some(ContextWindowEvidence {
+                                reported_prompt_tokens: u.prompt_tokens,
+                                estimated_sent_tokens: sent_estimate,
+                                resolved_window: window,
+                                warned: false,
+                            });
+                        }
+                    }
                     if let Some(log) = &cfg.event_log {
                         log.record(AgentRuntimeEvent::Usage {
                             round,
@@ -1066,6 +1137,10 @@ where
         }
 
         // Tool calls present: run each, feed result (or error) back as a tool msg.
+        // Each tool round overwrites `final_round_tool_errors`, so after the turn
+        // it reports the LAST executed tool round — zero when the model recovered
+        // from earlier failures before finishing.
+        turn_status.final_round_tool_errors = 0;
         for tc in tool_calls {
             // Narrate the action (Claude-Code-style), e.g. `⏺ Read(deck1.md)`.
             if !cfg.quiet {
@@ -1101,6 +1176,8 @@ where
                         force_final_next = true;
                     }
                     turn_status.tool_errors = turn_status.tool_errors.saturating_add(1);
+                    turn_status.final_round_tool_errors =
+                        turn_status.final_round_tool_errors.saturating_add(1);
                     if matches!(e, kitsu_tools::ToolError::PolicyDenied(_)) {
                         turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
                     }

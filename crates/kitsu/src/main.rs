@@ -3802,6 +3802,14 @@ fn render_context_command(
         "context window discovery: {}",
         window_provenance.discovery.label()
     );
+    if let Some(evidence) = state.window_evidence {
+        eprintln!(
+            "context window runtime check: provider accepted {} of ~{} estimated prompt tokens; server window likely smaller than the resolved {}",
+            evidence.reported_prompt_tokens,
+            evidence.estimated_sent_tokens,
+            evidence.resolved_window
+        );
+    }
     let ledger = &state.compaction_ledger;
     if ledger.total_compactions > 0 {
         eprintln!(
@@ -3875,6 +3883,11 @@ fn context_command_payload(
         "source": window_provenance.source.label(),
         "cache": window_provenance.cache.label(),
         "discovery": window_provenance.discovery.label(),
+        "runtime_evidence": state.window_evidence.map(|evidence| serde_json::json!({
+            "reported_prompt_tokens": evidence.reported_prompt_tokens,
+            "estimated_sent_tokens": evidence.estimated_sent_tokens,
+            "resolved_window": evidence.resolved_window,
+        })),
         "roles": {
             "user": breakdown.user,
             "assistant": breakdown.assistant,
@@ -4564,7 +4577,9 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
     let mut agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
-    let event_log = live_agent_event_log(cli.jsonl, "ask:1");
+    let partial_answer: PartialAnswerBuffer = Arc::default();
+    let event_log =
+        live_agent_event_log_capturing(cli.jsonl, "ask:1", Some(partial_answer.clone()));
     agent_cfg.event_log = Some(event_log.clone());
     if cli.jsonl {
         emit_jsonl(
@@ -4595,10 +4610,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         _ => None,
     };
     finish_agent_trace(cli, "ask:1", &event_log, assistant)?;
+    warn_context_window_evidence(cli, Some("ask:1"), &mut state)?;
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
-                finish_assistant_disposition(cli, "ask:1", false, Some(&issue))?;
+                finish_assistant_disposition(
+                    cli,
+                    "ask:1",
+                    AssistantDisposition::Discarded,
+                    Some(&issue),
+                )?;
                 let mapped = if kind == ScriptFailureKind::Provider {
                     CliError::provider(format!("incomplete turn: {issue}"))
                 } else {
@@ -4635,7 +4656,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 }
                 return Err(mapped);
             }
-            finish_assistant_disposition(cli, "ask:1", true, None)?;
+            finish_assistant_disposition(cli, "ask:1", AssistantDisposition::Committed, None)?;
             if cli.jsonl {
                 emit_jsonl(
                     "turn_finished",
@@ -4651,12 +4672,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             Ok(())
         }
         TurnOutcome::Completed(Err(error)) => {
-            finish_assistant_disposition(
-                cli,
-                "ask:1",
-                false,
-                Some("the model turn failed before commit"),
-            )?;
+            if let Some(partial) = deadline_partial_answer(&error, &partial_answer) {
+                emit_partial_deadline_answer(cli, "ask:1", &partial)?;
+            } else {
+                finish_assistant_disposition(
+                    cli,
+                    "ask:1",
+                    AssistantDisposition::Discarded,
+                    Some("the model turn failed before commit"),
+                )?;
+            }
             let mapped = map_agent_error(
                 error,
                 ProviderOperation::Chat {
@@ -4686,7 +4711,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             finish_assistant_disposition(
                 cli,
                 "ask:1",
-                false,
+                AssistantDisposition::Discarded,
                 Some("the model turn was cancelled before commit"),
             )?;
             let mapped = CliError::cancelled("request cancelled by Ctrl+C");
@@ -4713,8 +4738,53 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
 
 // --- chat REPL --------------------------------------------------------------
 
+/// Situational grounding injected into the system prompt: the launch working
+/// directory plus every granted filesystem root with its authority, so a
+/// prompt like "explain this codebase" resolves against the grants instead of
+/// making the model ask the user for paths.
+#[derive(Debug, Clone, Default)]
+struct PromptEnvironment {
+    /// Launch working directory (already display-formatted).
+    cwd: String,
+    /// Granted roots as `(path, authority)` where authority is one of
+    /// "read-only", "write-only", or "read-write".
+    roots: Vec<(String, &'static str)>,
+}
+
+impl PromptEnvironment {
+    /// Classify the CLI grant lists into deduplicated `(path, authority)`
+    /// pairs. Read-write wins over the one-sided lists when a path appears in
+    /// both.
+    fn from_grants(
+        cwd: &std::path::Path,
+        read_only: &[String],
+        write_only: &[String],
+        read_write: &[String],
+    ) -> Self {
+        let mut roots: Vec<(String, &'static str)> = Vec::new();
+        let mut push = |path: &String, authority: &'static str| {
+            if !roots.iter().any(|(existing, _)| existing == path) {
+                roots.push((path.clone(), authority));
+            }
+        };
+        for path in read_write {
+            push(path, "read-write");
+        }
+        for path in read_only {
+            push(path, "read-only");
+        }
+        for path in write_only {
+            push(path, "write-only");
+        }
+        Self {
+            cwd: cwd.display().to_string(),
+            roots,
+        }
+    }
+}
+
 /// System prompt seeding every chat session.
-fn chat_system_prompt(tool_names: &[String]) -> String {
+fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) -> String {
     if tool_names.is_empty() {
         "You are kitsu, a concise, helpful CLI assistant.".to_string()
     } else {
@@ -4726,11 +4796,30 @@ fn chat_system_prompt(tool_names: &[String]) -> String {
             "You are kitsu, a concise, helpful CLI assistant with these tools: {}. ",
             tool_names.join(", ")
         );
+        if !environment.cwd.is_empty() {
+            prompt.push_str(&format!("Current working directory: {}. ", environment.cwd));
+        }
+        if !environment.roots.is_empty() {
+            let listed = environment
+                .roots
+                .iter()
+                .map(|(path, authority)| format!("{path} ({authority})"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            prompt.push_str(&format!("Granted filesystem roots: {listed}. "));
+        }
         if has_read {
             prompt.push_str(
                 "When the user refers to a local file or directory, use the available filesystem \
                  tools to inspect it directly instead of asking them to paste its contents. ",
             );
+            if !environment.roots.is_empty() {
+                prompt.push_str(
+                    "When the user says \"this codebase\", \"this project\", or uses relative \
+                     paths, explore the granted roots with your tools (list, then read) instead \
+                     of asking the user for paths. ",
+                );
+            }
         }
         if has_edit {
             prompt.push_str(
@@ -4878,14 +4967,51 @@ fn emit_command_runtime_event(
     emit_jsonl(&kind, serde_json::Value::Object(object))
 }
 
+/// Streamed assistant output captured turn-side, so a deadline expiry can
+/// preserve the already-delivered partial answer instead of discarding it.
+#[derive(Debug, Default, Clone)]
+struct PartialAnswer {
+    text: String,
+    last_round: u32,
+}
+
+type PartialAnswerBuffer = Arc<std::sync::Mutex<PartialAnswer>>;
+
+fn snapshot_partial_answer(buffer: &PartialAnswerBuffer) -> PartialAnswer {
+    buffer
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+}
+
 fn live_agent_event_log(jsonl: bool, turn_id: &str) -> kitsu_core::AgentEventLog {
+    live_agent_event_log_capturing(jsonl, turn_id, None)
+}
+
+fn live_agent_event_log_capturing(
+    jsonl: bool,
+    turn_id: &str,
+    partial: Option<PartialAnswerBuffer>,
+) -> kitsu_core::AgentEventLog {
     let turn_id = turn_id.to_string();
     kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
+        if let (Some(partial), kitsu_core::AgentRuntimeEvent::AssistantDelta { round, text }) =
+            (partial.as_ref(), event)
+        {
+            let mut partial = partial
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            partial.text.push_str(text);
+            partial.last_round = partial.last_round.max(*round);
+        }
         if jsonl {
             // The process-long emitter retains a terminal write failure. The
             // turn boundary below converts it into the required nonzero exit.
             emit_runtime_event(&turn_id, event).is_ok()
         } else if let Some(notice) = format_provider_attempt_notice(event) {
+            // A mid-stream status must start on its own line, never fused onto
+            // the last streamed stdout character.
+            kitsu_render::finish_line();
             eprintln!("~ {notice}");
             true
         } else {
@@ -4900,6 +5026,7 @@ fn live_command_event_log(jsonl: bool, line: usize, command: &str) -> kitsu_core
         if jsonl {
             emit_command_runtime_event(line, &command, event).is_ok()
         } else if let Some(notice) = format_provider_attempt_notice(event) {
+            kitsu_render::finish_line();
             eprintln!("~ {notice}");
             true
         } else {
@@ -4936,20 +5063,109 @@ fn finish_agent_trace(
     }
     for event in log.take() {
         if let Some(notice) = format_provider_attempt_notice(&event) {
+            kitsu_render::finish_line();
             eprintln!("~ {notice}");
         }
     }
     Ok(())
 }
 
+/// Terminal state of a turn's provisional assistant-output transaction.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AssistantDisposition {
+    /// The turn succeeded; streamed output is the committed answer.
+    Committed,
+    /// The deadline expired after real streamed output: the delivered partial
+    /// answer is kept and labeled partial instead of being destroyed.
+    CommittedPartial,
+    /// Strict rollback: streamed output must not be mistaken for an answer.
+    Discarded,
+}
+
+impl AssistantDisposition {
+    fn jsonl_status(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::CommittedPartial => "committed_partial",
+            Self::Discarded => "discarded",
+        }
+    }
+}
+
+/// Marker appended to a deadline-expired partial answer, mirroring the
+/// orchestrator's `[stopped: …]`/`[truncated: …]` stream markers so piped
+/// consumers can detect the truncation in-band.
+const DEADLINE_PARTIAL_MARKER: &str = "\n[stopped: deadline expired - answer is partial]";
+
+/// Close a deadline-expired turn that already streamed real output: keep the
+/// delivered partial answer and label it honestly (human notice / JSONL
+/// `assistant` + `committed_partial` disposition) instead of destroying it.
+/// Returns the full partial text (marker included) for callers that commit it
+/// to a durable session. The turn still fails with the mapped provider error
+/// (exit 2): only the destruction of already-delivered output changes, not
+/// the failure classification.
+fn emit_partial_deadline_answer(
+    cli: &Cli,
+    turn_id: &str,
+    partial: &PartialAnswer,
+) -> Result<String, CliError> {
+    let partial_text = format!("{}{}", partial.text, DEADLINE_PARTIAL_MARKER);
+    if cli.jsonl {
+        // Keep the deltas-concatenate-to-assistant contract: the marker is
+        // emitted as a delta before the assistant payload that includes it.
+        emit_jsonl(
+            "assistant_delta",
+            serde_json::json!({
+                "turn_id": turn_id,
+                "round": partial.last_round.max(1),
+                "text": DEADLINE_PARTIAL_MARKER,
+            }),
+        )?;
+        emit_jsonl(
+            "assistant",
+            serde_json::json!({"turn_id": turn_id, "text": partial_text}),
+        )?;
+    } else {
+        // The partial bytes are already on stdout; append the marker there so
+        // a piped consumer can detect the truncation without parsing stderr.
+        kitsu_render::print_message(DEADLINE_PARTIAL_MARKER);
+    }
+    finish_assistant_disposition(
+        cli,
+        turn_id,
+        AssistantDisposition::CommittedPartial,
+        Some(&format!(
+            "timed out after {}s - the answer above is partial; completed tool results and file changes were kept",
+            cli.timeout_secs
+        )),
+    )?;
+    Ok(partial_text)
+}
+
+/// The deadline-expired partial answer for `error`, if there is one worth
+/// preserving: the turn failed on the inference deadline AND real streamed
+/// output was already delivered.
+fn deadline_partial_answer(
+    error: &kitsu_core::AgentError,
+    partial: &PartialAnswerBuffer,
+) -> Option<PartialAnswer> {
+    matches!(
+        error,
+        kitsu_core::AgentError::Provider(ProviderError::Timeout)
+    )
+    .then(|| snapshot_partial_answer(partial))
+    .filter(|partial| !partial.text.is_empty())
+}
+
 /// Close the provisional assistant-output transaction after local strictness
 /// checks. Streamed deltas remain useful for live UIs, but this terminal record
 /// makes it impossible for automation to mistake rolled-back text for a
-/// committed answer. Human mode visibly invalidates discarded output.
+/// committed answer. Human mode visibly invalidates discarded output and
+/// labels deadline-expired partial output honestly instead of destroying it.
 fn finish_assistant_disposition(
     cli: &Cli,
     turn_id: &str,
-    committed: bool,
+    disposition: AssistantDisposition,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
     if cli.jsonl {
@@ -4957,17 +5173,34 @@ fn finish_assistant_disposition(
             "assistant_disposition",
             serde_json::json!({
                 "turn_id": turn_id,
-                "status": if committed { "committed" } else { "discarded" },
+                "status": disposition.jsonl_status(),
                 "reason": reason,
             }),
         )?;
-    } else if !committed {
-        eprintln!(
-            "~ provisional assistant output, if any, was DISCARDED and was not committed{}",
-            reason
-                .map(|reason| format!(": {}", terminal_inline(reason)))
-                .unwrap_or_default()
-        );
+        return Ok(());
+    }
+    match disposition {
+        AssistantDisposition::Committed => {}
+        AssistantDisposition::CommittedPartial => {
+            // The partial answer is already on stdout; terminate its line
+            // before this stderr status so the two streams can't fuse.
+            kitsu_render::finish_line();
+            eprintln!(
+                "~ {}",
+                reason
+                    .map(terminal_inline)
+                    .unwrap_or_else(|| "the answer above is partial".to_string())
+            );
+        }
+        AssistantDisposition::Discarded => {
+            kitsu_render::finish_line();
+            eprintln!(
+                "~ provisional assistant output, if any, was DISCARDED and was not committed{}",
+                reason
+                    .map(|reason| format!(": {}", terminal_inline(reason)))
+                    .unwrap_or_default()
+            );
+        }
     }
     Ok(())
 }
@@ -4976,7 +5209,12 @@ fn strict_turn_failure(
     status: &kitsu_core::AgentTurnStatus,
 ) -> Option<(ScriptFailureKind, String)> {
     use kitsu_core::TurnCompletion;
-    if status.tool_errors > 0 {
+    // Policy denials always fail the turn: local authority was refused, and a
+    // later successful call does not un-refuse it. Plain tool errors fail the
+    // turn only when the FINAL tool round still carried one — an early failure
+    // the model corrected in a later round (the normal agentic retry pattern,
+    // e.g. an edit-precondition conflict followed by a fixed edit) commits.
+    if status.policy_errors > 0 {
         let kind = if status.policy_errors == status.tool_errors {
             ScriptFailureKind::Policy
         } else {
@@ -4995,6 +5233,15 @@ fn strict_turn_failure(
         };
         return Some((kind, issue));
     }
+    if status.final_round_tool_errors > 0 {
+        return Some((
+            ScriptFailureKind::Tool,
+            format!(
+                "{} tool call(s) failed during the turn ({} local policy denial(s))",
+                status.tool_errors, status.policy_errors
+            ),
+        ));
+    }
     match status.completion {
         TurnCompletion::LengthLimited => Some((
             ScriptFailureKind::Provider,
@@ -5006,6 +5253,60 @@ fn strict_turn_failure(
         )),
         TurnCompletion::Complete => None,
     }
+}
+
+/// One-time warning for runtime context-window evidence (see
+/// [`kitsu_core::ContextWindowEvidence`]): the provider's usage report implies
+/// the server's real window is smaller than the resolved one. Human mode
+/// prints one stderr line; JSONL emits a typed `context_window_mismatch`
+/// event. The evidence stays recorded so `/context` provenance can surface it,
+/// and the resolved window is never rewritten automatically.
+fn warn_context_window_evidence(
+    cli: &Cli,
+    turn_id: Option<&str>,
+    state: &mut kitsu_core::AgentSessionState,
+) -> Result<(), CliError> {
+    let Some(evidence) = state.window_evidence.as_mut() else {
+        return Ok(());
+    };
+    if evidence.warned {
+        return Ok(());
+    }
+    evidence.warned = true;
+    if cli.jsonl {
+        let mut payload = serde_json::json!({
+            "reported_prompt_tokens": evidence.reported_prompt_tokens,
+            "estimated_sent_tokens": evidence.estimated_sent_tokens,
+            "resolved_window": evidence.resolved_window,
+        });
+        if let Some(turn_id) = turn_id {
+            payload["turn_id"] = serde_json::Value::String(turn_id.to_string());
+        }
+        emit_jsonl("context_window_mismatch", payload)?;
+    } else {
+        eprintln!(
+            "~ context window mismatch suspected: the provider accepted {} of ~{} estimated prompt tokens; the server likely serves a smaller window than the resolved {} and truncated the input (set --context-window {} or fix the gateway profile; /context shows provenance)",
+            evidence.reported_prompt_tokens,
+            evidence.estimated_sent_tokens,
+            evidence.resolved_window,
+            evidence.reported_prompt_tokens,
+        );
+    }
+    Ok(())
+}
+
+/// Roll conversation-scoped agent state back to its pre-turn snapshot while
+/// preserving runtime backend telemetry: context-window evidence describes the
+/// serving backend, not the rolled-back turn, so a rollback must neither erase
+/// it nor re-arm its one-time warning.
+fn rollback_agent_state(
+    state: &mut kitsu_core::AgentSessionState,
+    mut snapshot: kitsu_core::AgentSessionState,
+) {
+    if snapshot.window_evidence.is_none() {
+        snapshot.window_evidence = state.window_evidence;
+    }
+    *state = snapshot;
 }
 
 fn report_cancelled_agents(ids: Vec<u64>) {
@@ -5700,7 +6001,20 @@ fn emit_script_background_results(
     Ok(())
 }
 
-fn format_write_checkpoint(report: &kitsu_tools::builtins::fs::JournalTurnReport) -> String {
+/// True when a `/undo N` hint is actionable from the current entry point: only
+/// the interactive REPL can actually type `/undo`. Checkpoints live in this
+/// process's write journal, so scripted/piped runs must not advertise an undo
+/// path that no later process can reach.
+static UNDO_HINTS_ACTIONABLE: AtomicBool = AtomicBool::new(false);
+
+fn undo_hint_actionable() -> bool {
+    UNDO_HINTS_ACTIONABLE.load(Ordering::Acquire)
+}
+
+fn format_write_checkpoint(
+    report: &kitsu_tools::builtins::fs::JournalTurnReport,
+    undo_hint: bool,
+) -> String {
     let label = terminal_inline(&report.label);
     let mut output = format!("~ verified file checkpoint #{} ({}):", report.id, label);
     for change in &report.changes {
@@ -5726,10 +6040,12 @@ fn format_write_checkpoint(report: &kitsu_tools::builtins::fs::JournalTurnReport
             kitsu_render::sanitize_terminal_text(report.unified_diff.trim_end()).as_str(),
         );
     }
-    output.push_str(&format!(
-        "\n  /undo {} restores this checkpoint if its files still match",
-        report.id
-    ));
+    if undo_hint {
+        output.push_str(&format!(
+            "\n  /undo {} restores this checkpoint if its files still match",
+            report.id
+        ));
+    }
     output
 }
 
@@ -5795,7 +6111,10 @@ fn trusted_undo_history_event(
 
 fn report_write_checkpoint(report: kitsu_tools::builtins::fs::JournalTurnReport) {
     if !jsonl_requested() {
-        eprintln!("{}", format_write_checkpoint(&report));
+        eprintln!(
+            "{}",
+            format_write_checkpoint(&report, undo_hint_actionable())
+        );
     }
 }
 
@@ -5818,6 +6137,9 @@ async fn cancel_agents_and_report_writes(
 
 #[derive(Default)]
 struct ScriptRunStatus {
+    /// Turns and commands that completed successfully. `--allow-turn-errors`
+    /// accepts PARTIAL success; a run where nothing succeeded stays an error.
+    successes: usize,
     failures: usize,
     provider_failures: usize,
     tool_failures: usize,
@@ -5828,6 +6150,10 @@ struct ScriptRunStatus {
 }
 
 impl ScriptRunStatus {
+    fn record_success(&mut self) {
+        self.successes += 1;
+    }
+
     fn record_turn_failure(&mut self, kind: ScriptFailureKind) {
         self.failures += 1;
         self.provider_failures += usize::from(kind == ScriptFailureKind::Provider);
@@ -5903,6 +6229,20 @@ async fn finalize_scripted_run(
             CliError::user(message)
         });
         // Aggregate turn/command failures already have their own framed events.
+        status.primary_error_framed = true;
+    } else if aggregate_failure && status.successes == 0 {
+        // --allow-turn-errors accepts PARTIAL success. When every turn and
+        // command failed there is no success to accept, so a zero exit would
+        // mislabel a total failure.
+        let message = format!(
+            "script failed: all {} turn(s) or command(s) failed (--allow-turn-errors accepts partial success, not total failure)",
+            status.failures
+        );
+        primary_error = Some(if status.provider_failures > 0 {
+            CliError::provider(message)
+        } else {
+            CliError::user(message)
+        });
         status.primary_error_framed = true;
     }
 
@@ -6115,6 +6455,7 @@ async fn run_scripted_body(
             match result {
                 Ok(()) => {
                     persist_session_required(session_store, session, model, messages)?;
+                    status.record_success();
                     last_failed = None;
                 }
                 Err(kind) => {
@@ -6224,6 +6565,7 @@ async fn run_scripted_body(
                             )?;
                         }
                     }
+                    status.record_success();
                     finish_command("ok", None, EXIT_USER)?;
                     continue;
                 }
@@ -6303,6 +6645,7 @@ async fn run_scripted_body(
                     match result {
                         Ok(()) => {
                             persist_command_session!();
+                            status.record_success();
                             last_failed = None;
                             finish_command("ok", None, EXIT_USER)?;
                         }
@@ -6353,6 +6696,7 @@ async fn run_scripted_body(
                     match result {
                         Ok(()) => {
                             persist_command_session!();
+                            status.record_success();
                             last_failed = None;
                             finish_command("ok", None, EXIT_USER)?;
                         }
@@ -6389,6 +6733,7 @@ async fn run_scripted_body(
                                     }),
                                 )?;
                             }
+                            status.record_success();
                             finish_command("ok", None, EXIT_USER)?;
                         }
                         Err(error) => {
@@ -6446,6 +6791,7 @@ async fn run_scripted_body(
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
+                status.record_success();
                 last_failed = None;
             }
             Err(kind) => {
@@ -6575,11 +6921,18 @@ async fn run_scripted_turn(
     };
     finish_agent_trace(cli, location, &event_log, assistant)
         .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+    warn_context_window_evidence(cli, Some(location), state)
+        .map_err(|_| ScriptFailureKind::JsonlOutput)?;
     match outcome {
         TurnOutcome::Completed(Ok(_)) => {
             if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
-                finish_assistant_disposition(cli, location, false, Some(&issue))
-                    .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+                finish_assistant_disposition(
+                    cli,
+                    location,
+                    AssistantDisposition::Discarded,
+                    Some(&issue),
+                )
+                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 if cli.jsonl {
                     emit_jsonl(
                         "error",
@@ -6605,7 +6958,7 @@ async fn run_scripted_turn(
                     .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 }
                 *messages = messages_before;
-                *state = state_before;
+                rollback_agent_state(state, state_before);
                 cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
                 if !cli.jsonl {
                     eprintln!(
@@ -6621,8 +6974,14 @@ async fn run_scripted_turn(
                 }
                 Err(kind)
             } else {
-                finish_assistant_disposition(cli, location, true, None)
+                finish_assistant_disposition(cli, location, AssistantDisposition::Committed, None)
                     .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+                if !cli.jsonl && state.last_turn.tool_errors > 0 {
+                    eprintln!(
+                        "~ {} earlier tool error(s) were recovered within the turn; final state committed",
+                        state.last_turn.tool_errors
+                    );
+                }
                 if cli.jsonl {
                     emit_jsonl(
                         "turn_finished",
@@ -6642,7 +7001,7 @@ async fn run_scripted_turn(
             finish_assistant_disposition(
                 cli,
                 location,
-                false,
+                AssistantDisposition::Discarded,
                 Some("the model turn failed before commit"),
             )
             .map_err(|_| ScriptFailureKind::JsonlOutput)?;
@@ -6673,7 +7032,7 @@ async fn run_scripted_turn(
                 .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             *messages = messages_before;
-            *state = state_before;
+            rollback_agent_state(state, state_before);
             cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
             if !cli.jsonl {
                 eprintln!("{}: {error_message}", terminal_inline(location));
@@ -6688,7 +7047,7 @@ async fn run_scripted_turn(
             finish_assistant_disposition(
                 cli,
                 location,
-                false,
+                AssistantDisposition::Discarded,
                 Some("the model turn was cancelled before commit"),
             )
             .map_err(|_| ScriptFailureKind::JsonlOutput)?;
@@ -6710,7 +7069,7 @@ async fn run_scripted_turn(
                 .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             }
             *messages = messages_before;
-            *state = state_before;
+            rollback_agent_state(state, state_before);
             cancel_agents_and_report_writes(registry, agent_watermark, journal).await;
             if !cli.jsonl {
                 eprintln!("{}: request cancelled by Ctrl+C", terminal_inline(location));
@@ -7177,6 +7536,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let scripted = script.is_some();
     let forced_one_shot = initial_review.is_some();
     let interactive = kitsu_render::stdin_is_tty() && !scripted && !forced_one_shot;
+    // Checkpoint blocks always print; the "/undo N" hint is only advertised
+    // where a human can actually type it (the interactive REPL).
+    UNDO_HINTS_ACTIONABLE.store(interactive, Ordering::Release);
     let durable_session = !no_session && (interactive || session_requested || resume.is_some());
     let command_requested =
         enable_commands || !command_roots.is_empty() || !allow_commands.is_empty();
@@ -7555,7 +7917,21 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // is honest about what loaded and why. Each source is pushed as a chunk so its
     // estimate (headers included) sums to the whole system-message estimate.
     let mut provenance: Vec<CtxEntry> = Vec::new();
-    let base = chat_system_prompt(&tool_names);
+    let prompt_environment = {
+        let cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+        // Interactive chat implicitly grants the launch directory as a read
+        // root (see the Permissions setup above); tell the model the same
+        // truth the permission layer enforces.
+        let mut read_only: Vec<String> = allow_paths.to_vec();
+        if interactive {
+            let cwd_text = cwd.to_string_lossy().to_string();
+            if !read_only.contains(&cwd_text) {
+                read_only.push(cwd_text);
+            }
+        }
+        PromptEnvironment::from_grants(&cwd, &read_only, allow_write, allow_read_write)
+    };
+    let base = chat_system_prompt(&tool_names, &prompt_environment);
     provenance.push(CtxEntry::new(
         "base prompt",
         estimate_str(&base),
@@ -7991,7 +8367,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
         messages.push(ChatMessage::user(expanded_text));
         let mut cfg = base_cfg(model.clone(), cli);
-        let event_log = live_agent_event_log(cli.jsonl, "piped:1");
+        let partial_answer: PartialAnswerBuffer = Arc::default();
+        let event_log =
+            live_agent_event_log_capturing(cli.jsonl, "piped:1", Some(partial_answer.clone()));
         cfg.event_log = Some(event_log.clone());
         let no_tools = Registry::new();
         let turn_tools = match submitted.tool_mode {
@@ -8027,6 +8405,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             _ => None,
         };
         finish_agent_trace(cli, "piped:1", &event_log, assistant)?;
+        warn_context_window_evidence(cli, Some("piped:1"), &mut session_state)?;
         return match outcome {
             TurnOutcome::Completed(Ok(_)) => {
                 let unfinished_agents = agent_registry.running();
@@ -8034,7 +8413,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     finish_assistant_disposition(
                         cli,
                         "piped:1",
-                        false,
+                        AssistantDisposition::Discarded,
                         Some("unfinished background agents made the turn incomplete"),
                     )?;
                     cancel_agents_and_report_writes(&agent_registry, 0, &write_journal).await;
@@ -8060,7 +8439,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     return Err(mapped);
                 }
                 if let Some((kind, issue)) = strict_turn_failure(&session_state.last_turn) {
-                    finish_assistant_disposition(cli, "piped:1", false, Some(&issue))?;
+                    finish_assistant_disposition(
+                        cli,
+                        "piped:1",
+                        AssistantDisposition::Discarded,
+                        Some(&issue),
+                    )?;
                     cancel_agents_and_report_writes(
                         &agent_registry,
                         agent_watermark,
@@ -8106,7 +8490,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 if let Err(mapped) =
                     persist_session_required(&session_store, &session, &model, &messages)
                 {
-                    finish_assistant_disposition(cli, "piped:1", true, None)?;
+                    finish_assistant_disposition(
+                        cli,
+                        "piped:1",
+                        AssistantDisposition::Committed,
+                        None,
+                    )?;
                     if cli.jsonl {
                         emit_jsonl(
                             "error",
@@ -8125,7 +8514,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     return Err(mapped);
                 }
-                finish_assistant_disposition(cli, "piped:1", true, None)?;
+                finish_assistant_disposition(
+                    cli,
+                    "piped:1",
+                    AssistantDisposition::Committed,
+                    None,
+                )?;
+                if !cli.jsonl && session_state.last_turn.tool_errors > 0 {
+                    eprintln!(
+                        "~ {} earlier tool error(s) were recovered within the turn; final state committed",
+                        session_state.last_turn.tool_errors
+                    );
+                }
                 if cli.jsonl {
                     emit_jsonl(
                         "turn_finished",
@@ -8141,12 +8541,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 Ok(())
             }
             TurnOutcome::Completed(Err(error)) => {
-                finish_assistant_disposition(
-                    cli,
-                    "piped:1",
-                    false,
-                    Some("the model turn failed before commit"),
-                )?;
+                if let Some(partial) = deadline_partial_answer(&error, &partial_answer) {
+                    let partial_text = emit_partial_deadline_answer(cli, "piped:1", &partial)?;
+                    // Commit the partial answer (with the completed tool
+                    // rounds already in `messages`) to a durable session so a
+                    // resume can continue from what was actually delivered.
+                    messages.push(ChatMessage::assistant(partial_text, Vec::new()));
+                    if let Err(persist_error) =
+                        persist_session_required(&session_store, &session, &model, &messages)
+                    {
+                        if !cli.jsonl {
+                            eprintln!(
+                                "~ warning: could not save the partial turn: {}",
+                                terminal_inline(&persist_error.to_string())
+                            );
+                        }
+                    }
+                } else {
+                    finish_assistant_disposition(
+                        cli,
+                        "piped:1",
+                        AssistantDisposition::Discarded,
+                        Some("the model turn failed before commit"),
+                    )?;
+                }
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let mapped = map_agent_error(
@@ -8180,7 +8598,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 finish_assistant_disposition(
                     cli,
                     "piped:1",
-                    false,
+                    AssistantDisposition::Discarded,
                     Some("the model turn was cancelled before commit"),
                 )?;
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
@@ -8260,7 +8678,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     if current.terminal > previous.terminal {
                         for report in notification_journal.drain_and_take_reports().await {
                             let notice = kitsu_render::PromptSafeAsyncNotice::info(
-                                format_write_checkpoint(&report),
+                                format_write_checkpoint(&report, undo_hint_actionable()),
                             );
                             if typeahead_active.load(Ordering::Acquire)
                                 || notice.publish_with(|frame| printer.print(frame)).is_err()
@@ -8854,6 +9272,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             _ => None,
         };
         finish_agent_trace(cli, "interactive", &event_log, assistant)?;
+        warn_context_window_evidence(cli, None, &mut session_state)?;
         match turn_outcome {
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Ok(text))) => {
                 last_failed = None;
@@ -8868,11 +9287,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 finish_assistant_disposition(
                     cli,
                     "interactive",
-                    false,
+                    AssistantDisposition::Discarded,
                     Some("the model turn failed before commit"),
                 )?;
                 messages = messages_before;
-                session_state = state_before;
+                rollback_agent_state(&mut session_state, state_before);
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 last_failed = Some(retry_prompt);
@@ -8885,11 +9304,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 finish_assistant_disposition(
                     cli,
                     "interactive",
-                    false,
+                    AssistantDisposition::Discarded,
                     Some("the model turn was cancelled before commit"),
                 )?;
                 messages = messages_before;
-                session_state = state_before;
+                rollback_agent_state(&mut session_state, state_before);
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 last_failed = Some(retry_prompt);
@@ -8901,11 +9320,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 finish_assistant_disposition(
                     cli,
                     "interactive",
-                    false,
+                    AssistantDisposition::Discarded,
                     Some("the partial turn was replaced by a steering correction"),
                 )?;
                 messages = messages_before;
-                session_state = state_before;
+                rollback_agent_state(&mut session_state, state_before);
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let mut restarted = retry_prompt;
@@ -8929,11 +9348,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 finish_assistant_disposition(
                     cli,
                     "interactive",
-                    false,
+                    AssistantDisposition::Discarded,
                     Some("the foreground turn was cancelled by /quit cancel"),
                 )?;
                 messages = messages_before;
-                session_state = state_before;
+                rollback_agent_state(&mut session_state, state_before);
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let stopped = agent_registry.cancel_all().await;
@@ -9508,7 +9927,7 @@ async fn handle_slash(
             .await;
             let Some(result) = result else {
                 *messages = messages_before;
-                *state = state_before;
+                rollback_agent_state(state, state_before);
                 eprintln!("^C (manual compaction cancelled; context restored)");
                 return SlashResult::Cancelled;
             };
@@ -9542,7 +9961,7 @@ async fn handle_slash(
                 Err(error) => {
                     let kind = script_failure_kind(&error);
                     *messages = messages_before;
-                    *state = state_before;
+                    rollback_agent_state(state, state_before);
                     let message = chat_error_message(error, model, cli.timeout_secs);
                     eprintln!("cannot compact context (context restored): {message}");
                     return if kind == ScriptFailureKind::Provider {
@@ -9579,7 +9998,10 @@ async fn handle_slash(
             report_write_checkpoints(journal.drain_and_take_reports().await);
             match journal.checkpoint_preview(id) {
                 Some(report) => {
-                    eprintln!("{}", format_write_checkpoint(&report));
+                    eprintln!(
+                        "{}",
+                        format_write_checkpoint(&report, undo_hint_actionable())
+                    );
                     return SlashResult::Continue(Some(serde_json::json!({
                         "kind": "checkpoint",
                         "id": report.id,
@@ -10810,7 +11232,7 @@ mod tests {
             unified_diff: diff.to_string(),
             diff_truncated: false,
         };
-        let rendered = format_write_checkpoint(&report);
+        let rendered = format_write_checkpoint(&report, true);
         assert!(rendered.contains("verified snapshot-derived diff"));
         assert!(rendered.contains("-old\n+new"));
         assert!(rendered.contains("/undo 19"));
@@ -10923,17 +11345,101 @@ mod tests {
 
     #[test]
     fn write_only_system_prompt_does_not_claim_read_or_edit_authority() {
-        let prompt = chat_system_prompt(&["fs_write_file".to_string()]);
+        let environment = PromptEnvironment::default();
+        let prompt = chat_system_prompt(&["fs_write_file".to_string()], &environment);
         assert!(prompt.contains("write-only filesystem authority"));
         assert!(!prompt.contains("fs_read_file"));
         assert!(!prompt.contains("fs_edit_file"));
 
-        let combined = chat_system_prompt(&[
-            "fs_read_file".to_string(),
-            "fs_write_file".to_string(),
-            "fs_edit_file".to_string(),
-        ]);
+        let combined = chat_system_prompt(
+            &[
+                "fs_read_file".to_string(),
+                "fs_write_file".to_string(),
+                "fs_edit_file".to_string(),
+            ],
+            &environment,
+        );
         assert!(combined.contains("fs_edit_file for exact localized edits"));
+    }
+
+    #[test]
+    fn system_prompt_names_the_cwd_and_every_granted_root_with_authority() {
+        let environment = PromptEnvironment::from_grants(
+            std::path::Path::new("/work/project"),
+            &["/data/readonly".to_string(), "/shared".to_string()],
+            &["/out/writeonly".to_string()],
+            &["/work/project".to_string(), "/shared".to_string()],
+        );
+        let prompt = chat_system_prompt(
+            &["fs_read_file".to_string(), "fs_write_file".to_string()],
+            &environment,
+        );
+        assert!(prompt.contains("Current working directory: /work/project."));
+        assert!(prompt.contains("/data/readonly (read-only)"));
+        assert!(prompt.contains("/out/writeonly (write-only)"));
+        assert!(prompt.contains("/work/project (read-write)"));
+        // Read-write wins when a path appears in more than one grant list.
+        assert!(prompt.contains("/shared (read-write)"));
+        assert!(!prompt.contains("/shared (read-only)"));
+        // The model is told to explore rather than ask for paths.
+        assert!(prompt.contains("explore the granted roots"));
+    }
+
+    #[test]
+    fn system_prompt_without_grants_omits_the_roots_line_but_keeps_the_cwd() {
+        let environment =
+            PromptEnvironment::from_grants(std::path::Path::new("/work/project"), &[], &[], &[]);
+        let prompt = chat_system_prompt(&["command_exec".to_string()], &environment);
+        assert!(prompt.contains("Current working directory: /work/project."));
+        assert!(!prompt.contains("Granted filesystem roots"));
+    }
+
+    #[test]
+    fn strict_turn_failure_commits_recovered_tool_errors() {
+        // Recovered: an early failure, but the final tool round was clean.
+        let recovered = kitsu_core::AgentTurnStatus {
+            tool_errors: 2,
+            final_round_tool_errors: 0,
+            ..Default::default()
+        };
+        assert!(strict_turn_failure(&recovered).is_none());
+
+        // Unrecovered: the final tool round still failed.
+        let unrecovered = kitsu_core::AgentTurnStatus {
+            tool_errors: 1,
+            final_round_tool_errors: 1,
+            ..Default::default()
+        };
+        let (kind, issue) = strict_turn_failure(&unrecovered).expect("must fail");
+        assert_eq!(kind, ScriptFailureKind::Tool);
+        assert!(issue.contains("1 tool call(s) failed"));
+
+        // A policy denial always fails, even when a later round succeeded.
+        let denied = kitsu_core::AgentTurnStatus {
+            tool_errors: 1,
+            policy_errors: 1,
+            final_round_tool_errors: 0,
+            ..Default::default()
+        };
+        let (kind, issue) = strict_turn_failure(&denied).expect("must fail");
+        assert_eq!(kind, ScriptFailureKind::Policy);
+        assert!(issue.contains("denied by local policy"));
+    }
+
+    #[test]
+    fn checkpoint_undo_hint_is_suppressed_when_not_actionable() {
+        let report = kitsu_tools::builtins::fs::JournalTurnReport {
+            id: 3,
+            label: "fix the bug".to_string(),
+            changes: Vec::new(),
+            unified_diff: String::new(),
+            diff_truncated: false,
+        };
+        let interactive = format_write_checkpoint(&report, true);
+        assert!(interactive.contains("/undo 3 restores this checkpoint"));
+        let scripted = format_write_checkpoint(&report, false);
+        assert!(!scripted.contains("/undo"));
+        assert!(scripted.contains("verified file checkpoint #3"));
     }
 
     #[test]
@@ -10976,7 +11482,7 @@ mod tests {
             unified_diff: String::new(),
             diff_truncated: false,
         };
-        let checkpoint = format_write_checkpoint(&report);
+        let checkpoint = format_write_checkpoint(&report, true);
         assert!(!checkpoint.contains('\u{1b}'));
         assert!(!checkpoint.contains("\nforged-checkpoint"));
     }
