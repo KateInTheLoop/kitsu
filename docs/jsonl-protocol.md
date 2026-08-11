@@ -97,6 +97,22 @@ guarantees requires a new schema identifier.
   stderr. Status, permissions, and session inventory retain a compatibility
   `text` field alongside typed fields. Job mutations report both whether state
   changed and the resulting bounded registry/thread snapshot.
+  The `permissions` result carries `commands.exact_grants[].cwd_source`
+  (`"explicit"`, `"launch_directory"`, or `null` for a grant created at runtime
+  through the approval prompt) and a `host_evidence` object describing the
+  host-owned workspace-evidence root used by `/diff`, `/review`, and
+  `kitsu review`: `repository_root`, `consumers`, `model_read_root` (always
+  `false` — host evidence never becomes a model read root),
+  `prompt_disclosure`, and `excluded_private_paths`. Outside a Git worktree it
+  reports `repository_root: null` plus `unavailable`.
+  The `command_artifacts` result carries `cross_run` (`generation_count`,
+  `bytes`) describing what earlier runs left on disk, alongside the
+  in-process `usage`/`artifacts` fields.
+  The `diff` result carries `evidence_bytes` and `model_disclosed: false`:
+  `/diff` renders host-gathered bytes to the terminal only. `/review` instead
+  emits a `review_disclosure` result inside its own command frame, before the
+  turn that carries the bytes, with `model_disclosed: true`,
+  `model_read_root_granted: false`, and `evidence_bytes`.
   The `jobs`/`steer` receipt additionally carries `restarts_thread` (always
   `true`) and `discarded_ms`: steering does not append to the running attempt,
   it drops it and restarts the worker on a fresh transcript, discarding that

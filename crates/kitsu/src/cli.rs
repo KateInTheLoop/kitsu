@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
-    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n  kitsu artifacts --help  Host-only command-artifact storage\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
 pub struct Cli {
     /// Gateway profile to use (from [gateways.<name>] in the config).
@@ -252,6 +252,18 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<SessionCommand>,
     },
+    /// Inspect or reclaim command-artifact storage left by earlier runs.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu artifacts\n  kitsu artifacts list --json\n  kitsu artifacts prune all --dry-run\n  kitsu artifacts prune all --older-than 7d\n\nHost-only: these paths are Kitsu-private, no model authority is involved, and the config path only selects the isolated namespace. Generations held by a live process are never removed."
+    )]
+    Artifacts {
+        /// Emit one JSON result instead of human text.
+        #[arg(long, global = true)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ArtifactCommand>,
+    },
     /// Interactive chat, scripted multi-turn work, or one piped turn.
     #[command(
         after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
@@ -292,8 +304,10 @@ pub enum Command {
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
 
-        /// Pre-approve one exact argv in the launch directory, encoded as a
-        /// JSON string array, for example '["cargo","test"]'. Repeatable and
+        /// Pre-approve one exact argv, encoded either as a JSON string array
+        /// run in the launch directory, for example '["cargo","test"]', or as
+        /// '{"argv":["cargo","test"],"cwd":"/abs/dir"}' to bind it to an
+        /// explicit working directory inside a --command-root. Repeatable and
         /// intended for non-interactive scripts.
         #[arg(long = "allow-command", value_name = "JSON_ARGV")]
         allow_commands: Vec<String>,
@@ -328,6 +342,23 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
+pub enum ArtifactCommand {
+    /// List retained generations across runs (the default when no action is given).
+    List,
+    /// Remove exact generations. Live and still-owned generations are skipped.
+    Prune {
+        /// Exact generation id, or `all`.
+        target: String,
+        /// Only remove generations at least this old (for example `7d`, `12h`).
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Report what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
 pub enum SessionCommand {
     /// List saved sessions (the default when no action is given).
     List,
@@ -354,9 +385,10 @@ pub enum SessionCommand {
         id: String,
         /// New output file; an artifact sidecar may be created beside it.
         destination: std::path::PathBuf,
-        /// Human-readable Markdown or the complete JSON snapshot.
-        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
-        format: String,
+        /// Human-readable Markdown or the complete JSON snapshot. When omitted,
+        /// a `.json` destination selects JSON and anything else Markdown.
+        #[arg(long, value_parser = ["markdown", "json"])]
+        format: Option<String>,
     },
     /// Move an exact inactive session into recoverable archive storage.
     Archive { id: String },

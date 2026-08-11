@@ -852,6 +852,42 @@ async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
             .success();
         assert!(export.is_file());
 
+        // No --format: the destination extension decides, and says so.
+        let inferred = home_path.join("inferred-export.json");
+        let mut inferred_cmd = base_cmd(&home_path);
+        inferred_cmd
+            .args([
+                "sessions",
+                "export",
+                &forked_id,
+                &inferred.to_string_lossy(),
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "inferred --format json from the .json destination",
+            ));
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&inferred).unwrap())
+            .expect("inferred export is a JSON snapshot");
+
+        // Anything else keeps the Markdown default, silently.
+        let markdown = home_path.join("inferred-export.md");
+        let mut markdown_cmd = base_cmd(&home_path);
+        markdown_cmd
+            .args([
+                "sessions",
+                "export",
+                &forked_id,
+                &markdown.to_string_lossy(),
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("inferred --format").not());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&markdown).unwrap())
+                .is_err()
+        );
+
         let mut archive = base_cmd(&home_path);
         archive
             .args(["sessions", "archive", &forked_id])
@@ -1737,6 +1773,9 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
         [
             "run_started",
             "command_started",
+            // The one-shot evidence disclosure is framed inside the command that
+            // caused it, before the prompt that carries the bytes.
+            "command_result",
             "turn_started",
             "provider_request",
             "provider_attempt",
@@ -1747,13 +1786,17 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
             "final_summary",
         ]
     );
-    assert_eq!(events[4]["category"], "cancelled");
-    assert_eq!(events[4]["outcome"], "cancelled");
-    assert_eq!(events[5]["status"], "discarded");
-    assert_eq!(events[6]["kind"], "cancelled");
-    assert_eq!(events[7]["status"], "cancelled");
+    assert_eq!(events[2]["result"]["kind"], "review_disclosure");
+    assert_eq!(events[2]["result"]["model_disclosed"], true);
+    assert_eq!(events[2]["result"]["model_read_root_granted"], false);
+    assert!(events[2]["result"]["evidence_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(events[5]["category"], "cancelled");
+    assert_eq!(events[5]["outcome"], "cancelled");
+    assert_eq!(events[6]["status"], "discarded");
+    assert_eq!(events[7]["kind"], "cancelled");
     assert_eq!(events[8]["status"], "cancelled");
     assert_eq!(events[9]["status"], "cancelled");
+    assert_eq!(events[10]["status"], "cancelled");
 }
 
 #[tokio::test]
@@ -3258,8 +3301,13 @@ fn test_diff_command_reports_verified_tracked_and_untracked_changes() {
         .stderr(predicate::str::contains("+new evidence"));
 }
 
+/// `/diff` is host-owned evidence, not a model read: launched in a
+/// subdirectory with **no** filesystem grant at all it still resolves the
+/// pathspec against the repository root and renders the diff, and
+/// `/permissions` reports no model read roots while naming the host-evidence
+/// root it used.
 #[test]
-fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
+fn test_diff_from_subdirectory_resolves_filter_without_grants() {
     let home = TempDir::new().unwrap();
     write_config(home.path(), "http://127.0.0.1:1");
     let repo = TempDir::new().unwrap();
@@ -3291,28 +3339,35 @@ fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
     let script = package.join("diff-script.txt");
     fs::write(&script, "/diff src/lib.rs\n/quit\n").unwrap();
 
-    let mut denied = base_cmd(home.path());
-    denied.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-    denied.current_dir(&package);
-    denied.args([
+    fs::write(&script, "/diff src/lib.rs\n/permissions\n/quit\n").unwrap();
+
+    let mut ungranted = base_cmd(home.path());
+    ungranted.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    ungranted.current_dir(&package);
+    ungranted.args([
         "--gateway",
         "example",
         "chat",
-        "--allow-path",
-        &package.to_string_lossy(),
         "--script",
         &script.to_string_lossy(),
     ]);
-    denied
+    ungranted
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("read permission required"));
+        .success()
+        .stderr(predicate::str::contains("crates/widget/src/lib.rs"))
+        .stderr(predicate::str::contains("+after"))
+        .stderr(predicate::str::contains("read permission required").not())
+        .stderr(predicate::str::contains("read roots   none"))
+        .stderr(predicate::str::contains("host evidence"))
+        .stderr(predicate::str::contains(
+            "never a model read root, never a model tool target",
+        ));
 
-    let mut allowed = base_cmd(home.path());
-    allowed.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-    allowed.current_dir(&package);
-    allowed.args([
+    // A read grant neither widens nor narrows the host-evidence scope.
+    let mut granted = base_cmd(home.path());
+    granted.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    granted.current_dir(&package);
+    granted.args([
         "--gateway",
         "example",
         "chat",
@@ -3321,7 +3376,7 @@ fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
         "--script",
         &script.to_string_lossy(),
     ]);
-    allowed
+    granted
         .assert()
         .success()
         .stderr(predicate::str::contains("crates/widget/src/lib.rs"))
@@ -6041,4 +6096,905 @@ fn test_closed_output_pipe_exits_cleanly_without_a_panic() {
         );
         assert_eq!(status.code(), Some(0), "{args:?} stderr: {stderr}");
     }
+}
+
+// --- --allow-command explicit cwd (cycle 7 item 1) --------------------------
+
+/// The object form binds a pregrant to a working directory the user names, so
+/// automation launched outside a `--command-root` no longer has to `cd` first.
+/// The grant stays exact argv *and* exact cwd: a sibling directory inside the
+/// same root is not authorized by it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_allow_command_object_form_binds_explicit_cwd_exactly() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proj = TempDir::new().unwrap();
+    let launch = TempDir::new().unwrap();
+    let sub = proj.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let argv = vec!["/bin/echo".to_string(), "KITSU_EXPLICIT_CWD".to_string()];
+
+    let run = |cwd: std::path::PathBuf| {
+        let argv = argv.clone();
+        let proj_root = proj.path().to_path_buf();
+        let launch_dir = launch.path().to_path_buf();
+        async move {
+            let server = MockServer::start().await;
+            let tool_args = serde_json::json!({"argv": argv, "cwd": cwd}).to_string();
+            Mock::given(method("POST"))
+                .and(path(CHAT_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "command_call_1",
+                                "type": "function",
+                                "function": {"name": "command_exec", "arguments": tool_args}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(CHAT_PATH))
+                .and(body_string_contains("\"role\":\"tool\""))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop"
+                    }]
+                })))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+
+            let home = TempDir::new().unwrap();
+            write_config(home.path(), &server.uri());
+            let pregrant = serde_json::json!({"argv": argv, "cwd": proj_root}).to_string();
+            let mut cmd = base_cmd(home.path());
+            let output = cmd
+                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .current_dir(&launch_dir)
+                .args([
+                    "--gateway",
+                    "example",
+                    "--jsonl",
+                    "--no-stream",
+                    "chat",
+                    "--no-session",
+                    "--command-root",
+                    &proj_root.to_string_lossy(),
+                    "--allow-command",
+                    &pregrant,
+                    "run the pre-approved command",
+                ])
+                .output()
+                .unwrap();
+            // `home` must outlive the child process.
+            drop(home);
+            output
+        }
+    };
+
+    // Granted cwd: startup succeeds from a launch directory outside the root and
+    // the command runs unprompted.
+    let granted = run(proj.path().to_path_buf()).await;
+    assert!(
+        granted.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&granted.stderr),
+        String::from_utf8_lossy(&granted.stdout)
+    );
+    let events = String::from_utf8(granted.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("tool_finished event");
+    assert_eq!(finished["command"]["exit_code"], 0);
+    assert!(finished["command"]["stdout_tail"]
+        .as_str()
+        .unwrap()
+        .contains("KITSU_EXPLICIT_CWD"));
+
+    // A subdirectory of the same command root is a different cwd: still denied.
+    let sibling = run(sub).await;
+    let sibling_events = String::from_utf8(sibling.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !sibling_events
+            .iter()
+            .any(|event| event["type"] == "tool_finished"
+                && event["command"]["exit_code"] == serde_json::json!(0)),
+        "an explicit-cwd grant must not authorize a sibling directory: {sibling_events:?}"
+    );
+}
+
+/// The bare array form keeps meaning "the launch directory", and `/permissions`
+/// says which of the two the user actually wrote.
+#[test]
+#[serial]
+fn test_allow_command_permissions_report_cwd_provenance() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/permissions\n/quit\n").unwrap();
+
+    let mut legacy = base_cmd(home.path());
+    legacy
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "chat",
+            "--allow-command",
+            r#"["/bin/echo","hi"]"#,
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    legacy
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("launch directory"))
+        .stderr(predicate::str::contains("explicit cwd").not());
+
+    let explicit_spec =
+        serde_json::json!({"argv": ["/bin/echo", "hi"], "cwd": proj.path()}).to_string();
+    let mut explicit = base_cmd(home.path());
+    explicit
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &explicit_spec,
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    explicit
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("explicit cwd"));
+}
+
+/// `/permissions --jsonl` carries the same provenance as an additive key.
+#[test]
+#[serial]
+fn test_permissions_payload_reports_cwd_source() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/permissions\n/quit\n").unwrap();
+    let spec = serde_json::json!({"argv": ["/bin/echo", "hi"], "cwd": proj.path()}).to_string();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "--jsonl",
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &spec,
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("permissions script");
+    assert!(output.status.success());
+    let permissions = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["result"]["kind"] == "permissions")
+        .expect("permissions payload");
+    assert_eq!(
+        permissions["result"]["commands"]["exact_grants"][0]["cwd_source"],
+        "explicit"
+    );
+}
+
+/// When the legacy form is unsatisfiable because the launch directory sits
+/// outside the roots, the startup error names the object syntax that fixes it.
+#[test]
+#[serial]
+fn test_allow_command_launch_cwd_outside_roots_names_object_syntax() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let launch = TempDir::new().expect("launch dir");
+    let root = proj.path().canonicalize().unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(launch.path())
+        .args([
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            r#"["/bin/echo","hi"]"#,
+            "--no-session",
+            "hello",
+        ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("\"cwd\""))
+        .stderr(predicate::str::contains(root.to_string_lossy().to_string()));
+}
+
+/// Ambiguous spellings fail closed at startup rather than silently degrading to
+/// a launch-directory grant.
+#[test]
+#[serial]
+fn test_allow_command_rejects_unknown_fields_and_relative_cwd() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+
+    for (spec, needle) in [
+        (
+            r#"{"argv":["/bin/echo"],"cd":"/tmp"}"#,
+            "invalid --allow-command value",
+        ),
+        (
+            r#"{"argv":["/bin/echo"],"cwd":"relative"}"#,
+            "must be an absolute path",
+        ),
+    ] {
+        let mut cmd = base_cmd(home.path());
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(proj.path())
+            .args([
+                "chat",
+                "--command-root",
+                &proj.path().to_string_lossy(),
+                "--allow-command",
+                spec,
+                "--no-session",
+                "hello",
+            ]);
+        cmd.assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(needle));
+    }
+}
+
+// --- host-owned workspace evidence (cycle 7 item 2) -------------------------
+
+/// Host evidence is not model authority. `/diff` succeeds with no grants, and
+/// the same session still advertises no filesystem tools and reports no read
+/// roots — the diff bytes reached the terminal, never the model's reach.
+#[test]
+#[serial]
+fn test_diff_authority_does_not_make_files_model_readable() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(repo.path().join("secret.txt"), "before\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(repo.path().join("secret.txt"), "after\n").unwrap();
+    let script = repo.path().join("script.txt");
+    fs::write(&script, "/diff\n/tools\n/permissions\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("+after"))
+        .stderr(predicate::str::contains("fs_read_file").not())
+        .stderr(predicate::str::contains("read roots   none"))
+        .stderr(predicate::str::contains("host evidence"));
+}
+
+/// `/diff --jsonl` carries the host bytes and says plainly that nothing was
+/// disclosed to the model, and the stream contains no grant of any kind.
+#[test]
+#[serial]
+fn test_diff_jsonl_reports_host_only_evidence() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let script = repo.path().join("script.txt");
+    fs::write(&script, "/diff\n/permissions\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let diffs = events
+        .iter()
+        .filter(|event| event["result"]["kind"] == "diff")
+        .collect::<Vec<_>>();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0]["result"]["model_disclosed"], false);
+    assert!(diffs[0]["result"]["evidence_bytes"].as_u64().unwrap() > 0);
+    assert!(diffs[0]["result"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("fresh"));
+
+    let permissions = events
+        .iter()
+        .find(|event| event["result"]["kind"] == "permissions")
+        .expect("permissions payload");
+    assert_eq!(
+        permissions["result"]["host_evidence"]["model_read_root"],
+        false
+    );
+    assert_eq!(
+        permissions["result"]["host_evidence"]["prompt_disclosure"],
+        "explicit_user_command_only"
+    );
+    assert!(permissions["result"]["host_evidence"]["repository_root"].is_string());
+    assert!(
+        permissions["result"]["filesystem"]["read"]["active_invocation"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A workspace that lives inside Kitsu's own private state is refused outright
+/// rather than disclosed as "workspace" evidence.
+#[test]
+#[serial]
+fn test_evidence_root_inside_private_state_is_refused() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let inside = home.path().join(".kitsu/inside-repo");
+    fs::create_dir_all(&inside).unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&inside)
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(inside.join("note.txt"), "private\n").unwrap();
+    let script = home.path().join("script.txt");
+    fs::write(&script, "/diff\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(&inside)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "refusing to gather workspace evidence from inside Kitsu-private state",
+    ));
+}
+
+/// `kitsu review` no longer fabricates a repository read root for itself. It
+/// discloses exactly one bounded diff and says so.
+#[tokio::test]
+#[serial]
+async fn test_review_discloses_evidence_without_granting_read_root() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "no findings"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 3, "total_tokens": 24}
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("review-me.rs"), "fn main() {}\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args(["--gateway", "example", "--no-stream", "review"]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "bytes of host-verified evidence to example-model-v1",
+        ))
+        .stderr(predicate::str::contains("no read root granted"))
+        .stderr(predicate::str::contains("read roots 1").not());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("tools")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(true),
+            "review advertised tools: {body}"
+        );
+        let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.contains("review-me.rs"));
+    }
+}
+
+// --- cycle 7 cheap wins -----------------------------------------------------
+
+/// A clean tree is not a dead end: echo the path the user typed and name the
+/// targets that would actually have something to review.
+#[test]
+#[serial]
+fn test_review_on_clean_tree_suggests_reachable_targets() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/lib.rs"), "fn clean() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+
+    let mut top_level = base_cmd(home.path());
+    top_level
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args(["--gateway", "example", "review", "src/lib.rs"]);
+    top_level
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("at src/lib.rs"))
+        .stderr(predicate::str::contains("--commit HEAD src/lib.rs"))
+        .stderr(predicate::str::contains("@src/lib.rs"));
+
+    let script = repo.path().join("review.txt");
+    fs::write(&script, "/review src/lib.rs\n/quit\n").unwrap();
+    let mut slash = base_cmd(home.path());
+    slash
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    slash
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/review commit HEAD src/lib.rs"))
+        .stderr(predicate::str::contains("@src/lib.rs"));
+}
+
+/// The preflight error explains its own numbers: window, effective prompt
+/// budget, and the reserve that separates the target from it — and it names
+/// `--context-window`, the most direct lever.
+#[test]
+#[serial]
+fn test_context_preflight_error_explains_its_budget_numbers() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--gateway",
+        "example",
+        "--context-window",
+        "2048",
+        "ask",
+        &"overflowing prompt ".repeat(4000),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("trim target is"))
+        .stderr(predicate::str::contains("effective prompt budget"))
+        .stderr(predicate::str::contains("window 2048 tokens"))
+        .stderr(predicate::str::contains("reserve)"))
+        .stderr(predicate::str::contains("--context-window <n>"));
+}
+
+// --- cross-run artifact retention (cycle 7 item 4) --------------------------
+
+/// A stateless `--enable-commands` run leaves its generation on disk after
+/// exit — deliberately, so the captured output stays readable — and
+/// `kitsu artifacts` is what finds and reclaims it afterwards.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_artifacts_list_and_prune_reclaim_cross_run_generations() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let argv = vec!["/bin/echo".to_string(), "KITSU_RETAINED".to_string()];
+    let tool_args = serde_json::json!({"argv": argv, "cwd": work.path()}).to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "command_call_1",
+                        "type": "function",
+                        "function": {"name": "command_exec", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let pregrant = serde_json::to_string(&argv).unwrap();
+    let mut cmd = base_cmd(home.path());
+    let run = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "--allow-command",
+            &pregrant,
+            "run it",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // The generation survived process exit, and cross-run listing finds it.
+    let mut list = base_cmd(home.path());
+    let listed = list
+        .args(["artifacts", "list", "--json"])
+        .output()
+        .expect("artifact inventory");
+    assert!(listed.status.success());
+    let inventory: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let generations = inventory["generations"].as_array().unwrap();
+    let retained = generations
+        .iter()
+        .find(|generation| generation["namespace"] == "runtime")
+        .expect("a retained runtime generation");
+    assert_eq!(retained["state"], "orphaned");
+    assert_eq!(retained["prunable"], true);
+    assert!(retained["files"].as_u64().unwrap() >= 1);
+    assert!(retained["bytes"].as_u64().unwrap() > 0);
+    let generation_path = retained["path"].as_str().unwrap().to_string();
+    assert!(Path::new(&generation_path).exists());
+
+    // --dry-run reports without removing.
+    let mut dry = base_cmd(home.path());
+    dry.args(["artifacts", "prune", "all", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would remove 1 generation(s)"));
+    assert!(Path::new(&generation_path).exists());
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+    assert!(!Path::new(&generation_path).exists());
+
+    // An unmatched selector is an error, consistent with `sessions delete`.
+    let mut missing = base_cmd(home.path());
+    missing
+        .args(["artifacts", "prune", "runtime-0-0-0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no retained artifact generation"));
+}
+
+/// Pruning must never touch sessions, config, locks, or anything that is not an
+/// artifact generation — and must refuse a symlink wearing a generation name.
+#[test]
+#[serial]
+fn test_artifacts_prune_never_touches_sessions_or_foreign_entries() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let state = home.path().join(".kitsu");
+    let artifacts = state.join("artifacts");
+    let sessions = state.join("sessions");
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("precious.txt"), "do not delete\n").unwrap();
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir_all(sessions.join(".locks")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+
+    let generation = artifacts.join("runtime-11-22-0");
+    fs::create_dir(&generation).unwrap();
+    fs::write(generation.join(".lock"), "").unwrap();
+    fs::write(generation.join("command-output-0.txt"), "removable\n").unwrap();
+    fs::create_dir(artifacts.join("not-an-artifact")).unwrap();
+    fs::write(artifacts.join("not-an-artifact/keep.txt"), "keep\n").unwrap();
+    fs::write(sessions.join("s-1-2-0.json"), "{}").unwrap();
+    fs::create_dir(sessions.join("s-1-2-0.artifacts")).unwrap();
+    fs::write(sessions.join("s-1-2-0.artifacts/kept.txt"), "owned\n").unwrap();
+    fs::write(state.join("history"), "line\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), artifacts.join("runtime-33-44-0")).unwrap();
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+
+    assert!(!generation.exists());
+    assert!(artifacts.join("not-an-artifact/keep.txt").exists());
+    assert!(sessions.join("s-1-2-0.json").exists());
+    assert!(sessions.join("s-1-2-0.artifacts/kept.txt").exists());
+    assert!(sessions.join(".locks").exists());
+    assert!(state.join("history").exists());
+    assert!(state.join("config.toml").exists());
+    assert!(outside.path().join("precious.txt").exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(artifacts.join("runtime-33-44-0")).is_ok());
+}
+
+/// Listing creates nothing: inspecting disk state must not materialize a
+/// profile directory.
+#[test]
+#[serial]
+fn test_artifacts_list_is_read_only() {
+    let home = TempDir::new().unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["artifacts"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no retained command artifacts"));
+
+    assert!(
+        !home.path().join(".kitsu").exists(),
+        "listing artifacts must not create Kitsu state"
+    );
+}
+
+/// The startup sweep removes provably empty orphans and nothing else, and
+/// `/artifacts` stops reporting "0 retained" while other runs sit on disk.
+#[test]
+#[serial]
+fn test_startup_sweep_removes_only_empty_orphans_and_slash_reports_cross_run() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let state = home.path().join(".kitsu");
+    let artifacts = state.join("artifacts");
+    let sessions = state.join("sessions");
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+
+    // Empty orphan generation with a released lock: sweepable.
+    let empty = artifacts.join("runtime-11-22-0");
+    fs::create_dir(&empty).unwrap();
+    fs::write(empty.join(".lock"), "").unwrap();
+    // Non-empty orphan: retained, never swept.
+    let populated = artifacts.join("runtime-11-22-1");
+    fs::create_dir(&populated).unwrap();
+    fs::write(populated.join(".lock"), "").unwrap();
+    fs::write(populated.join("command-output-0.txt"), "keep me\n").unwrap();
+    // Empty orphan sidecar with a released lock: sweepable.
+    let empty_sidecar = sessions.join("s-9-9-9.artifacts");
+    fs::create_dir(&empty_sidecar).unwrap();
+    fs::create_dir_all(sessions.join(".locks")).unwrap();
+    fs::write(sessions.join(".locks/s-9-9-9.lock"), "").unwrap();
+    // Sidecar whose session still exists: never swept.
+    fs::write(sessions.join("s-1-2-0.json"), "{}").unwrap();
+    let owned_sidecar = sessions.join("s-1-2-0.artifacts");
+    fs::create_dir(&owned_sidecar).unwrap();
+
+    let script = home.path().join("script.txt");
+    fs::write(&script, "/artifacts\n/quit\n").unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--gateway",
+        "example",
+        "chat",
+        "--enable-commands",
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("other runs:"))
+        .stderr(predicate::str::contains("kitsu artifacts list"));
+
+    assert!(!empty.exists(), "empty orphan generation should be swept");
+    assert!(
+        !empty_sidecar.exists(),
+        "empty orphan sidecar should be swept"
+    );
+    assert!(populated.exists(), "non-empty orphan must survive");
+    assert!(owned_sidecar.exists(), "owned sidecar must survive");
+    assert!(sessions.join("s-1-2-0.json").exists());
+}
+
+/// A generation whose lock is held by a live process is never removed, and the
+/// prune says why rather than failing silently.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_artifacts_prune_skips_live_generation() {
+    use std::os::unix::io::AsRawFd as _;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let artifacts = home.path().join(".kitsu/artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    let live = artifacts.join("runtime-55-66-0");
+    fs::create_dir(&live).unwrap();
+    fs::write(live.join("command-output-0.txt"), "in flight\n").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(live.join(".lock"))
+        .unwrap();
+    // SAFETY: `lock` is an open descriptor owned by this test.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("removed 0 generation(s)"))
+        .stdout(predicate::str::contains(
+            "a live process holds this generation's lock",
+        ))
+        .stderr(predicate::str::contains("nothing was removed"));
+
+    assert!(live.join("command-output-0.txt").exists());
+    drop(lock);
+
+    // Once the owner is gone the same command reclaims it.
+    let mut again = base_cmd(home.path());
+    again
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+    assert!(!live.exists());
 }

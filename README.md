@@ -182,6 +182,31 @@ kitsu sessions delete <exact-id>
 kitsu sessions resume last --json  # prints exact argv outside interactive chat
 ```
 
+### Artifacts on disk
+
+Developer-command output is captured in full into Kitsu-private *generation*
+directories so a one-shot automation run can still read it after the process
+exits. That retention is deliberate, which also means generations accumulate
+across runs. Inspect and reclaim them without contacting a provider:
+
+```bash
+kitsu artifacts                       # list retained generations across runs
+kitsu artifacts list --json           # same, for automation
+kitsu artifacts prune all --dry-run   # report what would be reclaimed
+kitsu artifacts prune all             # reclaim it
+kitsu artifacts prune <id> --older-than 7d
+```
+
+`kitsu artifacts` is **host-only**: it runs outside any chat, no model authority
+is involved, and none is created. Safety is biased toward keeping data — a
+generation held by a live process (proven by an advisory lock the kernel
+releases on process death, not by a reusable pid) is skipped with a named
+reason, session-owned sidecars are skipped, and only exact
+`runtime-<pid>-<nanos>-<gen>` and `<session-id>.artifacts` directories are ever
+touched. Chat startup additionally sweeps *provably empty* orphans, which
+destroys nothing of value, and prints a one-line notice — never a deletion —
+when non-empty leftovers pass a threshold.
+
 ---
 
 ## Add any OpenAI-compatible endpoint (the general recipe)
@@ -465,6 +490,7 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `review [path]` | Run one tool-free review over host-verified working/staged/unstaged/base/commit evidence; supports JSONL, focus instructions, and opt-in session continuity. |
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
 | `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `resume` launches chat on a TTY or emits exact argv otherwise. |
+| `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
 **Global flags** (apply to any command)
@@ -502,7 +528,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
 | `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. |
-| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv in the launch directory, e.g. `'["cargo","test"]'` (repeatable). |
+| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
 | `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
 | `--session` | Explicitly create and autosave a new scripted or piped session. |
@@ -547,6 +573,17 @@ it won't ask again.
   repeatable. Read and write authority stay independent unless the combined
   flag is used — e.g. read a whole repo but confine generated files to one
   scratch dir.
+- **Host-owned evidence is not model authority.** `/diff`, `/review`,
+  `kitsu review`, and `/checkpoint <id>` are produced by Kitsu's own `git`, not
+  by a model tool, so they need **no** read grant and never create one. `/diff`
+  renders to your terminal only. `/review` discloses exactly one bounded diff to
+  the model and says so (`~ disclosing N bytes of host-verified evidence …; no
+  read root granted`) — a one-shot disclosure, not standing authority to read
+  anything else. `/permissions` shows the host-evidence root under
+  `host evidence`. This is deliberately different from `@file` attachments,
+  which *do* consume model read authority: an attachment can name any file, and
+  the grant is what bounds which files can be named, whereas evidence scope is
+  fixed by the repository Kitsu was launched in.
 - **In-session grants:** `/allow <path>`, `/allow-write <path>`, and
   `/allow-read-write <path>`. `/revoke-read <exact-root>` and
   `/revoke-write <exact-root>` remove a displayed root for the current session;
@@ -607,8 +644,8 @@ Slash commands inside the REPL:
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
 | `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
 | `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
-| `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. |
-| `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. The top-level `kitsu review` provides the noninteractive form. |
+| `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. Host-owned: needs no read grant, and the bytes never leave your terminal. |
+| `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. Discloses one bounded diff to the model without granting a read root. The top-level `kitsu review` provides the noninteractive form. |
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
 | `/permissions` | Show effective filesystem authority with invocation/session provenance, revoked invocation roots, protected/internal reads, protected writes, and the command non-sandbox warning. |
 | `/tools` | Show enabled tools and the effective permission behavior. |
@@ -626,7 +663,7 @@ Slash commands inside the REPL:
 | `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
 | `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
-| `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. |
+| `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |

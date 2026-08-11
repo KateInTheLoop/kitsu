@@ -15,6 +15,7 @@ top-level entry points are:
 | `kitsu review [path]` | One tool-free turn over host-verified working/staged/unstaged/base/commit evidence, with optional JSONL and session continuity. |
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
 | `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`. |
+| `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and
@@ -115,6 +116,16 @@ stdin.
 - `/diff` derives bounded working/staged/unstaged+untracked/base/commit/checkpoint
   evidence from Git, the journal, and filesystem. `/review` submits exactly that
   evidence in a no-tools turn. `kitsu review` is the one-shot automation surface.
+  All three are **host-owned**: the evidence is produced by Kitsu's own `git`,
+  not by a model tool, so they require no filesystem grant and never create one.
+  Scope is fixed by the repository root of the launch directory and a path
+  argument can only narrow it; a workspace inside Kitsu-private state is refused
+  outright. `/diff` renders to the terminal only; `/review` and `kitsu review`
+  perform one bounded disclosure of that diff to the provider and say so
+  (`~ disclosing N bytes …; no read root granted`). `/permissions` reports the
+  evidence root, its private exclusions, and that it is not a model read root.
+  This differs from `@file` attachments, which do consume model read authority
+  because their scope is user-nameable.
 
 Developer commands are an independent, explicit capability. `--enable-commands`
 registers `command_exec`; roots come from `--command-root` or the launch
@@ -125,7 +136,13 @@ full-output artifact. The completed serialized artifact is capped at 16 MiB,
 including JSONL framing and hex expansion; it reports separately how many raw
 stdout/stderr bytes were retained, marks truncation, and keeps draining both
 child pipes. Interactive invocations have their own approval
-prompt; automation must use exact `--allow-command` grants. `--yes` and
+prompt; automation must use exact `--allow-command` grants, either as a JSON
+argv array bound to the launch directory or as
+`{"argv":[…],"cwd":"/abs/dir"}` bound to an explicit directory inside a command
+root. Both forms are exact argv **and** exact cwd, are validated at startup
+(failing closed with the object syntax named when the launch directory is
+outside the roots), and are re-applied to their own recorded cwd across `/new`
+and `/resume`. `--yes` and
 filesystem grants do not approve commands. Exact approval is followed by a
 mandatory Linux Bubblewrap boundary: approved command roots are writable,
 required runtime paths are read-only, network/PID/IPC/UTS namespaces and the
@@ -219,6 +236,17 @@ error.
   ID and permanently removes its validated snapshot/artifacts.
 - Leases prevent concurrent activation or lifecycle mutation of the same saved
   session. Lifecycle commands reject symlinked or irregular private entries.
+
+Command-artifact generations survive process exit by design, so they accumulate
+across runs. `kitsu artifacts` lists and prunes them without a provider and
+outside any chat: no model authority is involved and none is created. Removal
+requires an exact `runtime-<pid>-<nanos>-<gen>` or `<session-id>.artifacts`
+name, a real directory rather than a symlink, and proof of non-liveness through
+an advisory lock the kernel releases on process death — pids are reused, so they
+are never trusted. Chat startup sweeps only provably empty orphans (including
+sidecars whose session never committed a snapshot) and otherwise prints a
+threshold notice rather than deleting anything. In-session `/artifacts` reports
+what other runs left on disk alongside this session's own usage.
 
 ## Context management
 

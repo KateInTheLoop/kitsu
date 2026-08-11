@@ -1,4 +1,4 @@
-# Chat UX dogfood — cycle 7 audit checkpoint (interrupted)
+# Chat UX dogfood — cycle 7 audit checkpoint
 
 Date: 2026-08-11
 
@@ -45,6 +45,53 @@ the implementation pass is deferred to the next cycle.
 2. (post-ship validation — not delivered; rerun next cycle)
 3. [Agent deck UX](chat-ux-cycle-7-audits/raw/03-agent-deck.md)
 4. [Backlog design spike](chat-ux-cycle-7-audits/raw/04-backlog-design.md)
+
+## Implementation outcome
+
+After capacity returned, two Opus fix passes closed the cycle on this branch:
+
+**Pass C (agent-deck correctness, committed `cb4ff84`):** built-in profiles
+inherit reasoning-effort omission instead of force-sending it (fixing the
+critical dead-profiles bug) and failed spawns render as errors with
+remediation; scripted/piped exits join live background agents (bounded by
+`--agent-join-timeout`) instead of cancelling them with a false rollback
+blame, and piped runs surface previously-dropped background results; broken
+pipes exit cleanly instead of panicking; `/jobs`, `/agent`, and `/profiles`
+render from the DTO in the fox design language instead of Rust Debug dumps;
+`/jobs steer` receipts state the real restart semantics. 13 regression tests.
+
+**Pass D (backlog implementation, this commit):** `--allow-command` accepts
+`{"argv":[...],"cwd":"..."}` with startup validation, `/permissions`
+provenance, and the `/new`-rebinding latent bug fixed; `/diff` and `/review`
+run under a host-only `WorkspaceEvidenceAuthority` — no model read roots
+required or granted, `run_review`'s silent self-grant removed, provider
+disclosure explicitly announced (human line + JSONL `review_disclosure`),
+`/permissions` gains a host-evidence section; `kitsu review` clean-tree
+dead-end now suggests `--commit HEAD` and `@file`; `sessions export` infers
+JSON from the destination extension; context-overflow errors spell out
+window/budget/trim-target arithmetic; new `kitsu artifacts list|prune` with
+flock-based liveness, startup sweep of provably-empty orphans (both
+`runtime-*` generations and `s-*.artifacts` sidecars), and an `/artifacts`
+cross-run section. 25 more regression tests. No descopes.
+
+## Release verification
+
+Final tree: fmt clean, workspace clippy clean (`-D warnings`), 623 passing
+tests (206 bin unit, 112 CLI integration, 84 core, 58 provider, 130
+tools/permissions, 30 render, 2 provenance, +artifact-crate units). The known
+PTY-environmental failure was re-verified as pre-existing at each pass.
+Maintainer live checks: scripted `/diff` produces evidence with zero grants;
+`artifacts list`/`prune --dry-run` identify orphans without deleting;
+`kitsu-tools` untouched across both passes, so the model-facing permission
+boundary is provably unchanged.
+
+## Remaining backlog
+
+Session search; screen-reader rendering mode; syntect code-block boxes on the
+streaming path (with the doc-comment fence-tracker fix); agent-deck front
+door (`/agent spawn`), live-turn `/jobs` output, steering correction
+accumulation; deck identity proposals D1–D8 round 2; human-mode one-shot
+deliverable on stdout (git-workflow gap 4); JSONL file-mutation event.
 
 ## Loop state at interruption
 

@@ -611,7 +611,8 @@ pub enum AgentError {
     Loop(String),
 
     #[error(
-        "context preflight stopped an oversized provider request: protected prompt needs about {required} {unit}, but the configured target is {target} {unit}; shorten the latest request or system instructions, disable large tool schemas, lower max output tokens, clear/compact history, or select a model with a larger context window"
+        "context preflight stopped an oversized provider request: protected prompt needs about {required} {unit}, but the trim target is {target} {unit}{}; shorten the latest request or system instructions, disable large tool schemas, raise the window with --context-window <n>, lower --max-output-tokens, clear/compact history, or select a model with a larger context window",
+        context_budget_detail(*window, *effective, *target, *unit)
     )]
     ContextOverflow {
         required: u64,
@@ -620,12 +621,35 @@ pub enum AgentError {
         /// The resolved model window for token checks; `None` identifies the
         /// coarse byte-budget fallback used when model metadata is unavailable.
         window: Option<u64>,
+        /// The prompt budget the `kitsu-context:` line reports (window minus the
+        /// output reservation). `None` in the byte fallback, where the target is
+        /// the whole budget. Carried so the two numbers a user sees side by side
+        /// can explain their own difference instead of silently disagreeing.
+        effective: Option<u64>,
     },
 
     #[error(
         "manual compaction needs a resolved model context window; configure context_window or select a model whose window Kitsu can discover"
     )]
     ContextWindowUnknown,
+}
+
+/// Spell out the relationship between the window, the effective prompt budget,
+/// and the trim target so the preflight error and the `kitsu-context:` line
+/// never present two unexplained numbers for the same limit.
+fn context_budget_detail(
+    window: Option<u64>,
+    effective: Option<u64>,
+    target: u64,
+    unit: ContextUnit,
+) -> String {
+    match (window, effective) {
+        (Some(window), Some(effective)) => format!(
+            " (window {window} {unit}, effective prompt budget {effective} {unit}, trim target = effective minus a {} {unit} reserve)",
+            effective.saturating_sub(target)
+        ),
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1696,6 +1720,7 @@ struct RequestMeasurement {
     used: u64,
     target: u64,
     window: Option<u64>,
+    effective: Option<u64>,
     unit: ContextUnit,
 }
 
@@ -1740,10 +1765,12 @@ fn request_measurement(
             } else {
                 schema_tokens
             };
+        let budget = ContextBudget::new(window, max_tokens);
         RequestMeasurement {
             used,
-            target: ContextBudget::new(window, max_tokens).target,
+            target: budget.target,
             window: Some(window),
+            effective: Some(budget.effective),
             unit: ContextUnit::Tokens,
         }
     } else {
@@ -1756,6 +1783,7 @@ fn request_measurement(
             used: messages.iter().map(|m| m.byte_size() as u64).sum::<u64>() + schema_bytes,
             target: cfg.max_context_bytes as u64,
             window: None,
+            effective: None,
             unit: ContextUnit::Bytes,
         }
     }
@@ -1768,6 +1796,7 @@ fn check_measurement(measurement: RequestMeasurement) -> Result<RequestMeasureme
             target: measurement.target,
             unit: measurement.unit,
             window: measurement.window,
+            effective: measurement.effective,
         });
     }
     Ok(measurement)

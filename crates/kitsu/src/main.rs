@@ -1,6 +1,7 @@
 //! kitsu — CLI entry. MVP target: `kitsu ask --gateway example "hello"` runs the
 //! agent loop against the gateway (Mistral). See docs/architecture.md §6.
 
+mod artifacts;
 mod attachments;
 mod cli;
 mod command_artifact;
@@ -369,6 +370,7 @@ fn run() -> Result<(), CliError> {
         Command::Sessions { json, command } => {
             runtime.block_on(run_sessions(&cli, *json, command.as_ref()))
         }
+        Command::Artifacts { json, command } => run_artifacts(&cli, *json, command.as_ref()),
         Command::Chat {
             prompt,
             allow_paths,
@@ -431,15 +433,14 @@ async fn run_review(
     resume: Option<&str>,
     persist_session: bool,
 ) -> Result<(), CliError> {
-    let start = std::env::current_dir()
-        .map_err(|error| CliError::user(format!("cannot resolve review directory: {error}")))?;
-    let root = workspace::repository_root(&start).unwrap_or(start);
-    let allow_paths = vec![root.to_string_lossy().into_owned()];
+    // No fabricated read root. `kitsu review` gathers its evidence through the
+    // host-owned WorkspaceEvidenceAuthority, so granting the model the whole
+    // repository would be an undisclosed invocation read root that buys nothing.
     run_chat(
         cli,
         ChatInvocation {
             first_prompt: None,
-            allow_paths: &allow_paths,
+            allow_paths: &[],
             allow_write: &[],
             allow_read_write: &[],
             enable_commands: false,
@@ -473,6 +474,21 @@ fn starter_config(destination: &std::path::Path) -> String {
         "# Kitsu starter configuration (contains no credentials).\n# Next: kitsu --config {} doctor\n{STARTER_CONFIG_BODY}",
         shell_quote(&destination.to_string_lossy()),
     )
+}
+
+/// Infer the export format from the destination extension. Only `.json` (case
+/// insensitively) selects JSON; everything else keeps the Markdown default, so
+/// the inference can never surprise an existing `.md`/extensionless workflow.
+fn inferred_export_format(destination: &std::path::Path) -> session::SessionExportFormat {
+    let is_json = destination
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .is_some_and(|extension| extension.eq_ignore_ascii_case("json"));
+    if is_json {
+        session::SessionExportFormat::Json
+    } else {
+        session::SessionExportFormat::Markdown
+    }
 }
 
 fn reject_jsonl_for_management(cli: &Cli, replacement: &str) -> Result<(), CliError> {
@@ -717,6 +733,200 @@ fn format_saved_session(saved: &session::SavedSession) -> String {
     output
 }
 
+fn artifact_generation_payload(generation: &artifacts::Generation) -> serde_json::Value {
+    serde_json::json!({
+        "id": generation.id,
+        "path": generation.path,
+        "namespace": generation.namespace.label(),
+        "files": generation.files,
+        "bytes": generation.bytes,
+        "age_secs": generation.age_secs,
+        "state": generation.retention.label(),
+        "prunable": generation.prunable(),
+    })
+}
+
+fn format_artifact_inventory(
+    generations: &[artifacts::Generation],
+    config_path: &std::path::Path,
+) -> String {
+    let mut out = format!("command artifacts for config {}", shorten_home(config_path));
+    for namespace in [
+        artifacts::Namespace::Runtime,
+        artifacts::Namespace::Sessions,
+    ] {
+        let group = generations
+            .iter()
+            .filter(|generation| generation.namespace == namespace)
+            .collect::<Vec<_>>();
+        if group.is_empty() {
+            continue;
+        }
+        out.push_str(&format!("\n  namespace {}", namespace.label()));
+        for generation in group {
+            out.push_str(&format!(
+                "\n    {:<40} {:>3} file(s) {:>10}  {:<9} {}",
+                terminal_inline(&generation.id),
+                generation.files,
+                artifacts::human_bytes(generation.bytes),
+                artifacts::human_age(generation.age_secs),
+                generation.retention.label(),
+            ));
+        }
+    }
+    let total_bytes: u64 = generations.iter().map(|generation| generation.bytes).sum();
+    let prunable = generations
+        .iter()
+        .filter(|generation| generation.prunable())
+        .count();
+    let live = generations
+        .iter()
+        .filter(|generation| generation.retention == artifacts::Retention::InUse)
+        .count();
+    out.push_str(&format!(
+        "\n  total {} generation(s), {}; {prunable} prunable, {live} in use by a live process",
+        generations.len(),
+        artifacts::human_bytes(total_bytes),
+    ));
+    out.push_str(
+        "\n  prune with: kitsu artifacts prune all | kitsu artifacts prune all --older-than 7d",
+    );
+    out
+}
+
+/// `kitsu artifacts` — provider-free, offline, host-only inventory and pruning
+/// of storage left by earlier runs. Listing is strictly read-only: merely
+/// looking at disk state must not materialize a profile directory.
+fn run_artifacts(
+    cli: &Cli,
+    json: bool,
+    command: Option<&cli::ArtifactCommand>,
+) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu artifacts --json")?;
+    let config_path = Config::resolve_path(cli.config.as_deref());
+    let state_dir = runtime_state_dir_read_only(&config_path);
+    let generations = artifacts::scan(&state_dir).map_err(CliError::user)?;
+
+    match command {
+        None | Some(cli::ArtifactCommand::List) => {
+            if json {
+                return print_json(&serde_json::json!({
+                    "action": "list",
+                    "state_dir": state_dir,
+                    "generations": generations
+                        .iter()
+                        .map(artifact_generation_payload)
+                        .collect::<Vec<_>>(),
+                    "total_bytes": generations.iter().map(|generation| generation.bytes).sum::<u64>(),
+                }));
+            }
+            if generations.is_empty() {
+                println!(
+                    "no retained command artifacts for config {}",
+                    shorten_home(&config_path)
+                );
+                return Ok(());
+            }
+            println!("{}", format_artifact_inventory(&generations, &config_path));
+            Ok(())
+        }
+        Some(cli::ArtifactCommand::Prune {
+            target,
+            older_than,
+            dry_run,
+        }) => {
+            let minimum_age = older_than
+                .as_deref()
+                .map(artifacts::parse_duration_secs)
+                .transpose()
+                .map_err(CliError::user)?;
+            let selected = generations
+                .iter()
+                .filter(|generation| target == "all" || &generation.id == target)
+                .collect::<Vec<_>>();
+            if selected.is_empty() {
+                return Err(CliError::user(format!(
+                    "no retained artifact generation matches {}; run 'kitsu artifacts list' to see what exists",
+                    terminal_inline(target)
+                )));
+            }
+            let mut removed = Vec::new();
+            let mut skipped = Vec::new();
+            let mut reclaimed = 0u64;
+            for generation in selected {
+                if !generation.prunable() {
+                    skipped.push((generation, skip_reason(generation)));
+                    continue;
+                }
+                if minimum_age.is_some_and(|minimum| {
+                    generation.age_secs.map(|age| age < minimum).unwrap_or(true)
+                }) {
+                    skipped.push((generation, "newer than --older-than".to_string()));
+                    continue;
+                }
+                if *dry_run {
+                    reclaimed += generation.bytes;
+                    removed.push(generation);
+                    continue;
+                }
+                match artifacts::remove(generation) {
+                    Ok(()) => {
+                        reclaimed += generation.bytes;
+                        removed.push(generation);
+                    }
+                    Err(error) => skipped.push((generation, error)),
+                }
+            }
+            if json {
+                return print_json(&serde_json::json!({
+                    "action": if *dry_run { "prune_dry_run" } else { "prune" },
+                    "removed": removed
+                        .iter()
+                        .map(|generation| artifact_generation_payload(generation))
+                        .collect::<Vec<_>>(),
+                    "skipped": skipped
+                        .iter()
+                        .map(|(generation, reason)| serde_json::json!({
+                            "id": generation.id,
+                            "reason": reason,
+                        }))
+                        .collect::<Vec<_>>(),
+                    "reclaimed_bytes": reclaimed,
+                }));
+            }
+            println!(
+                "{} {} generation(s), {}",
+                if *dry_run { "would remove" } else { "removed" },
+                removed.len(),
+                artifacts::human_bytes(reclaimed)
+            );
+            for (generation, reason) in &skipped {
+                println!("  skipped {}: {reason}", terminal_inline(&generation.id));
+            }
+            if removed.is_empty() {
+                return Err(CliError::user(
+                    "nothing was removed; every matching generation is still in use or owned"
+                        .to_string(),
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+fn skip_reason(generation: &artifacts::Generation) -> String {
+    match generation.retention {
+        artifacts::Retention::InUse => "a live process holds this generation's lock".to_string(),
+        artifacts::Retention::SessionExists => {
+            "its session still exists; use 'kitsu sessions delete <id>' first".to_string()
+        }
+        artifacts::Retention::Orphaned => format!(
+            "no lock file and younger than the {}s liveness grace period",
+            artifacts::UNLOCKED_GRACE_SECS
+        ),
+    }
+}
+
 async fn run_sessions(
     cli: &Cli,
     json: bool,
@@ -828,10 +1038,19 @@ async fn run_sessions(
             format,
         }) => {
             require_session_namespace(&sessions_dir, "export", &config_path)?;
-            let format = match format.as_str() {
-                "markdown" => session::SessionExportFormat::Markdown,
-                "json" => session::SessionExportFormat::Json,
-                _ => unreachable!("clap validates session export format"),
+            let format = match format.as_deref() {
+                Some("markdown") => session::SessionExportFormat::Markdown,
+                Some("json") => session::SessionExportFormat::Json,
+                Some(_) => unreachable!("clap validates session export format"),
+                // An explicit --format always wins; inference only fills the gap
+                // that used to silently write Markdown into a .json file.
+                None => {
+                    let inferred = inferred_export_format(destination);
+                    if inferred == session::SessionExportFormat::Json && !json {
+                        eprintln!("~ inferred --format json from the .json destination");
+                    }
+                    inferred
+                }
             };
             let output = session::SessionStore::export(&sessions_dir, id, destination, format)
                 .map_err(|error| session_error("export", &config_path, error))?;
@@ -2171,6 +2390,11 @@ impl Drop for OffloadDirGuard {
 #[derive(Debug, Default)]
 struct ArtifactDirectoryAllocator {
     next_generation: u64,
+    /// Advisory locks held for the lifetime of this process, one per allocated
+    /// generation. Cross-run pruning tests these instead of pids (which are
+    /// reused) or marker files (which a killed process never removes); the
+    /// kernel releases them on process death, including `SIGKILL`.
+    locks: Vec<std::fs::File>,
 }
 
 impl ArtifactDirectoryAllocator {
@@ -2216,6 +2440,9 @@ impl ArtifactDirectoryAllocator {
                                 directory.display()
                             ));
                         }
+                    }
+                    if let Some(lock) = artifacts::hold_generation_lock(&directory) {
+                        self.locks.push(lock);
                     }
                     return Ok(directory);
                 }
@@ -2833,6 +3060,11 @@ struct SessionInfo {
     command_policy: Option<Arc<kitsu_tools::CommandPolicy>>,
     command_artifact_sink: Option<command_artifact::CommandArtifactSink>,
     invocation_command_grants: Vec<kitsu_tools::CommandGrantInfo>,
+    /// CLI-layer provenance for the invocation pregrants, kept parallel to
+    /// `invocation_command_grants` rather than inside `CommandGrantInfo`: the
+    /// cwd origin is a flag fact, and folding it into the policy struct would
+    /// perturb the argv+cwd+executable equality that classifies provenance.
+    invocation_command_pregrants: Vec<PregrantedCommand>,
     agent_profiles: Arc<subagent::profile::AgentProfileCatalog>,
     permissions: Arc<Permissions>,
     autosave_dirty: Cell<bool>,
@@ -3014,20 +3246,142 @@ fn dangerous_bypass_revocation_error(mode: Mode, access: &str) -> Option<String>
     })
 }
 
+/// The wire shape of one `--allow-command` value. The bare array stays
+/// byte-compatible with every existing script; the object form names the
+/// working directory the grant is bound to, so automation launched outside a
+/// `--command-root` no longer has to `cd` to make a pregrant satisfiable.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(untagged, deny_unknown_fields)]
+enum PregrantedCommandSpec {
+    Argv(Vec<String>),
+    Explicit {
+        argv: Vec<String>,
+        cwd: std::path::PathBuf,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CwdSource {
+    LaunchDirectory,
+    Explicit,
+}
+
+impl CwdSource {
+    fn label(self) -> &'static str {
+        match self {
+            CwdSource::LaunchDirectory => "launch directory",
+            CwdSource::Explicit => "explicit cwd",
+        }
+    }
+
+    fn payload_value(self) -> &'static str {
+        match self {
+            CwdSource::LaunchDirectory => "launch_directory",
+            CwdSource::Explicit => "explicit",
+        }
+    }
+}
+
+/// One resolved pregrant: exact argv bound to exactly one working directory.
+/// `cwd` is rewritten to the policy's canonical form once the grant lands, so
+/// `/new` re-grants and `/permissions` provenance both key off the same path.
+#[derive(Debug, Clone)]
+struct PregrantedCommand {
+    argv: Vec<String>,
+    cwd: std::path::PathBuf,
+    cwd_source: CwdSource,
+}
+
+impl PregrantedCommandSpec {
+    fn parse(encoded: &str) -> Result<Self, CliError> {
+        serde_json::from_str(encoded).map_err(|error| {
+            CliError::user(format!(
+                "invalid --allow-command value {encoded:?}: expected a JSON string array such as \
+                 '[\"cargo\",\"test\"]', or an object such as \
+                 '{{\"argv\":[\"cargo\",\"test\"],\"cwd\":\"/path/inside/a/command/root\"}}' ({error})"
+            ))
+        })
+    }
+
+    /// Bind the spec to a working directory. A relative explicit cwd is refused
+    /// rather than resolved against the process directory: that would reintroduce
+    /// exactly the ambiguity the object form exists to remove.
+    fn resolve(&self, launch_dir: &std::path::Path) -> Result<PregrantedCommand, CliError> {
+        let (argv, cwd, cwd_source) = match self {
+            PregrantedCommandSpec::Argv(argv) => (
+                argv.clone(),
+                launch_dir.to_path_buf(),
+                CwdSource::LaunchDirectory,
+            ),
+            PregrantedCommandSpec::Explicit { argv, cwd } => {
+                if !cwd.is_absolute() {
+                    return Err(CliError::user(format!(
+                        "invalid --allow-command {}: \"cwd\" must be an absolute path, not {}",
+                        display_pregrant_argv(argv),
+                        cwd.display()
+                    )));
+                }
+                (argv.clone(), cwd.clone(), CwdSource::Explicit)
+            }
+        };
+        if argv.is_empty() {
+            return Err(CliError::user(
+                "invalid --allow-command: \"argv\" must name at least one program".to_string(),
+            ));
+        }
+        Ok(PregrantedCommand {
+            argv,
+            cwd,
+            cwd_source,
+        })
+    }
+}
+
+fn display_pregrant_argv(argv: &[String]) -> String {
+    serde_json::to_string(argv).unwrap_or_else(|_| "[invalid argv]".to_string())
+}
+
+/// Startup failure text for one pregrant. When the legacy array form failed only
+/// because the launch directory sits outside the approved roots, name the object
+/// syntax that makes the same grant expressible.
+fn pregrant_error(grant: &PregrantedCommand, roots: &[String], error: &str) -> String {
+    let base = format!(
+        "invalid --allow-command {}: {error}",
+        display_pregrant_argv(&grant.argv)
+    );
+    if grant.cwd_source == CwdSource::Explicit || !error.contains("outside the approved command") {
+        return base;
+    }
+    let suggestion = roots
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "/path".to_string());
+    format!(
+        "{base}; the launch directory {} is outside the approved command roots ({}) — pass \
+         {{\"argv\":{},\"cwd\":\"{suggestion}\"}} to bind the grant to a root explicitly",
+        grant.cwd.display(),
+        roots.join(", "),
+        display_pregrant_argv(&grant.argv),
+    )
+}
+
 fn reset_command_session(
     policy: Option<&Arc<kitsu_tools::CommandPolicy>>,
-    explicit_grants: &[Vec<String>],
-    cwd: &std::path::Path,
+    explicit_grants: &[PregrantedCommand],
 ) {
     let Some(policy) = policy else {
         return;
     };
     policy.reset_session_grants();
-    for argv in explicit_grants {
-        if let Err(error) = policy.grant_command(argv, cwd) {
+    for grant in explicit_grants {
+        // Re-grant against the cwd the pregrant was bound to at startup, never
+        // the current launch directory: an explicit-cwd grant must survive /new
+        // and /resume unchanged rather than being silently rebound.
+        if let Err(error) = policy.grant_command(&grant.argv, &grant.cwd) {
             eprintln!(
-                "warning: could not restore explicit command grant {}: {error}",
-                serde_json::to_string(argv).unwrap_or_else(|_| "[invalid argv]".to_string())
+                "warning: could not restore explicit command grant {} (cwd {}): {error}",
+                display_pregrant_argv(&grant.argv),
+                grant.cwd.display()
             );
         }
     }
@@ -3192,22 +3546,6 @@ fn path_is_within(path: &std::path::Path, directory: &std::path::Path) -> bool {
     })
 }
 
-fn checkpoint_change_matches_path(
-    root: &std::path::Path,
-    path: &std::path::Path,
-    pathspec: Option<&str>,
-) -> bool {
-    let Some(pathspec) = pathspec.filter(|pathspec| *pathspec != ".") else {
-        return true;
-    };
-    path_identities(path).iter().any(|path| {
-        path.strip_prefix(root).is_ok_and(|relative| {
-            relative == std::path::Path::new(pathspec)
-                || relative.starts_with(std::path::Path::new(pathspec))
-        })
-    })
-}
-
 fn review_target_label(evidence: &workspace::ReviewEvidence) -> String {
     let mut label = format!("target {}", terminal_inline(&evidence.target));
     if let Some(revision) = &evidence.resolved_revision {
@@ -3222,6 +3560,38 @@ fn review_target_label(evidence: &workspace::ReviewEvidence) -> String {
     label
 }
 
+/// "Nothing to review" is a dead end only when it withholds what to do next.
+/// Echo the path the user actually typed and name the reachable targets.
+fn empty_review_message(
+    evidence: &workspace::ReviewEvidence,
+    path: Option<&str>,
+    top_level: bool,
+) -> String {
+    let mut message = format!(
+        "nothing to review for verified {}",
+        review_target_label(evidence)
+    );
+    if let Some(path) = path.map(str::trim).filter(|path| !path.is_empty()) {
+        message.push_str(&format!(" at {}", terminal_inline(path)));
+    }
+    let path_arg = path
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or("<path>");
+    if top_level {
+        message.push_str(&format!(
+            "; review its committed content with --commit HEAD {path_arg}, pick another target \
+             with --staged/--unstaged/--base <rev>, or discuss the file in chat with @{path_arg}"
+        ));
+    } else {
+        message.push_str(&format!(
+            "; review its committed content with /review commit HEAD {path_arg}, pick another \
+             target with /review staged|unstaged|base <rev>, or attach it with @{path_arg}"
+        ));
+    }
+    message
+}
+
 fn review_evidence_is_empty(evidence: &workspace::ReviewEvidence) -> bool {
     matches!(
         evidence.diff.as_str(),
@@ -3234,6 +3604,30 @@ fn review_evidence_is_empty(evidence: &workspace::ReviewEvidence) -> bool {
     )
 }
 
+/// Disclosing host-gathered evidence to the provider is a bounded, one-shot
+/// event, not a standing capability: say so at the moment it happens so the
+/// absence of a read root is not mistaken for the absence of disclosure.
+fn evidence_disclosure_line(evidence: &workspace::ReviewEvidence, model: &str) -> String {
+    format!(
+        "~ disclosing {} bytes of host-verified evidence to {}; no read root granted",
+        evidence.diff.len(),
+        terminal_inline(model),
+    )
+}
+
+fn evidence_disclosure_payload(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
+    serde_json::json!({
+        "kind": "review_disclosure",
+        "target": evidence.target,
+        "resolved_revision": evidence.resolved_revision,
+        "merge_base": evidence.merge_base,
+        "truncated": evidence.truncated,
+        "evidence_bytes": evidence.diff.len(),
+        "model_disclosed": true,
+        "model_read_root_granted": false,
+    })
+}
+
 fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
     format!(
         "Review the following host-verified diff evidence ({scope}). Focus on correctness, security, regressions, and missing tests. Report findings by severity with file/line references. Do not claim anything outside this exact evidence. This is a review-only turn with no tools.\n\n```diff\n{diff}\n```",
@@ -3242,83 +3636,135 @@ fn verified_review_prompt(evidence: &workspace::ReviewEvidence) -> String {
     )
 }
 
-async fn authorized_workspace_review(
+/// Host-owned authority to gather verified workspace evidence for `/diff`,
+/// `/review`, `kitsu review`, and `/checkpoint`.
+///
+/// It never consults, creates, or widens a model read root. The evidence is
+/// produced by Kitsu's own `git` (workspace.rs), not by a model tool, so the
+/// confidentiality boundary is `review_evidence_excluding`'s private-path
+/// exclusion — not the model's standing read authority. Coupling the two only
+/// ever trained users to widen model authority in order to look at their own
+/// diff, which is the consent anti-pattern this type exists to remove.
+///
+/// Scope is fixed by the directory Kitsu was launched in; a caller-supplied
+/// path can only narrow it. `for_session` must never accept a caller-named
+/// root — that would turn it into an arbitrary-read primitive.
+struct WorkspaceEvidenceAuthority {
+    root: std::path::PathBuf,
+    private: Vec<std::path::PathBuf>,
+}
+
+impl WorkspaceEvidenceAuthority {
+    /// Live git evidence: requires a worktree, since that is what `git` reads.
+    fn for_session(session: &SessionInfo, perms: &Permissions) -> Result<Self, String> {
+        Self::bind(
+            session,
+            perms,
+            workspace::repository_root(&session.directory)?,
+        )
+    }
+
+    /// Checkpoint replay: `checkpoint_evidence` never re-reads the filesystem,
+    /// it replays diff bytes Kitsu itself captured under write authority, so it
+    /// works outside a worktree too.
+    fn for_checkpoint(session: &SessionInfo, perms: &Permissions) -> Result<Self, String> {
+        let root = workspace::repository_root(&session.directory).unwrap_or_else(|_| {
+            std::fs::canonicalize(&session.directory).unwrap_or_else(|_| session.directory.clone())
+        });
+        Self::bind(session, perms, root)
+    }
+
+    fn bind(
+        session: &SessionInfo,
+        perms: &Permissions,
+        root: std::path::PathBuf,
+    ) -> Result<Self, String> {
+        // Fail closed when the workspace itself lives inside Kitsu-private
+        // state: host-owned or not, Kitsu never discloses its own runtime state
+        // as workspace evidence.
+        if perms.is_within_protected_read_root(&root) {
+            return Err(format!(
+                "refusing to gather workspace evidence from inside Kitsu-private state ({}); \
+                 run Kitsu from a workspace outside its own state directory",
+                root.display()
+            ));
+        }
+        Ok(Self {
+            root,
+            private: private_workspace_paths(session),
+        })
+    }
+
+    /// Resolve a user-typed path against the bound root. Rejects `..` escapes
+    /// and anything outside the repository before any I/O (workspace.rs).
+    fn pathspec(
+        &self,
+        session: &SessionInfo,
+        path: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        workspace::pathspec_from_directory(&self.root, &session.directory, path.unwrap_or(""))
+    }
+
+    /// One concise line for `/permissions` when there is no evidence root.
+    /// The raw `git` discovery error belongs in a `/diff` failure, not in a
+    /// standing disclosure of what Kitsu can and cannot see.
+    fn unavailable_reason(session: &SessionInfo, perms: &Permissions) -> String {
+        match workspace::repository_root(&session.directory) {
+            Err(_) => "not inside a Git worktree".to_string(),
+            Ok(root) if perms.is_within_protected_read_root(&root) => {
+                "the workspace is inside Kitsu-private state".to_string()
+            }
+            Ok(_) => "unavailable".to_string(),
+        }
+    }
+
+    fn notice_private_exclusions(&self) {
+        if self
+            .private
+            .iter()
+            .any(|path| path_is_within(path, &self.root))
+        {
+            eprintln!("~ active Kitsu config/private state omitted from workspace evidence");
+        }
+    }
+}
+
+fn authorized_workspace_review(
     session: &SessionInfo,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     request: ReviewRequest,
 ) -> Result<workspace::ReviewEvidence, String> {
-    let private_paths = private_workspace_paths(session);
-    let (root, target) = match request.scope {
-        ReviewScope::Checkpoint(id) => {
-            let root = workspace::repository_root(&session.directory).unwrap_or_else(|_| {
-                std::fs::canonicalize(&session.directory)
-                    .unwrap_or_else(|_| session.directory.clone())
-            });
-            let report = journal.checkpoint_preview(id).ok_or_else(|| {
-                format!("checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints")
-            })?;
-            let pathspec = workspace::pathspec_from_directory(
-                &root,
-                &session.directory,
-                request.path.as_deref().unwrap_or(""),
-            )?;
-            for change in &report.changes {
-                if private_paths
-                    .iter()
-                    .any(|private| path_is_within(&change.path, private))
-                    || !checkpoint_change_matches_path(&root, &change.path, pathspec.as_deref())
-                {
-                    continue;
-                }
-                perms.check_read(&change.path).await.map_err(|error| {
-                    format!(
-                        "read permission required for checkpoint path {}: {error}",
-                        change.path.display()
-                    )
-                })?;
-            }
-            return workspace::review_evidence_excluding(
-                &root,
-                workspace::ReviewTarget::Checkpoint(report),
-                pathspec.as_deref(),
-                &private_paths,
-            );
-        }
-        ReviewScope::Working => (
-            workspace::repository_root(&session.directory)?,
-            workspace::ReviewTarget::WorkingTree,
-        ),
-        ReviewScope::Staged => (
-            workspace::repository_root(&session.directory)?,
-            workspace::ReviewTarget::Staged,
-        ),
-        ReviewScope::Unstaged => (
-            workspace::repository_root(&session.directory)?,
-            workspace::ReviewTarget::Unstaged,
-        ),
-        ReviewScope::Base(revision) => (
-            workspace::repository_root(&session.directory)?,
-            workspace::ReviewTarget::Base(revision),
-        ),
-        ReviewScope::Commit(revision) => (
-            workspace::repository_root(&session.directory)?,
-            workspace::ReviewTarget::Commit(revision),
-        ),
-    };
-    let root = perms
-        .check_read(&root)
-        .await
-        .map_err(|error| format!("read permission required for {}: {error}", root.display()))?;
-    let pathspec = workspace::pathspec_from_directory(
-        &root,
-        &session.directory,
-        request.path.as_deref().unwrap_or(""),
-    )?;
-    if private_paths.iter().any(|path| path_is_within(path, &root)) {
-        eprintln!("~ active Kitsu config/private state omitted from workspace evidence");
+    if let ReviewScope::Checkpoint(id) = request.scope {
+        let authority = WorkspaceEvidenceAuthority::for_checkpoint(session, perms)?;
+        let report = journal.checkpoint_preview(id).ok_or_else(|| {
+            format!("checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints")
+        })?;
+        let pathspec = authority.pathspec(session, request.path.as_deref())?;
+        return workspace::review_evidence_excluding(
+            &authority.root,
+            workspace::ReviewTarget::Checkpoint(report),
+            pathspec.as_deref(),
+            &authority.private,
+        );
     }
-    workspace::review_evidence_excluding(&root, target, pathspec.as_deref(), &private_paths)
+    let authority = WorkspaceEvidenceAuthority::for_session(session, perms)?;
+    let target = match request.scope {
+        ReviewScope::Working => workspace::ReviewTarget::WorkingTree,
+        ReviewScope::Staged => workspace::ReviewTarget::Staged,
+        ReviewScope::Unstaged => workspace::ReviewTarget::Unstaged,
+        ReviewScope::Base(revision) => workspace::ReviewTarget::Base(revision),
+        ReviewScope::Commit(revision) => workspace::ReviewTarget::Commit(revision),
+        ReviewScope::Checkpoint(_) => unreachable!("checkpoint scope handled above"),
+    };
+    let pathspec = authority.pathspec(session, request.path.as_deref())?;
+    authority.notice_private_exclusions();
+    workspace::review_evidence_excluding(
+        &authority.root,
+        target,
+        pathspec.as_deref(),
+        &authority.private,
+    )
 }
 
 fn format_sessions(dir: &std::path::Path, current: Option<&str>) -> Result<String, String> {
@@ -3757,6 +4203,34 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
             out.push_str(&format!("\n    - {} (Kitsu-managed)", shorten_home(&root)));
         }
     }
+    out.push_str("\n  host evidence");
+    match WorkspaceEvidenceAuthority::for_session(session, perms) {
+        Ok(authority) => {
+            out.push_str(&format!(
+                "\n    - {} (git worktree; /diff, /review, kitsu review)",
+                shorten_home(&authority.root)
+            ));
+            out.push_str(
+                "\n      host-only: read by Kitsu's own git, never a model read root, never a model tool target",
+            );
+            for path in &authority.private {
+                out.push_str(&format!(
+                    "\n      excludes {} (Kitsu-private)",
+                    shorten_home(path)
+                ));
+            }
+            out.push_str(
+                "\n      write checkpoints are replayed from Kitsu's own verified snapshots, including changes written outside this root",
+            );
+            out.push_str("\n      /review discloses one bounded diff per command; /diff never leaves this terminal");
+        }
+        Err(_) => {
+            out.push_str(&format!(
+                "\n    none ({})",
+                WorkspaceEvidenceAuthority::unavailable_reason(session, perms)
+            ));
+        }
+    }
     let protected_writes = perms.protected_write_roots();
     out.push_str("\n  protected writes");
     if protected_writes.is_empty() {
@@ -3792,8 +4266,11 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
                 } else {
                     "session/runtime"
                 };
+                let origin = pregrant_cwd_source(session, grant)
+                    .map(|source| format!(", {}", source.label()))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "\n      [{}] {} (cwd {}; {provenance})",
+                    "\n      [{}] {} (cwd {}; {provenance}{origin})",
                     index + 1,
                     terminal_inline(&grant.display_argv()),
                     shorten_home(&grant.cwd),
@@ -3813,8 +4290,11 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
         if !revoked_invocation.is_empty() {
             out.push_str("\n    revoked invocation command grants");
             for grant in revoked_invocation {
+                let origin = pregrant_cwd_source(session, grant)
+                    .map(|source| format!("{}; ", source.label()))
+                    .unwrap_or_default();
                 out.push_str(&format!(
-                    "\n      - {} (cwd {}; reset/new session restores it)",
+                    "\n      - {} (cwd {}; {origin}reset/new session restores it)",
                     terminal_inline(&grant.display_argv()),
                     shorten_home(&grant.cwd),
                 ));
@@ -3861,9 +4341,23 @@ fn json_paths(paths: impl IntoIterator<Item = std::path::PathBuf>) -> Vec<String
         .collect()
 }
 
+/// CLI-layer cwd provenance for one active grant, or `None` when the grant was
+/// created at runtime through the approval prompt rather than by a flag.
+fn pregrant_cwd_source(
+    session: &SessionInfo,
+    grant: &kitsu_tools::CommandGrantInfo,
+) -> Option<CwdSource> {
+    session
+        .invocation_command_pregrants
+        .iter()
+        .find(|pregrant| pregrant.argv == grant.argv && pregrant.cwd == grant.cwd)
+        .map(|pregrant| pregrant.cwd_source)
+}
+
 fn command_grant_payload(
     grant: &kitsu_tools::CommandGrantInfo,
     provenance: &'static str,
+    cwd_source: Option<CwdSource>,
 ) -> serde_json::Value {
     let fingerprint_status = match grant.executable.as_ref() {
         Some(executable) if executable.fingerprint.is_some() => "bound_and_revalidated",
@@ -3874,6 +4368,7 @@ fn command_grant_payload(
         "argv": grant.argv,
         "cwd": grant.cwd,
         "provenance": provenance,
+        "cwd_source": cwd_source.map(CwdSource::payload_value),
         "executable": grant.executable,
         "fingerprint_status": fingerprint_status,
     })
@@ -3916,6 +4411,7 @@ fn permissions_payload(
                 } else {
                     "session/runtime"
                 },
+                pregrant_cwd_source(session, grant),
             )
         })
         .collect::<Vec<_>>();
@@ -3923,12 +4419,34 @@ fn permissions_payload(
         .invocation_command_grants
         .iter()
         .filter(|grant| !active_grants.contains(grant))
-        .map(|grant| command_grant_payload(grant, "revoked_invocation"))
+        .map(|grant| {
+            command_grant_payload(
+                grant,
+                "revoked_invocation",
+                pregrant_cwd_source(session, grant),
+            )
+        })
         .collect::<Vec<_>>();
     let containment = session
         .command_policy
         .as_ref()
         .map(|policy| policy.containment_status());
+    let host_evidence = match WorkspaceEvidenceAuthority::for_session(session, perms) {
+        Ok(authority) => serde_json::json!({
+            "repository_root": authority.root,
+            "consumers": ["diff", "review", "checkpoint"],
+            "model_read_root": false,
+            "prompt_disclosure": "explicit_user_command_only",
+            "excluded_private_paths": json_paths(authority.private),
+        }),
+        Err(_) => serde_json::json!({
+            "repository_root": serde_json::Value::Null,
+            "consumers": ["checkpoint"],
+            "model_read_root": false,
+            "prompt_disclosure": "explicit_user_command_only",
+            "unavailable": WorkspaceEvidenceAuthority::unavailable_reason(session, perms),
+        }),
+    };
 
     serde_json::json!({
         "kind": "permissions",
@@ -3951,6 +4469,7 @@ fn permissions_payload(
             "internal_read_roots": json_paths(perms.internal_read_roots()),
             "protected_write_roots": json_paths(perms.protected_write_roots()),
         },
+        "host_evidence": host_evidence,
         "commands": {
             "enabled": session.command_mode.is_some(),
             "mode": session.command_mode,
@@ -6071,7 +6590,35 @@ async fn handle_jobs_command(
     }
 }
 
-fn command_artifact_payload(sink: &command_artifact::CommandArtifactSink) -> serde_json::Value {
+/// On-disk totals for generations this process does not own. `/artifacts`
+/// reporting "0 retained" in a fresh session while gigabytes sit on disk is the
+/// lie this closes.
+#[derive(Debug, Default, Clone, Copy)]
+struct CrossRunArtifacts {
+    generations: usize,
+    bytes: u64,
+}
+
+fn cross_run_artifacts(session: &SessionInfo) -> CrossRunArtifacts {
+    let own = session.offload_dir.borrow().clone();
+    let Ok(generations) = artifacts::scan(&session.state_dir) else {
+        return CrossRunArtifacts::default();
+    };
+    let mut report = CrossRunArtifacts::default();
+    for generation in generations {
+        if own.as_deref().is_some_and(|own| own == generation.path) {
+            continue;
+        }
+        report.generations += 1;
+        report.bytes += generation.bytes;
+    }
+    report
+}
+
+fn command_artifact_payload(
+    sink: &command_artifact::CommandArtifactSink,
+    cross_run: CrossRunArtifacts,
+) -> serde_json::Value {
     let quota = sink.quota();
     let usage = sink.usage();
     let artifacts = sink
@@ -6104,10 +6651,17 @@ fn command_artifact_payload(sink: &command_artifact::CommandArtifactSink) -> ser
             "available_bytes": usage.available_bytes(),
         },
         "artifacts": artifacts,
+        "cross_run": {
+            "generation_count": cross_run.generations,
+            "bytes": cross_run.bytes,
+        },
     })
 }
 
-fn format_command_artifacts(sink: &command_artifact::CommandArtifactSink) -> String {
+fn format_command_artifacts(
+    sink: &command_artifact::CommandArtifactSink,
+    cross_run: CrossRunArtifacts,
+) -> String {
     let usage = sink.usage();
     let mut output = format!(
         "command artifacts: {} retained / {} in flight | {} retained bytes / {} reserved bytes | {} slots and {} bytes available",
@@ -6138,11 +6692,19 @@ fn format_command_artifacts(sink: &command_artifact::CommandArtifactSink) -> Str
     } else {
         output.push_str("\n  prune with /artifacts prune <id|all>");
     }
+    if cross_run.generations > 0 {
+        output.push_str(&format!(
+            "\n  other runs:   {} generation(s), {} retained on disk - `kitsu artifacts list` (host-only)",
+            cross_run.generations,
+            artifacts::human_bytes(cross_run.bytes),
+        ));
+    }
     output
 }
 
 fn handle_command_artifacts(
     sink: Option<&command_artifact::CommandArtifactSink>,
+    cross_run: CrossRunArtifacts,
     arg: &str,
 ) -> Result<serde_json::Value, ()> {
     let Some(sink) = sink else {
@@ -6152,8 +6714,8 @@ fn handle_command_artifacts(
     let mut parts = arg.split_whitespace();
     match parts.next().unwrap_or("list") {
         "list" if parts.next().is_none() => {
-            eprintln!("{}", format_command_artifacts(sink));
-            Ok(command_artifact_payload(sink))
+            eprintln!("{}", format_command_artifacts(sink, cross_run));
+            Ok(command_artifact_payload(sink, cross_run))
         }
         "prune" => {
             let Some(target) = parts.next() else {
@@ -6177,7 +6739,7 @@ fn handle_command_artifacts(
             match removed {
                 Ok(removed) => {
                     eprintln!("~ pruned {} command artifact(s)", removed.len());
-                    let mut payload = command_artifact_payload(sink);
+                    let mut payload = command_artifact_payload(sink, cross_run);
                     payload["action"] = serde_json::Value::String("prune".to_string());
                     payload["removed"] =
                         serde_json::json!(removed.iter().map(|a| a.id).collect::<Vec<_>>());
@@ -7101,6 +7663,18 @@ async fn run_scripted_body(
                     continue;
                 }
                 SlashResult::SubmitPrompt(prompt) => {
+                    if let Some(disclosure) = prompt.disclosure.as_ref() {
+                        if cli.jsonl {
+                            emit_jsonl(
+                                "command_result",
+                                serde_json::json!({
+                                    "line": line_number,
+                                    "command": trimmed,
+                                    "result": disclosure,
+                                }),
+                            )?;
+                        }
+                    }
                     let turn_tools = match prompt.tool_mode {
                         TurnToolMode::Full => tools,
                         TurnToolMode::None => &no_tools,
@@ -8028,6 +8602,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
     if durable_session || command_requested {
         prepare_runtime_state_dir(&setup.state_dir).map_err(CliError::user)?;
+        // The state dir is being prepared anyway, so reclaim the litter that is
+        // provably worthless: empty, orphaned, and held by nobody. Non-empty
+        // orphans are never deleted automatically — they may hold the only copy
+        // of a command's output — but they stop being invisible.
+        let sweep = artifacts::sweep_empty_orphans(&setup.state_dir);
+        if let Some(notice) = sweep.notice() {
+            if !cli.jsonl {
+                eprintln!("{notice}");
+            }
+        }
     }
     let sessions_dir = setup.state_dir.join("sessions");
     let resumed = match resume {
@@ -8120,16 +8704,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         .expect("non-zero built-in command artifact quota");
         command_artifact::CommandArtifactSink::with_quota(quota)
     });
-    let explicit_command_grants: Vec<Vec<String>> = allow_commands
+    let command_pregrant_specs: Vec<PregrantedCommandSpec> = allow_commands
         .iter()
-        .map(|encoded| {
-            serde_json::from_str(encoded).map_err(|error| {
-                CliError::user(format!(
-                    "invalid --allow-command value {encoded:?}: expected a JSON string array ({error})"
-                ))
-            })
-        })
+        .map(|encoded| PregrantedCommandSpec::parse(encoded))
         .collect::<Result<_, _>>()?;
+    let mut explicit_command_grants: Vec<PregrantedCommand> = Vec::new();
     let command_policy = if command_requested {
         let launch_dir = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve command directory: {error}"))
@@ -8153,10 +8732,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             policy = policy.with_output_artifact_sink(Arc::new(sink.clone()));
         }
         let policy = Arc::new(policy);
-        for argv in &explicit_command_grants {
-            policy
-                .grant_command(argv, &launch_dir)
-                .map_err(|error| CliError::user(format!("invalid --allow-command: {error}")))?;
+        explicit_command_grants = command_pregrant_specs
+            .iter()
+            .map(|spec| spec.resolve(&launch_dir))
+            .collect::<Result<_, _>>()?;
+        for grant in &mut explicit_command_grants {
+            // Fail closed at startup, before any turn: an unsatisfiable pregrant
+            // is a configuration error, never a silently dropped capability.
+            let canonical = policy
+                .grant_command(&grant.argv, &grant.cwd)
+                .map_err(|error| {
+                    CliError::user(pregrant_error(grant, &roots, &error.to_string()))
+                })?;
+            grant.cwd = canonical;
         }
         Some(policy)
     } else {
@@ -8596,6 +9184,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .as_ref()
             .map(|policy| policy.session_grants())
             .unwrap_or_default(),
+        invocation_command_pregrants: explicit_command_grants.clone(),
         agent_profiles: profile_catalog,
         permissions: perms.clone(),
         autosave_dirty: Cell::new(false),
@@ -8657,20 +9246,21 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
 
     let mut initial_review_submission = if let Some(review) = initial_review {
         report_write_checkpoints(write_journal.drain_and_take_reports().await);
+        let requested_path = review.request.path.clone();
         let evidence =
-            authorized_workspace_review(&session, &perms, &write_journal, review.request)
-                .await
-                .map_err(|error| {
-                    CliError::user(format!("cannot prepare verified review: {error}"))
-                })?;
+            authorized_workspace_review(&session, &perms, &write_journal, review.request).map_err(
+                |error| CliError::user(format!("cannot prepare verified review: {error}")),
+            )?;
         if review_evidence_is_empty(&evidence) {
-            return Err(CliError::user(format!(
-                "nothing to review for verified {}",
-                review_target_label(&evidence)
+            return Err(CliError::user(empty_review_message(
+                &evidence,
+                requested_path.as_deref(),
+                true,
             )));
         }
         if !cli.jsonl {
             eprintln!("~ verified {}", review_target_label(&evidence));
+            eprintln!("{}", evidence_disclosure_line(&evidence, &model));
         }
         let mut prompt = verified_review_prompt(&evidence);
         if let Some(instructions) = review
@@ -9409,11 +9999,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     *session.project_context.borrow_mut() = fresh_project_context_source.clone();
                     *session.provenance.borrow_mut() = fresh_provenance.clone();
                     perms.reset_runtime_grants();
-                    reset_command_session(
-                        command_policy.as_ref(),
-                        &explicit_command_grants,
-                        &session.directory,
-                    );
+                    reset_command_session(command_policy.as_ref(), &explicit_command_grants);
                     if let Err(error) = rotate_artifact_storage(
                         &perms,
                         &session.offload_dir,
@@ -9536,11 +10122,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         *session.session_id.borrow_mut() = Some(saved.id.clone());
                     }
                     perms.reset_runtime_grants();
-                    reset_command_session(
-                        command_policy.as_ref(),
-                        &explicit_command_grants,
-                        &session.directory,
-                    );
+                    reset_command_session(command_policy.as_ref(), &explicit_command_grants);
                     if let Err(error) = rotate_artifact_storage(
                         &perms,
                         &session.offload_dir,
@@ -9918,6 +10500,9 @@ enum TurnToolMode {
 struct SubmittedPrompt {
     text: String,
     tool_mode: TurnToolMode,
+    /// Structured record of a one-shot evidence disclosure, emitted as the
+    /// command's `command_result` in JSONL mode.
+    disclosure: Option<serde_json::Value>,
 }
 
 impl SubmittedPrompt {
@@ -9925,6 +10510,7 @@ impl SubmittedPrompt {
         Self {
             text: text.into(),
             tool_mode: TurnToolMode::Full,
+            disclosure: None,
         }
     }
 
@@ -9932,7 +10518,13 @@ impl SubmittedPrompt {
         Self {
             text: text.into(),
             tool_mode: TurnToolMode::None,
+            disclosure: None,
         }
+    }
+
+    fn with_disclosure(mut self, disclosure: serde_json::Value) -> Self {
+        self.disclosure = Some(disclosure);
+        self
     }
 }
 
@@ -10591,7 +11183,7 @@ async fn handle_slash(
                 }
             };
             report_write_checkpoints(journal.drain_and_take_reports().await);
-            match authorized_workspace_review(session, perms, journal, request).await {
+            match authorized_workspace_review(session, perms, journal, request) {
                 Ok(evidence) => {
                     if !cli.jsonl {
                         eprintln!("~ verified {}", review_target_label(&evidence));
@@ -10606,6 +11198,9 @@ async fn handle_slash(
                         "merge_base": evidence.merge_base,
                         "truncated": evidence.truncated,
                         "diff": evidence.diff,
+                        // /diff renders host bytes to this terminal only.
+                        "evidence_bytes": evidence.diff.len(),
+                        "model_disclosed": false,
                     })));
                 }
                 Err(error) => {
@@ -10626,18 +11221,25 @@ async fn handle_slash(
                 }
             };
             report_write_checkpoints(journal.drain_and_take_reports().await);
-            match authorized_workspace_review(session, perms, journal, request).await {
+            let requested_path = request.path.clone();
+            match authorized_workspace_review(session, perms, journal, request) {
                 Ok(evidence) if review_evidence_is_empty(&evidence) => {
                     eprintln!(
-                        "nothing to review for verified {}",
-                        review_target_label(&evidence)
+                        "{}",
+                        empty_review_message(&evidence, requested_path.as_deref(), false)
                     );
                     return SlashResult::Error;
                 }
                 Ok(evidence) => {
-                    return SlashResult::SubmitPrompt(SubmittedPrompt::review(
-                        verified_review_prompt(&evidence),
-                    ));
+                    if !cli.jsonl {
+                        eprintln!("~ verified {}", review_target_label(&evidence));
+                        eprintln!("{}", evidence_disclosure_line(&evidence, model));
+                    }
+                    let disclosure = evidence_disclosure_payload(&evidence);
+                    return SlashResult::SubmitPrompt(
+                        SubmittedPrompt::review(verified_review_prompt(&evidence))
+                            .with_disclosure(disclosure),
+                    );
                 }
                 Err(error) => {
                     eprintln!("cannot review diff: {}", terminal_inline(&error));
@@ -10655,10 +11257,17 @@ async fn handle_slash(
                 eprintln!("usage: /export <file> [markdown|json]");
                 return SlashResult::Error;
             };
-            let format = match args.next().unwrap_or("markdown") {
-                "markdown" | "md" => session::SessionExportFormat::Markdown,
-                "json" => session::SessionExportFormat::Json,
-                other => {
+            let format = match args.next() {
+                Some("markdown" | "md") => session::SessionExportFormat::Markdown,
+                Some("json") => session::SessionExportFormat::Json,
+                None => {
+                    let inferred = inferred_export_format(std::path::Path::new(destination));
+                    if inferred == session::SessionExportFormat::Json {
+                        eprintln!("~ inferred json format from the .json destination");
+                    }
+                    inferred
+                }
+                Some(other) => {
                     eprintln!("unknown export format '{other}'; use markdown or json");
                     return SlashResult::Error;
                 }
@@ -10756,7 +11365,11 @@ async fn handle_slash(
             })));
         }
         "artifacts" => {
-            return match handle_command_artifacts(session.command_artifact_sink.as_ref(), arg) {
+            return match handle_command_artifacts(
+                session.command_artifact_sink.as_ref(),
+                cross_run_artifacts(session),
+                arg,
+            ) {
                 Ok(payload) => SlashResult::Continue(Some(payload)),
                 Err(()) => SlashResult::Error,
             };
@@ -13011,15 +13624,106 @@ mod tests {
             )
             .unwrap(),
         );
-        let explicit = vec![vec!["cargo".to_string(), "test".to_string()]];
+        let explicit = vec![PregrantedCommand {
+            argv: vec!["cargo".to_string(), "test".to_string()],
+            cwd: root.path().canonicalize().unwrap(),
+            cwd_source: CwdSource::LaunchDirectory,
+        }];
         let live_only = vec!["cargo".to_string(), "clippy".to_string()];
-        policy.grant_command(&explicit[0], root.path()).unwrap();
+        policy
+            .grant_command(&explicit[0].argv, root.path())
+            .unwrap();
         policy.grant_command(&live_only, root.path()).unwrap();
 
-        reset_command_session(Some(&policy), &explicit, root.path());
+        reset_command_session(Some(&policy), &explicit);
 
-        assert!(policy.is_granted(&explicit[0], root.path()));
+        assert!(policy.is_granted(&explicit[0].argv, root.path()));
         assert!(!policy.is_granted(&live_only, root.path()));
+    }
+
+    #[test]
+    fn session_switch_restores_pregrants_against_their_own_cwd() {
+        // /new must not silently rebind an explicit-cwd pregrant to the launch
+        // directory: the grant is exact argv *and* exact cwd.
+        let root = tempfile::tempdir().unwrap();
+        let nested = root.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        let policy = Arc::new(
+            kitsu_tools::CommandPolicy::new(
+                &[root.path().to_string_lossy().to_string()],
+                kitsu_tools::CommandMode::Deny,
+            )
+            .unwrap(),
+        );
+        let argv = vec!["cargo".to_string(), "test".to_string()];
+        let explicit = vec![PregrantedCommand {
+            argv: argv.clone(),
+            cwd: nested.canonicalize().unwrap(),
+            cwd_source: CwdSource::Explicit,
+        }];
+        policy.grant_command(&argv, &nested).unwrap();
+
+        reset_command_session(Some(&policy), &explicit);
+
+        assert!(policy.is_granted(&argv, &nested));
+        assert!(!policy.is_granted(&argv, root.path()));
+    }
+
+    #[test]
+    fn pregrant_spec_accepts_both_shapes_and_rejects_ambiguity() {
+        let launch = std::path::Path::new("/launch");
+        let resolve = |encoded: &str| {
+            PregrantedCommandSpec::parse(encoded)
+                .and_then(|spec| spec.resolve(launch))
+                .map_err(|error| error.message)
+        };
+
+        let legacy = resolve("[\"pwd\"]").expect("legacy array form still parses");
+        assert_eq!(legacy.cwd, launch);
+        assert_eq!(legacy.cwd_source, CwdSource::LaunchDirectory);
+
+        let explicit =
+            resolve("{\"argv\":[\"pwd\"],\"cwd\":\"/proj\"}").expect("object form parses");
+        assert_eq!(explicit.cwd, std::path::Path::new("/proj"));
+        assert_eq!(explicit.cwd_source, CwdSource::Explicit);
+
+        // A misspelled key must be a startup error, never a silent launch-cwd grant.
+        let unknown = resolve("{\"argv\":[\"pwd\"],\"cd\":\"/proj\"}").unwrap_err();
+        assert!(unknown.contains("invalid --allow-command value"));
+
+        let relative = resolve("{\"argv\":[\"pwd\"],\"cwd\":\"proj\"}").unwrap_err();
+        assert!(relative.contains("must be an absolute path"));
+
+        let empty = resolve("[]").unwrap_err();
+        assert!(empty.contains("at least one program"));
+    }
+
+    #[test]
+    fn legacy_pregrant_outside_roots_names_the_object_syntax() {
+        let grant = PregrantedCommand {
+            argv: vec!["pwd".to_string()],
+            cwd: std::path::PathBuf::from("/launch"),
+            cwd_source: CwdSource::LaunchDirectory,
+        };
+        let message = pregrant_error(
+            &grant,
+            &["/proj".to_string()],
+            "policy denied: command cwd '/launch' is outside the approved command roots",
+        );
+        assert!(message.contains("\"cwd\":\"/proj\""));
+        assert!(message.contains("/launch is outside the approved command roots"));
+
+        // An explicit cwd that fails is reported as-is — the suggestion would be noise.
+        let explicit = PregrantedCommand {
+            cwd_source: CwdSource::Explicit,
+            ..grant
+        };
+        let message = pregrant_error(
+            &explicit,
+            &["/proj".to_string()],
+            "policy denied: command cwd '/launch' is outside the approved command roots",
+        );
+        assert!(!message.contains("pass {"));
     }
 
     #[test]
