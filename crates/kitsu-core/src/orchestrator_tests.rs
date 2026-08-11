@@ -2214,6 +2214,7 @@ async fn protected_token_overflow_fails_locally_without_calling_provider() {
             target: 80,
             unit: ContextUnit::Tokens,
             window: Some(200),
+            effective: Some(100),
         } if required > 80
     ));
     assert_eq!(
