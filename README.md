@@ -635,6 +635,19 @@ it won't ask again.
   `--command-env` pass-through variables — never anything else inherited from
   the host. Missing, changed, or unsupported containment
   fails before prompting or launching; exact approval never substitutes for it.
+  **Known limitation — pip/npm user-level installs:** the host home directory is
+  never mounted inside containment (`HOME` points at an empty tmpfs), so
+  toolchains installed per-user (e.g. `pip install --user pytest` under
+  `~/.local`) are invisible even when the identical command passes on the host,
+  and typically fail with `No module named ...` / `command not found`. Kitsu
+  deliberately does not auto-mount `~/.local`: it can hold sensitive
+  user-service data (e.g. `~/.local/share/keyrings`), and silently widening the
+  sandbox would break the deny-by-default posture. When a contained command
+  fails in that shape, the receipt and the model-visible result carry a
+  host-authored hint naming the remedies; the recipe is explicit opt-in:
+  `--command-root ~/.local` (makes the tree visible at its real path) plus
+  `--command-env PYTHONPATH=$HOME/.local/lib/pythonX.Y/site-packages` (or
+  `NODE_PATH`/`PATH` equivalents) so the interpreter can find it.
   `/permissions` numbers exact argv/cwd grants with invocation/runtime
   provenance; `/revoke-command <number>` removes one for the current session.
   A session grant is bound to the observed executable identity and is revoked

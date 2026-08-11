@@ -684,6 +684,31 @@ enum SpinnerMode {
 /// with a sweeping tail. Plain/reduced-motion modes never see these.
 const SPINNER_FRAMES: [&str; 4] = ["( ･ᴥ･ )ﾉ", "( ･ᴥ･ )～", "( ･ᴥ･ ) ～", "( ﾉᴥﾉ )～"];
 
+/// Backed-off cadence shared by line-based waiting heartbeats (cycle-10 G4):
+/// 15s, 30s, 60s, then every 120s. A long wait stays visibly alive without
+/// `~ still waiting` lines stacking 10-15 deep between receipts and drowning
+/// the ◆/◇ landmarks in the transcript.
+pub fn heartbeat_backoff(beat_index: u32) -> std::time::Duration {
+    const CADENCE_SECS: [u64; 3] = [15, 30, 60];
+    std::time::Duration::from_secs(
+        CADENCE_SECS
+            .get(beat_index as usize)
+            .copied()
+            .unwrap_or(120),
+    )
+}
+
+/// Cumulative wait time for heartbeat lines: `45s`, then `4m30s` past a
+/// minute, so a long transcript shows total elapsed wait at a glance.
+pub fn format_wait_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
+}
+
 fn spinner_mode(destination_is_tty: bool, plain: bool, reduced_motion: bool) -> SpinnerMode {
     if !destination_is_tty {
         SpinnerMode::Heartbeat
@@ -726,15 +751,22 @@ impl Spinner {
                     // Long enough that a normal request never logs anything;
                     // only a genuinely slow round (the exact case with no other
                     // progress signal — heavy tool-calling on a local model)
-                    // does. Repeats so a multi-minute wait doesn't go silent.
-                    const FIRST_BEAT: std::time::Duration = std::time::Duration::from_secs(10);
-                    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-                    tokio::time::sleep(FIRST_BEAT).await;
-                    let mut waited = FIRST_BEAT;
+                    // does. The line-based render path cannot rewrite in
+                    // place, so repeats back off exponentially (15s, 30s,
+                    // 60s, then every 120s) with cumulative elapsed time,
+                    // keeping a multi-minute wait visible without drowning
+                    // the receipt landmarks (cycle-10 G4).
+                    let mut waited = std::time::Duration::ZERO;
+                    let mut beat = 0u32;
                     loop {
-                        eprintln!("~ still waiting on the model ({}s)...", waited.as_secs());
-                        tokio::time::sleep(INTERVAL).await;
-                        waited += INTERVAL;
+                        let interval = heartbeat_backoff(beat);
+                        tokio::time::sleep(interval).await;
+                        waited += interval;
+                        beat += 1;
+                        eprintln!(
+                            "~ still waiting on the model ({})...",
+                            format_wait_elapsed(waited)
+                        );
                     }
                 });
                 return Self {
@@ -1788,6 +1820,41 @@ mod tests {
             "  * kitsu is thinking\n"
         );
         assert!(!output.contains(&b'\r'));
+    }
+
+    /// Cycle-10 G4: line-based heartbeats back off exponentially — 15s, 30s,
+    /// 60s, then every 120s — so ten minutes of waiting produces a handful of
+    /// lines instead of dozens, and each line's elapsed field is cumulative.
+    #[test]
+    fn heartbeat_cadence_backs_off_and_elapsed_is_cumulative() {
+        use super::{format_wait_elapsed, heartbeat_backoff};
+        let cadence: Vec<u64> = (0..6).map(|i| heartbeat_backoff(i).as_secs()).collect();
+        assert_eq!(cadence, [15, 30, 60, 120, 120, 120]);
+
+        // Ten minutes of waiting: 15+30+60 then 120-steps → 7 lines total.
+        let mut waited = std::time::Duration::ZERO;
+        let mut beats = 0u32;
+        while waited < std::time::Duration::from_secs(600) {
+            waited += heartbeat_backoff(beats);
+            beats += 1;
+        }
+        assert!(
+            beats <= 8,
+            "ten minutes must not stack more than 8 heartbeat lines, got {beats}"
+        );
+
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(45)),
+            "45s"
+        );
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(270)),
+            "4m30s"
+        );
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(600)),
+            "10m00s"
+        );
     }
 
     #[test]

@@ -1266,6 +1266,70 @@ fn tool_activity_formatting() {
     assert!(sanitized_warning.contains("[chat-template marker]"));
 }
 
+/// Cycle-10 G5: the `full output=` artifact path is the one pointer to the
+/// complete command output. It must never be elided — a real profile-scoped
+/// artifact path routinely exceeds the old 160-char cap and was cut
+/// mid-filename — and it stays the receipt's final field so a wrapped line
+/// ends with a copyable path. Cycle-10 G2: a containment hint, when present,
+/// is rendered as its own bounded receipt field.
+#[test]
+fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
+    use crate::orchestrator::format_tool_result;
+
+    let long_reference = format!(
+        "/home/user/.kitsu/profiles/v1-fnv128-{}/sessions/s-1786459292594577016-2717952-0.artifacts/runtime-2718000-1786459292594577016-1/command-output-1.txt",
+        "a".repeat(32)
+    );
+    assert!(long_reference.chars().count() > 160);
+    let output = serde_json::json!({
+        "argv": ["python3", "-m", "pytest", "-q"],
+        "cwd": "/workspace/project",
+        "executable": {
+            "invocation": "python3",
+            "resolution": "ambient_path",
+            "observed_path": "/usr/bin/python3",
+            "pinned": false
+        },
+        "ambient_authority": {
+            "inherits_environment": false,
+            "filesystem_confined_to_command_roots": true,
+            "network_confined": true,
+            "executable_identity_pinned": true
+        },
+        "termination": "exited",
+        "success": false,
+        "exit_code": 1,
+        "signal": null,
+        "stdout": "",
+        "stderr": "/usr/bin/python3: No module named pytest",
+        "stdout_bytes": 0,
+        "stderr_bytes": 40,
+        "stdout_retained_bytes": 0,
+        "stderr_retained_bytes": 40,
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_capture_complete": true,
+        "stderr_capture_complete": true,
+        "elapsed_ms": 23,
+        "artifact": {"reference": long_reference},
+        "artifact_error": null,
+        "containment_hint": "output matches 'No module named' — try --command-env / --command-root"
+    });
+    let receipt = format_tool_result("command_exec", &output.to_string(), false);
+    assert!(
+        receipt.contains(&format!("full output={long_reference:?}")),
+        "artifact path must appear complete and unelided: {receipt}"
+    );
+    assert!(
+        receipt.trim_end_matches('"').ends_with(&long_reference),
+        "artifact path must be the receipt's final field: {receipt}"
+    );
+    assert!(
+        receipt.contains("hint: output matches 'No module named'"),
+        "containment hint must be rendered: {receipt}"
+    );
+}
+
 // --- context trimming (Stage 1c) --------------------------------------------
 
 #[test]
