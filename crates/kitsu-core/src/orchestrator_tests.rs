@@ -168,6 +168,54 @@ impl Provider for TelemetryProvider {
     }
 }
 
+#[derive(Clone)]
+struct SummaryTelemetryProvider;
+
+impl Provider for SummaryTelemetryProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        Ok(Box::pin(stream::iter(vec![
+            Ok(ChatDelta::Text(
+                "SUMMARY: earlier work on foo.rs".to_string(),
+            )),
+            Ok(ChatDelta::Usage(kitsu_providers::Usage {
+                prompt_tokens: 111,
+                completion_tokens: 22,
+                total_tokens: 133,
+            })),
+            Ok(ChatDelta::Done(FinishReason::Stop)),
+        ])))
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<kitsu_providers::ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        if let Some(telemetry) = telemetry {
+            let _ = telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 1,
+                category: kitsu_providers::ProviderAttemptCategory::Success,
+                status: Some(200),
+                outcome: kitsu_providers::ProviderAttemptOutcome::BodyCompleted,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: 9_900,
+            });
+        }
+        self.chat_stream(req).await
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
 fn tc(name: &str, call_id: &str, args: &str) -> ToolCall {
     ToolCall {
         tool_name: name.to_string(),
@@ -469,6 +517,7 @@ async fn test_loop_tool_error_fed_back() {
         "the loop should reach the round-2 answer: {out}"
     );
     assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.policy_errors, 0);
 
     // The error must have been fed back as a tool message on round 2.
     let seen = provider.seen_messages.lock().unwrap();
@@ -479,6 +528,47 @@ async fn test_loop_tool_error_fed_back() {
             .any(|m| m.role == kitsu_providers::Role::Tool && m.content.contains("ExecError")),
         "round 2 must include the serialized tool error fed back to the model"
     );
+}
+
+#[tokio::test]
+async fn test_turn_status_separates_policy_denials_from_other_tool_errors() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("write", "call_denied", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("continued safely".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register(
+        "write",
+        Box::new(|_| {
+            Box::pin(async {
+                Err::<String, ToolError>(ToolError::PolicyDenied(
+                    "path is outside the write roots".to_string(),
+                ))
+            })
+        }),
+    );
+    let mut state = AgentSessionState::default();
+
+    assert_eq!(
+        run_agent_turn_with_state(
+            &provider,
+            &tools,
+            &mut initial_messages(),
+            &cfg(4),
+            &mut state,
+        )
+        .await
+        .unwrap(),
+        "continued safely"
+    );
+    assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.policy_errors, 1);
 }
 
 /// Fix #4: a `FinishReason::Length` (model hit its output cap) must be surfaced
@@ -1088,6 +1178,19 @@ fn tool_activity_formatting() {
     assert!(command_result.contains("stderr 3 B"));
     assert!(command_result.contains("bad"));
     assert!(command_result.contains("full output=\"session:command-1\""));
+
+    let mut cancelled_without_artifact = command_output.clone();
+    cancelled_without_artifact["termination"] = serde_json::json!("cancelled");
+    cancelled_without_artifact["artifact"] = serde_json::Value::Null;
+    cancelled_without_artifact["artifact_error"] =
+        serde_json::json!("no full-output artifact was created; no cleanup was required");
+    let cancelled_result = format_tool_result(
+        "command_exec",
+        &cancelled_without_artifact.to_string(),
+        false,
+    );
+    assert!(cancelled_result.contains("artifact status="));
+    assert!(!cancelled_result.contains("artifact error="));
 
     let mut signaled = command_output.clone();
     signaled["termination"] = serde_json::json!("signaled");
@@ -1923,22 +2026,19 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
 #[tokio::test]
 async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
     use crate::context::ContextMeter;
-    use crate::orchestrator::{enforce_context_budget, CompactionMode};
+    use crate::orchestrator::{
+        enforce_context_budget, AgentEventLog, AgentRuntimeEvent, CompactionMode,
+        ProviderRequestPurpose,
+    };
     use kitsu_providers::{ChatMessage, Usage};
 
-    let provider = MockProvider::new(vec![vec![
-        ChatDelta::Text("SUMMARY: earlier work on foo.rs".to_string()),
-        ChatDelta::Usage(Usage {
-            prompt_tokens: 111,
-            completion_tokens: 22,
-            total_tokens: 133,
-        }),
-        ChatDelta::Done(FinishReason::Stop),
-    ]]);
+    let provider = SummaryTelemetryProvider;
     let mut cfg = cfg(10);
     cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
+    let log = AgentEventLog::default();
+    cfg.event_log = Some(log.clone());
     let mut meter = ContextMeter::new();
 
     let mut msgs = vec![ChatMessage::system("sys")];
@@ -1971,6 +2071,35 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         "the summarizer call's real usage must be folded into the turn's usage"
     );
     assert_eq!(turn_usage.completion_tokens, 22);
+
+    let events = log.take();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ProviderRequest {
+            purpose: ProviderRequestPurpose::Compaction,
+            tools_offered: 0,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ProviderAttempt {
+            purpose: ProviderRequestPurpose::Compaction,
+            terminal: true,
+            ..
+        }
+    )));
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::Usage {
+            purpose: ProviderRequestPurpose::Compaction,
+            total_tokens: 133,
+            ..
+        }
+    )));
+    assert!(!events
+        .iter()
+        .any(|event| matches!(event, AgentRuntimeEvent::AssistantDelta { .. })));
 }
 
 /// Regression: when there's nothing safely droppable (too few exchanges),
@@ -2335,9 +2464,147 @@ async fn structured_event_log_frames_provider_usage_tools_and_completion() {
             success: true,
             completion,
             tool_errors: 0,
+            policy_errors: 0,
         }) if completion == "complete"
     ));
     assert!(log.take().is_empty(), "take drains the trace");
+}
+
+#[tokio::test]
+async fn structured_event_log_streams_safe_assistant_deltas_while_quiet() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("hello ".to_string()),
+        ChatDelta::Text("world".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let log = AgentEventLog::default();
+    let mut c = cfg(1);
+    c.stream = true;
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    assert_eq!(
+        run_agent_turn(&provider, &tools, &mut messages, &c)
+            .await
+            .unwrap(),
+        "hello world"
+    );
+    let deltas: Vec<_> = log
+        .take()
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::AssistantDelta { round, text } => Some((round, text)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        deltas,
+        vec![(1, "hello ".to_string()), (1, "world".to_string())]
+    );
+}
+
+#[tokio::test]
+async fn structured_event_log_never_emits_synthesized_text_tool_json() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let raw_call = r#"{"name":"read","arguments":{"path":"README.md"}}"#;
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(raw_call.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("safe final answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "read".to_string(),
+            description: "read".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"ok":true}"#),
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(3);
+    c.stream = true;
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    assert_eq!(
+        run_agent_turn(&provider, &tools, &mut messages, &c)
+            .await
+            .unwrap(),
+        "safe final answer"
+    );
+    let emitted: String = log
+        .take()
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::AssistantDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(emitted, "safe final answer");
+    assert!(!emitted.contains(raw_call));
+}
+
+#[tokio::test]
+async fn assistant_deltas_exclude_intermediate_structured_tool_narration() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text("I will inspect the file first.".to_string()),
+            ChatDelta::ToolCall(tc("read", "call-1", r#"{"path":"README.md"}"#)),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("The final answer.".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "read".to_string(),
+            description: "read".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"ok":true}"#),
+    );
+    let log = AgentEventLog::default();
+    let mut c = cfg(3);
+    c.stream = true;
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let answer = run_agent_turn(&provider, &tools, &mut messages, &c)
+        .await
+        .unwrap();
+    let emitted: String = log
+        .take()
+        .into_iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::AssistantDelta { text, .. } => Some(text),
+            _ => None,
+        })
+        .collect();
+
+    assert_eq!(answer, "The final answer.");
+    assert_eq!(emitted, answer);
+    assert!(!emitted.contains("inspect the file"));
 }
 
 #[tokio::test]
@@ -2645,10 +2912,100 @@ async fn dropping_in_flight_command_records_native_cancelled_metadata() {
             && !command.stdout_capture_complete
             && !command.stderr_capture_complete
             && command.artifact.is_none()
-            && command.artifact_error.as_deref().is_some_and(|error| {
-                error.contains("not published") && error.contains("cleanup was requested")
+            && command.artifact_error.as_deref().is_some_and(|status| {
+                status.contains("state was observed")
+                    && status.contains("unverified")
+                    && status.contains("no cleanup is claimed")
+                    && !status.contains("cleanup was requested")
             })
     ));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn cancelling_real_command_preserves_observed_output_and_executable() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use kitsu_providers::ChatMessage;
+    use kitsu_tools::{command_exec_tool, CommandMode, CommandPolicy, CommandTermination};
+
+    let dir = tempfile::tempdir().unwrap();
+    let ready = dir.path().join("ready");
+    let script = "printf observed-out; printf observed-err >&2; : > \"$1\"; sleep 30";
+    let argv = vec![
+        "/bin/sh".to_string(),
+        "-c".to_string(),
+        script.to_string(),
+        "sh".to_string(),
+        ready.to_string_lossy().into_owned(),
+    ];
+    let args = serde_json::json!({
+        "argv": argv,
+        "cwd": dir.path().to_string_lossy(),
+        "timeout_ms": 30_000,
+    })
+    .to_string();
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::ToolCall(tc("command_exec", "call-real-command", &args)),
+        ChatDelta::Done(FinishReason::ToolCalls),
+    ]]);
+    let policy = Arc::new(
+        CommandPolicy::new(
+            &[dir.path().to_string_lossy().into_owned()],
+            CommandMode::Deny,
+        )
+        .unwrap(),
+    );
+    policy.grant_command(&argv, dir.path()).unwrap();
+    let (descriptor, handler) = command_exec_tool(policy);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(descriptor, handler);
+    let log = AgentEventLog::default();
+    let mut c = cfg(4);
+    c.quiet = true;
+    c.event_log = Some(log.clone());
+    let mut messages = vec![ChatMessage::user("work")];
+
+    let mut turn = Box::pin(run_agent_turn(&provider, &tools, &mut messages, &c));
+    for _ in 0..100 {
+        tokio::select! {
+            result = &mut turn => panic!("command unexpectedly finished: {result:?}"),
+            _ = tokio::time::sleep(std::time::Duration::from_millis(10)) => {}
+        }
+        if ready.exists() {
+            break;
+        }
+    }
+    assert!(ready.exists(), "command should reach its sleeping phase");
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    drop(turn);
+
+    let command = log
+        .take()
+        .into_iter()
+        .find_map(|event| match event {
+            AgentRuntimeEvent::ToolFinished {
+                call_id,
+                cancelled: true,
+                command,
+                ..
+            } if call_id == "call-real-command" => command,
+            _ => None,
+        })
+        .expect("real command cancellation needs structured progress");
+    assert_eq!(command.termination, CommandTermination::Cancelled);
+    assert!(command.stdout_bytes >= "observed-out".len() as u64);
+    assert!(command.stderr_bytes >= "observed-err".len() as u64);
+    assert!(command.stdout_tail.contains("observed-out"));
+    assert!(command.stderr_tail.contains("observed-err"));
+    assert!(command.executable.observed_path.is_some());
+    assert!(command.elapsed_ms > 0);
+    assert!(!command.stdout_capture_complete);
+    assert!(!command.stderr_capture_complete);
+    assert!(command.artifact.is_none());
+    assert!(command.artifact_error.as_deref().is_some_and(|status| {
+        status.contains("no full-output artifact was created")
+            && status.contains("no cleanup was required")
+    }));
 }
 
 #[tokio::test]

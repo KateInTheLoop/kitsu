@@ -67,6 +67,52 @@ pub struct SessionStore {
     lease: SessionLease,
 }
 
+/// Evidence for one atomically installed session snapshot. On Unix the file
+/// descriptor is the exact inode created by the commit and remains valid even
+/// if another same-user process immediately renames, hard-links, or unlinks the
+/// visible snapshot path.
+#[derive(Debug)]
+pub struct SnapshotCommit {
+    path: PathBuf,
+    #[cfg(unix)]
+    file: std::fs::File,
+}
+
+impl SnapshotCommit {
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    #[cfg(unix)]
+    pub fn file(&self) -> &std::fs::File {
+        &self.file
+    }
+}
+
+/// A session snapshot save failed. If installation completed before a cleanup
+/// or durability error, Unix callers still receive the exact installed inode so
+/// private-identity bookkeeping cannot lose the file merely because the save is
+/// reported as unsuccessful.
+#[derive(Debug)]
+pub struct SnapshotSaveError {
+    message: String,
+    installed_commit: Option<SnapshotCommit>,
+}
+
+impl SnapshotSaveError {
+    pub fn installed_commit(&self) -> Option<&SnapshotCommit> {
+        self.installed_commit.as_ref()
+    }
+}
+
+impl std::fmt::Display for SnapshotSaveError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for SnapshotSaveError {}
+
 /// A process-wide/session-wide exclusion lease. Lock files remain in place so
 /// dropping one lease can never unlink the inode while another process is
 /// waiting on or has acquired it.
@@ -699,6 +745,12 @@ impl PrivateDirectory {
     fn sync(&self, context: &str) -> Result<(), String> {
         #[cfg(unix)]
         {
+            #[cfg(test)]
+            if fail_next_private_directory_sync() {
+                return Err(format!(
+                    "cannot sync {context} directory: injected post-install failure"
+                ));
+            }
             self.file
                 .sync_all()
                 .map_err(|error| format!("cannot sync {context} directory: {error}"))
@@ -1368,6 +1420,14 @@ fn existing_regular_dir(dir: &Path, context: &str) -> Result<(), String> {
 struct AtomicWriteFailure {
     message: String,
     installed: bool,
+    #[cfg(unix)]
+    file: Option<std::fs::File>,
+}
+
+#[derive(Debug)]
+struct AtomicWriteCommit {
+    #[cfg(unix)]
+    file: std::fs::File,
 }
 
 impl AtomicWriteFailure {
@@ -1375,13 +1435,47 @@ impl AtomicWriteFailure {
         Self {
             message,
             installed: false,
+            #[cfg(unix)]
+            file: None,
         }
     }
 
+    #[cfg(any(not(unix), test))]
     fn after_install(message: String) -> Self {
         Self {
             message,
             installed: true,
+            #[cfg(unix)]
+            file: None,
+        }
+    }
+
+    #[cfg(unix)]
+    fn after_install_with_file(message: String, file: std::fs::File) -> Self {
+        Self {
+            message,
+            installed: true,
+            file: Some(file),
+        }
+    }
+
+    fn into_snapshot_save_error(self, path: PathBuf) -> SnapshotSaveError {
+        #[cfg(unix)]
+        {
+            let Self { message, file, .. } = self;
+            SnapshotSaveError {
+                message,
+                installed_commit: file.map(|file| SnapshotCommit { path, file }),
+            }
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = path;
+            SnapshotSaveError {
+                message: self.message,
+                installed_commit: None,
+            }
         }
     }
 }
@@ -1395,7 +1489,7 @@ fn atomic_write_private_detailed(
     bytes: &[u8],
     replace: bool,
     context: &str,
-) -> Result<(), AtomicWriteFailure> {
+) -> Result<AtomicWriteCommit, AtomicWriteFailure> {
     let parent = target
         .parent()
         .filter(|parent| !parent.as_os_str().is_empty())
@@ -1457,7 +1551,9 @@ fn atomic_write_private_detailed(
         }
     }
 
-    sync_directory(parent, context).map_err(AtomicWriteFailure::after_install)
+    sync_directory(parent, context)
+        .map_err(AtomicWriteFailure::after_install)
+        .map(|()| AtomicWriteCommit {})
 }
 
 /// Descriptor-relative variant used for private session namespaces. The
@@ -1468,7 +1564,7 @@ fn atomic_write_private_in_detailed(
     bytes: &[u8],
     replace: bool,
     context: &str,
-) -> Result<(), AtomicWriteFailure> {
+) -> Result<AtomicWriteCommit, AtomicWriteFailure> {
     let target = directory.path.join(target_name);
 
     #[cfg(unix)]
@@ -1493,8 +1589,6 @@ fn atomic_write_private_in_detailed(
                 target.display()
             )));
         }
-        drop(file);
-
         if replace {
             if let Err(error) = renameat(
                 &directory.file,
@@ -1527,32 +1621,25 @@ fn atomic_write_private_in_detailed(
                 return Err(AtomicWriteFailure::before_install(message));
             }
             if let Err(error) = unlinkat(&directory.file, OsStr::new(&temporary_name)) {
-                return Err(AtomicWriteFailure::after_install(format!(
-                    "{context} '{}' was written, but its temporary link could not be removed: {error}",
-                    target.display()
-                )));
+                return Err(AtomicWriteFailure::after_install_with_file(
+                    format!(
+                        "{context} '{}' was written, but its temporary link could not be removed: {error}",
+                        target.display()
+                    ),
+                    file,
+                ));
             }
         }
-        directory
-            .sync(context)
-            .map_err(AtomicWriteFailure::after_install)
+        if let Err(error) = directory.sync(context) {
+            return Err(AtomicWriteFailure::after_install_with_file(error, file));
+        }
+        Ok(AtomicWriteCommit { file })
     }
 
     #[cfg(not(unix))]
     {
         atomic_write_private_detailed(&target, bytes, replace, context)
     }
-}
-
-fn atomic_write_private_in(
-    directory: &PrivateDirectory,
-    target_name: &OsStr,
-    bytes: &[u8],
-    replace: bool,
-    context: &str,
-) -> Result<(), String> {
-    atomic_write_private_in_detailed(directory, target_name, bytes, replace, context)
-        .map_err(|error| error.message)
 }
 
 impl PrivateDirectory {
@@ -1582,20 +1669,23 @@ fn write_saved_file(
     dir: &PrivateDirectory,
     saved: &SavedSession,
     replace: bool,
-) -> Result<PathBuf, String> {
+) -> Result<(PathBuf, AtomicWriteCommit), SnapshotSaveError> {
     if !valid_id(&saved.id) {
-        return Err("saved session has an invalid id".to_string());
+        return Err(SnapshotSaveError {
+            message: "saved session has an invalid id".to_string(),
+            installed_commit: None,
+        });
     }
     let name = format!("{}.json", saved.id);
     let target = dir.path.join(&name);
-    atomic_write_private_in(
-        dir,
-        OsStr::new(&name),
-        &encode_saved(saved)?,
-        replace,
-        "session",
-    )?;
-    Ok(target)
+    let bytes = encode_saved(saved).map_err(|message| SnapshotSaveError {
+        message,
+        installed_commit: None,
+    })?;
+    let commit =
+        atomic_write_private_in_detailed(dir, OsStr::new(&name), &bytes, replace, "session")
+            .map_err(|error| error.into_snapshot_save_error(target.clone()))?;
+    Ok((target, commit))
 }
 
 fn markdown_export(saved: &SavedSession) -> String {
@@ -1653,6 +1743,9 @@ fn markdown_export(saved: &SavedSession) -> String {
 thread_local! {
     static AFTER_SESSION_DIRECTORY_PINNED: std::cell::RefCell<Option<Box<dyn FnOnce()>>> =
         std::cell::RefCell::new(None);
+    static FAIL_NEXT_PRIVATE_DIRECTORY_SYNC: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
 }
 
 #[cfg(all(test, unix))]
@@ -1662,6 +1755,11 @@ fn after_session_directory_pinned() {
             hook();
         }
     });
+}
+
+#[cfg(all(test, unix))]
+fn fail_next_private_directory_sync() -> bool {
+    FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|fail| fail.replace(false))
 }
 
 #[cfg(not(all(test, unix)))]
@@ -1742,6 +1840,22 @@ fn list_in(directory: &PrivateDirectory) -> Result<Vec<SessionSummary>, String> 
     Ok(summaries)
 }
 
+/// Prefer the newest session that has at least one user turn. A freshly
+/// created durable snapshot is useful for crash recovery, but it should not
+/// displace the user's most recent real conversation when resolving `last`.
+/// If every eligible snapshot is empty, retain the historical newest fallback.
+fn preferred_last_id(summaries: &[SessionSummary], excluded_id: Option<&str>) -> Option<String> {
+    let eligible = || {
+        summaries
+            .iter()
+            .filter(|summary| excluded_id != Some(summary.id.as_str()))
+    };
+    eligible()
+        .find(|summary| summary.turns > 0)
+        .or_else(|| eligible().next())
+        .map(|summary| summary.id.clone())
+}
+
 impl SessionStore {
     pub fn create(dir: PathBuf) -> Result<Self, String> {
         let directory = prepare_session_directory(&dir)?;
@@ -1808,7 +1922,7 @@ impl SessionStore {
         model: &str,
         project_context: Option<&Path>,
         messages: &[ChatMessage],
-    ) -> Result<(), String> {
+    ) -> Result<SnapshotCommit, SnapshotSaveError> {
         let saved = SavedSession {
             version: SESSION_VERSION,
             id: self.id.clone(),
@@ -1820,17 +1934,18 @@ impl SessionStore {
             project_context: project_context.map(|path| path.display().to_string()),
             messages: messages.to_vec(),
         };
-        write_saved_file(&self.directory, &saved, true)?;
-        Ok(())
+        let (path, commit) = write_saved_file(&self.directory, &saved, true)?;
+        Ok(SnapshotCommit {
+            path,
+            #[cfg(unix)]
+            file: commit.file,
+        })
     }
 
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         let id = if selector == "last" || selector.is_empty() {
-            list_in(&directory)?
-                .into_iter()
-                .next()
-                .map(|summary| summary.id)
+            preferred_last_id(&list_in(&directory)?, None)
                 .ok_or_else(|| "no saved sessions in this config directory".to_string())?
         } else if valid_id(selector) {
             selector.to_string()
@@ -1850,10 +1965,7 @@ impl SessionStore {
     ) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         if selector == "last" || selector.is_empty() {
-            let id = list_in(&directory)?
-                .into_iter()
-                .find(|summary| active_id != Some(summary.id.as_str()))
-                .map(|summary| summary.id)
+            let id = preferred_last_id(&list_in(&directory)?, active_id)
                 .ok_or_else(|| "no other saved session in this config directory".to_string())?;
             return directory.read_saved(&id);
         }
@@ -1874,10 +1986,7 @@ impl SessionStore {
     pub fn fork(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         let mut forked = if selector == "last" || selector.is_empty() {
-            let id = list_in(&directory)?
-                .into_iter()
-                .next()
-                .map(|summary| summary.id)
+            let id = preferred_last_id(&list_in(&directory)?, None)
                 .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
@@ -1956,10 +2065,7 @@ impl SessionStore {
     ) -> Result<PathBuf, String> {
         let directory = open_session_directory(dir)?;
         let mut saved = if selector == "last" || selector.is_empty() {
-            let id = list_in(&directory)?
-                .into_iter()
-                .next()
-                .map(|summary| summary.id)
+            let id = preferred_last_id(&list_in(&directory)?, None)
                 .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
@@ -2305,6 +2411,16 @@ mod tests {
         });
     }
 
+    #[cfg(unix)]
+    fn inject_next_private_directory_sync_failure() {
+        FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|fail| {
+            assert!(
+                !fail.replace(true),
+                "a private-directory sync failure is already queued"
+            );
+        });
+    }
+
     #[test]
     fn saves_loads_and_lists_without_credentials() {
         let root = tempfile::tempdir().unwrap();
@@ -2315,7 +2431,7 @@ mod tests {
             ChatMessage::user("hello"),
             ChatMessage::assistant("world", vec![]),
         ];
-        store
+        let commit = store
             .save(root.path(), "local", "model-a", None, &messages)
             .unwrap();
 
@@ -2360,9 +2476,179 @@ mod tests {
         assert_eq!(list[0].turns, 1);
         assert_eq!(list[0].gateway, "local");
         assert_eq!(list[0].preview, "hello");
+        assert_eq!(
+            commit.path(),
+            root.path()
+                .join("sessions")
+                .join(format!("{original_id}.json"))
+        );
 
         store.reset().unwrap();
         assert_ne!(store.id(), original_id);
+    }
+
+    #[test]
+    fn last_prefers_a_real_conversation_over_a_newer_zero_turn_snapshot() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let productive = SessionStore::create(dir.clone()).unwrap();
+        productive
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[
+                    ChatMessage::system("system"),
+                    ChatMessage::user("real turn"),
+                ],
+            )
+            .unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        let empty = SessionStore::create(dir.clone()).unwrap();
+        empty
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::system("system")],
+            )
+            .unwrap();
+
+        let listed = SessionStore::list(&dir).unwrap();
+        assert_eq!(listed[0].id, empty.id(), "fixture must be newest");
+        assert_eq!(listed[0].turns, 0);
+        assert_eq!(
+            SessionStore::load(&dir, "last").unwrap().id,
+            productive.id()
+        );
+        assert_eq!(SessionStore::load(&dir, empty.id()).unwrap().id, empty.id());
+        assert_eq!(
+            SessionStore::load_other(&dir, "last", Some(empty.id()))
+                .unwrap()
+                .id,
+            productive.id()
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn save_returns_the_exact_inode_for_private_identity_observation() {
+        use kitsu_tools::{Mode, Permissions, ToolError};
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let store = SessionStore::create(sessions.clone()).unwrap();
+        let broad = root.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms
+            .protect_read_path(&sessions.to_string_lossy())
+            .unwrap();
+        perms
+            .protect_write_path(&sessions.to_string_lossy())
+            .unwrap();
+
+        let commit = store
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::system("private transcript")],
+            )
+            .unwrap();
+        let alias = root.path().join("surviving-session-alias.json");
+        std::fs::hard_link(commit.path(), &alias).unwrap();
+        std::fs::remove_file(commit.path()).unwrap();
+
+        perms
+            .observe_protected_file(commit.path(), commit.file())
+            .unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn post_install_save_failure_preserves_the_exact_inode_for_observation() {
+        use kitsu_tools::{Mode, Permissions, ToolError};
+
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let store = SessionStore::create(sessions.clone()).unwrap();
+        let broad = root.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms
+            .protect_read_path(&sessions.to_string_lossy())
+            .unwrap();
+        perms
+            .protect_write_path(&sessions.to_string_lossy())
+            .unwrap();
+
+        inject_next_private_directory_sync_failure();
+        let error = store
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::system("private transcript")],
+            )
+            .expect_err("the injected directory-sync failure must surface");
+        assert!(error.to_string().contains("injected post-install failure"));
+        let commit = error
+            .installed_commit()
+            .expect("an after-install failure must retain the installed descriptor");
+        let alias = root.path().join("surviving-failed-session-alias.json");
+        std::fs::hard_link(commit.path(), &alias).unwrap();
+        std::fs::remove_file(commit.path()).unwrap();
+
+        perms
+            .observe_protected_file(commit.path(), commit.file())
+            .unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn last_still_resolves_when_only_zero_turn_snapshots_exist() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let empty = SessionStore::create(dir.clone()).unwrap();
+        empty
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::system("system")],
+            )
+            .unwrap();
+
+        assert_eq!(SessionStore::load(&dir, "last").unwrap().id, empty.id());
     }
 
     #[test]

@@ -72,6 +72,9 @@ pub enum AgentStatus {
 struct AgentRecord {
     task: String,
     status: AgentStatus,
+    /// Set only after a full terminal result has been returned to a user/model
+    /// surface. Listing body-free progress does not acknowledge the result.
+    result_observed: bool,
     handle: Option<tokio::task::JoinHandle<()>>,
     started_at: Instant,
     finished_at: Option<Instant>,
@@ -339,6 +342,7 @@ impl AgentRegistry {
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
+                    result_observed: false,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
@@ -391,6 +395,7 @@ impl AgentRegistry {
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
+                    result_observed: false,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
@@ -750,14 +755,41 @@ impl AgentRegistry {
     }
 
     /// The full result/status text for one agent, or `None` if unknown.
+    /// Reading a terminal result acknowledges it for shutdown reporting;
+    /// polling a running job does not.
     pub fn result(&self, id: u64) -> Option<String> {
-        let g = self.agents.lock().expect("agent registry");
-        g.get(&id).map(|rec| match &rec.status {
+        let mut agents = self.agents.lock().expect("agent registry");
+        let record = agents.get_mut(&id)?;
+        let result = match &record.status {
             AgentStatus::Running => format!("agent #{id} is still running"),
-            AgentStatus::Done(r) => r.clone(),
-            AgentStatus::Failed(e) => format!("agent #{id} failed: {e}"),
+            AgentStatus::Done(result) => result.clone(),
+            AgentStatus::Failed(error) => format!("agent #{id} failed: {error}"),
             AgentStatus::Cancelled(reason) => format!("agent #{id} cancelled: {reason}"),
-        })
+        };
+        if !matches!(record.status, AgentStatus::Running) {
+            record.result_observed = true;
+        }
+        Some(result)
+    }
+
+    /// Return every terminal result that no user/model surface has consumed,
+    /// mark it observed, and keep the registry records available for later
+    /// inspection. Interactive shutdown uses this to ensure completed detached
+    /// work is printed before the process exits instead of silently vanishing.
+    pub fn take_unobserved_terminal_results(&self) -> Vec<AgentTerminalStatus> {
+        let mut agents = self.agents.lock().expect("agent registry");
+        let mut results = agents
+            .iter_mut()
+            .filter_map(|(id, record)| {
+                if matches!(record.status, AgentStatus::Running) || record.result_observed {
+                    return None;
+                }
+                record.result_observed = true;
+                Some(terminal_status(*id, record, true))
+            })
+            .collect::<Vec<_>>();
+        results.sort_by_key(|result| result.id);
+        results
     }
 
     /// Build the next snapshot while holding `agents`, establishing one total
@@ -841,6 +873,7 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
             ProviderError::Connection(_) => AgentFailureClass::ProviderConnection,
             ProviderError::Timeout => AgentFailureClass::ProviderTimeout,
             ProviderError::InvalidResponse(_) => AgentFailureClass::ProviderInvalidResponse,
+            ProviderError::ResponseTooLarge { .. } => AgentFailureClass::ProviderInvalidResponse,
             ProviderError::Unauthorized { .. } => AgentFailureClass::ProviderAuthentication,
             ProviderError::Http { status: 429, .. } => AgentFailureClass::ProviderRateLimited,
             ProviderError::Http { status, .. } if (400..500).contains(status) => {
@@ -859,6 +892,48 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
     }
 }
 
+/// Render a subagent failure without copying provider-controlled diagnostics
+/// into a durable job result or a parent-model tool result. Provider response
+/// bodies, URLs, transport strings, auth hints, and loop detail can all contain
+/// secrets; retain only typed categories and locally generated numeric fields.
+fn safe_subagent_error(error: &AgentError) -> String {
+    let detail = match error {
+        AgentError::Provider(error) => match error {
+            ProviderError::Connection(_) => "provider connection failed".to_string(),
+            ProviderError::Timeout => "provider request timed out".to_string(),
+            ProviderError::InvalidResponse(_) => {
+                "provider returned an invalid response".to_string()
+            }
+            ProviderError::ResponseTooLarge { part, limit_bytes } => format!(
+                "provider {part} exceeded the {limit_bytes}-byte safety limit"
+            ),
+            ProviderError::Unauthorized { status, .. } => {
+                format!("provider authentication failed (HTTP {status})")
+            }
+            ProviderError::Http { status, .. } => {
+                format!("provider request failed (HTTP {status})")
+            }
+            ProviderError::ToolsNotSupported => {
+                "provider does not support required tool calls".to_string()
+            }
+            ProviderError::Auth(_) => "provider credentials are not configured".to_string(),
+        },
+        AgentError::Loop(_) => "agent loop failed".to_string(),
+        AgentError::ContextOverflow {
+            required,
+            target,
+            unit,
+            ..
+        } => format!(
+            "context preflight rejected the request ({required} {unit} required; {target} {unit} available)"
+        ),
+        AgentError::ContextWindowUnknown => {
+            "model context window is unknown; compaction could not run safely".to_string()
+        }
+    };
+    format!("subagent failed: {detail}")
+}
+
 fn provider_category_label(category: ProviderAttemptCategory) -> &'static str {
     match category {
         ProviderAttemptCategory::Success => "success",
@@ -870,6 +945,8 @@ fn provider_category_label(category: ProviderAttemptCategory) -> &'static str {
         ProviderAttemptCategory::UnexpectedStatus => "unexpected status",
         ProviderAttemptCategory::Timeout => "timeout",
         ProviderAttemptCategory::Connection => "connection",
+        ProviderAttemptCategory::ResponseTooLarge => "response too large",
+        ProviderAttemptCategory::InvalidResponse => "invalid response",
         ProviderAttemptCategory::Cancelled => "cancelled",
     }
 }
@@ -877,6 +954,8 @@ fn provider_category_label(category: ProviderAttemptCategory) -> &'static str {
 fn provider_outcome_label(outcome: ProviderAttemptOutcome) -> &'static str {
     match outcome {
         ProviderAttemptOutcome::ResponseAccepted => "accepted",
+        ProviderAttemptOutcome::BodyCompleted => "body completed",
+        ProviderAttemptOutcome::BodyFailed => "body failed",
         ProviderAttemptOutcome::RetryScheduled => "retry scheduled",
         ProviderAttemptOutcome::Rejected => "rejected",
         ProviderAttemptOutcome::TransportFailed => "transport failed",
@@ -962,6 +1041,7 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
             telemetry.total_tokens = telemetry.total_tokens.saturating_add(total_tokens);
             telemetry.record_activity("usage updated".to_string());
         }
+        AgentRuntimeEvent::AssistantDelta { .. } => {}
         AgentRuntimeEvent::ToolStarted { name, .. } => {
             telemetry.record_activity(format!("started tool {}", safe_activity_name(&name)))
         }
@@ -1037,7 +1117,7 @@ async fn run_subagent_report_with_progress<P: Provider>(
     let result = match outcome {
         Ok(text) if !text.trim().is_empty() => Ok(text),
         Ok(_) => Ok("(subagent returned no result)".to_string()),
-        Err(error) => Err(format!("subagent failed: {error}")),
+        Err(error) => Err(safe_subagent_error(&error)),
     };
     SubagentRunReport { result, telemetry }
 }
@@ -1527,12 +1607,14 @@ mod tests {
             vec![
                 AgentRuntimeEvent::Usage {
                     round: 1,
+                    purpose: kitsu_core::ProviderRequestPurpose::Inference,
                     prompt_tokens: 9,
                     completion_tokens: 4,
                     total_tokens: 13,
                 },
                 AgentRuntimeEvent::Usage {
                     round: 2,
+                    purpose: kitsu_core::ProviderRequestPurpose::Inference,
                     prompt_tokens: 3,
                     completion_tokens: 2,
                     total_tokens: 5,
@@ -1566,6 +1648,7 @@ mod tests {
                     success: true,
                     completion: "SECRET_COMPLETION".to_string(),
                     tool_errors: 1,
+                    policy_errors: 0,
                 },
             ],
             None,
@@ -1599,6 +1682,39 @@ mod tests {
         assert_eq!(failure_class, AgentFailureClass::ProviderRateLimited);
         assert_eq!(failure_class.to_string(), "provider_rate_limited");
         assert!(!failure_class.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn subagent_failure_text_never_retains_provider_or_loop_detail() {
+        let unsafe_detail = "TOKEN_SECRET https://user:pass@example.invalid/private";
+        let cases = [
+            AgentError::Provider(ProviderError::Connection(unsafe_detail.to_string())),
+            AgentError::Provider(ProviderError::InvalidResponse(unsafe_detail.to_string())),
+            AgentError::Provider(ProviderError::Unauthorized {
+                status: 401,
+                hint: Some(unsafe_detail.to_string()),
+            }),
+            AgentError::Provider(ProviderError::Http {
+                status: 503,
+                body: unsafe_detail.to_string(),
+            }),
+            AgentError::Loop(unsafe_detail.to_string()),
+        ];
+
+        for error in cases {
+            let rendered = safe_subagent_error(&error);
+            assert!(rendered.starts_with("subagent failed:"));
+            assert!(!rendered.contains("TOKEN_SECRET"));
+            assert!(!rendered.contains("example.invalid"));
+            assert!(!rendered.contains("user:pass"));
+        }
+        assert!(
+            safe_subagent_error(&AgentError::Provider(ProviderError::Http {
+                status: 503,
+                body: unsafe_detail.to_string(),
+            }))
+            .contains("HTTP 503")
+        );
     }
 
     #[tokio::test]
@@ -1640,6 +1756,7 @@ mod tests {
                         id,
                         AgentRuntimeEvent::ProviderRequest {
                             round: 1,
+                            purpose: kitsu_core::ProviderRequestPurpose::Inference,
                             message_count: 2,
                             tools_offered: 1,
                         },
@@ -1648,6 +1765,7 @@ mod tests {
                         id,
                         AgentRuntimeEvent::Usage {
                             round: 1,
+                            purpose: kitsu_core::ProviderRequestPurpose::Inference,
                             prompt_tokens: 12,
                             completion_tokens: 3,
                             total_tokens: 15,
@@ -1698,6 +1816,26 @@ mod tests {
             registry.result(id).as_deref(),
             Some("finished before subscribe")
         );
+    }
+
+    #[test]
+    fn shutdown_take_returns_only_terminal_results_not_already_observed() {
+        let registry = AgentRegistry::new();
+        let observed = registry.start("opened result".to_string()).unwrap();
+        let unseen = registry.start("unseen result".to_string()).unwrap();
+        let running = registry.start("still running".to_string()).unwrap();
+        registry.finish(observed, Ok("opened".to_string()));
+        registry.finish(unseen, Err("needs attention".to_string()));
+
+        assert_eq!(registry.result(observed).as_deref(), Some("opened"));
+        assert!(registry.result(running).unwrap().contains("still running"));
+
+        let pending = registry.take_unobserved_terminal_results();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].id, unseen);
+        assert!(matches!(pending[0].status, AgentStatus::Failed(_)));
+        assert!(registry.take_unobserved_terminal_results().is_empty());
+        assert_eq!(registry.running(), 1);
     }
 
     #[tokio::test]

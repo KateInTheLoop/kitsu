@@ -11,5 +11,6 @@ pub use orchestrator::{
     compact_context, run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentError,
     AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus, CommandRuntimeInvocation,
     CommandRuntimeResult, CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason,
-    CompactionRecord, CompactionReport, ContextUnit, SummaryFallbackReason, TurnCompletion,
+    CompactionRecord, CompactionReport, ContextUnit, ProviderRequestPurpose, SummaryFallbackReason,
+    TurnCompletion,
 };

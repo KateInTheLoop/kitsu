@@ -4,10 +4,14 @@
 //! curated, budget-aware project context instead of slurping arbitrary markdown.
 //! Tolerant by design — only the H1 is guaranteed by the spec. Falls back to an
 //! `AGENTS.md`/`CLAUDE.md` when no `llms.txt` is present.
+//! Filesystem discovery and loading currently require Unix descriptor-relative,
+//! no-follow traversal. Other platforms return no project context until an
+//! equivalent handle-relative, no-reparse implementation is available.
 
 use std::path::{Path, PathBuf};
 
 use kitsu_core::context::estimate_str;
+use kitsu_tools::Permissions;
 
 /// Parsed `llms.txt`: an H1 name, a blockquote summary, the required body, and
 /// the budget-optional `## Optional` section.
@@ -108,35 +112,47 @@ pub fn parse(content: &str) -> LlmsTxt {
 
 /// Discover a project-context file: a configured path, else `llms.txt` walking up
 /// from `start` to the git/project root, else an `AGENTS.md`/`CLAUDE.md` fallback
-/// found along the way.
+/// found along the way. Returns `None` on non-Unix platforms, where secure
+/// no-reparse traversal is not yet implemented.
 pub fn discover(start: &Path, configured: Option<&Path>) -> Option<PathBuf> {
-    if let Some(p) = configured {
-        if p.is_file() {
-            return Some(p.to_path_buf());
-        }
+    #[cfg(not(unix))]
+    {
+        let _ = (start, configured);
+        None
     }
-    let mut dir = Some(start);
-    let mut fallback: Option<PathBuf> = None;
-    while let Some(d) = dir {
-        let llms = d.join("llms.txt");
-        if llms.is_file() {
-            return Some(llms); // llms.txt always wins
-        }
-        if fallback.is_none() {
-            for name in ["AGENTS.md", "CLAUDE.md"] {
-                let c = d.join(name);
-                if c.is_file() {
-                    fallback = Some(c);
-                    break;
-                }
+
+    #[cfg(unix)]
+    {
+        if let Some(p) = configured {
+            let p = std::path::absolute(p).ok()?;
+            if is_regular_file_no_follow(&p) {
+                return Some(p);
             }
         }
-        if d.join(".git").exists() {
-            break; // don't walk past the project root
+        let start = std::path::absolute(start).ok()?;
+        let mut dir = Some(start.as_path());
+        let mut fallback: Option<PathBuf> = None;
+        while let Some(d) = dir {
+            let llms = d.join("llms.txt");
+            if is_regular_file_no_follow(&llms) {
+                return Some(llms); // llms.txt always wins
+            }
+            if fallback.is_none() {
+                for name in ["AGENTS.md", "CLAUDE.md"] {
+                    let c = d.join(name);
+                    if is_regular_file_no_follow(&c) {
+                        fallback = Some(c);
+                        break;
+                    }
+                }
+            }
+            if std::fs::symlink_metadata(d.join(".git")).is_ok() {
+                break; // don't walk past the project root
+            }
+            dir = d.parent();
         }
-        dir = d.parent();
+        fallback
     }
-    fallback
 }
 
 /// Load project context: discover, then parse (`llms.txt`) or read raw
@@ -149,11 +165,12 @@ pub fn load(
     start: &Path,
     configured: Option<&Path>,
     window: Option<u64>,
+    permissions: &Permissions,
 ) -> Option<(String, u64, PathBuf)> {
     let path = discover(start, configured)?;
     // Bound the read so a pathologically large file can't blow up memory; the
     // rendered context is capped again below.
-    let content = read_capped(&path, 256 * 1024)?;
+    let content = read_capped(&path, 256 * 1024, permissions)?;
     let is_llms = path.file_name().map(|n| n == "llms.txt").unwrap_or(false);
     let optional_cap = window.map(|w| w / 4).unwrap_or(2048);
     // Leave the rest of the window for the base prompt, tool schemas, and the
@@ -184,14 +201,42 @@ pub fn load(
 }
 
 /// Read at most `max` bytes of a file as (lossy) UTF-8.
-fn read_capped(path: &Path, max: u64) -> Option<String> {
+#[cfg(unix)]
+fn read_capped(path: &Path, max: u64, permissions: &Permissions) -> Option<String> {
+    read_capped_with_hook(path, max, permissions, || {})
+}
+
+#[cfg(not(unix))]
+fn read_capped(_path: &Path, _max: u64, _permissions: &Permissions) -> Option<String> {
+    None
+}
+
+#[cfg(unix)]
+fn is_regular_file_no_follow(path: &Path) -> bool {
+    crate::attachments::open_regular_file_no_follow(path).is_ok()
+}
+
+#[cfg(unix)]
+fn read_capped_with_hook<F>(
+    path: &Path,
+    max: u64,
+    permissions: &Permissions,
+    after_open: F,
+) -> Option<String>
+where
+    F: FnOnce(),
+{
     use std::io::Read;
+
+    // Descriptor-relative O_NOFOLLOW pins the file selected at open time, so a
+    // repository cannot replace an ancestor with a symlink between discovery
+    // and the read.
+    let file = crate::attachments::open_regular_file_no_follow(path).ok()?;
+
+    after_open();
+    permissions.validate_trusted_opened_read(path, &file).ok()?;
     let mut buf = Vec::new();
-    std::fs::File::open(path)
-        .ok()?
-        .take(max)
-        .read_to_end(&mut buf)
-        .ok()?;
+    file.take(max).read_to_end(&mut buf).ok()?;
     Some(String::from_utf8_lossy(&buf).into_owned())
 }
 
@@ -212,6 +257,10 @@ fn cap_to_tokens(s: String, cap: u64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn permissions() -> Permissions {
+        Permissions::for_roots(&[], &[]).unwrap()
+    }
 
     const SAMPLE: &str = "\u{feff}# Acme\n> A tiny widget library.\nSome details.\n\n\
 ## Docs\n- [Readme](README.md): the readme\n- [Guide](guide.md)\n\n\
@@ -245,6 +294,7 @@ mod tests {
         assert!(parse("no heading here\n- just a list").is_empty());
     }
 
+    #[cfg(unix)]
     #[test]
     fn load_drops_optional_when_over_budget() {
         let dir = tempfile::tempdir().unwrap();
@@ -252,7 +302,7 @@ mod tests {
         let content = format!("# P\n> sum\n## S\n- [a](b)\n## Optional\n{big_optional}\n");
         std::fs::write(dir.path().join("llms.txt"), content).unwrap();
         // Small window → window/4 optional budget is tiny → optional dropped.
-        let (rendered, _, source) = load(dir.path(), None, Some(2000)).unwrap();
+        let (rendered, _, source) = load(dir.path(), None, Some(2000), &permissions()).unwrap();
         assert!(rendered.contains("# P"));
         assert!(
             !rendered.contains("zzz"),
@@ -261,6 +311,7 @@ mod tests {
         assert_eq!(source, dir.path().join("llms.txt"));
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_prefers_llms_txt_over_agents_md_and_stops_at_git_root() {
         let root = tempfile::tempdir().unwrap();
@@ -274,6 +325,7 @@ mod tests {
         assert_eq!(found.file_name().unwrap(), "llms.txt");
     }
 
+    #[cfg(unix)]
     #[test]
     fn discover_falls_back_to_agents_md() {
         let root = tempfile::tempdir().unwrap();
@@ -281,6 +333,84 @@ mod tests {
         std::fs::write(root.path().join("AGENTS.md"), "agents").unwrap();
         let found = discover(root.path(), None).unwrap();
         assert_eq!(found.file_name().unwrap(), "AGENTS.md");
+    }
+
+    #[cfg(not(unix))]
+    #[test]
+    fn project_context_reads_fail_closed_without_secure_path_traversal() {
+        let root = tempfile::tempdir().unwrap();
+        let context = root.path().join("llms.txt");
+        std::fs::write(&context, "# Private").unwrap();
+
+        assert!(discover(root.path(), Some(&context)).is_none());
+        assert!(load(root.path(), Some(&context), Some(4_096), &permissions()).is_none());
+        assert!(read_capped(&context, 4_096, &permissions()).is_none());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discovery_ignores_symlinked_implicit_and_configured_context() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(root.path().join(".git")).unwrap();
+        let outside = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(outside.path(), "PRIVATE").unwrap();
+        symlink(outside.path(), root.path().join("llms.txt")).unwrap();
+        std::fs::write(root.path().join("AGENTS.md"), "SAFE").unwrap();
+
+        let discovered = discover(root.path(), None).unwrap();
+        assert_eq!(discovered, root.path().join("AGENTS.md"));
+        let (content, _, source) = load(root.path(), None, Some(4_096), &permissions()).unwrap();
+        assert_eq!(content, "SAFE");
+        assert_eq!(source, discovered);
+        assert_eq!(
+            discover(root.path(), Some(&root.path().join("llms.txt"))).unwrap(),
+            root.path().join("AGENTS.md")
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn context_read_stays_pinned_across_an_ancestor_symlink_swap() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let moved = root.path().join("project-before-race");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let context = project.join("AGENTS.md");
+        std::fs::write(&context, "AUTHORIZED").unwrap();
+        std::fs::write(outside.join("AGENTS.md"), "PRIVATE").unwrap();
+
+        let content = read_capped_with_hook(&context, 1024, &permissions(), || {
+            std::fs::rename(&project, &moved).unwrap();
+            symlink(&outside, &project).unwrap();
+        })
+        .unwrap();
+
+        assert_eq!(content, "AUTHORIZED");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn project_context_rejects_an_outside_hard_link() {
+        let root = tempfile::tempdir().unwrap();
+        let project = root.path().join("project");
+        let outside = root.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        std::fs::create_dir(project.join(".git")).unwrap();
+        let secret = outside.join("unrelated-secret.txt");
+        let context = project.join("AGENTS.md");
+        std::fs::write(&secret, "token = secret").unwrap();
+
+        let permissions = permissions();
+        std::fs::hard_link(&secret, &context).unwrap();
+
+        assert!(load(&project, None, Some(4_096), &permissions).is_none());
     }
     #[test]
     fn blockquote_after_prose_is_not_summary() {

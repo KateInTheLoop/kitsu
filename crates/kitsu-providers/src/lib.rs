@@ -7,7 +7,7 @@ pub mod openai_compat;
 pub mod telemetry;
 pub mod types;
 
-pub use error::{AuthError, ExpiryStatus, ProviderError};
+pub use error::{AuthError, ExpiryStatus, ProviderError, ProviderResponsePart};
 pub use telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };

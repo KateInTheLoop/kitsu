@@ -16,7 +16,7 @@ use wiremock::matchers::{header, method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::auth::{EnvBearerAuth, NoAuth};
-use crate::error::ProviderError;
+use crate::error::{ProviderError, ProviderResponsePart};
 use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use crate::telemetry::{ProviderAttemptCategory, ProviderAttemptOutcome, ProviderTelemetrySink};
 use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason};
@@ -361,14 +361,19 @@ async fn test_physical_attempt_telemetry_reports_retry_and_terminal_success() {
     let observed = Arc::clone(&events);
     let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
 
-    let _stream = provider
+    let stream = provider
         .chat_stream_with_telemetry(simple_request(), Some(sink))
         .await
         .expect("the request should retry once and then succeed");
+    let _ = collect_stream(stream).await;
 
     assert_eq!(calls.load(Ordering::Relaxed), 2);
     let events = events.lock().unwrap();
-    assert_eq!(events.len(), 2, "one event is required per HTTP send");
+    assert_eq!(
+        events.len(),
+        2,
+        "one terminal event is required per HTTP send"
+    );
     let retry = &events[0];
     assert_eq!(retry.attempt, 1);
     assert_eq!(retry.max_attempts, 2);
@@ -380,14 +385,110 @@ async fn test_physical_attempt_telemetry_reports_retry_and_terminal_success() {
     assert!(retry.retry_after_used);
     assert!(retry.remaining_deadline_ms <= 3000);
 
-    let success = &events[1];
-    assert_eq!(success.attempt, 2);
-    assert_eq!(success.category, ProviderAttemptCategory::Success);
-    assert_eq!(success.status, Some(200));
-    assert_eq!(success.outcome, ProviderAttemptOutcome::ResponseAccepted);
-    assert!(success.terminal);
-    assert_eq!(success.retry_delay_ms, None);
-    assert!(!success.retry_after_used);
+    let completed = &events[1];
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(completed.category, ProviderAttemptCategory::Success);
+    assert_eq!(completed.status, Some(200));
+    assert_eq!(completed.outcome, ProviderAttemptOutcome::BodyCompleted);
+    assert!(completed.terminal);
+}
+
+#[tokio::test]
+async fn test_cancelling_during_retry_backoff_records_one_terminal_disposition() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_calls.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(429).insert_header("retry-after", "1")
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 1;
+    provider.timeout = Duration::from_secs(5);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let retry_scheduled = Arc::new(tokio::sync::Notify::new());
+    let retry_observed = Arc::clone(&retry_scheduled);
+    let sink = ProviderTelemetrySink::new(move |event| {
+        let is_retry = event.outcome == ProviderAttemptOutcome::RetryScheduled;
+        observed.lock().unwrap().push(event);
+        if is_retry {
+            retry_observed.notify_one();
+        }
+    });
+
+    let mut request = Box::pin(provider.chat_stream_with_telemetry(simple_request(), Some(sink)));
+    tokio::select! {
+        _ = retry_scheduled.notified() => {}
+        _ = &mut request => panic!("request left retry backoff unexpectedly"),
+    }
+    drop(request);
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::RetryScheduled);
+    assert!(!events[0].terminal);
+    assert_eq!(events[1].attempt, 2);
+    assert_eq!(events[1].status, None);
+    assert_eq!(events[1].category, ProviderAttemptCategory::Cancelled);
+    assert_eq!(events[1].outcome, ProviderAttemptOutcome::Cancelled);
+    assert!(events[1].terminal);
+    assert_eq!(
+        events.iter().filter(|event| event.terminal).count(),
+        1,
+        "cancelling backoff must close, not duplicate, the terminal disposition"
+    );
+}
+
+#[tokio::test]
+async fn test_fallible_telemetry_sink_stops_before_retry_send() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_calls.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(429).insert_header("retry-after", "1")
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 2;
+    provider.timeout = Duration::from_secs(5);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::with_fallible_observer(move |event| {
+        let keep_running = event.outcome != ProviderAttemptOutcome::RetryScheduled;
+        observed.lock().unwrap().push(event);
+        keep_running
+    });
+
+    let error = match provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+    {
+        Err(error) => error,
+        Ok(_) => panic!("observer rejection must stop the logical request"),
+    };
+    assert!(matches!(error, ProviderError::Connection(_)));
+    assert_eq!(calls.load(Ordering::Relaxed), 1, "no retry may be sent");
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::RetryScheduled);
+    assert!(events.iter().any(|event| {
+        event.attempt == 2 && event.terminal && event.outcome == ProviderAttemptOutcome::Cancelled
+    }));
+    assert_eq!(events.iter().filter(|event| event.terminal).count(), 1);
 }
 
 #[tokio::test]
@@ -484,8 +585,8 @@ async fn test_attempt_telemetry_marks_retry_that_cannot_fit_as_terminal_deadline
     assert_eq!(attempt.status, Some(503));
     assert_eq!(attempt.outcome, ProviderAttemptOutcome::DeadlineExceeded);
     assert!(attempt.terminal);
-    assert!(attempt.retry_after_used);
-    assert_eq!(attempt.retry_delay_ms, Some(30_000));
+    assert!(!attempt.retry_after_used);
+    assert_eq!(attempt.retry_delay_ms, None);
     assert!(attempt.remaining_deadline_ms <= 250);
 }
 
@@ -670,6 +771,32 @@ async fn test_retry_sleep_stops_at_total_request_deadline() {
     assert_eq!(started.elapsed(), Duration::from_secs(3));
 }
 
+#[tokio::test(start_paused = true)]
+async fn test_late_retry_wake_records_terminal_deadline() {
+    use super::{sleep_before_retry_observed, RetryBackoffAttemptGuard};
+
+    let started = tokio::time::Instant::now();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let guard = RetryBackoffAttemptGuard::new(Some(&sink), 2, 3, started, Duration::from_secs(2));
+    let waiter = tokio::spawn(sleep_before_retry_observed(
+        started,
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        guard,
+    ));
+    tokio::task::yield_now().await;
+    tokio::time::advance(Duration::from_secs(3)).await;
+
+    assert!(matches!(waiter.await.unwrap(), Err(ProviderError::Timeout)));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attempt, 2);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::DeadlineExceeded);
+    assert!(events[0].terminal);
+}
+
 #[test]
 fn test_parse_completion_surfaces_usage() {
     use super::parse_completion;
@@ -712,8 +839,9 @@ fn test_sse_decoder_surfaces_trailing_usage_chunk() {
         b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"hi\"},\"finish_reason\":null}]}\n\
           data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":2,\"total_tokens\":7}}\n\
           data: [DONE]\n",
-    );
-    out.extend(dec.finalize());
+    )
+    .unwrap();
+    out.extend(dec.finalize().unwrap());
     let u = out
         .iter()
         .find_map(|d| match d {
@@ -723,6 +851,357 @@ fn test_sse_decoder_surfaces_trailing_usage_chunk() {
         .expect("usage surfaced from stream");
     assert_eq!(u.total_tokens, 7);
     assert_eq!(u.prompt_tokens, 5);
+}
+
+#[tokio::test]
+async fn test_done_terminates_without_waiting_for_wire_eof() {
+    use super::{sse_step, ByteStream, ResponseBodyAttemptGuard, SseDecoder, SseState};
+
+    let body = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"done\"},\"finish_reason\":\"stop\"}]}\ndata: [DONE]\n".to_vec();
+    let byte_stream: ByteStream =
+        futures::stream::once(async { Ok::<Vec<u8>, reqwest::Error>(body) })
+            .chain(futures::stream::pending())
+            .boxed();
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let guard = ResponseBodyAttemptGuard::new(
+        Some(&sink),
+        1,
+        1,
+        200,
+        tokio::time::Instant::now(),
+        Duration::from_secs(5),
+    );
+    let state = SseState::Reading {
+        stream: byte_stream,
+        dec: SseDecoder::default(),
+        queue: std::collections::VecDeque::new(),
+        attempt_guard: guard,
+    };
+
+    let (item, state) = tokio::time::timeout(Duration::from_millis(100), sse_step(state))
+        .await
+        .expect("[DONE] must not wait for the pending transport")
+        .expect("[DONE] must emit a terminal delta");
+    assert!(matches!(item, Ok(ChatDelta::Text(text)) if text == "done"));
+    let (item, state) = tokio::time::timeout(Duration::from_millis(100), sse_step(state))
+        .await
+        .expect("queued terminal delta must not wait for the pending transport")
+        .expect("[DONE] must emit a terminal delta");
+    assert!(matches!(item, Ok(ChatDelta::Done(FinishReason::Stop))));
+    assert!(sse_step(state).await.is_none());
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyCompleted);
+    assert!(events[0].terminal);
+}
+
+#[test]
+fn test_sse_decoder_rejects_malformed_error_and_empty_success_payloads() {
+    use super::SseDecoder;
+
+    for (record, expected) in [
+        ("data: not-json\n", "malformed JSON"),
+        (
+            "data: {\"error\":{\"message\":\"secret provider detail\"}}\n",
+            "error object",
+        ),
+    ] {
+        let mut decoder = SseDecoder::default();
+        let error = decoder
+            .push_bytes(record.as_bytes())
+            .expect_err("invalid data records must fail the response");
+        assert!(matches!(error, ProviderError::InvalidResponse(_)));
+        assert!(error.to_string().contains(expected));
+        assert!(!error.to_string().contains("secret provider detail"));
+    }
+
+    let mut decoder = SseDecoder::default();
+    decoder.push_bytes(b"data: [DONE]\n").unwrap();
+    let error = decoder
+        .finalize()
+        .expect_err("a sentinel without a semantic choice is not a completion");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
+#[test]
+fn test_nonstream_completion_rejects_error_and_empty_choice_objects() {
+    use super::parse_completion;
+
+    let error = parse_completion(r#"{"error":{"message":"secret provider detail"}}"#)
+        .expect_err("HTTP-200 error objects must not become empty answers");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert!(!error.to_string().contains("secret provider detail"));
+
+    let error = parse_completion(r#"{"choices":[]}"#)
+        .expect_err("an empty choice list must not become a successful answer");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+
+    let error = parse_completion(r#"{"choices":[{}]}"#)
+        .expect_err("a defaulted choice without content or a terminal reason is not an answer");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
+#[tokio::test]
+async fn test_clean_eof_without_semantic_terminal_is_body_failure() {
+    let server = MockServer::start().await;
+    let body = r#"data: {"choices":[{"index":0,"delta":{"content":"partial"},"finish_reason":null}]}
+
+"#;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let mut stream = provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+        .unwrap();
+    assert!(matches!(stream.next().await, Some(Ok(ChatDelta::Text(text))) if text == "partial"));
+    assert!(matches!(
+        stream.next().await,
+        Some(Err(ProviderError::InvalidResponse(message)))
+            if message.contains("explicit finish_reason")
+    ));
+    assert!(stream.next().await.is_none());
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::InvalidResponse);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyFailed);
+    assert!(events[0].terminal);
+}
+
+#[tokio::test]
+async fn test_clean_eof_with_finish_reason_remains_valid() {
+    let server = MockServer::start().await;
+    let body = r#"data: {"choices":[{"index":0,"delta":{"content":"complete"},"finish_reason":"stop"}]}
+
+"#;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(body),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let stream = provider.chat_stream(simple_request()).await.unwrap();
+    let (text, calls, finish) = collect_stream(stream).await;
+    assert_eq!(text, "complete");
+    assert!(calls.is_empty());
+    assert_eq!(finish, Some(FinishReason::Stop));
+}
+
+#[test]
+fn test_sse_decoder_rejects_newline_free_oversized_record() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES};
+
+    let mut dec = SseDecoder::default();
+    let error = dec
+        .push_bytes(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
+        .expect_err("an unterminated SSE record must not grow without bound");
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseLine,
+            limit_bytes: MAX_SSE_LINE_BYTES,
+        }
+    ));
+}
+
+#[test]
+fn test_sse_decoder_enforces_aggregate_stream_ceiling() {
+    use super::{SseDecoder, MAX_SSE_STREAM_BYTES};
+
+    let mut dec = SseDecoder {
+        received_bytes: MAX_SSE_STREAM_BYTES,
+        ..SseDecoder::default()
+    };
+    let error = dec
+        .push_bytes(b"\n")
+        .expect_err("many individually small SSE records still need a total ceiling");
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseStream,
+            limit_bytes: MAX_SSE_STREAM_BYTES,
+        }
+    ));
+}
+
+#[test]
+fn test_sse_decoder_bounds_fragmented_tool_arguments() {
+    use super::{SseDecoder, MAX_STREAMED_TOOL_ARGUMENT_BYTES};
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let fragment = "x".repeat(16 * 1024);
+    let mut error = None;
+    for index in 0..=(MAX_STREAMED_TOOL_ARGUMENT_BYTES / fragment.len()) {
+        let chunk = serde_json::json!({
+            "choices": [{
+                "delta": {
+                    "tool_calls": [{
+                        "index": 0,
+                        "id": (index == 0).then_some("call_1"),
+                        "function": {
+                            "name": (index == 0).then_some("fs.write_file"),
+                            "arguments": fragment,
+                        }
+                    }]
+                }
+            }]
+        });
+        let line = format!("data: {chunk}");
+        if let Err(found) = dec.process_line(&line, &mut deltas) {
+            error = Some(found);
+            break;
+        }
+    }
+    assert!(matches!(
+        error,
+        Some(ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ToolArguments,
+            limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn test_nonstream_completion_body_has_hard_ceiling() {
+    use super::MAX_COMPLETION_BODY_BYTES;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200).set_body_bytes(vec![b'x'; MAX_COMPLETION_BODY_BYTES + 1]),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let mut request = simple_request();
+    request.stream = false;
+    let error = match provider.chat_stream(request).await {
+        Err(error) => error,
+        Ok(_) => panic!("an oversized non-stream response must fail before parsing"),
+    };
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::CompletionBody,
+            limit_bytes: MAX_COMPLETION_BODY_BYTES,
+        }
+    ));
+}
+
+#[tokio::test]
+async fn test_error_body_has_small_safe_ceiling() {
+    use super::MAX_ERROR_BODY_BYTES;
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(500).set_body_bytes(vec![b'x'; MAX_ERROR_BODY_BYTES + 1]),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let error = match provider.chat_stream(simple_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("an oversized diagnostic body must not be retained"),
+    };
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ErrorBody,
+            limit_bytes: MAX_ERROR_BODY_BYTES,
+        }
+    ));
+    assert!(!error.to_string().contains(&"x".repeat(1024)));
+}
+
+#[tokio::test]
+async fn test_accepted_header_is_followed_by_terminal_decode_failure() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not-json"))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let mut request = simple_request();
+    request.stream = false;
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    assert!(matches!(
+        provider
+            .chat_stream_with_telemetry(request, Some(sink))
+            .await,
+        Err(ProviderError::InvalidResponse(_))
+    ));
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::InvalidResponse);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyFailed);
+    assert!(events[0].terminal);
+}
+
+#[tokio::test]
+async fn test_dropped_accepted_stream_is_terminal_cancellation() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_two_text_deltas()),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let stream = provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+        .unwrap();
+    drop(stream);
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::Cancelled);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::Cancelled);
+    assert!(events[0].terminal);
 }
 
 // --- model_context_length (Stage 1b window discovery) -----------------------
@@ -739,6 +1218,32 @@ fn provider_with_models(base_url: String) -> OpenAICompatProvider {
         },
         auth,
     )
+}
+
+#[tokio::test]
+async fn test_model_catalog_body_has_hard_ceiling() {
+    use super::MAX_MODEL_CATALOG_BODY_BYTES;
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_bytes(vec![
+            b'x';
+            MAX_MODEL_CATALOG_BODY_BYTES
+                + 1
+        ]))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert!(matches!(
+        provider.list_models().await,
+        Err(ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ModelCatalogBody,
+            limit_bytes: MAX_MODEL_CATALOG_BODY_BYTES,
+        })
+    ));
 }
 
 #[tokio::test]

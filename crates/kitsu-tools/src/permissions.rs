@@ -200,6 +200,144 @@ pub struct PermissionRequest {
     pub grant_dir: String,
 }
 
+/// One exact regular-file read authorized by [`Permissions`].
+///
+/// On Unix this captures the device/inode selected at authorization time. The
+/// caller must open the returned path without following symlinks and then call
+/// [`Self::validate_opened_file`] before consuming any bytes. This closes the
+/// final pathname check-to-open window without forcing the permission layer to
+/// own filesystem I/O or leak an open descriptor across abstractions.
+#[derive(Debug, Clone)]
+pub struct ReadAuthorization {
+    apparent: PathBuf,
+    path: PathBuf,
+    #[cfg(unix)]
+    identity: ProtectedFileIdentity,
+}
+
+/// Host-only authorization for one exact implicit-input directory snapshot.
+///
+/// This is intentionally separate from model-visible read roots. On Unix the
+/// token records only the single-link regular-file identities present below a
+/// no-symlink root when it is issued. Callers still open every file without
+/// following any path component and validate that descriptor before consuming
+/// bytes. Files linked in later, multiply linked files, and files explicitly
+/// observed as Kitsu-private are rejected.
+#[derive(Debug, Clone)]
+pub struct TrustedImplicitReadRoot {
+    root: PathBuf,
+    #[cfg(unix)]
+    identities: HashSet<ProtectedFileIdentity>,
+}
+
+impl TrustedImplicitReadRoot {
+    pub fn path(&self) -> &Path {
+        &self.root
+    }
+
+    pub fn validate_opened_file(
+        &self,
+        requested: &Path,
+        file: &std::fs::File,
+        permissions: &Permissions,
+    ) -> Result<(), ToolError> {
+        #[cfg(not(unix))]
+        {
+            let _ = (requested, file, permissions);
+            Err(ToolError::PolicyDenied(
+                "trusted implicit filesystem inputs are unavailable on this platform because secure no-reparse traversal is not implemented"
+                    .to_string(),
+            ))
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            let apparent = normalize_apparent(requested)?;
+            if apparent == self.root || !apparent.starts_with(&self.root) {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' is outside trusted input root '{}'",
+                    requested.display(),
+                    self.root.display()
+                )));
+            }
+            let metadata = file.metadata().map_err(|error| {
+                ToolError::PolicyDenied(format!(
+                    "cannot inspect implicit read target '{}': {error}",
+                    requested.display()
+                ))
+            })?;
+            let Some(identity) = protected_file_identity(&metadata) else {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' is not a regular file",
+                    requested.display()
+                )));
+            };
+            if metadata.nlink() > 1 {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' has multiple hard links; refusing to ingest an ambiguous filesystem identity",
+                    requested.display()
+                )));
+            }
+            if !self.identities.contains(&identity) {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' was not present in the trusted input snapshot",
+                    requested.display()
+                )));
+            }
+            if permissions
+                .explicitly_observed_read_files
+                .read()
+                .unwrap()
+                .contains(&identity)
+            {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' has been explicitly observed as Kitsu-private state",
+                    requested.display()
+                )));
+            }
+            Ok(())
+        }
+    }
+}
+
+impl ReadAuthorization {
+    /// Canonical path which the caller must open without following symlinks.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
+
+    /// Verify that `file` is the exact regular file authorized earlier and that
+    /// its identity has not since become Kitsu-private.
+    pub fn validate_opened_file(
+        &self,
+        file: &std::fs::File,
+        permissions: &Permissions,
+    ) -> Result<(), ToolError> {
+        let metadata = file.metadata().map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot inspect opened read target '{}': {error}",
+                self.path.display()
+            ))
+        })?;
+        if !metadata.is_file() {
+            return Err(ToolError::PolicyDenied(format!(
+                "read target '{}' is not a regular file",
+                self.path.display()
+            )));
+        }
+        #[cfg(unix)]
+        if protected_file_identity(&metadata) != Some(self.identity) {
+            return Err(ToolError::PolicyDenied(format!(
+                "read target '{}' changed after authorization; retry the read",
+                self.path.display()
+            )));
+        }
+        permissions.ensure_opened_read_allowed(&self.apparent, &self.path, &metadata, true)
+    }
+}
+
 /// Something that can ask the user to approve an operation. Implemented by the
 /// CLI (prints a prompt and reads a keypress); the tools crate stays UI-free.
 pub trait Prompter: Send + Sync {
@@ -226,10 +364,18 @@ pub struct Permissions {
     /// conservative denial rather than exposing a former private alias.
     #[cfg(unix)]
     protected_read_files: RwLock<HashSet<ProtectedFileIdentity>>,
-    /// Files observed with multiple names remain non-readable through an
-    /// internal-read subtree even if one link is subsequently removed.
+    /// Files present when a protected root is registered, explicitly observed
+    /// as private later, or discovered with multiple names remain non-readable
+    /// through an internal-read subtree. This prevents a private one-link file
+    /// from being hard-linked into an artifact exception and having its
+    /// original name removed before authorization.
     #[cfg(unix)]
     protected_read_multiply_linked_files: RwLock<HashSet<ProtectedFileIdentity>>,
+    /// Files explicitly committed or re-observed by the Kitsu host after
+    /// policy construction. Trusted implicit-root snapshots never override
+    /// this classification.
+    #[cfg(unix)]
+    explicitly_observed_read_files: RwLock<HashSet<ProtectedFileIdentity>>,
     internal_read_roots: RwLock<Vec<PathBuf>>,
     protected_write_roots: RwLock<Vec<PathBuf>>,
     /// Write-side counterpart to `protected_read_files`.
@@ -436,6 +582,8 @@ impl Permissions {
             protected_read_files: RwLock::new(HashSet::new()),
             #[cfg(unix)]
             protected_read_multiply_linked_files: RwLock::new(HashSet::new()),
+            #[cfg(unix)]
+            explicitly_observed_read_files: RwLock::new(HashSet::new()),
             internal_read_roots: RwLock::new(Vec::new()),
             protected_write_roots: RwLock::new(Vec::new()),
             #[cfg(unix)]
@@ -529,11 +677,34 @@ impl Permissions {
             insert_minimal_root(&mut roots, canon.clone());
         }
         #[cfg(unix)]
-        refresh_protected_file_identities(
-            &self.protected_read_roots,
-            &self.protected_read_files,
-            &self.protected_read_multiply_linked_files,
-        )?;
+        {
+            // Internal exceptions are granted only to fresh runtime artifact
+            // generations. Every file already present when private state is
+            // registered is therefore strict private state, even if it has a
+            // single link at this instant. Later refreshes remain narrower and
+            // add only multiply-linked identities so newly generated artifacts
+            // do not lose their intended read exception.
+            let roots = self.protected_read_roots.read().unwrap().clone();
+            let mut discovered = HashSet::new();
+            let mut multiply_linked = HashSet::new();
+            for root in &roots {
+                collect_protected_file_identities(root, &mut discovered, &mut multiply_linked)
+                    .map_err(|error| {
+                        ToolError::PolicyDenied(format!(
+                            "cannot safely inspect Kitsu-private path '{}': {error}",
+                            root.display()
+                        ))
+                    })?;
+            }
+            self.protected_read_files
+                .write()
+                .unwrap()
+                .extend(discovered.iter().copied());
+            self.protected_read_multiply_linked_files
+                .write()
+                .unwrap()
+                .extend(discovered);
+        }
         Ok(canon)
     }
 
@@ -681,6 +852,149 @@ impl Permissions {
     /// Snapshot Kitsu-private roots that model tools may never write.
     pub fn protected_write_roots(&self) -> Vec<PathBuf> {
         self.protected_write_roots.read().unwrap().clone()
+    }
+
+    /// Record the stable identity of Kitsu-private state immediately after the
+    /// host creates or replaces it.
+    ///
+    /// Protected-directory rescans normally discover multiply-linked files at
+    /// authorization time. That is necessarily too late if another process
+    /// hard-links a newly created private file and removes its private name
+    /// before the first model access. Host persistence paths call this at their
+    /// commit boundary so the identity remains denied through the surviving
+    /// alias for this [`Permissions`] lifetime.
+    pub fn observe_protected_path(&self, path: &Path) -> Result<PathBuf, ToolError> {
+        let apparent = normalize_apparent(path)?;
+        let canon = std::fs::canonicalize(path).map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot observe Kitsu-private path '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let protects_read = self
+            .protected_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| apparent.starts_with(root) || canon.starts_with(root));
+        let protects_write = self
+            .protected_write_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| apparent.starts_with(root) || canon.starts_with(root));
+        if !protects_read && !protects_write {
+            return Err(ToolError::PolicyDenied(format!(
+                "path '{}' is not beneath a registered Kitsu-private root",
+                path.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            let mut discovered = HashSet::new();
+            let mut multiply_linked = HashSet::new();
+            collect_protected_file_identities(&apparent, &mut discovered, &mut multiply_linked)
+                .map_err(|error| {
+                    ToolError::PolicyDenied(format!(
+                        "cannot safely inspect Kitsu-private path '{}': {error}",
+                        path.display()
+                    ))
+                })?;
+            if protects_read {
+                self.protected_read_files
+                    .write()
+                    .unwrap()
+                    .extend(discovered.iter().copied());
+                self.protected_read_multiply_linked_files
+                    .write()
+                    .unwrap()
+                    .extend(discovered.iter().copied());
+                self.explicitly_observed_read_files
+                    .write()
+                    .unwrap()
+                    .extend(discovered.iter().copied());
+            }
+            if protects_write {
+                self.protected_write_files
+                    .write()
+                    .unwrap()
+                    .extend(discovered);
+                self.protected_write_multiply_linked_files
+                    .write()
+                    .unwrap()
+                    .extend(multiply_linked);
+            }
+        }
+        Ok(canon)
+    }
+
+    /// Record a just-created private regular file through an already-open host
+    /// descriptor. Unlike [`Self::observe_protected_path`], this remains sound
+    /// if another same-user process hard-links the file and removes its private
+    /// pathname between the atomic commit and policy bookkeeping: the open file
+    /// keeps the installed inode alive until its identity is stored.
+    #[cfg(unix)]
+    pub fn observe_protected_file(
+        &self,
+        path: &Path,
+        file: &std::fs::File,
+    ) -> Result<PathBuf, ToolError> {
+        use std::os::unix::fs::MetadataExt;
+
+        let apparent = normalize_apparent(path)?;
+        let protects_read = self
+            .protected_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| apparent.starts_with(root));
+        let protects_write = self
+            .protected_write_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| apparent.starts_with(root));
+        if !protects_read && !protects_write {
+            return Err(ToolError::PolicyDenied(format!(
+                "path '{}' is not beneath a registered Kitsu-private root",
+                path.display()
+            )));
+        }
+
+        let metadata = file.metadata().map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot inspect committed Kitsu-private file '{}': {error}",
+                path.display()
+            ))
+        })?;
+        let Some(identity) = protected_file_identity(&metadata) else {
+            return Err(ToolError::PolicyDenied(format!(
+                "committed Kitsu-private path '{}' is not a regular file",
+                path.display()
+            )));
+        };
+        if protects_read {
+            self.protected_read_files.write().unwrap().insert(identity);
+            self.protected_read_multiply_linked_files
+                .write()
+                .unwrap()
+                .insert(identity);
+            self.explicitly_observed_read_files
+                .write()
+                .unwrap()
+                .insert(identity);
+        }
+        if protects_write {
+            self.protected_write_files.write().unwrap().insert(identity);
+            if metadata.nlink() > 1 {
+                self.protected_write_multiply_linked_files
+                    .write()
+                    .unwrap()
+                    .insert(identity);
+            }
+        }
+        Ok(apparent)
     }
 
     /// Revoke grants added after construction, including internal reads, and
@@ -833,6 +1147,208 @@ impl Permissions {
             return Ok(canon);
         }
         self.resolve(Action::Read, requested, canon).await
+    }
+
+    /// Authorize one exact regular-file read.
+    ///
+    /// Callers must open [`ReadAuthorization::path`] without following symlinks
+    /// and validate the resulting descriptor before reading. Plain
+    /// [`Self::check_read`] remains available for directory/listing operations
+    /// whose descriptor ownership is handled by the tool itself.
+    pub async fn authorize_read_file(
+        &self,
+        requested: &Path,
+    ) -> Result<ReadAuthorization, ToolError> {
+        let apparent = normalize_apparent(requested)?;
+        let path = self.check_read(requested).await?;
+        let metadata = std::fs::metadata(&path).map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot inspect read target '{}': {error}",
+                requested.display()
+            ))
+        })?;
+        self.ensure_opened_read_allowed(&apparent, &path, &metadata, true)?;
+        if !metadata.is_file() {
+            return Err(ToolError::PolicyDenied(format!(
+                "read target '{}' is not a regular file",
+                requested.display()
+            )));
+        }
+        Ok(ReadAuthorization {
+            apparent,
+            path,
+            #[cfg(unix)]
+            identity: protected_file_identity(&metadata)
+                .expect("regular Unix file has a stable device/inode identity"),
+        })
+    }
+
+    /// Validate an already-open host-selected implicit input such as project
+    /// context or a filesystem skill. This does not consult or widen ordinary
+    /// model read grants; it only rejects Kitsu-private paths and identities.
+    /// Internal artifact exceptions are deliberately not honored for implicit
+    /// prompt inputs.
+    pub fn validate_trusted_opened_read(
+        &self,
+        requested: &Path,
+        file: &std::fs::File,
+    ) -> Result<(), ToolError> {
+        let apparent = normalize_apparent(requested)?;
+        let canonical = std::fs::canonicalize(requested).unwrap_or_else(|_| apparent.clone());
+        let metadata = file.metadata().map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot inspect implicit read target '{}': {error}",
+                requested.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if metadata.is_file() && metadata.nlink() > 1 {
+                return Err(ToolError::PolicyDenied(format!(
+                    "implicit read target '{}' has multiple hard links; refusing to ingest an ambiguous filesystem identity",
+                    requested.display()
+                )));
+            }
+        }
+        self.ensure_opened_read_allowed(&apparent, &canonical, &metadata, false)
+    }
+
+    /// Snapshot one host-selected directory for implicit prompt inputs without
+    /// granting any model filesystem authority.
+    ///
+    /// The root and all file identities are captured before discovery. A
+    /// caller must subsequently use [`TrustedImplicitReadRoot::validate_opened_file`]
+    /// on a component-wise no-follow descriptor. Non-Unix platforms fail
+    /// closed until an equivalent no-reparse traversal exists.
+    pub fn authorize_trusted_implicit_read_root(
+        &self,
+        requested: &Path,
+    ) -> Result<TrustedImplicitReadRoot, ToolError> {
+        #[cfg(not(unix))]
+        {
+            let _ = requested;
+            Err(ToolError::PolicyDenied(
+                "trusted implicit filesystem inputs are unavailable on this platform because secure no-reparse traversal is not implemented"
+                    .to_string(),
+            ))
+        }
+
+        #[cfg(unix)]
+        {
+            let root = normalize_apparent(requested)?;
+            let metadata = std::fs::symlink_metadata(&root).map_err(|error| {
+                ToolError::PolicyDenied(format!(
+                    "trusted implicit read root '{}' is not accessible: {error}",
+                    requested.display()
+                ))
+            })?;
+            if metadata.file_type().is_symlink() || !metadata.is_dir() {
+                return Err(ToolError::PolicyDenied(format!(
+                    "trusted implicit read root '{}' is not a regular directory",
+                    requested.display()
+                )));
+            }
+            let canonical = std::fs::canonicalize(&root).map_err(|error| {
+                ToolError::PolicyDenied(format!(
+                    "trusted implicit read root '{}' cannot be resolved: {error}",
+                    requested.display()
+                ))
+            })?;
+            if canonical != root {
+                return Err(ToolError::PolicyDenied(format!(
+                    "trusted implicit read root '{}' traverses a symlink or reparse-like alias",
+                    requested.display()
+                )));
+            }
+
+            let mut identities = HashSet::new();
+            let mut multiply_linked = HashSet::new();
+            collect_protected_file_identities(&root, &mut identities, &mut multiply_linked)
+                .map_err(|error| {
+                    ToolError::PolicyDenied(format!(
+                        "cannot safely snapshot trusted implicit read root '{}': {error}",
+                        requested.display()
+                    ))
+                })?;
+            identities.retain(|identity| !multiply_linked.contains(identity));
+            Ok(TrustedImplicitReadRoot { root, identities })
+        }
+    }
+
+    fn ensure_opened_read_allowed(
+        &self,
+        apparent: &Path,
+        canonical: &Path,
+        metadata: &std::fs::Metadata,
+        allow_internal: bool,
+    ) -> Result<(), ToolError> {
+        if !metadata.is_file() {
+            return Err(ToolError::PolicyDenied(format!(
+                "read target '{}' is not a regular file",
+                canonical.display()
+            )));
+        }
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+
+            if metadata.nlink() > 1 {
+                refresh_protected_file_identities(
+                    &self.protected_read_roots,
+                    &self.protected_read_files,
+                    &self.protected_read_multiply_linked_files,
+                )?;
+            }
+        }
+        let protected_by_path = self
+            .protected_read_roots
+            .read()
+            .unwrap()
+            .iter()
+            .any(|root| apparent.starts_with(root) || canonical.starts_with(root));
+        #[cfg(unix)]
+        let identity = protected_file_identity(metadata)
+            .expect("regular Unix file has a stable device/inode identity");
+        #[cfg(unix)]
+        let protected = protected_by_path
+            || self
+                .protected_read_files
+                .read()
+                .unwrap()
+                .contains(&identity);
+        #[cfg(not(unix))]
+        let protected = protected_by_path;
+        if !protected {
+            return Ok(());
+        }
+
+        if allow_internal {
+            let internal = self
+                .internal_read_roots
+                .read()
+                .unwrap()
+                .iter()
+                .any(|root| canonical.starts_with(root));
+            #[cfg(unix)]
+            let unsafe_internal_alias = self
+                .protected_read_multiply_linked_files
+                .read()
+                .unwrap()
+                .contains(&identity);
+            #[cfg(not(unix))]
+            let unsafe_internal_alias = false;
+            if internal && !unsafe_internal_alias {
+                return Ok(());
+            }
+        }
+
+        Err(ToolError::PolicyDenied(format!(
+            "path '{}' contains Kitsu-private configuration or session state",
+            apparent.display()
+        )))
     }
 
     /// Check (and possibly prompt for) write access to `requested`. The target
@@ -1423,7 +1939,6 @@ mod tests {
         let sessions = private.join("sessions");
         std::fs::create_dir_all(&artifacts).unwrap();
         std::fs::create_dir_all(&sessions).unwrap();
-        let artifact = write_file(&artifacts, "result.txt", "safe output");
         let session = write_file(&sessions, "saved.json", "secret");
 
         let perms = Permissions::for_roots(&[], &[]).unwrap();
@@ -1431,6 +1946,9 @@ mod tests {
         perms
             .allow_internal_read_root(&artifacts.to_string_lossy())
             .unwrap();
+        // Internal exceptions are for fresh runtime artifacts. A file already
+        // present when private state is registered remains private forever.
+        let artifact = write_file(&artifacts, "result.txt", "safe output");
 
         // The internal capability grants its canonical subtree directly; it
         // does not depend on a user-visible read root.
@@ -1455,6 +1973,67 @@ mod tests {
             Err(ToolError::PolicyDenied(_))
         ));
         assert_eq!(perms.check_read(&artifact).await.unwrap(), artifact);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn trusted_implicit_root_is_snapshot_bound_and_never_overrides_observed_private_files() {
+        let dir = tempfile::tempdir().unwrap();
+        let private = dir.path().join(".kitsu");
+        let skills = private.join("skills");
+        let skill_dir = skills.join("review");
+        let sessions = private.join("sessions");
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        let manifest = write_file(&skill_dir, "SKILL.md", "trusted instructions");
+        let session = write_file(&sessions, "saved.json", "private transcript");
+
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        let trusted = perms.authorize_trusted_implicit_read_root(&skills).unwrap();
+        let manifest_file = std::fs::File::open(&manifest).unwrap();
+        trusted
+            .validate_opened_file(&manifest, &manifest_file, &perms)
+            .unwrap();
+
+        let session_file = std::fs::File::open(&session).unwrap();
+        assert!(matches!(
+            trusted.validate_opened_file(&session, &session_file, &perms),
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        let linked = skill_dir.join("linked-session.json");
+        std::fs::hard_link(&session, &linked).unwrap();
+        let linked_file = std::fs::File::open(&linked).unwrap();
+        assert!(matches!(
+            trusted.validate_opened_file(&linked, &linked_file, &perms),
+            Err(ToolError::PolicyDenied(message)) if message.contains("multiple hard links")
+        ));
+
+        let late = write_file(&skill_dir, "late.txt", "not in snapshot");
+        let late_file = std::fs::File::open(&late).unwrap();
+        assert!(matches!(
+            trusted.validate_opened_file(&late, &late_file, &perms),
+            Err(ToolError::PolicyDenied(message)) if message.contains("not present")
+        ));
+
+        perms
+            .observe_protected_file(&manifest, &manifest_file)
+            .unwrap();
+        assert!(matches!(
+            trusted.validate_opened_file(&manifest, &manifest_file, &perms),
+            Err(ToolError::PolicyDenied(message)) if message.contains("explicitly observed")
+        ));
+
+        let displaced = private.join("skills-before-replacement");
+        std::fs::rename(&skills, &displaced).unwrap();
+        std::fs::create_dir_all(&skill_dir).unwrap();
+        std::fs::write(&manifest, "replacement instructions").unwrap();
+        let replacement_file = std::fs::File::open(&manifest).unwrap();
+        assert!(matches!(
+            trusted.validate_opened_file(&manifest, &replacement_file, &perms),
+            Err(ToolError::PolicyDenied(message)) if message.contains("not present")
+        ));
     }
 
     #[test]
@@ -1492,12 +2071,12 @@ mod tests {
         let runtime = dir.path().join("runtime");
         std::fs::create_dir_all(&artifacts).unwrap();
         std::fs::create_dir(&runtime).unwrap();
-        let artifact = write_file(&artifacts, "result.txt", "previous session");
         let perms = Permissions::for_roots(&[], &[]).unwrap();
         perms.protect_read_path(&private.to_string_lossy()).unwrap();
         perms
             .allow_internal_read_root(&artifacts.to_string_lossy())
             .unwrap();
+        let artifact = write_file(&artifacts, "result.txt", "current session");
         perms
             .protect_write_path(&private.to_string_lossy())
             .unwrap();
@@ -1623,12 +2202,14 @@ mod symlink_tests {
         let artifacts = private.join("artifacts");
         std::fs::create_dir_all(&artifacts).unwrap();
         let first_artifact = artifacts.join("result.txt");
-        std::fs::write(&first_artifact, "first").unwrap();
         let perms = Permissions::for_roots(&[], &[]).unwrap();
         perms.protect_read_path(&private.to_string_lossy()).unwrap();
         perms
             .allow_internal_read_root(&artifacts.to_string_lossy())
             .unwrap();
+        // Runtime artifact generations are granted while empty; their files
+        // are created only after the narrow exception exists.
+        std::fs::write(&first_artifact, "first").unwrap();
 
         assert_eq!(
             perms.check_read(&first_artifact).await.unwrap(),
@@ -1857,6 +2438,90 @@ mod symlink_tests {
         ));
     }
 
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn host_observation_protects_alias_after_private_name_is_removed() {
+        use std::os::unix::fs::MetadataExt;
+
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("state");
+        std::fs::create_dir(&private).unwrap();
+        let broad = base.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .protect_write_path(&private.to_string_lossy())
+            .unwrap();
+
+        // Model a Kitsu save boundary: the host records the committed private
+        // inode before another process can make an alias the only remaining
+        // namespace entry.
+        let session = private.join("session.json");
+        let alias = base.path().join("apparently-public.json");
+        std::fs::write(&session, "private transcript").unwrap();
+        perms.observe_protected_path(&session).unwrap();
+        std::fs::hard_link(&session, &alias).unwrap();
+        std::fs::remove_file(&session).unwrap();
+        assert_eq!(std::fs::metadata(&alias).unwrap().nlink(), 1);
+
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn descriptor_observation_closes_commit_to_path_observation_gap() {
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("state");
+        std::fs::create_dir(&private).unwrap();
+        let broad = base.path().to_string_lossy().to_string();
+        let perms = Permissions::new(
+            std::slice::from_ref(&broad),
+            std::slice::from_ref(&broad),
+            Mode::AutoAllow,
+        )
+        .unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .protect_write_path(&private.to_string_lossy())
+            .unwrap();
+
+        let session = private.join("session.json");
+        let alias = base.path().join("surviving-alias.json");
+        let committed = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&session)
+            .unwrap();
+        std::fs::hard_link(&session, &alias).unwrap();
+        std::fs::remove_file(&session).unwrap();
+
+        // Path-based observation is now impossible, but the host's commit
+        // descriptor still identifies the exact installed private inode.
+        assert!(perms.observe_protected_path(&session).is_err());
+        perms.observe_protected_file(&session, &committed).unwrap();
+        assert!(matches!(
+            perms.check_read(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+        assert!(matches!(
+            perms.check_write(&alias).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
     #[tokio::test]
     async fn internal_read_root_does_not_exempt_a_private_hard_link_alias() {
         let base = tempfile::tempdir().unwrap();
@@ -1866,15 +2531,15 @@ mod symlink_tests {
         std::fs::create_dir_all(&sessions).unwrap();
         std::fs::create_dir_all(&artifacts).unwrap();
         let session = sessions.join("session.json");
-        let legitimate_artifact = artifacts.join("result.txt");
         std::fs::write(&session, "private transcript").unwrap();
-        std::fs::write(&legitimate_artifact, "safe result").unwrap();
 
         let perms = Permissions::for_roots(&[], &[]).unwrap();
         perms.protect_read_path(&private.to_string_lossy()).unwrap();
         perms
             .allow_internal_read_root(&artifacts.to_string_lossy())
             .unwrap();
+        let legitimate_artifact = artifacts.join("result.txt");
+        std::fs::write(&legitimate_artifact, "safe result").unwrap();
         assert_eq!(
             perms.check_read(&legitimate_artifact).await.unwrap(),
             legitimate_artifact
@@ -1882,18 +2547,99 @@ mod symlink_tests {
 
         let alias = artifacts.join("apparently-safe.json");
         std::fs::hard_link(&session, &alias).unwrap();
+        // The private inode was observed with one link. Remove its original
+        // name before the first authorization check: the surviving alias must
+        // not become indistinguishable from a generated artifact merely
+        // because its current link count returned to one.
+        std::fs::remove_file(&session).unwrap();
         assert!(perms.is_read_protected(&alias));
         assert!(matches!(
             perms.check_read(&alias).await,
             Err(ToolError::PolicyDenied(_))
         ));
+    }
 
-        // Once observed as multiply linked, removing the private name cannot
-        // turn the remaining alias into a trusted generated artifact.
+    #[tokio::test]
+    async fn observed_future_private_file_cannot_become_a_one_link_internal_alias() {
+        let base = tempfile::tempdir().unwrap();
+        let private = base.path().join("state");
+        let sessions = private.join("sessions");
+        let artifacts = private.join("artifacts");
+        std::fs::create_dir_all(&sessions).unwrap();
+        std::fs::create_dir_all(&artifacts).unwrap();
+
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        perms
+            .allow_internal_read_root(&artifacts.to_string_lossy())
+            .unwrap();
+
+        let session = sessions.join("later.json");
+        let committed = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&session)
+            .unwrap();
+        perms.observe_protected_file(&session, &committed).unwrap();
+
+        let alias = artifacts.join("surviving.json");
+        std::fs::hard_link(&session, &alias).unwrap();
         std::fs::remove_file(&session).unwrap();
         assert!(matches!(
             perms.check_read(&alias).await,
             Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn exact_read_authorization_rejects_final_hard_link_substitution() {
+        let base = tempfile::tempdir().unwrap();
+        let allowed = base.path().join("allowed");
+        let private = base.path().join("private");
+        std::fs::create_dir(&allowed).unwrap();
+        std::fs::create_dir(&private).unwrap();
+        let target = allowed.join("target.txt");
+        let secret = private.join("session.json");
+        std::fs::write(&target, "public").unwrap();
+        std::fs::write(&secret, "private transcript").unwrap();
+
+        let perms = Permissions::for_roots(&[allowed.to_string_lossy().into_owned()], &[]).unwrap();
+        perms.protect_read_path(&private.to_string_lossy()).unwrap();
+        let authorization = perms.authorize_read_file(&target).await.unwrap();
+
+        // Replace the final name after policy authorization without using a
+        // symlink, then remove the original private name so link count alone no
+        // longer distinguishes the alias.
+        std::fs::remove_file(&target).unwrap();
+        std::fs::hard_link(&secret, &target).unwrap();
+        std::fs::remove_file(&secret).unwrap();
+        let opened = std::fs::File::open(&target).unwrap();
+
+        assert!(matches!(
+            authorization.validate_opened_file(&opened, &perms),
+            Err(ToolError::PolicyDenied(message)) if message.contains("changed after authorization")
+        ));
+    }
+
+    #[test]
+    fn trusted_implicit_read_rejects_any_multiply_linked_identity() {
+        let base = tempfile::tempdir().unwrap();
+        let project = base.path().join("project");
+        let outside = base.path().join("outside");
+        std::fs::create_dir(&project).unwrap();
+        std::fs::create_dir(&outside).unwrap();
+        let secret = outside.join("unrelated-secret.txt");
+        let context = project.join("AGENTS.md");
+        std::fs::write(&secret, "token = secret").unwrap();
+
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        std::fs::hard_link(&secret, &context).unwrap();
+        let opened = std::fs::File::open(&context).unwrap();
+
+        assert!(matches!(
+            perms.validate_trusted_opened_read(&context, &opened),
+            Err(ToolError::PolicyDenied(message)) if message.contains("multiple hard links")
         ));
     }
 

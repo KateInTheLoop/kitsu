@@ -9,9 +9,11 @@
     { "$ref": "#/$defs/turn_started" },
     { "$ref": "#/$defs/provider_request" },
     { "$ref": "#/$defs/provider_attempt" },
+    { "$ref": "#/$defs/assistant_delta" },
     { "$ref": "#/$defs/usage" },
     { "$ref": "#/$defs/tool_started" },
     { "$ref": "#/$defs/tool_finished" },
+    { "$ref": "#/$defs/background_result" },
     { "$ref": "#/$defs/assistant" },
     { "$ref": "#/$defs/turn_finished" },
     { "$ref": "#/$defs/command_started" },
@@ -37,6 +39,20 @@
       "properties": {
         "turn_id": { "type": "string", "minLength": 1 }
       }
+    },
+    "command_identity": {
+      "type": "object",
+      "required": ["line", "command"],
+      "properties": {
+        "line": { "type": "integer", "minimum": 1 },
+        "command": { "type": "string" }
+      }
+    },
+    "provider_operation_identity": {
+      "oneOf": [
+        { "$ref": "#/$defs/turn_identity" },
+        { "$ref": "#/$defs/command_identity" }
+      ]
     },
     "command_invocation": {
       "type": "object",
@@ -117,9 +133,13 @@
         "ambient_authority": { "$ref": "#/$defs/command_ambient_authority" },
         "artifact": {
           "type": "object",
-          "required": ["reference"],
+          "required": ["reference", "captured_bytes", "truncated", "limit_bytes", "artifact_bytes"],
           "properties": {
-            "reference": { "type": "string" }
+            "reference": { "type": "string" },
+            "captured_bytes": { "type": "integer", "minimum": 0 },
+            "truncated": { "type": "boolean" },
+            "limit_bytes": { "type": "integer", "minimum": 1 },
+            "artifact_bytes": { "type": "integer", "minimum": 0 }
           }
         },
         "artifact_error": { "type": "string" }
@@ -178,13 +198,14 @@
     "provider_request": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
-        { "$ref": "#/$defs/turn_identity" },
+        { "$ref": "#/$defs/provider_operation_identity" },
         {
           "type": "object",
-          "required": ["round", "message_count", "tools_offered"],
+          "required": ["round", "purpose", "message_count", "tools_offered"],
           "properties": {
             "type": { "const": "provider_request" },
             "round": { "type": "integer", "minimum": 1 },
+            "purpose": { "enum": ["inference", "compaction"] },
             "message_count": { "type": "integer", "minimum": 0 },
             "tools_offered": { "type": "integer", "minimum": 0 }
           }
@@ -194,11 +215,12 @@
     "provider_attempt": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
-        { "$ref": "#/$defs/turn_identity" },
+        { "$ref": "#/$defs/provider_operation_identity" },
         {
           "type": "object",
           "required": [
             "round",
+            "purpose",
             "attempt",
             "max_attempts",
             "category",
@@ -212,6 +234,7 @@
           "properties": {
             "type": { "const": "provider_attempt" },
             "round": { "type": "integer", "minimum": 1 },
+            "purpose": { "enum": ["inference", "compaction"] },
             "attempt": { "type": "integer", "minimum": 1 },
             "max_attempts": { "type": "integer", "minimum": 1 },
             "category": {
@@ -225,6 +248,8 @@
                 "unexpected_status",
                 "timeout",
                 "connection",
+                "response_too_large",
+                "invalid_response",
                 "cancelled"
               ]
             },
@@ -236,6 +261,8 @@
             "outcome": {
               "enum": [
                 "response_accepted",
+                "body_completed",
+                "body_failed",
                 "retry_scheduled",
                 "rejected",
                 "transport_failed",
@@ -251,16 +278,32 @@
         }
       ]
     },
-    "usage": {
+    "assistant_delta": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
         { "$ref": "#/$defs/turn_identity" },
         {
           "type": "object",
-          "required": ["round", "prompt_tokens", "completion_tokens", "total_tokens"],
+          "required": ["round", "text"],
+          "properties": {
+            "type": { "const": "assistant_delta" },
+            "round": { "type": "integer", "minimum": 1 },
+            "text": { "type": "string" }
+          }
+        }
+      ]
+    },
+    "usage": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/provider_operation_identity" },
+        {
+          "type": "object",
+          "required": ["round", "purpose", "prompt_tokens", "completion_tokens", "total_tokens"],
           "properties": {
             "type": { "const": "usage" },
             "round": { "type": "integer", "minimum": 1 },
+            "purpose": { "enum": ["inference", "compaction"] },
             "prompt_tokens": { "type": "integer", "minimum": 0 },
             "completion_tokens": { "type": "integer", "minimum": 0 },
             "total_tokens": { "type": "integer", "minimum": 0 }
@@ -306,6 +349,23 @@
         }
       ]
     },
+    "background_result": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": ["id", "task", "status", "result", "joined"],
+          "properties": {
+            "type": { "const": "background_result" },
+            "id": { "type": "integer", "minimum": 1 },
+            "task": { "type": "string" },
+            "status": { "enum": ["done", "failed", "cancelled"] },
+            "result": { "type": "string" },
+            "joined": { "type": "boolean" }
+          }
+        }
+      ]
+    },
     "assistant": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -330,7 +390,9 @@
           "properties": {
             "type": { "const": "turn_finished" },
             "status": { "enum": ["ok", "partial", "error", "cancelled"] },
-            "background_writes": { "type": "integer", "minimum": 0 }
+            "background_writes": { "type": "integer", "minimum": 0 },
+            "tool_errors": { "type": "integer", "minimum": 0 },
+            "policy_errors": { "type": "integer", "minimum": 0 }
           }
         }
       ]
@@ -396,7 +458,8 @@
             "kind": { "type": "string" },
             "message": { "type": "string" },
             "exit_code": { "type": "integer" },
-            "tool_errors": { "type": "integer", "minimum": 0 }
+            "tool_errors": { "type": "integer", "minimum": 0 },
+            "policy_errors": { "type": "integer", "minimum": 0 }
           }
         }
       ]
@@ -410,6 +473,8 @@
             "status",
             "failures",
             "provider_failures",
+            "tool_failures",
+            "policy_failures",
             "user_failures",
             "cancelled_failures"
           ],
@@ -418,6 +483,8 @@
             "status": { "enum": ["ok", "partial", "error", "cancelled"] },
             "failures": { "type": "integer", "minimum": 0 },
             "provider_failures": { "type": "integer", "minimum": 0 },
+            "tool_failures": { "type": "integer", "minimum": 0 },
+            "policy_failures": { "type": "integer", "minimum": 0 },
             "user_failures": { "type": "integer", "minimum": 0 },
             "cancelled_failures": { "type": "integer", "minimum": 0 }
           }
@@ -438,9 +505,11 @@
                   "turn_started",
                   "provider_request",
                   "provider_attempt",
+                  "assistant_delta",
                   "usage",
                   "tool_started",
                   "tool_finished",
+                  "background_result",
                   "assistant",
                   "turn_finished",
                   "command_started",

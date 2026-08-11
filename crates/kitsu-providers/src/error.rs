@@ -2,6 +2,33 @@
 
 use thiserror::Error;
 
+/// Bounded response component whose provider-controlled byte ceiling was
+/// exceeded. Keeping this typed lets automation distinguish resource-safety
+/// rejection from malformed JSON or a transport failure without including any
+/// untrusted response content in the error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderResponsePart {
+    CompletionBody,
+    ModelCatalogBody,
+    ErrorBody,
+    SseLine,
+    SseStream,
+    ToolArguments,
+}
+
+impl std::fmt::Display for ProviderResponsePart {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            Self::CompletionBody => "completion body",
+            Self::ModelCatalogBody => "model catalog body",
+            Self::ErrorBody => "provider error body",
+            Self::SseLine => "SSE line",
+            Self::SseStream => "SSE stream",
+            Self::ToolArguments => "streamed tool arguments",
+        })
+    }
+}
+
 #[derive(Debug, Clone, Error)]
 pub enum ProviderError {
     #[error("connection error: {0}")]
@@ -12,6 +39,12 @@ pub enum ProviderError {
 
     #[error("invalid response from provider: {0}")]
     InvalidResponse(String),
+
+    #[error("provider {part} exceeded the {limit_bytes}-byte safety limit")]
+    ResponseTooLarge {
+        part: ProviderResponsePart,
+        limit_bytes: usize,
+    },
 
     #[error("auth rejected by gateway ({status}){}", .hint.as_ref().map(|h| format!(" — {h}")).unwrap_or_default())]
     Unauthorized { status: u16, hint: Option<String> },

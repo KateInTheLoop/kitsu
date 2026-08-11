@@ -7,16 +7,18 @@ pub mod error;
 pub mod permissions;
 
 pub use builtins::command::{
-    command_exec_tool, execute_command, CommandAmbientAuthority, CommandApprovalRequest,
-    CommandArtifactCompletion, CommandArtifactRequest, CommandDecision, CommandExecArgs,
-    CommandExecutableFingerprint, CommandExecutableIdentity, CommandExecutableResolution,
-    CommandGrantInfo, CommandGrantedExecutable, CommandLimits, CommandMode, CommandOutput,
-    CommandOutputArtifact, CommandOutputArtifactSink, CommandOutputArtifactWriter,
-    CommandOutputStream, CommandPolicy, CommandPrompter, CommandTermination,
+    command_exec_tool, execute_command, scope_command_progress, CommandAmbientAuthority,
+    CommandApprovalRequest, CommandArtifactCompletion, CommandArtifactRequest, CommandDecision,
+    CommandExecArgs, CommandExecutableFingerprint, CommandExecutableIdentity,
+    CommandExecutableResolution, CommandGrantInfo, CommandGrantedExecutable, CommandLimits,
+    CommandMode, CommandOutput, CommandOutputArtifact, CommandOutputArtifactSink,
+    CommandOutputArtifactWriter, CommandOutputStream, CommandPolicy, CommandProgressSink,
+    CommandPrompter, CommandTermination,
 };
 pub use error::ToolError;
 pub use permissions::{
-    Action, Decision, Mode, PermissionRequest, Permissions, Prompter, Revocation,
+    Action, Decision, Mode, PermissionRequest, Permissions, Prompter, ReadAuthorization,
+    Revocation, TrustedImplicitReadRoot,
 };
 
 use std::collections::HashMap;
