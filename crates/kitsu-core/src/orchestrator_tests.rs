@@ -3082,3 +3082,173 @@ async fn failed_live_event_sink_stops_before_tool_mutation() {
         } if call_id == "call-must-not-run"
     )));
 }
+
+// --- recovered tool errors & final-round status ------------------------------
+
+/// A tool failure the model corrects in a later round is the normal agentic
+/// retry pattern: cumulative `tool_errors` still reports it, but
+/// `final_round_tool_errors` must be zero so strict callers can commit the
+/// turn on its successful final state.
+#[tokio::test]
+async fn test_recovered_tool_error_clears_final_round_status() {
+    let provider = MockProvider::new(vec![
+        // round 1: the failing call
+        vec![
+            ChatDelta::ToolCall(tc("flaky", "call_1", "{\"try\":1}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        // round 2: the corrected call succeeds
+        vec![
+            ChatDelta::ToolCall(tc("flaky", "call_2", "{\"try\":2}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        // round 3: final answer
+        vec![
+            ChatDelta::Text("fixed".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    tools.register("flaky", {
+        let calls = calls.clone();
+        Box::new(move |_args: String| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err::<String, ToolError>(ToolError::ExecError(
+                        "edit conflict: old_text matched 2 times".to_string(),
+                    ))
+                } else {
+                    Ok::<String, ToolError>("updated".to_string())
+                }
+            })
+        })
+    });
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("a recovered tool error must not abort the loop");
+    assert!(out.contains("fixed"));
+    assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.policy_errors, 0);
+    assert_eq!(
+        state.last_turn.final_round_tool_errors, 0,
+        "the last executed tool round succeeded, so the recovery must be visible"
+    );
+    assert_eq!(state.last_turn.completion, TurnCompletion::Complete);
+}
+
+/// An UNrecovered tool failure (the last tool round still failed) keeps a
+/// nonzero `final_round_tool_errors` so strict callers still reject the turn.
+#[tokio::test]
+async fn test_unrecovered_tool_error_keeps_final_round_status() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("bad_tool", "call_err", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("gave up".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    tools.register("bad_tool", err_handler(ran.clone()));
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("a failing tool must not abort the loop");
+    assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.final_round_tool_errors, 1);
+}
+
+// --- context-window runtime cross-check --------------------------------------
+
+#[test]
+fn test_context_window_shortfall_heuristic() {
+    use crate::orchestrator::context_window_shortfall;
+    // The audited Ollama case: resolved 8192, sent ~4299, server clamped 4096.
+    assert!(context_window_shortfall(4096, 4299, 8192));
+    // Acceptance-test shape: 5000-token prompt clamped to 4096.
+    assert!(context_window_shortfall(4096, 5000, 8192));
+    // Reported at/above the window is the window working as resolved.
+    assert!(!context_window_shortfall(8192, 9000, 8192));
+    // Small estimate noise (tokenizer beating chars/4) must not warn.
+    assert!(!context_window_shortfall(4000, 4100, 8192));
+    // Tiny prompts never trigger.
+    assert!(!context_window_shortfall(90, 100, 8192));
+    assert!(!context_window_shortfall(0, 100, 8192));
+    // Non-power-of-two clamps still trigger on a wide margin.
+    assert!(!context_window_shortfall(3900, 4100, 8192));
+    assert!(context_window_shortfall(3000, 5000, 8192));
+}
+
+/// A usage report far below the sent estimate records durable window evidence
+/// on the session state (without rewriting the resolved window).
+#[tokio::test]
+async fn test_usage_shortfall_records_window_evidence() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("short answer".to_string()),
+        ChatDelta::Usage(kitsu_providers::Usage {
+            prompt_tokens: 4096,
+            completion_tokens: 3,
+            total_tokens: 4099,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(2);
+    c.context_window = Some(8192);
+    c.quiet = true;
+    // ~20k chars => ~5k estimated tokens: inside the budget, far above 4096.
+    let mut messages = vec![kitsu_providers::ChatMessage::user("x".repeat(20_000))];
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .expect("turn should succeed");
+    let evidence = state
+        .window_evidence
+        .expect("shortfall evidence must be recorded");
+    assert_eq!(evidence.reported_prompt_tokens, 4096);
+    assert_eq!(evidence.resolved_window, 8192);
+    assert!(evidence.estimated_sent_tokens > 4096);
+    assert!(!evidence.warned, "warning is the CLI's one-time job");
+}
+
+/// A healthy usage report records no evidence.
+#[tokio::test]
+async fn test_healthy_usage_records_no_window_evidence() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Usage(kitsu_providers::Usage {
+            prompt_tokens: 5100,
+            completion_tokens: 2,
+            total_tokens: 5102,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(2);
+    c.context_window = Some(8192);
+    c.quiet = true;
+    let mut messages = vec![kitsu_providers::ChatMessage::user("x".repeat(20_000))];
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .expect("turn should succeed");
+    assert!(state.window_evidence.is_none());
+}

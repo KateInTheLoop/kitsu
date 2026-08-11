@@ -20,6 +20,7 @@
     { "$ref": "#/$defs/command_started" },
     { "$ref": "#/$defs/command_result" },
     { "$ref": "#/$defs/command_finished" },
+    { "$ref": "#/$defs/context_window_mismatch" },
     { "$ref": "#/$defs/error" },
     { "$ref": "#/$defs/final_summary" },
     { "$ref": "#/$defs/forward_compatible_event" }
@@ -396,7 +397,7 @@
           "required": ["status"],
           "properties": {
             "type": { "const": "assistant_disposition" },
-            "status": { "enum": ["committed", "discarded"] },
+            "status": { "enum": ["committed", "committed_partial", "discarded"] },
             "reason": { "type": ["string", "null"] }
           }
         }
@@ -513,6 +514,26 @@
         }
       ]
     },
+    "context_window_mismatch": {
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "reported_prompt_tokens",
+            "estimated_sent_tokens",
+            "resolved_window"
+          ],
+          "properties": {
+            "type": { "const": "context_window_mismatch" },
+            "turn_id": { "type": "string", "minLength": 1 },
+            "reported_prompt_tokens": { "type": "integer", "minimum": 0 },
+            "estimated_sent_tokens": { "type": "integer", "minimum": 0 },
+            "resolved_window": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
     "forward_compatible_event": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -538,6 +559,7 @@
                   "command_started",
                   "command_result",
                   "command_finished",
+                  "context_window_mismatch",
                   "error",
                   "final_summary"
                 ]

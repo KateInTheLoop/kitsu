@@ -484,7 +484,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
-| `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. |
+| `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. If the deadline expires after real output already streamed, one-shot runs keep it: the answer ends with a `[stopped: deadline expired …]` marker and is labeled partial (exit code stays `2`). |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
@@ -507,7 +507,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
 | `--session` | Explicitly create and autosave a new scripted or piped session. |
 | `--no-session` | Disable conversation snapshots and prompt-history persistence for this chat. |
-| `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. |
+| `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. Accepts *partial* success only: if every turn and command failed, the script still exits nonzero. |
 
 Examples:
 
@@ -675,8 +675,12 @@ kitsu --gateway ollama chat --allow-write ./out --script gen.txt
 
 Script failures include the file and line, roll the failed conversation turn
 back, and return exit `1` (command/input/auth setup, tool failure, or local
-policy denial) or `2` (provider, truncation, or exhausted rounds). Use
-`--allow-turn-errors` only when partial success is intentional.
+policy denial) or `2` (provider, truncation, or exhausted rounds). A tool error
+the model recovers from within the same turn (for example an edit-precondition
+conflict followed by a corrected, successful edit) does not fail the turn: the
+turn is judged by its final tool round, and only policy denials always fail.
+Use `--allow-turn-errors` only when partial success is intentional; it accepts
+partial success, so a script where everything failed still exits nonzero.
 
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
@@ -685,7 +689,11 @@ to determine the outcome. Provider streaming remains enabled unless
 `--no-stream` is set; text arrives in ordered, JSON-escaped `assistant_delta`
 records whose concatenation matches the final assistant event. Treat it as
 provisional until `assistant_disposition` says `committed`; strict rollback
-closes it as `discarded`. `run_started` distinguishes disabled, pending, and
+closes it as `discarded`, and a deadline that expires mid-answer in a one-shot
+run closes it as `committed_partial` (kept, marked, still exit `2`). A
+`context_window_mismatch` event reports runtime evidence that the server's
+real context window is smaller than the resolved one. `run_started`
+distinguishes disabled, pending, and
 resumable session snapshots. Status, permissions, context, diff, model,
 reasoning, compaction, session/checkpoint inventory, skills, profiles, command
 artifacts, help/tools, and job/thread slash commands emit typed
