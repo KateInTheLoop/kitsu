@@ -7,6 +7,15 @@
 //! `spawn_agent` tool (depth-1), and its filesystem actions still go through the
 //! shared permission model — no privilege escalation.
 
+pub mod profile;
+pub mod thread;
+
+use self::thread::{
+    AgentHandoffState, AgentSteeringError, AgentSteeringErrorKind, AgentSteeringReceipt,
+    AgentThreadLimitError, AgentThreadLimits, AgentThreadPhase, AgentThreadRuntime,
+    AgentThreadSnapshot, AgentThreadSnapshotDto,
+};
+
 use std::collections::HashMap;
 use std::fmt;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -25,6 +34,8 @@ use tokio::sync::watch;
 #[derive(serde::Deserialize)]
 struct SpawnArgs {
     task: String,
+    #[serde(default)]
+    profile: Option<String>,
 }
 
 #[derive(serde::Deserialize)]
@@ -72,13 +83,11 @@ pub enum AgentStatus {
 struct AgentRecord {
     task: String,
     status: AgentStatus,
-    /// Set only after a full terminal result has been returned to a user/model
-    /// surface. Listing body-free progress does not acknowledge the result.
-    result_observed: bool,
     handle: Option<tokio::task::JoinHandle<()>>,
     started_at: Instant,
     finished_at: Option<Instant>,
     telemetry: AgentTelemetry,
+    thread: thread::AgentThreadState,
 }
 
 /// Safe, bounded observability collected for one background subagent.
@@ -146,7 +155,7 @@ struct SubagentRunReport {
 impl AgentTelemetry {
     fn started(model: String) -> Self {
         Self {
-            model,
+            model: thread::safe_inline_label(&model, 256),
             last_activity: Some("started".to_string()),
             recent_activity: vec!["started".to_string()],
             ..Self::default()
@@ -274,6 +283,24 @@ pub enum AgentPruneOutcome {
     NotFound,
 }
 
+/// Outcome of explicitly acknowledging a terminal result handoff.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentHandoffAckOutcome {
+    Acknowledged,
+    AlreadyAcknowledged,
+    NotReady,
+    NotFound,
+}
+
+/// Outcome of closing one agent's correction channel without stopping it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AgentSteeringCloseOutcome {
+    Closed,
+    AlreadyClosed,
+    NotRunning,
+    NotFound,
+}
+
 /// Registry of background subagents, shared between `spawn_agent_bg`,
 /// `agent_result`, and the `/agents` command. Detached subagents update their
 /// record on completion; the user (via `/agents`) or the model (via
@@ -290,6 +317,7 @@ pub struct AgentRegistry {
     generation: AtomicU64,
     changes: watch::Sender<AgentRegistrySnapshot>,
     limits: AgentRegistryLimits,
+    thread_limits: AgentThreadLimits,
 }
 
 /// Cheap state published whenever the externally visible agent registry
@@ -316,6 +344,7 @@ impl AgentRegistry {
             generation: AtomicU64::new(0),
             changes,
             limits,
+            thread_limits: AgentThreadLimits::default(),
         }
     }
 
@@ -326,8 +355,20 @@ impl AgentRegistry {
 
     /// Construct a registry with explicit admission and retention bounds.
     /// Zero is valid and disables the corresponding kind of admission.
+    #[cfg(test)]
     pub fn with_limits(limits: AgentRegistryLimits) -> Arc<Self> {
         Arc::new(Self::with_config(limits))
+    }
+
+    /// Construct a registry with explicit job and per-thread retention bounds.
+    pub fn with_limits_and_thread_limits(
+        limits: AgentRegistryLimits,
+        thread_limits: AgentThreadLimits,
+    ) -> Result<Arc<Self>, AgentThreadLimitError> {
+        let thread_limits = thread_limits.validate()?;
+        let mut registry = Self::with_config(limits);
+        registry.thread_limits = thread_limits;
+        Ok(Arc::new(registry))
     }
 
     /// Register a new running agent, returning its id.
@@ -337,16 +378,18 @@ impl AgentRegistry {
             let mut agents = self.agents.lock().expect("agent registry");
             self.check_capacity(&agents)?;
             let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            let (thread, _runtime) =
+                thread::AgentThreadState::new(&task, "", None, self.thread_limits);
             agents.insert(
                 id,
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
-                    result_observed: false,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
                     telemetry: AgentTelemetry::started(String::new()),
+                    thread,
                 },
             );
             (id, self.changed_snapshot(&agents))
@@ -376,6 +419,7 @@ impl AgentRegistry {
     }
 
     /// Admit and atomically attach one instrumented detached task.
+    #[cfg(test)]
     fn spawn_background_report<F, Fut>(
         self: &Arc<Self>,
         task: String,
@@ -386,24 +430,54 @@ impl AgentRegistry {
         F: FnOnce(u64, Arc<Self>) -> Fut,
         Fut: std::future::Future<Output = SubagentRunReport> + Send + 'static,
     {
+        let full_task = task.clone();
+        self.spawn_background_thread(
+            task,
+            full_task,
+            model,
+            None,
+            move |id, registry, _runtime| build(id, registry),
+        )
+    }
+
+    /// Admit and atomically attach one detached task with an inspectable thread
+    /// and a correction receiver owned by its nested turn.
+    fn spawn_background_thread<F, Fut>(
+        self: &Arc<Self>,
+        task: String,
+        full_task: String,
+        model: String,
+        profile: Option<String>,
+        build: F,
+    ) -> Result<u64, AgentStartError>
+    where
+        F: FnOnce(u64, Arc<Self>, AgentThreadRuntime) -> Fut,
+        Fut: std::future::Future<Output = SubagentRunReport> + Send + 'static,
+    {
         let (id, update) = {
             let mut agents = self.agents.lock().expect("agent registry");
             self.check_capacity(&agents)?;
             let id = self.next.fetch_add(1, Ordering::Relaxed) + 1;
+            let (thread, runtime) = thread::AgentThreadState::new(
+                &full_task,
+                &model,
+                profile.as_deref(),
+                self.thread_limits,
+            );
             agents.insert(
                 id,
                 AgentRecord {
                     task,
                     status: AgentStatus::Running,
-                    result_observed: false,
                     handle: None,
                     started_at: Instant::now(),
                     finished_at: None,
                     telemetry: AgentTelemetry::started(model),
+                    thread,
                 },
             );
             let running_registry = self.clone();
-            let future = build(id, running_registry.clone());
+            let future = build(id, running_registry.clone(), runtime);
             let handle = tokio::spawn(async move {
                 running_registry.finish_report(id, future.await);
             });
@@ -469,10 +543,18 @@ impl AgentRegistry {
             if let Some(telemetry) = telemetry {
                 rec.telemetry = telemetry;
             }
-            rec.status = match result {
-                Ok(r) => AgentStatus::Done(r),
-                Err(e) => AgentStatus::Failed(e),
+            let (status, phase, result_bytes) = match result {
+                Ok(result) => {
+                    let bytes = result.len();
+                    (AgentStatus::Done(result), AgentThreadPhase::Done, bytes)
+                }
+                Err(error) => {
+                    let bytes = error.len();
+                    (AgentStatus::Failed(error), AgentThreadPhase::Failed, bytes)
+                }
             };
+            rec.status = status;
+            rec.thread.finish(phase, result_bytes);
             rec.handle = None;
             rec.finished_at = Some(Instant::now());
             self.changed_snapshot(&agents)
@@ -492,6 +574,7 @@ impl AgentRegistry {
             if !matches!(record.status, AgentStatus::Running) {
                 return;
             }
+            record.thread.record_runtime_event(&event);
             record_telemetry_event(&mut record.telemetry, event);
             self.changed_snapshot(&agents)
         };
@@ -571,6 +654,110 @@ impl AgentRegistry {
         }
     }
 
+    /// Inspect one agent's bounded, redacted task/event thread. It may contain
+    /// bounded assistant deltas, but never the registry's unbounded terminal
+    /// result field; use [`AgentRegistry::result`] to perform and acknowledge a
+    /// handoff.
+    pub fn thread_snapshot(&self, id: u64) -> Option<AgentThreadSnapshot> {
+        let agents = self.agents.lock().expect("agent registry");
+        let record = agents.get(&id)?;
+        Some(
+            record
+                .thread
+                .snapshot(id, elapsed_millis(record.started_at, record.finished_at)),
+        )
+    }
+
+    /// Inspect all retained threads in stable id order.
+    pub fn thread_snapshots(&self) -> Vec<AgentThreadSnapshot> {
+        let agents = self.agents.lock().expect("agent registry");
+        let mut snapshots = agents
+            .iter()
+            .map(|(id, record)| {
+                record
+                    .thread
+                    .snapshot(*id, elapsed_millis(record.started_at, record.finished_at))
+            })
+            .collect::<Vec<_>>();
+        snapshots.sort_by_key(|snapshot| snapshot.id);
+        snapshots
+    }
+
+    /// Export sanitized, versioned DTOs. This never serializes the unbounded
+    /// terminal result field, tool arguments/results, provider bodies, handles,
+    /// or permission grants. Bounded assistant timeline text remains visible.
+    pub fn thread_snapshot_dtos(&self) -> Vec<AgentThreadSnapshotDto> {
+        self.thread_snapshots()
+            .iter()
+            .map(AgentThreadSnapshotDto::from_snapshot)
+            .collect()
+    }
+
+    /// Queue a bounded correction for exactly one running agent.
+    pub fn steer(
+        &self,
+        id: u64,
+        correction: &str,
+    ) -> Result<AgentSteeringReceipt, AgentSteeringError> {
+        let (receipt, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return Err(AgentSteeringError::new(
+                    id,
+                    AgentSteeringErrorKind::UnknownAgent,
+                    None,
+                ));
+            };
+            if !matches!(record.status, AgentStatus::Running) {
+                return Err(AgentSteeringError::new(
+                    id,
+                    AgentSteeringErrorKind::NotRunning,
+                    None,
+                ));
+            }
+            let receipt = record.thread.submit_steering(id, correction)?;
+            (receipt, self.changed_snapshot(&agents))
+        };
+        self.publish(update);
+        Ok(receipt)
+    }
+
+    /// Close one running agent's correction channel without stopping its work.
+    pub fn close_steering(&self, id: u64) -> AgentSteeringCloseOutcome {
+        let (outcome, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return AgentSteeringCloseOutcome::NotFound;
+            };
+            if !matches!(record.status, AgentStatus::Running) {
+                return AgentSteeringCloseOutcome::NotRunning;
+            }
+            if !record.thread.close_steering("closed by user request") {
+                return AgentSteeringCloseOutcome::AlreadyClosed;
+            }
+            (
+                AgentSteeringCloseOutcome::Closed,
+                self.changed_snapshot(&agents),
+            )
+        };
+        self.publish(update);
+        outcome
+    }
+
+    fn mark_steering_applied(&self, id: u64, sequence: u64) {
+        let update = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return;
+            };
+            if !record.thread.steering_applied(sequence) {
+                return;
+            }
+            self.changed_snapshot(&agents)
+        };
+        self.publish(update);
+    }
+
     /// Abort one running agent and join its task before publishing/returning
     /// the cancelled terminal status. Terminal records are returned unchanged.
     pub async fn cancel(&self, id: u64) -> AgentCancelOutcome {
@@ -604,6 +791,11 @@ impl AgentRegistry {
         }
     }
 
+    /// Codex-style spelling for [`AgentRegistry::cancel`].
+    pub async fn stop(&self, id: u64) -> AgentCancelOutcome {
+        self.cancel(id).await
+    }
+
     /// Abort and join every running agent. Returned statuses are id-ordered.
     pub async fn cancel_all(&self) -> Vec<AgentTerminalStatus> {
         self.cancel_matching(|_| true, "cancelled by user request")
@@ -634,6 +826,9 @@ impl AgentRegistry {
             for (id, record) in agents.iter_mut() {
                 if predicate(*id) && matches!(record.status, AgentStatus::Running) {
                     record.status = AgentStatus::Cancelled(reason.to_string());
+                    record
+                        .thread
+                        .finish(AgentThreadPhase::Cancelled, reason.len());
                     record.finished_at = Some(Instant::now());
                     let handle = record.handle.take();
                     statuses.push(terminal_status(*id, record, handle.is_some()));
@@ -676,6 +871,13 @@ impl AgentRegistry {
         };
         self.publish(update);
         outcome
+    }
+
+    /// Close a terminal thread and release its retained transcript/result.
+    /// Running work must be stopped first; this is the user-facing spelling of
+    /// the existing non-destructive [`AgentRegistry::prune`] contract.
+    pub fn close(&self, id: u64) -> AgentPruneOutcome {
+        self.prune(id)
     }
 
     /// Remove all terminal records, retaining every running agent. Returned
@@ -758,18 +960,58 @@ impl AgentRegistry {
     /// Reading a terminal result acknowledges it for shutdown reporting;
     /// polling a running job does not.
     pub fn result(&self, id: u64) -> Option<String> {
-        let mut agents = self.agents.lock().expect("agent registry");
-        let record = agents.get_mut(&id)?;
-        let result = match &record.status {
-            AgentStatus::Running => format!("agent #{id} is still running"),
-            AgentStatus::Done(result) => result.clone(),
-            AgentStatus::Failed(error) => format!("agent #{id} failed: {error}"),
-            AgentStatus::Cancelled(reason) => format!("agent #{id} cancelled: {reason}"),
+        let (result, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let record = agents.get_mut(&id)?;
+            let result = result_text(id, &record.status);
+            let acknowledged = !matches!(record.status, AgentStatus::Running)
+                && record.thread.acknowledge_handoff();
+            let update = acknowledged.then(|| self.changed_snapshot(&agents));
+            (result, update)
         };
-        if !matches!(record.status, AgentStatus::Running) {
-            record.result_observed = true;
+        if let Some(update) = update {
+            self.publish(update);
         }
         Some(result)
+    }
+
+    /// Read status/result text without acknowledging a ready handoff.
+    pub fn peek_result(&self, id: u64) -> Option<String> {
+        let agents = self.agents.lock().expect("agent registry");
+        agents
+            .get(&id)
+            .map(|record| result_text(id, &record.status))
+    }
+
+    /// Return the explicit handoff state without reading result content.
+    pub fn handoff_state(&self, id: u64) -> Option<AgentHandoffState> {
+        self.agents
+            .lock()
+            .expect("agent registry")
+            .get(&id)
+            .map(|record| record.thread.handoff())
+    }
+
+    /// Acknowledge a result handoff without copying its content.
+    pub fn acknowledge_result(&self, id: u64) -> AgentHandoffAckOutcome {
+        let update = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let Some(record) = agents.get_mut(&id) else {
+                return AgentHandoffAckOutcome::NotFound;
+            };
+            match record.thread.handoff() {
+                AgentHandoffState::Unavailable => return AgentHandoffAckOutcome::NotReady,
+                AgentHandoffState::Acknowledged => {
+                    return AgentHandoffAckOutcome::AlreadyAcknowledged;
+                }
+                AgentHandoffState::Ready => {
+                    debug_assert!(record.thread.acknowledge_handoff());
+                }
+            }
+            self.changed_snapshot(&agents)
+        };
+        self.publish(update);
+        AgentHandoffAckOutcome::Acknowledged
     }
 
     /// Return every terminal result that no user/model surface has consumed,
@@ -777,17 +1019,24 @@ impl AgentRegistry {
     /// inspection. Interactive shutdown uses this to ensure completed detached
     /// work is printed before the process exits instead of silently vanishing.
     pub fn take_unobserved_terminal_results(&self) -> Vec<AgentTerminalStatus> {
-        let mut agents = self.agents.lock().expect("agent registry");
-        let mut results = agents
-            .iter_mut()
-            .filter_map(|(id, record)| {
-                if matches!(record.status, AgentStatus::Running) || record.result_observed {
-                    return None;
-                }
-                record.result_observed = true;
-                Some(terminal_status(*id, record, true))
-            })
-            .collect::<Vec<_>>();
+        let (mut results, update) = {
+            let mut agents = self.agents.lock().expect("agent registry");
+            let results = agents
+                .iter_mut()
+                .filter_map(|(id, record)| {
+                    if record.thread.handoff() != AgentHandoffState::Ready {
+                        return None;
+                    }
+                    debug_assert!(record.thread.acknowledge_handoff());
+                    Some(terminal_status(*id, record, true))
+                })
+                .collect::<Vec<_>>();
+            let update = (!results.is_empty()).then(|| self.changed_snapshot(&agents));
+            (results, update)
+        };
+        if let Some(update) = update {
+            self.publish(update);
+        }
         results.sort_by_key(|result| result.id);
         results
     }
@@ -828,6 +1077,15 @@ fn elapsed_millis(started: Instant, finished: Option<Instant>) -> u64 {
         .unwrap_or_else(Instant::now)
         .duration_since(started);
     u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX)
+}
+
+fn result_text(id: u64, status: &AgentStatus) -> String {
+    match status {
+        AgentStatus::Running => format!("agent #{id} is still running"),
+        AgentStatus::Done(result) => result.clone(),
+        AgentStatus::Failed(error) => format!("agent #{id} failed: {error}"),
+        AgentStatus::Cancelled(reason) => format!("agent #{id} cancelled: {reason}"),
+    }
 }
 
 fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
@@ -1086,7 +1344,8 @@ async fn run_subagent_report<P: Provider>(
     extra_system: &str,
     task: String,
 ) -> SubagentRunReport {
-    run_subagent_report_with_progress(provider, sub_tools, cfg, extra_system, task, None).await
+    run_subagent_report_with_progress(provider, sub_tools, cfg, extra_system, task, None, None)
+        .await
 }
 
 async fn run_subagent_report_with_progress<P: Provider>(
@@ -1096,22 +1355,64 @@ async fn run_subagent_report_with_progress<P: Provider>(
     extra_system: &str,
     task: String,
     progress: Option<(Arc<AgentRegistry>, u64)>,
+    mut thread_runtime: Option<AgentThreadRuntime>,
 ) -> SubagentRunReport {
     let mut system = SUBAGENT_SYSTEM.to_string();
     if !extra_system.is_empty() {
         system.push_str("\n\n");
         system.push_str(extra_system);
     }
-    let mut messages = vec![ChatMessage::system(system), ChatMessage::user(task)];
-    let event_log = match progress {
-        Some((registry, id)) => AgentEventLog::with_observer(move |event| {
-            registry.record_progress_event(id, event.clone());
-        }),
+    let event_log = match &progress {
+        Some((registry, id)) => {
+            let registry = registry.clone();
+            let id = *id;
+            AgentEventLog::with_observer(move |event| {
+                registry.record_progress_event(id, event.clone());
+            })
+        }
         None => AgentEventLog::default(),
     };
     let mut instrumented_cfg = cfg.clone();
     instrumented_cfg.event_log = Some(event_log.clone());
-    let outcome = run_agent_turn(provider, sub_tools, &mut messages, &instrumented_cfg).await;
+    let mut latest_correction = None;
+    let outcome = loop {
+        let mut messages = vec![
+            ChatMessage::system(system.clone()),
+            ChatMessage::user(task.clone()),
+        ];
+        if let Some(correction) = &latest_correction {
+            messages.push(ChatMessage::user(format!(
+                "Updated direction from the parent while you were working:\n{correction}"
+            )));
+        }
+
+        let turn = run_agent_turn(provider, sub_tools, &mut messages, &instrumented_cfg);
+        tokio::pin!(turn);
+        let steering = match thread_runtime.as_mut() {
+            Some(runtime) => tokio::select! {
+                biased;
+                outcome = &mut turn => break outcome,
+                correction = runtime.recv_steering() => correction,
+            },
+            None => break turn.await,
+        };
+        match steering {
+            Some(message) => {
+                if let Some((registry, id)) = &progress {
+                    registry.mark_steering_applied(*id, message.sequence);
+                }
+                latest_correction = Some(message.correction);
+                // Dropping `turn` stops the in-flight provider/tool future. The
+                // next attempt uses a fresh transcript plus the latest bounded
+                // correction; already-completed filesystem effects remain.
+            }
+            None => {
+                // The UI explicitly closed steering. Let this attempt finish
+                // without polling a permanently closed receiver.
+                break turn.await;
+            }
+        }
+    };
     let failure_class = outcome.as_ref().err().map(classify_agent_error);
     let telemetry = summarize_events(cfg.model.clone(), event_log.take(), failure_class);
     let result = match outcome {
@@ -1138,7 +1439,8 @@ async fn run_subagent<P: Provider>(
 
 /// A short one-line label for a task, for the collected `spawn_agents` output.
 fn task_preview(task: &str) -> String {
-    let first = task.lines().next().unwrap_or("").trim();
+    let safe_task = thread::sanitize_and_redact_text(task);
+    let first = safe_task.lines().next().unwrap_or("").trim();
     let short: String = first.chars().take(60).collect();
     if first.chars().count() > 60 {
         format!("{short}…")
@@ -1280,6 +1582,21 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
 /// result is stored in `registry` and fetched later via `agent_result`/`/agents`.
 /// `sub_cfg` must already be quiet. Depth-1: the subagent's registry has no spawn
 /// tools.
+#[derive(Clone)]
+pub struct BackgroundProfileRuntime {
+    catalog: Arc<profile::AgentProfileCatalog>,
+    tools: Arc<HashMap<String, Arc<Registry>>>,
+}
+
+impl BackgroundProfileRuntime {
+    pub fn new(
+        catalog: Arc<profile::AgentProfileCatalog>,
+        tools: Arc<HashMap<String, Arc<Registry>>>,
+    ) -> Self {
+        Self { catalog, tools }
+    }
+}
+
 pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     provider: Arc<P>,
     sub_tools: Arc<Registry>,
@@ -1287,6 +1604,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     live: LiveModelWindow,
     extra_system: String,
     registry: Arc<AgentRegistry>,
+    profile_runtime: BackgroundProfileRuntime,
 ) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "spawn_agent_bg".to_string(),
@@ -1298,7 +1616,8 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "task": {"type": "string", "description": "A complete, self-contained task for the background subagent"}
+                "task": {"type": "string", "description": "A complete, self-contained task for the background subagent"},
+                "profile": {"type": "string", "description": "Optional validated specialist profile name; available built-ins are reviewer and reasoning"}
             },
             "required": ["task"]
         }),
@@ -1310,29 +1629,80 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
         let live = live.clone();
         let extra_system = extra_system.clone();
         let registry = registry.clone();
+        let profile_runtime = profile_runtime.clone();
         Box::pin(async move {
             let a: SpawnArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
-            let cfg = resolve_cfg(&sub_cfg, &live);
+            let selected_profile = match a.profile.as_deref() {
+                Some(name) => {
+                    Some(profile_runtime.catalog.get(name).cloned().ok_or_else(|| {
+                        ToolError::InvalidArgs(format!(
+                            "unknown background-agent profile '{name}'; use /profiles"
+                        ))
+                    })?)
+                }
+                None => None,
+            };
+            let mut cfg = resolve_cfg(&sub_cfg, &live);
+            let effective_tools = selected_profile
+                .as_ref()
+                .and_then(|profile| profile_runtime.tools.get(&profile.name))
+                .cloned()
+                .unwrap_or_else(|| sub_tools.clone());
+            let mut effective_system = extra_system.clone();
+            if let Some(profile) = selected_profile.as_ref() {
+                if let Some(profile_model) = profile.model.as_ref() {
+                    cfg.model = profile_model.clone();
+                }
+                cfg.reasoning_effort = Some(match profile.reasoning_effort {
+                    profile::AgentReasoningEffort::None => kitsu_providers::ReasoningEffort::None,
+                    profile::AgentReasoningEffort::Minimal => {
+                        kitsu_providers::ReasoningEffort::Minimal
+                    }
+                    profile::AgentReasoningEffort::Low => kitsu_providers::ReasoningEffort::Low,
+                    profile::AgentReasoningEffort::Medium => {
+                        kitsu_providers::ReasoningEffort::Medium
+                    }
+                    profile::AgentReasoningEffort::High => kitsu_providers::ReasoningEffort::High,
+                    profile::AgentReasoningEffort::XHigh => kitsu_providers::ReasoningEffort::XHigh,
+                });
+                if !profile.instructions.trim().is_empty() {
+                    if !effective_system.is_empty() {
+                        effective_system.push_str("\n\n");
+                    }
+                    effective_system.push_str(&profile.instructions);
+                }
+                debug_assert!(profile.tool_policy.accepts_registry(&effective_tools));
+            }
             let model = cfg.model.clone();
             let preview = task_preview(&a.task);
+            let profile_name = selected_profile
+                .as_ref()
+                .map(|profile| profile.name.clone());
             // Admission and task-handle attachment are atomic with respect to
             // cancel-all/session teardown; no externally visible running record
             // can exist without a joinable handle.
             let id = registry
-                .spawn_background_report(preview, model, move |id, running_registry| async move {
-                    kitsu_tools::scope_without_interactive_prompts(
-                        run_subagent_report_with_progress(
-                            &provider,
-                            &sub_tools,
-                            &cfg,
-                            &extra_system,
-                            a.task,
-                            Some((running_registry, id)),
-                        ),
-                    )
-                    .await
-                })
+                .spawn_background_thread(
+                    preview,
+                    a.task.clone(),
+                    model,
+                    profile_name,
+                    move |id, running_registry, runtime| async move {
+                        kitsu_tools::scope_without_interactive_prompts(
+                            run_subagent_report_with_progress(
+                                &provider,
+                                &effective_tools,
+                                &cfg,
+                                &effective_system,
+                                a.task,
+                                Some((running_registry, id)),
+                                Some(runtime),
+                            ),
+                        )
+                        .await
+                    },
+                )
                 .map_err(|error| ToolError::ExecError(error.to_string()))?;
             Ok(format!(
                 "Started background agent #{id}. It runs detached — fetch its result later with \
@@ -1379,6 +1749,7 @@ mod tests {
     use kitsu_providers::{
         ChatDelta, ChatRequest, ChatStream, FinishReason, ProviderError, Role, Usage,
     };
+    use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::Mutex;
 
     /// A provider that echoes each request's task (last user message) back as the
@@ -1417,6 +1788,39 @@ mod tests {
         rounds: Mutex<Vec<Vec<ChatDelta>>>,
         last_model: Mutex<Option<String>>,
     }
+
+    /// The first request never completes. A steering correction must cancel
+    /// that attempt and restart with the correction as the latest user message.
+    struct SteeringProvider {
+        calls: AtomicUsize,
+    }
+
+    impl Provider for SteeringProvider {
+        async fn healthcheck(&self) -> Result<(), ProviderError> {
+            Ok(())
+        }
+
+        async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+            if self.calls.fetch_add(1, AtomicOrdering::SeqCst) == 0 {
+                return std::future::pending::<Result<ChatStream, ProviderError>>().await;
+            }
+            let latest_user = req
+                .messages
+                .iter()
+                .rev()
+                .find(|message| matches!(message.role, Role::User))
+                .map(|message| message.content.clone())
+                .unwrap_or_default();
+            Ok(Box::pin(stream::iter(vec![
+                Ok(ChatDelta::Text(format!("followed:{latest_user}"))),
+                Ok(ChatDelta::Done(FinishReason::Stop)),
+            ])))
+        }
+
+        async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+            Ok(None)
+        }
+    }
     impl Provider for MockProvider {
         async fn healthcheck(&self) -> Result<(), ProviderError> {
             Ok(())
@@ -1444,6 +1848,13 @@ mod tests {
             stream: false,
             ..Default::default()
         }
+    }
+
+    fn empty_profile_runtime() -> BackgroundProfileRuntime {
+        BackgroundProfileRuntime::new(
+            Arc::new(profile::AgentProfileCatalog::new()),
+            Arc::new(HashMap::new()),
+        )
     }
 
     #[tokio::test]
@@ -1544,6 +1955,7 @@ mod tests {
         let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
         let mut cfg = sub_cfg();
         cfg.quiet = true;
+        let profile_runtime = empty_profile_runtime();
         let (desc, handler) = spawn_agent_bg_tool(
             Arc::new(EchoProvider),
             Arc::new(Registry::new()),
@@ -1551,6 +1963,7 @@ mod tests {
             live,
             String::new(),
             registry.clone(),
+            profile_runtime,
         );
         assert_eq!(desc.name, "spawn_agent_bg");
         // Returns immediately with an id (does not block on the subagent).
@@ -1598,6 +2011,73 @@ mod tests {
         // /agents-style listing shows the finished agent.
         assert!(registry.list().contains("#1"));
         assert!(registry.list().contains("[done]"));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn background_steering_restarts_only_that_thread_and_handoff_is_explicit() {
+        use std::time::Duration;
+
+        let registry = AgentRegistry::new();
+        let provider = Arc::new(SteeringProvider {
+            calls: AtomicUsize::new(0),
+        });
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let mut cfg = sub_cfg();
+        cfg.quiet = true;
+        let profile_runtime = empty_profile_runtime();
+        let (_descriptor, handler) = spawn_agent_bg_tool(
+            provider.clone(),
+            Arc::new(Registry::new()),
+            cfg,
+            live,
+            String::new(),
+            registry.clone(),
+            profile_runtime,
+        );
+        handler(
+            r#"{"task":"review parser; token=hf_abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),
+        )
+        .await
+        .unwrap();
+
+        let receipt = registry
+            .steer(1, "focus on UTF-8 boundaries")
+            .expect("running thread accepts a targeted correction");
+        assert_eq!(receipt.id, 1);
+        assert_eq!(receipt.sequence, 1);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while registry.progress_snapshot().running != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("steered turn should restart and finish");
+        assert_eq!(provider.calls.load(AtomicOrdering::SeqCst), 2);
+
+        let result = registry.peek_result(1).unwrap();
+        assert!(result.contains("focus on UTF-8 boundaries"));
+        assert_eq!(registry.handoff_state(1), Some(AgentHandoffState::Ready));
+        let snapshot = registry.thread_snapshot(1).unwrap();
+        assert_eq!(snapshot.phase, AgentThreadPhase::Done);
+        assert_eq!(snapshot.handoff, AgentHandoffState::Ready);
+        assert!(!snapshot.steering_open);
+        let persisted =
+            serde_json::to_string(&AgentThreadSnapshotDto::from_snapshot(&snapshot)).unwrap();
+        assert!(!persisted.contains("hf_abcdefghijklmnopqrstuvwxyz123456"));
+        assert!(snapshot.timeline.entries.iter().any(|entry| {
+            entry.kind == thread::AgentTimelineKind::Lifecycle
+                && entry.text.contains("correction #1 applied")
+        }));
+        assert_eq!(
+            registry.acknowledge_result(1),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+        assert_eq!(
+            registry.acknowledge_result(1),
+            AgentHandoffAckOutcome::AlreadyAcknowledged
+        );
+        assert!(registry.take_unobserved_terminal_results().is_empty());
     }
 
     #[test]
@@ -1726,6 +2206,7 @@ mod tests {
         let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
         let mut cfg = sub_cfg();
         cfg.quiet = true;
+        let profile_runtime = empty_profile_runtime();
         let (_descriptor, handler) = spawn_agent_bg_tool(
             Arc::new(EchoProvider),
             Arc::new(Registry::new()),
@@ -1733,6 +2214,7 @@ mod tests {
             live,
             String::new(),
             registry.clone(),
+            profile_runtime,
         );
 
         let error = handler(r#"{"task":"must not start"}"#.to_string())
@@ -1915,6 +2397,10 @@ mod tests {
         };
         assert!(cancelled.joined);
         assert!(matches!(cancelled.status, AgentStatus::Cancelled(_)));
+        let cancelled_thread = registry.thread_snapshot(first).unwrap();
+        assert_eq!(cancelled_thread.phase, AgentThreadPhase::Cancelled);
+        assert_eq!(cancelled_thread.handoff, AgentHandoffState::Ready);
+        assert!(!cancelled_thread.steering_open);
         assert!(matches!(
             registry.cancel(first).await,
             AgentCancelOutcome::AlreadyTerminal(_)
@@ -1930,7 +2416,7 @@ mod tests {
         assert_eq!(error.kind, AgentCapacityKind::Records);
         assert_eq!(registry.watermark(), second, "refusal allocates no id");
 
-        let AgentPruneOutcome::Pruned(pruned) = registry.prune(first) else {
+        let AgentPruneOutcome::Pruned(pruned) = registry.close(first) else {
             panic!("terminal agent should be pruned");
         };
         assert_eq!(pruned.id, first);

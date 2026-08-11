@@ -127,6 +127,64 @@ Acceptance: repository skill metadata cannot provide unbounded hidden
 instructions or startup I/O; resume discloses changed/removed sources and the
 system prompt matches the active capability set.
 
+## Implementation outcome
+
+The implementation pass closed all ten priorities on the same branch, without
+hosted inference or credentials:
+
+1. Developer commands now require both exact argv/cwd consent and a successful,
+   fingerprinted Linux Bubblewrap preflight. Writable command roots, read-only
+   runtime mounts, isolated network/PID/IPC/UTS/user namespaces, capability
+   dropping, and a fixed environment are enforced; unsupported or changed
+   backends fail closed. Full-output artifacts have per-file and aggregate
+   count/byte ceilings plus `/artifacts` inventory/pruning.
+2. Background work has bounded redacted thread snapshots, targeted steering,
+   stop/close semantics, explicit result handoff/acknowledgement, and `/agent`
+   plus richer `/jobs` JSON. Partial model bodies and tool payloads are excluded
+   from the inspection timeline.
+3. The request path transports optional reasoning effort, `/reasoning` changes
+   it for later turns, and validated built-in profiles provide a read-only
+   reviewer and an intentionally tool-free reasoning worker. Profile-selected
+   children receive only their intersected registry and instructions.
+4. A positional chat prompt starts without consulting stdin. Piped input,
+   attachment expansion, and the one-shot model turn share one deadline; script
+   file acquisition is cancellable and bounded. Held-open-stdin regressions
+   cover both paths.
+5. Build invalidation follows the real/common Git directories, worktree HEAD,
+   index, loose/packed/reftable refs, and source/ignore inputs. Ordinary and
+   linked-worktree fixtures prove A-to-B and dirty-to-clean provenance changes
+   without `cargo clean`.
+6. Streaming is explicitly transactional: JSONL closes provisional
+   `assistant_delta`/`assistant` output with a committed or discarded
+   `assistant_disposition`; human mode visibly invalidates rolled-back text.
+7. `run_started` labels session snapshots disabled, pending until first success,
+   or resumable. Help, tools, checkpoint inventory, profiles, reasoning,
+   artifacts, and thread controls produce paired structured command results.
+8. Generated quick-start commands use the actual config path. Doctor separates
+   credential requirement/presence/readiness, normalizes and validates the
+   selected model catalog, and labels `--online` as catalog-only rather than a
+   chat-route probe.
+9. Active-turn job steering/stopping and `/quit cancel` bypass the prompt FIFO;
+   notices preserve one input-order stream, session switches discard stale
+   notice baselines, and plain assistive Ctrl+C returns to an escape-free prompt.
+10. Skill discovery/loading now has deterministic count, manifest, index,
+    resource, and omission budgets; project metadata is framed as untrusted;
+    explicit loads retain SHA-256 provenance. Resume always rebuilds current
+    system context and revalidates every persisted `/skill` snapshot, replacing
+    drifted content and removing unavailable sources with a disclosure.
+
+The cycle is intentionally stopped after this implementation/release gate; no
+sixth hourly audit starts automatically.
+
+## Release verification
+
+The final integrated tree passed 558 local tests: 184 Kitsu unit tests, 2 Git
+provenance fixtures, 84 CLI integration tests, 79 core tests, 58 provider
+tests, 21 renderer tests, and 130 tool/permission tests. The strict workspace
+Clippy gate (`-D warnings` with all targets and features), formatting check,
+diff whitespace check, and published JSON Schema parse also passed. These gates
+used offline dependencies and local fixtures; they did not call hosted models.
+
 ## Important follow-ups
 
 Host-owned `/diff` should not require widening model read authority; exact

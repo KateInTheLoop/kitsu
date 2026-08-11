@@ -8,15 +8,17 @@ Kitsu is a Cargo workspace of five crates:
 
 - `kitsu` — `init`, `doctor`, `ask`, verified `review`, `models`, `sessions`, and
   `chat`; slash commands; JSONL automation; `@file`; editable queues/steering;
-  project context; and bounded background-job control.
+  project context; bounded background-agent threads/profiles; reasoning control;
+  and aggregate command-artifact lifecycle management.
 - `kitsu-core` — the provider/tool agent loop, checked context preflight,
   offload/trim/summarize cascade, manual compaction, and compaction telemetry.
 - `kitsu-providers` — provider traits and the shared OpenAI-compatible client,
   including streaming, physical-attempt telemetry, retry deadlines, and model
-  discovery/cache behavior.
+  discovery/cache behavior. Optional reasoning effort is transported only when
+  configured.
 - `kitsu-tools` — protected-path permissions, read/edit/write/search tools,
   verified diff/checkpoint journals, and opt-in literal-argv developer commands
-  with protected full-output artifacts.
+  with exact approval plus mandatory fail-closed Linux OS containment.
 - `kitsu-render` — sanitized terminal output, plain/reduced-motion rendering,
   streaming, diffs, tool activity, and usage/context telemetry.
 

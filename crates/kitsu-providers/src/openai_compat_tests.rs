@@ -76,6 +76,7 @@ fn simple_request() -> ChatRequest {
         tools: None,
         stream: true,
         temperature: Some(0.2),
+        reasoning_effort: None,
         max_tokens: None,
     }
 }

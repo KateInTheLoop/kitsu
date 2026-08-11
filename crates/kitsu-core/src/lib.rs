@@ -7,6 +7,7 @@ pub mod context;
 pub mod orchestrator;
 
 pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
+pub use kitsu_providers::ReasoningEffort;
 pub use orchestrator::{
     compact_context, run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentError,
     AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus, CommandRuntimeInvocation,

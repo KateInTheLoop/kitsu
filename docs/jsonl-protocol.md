@@ -37,7 +37,9 @@ guarantees requires a new schema identifier.
 - `run_started` is the first event after CLI validation; its `mode` is one of
   `ask`, `script`, `piped`, `review`, or `models`.
 - Chat/review runs report the resolved `model`, exact `session_id` (or null),
-  whether continuity was resumed, and whether successful work is durable.
+  whether continuity was resumed, whether successful work is durable,
+  `session_snapshot_state` (`disabled`, `pending_until_first_success`, or
+  `resumable`), and whether current system context replaced saved context.
 - A turn begins with `turn_started` and ends with exactly one `turn_finished`.
 - `provider_request` represents one logical model request in an agent round.
 - Provider requests, attempts, and usage carry `purpose: "inference"` for the
@@ -55,7 +57,10 @@ guarantees requires a new schema identifier.
 - Streaming text that is safe to display appears as ordered `assistant_delta`
   records. Text from a tool-capable round is held until Kitsu has ruled out a
   text-protocol tool call, so raw tool JSON is never mislabeled as an answer.
-  Concatenating one turn's deltas reproduces its committed `assistant.text`.
+  Concatenating one turn's deltas reproduces its final `assistant.text`, but
+  consumers must treat both as provisional until the matching
+  `assistant_disposition` says `committed`. Strict tool/policy or incomplete-turn
+  rollback instead closes them as `discarded` with an optional reason.
 - `tool_started` is followed by exactly one matching `tool_finished`, including
   cancellation.
 - A detached job whose terminal result was not already consumed is emitted as a
@@ -65,11 +70,14 @@ guarantees requires a new schema identifier.
 - Script query commands may place one structured `command_result` between their
   matching `command_started` and `command_finished`; status, permissions,
   context, diff, model-catalog, model-switch, compaction, session inventory,
-  skills, and background-job results never disappear into human stderr. Status,
-  permissions, and session inventory retain a compatibility `text` field
-  alongside typed fields. Job mutations report both whether state changed and
-  the resulting bounded registry snapshot.
+  skills, profiles, reasoning, tools, help, checkpoint inventory, command
+  artifacts, and background-job/thread results never disappear into human
+  stderr. Status, permissions, and session inventory retain a compatibility
+  `text` field alongside typed fields. Job mutations report both whether state
+  changed and the resulting bounded registry/thread snapshot.
 - `assistant` follows that turn's runtime events when final text is available.
+- `assistant_disposition` follows the assistant payload and closes its
+  provisional output transaction before `turn_finished`.
 - `final_summary` is the final event for a normally writable sink.
 
 `final_summary.status` is `ok` when every requested operation succeeded,

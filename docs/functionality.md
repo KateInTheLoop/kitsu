@@ -31,14 +31,21 @@ and refuses symlink-directory traversal.
 The implemented chat controls include:
 
 - Inspection: `/status`, `/context [refresh]`, `/permissions`, `/tools`, scoped
-  `/diff`, `/checkpoints`, `/checkpoint <id>`, `/jobs`, and `/sessions`.
-- Model/context: `/model`, `/models`, `/compact`, `/clear`, and `/retry`.
+  `/diff`, `/checkpoints`, `/checkpoint <id>`, `/jobs`, `/agent`, `/profiles`,
+  `/artifacts`, and `/sessions`.
+- Model/context: `/model`, `/models`, `/reasoning`, `/compact`, `/clear`, and
+  `/retry`.
 - Files/workflow: `/allow`, `/allow-write`, `/allow-read-write`,
   `/revoke-read`, `/revoke-write`, `/revoke-command`, `/save`, scoped `/review`,
   and `/undo [id]`.
 - Local context: `/skills` and `/skill`; bounded UTF-8 skill resources are
   captured with no-follow reads and loading them grants no filesystem access.
-- Scheduling: editable `/queue` controls plus active-turn `/steer` on Unix.
+  Discovery, aggregate manifest/resource bytes, directory entry count, and
+  rendered index size all have deterministic ceilings. Source/resource SHA-256
+  snapshots make later drift explicit, and project metadata is framed as
+  untrusted until an explicit load.
+- Scheduling: editable `/queue` controls plus active-turn `/steer`, `/jobs
+  steer|stop|stop-all`, and `/quit cancel` on Unix.
 - Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
   `/restore`, and `/delete`.
 
@@ -52,8 +59,9 @@ estimate and compaction ledger.
 meter back, and makes the submitted prompt available to `/retry`. Completed file
 side effects remain on disk and are reported rather than hidden. At an idle
 prompt, `Ctrl+C` clears the input. `/quit wait` waits for background jobs and
-`/quit cancel` cancels and joins them; an unqualified exit refuses to discard
-live work.
+`/quit cancel` immediately cancels the foreground turn, clears queued prompts,
+cancels and joins background jobs, and exits; an unqualified exit refuses to
+discard live work.
 
 ### Prompt queue and platform behavior
 
@@ -118,25 +126,36 @@ including JSONL framing and hex expansion; it reports separately how many raw
 stdout/stderr bytes were retained, marks truncation, and keeps draining both
 child pipes. Interactive invocations have their own approval
 prompt; automation must use exact `--allow-command` grants. `--yes` and
-filesystem grants do not approve commands. Command roots constrain only the
-requested working directory: approved processes retain the ambient host user's
-filesystem, network, environment, and process authority and are not sandboxed.
+filesystem grants do not approve commands. Exact approval is followed by a
+mandatory Linux Bubblewrap boundary: approved command roots are writable,
+required runtime paths are read-only, network/PID/IPC/UTS namespaces and the
+environment are isolated, and capabilities are dropped. Backend absence,
+replacement, or unsupported platforms fail closed before a prompt or child
+launch.
 Session grants also bind the executable observed at approval time; replacement
 or changed `PATH` resolution invalidates the grant before execution.
 Windows command execution currently fails closed before approval because Kitsu
-does not yet have loader-equivalent extension resolution and executable-image
-validation; it never substitutes a pathname-only fingerprint.
+does not yet have equivalent containment, loader-extension resolution, and
+executable-image validation; it never substitutes a pathname-only fingerprint.
 Default command timeout is 120 seconds, the requestable maximum is 600 seconds,
-retained stdout and stderr are each capped at 64 KiB.
+retained stdout and stderr are each capped at 64 KiB. Each protected full-output
+artifact has a 16 MiB serialized ceiling; the sink enforces 32 retained/in-flight
+artifacts and 256 MiB aggregate reservation, deterministically pruning the
+oldest verified artifact. `/artifacts` lists usage and prunes by ID or all.
 
 `/jobs` exposes bounded running/record capacity, status, elapsed time, model,
-usage, tool/write counts, safe recent activity, failure class, full terminal
-result retrieval, cancel+join, and pruning. `/agents` remains a compatibility
-alias. Styled mode uses a redraw-safe external printer; literal plain/assistive
-input defers notices until the current line is submitted. Any terminal result
-not opened through `/jobs show` is surfaced before a session switch or exit.
-Scripted JSONL emits the same retained evidence as `background_result`; an
-unacknowledged failed detached job makes strict automation fail.
+usage, tool/write counts, safe recent activity, failure class, terminal result
+handoff, targeted steering, joined cancellation, and pruning. `/agent show`
+adds a bounded redacted event timeline; tool arguments/output and partial model
+bodies are never copied into that inspection record. Built-in `/profiles`
+select a read-only reviewer or a tool-free reasoning worker, and background
+spawns can name a profile without inheriting broader capabilities. `/agents`
+remains a compatibility alias. Styled mode uses a redraw-safe external printer;
+literal plain/assistive input defers notices until the current line is submitted.
+Any terminal result not opened through `/jobs show` is surfaced before a session
+switch or exit. Scripted JSONL emits the same retained evidence as
+`background_result`; an unacknowledged failed detached job makes strict
+automation fail.
 
 ### `@file` attachments
 
@@ -251,8 +270,10 @@ machine-readable documents for management workflows. They reject `--jsonl`,
 whose event protocol is reserved for model-turn automation.
 
 `--jsonl` is the machine protocol. Provider streaming remains enabled unless
-`--no-stream` is set, and safe committed fragments become ordered
-`assistant_delta` events. It emits one `kitsu.chat.v1` JSON object per stdout
+`--no-stream` is set. Ordered `assistant_delta` records are provisional until a
+terminal `assistant_disposition` marks their turn `committed` or `discarded`;
+strict rollback can therefore never masquerade as a successful answer. It emits
+one `kitsu.chat.v1` JSON object per stdout
 line: run/turn/command framing, provider/tool/usage events, assistant text,
 typed errors, and exactly one `final_summary`. It rejects interactive TTY chat
 and human help/version output. Human diagnostics may still use stderr, but the
@@ -261,6 +282,17 @@ Error events distinguish user/provider/cancelled failures, ordinary tool
 failures, and local policy denials. Status, permissions, context, diff, model,
 compaction, session-inventory, skill, and job commands return typed
 `command_result` payloads rather than requiring stderr parsing.
+`run_started.session_snapshot_state` distinguishes stateless/disabled,
+pending-until-first-success, and immediately resumable continuity. Resuming
+always rebuilds the leading system context from the current project, skills,
+tools, model, and permission surface instead of trusting a stale saved system
+message.
+
+For one-shot chat, `--timeout-secs` is one deadline across piped-input reading,
+attachment preflight, retries, response-body streaming, and the model turn. A
+positional prompt is consumed immediately and never waits for an unrelated open
+stdin handle. Script file acquisition is also bounded; each scripted turn keeps
+its documented request deadline.
 
 Without JSONL, stdout contains assistant text only. Human metadata is on stderr;
 redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
@@ -284,15 +316,17 @@ control strings, but arbitrary safe Unicode in model text, paths, and user data
 is preserved. `KITSU_REDUCED_MOTION=1` uses a visible static status instead of
 the animated spinner.
 
-Unix builds additionally use descriptor-bound command cwd, process-group command
-cancellation, and descriptor-relative no-follow mutation/session operations.
+Linux builds additionally use mandatory Bubblewrap command containment.
+Unix builds use descriptor-bound command cwd, process-group command cancellation,
+and descriptor-relative no-follow mutation/session operations.
 Portable branches validate paths and snapshots and cancel/reap the direct child,
 but retain platform pathname races and cannot kill an entire descendant process
 group. Operations requiring an unavailable race-free atomic primitive fail
 closed rather than weakening the conflict guarantee. In particular, implicit
 project context, filesystem skills, and `@file` attachment reads/completion are
 disabled on non-Unix platforms until equivalent component-pinned traversal is
-available.
+available, and developer commands are disabled without a supported containment
+backend.
 
 ## Verification boundary
 

@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
-    after_help = "GET STARTED:\n  kitsu init\n  kitsu doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
 pub struct Cli {
     /// Gateway profile to use (from [gateways.<name>] in the config).
@@ -62,6 +62,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub temperature: Option<f32>,
 
+    /// Reasoning effort for compatible models/gateways. Omitted by default so
+    /// non-reasoning endpoints receive no extra request field.
+    #[arg(
+        long,
+        global = true,
+        value_name = "LEVEL",
+        value_parser = ["none", "minimal", "low", "medium", "high", "xhigh"]
+    )]
+    pub reasoning_effort: Option<String>,
+
     /// Maximum agent tool-call rounds per turn before the loop stops. Tool-aware
     /// reviews of large repos need many rounds to read files THEN write the
     /// answer; the default 10 truncates them ("[stopped: max tool rounds
@@ -79,7 +89,12 @@ pub struct Cli {
     /// (local Ollama/vLLM in particular) routinely exceeds even this default
     /// and fails the turn; raise it further (e.g. 300) for tool-heavy review
     /// work.
-    #[arg(long, global = true, default_value_t = 120)]
+    #[arg(
+        long,
+        global = true,
+        default_value_t = 120,
+        value_parser = clap::value_parser!(u64).range(1..)
+    )]
     pub timeout_secs: u64,
 
     /// Max output tokens per response. Unset lets the gateway apply its own cap
@@ -154,8 +169,9 @@ pub enum Command {
     },
     /// Run read-only configuration, auth, cache, and runtime diagnostics.
     Doctor {
-        /// Also contact the configured model-catalog endpoint. Offline checks
-        /// are the default and never access the network.
+        /// Also contact and validate the configured model-catalog endpoint.
+        /// This verifies catalog reachability/model presence, not a billable
+        /// chat completion; offline checks are the default.
         #[arg(long)]
         online: bool,
 
@@ -257,9 +273,10 @@ pub enum Command {
         enable_commands: bool,
 
         /// Constrain command working directories to this existing directory
-        /// (repeatable). This is a cwd restriction, NOT a filesystem, network,
-        /// or process sandbox. Implies --enable-commands. With no explicit root,
-        /// --enable-commands uses the launch directory.
+        /// (repeatable). These become writable mounts inside mandatory Linux
+        /// OS containment; exact argv/cwd approval remains a separate gate.
+        /// Implies --enable-commands. With no explicit root, --enable-commands
+        /// uses the launch directory.
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
 

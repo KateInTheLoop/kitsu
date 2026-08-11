@@ -163,7 +163,10 @@ command that changes durable conversation/model state. Query-only scripts do
 not create zero-turn sessions. `last` prefers the newest conversation with a
 real user turn over legacy zero-turn snapshots.
 Resume resets runtime grants, never restores saved grants, and retains only
-roots explicitly supplied by the current invocation.
+roots explicitly supplied by the current invocation. It also rebuilds the
+leading system prompt from the current model/tools/project/skill surface.
+Persisted `/skill` loads carry source/resource hashes; changed loads are replaced
+from the current pinned source and missing ones are removed with a disclosure.
 
 Session inventory and lifecycle do not require a provider or even a parseable
 config file; the resolved config path only selects the isolated namespace:
@@ -479,8 +482,9 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--plain` | off | Use stable ASCII markers and disable color and animation. |
 | `--reduced-motion` | off | Keep styled output but replace animated waiting indicators with a static status. |
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
+| `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
-| `--timeout-secs <n>` | `120` | Total inference deadline, including retries, backoff, and streamed body reads. Local-model tool-calling rounds routinely need more; raise it (e.g. `300`) for tool-heavy work. |
+| `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
@@ -497,7 +501,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
 | `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
-| `--command-root <PATH>` | Restrict command working directories to an existing root (repeatable; implies `--enable-commands`). This is a cwd restriction, not a host sandbox. |
+| `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. |
 | `--allow-command <JSON_ARGV>` | Pre-approve one exact argv in the launch directory, e.g. `'["cargo","test"]'` (repeatable). |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
 | `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
@@ -570,18 +574,26 @@ it won't ask again.
   listed separately by `/permissions` and cannot be revoked as user grants.
 - Developer commands use a separate policy, literal argv (never a shell string),
   approved working-directory roots, bounded output, and timeout/cancellation.
-  Enable them explicitly with `--enable-commands`. Command roots restrict only
-  where a process starts; they are not filesystem, network, or process sandboxes.
+  Enable them explicitly with `--enable-commands`. On Linux every approved
+  process must also pass a fingerprinted Bubblewrap preflight: approved command
+  roots are writable mounts, required runtime paths are read-only, network/PID/
+  IPC/UTS namespaces are isolated, capabilities are dropped, and the child gets
+  a fixed non-secret environment. Missing, changed, or unsupported containment
+  fails before prompting or launching; exact approval never substitutes for it.
   `/permissions` numbers exact argv/cwd grants with invocation/runtime
   provenance; `/revoke-command <number>` removes one for the current session.
   A session grant is bound to the observed executable identity and is revoked
   if the executable or its `PATH` resolution changes before reuse.
   Windows command execution currently fails closed before approval until Kitsu
-  can reproduce loader-equivalent extension and executable-image validation.
+  has an equivalent containment backend and can reproduce loader-equivalent
+  extension and executable-image validation.
   The completed protected JSONL artifact is capped at 16 MiB including framing
   and encoding expansion. Kitsu keeps draining after that ceiling and reports
   raw captured bytes, exact serialized bytes, and truncation; the model and
-  JSONL event receive smaller bounded head/tail previews.
+  JSONL event receive smaller bounded head/tail previews. A sink retains at most
+  32 artifacts and 256 MiB of reserved/retained serialized data, pruning the
+  oldest verified artifact before admitting a new one. `/artifacts` exposes the
+  exact quota, usage, IDs, and explicit pruning.
 
 Enter `/` to show all commands, or type a slash prefix and press Tab to complete
 it. Completion and `/help` share the same command registry, so their descriptions
@@ -593,6 +605,7 @@ Slash commands inside the REPL:
 |---|---|
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
+| `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
 | `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
 | `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. |
 | `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. The top-level `kitsu review` provides the noninteractive form. |
@@ -610,7 +623,10 @@ Slash commands inside the REPL:
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
-| `/jobs [list\|show ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job capacity, model/elapsed/usage/tool/write activity, retrieve results, cancel+join work, or prune terminal records. `/agents [id]` remains an alias. |
+| `/profiles` | List validated background-agent profiles. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker. |
+| `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
+| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `/agents [id]` remains an alias. |
+| `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
@@ -625,7 +641,7 @@ Slash commands inside the REPL:
 | `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
-| `/quit [wait\|cancel]` (or `/exit`) | Exit only when jobs are done, explicitly wait, or cancel+join them first. |
+| `/quit [wait\|cancel]` (or `/exit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
 
 ### Coding workflows: paste & file generation
 
@@ -666,10 +682,14 @@ For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
 output, typed errors, and exactly one `final_summary`. Human stderr is not needed
 to determine the outcome. Provider streaming remains enabled unless
-`--no-stream` is set; committed text arrives in ordered, JSON-escaped
-`assistant_delta` records whose concatenation matches the final assistant event.
-Status, permissions, context, diff, model, compaction, session-inventory, skill,
-and job slash commands emit typed `command_result` objects.
+`--no-stream` is set; text arrives in ordered, JSON-escaped `assistant_delta`
+records whose concatenation matches the final assistant event. Treat it as
+provisional until `assistant_disposition` says `committed`; strict rollback
+closes it as `discarded`. `run_started` distinguishes disabled, pending, and
+resumable session snapshots. Status, permissions, context, diff, model,
+reasoning, compaction, session/checkpoint inventory, skills, profiles, command
+artifacts, help/tools, and job/thread slash commands emit typed
+`command_result` objects.
 
 `Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
 idle prompt it clears input. Automation emits a structured cancelled event and
@@ -779,7 +799,10 @@ always: false
   and `~/.kitsu/skills/*/SKILL.md` (user). kitsu ships a couple under
   `.kitsu/skills/` as examples. Symlinked skill roots, directories, and
   `SKILL.md` files are ignored rather than widening read authority. User skills
-  win duplicate names; `/skills` reports origins and ignored duplicates.
+  win duplicate names; `/skills` reports origins, content hashes, bounded
+  omissions, and ignored duplicates. Discovery admits at most 64 skills,
+  256 KiB per manifest / 1 MiB of manifests globally, and a 16 KiB rendered
+  index.
 - **On demand:** only the index (`name — description`) is always in context; the
   model loads a skill's body by calling the `skill` tool when a task matches, or
   you run `/skill <name>`. `/skills [filter]` lists them. `--skill <name>`
@@ -787,10 +810,12 @@ always: false
   `--no-project-context`). A project skill's `always: true` body still requires
   an explicit load; only user-controlled always skills are injected up front.
 - **Bundled files & links:** a skill dir can ship UTF-8 resource files
-  (checklists, templates). Kitsu captures them through no-follow file
-  descriptors during discovery (32 KiB each / 64 KiB total) and includes that
-  bounded snapshot when the skill loads; loading a skill never widens filesystem
-  authority. A skill's `links:` are surfaced to you but **never auto-fetched**.
+  (checklists, templates). Discovery records bounded identity metadata, then an
+  explicit load reads through no-follow descriptors and verifies identity/drift
+  before framing the content (16 files / 64 KiB per skill; 128 files / 512 KiB
+  globally). SHA-256 source/resource snapshots make later changes explicit;
+  loading a skill never widens filesystem authority. A skill's `links:` are
+  surfaced to you but **never auto-fetched**.
 - **Local only, by design:** skills are trusted because *you placed them there* —
   kitsu never fetches them from the network (injecting internet instructions into
   a tool-enabled agent is exactly what the permission model prevents). To use one
