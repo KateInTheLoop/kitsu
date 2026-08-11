@@ -169,7 +169,11 @@ fn main() {
         Ok(()) => 0,
         Err(e) => {
             if !jsonl_mode {
-                eprintln!("{e}");
+                // One weighted `! error:` notice (ember-red on a TTY); any
+                // extra lines in the message are the actionable hint.
+                for line in kitsu_render::error_lines(&e.to_string()) {
+                    std::eprintln!("{line}");
+                }
                 e.exit_code()
             } else {
                 if jsonl_output_failure().is_none()
@@ -1095,6 +1099,10 @@ fn safe_provider_error_message(
 /// Integration hook for human-mode provider telemetry. The runtime event log
 /// can call this beside its JSONL serializer; the result contains only bounded
 /// enums, numeric status/timing fields, and no provider-controlled text.
+///
+/// The success path stays silent: a first-attempt success is the normal case
+/// and narrating it is transport noise. Retries, failures, and a success that
+/// needed more than one attempt still report (JSONL mode keeps every event).
 fn format_provider_attempt_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
     let kitsu_core::AgentRuntimeEvent::ProviderAttempt {
         purpose,
@@ -1112,6 +1120,9 @@ fn format_provider_attempt_notice(event: &kitsu_core::AgentRuntimeEvent) -> Opti
     else {
         return None;
     };
+    if matches!(category, kitsu_providers::ProviderAttemptCategory::Success) && *attempt <= 1 {
+        return None;
+    }
     let category = match category {
         kitsu_providers::ProviderAttemptCategory::Success => "success",
         kitsu_providers::ProviderAttemptCategory::RateLimited => "rate limited",
@@ -2159,11 +2170,49 @@ impl ArtifactDirectoryAllocator {
     }
 }
 
+/// `/help` section a command belongs to. Grouping is presentation only: the
+/// registry below stays the single source for completion and JSONL payloads.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum CommandGroup {
+    Session,
+    ContextHistory,
+    FilesDiffsCheckpoints,
+    AgentsJobs,
+    Permissions,
+    ModelsReasoning,
+}
+
+impl CommandGroup {
+    const ORDER: [CommandGroup; 6] = [
+        CommandGroup::Session,
+        CommandGroup::ContextHistory,
+        CommandGroup::FilesDiffsCheckpoints,
+        CommandGroup::AgentsJobs,
+        CommandGroup::Permissions,
+        CommandGroup::ModelsReasoning,
+    ];
+
+    fn heading(self) -> &'static str {
+        match self {
+            CommandGroup::Session => "session",
+            CommandGroup::ContextHistory => "context & history",
+            CommandGroup::FilesDiffsCheckpoints => "files, diffs & checkpoints",
+            CommandGroup::AgentsJobs => "agents & jobs",
+            CommandGroup::Permissions => "permissions",
+            CommandGroup::ModelsReasoning => "models & reasoning",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy)]
 struct SlashCommandSpec {
     name: &'static str,
     args: &'static str,
     description: &'static str,
+    group: CommandGroup,
+    /// A backward-compatible alias folds into its parent's `/help` row while
+    /// remaining a first-class registry entry for completion and dispatch.
+    alias_of: Option<&'static str>,
 }
 
 impl SlashCommandSpec {
@@ -2183,211 +2232,295 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "agent",
         args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
         description: "inspect and control one background agent thread",
+        group: CommandGroup::AgentsJobs,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "agents",
         args: "[id]",
         description: "backward-compatible alias for /jobs",
+        group: CommandGroup::AgentsJobs,
+        alias_of: Some("jobs"),
     },
     SlashCommandSpec {
         name: "allow",
         args: "<path>",
         description: "grant read access for this session",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "allow-read-write",
         args: "<path>",
         description: "grant read and write access for this session",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "allow-write",
         args: "<path>",
         description: "grant write access for this session",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "archive",
         args: "<id>",
         description: "archive an inactive saved conversation",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "artifacts",
         args: "[list|prune <id|all>]",
         description: "inspect or prune retained command-output artifacts",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "checkpoint",
         args: "<id>",
         description: "preview one recoverable verified file checkpoint",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "checkpoints",
         args: "",
         description: "list recoverable verified file checkpoints",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "clear",
         args: "",
         description: "clear conversation history",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "compact",
         args: "",
         description: "compact older conversation context now",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "context",
         args: "[refresh]",
         description: "show context utilization or refresh discovered window metadata",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "delete",
         args: "<id>",
         description: "permanently delete an inactive live session",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "diff",
         args: "[scope] [path]",
         description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "exit",
         args: "[wait|cancel]",
         description: "exit chat with an explicit background-job policy",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "export",
         args: "<file> [markdown|json]",
         description: "export the active session without overwriting",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "fork",
         args: "[id]",
         description: "clone and switch to a fresh session",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "help",
         args: "",
         description: "show command help",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "jobs",
         args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|close <id>]",
         description: "inspect, steer, stop, and close background agent threads",
+        group: CommandGroup::AgentsJobs,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "model",
         args: "<name>",
         description: "switch model while keeping history",
+        group: CommandGroup::ModelsReasoning,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "models",
         args: "[filter]",
         description: "list gateway models",
+        group: CommandGroup::ModelsReasoning,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "new",
         args: "",
         description: "start and autosave a fresh conversation",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "permissions",
         args: "",
         description: "show filesystem access policy",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "profiles",
         args: "",
         description: "show available specialist background-agent profiles",
+        group: CommandGroup::AgentsJobs,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "queue",
         args: "[list|add|remove|edit|move|promote|clear]",
         description: "inspect or edit the bounded prompt queue",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "quit",
         args: "[wait|cancel]",
         description: "exit, wait for jobs, or cancel and join them",
+        group: CommandGroup::Session,
+        alias_of: Some("exit"),
     },
     SlashCommandSpec {
         name: "reasoning",
         args: "[default|none|minimal|low|medium|high|xhigh]",
         description: "show or change reasoning effort for subsequent turns",
+        group: CommandGroup::ModelsReasoning,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "restore",
         args: "<id>",
         description: "restore an archived session",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "resume",
         args: "<id|last>",
         description: "resume a saved conversation",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "retry",
         args: "",
         description: "retry the last failed or cancelled prompt",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "review",
         args: "[scope] [path]",
         description: "review a verified working/staged/unstaged/base/commit/checkpoint diff",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "revoke-command",
         args: "<number>",
         description: "revoke a numbered exact command grant",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "revoke-read",
         args: "<exact-root>",
         description: "revoke an exact read root for this session",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "revoke-write",
         args: "<exact-root>",
         description: "revoke an exact write root for this session",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "save",
         args: "<file>",
         description: "save the latest response",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "sessions",
         args: "",
         description: "list locally saved conversations",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "skill",
         args: "<name>",
         description: "load a skill into context",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "skills",
         args: "[filter]",
         description: "list available skills",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "status",
         args: "",
         description: "show model, context, tools, and session state",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "steer",
         args: "<correction>",
         description: "redirect the active response and restart that turn",
+        group: CommandGroup::Session,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "tools",
         args: "",
         description: "show enabled tools and effective access",
+        group: CommandGroup::Permissions,
+        alias_of: None,
     },
     SlashCommandSpec {
         name: "undo",
         args: "[id]",
         description: "undo the latest or selected conflict-free file checkpoint",
+        group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
     },
 ];
 
@@ -2398,21 +2531,37 @@ fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
         .collect()
 }
 
-fn slash_help(model: &str) -> String {
+/// Render `/help` grouped by [`CommandGroup`] instead of one alphabetical
+/// wall. Aliases fold into their parent row. Rows carry no color in any mode;
+/// `styled` only emboldens the section headers, so the row text is identical
+/// under `NO_COLOR`/`--plain` and in the JSONL `command_result` payload
+/// (which always receives the unstyled variant).
+fn slash_help(model: &str, styled: bool) -> String {
     let model = terminal_inline(model);
     let width = SLASH_COMMANDS
         .iter()
+        .filter(|spec| spec.alias_of.is_none())
         .map(|spec| spec.syntax().len())
         .max()
         .unwrap_or(0);
     let mut out = String::from("commands:\n");
-    for spec in SLASH_COMMANDS {
-        let syntax = spec.syntax();
-        out.push_str(&format!(
-            "  {syntax:<width$}  {}\n",
-            spec.description,
-            width = width
-        ));
+    for group in CommandGroup::ORDER {
+        out.push_str(&kitsu_render::section_heading(group.heading(), styled));
+        out.push('\n');
+        for spec in SLASH_COMMANDS
+            .iter()
+            .filter(|spec| spec.group == group && spec.alias_of.is_none())
+        {
+            let syntax = spec.syntax();
+            let mut description = spec.description.to_string();
+            for alias in SLASH_COMMANDS
+                .iter()
+                .filter(|alias| alias.alias_of == Some(spec.name))
+            {
+                description.push_str(&format!(" (alias: /{})", alias.name));
+            }
+            out.push_str(&format!("  {syntax:<width$}  {description}\n"));
+        }
     }
     out.push_str(&format!("current model: {model}"));
     out
@@ -5193,13 +5342,19 @@ fn finish_assistant_disposition(
             );
         }
         AssistantDisposition::Discarded => {
+            // Only warn about discarded provisional output when this turn
+            // actually streamed some: an alarming DISCARDED line under a turn
+            // that produced nothing is noise (JSONL always gets the record).
+            let streamed = kitsu_render::turn_wrote_assistant_output();
             kitsu_render::finish_line();
-            eprintln!(
-                "~ provisional assistant output, if any, was DISCARDED and was not committed{}",
-                reason
-                    .map(|reason| format!(": {}", terminal_inline(reason)))
-                    .unwrap_or_default()
-            );
+            if streamed {
+                eprintln!(
+                    "~ provisional assistant output was DISCARDED and was not committed{}",
+                    reason
+                        .map(|reason| format!(": {}", terminal_inline(reason)))
+                        .unwrap_or_default()
+                );
+            }
         }
     }
     Ok(())
@@ -6016,7 +6171,16 @@ fn format_write_checkpoint(
     undo_hint: bool,
 ) -> String {
     let label = terminal_inline(&report.label);
-    let mut output = format!("~ verified file checkpoint #{} ({}):", report.id, label);
+    // `◈` is the receipt glyph (design.md §8): a durable artifact was created.
+    let marker = if kitsu_render::plain_mode() {
+        "#"
+    } else {
+        kitsu_render::GLYPH_RECEIPT
+    };
+    let mut output = format!(
+        "{marker} verified file checkpoint #{} ({}):",
+        report.id, label
+    );
     for change in &report.changes {
         output.push_str(&format!(
             "\n  - {} {} ({} -> {} bytes; first changed line {})",
@@ -8079,12 +8243,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         for change in &resumed_skill_changes {
             eprintln!("~ {}", terminal_inline(change));
         }
-        eprintln!(
-            "~ resumed session {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
+        eprintln!("{}", kitsu_render::milestone_line(&format!(
+            "resumed session {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
             saved.id,
             perms.base_read_roots().len(),
             perms.base_write_roots().len(),
-        );
+        )));
         session_state.meter.invalidate();
     }
     *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
@@ -8755,12 +8919,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let line = match (prioritized, queued_line) {
             (Some(command), _) => command,
             (None, Some(queued)) => {
+                // Queue bookkeeping is only worth narrating while a backlog
+                // remains; draining the final item stays silent.
                 let status = prompt_queue.lock().expect("prompt queue").status();
-                eprintln!(
-                    "~ running queued prompt ({} remaining; {} queue slot(s) available)",
-                    status.queued,
-                    status.remaining()
-                );
+                if status.queued > 0 {
+                    eprintln!(
+                        "~ running queued prompt ({} remaining; {} queue slot(s) available)",
+                        status.queued,
+                        status.remaining()
+                    );
+                }
                 queued
             }
             (None, None) if exit_after_queue => {
@@ -8925,8 +9093,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     ) {
                         eprintln!("warning: private artifact storage disabled: {error}");
                     }
-                    eprintln!(
-                        "~ started new session {} (runtime grants reset; invocation grants retained: {} read, {} write)",
+                    eprintln!("{}", kitsu_render::milestone_line(&format!(
+                        "started new session {} (runtime grants reset; invocation grants retained: {} read, {} write)",
                         session
                             .session_id
                             .borrow()
@@ -8934,7 +9102,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             .unwrap_or("(autosave disabled)"),
                         perms.base_read_roots().len(),
                         perms.base_write_roots().len(),
-                    );
+                    )));
                     continue;
                 }
                 SlashResult::ResumeSession(selector) => {
@@ -9077,12 +9245,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     write_journal.reset();
                     *live_mw.lock().expect("live model/window") =
                         (model.clone(), context_window.get());
-                    eprintln!(
-                        "~ resumed {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
+                    eprintln!("{}", kitsu_render::milestone_line(&format!(
+                        "resumed {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
                         saved.id,
                         perms.base_read_roots().len(),
                         perms.base_write_roots().len(),
-                    );
+                    )));
                     continue;
                 }
                 SlashResult::ListSessions => {
@@ -9243,12 +9411,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             eprintln!("{notice}");
         }
         if captured.captured > 0 {
+            // Only narrate type-ahead that is still waiting: input that was
+            // consumed immediately (e.g. an /exit) needs no bookkeeping line.
             let status = prompt_queue.lock().expect("prompt queue").status();
-            eprintln!("~ captured type-ahead: {status}");
+            if status.queued > 0 {
+                eprintln!("~ captured type-ahead: {status}");
+            }
         }
         if captured.eof {
             exit_after_queue = true;
-            eprintln!("~ end of input received; exiting after queued prompts finish");
+            if prompt_queue.lock().expect("prompt queue").status().queued > 0 {
+                eprintln!("~ end of input received; exiting after queued prompts finish");
+            }
         }
         for outcome in captured.outcomes {
             match outcome {
@@ -9295,7 +9469,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 last_failed = Some(retry_prompt);
-                eprintln!("{}", chat_error_message(e, &model, cli.timeout_secs));
+                for line in
+                    kitsu_render::error_lines(&chat_error_message(e, &model, cli.timeout_secs))
+                {
+                    eprintln!("{line}");
+                }
                 eprintln!(
                     "~ failed turn rolled back; completed file changes, if any, remain on disk"
                 );
@@ -9856,8 +10034,14 @@ async fn handle_slash(
             return SlashResult::Quit;
         }
         "" | "help" => {
-            let text = slash_help(model);
-            eprintln!("{text}");
+            // The JSONL payload always carries the unstyled text; only the
+            // live terminal gets bold group headings.
+            let text = slash_help(model, false);
+            if kitsu_render::stderr_styled() {
+                eprintln!("{}", slash_help(model, true));
+            } else {
+                eprintln!("{text}");
+            }
             return SlashResult::Continue(Some(serde_json::json!({
                 "kind": "help",
                 "model": model,
@@ -10042,9 +10226,12 @@ async fn handle_slash(
                 Ok(report) => {
                     messages.push(trusted_undo_history_event(&report));
                     eprintln!(
-                        "~ restored checkpoint #{} ({}):",
-                        report.id,
-                        terminal_inline(&report.label)
+                        "{}",
+                        kitsu_render::milestone_line(&format!(
+                            "restored checkpoint #{} ({}):",
+                            report.id,
+                            terminal_inline(&report.label)
+                        ))
                     );
                     for change in report.changes {
                         eprintln!("  - {}", shorten_home(&change.path));
@@ -10862,11 +11049,19 @@ impl Prompter for CliPrompter {
                 terminal_inline(&req.grant_dir)
             );
         } else {
+            // The approval moment carries visual weight: one shared header
+            // design for file and command prompts (see CliCommandPrompter).
             eprint!(
-                "\x1b[?2004l\n\u{23fa} kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
-                req.action.verb(),
-                terminal_inline(&req.path),
-                terminal_inline(&req.grant_dir)
+                "\x1b[?2004l\n{}\n{}\n> ",
+                kitsu_render::approval_header(&format!(
+                    "kitsu wants to {} {}",
+                    req.action.verb(),
+                    terminal_inline(&req.path)
+                )),
+                kitsu_render::approval_options(&format!(
+                    "always ({})",
+                    terminal_inline(&req.grant_dir)
+                )),
             );
         }
         let _ = std::io::stderr().flush();
@@ -10897,14 +11092,37 @@ impl CommandPrompter for CliCommandPrompter {
             .as_deref()
             .map(terminal_inline)
             .unwrap_or_else(|| "not observed".to_string());
-        eprint!(
-            "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
-            terminal_inline(&req.display_argv()),
-            terminal_inline(&req.cwd),
-            terminal_inline(&req.executable.invocation),
-            req.timeout_ms,
-            terminal_inline(req.authority_notice()),
-        );
+        if kitsu_render::plain_mode() {
+            eprint!(
+                "\ncommand permission> run {}\n  cwd: {}\n  executable: {} ({resolution}; observed: {observed}; bytes not pinned)\n  timeout: {} ms\n  authority: {}\n  [y] allow once   [a] allow this exact argv/cwd for session   [n] deny\n> ",
+                terminal_inline(&req.display_argv()),
+                terminal_inline(&req.cwd),
+                terminal_inline(&req.executable.invocation),
+                req.timeout_ms,
+                terminal_inline(req.authority_notice()),
+            );
+        } else {
+            // Same weighted header design as the filesystem prompt above, with
+            // the command's provenance details dimmed beneath it.
+            eprint!(
+                "\n{}\n{}\n{}\n{}\n{}\n{}\n> ",
+                kitsu_render::approval_header(&format!(
+                    "run {}",
+                    terminal_inline(&req.display_argv())
+                )),
+                kitsu_render::approval_detail(&format!("cwd: {}", terminal_inline(&req.cwd))),
+                kitsu_render::approval_detail(&format!(
+                    "executable: {} ({resolution}; observed: {observed}; bytes not pinned)",
+                    terminal_inline(&req.executable.invocation)
+                )),
+                kitsu_render::approval_detail(&format!("timeout: {} ms", req.timeout_ms)),
+                kitsu_render::approval_detail(&format!(
+                    "authority: {}",
+                    terminal_inline(req.authority_notice())
+                )),
+                kitsu_render::approval_options("allow this exact argv/cwd for session"),
+            );
+        }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
             return CommandDecision::Deny;
@@ -11116,12 +11334,53 @@ mod tests {
         sorted.dedup();
         assert_eq!(names, sorted, "registry must remain sorted and unique");
 
-        let help = slash_help("test-model");
+        let help = slash_help("test-model", false);
         for spec in SLASH_COMMANDS {
-            assert!(help.contains(&spec.syntax()));
-            assert!(help.contains(spec.description));
+            match spec.alias_of {
+                // Aliases fold into their parent row instead of having one.
+                Some(parent) => {
+                    assert!(help.contains(&format!("(alias: /{})", spec.name)));
+                    assert!(
+                        !help.contains(&spec.syntax()),
+                        "alias {} has own row",
+                        spec.name
+                    );
+                    assert!(SLASH_COMMANDS
+                        .iter()
+                        .any(|candidate| candidate.name == parent && candidate.alias_of.is_none()));
+                }
+                None => {
+                    assert!(help.contains(&spec.syntax()));
+                    assert!(help.contains(spec.description));
+                }
+            }
         }
         assert!(help.ends_with("current model: test-model"));
+    }
+
+    #[test]
+    fn slash_help_groups_commands_without_forking_the_registry() {
+        let help = slash_help("test-model", false);
+        assert!(
+            !help.contains('\u{1b}'),
+            "unstyled help must carry zero escape bytes"
+        );
+        // Every group heading appears exactly once, as a standalone line.
+        let mut headings = 0;
+        for group in CommandGroup::ORDER {
+            assert!(
+                help.lines().any(|line| line == group.heading()),
+                "missing heading {:?}",
+                group.heading()
+            );
+            headings += 1;
+        }
+        assert!(headings <= 6);
+        // Styled mode differs only by heading emphasis: stripping terminal
+        // sequences must restore the exact unstyled text.
+        let styled = slash_help("test-model", true);
+        assert!(styled.contains('\u{1b}'));
+        assert_eq!(kitsu_render::sanitize_terminal_text(&styled), help);
     }
 
     #[test]
@@ -11803,6 +12062,29 @@ mod tests {
         assert!(notice.contains("rate limited; HTTP 429"));
         assert!(notice.contains("retry in 750ms (Retry-After)"));
         assert!(notice.contains("12500ms deadline remaining"));
+    }
+
+    #[test]
+    fn first_attempt_success_telemetry_is_silent_but_retried_success_reports() {
+        let success = |attempt: u32| kitsu_core::AgentRuntimeEvent::ProviderAttempt {
+            round: 1,
+            purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            attempt,
+            max_attempts: 3,
+            category: kitsu_providers::ProviderAttemptCategory::Success,
+            status: Some(200),
+            outcome: kitsu_providers::ProviderAttemptOutcome::BodyCompleted,
+            terminal: true,
+            retry_delay_ms: None,
+            retry_after_used: false,
+            remaining_deadline_ms: 120_000,
+        };
+        // The normal case — one attempt, success — is transport noise and
+        // must never narrate after a good turn.
+        assert_eq!(format_provider_attempt_notice(&success(1)), None);
+        // A success that needed retries closes the visible retry story.
+        let retried = format_provider_attempt_notice(&success(2)).unwrap();
+        assert!(retried.contains("attempt 2/3: success"));
     }
 
     #[test]
