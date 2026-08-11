@@ -511,6 +511,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
 | `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. If the deadline expires after real output already streamed, one-shot runs keep it: the answer ends with a `[stopped: deadline expired …]` marker and is labeled partial (exit code stays `2`). |
+| `--agent-join-timeout <n>` | `--timeout-secs` | How long a non-interactive exit (scripted or piped chat) waits for live background agents to finish before cancelling them. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
@@ -527,10 +528,11 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
 | `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
-| `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. |
-| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. |
+| `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. **The approved executable's own directory is a second, independent root requirement** — if a tool lives outside every `--command-root` (e.g. `~/.local/bin/pytest`), containment denies it at run time; the denial names the exact missing directory and the `--command-root` flag to add. |
+| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. Every pregrant is also named verbatim (argv + cwd) in the system prompt, so the model can call it directly instead of guessing. |
+| `--command-env <NAME[=VALUE]>` | Opt-in, explicit environment pass-through into contained commands (repeatable), layered on top of the fixed non-secret base set (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`). Needed for interpreter-based toolchains (`pytest`, `npm test`, ...) whose module search path is env-driven (`PYTHONPATH`, `NODE_PATH`, ...). Bare `NAME` reads the value from kitsu's own environment and is refused for names that look secret-bearing (case-insensitive substring match on `KEY`/`TOKEN`/`SECRET`/`PASSWORD`); use `NAME=value` to pass an explicit literal value regardless of name. Nothing else is inherited from the host — deny-by-default is unchanged. Disclosed in `/permissions` and JSONL (secret-shaped values are redacted there even though the contained process receives the real value). |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
-| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
+| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. `--resume` already implies `--session`, so passing both explicitly is a harmless no-op confirmation, not an error. |
 | `--session` | Explicitly create and autosave a new scripted or piped session. |
 | `--no-session` | Disable conversation snapshots and prompt-history persistence for this chat. |
 | `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. Accepts *partial* success only: if every turn and command failed, the script still exits nonzero. |
@@ -558,8 +560,8 @@ In an interactive `chat` the model has filesystem tools (`fs_read_file`,
 similar to Claude Code — it asks before touching paths you haven't allowed:
 
 ```
-⏺ kitsu wants to write /home/you/project/notes.md
-  [y] allow once   [a] always (this dir)   [n] deny
+◉ permission — kitsu wants to write /home/you/project/notes.md
+  [y] allow once · [a] always (/home/you/project) · [n] deny
 >
 ```
 
@@ -615,7 +617,10 @@ it won't ask again.
   process must also pass a fingerprinted Bubblewrap preflight: approved command
   roots are writable mounts, required runtime paths are read-only, network/PID/
   IPC/UTS namespaces are isolated, capabilities are dropped, and the child gets
-  a fixed non-secret environment. Missing, changed, or unsupported containment
+  a fixed non-secret environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`,
+  `TMPDIR`, `USER`, `LOGNAME`), optionally extended with explicit
+  `--command-env` pass-through variables — never anything else inherited from
+  the host. Missing, changed, or unsupported containment
   fails before prompting or launching; exact approval never substitutes for it.
   `/permissions` numbers exact argv/cwd grants with invocation/runtime
   provenance; `/revoke-command <number>` removes one for the current session.
@@ -678,7 +683,7 @@ Slash commands inside the REPL:
 | `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
-| `/quit [wait\|cancel]` (or `/exit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
+| `/exit [wait\|cancel]` (or `/quit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
 
 ### Coding workflows: paste & file generation
 
@@ -738,9 +743,9 @@ artifacts, help/tools, and job/thread slash commands emit typed
 
 `Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
 idle prompt it clears input. Automation emits a structured cancelled event and
-exits `130`. `Ctrl+D` or `/quit` does not silently discard live background agents,
+exits `130`. `Ctrl+D` or `/exit` does not silently discard live background agents,
 and neither does the end of a `--script` or piped run: it joins them the way
-`/quit wait` does, bounded by `--agent-join-timeout` (default `--timeout-secs`).
+`/exit wait` does, bounded by `--agent-join-timeout` (default `--timeout-secs`).
 Only agents still running when that bound expires are cancelled, and they are
 reported as cancelled by shutdown policy — never as casualties of a rolled-back
 turn.

@@ -76,6 +76,40 @@ unchanged: session search, screen-reader mode, syntect code boxes, agent-deck
 front door and live-turn output, deck identity round 2, stdout deliverable in
 human one-shot mode.
 
+## Implementation outcome
+
+One Sonnet fix pass closed the cycle scope (this commit):
+
+1. **Containment environment**: root cause was `HOME` redirection breaking
+   Python user-site resolution, proven by raw-bwrap reproduction — not a
+   missing mount. New repeatable `--command-env NAME[=VALUE]`: bare names are
+   read from kitsu's environment and refused for secret-shaped names
+   (`*KEY*`/`*TOKEN*`/`*SECRET*`/`*PASSWORD*`, case-insensitive); explicit
+   `NAME=value` is always allowed; values merge over the fixed base set and
+   are disclosed in `/permissions` and JSONL with secret-shaped values
+   redacted. Deny-by-default inheritance unchanged.
+2. **Pregrant disclosure**: the system prompt now lists exact pre-approved
+   commands with their cwd (capped at 20 with an overflow note), inherited by
+   `/new` and resume rebuilds.
+3. **Teaching denials**: the executable-outside-roots denial names the
+   missing directory and the `--command-root` flag; rule documented.
+4. **`--resume` composes with `--session`** as the README promised.
+5. **All ten docs-drift corrections applied**, including the README
+   permission transcript (`◉`), the `agent_deck_ui.md` rewrite (implemented
+   inline deck, future ideas preserved), `kitsu init` config aligned with the
+   README recipe and verified end-to-end against a mock endpoint, and a
+   refreshed `llms.txt`.
+
+## Release verification
+
+Final tree: fmt clean, workspace clippy clean (`-D warnings`), 642 passing
+tests (216 bin unit, 116 CLI integration, 84 core, 58 provider, 136
+tools/permissions including real-bwrap reproductions, 30 render, 2
+provenance). The known PTY-environmental failure remains pre-existing.
+Maintainer review focused on the containment change: secret-name refusal,
+disclosure redaction, and the unchanged deny-by-default posture were verified
+in the diff and test suite.
+
 ## Report index
 
 1. [Post-ship validation](chat-ux-cycle-8-audits/raw/01-postship-validation.md)

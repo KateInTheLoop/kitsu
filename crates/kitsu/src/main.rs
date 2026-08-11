@@ -378,6 +378,7 @@ fn run() -> Result<(), CliError> {
             allow_read_write,
             enable_commands,
             command_roots,
+            command_env,
             allow_commands,
             script,
             resume,
@@ -393,6 +394,7 @@ fn run() -> Result<(), CliError> {
                 allow_read_write,
                 enable_commands: *enable_commands,
                 command_roots,
+                command_env,
                 allow_commands,
                 script: script.as_deref(),
                 resume: resume.as_deref(),
@@ -412,6 +414,7 @@ struct ChatInvocation<'a> {
     allow_read_write: &'a [String],
     enable_commands: bool,
     command_roots: &'a [String],
+    command_env: &'a [String],
     allow_commands: &'a [String],
     script: Option<&'a str>,
     resume: Option<&'a str>,
@@ -445,6 +448,7 @@ async fn run_review(
             allow_read_write: &[],
             enable_commands: false,
             command_roots: &[],
+            command_env: &[],
             allow_commands: &[],
             script: None,
             resume,
@@ -457,14 +461,23 @@ async fn run_review(
     .await
 }
 
+// Kept byte-for-byte aligned with README's "Ollama (local)" provider recipe
+// (flavor, base_url, and model) so `kitsu init` never disagrees with the
+// docs a new user is reading one section away, and so the generated config
+// works out of the box against `ollama pull llama3.2` without a model-tag
+// mismatch (cycle-8 docs-drift finding: the old `qwen2.5-coder:7b` default
+// 404'd against the tag Ollama actually produces). `flavor` is validated
+// against a closed set (`openai`/`anthropic`/`ollama`) but every value
+// currently routes through the same OpenAI-compatible transport — `openai`
+// here matches every other recipe, including this same Ollama gateway.
 const STARTER_CONFIG_BODY: &str = r#"default_gateway = "ollama"
 
 [gateways.ollama]
-flavor = "ollama"
-base_url = "http://127.0.0.1:11434"
+flavor = "openai"
+base_url = "http://localhost:11434"
 chat_path = "/v1/chat/completions"
 models_path = "/v1/models"
-model = "qwen2.5-coder:7b"
+model = "llama3.2"
 context_window = 32768
 auth = { method = "none" }
 "#;
@@ -1002,6 +1015,7 @@ async fn run_sessions(
                         allow_read_write: &[],
                         enable_commands: false,
                         command_roots: &[],
+                        command_env: &[],
                         allow_commands: &[],
                         script: None,
                         resume: Some(&saved.id),
@@ -2648,8 +2662,8 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "jobs",
-        args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|close <id>]",
-        description: "inspect, steer, stop, and close background agent threads",
+        args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
+        description: "inspect, steer, stop, prune, and close background agent threads",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -3339,6 +3353,68 @@ impl PregrantedCommandSpec {
 
 fn display_pregrant_argv(argv: &[String]) -> String {
     serde_json::to_string(argv).unwrap_or_else(|_| "[invalid argv]".to_string())
+}
+
+/// The wire shape of one `--command-env` value. A bare `NAME` reads the
+/// value from kitsu's own process environment (subject to the secret-name
+/// policy on [`Self::resolve`]); `NAME=value` supplies an explicit literal
+/// the caller typed directly, always allowed regardless of name shape.
+#[derive(Debug, Clone)]
+enum CommandEnvSpec {
+    Passthrough(String),
+    Explicit(String, String),
+}
+
+impl CommandEnvSpec {
+    fn parse(raw: &str) -> Result<Self, CliError> {
+        if let Some((name, value)) = raw.split_once('=') {
+            let name = name.trim();
+            if name.is_empty() {
+                return Err(CliError::user(format!(
+                    "invalid --command-env {raw:?}: name before '=' must not be empty"
+                )));
+            }
+            return Ok(CommandEnvSpec::Explicit(
+                name.to_string(),
+                value.to_string(),
+            ));
+        }
+        let name = raw.trim();
+        if name.is_empty() {
+            return Err(CliError::user(
+                "invalid --command-env: expected NAME or NAME=value".to_string(),
+            ));
+        }
+        Ok(CommandEnvSpec::Passthrough(name.to_string()))
+    }
+
+    /// Resolve to a concrete (name, value) pair. A bare pass-through of a
+    /// name that looks secret-bearing is refused outright: deny-by-default
+    /// means nothing is silently forwarded from kitsu's own environment
+    /// unless the caller can name it AND (for secret-shaped names) type the
+    /// literal value explicitly.
+    fn resolve(&self) -> Result<(String, String), CliError> {
+        match self {
+            CommandEnvSpec::Explicit(name, value) => Ok((name.clone(), value.clone())),
+            CommandEnvSpec::Passthrough(name) => {
+                if kitsu_tools::env_name_looks_secret(name) {
+                    return Err(CliError::user(format!(
+                        "refusing --command-env {name}: the name looks secret-bearing (matches \
+                         a case-insensitive KEY/TOKEN/SECRET/PASSWORD substring), so it cannot be \
+                         silently passed through by name; use --command-env {name}=<value> to \
+                         pass an explicit value instead"
+                    )));
+                }
+                let value = std::env::var(name).map_err(|_| {
+                    CliError::user(format!(
+                        "invalid --command-env {name:?}: not set in kitsu's own environment; use \
+                         --command-env {name}=<value> to pass an explicit value instead"
+                    ))
+                })?;
+                Ok((name.clone(), value))
+            }
+        }
+    }
 }
 
 /// Startup failure text for one pregrant. When the legacy array form failed only
@@ -4308,9 +4384,17 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
             match policy.containment_status() {
                 kitsu_tools::CommandContainmentStatus::Ready(ready) => {
                     out.push_str(&format!(
-                        "\n    OS containment ready: {:?} at {}; network/PID/IPC/UTS isolated; fixed environment",
+                        "\n    OS containment ready: {:?} at {}; network/PID/IPC/UTS isolated; fixed environment{}",
                         ready.backend,
                         shorten_home(&ready.backend_path),
+                        if ready.passthrough_environment.is_empty() {
+                            String::new()
+                        } else {
+                            format!(
+                                " + --command-env pass-through: {}",
+                                ready.passthrough_environment.join(", ")
+                            )
+                        },
                     ));
                     for root in ready.writable_command_roots {
                         out.push_str(&format!("\n      rw {}", shorten_home(&root)));
@@ -5482,7 +5566,23 @@ struct PromptEnvironment {
     /// Granted roots as `(path, authority)` where authority is one of
     /// "read-only", "write-only", or "read-write".
     roots: Vec<(String, &'static str)>,
+    /// Exact `--allow-command` pregrants as `(display argv, cwd)`, so the
+    /// model can choose to call one directly instead of guessing an
+    /// invocation and risking a denied round-trip (cycle-8 audit gap 3).
+    /// Capped at [`PROMPT_PREGRANT_CAP`] entries; overflow is summarized
+    /// rather than silently dropped.
+    command_pregrants: Vec<(String, String)>,
+    /// Count of pregrants omitted from `command_pregrants` because the cap
+    /// was reached.
+    command_pregrants_overflow: usize,
 }
+
+/// Maximum number of exact command pregrants named verbatim in the system
+/// prompt. Bounded so a script with dozens of `--allow-command` flags
+/// doesn't blow the context budget on grant listings alone; the overflow
+/// count is still disclosed so the model knows more exist (and can be
+/// discovered via `/permissions` provenance).
+const PROMPT_PREGRANT_CAP: usize = 20;
 
 impl PromptEnvironment {
     /// Classify the CLI grant lists into deduplicated `(path, authority)`
@@ -5512,7 +5612,23 @@ impl PromptEnvironment {
         Self {
             cwd: cwd.display().to_string(),
             roots,
+            command_pregrants: Vec::new(),
+            command_pregrants_overflow: 0,
         }
+    }
+
+    /// Attach the exact `--allow-command` pregrants for disclosure in the
+    /// system prompt. Order is preserved; entries beyond
+    /// [`PROMPT_PREGRANT_CAP`] are counted but not listed verbatim.
+    fn with_command_pregrants(mut self, pregrants: &[PregrantedCommand]) -> Self {
+        let overflow = pregrants.len().saturating_sub(PROMPT_PREGRANT_CAP);
+        self.command_pregrants = pregrants
+            .iter()
+            .take(PROMPT_PREGRANT_CAP)
+            .map(|grant| (display_pregrant_argv(&grant.argv), shorten_home(&grant.cwd)))
+            .collect();
+        self.command_pregrants_overflow = overflow;
+        self
     }
 }
 
@@ -5571,8 +5687,27 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         if has_commands {
             prompt.push_str(
                 "Use command_exec's literal argv/cwd interface for relevant builds, tests, and \
-                 linters; command approval is separate from filesystem access.",
+                 linters; command approval is separate from filesystem access. ",
             );
+            if !environment.command_pregrants.is_empty() {
+                let listed = environment
+                    .command_pregrants
+                    .iter()
+                    .map(|(argv, cwd)| format!("{argv} in {cwd}"))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                prompt.push_str(&format!(
+                    "Pre-approved commands (call command_exec with this exact argv/cwd — no \
+                     approval prompt needed): {listed}"
+                ));
+                if environment.command_pregrants_overflow > 0 {
+                    prompt.push_str(&format!(
+                        " (+{} more pre-approved; see /permissions)",
+                        environment.command_pregrants_overflow
+                    ));
+                }
+                prompt.push_str(". ");
+            }
         }
         prompt.trim_end().to_string()
     }
@@ -8570,6 +8705,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         allow_read_write,
         enable_commands,
         command_roots,
+        command_env,
         allow_commands,
         script,
         resume,
@@ -8592,8 +8728,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // where a human can actually type it (the interactive REPL).
     UNDO_HINTS_ACTIONABLE.store(interactive, Ordering::Release);
     let durable_session = !no_session && (interactive || session_requested || resume.is_some());
-    let command_requested =
-        enable_commands || !command_roots.is_empty() || !allow_commands.is_empty();
+    let command_requested = enable_commands
+        || !command_roots.is_empty()
+        || !allow_commands.is_empty()
+        || !command_env.is_empty();
     if cli.jsonl && interactive {
         return Err(CliError::user(
             "--jsonl is an automation mode; use --script, pipe one prompt, or use `ask`"
@@ -8730,6 +8868,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
         if let Some(sink) = command_artifact_sink.as_ref() {
             policy = policy.with_output_artifact_sink(Arc::new(sink.clone()));
+        }
+        if !command_env.is_empty() {
+            let resolved_env = command_env
+                .iter()
+                .map(|raw| CommandEnvSpec::parse(raw)?.resolve())
+                .collect::<Result<Vec<(String, String)>, CliError>>()?;
+            policy = policy.with_passthrough_environment(resolved_env);
         }
         let policy = Arc::new(policy);
         explicit_command_grants = command_pregrant_specs
@@ -9000,6 +9145,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
         }
         PromptEnvironment::from_grants(&cwd, &read_only, allow_write, allow_read_write)
+            .with_command_pregrants(&explicit_command_grants)
     };
     let base = chat_system_prompt(&tool_names, &prompt_environment);
     provenance.push(CtxEntry::new(
@@ -12790,6 +12936,76 @@ mod tests {
         assert!(!prompt.contains("Granted filesystem roots"));
     }
 
+    /// Regression for cycle-8 audit gap 3: `--allow-command` pregrants must
+    /// be named verbatim (exact argv/cwd) in the system prompt sent to the
+    /// model, not just surfaced via `/permissions` — otherwise a tool-
+    /// capable model can only guess an invocation and risk a denied
+    /// round-trip.
+    #[test]
+    fn system_prompt_names_every_pregranted_command_verbatim() {
+        let pregrants = vec![
+            PregrantedCommand {
+                argv: vec!["pytest".to_string(), "-v".to_string()],
+                cwd: std::path::PathBuf::from("/work/project"),
+                cwd_source: CwdSource::LaunchDirectory,
+            },
+            PregrantedCommand {
+                argv: vec!["cargo".to_string(), "test".to_string()],
+                cwd: std::path::PathBuf::from("/work/project"),
+                cwd_source: CwdSource::LaunchDirectory,
+            },
+        ];
+        let environment =
+            PromptEnvironment::from_grants(std::path::Path::new("/work/project"), &[], &[], &[])
+                .with_command_pregrants(&pregrants);
+        let prompt = chat_system_prompt(&["command_exec".to_string()], &environment);
+        assert!(prompt.contains("Pre-approved commands"), "{prompt}");
+        assert!(
+            prompt.contains(r#"["pytest","-v"] in /work/project"#),
+            "{prompt}"
+        );
+        assert!(
+            prompt.contains(r#"["cargo","test"] in /work/project"#),
+            "{prompt}"
+        );
+        assert!(!prompt.contains("more pre-approved"));
+    }
+
+    #[test]
+    fn system_prompt_without_commands_tool_omits_pregrant_disclosure() {
+        let pregrants = vec![PregrantedCommand {
+            argv: vec!["pytest".to_string()],
+            cwd: std::path::PathBuf::from("/work/project"),
+            cwd_source: CwdSource::LaunchDirectory,
+        }];
+        let environment =
+            PromptEnvironment::from_grants(std::path::Path::new("/work/project"), &[], &[], &[])
+                .with_command_pregrants(&pregrants);
+        // No command_exec tool granted: never mention command pregrants even
+        // though they're attached to the environment.
+        let prompt = chat_system_prompt(&["fs_read_file".to_string()], &environment);
+        assert!(!prompt.contains("Pre-approved commands"));
+        assert!(!prompt.contains("pytest"));
+    }
+
+    #[test]
+    fn system_prompt_caps_pregrant_disclosure_and_notes_the_overflow_count() {
+        let pregrants: Vec<PregrantedCommand> = (0..(PROMPT_PREGRANT_CAP + 3))
+            .map(|index| PregrantedCommand {
+                argv: vec!["tool".to_string(), index.to_string()],
+                cwd: std::path::PathBuf::from("/work/project"),
+                cwd_source: CwdSource::LaunchDirectory,
+            })
+            .collect();
+        let environment =
+            PromptEnvironment::from_grants(std::path::Path::new("/work/project"), &[], &[], &[])
+                .with_command_pregrants(&pregrants);
+        let prompt = chat_system_prompt(&["command_exec".to_string()], &environment);
+        assert!(prompt.contains("+3 more pre-approved"), "{prompt}");
+        // The very last grant beyond the cap must not be listed verbatim.
+        assert!(!prompt.contains(&format!("\"{}\"", PROMPT_PREGRANT_CAP + 2)));
+    }
+
     #[test]
     fn strict_turn_failure_commits_recovered_tool_errors() {
         // Recovered: an early failure, but the final tool round was clean.
@@ -13826,6 +14042,46 @@ mod tests {
         assert_eq!(parsed.skill, vec!["review"]);
     }
 
+    /// Regression: README documents "--resume implies --session", so passing
+    /// both explicitly must be a harmless no-op confirmation, not a clap
+    /// conflict error — in either argument order.
+    #[test]
+    fn resume_and_session_compose_in_either_order() {
+        let resume_then_session =
+            Cli::try_parse_from(["kitsu", "chat", "--resume", "abc", "--session"])
+                .expect("--resume then --session must not conflict");
+        let Command::Chat {
+            resume, session, ..
+        } = &resume_then_session.command
+        else {
+            panic!("expected Command::Chat");
+        };
+        assert_eq!(resume.as_deref(), Some("abc"));
+        assert!(*session);
+
+        let session_then_resume =
+            Cli::try_parse_from(["kitsu", "chat", "--session", "--resume", "abc"])
+                .expect("--session then --resume must not conflict");
+        let Command::Chat {
+            resume, session, ..
+        } = &session_then_resume.command
+        else {
+            panic!("expected Command::Chat");
+        };
+        assert_eq!(resume.as_deref(), Some("abc"));
+        assert!(*session);
+    }
+
+    /// `--session` still conflicts with `--no-session` — that combination is
+    /// genuinely contradictory, unlike `--resume` (which already implies
+    /// `--session`).
+    #[test]
+    fn session_still_conflicts_with_no_session() {
+        let error = Cli::try_parse_from(["kitsu", "chat", "--session", "--no-session"])
+            .expect_err("--session and --no-session remain a hard conflict");
+        assert_eq!(error.kind(), clap::error::ErrorKind::ArgumentConflict);
+    }
+
     /// Regression: a sibling directory that merely SHARES the home dir as a
     /// string prefix (no path-segment boundary) must NOT be corrupted by
     /// `strip_prefix` — it must be left as the full, unshortened path.
@@ -13878,5 +14134,75 @@ mod tests {
                 None => std::env::remove_var(self.key),
             }
         }
+    }
+
+    /// `CliError` deliberately doesn't derive `Debug` (see its definition),
+    /// so tests unwrap through this helper instead of `.unwrap()`.
+    fn expect_ok<T>(result: Result<T, CliError>) -> T {
+        result.unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    #[test]
+    fn command_env_spec_parses_bare_and_explicit_forms() {
+        assert!(matches!(
+            expect_ok(CommandEnvSpec::parse("PYTHONPATH")),
+            CommandEnvSpec::Passthrough(name) if name == "PYTHONPATH"
+        ));
+        assert!(matches!(
+            expect_ok(CommandEnvSpec::parse("PYTHONPATH=/venv/site-packages")),
+            CommandEnvSpec::Explicit(name, value)
+                if name == "PYTHONPATH" && value == "/venv/site-packages"
+        ));
+        // A value may itself contain '=' (e.g. a joined PATH-like value).
+        assert!(matches!(
+            expect_ok(CommandEnvSpec::parse("FOO=a=b")),
+            CommandEnvSpec::Explicit(name, value) if name == "FOO" && value == "a=b"
+        ));
+        assert!(CommandEnvSpec::parse("").is_err());
+        assert!(CommandEnvSpec::parse("=value").is_err());
+    }
+
+    #[test]
+    #[serial]
+    fn command_env_spec_bare_passthrough_resolves_from_process_environment() {
+        let _guard = EnvVarGuard::set("KITSU_TEST_COMMAND_ENV_PROBE", "probe-value");
+        let (name, value) =
+            expect_ok(expect_ok(CommandEnvSpec::parse("KITSU_TEST_COMMAND_ENV_PROBE")).resolve());
+        assert_eq!(name, "KITSU_TEST_COMMAND_ENV_PROBE");
+        assert_eq!(value, "probe-value");
+    }
+
+    #[test]
+    fn command_env_spec_bare_passthrough_of_a_secret_shaped_name_is_refused() {
+        // SAFETY-adjacent note: deliberately do NOT set this var — the point
+        // is that the name alone is enough to refuse the bare form, whether
+        // or not it happens to be set in this process.
+        let error = expect_ok(CommandEnvSpec::parse("MY_API_KEY"))
+            .resolve()
+            .expect_err("secret-shaped bare passthrough must be refused");
+        let message = error.to_string();
+        assert!(message.contains("MY_API_KEY"), "{message}");
+        assert!(message.contains("--command-env MY_API_KEY="), "{message}");
+    }
+
+    #[test]
+    fn command_env_spec_explicit_form_allows_a_secret_shaped_name() {
+        // The explicit form is always allowed: the caller is typing the
+        // literal value directly rather than asking kitsu to forward an
+        // ambient one from its own environment.
+        let (name, value) =
+            expect_ok(expect_ok(CommandEnvSpec::parse("MY_API_KEY=sk-explicit-value")).resolve());
+        assert_eq!(name, "MY_API_KEY");
+        assert_eq!(value, "sk-explicit-value");
+    }
+
+    #[test]
+    fn command_env_spec_bare_passthrough_of_an_unset_var_is_a_clear_error() {
+        let name = "KITSU_TEST_COMMAND_ENV_DEFINITELY_UNSET";
+        assert!(std::env::var(name).is_err(), "test precondition");
+        let error = expect_ok(CommandEnvSpec::parse(name))
+            .resolve()
+            .expect_err("unset bare passthrough must error, not silently drop the flag");
+        assert!(error.to_string().contains(name));
     }
 }

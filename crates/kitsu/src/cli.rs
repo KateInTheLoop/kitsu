@@ -300,9 +300,25 @@ pub enum Command {
         /// (repeatable). These become writable mounts inside mandatory Linux
         /// OS containment; exact argv/cwd approval remains a separate gate.
         /// Implies --enable-commands. With no explicit root, --enable-commands
-        /// uses the launch directory.
+        /// uses the launch directory. If the approved executable itself lives
+        /// outside every command root, containment denies it — pass its own
+        /// directory too (the denial names the exact directory to add).
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
+
+        /// Opt-in, explicit pass-through of one environment variable into
+        /// contained commands (repeatable), layered on top of the fixed
+        /// non-secret base set every contained command already receives
+        /// (PATH, HOME, LANG, LC_ALL, TERM, TMPDIR, USER, LOGNAME) — needed
+        /// for interpreter-based toolchains (pytest, npm test, ...) whose
+        /// module search path is env-driven (e.g. PYTHONPATH, NODE_PATH).
+        /// Bare `NAME` reads the value from kitsu's own environment and is
+        /// refused for names that look secret-bearing (case-insensitive
+        /// substring match on KEY/TOKEN/SECRET/PASSWORD); use `NAME=value`
+        /// to pass an explicit literal value regardless of name. Nothing
+        /// else is inherited from the host — deny-by-default is unchanged.
+        #[arg(long = "command-env", value_name = "NAME[=VALUE]")]
+        command_env: Vec<String>,
 
         /// Pre-approve one exact argv, encoded either as a JSON string array
         /// run in the launch directory, for example '["cargo","test"]', or as
@@ -326,8 +342,10 @@ pub enum Command {
         resume: Option<String>,
 
         /// Persist a new scripted or piped chat and autosave successful turns.
-        /// Interactive chat already persists by default; --resume implies this.
-        #[arg(long, conflicts_with_all = ["resume", "no_session"])]
+        /// Interactive chat already persists by default; --resume implies this,
+        /// so passing both is a harmless no-op confirmation rather than an
+        /// error.
+        #[arg(long, conflicts_with = "no_session")]
         session: bool,
 
         /// Disable automatic local session snapshots for this chat.

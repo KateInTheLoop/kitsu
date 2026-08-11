@@ -415,6 +415,81 @@ fn test_init_is_no_clobber_and_doctor_is_read_only_json() {
     assert!(!home.path().join(".kitsu").exists());
 }
 
+/// Cycle-8 docs-drift finding: `kitsu init` used to emit `flavor = "ollama"`
+/// and `127.0.0.1`, disagreeing with every README provider recipe (which all
+/// use `flavor = "openai"`), and defaulted to a model tag
+/// (`qwen2.5-coder:7b`) that 404s against what `ollama pull qwen2.5-coder`
+/// actually produces. The starter config must now match README's "Ollama
+/// (local)" recipe exactly on the fields that matter (flavor, base_url,
+/// chat_path, models_path, model, auth).
+#[test]
+fn test_init_generated_config_matches_the_readme_ollama_recipe() {
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("kitsu.toml");
+    let mut init = base_cmd(home.path());
+    init.args(["init", "--path", &config.to_string_lossy()])
+        .assert()
+        .success();
+    let contents = fs::read_to_string(&config).expect("starter config");
+    let parsed: toml::Value = contents.parse().expect("starter config is valid TOML");
+    let gateway = &parsed["gateways"]["ollama"];
+    assert_eq!(gateway["flavor"].as_str(), Some("openai"));
+    assert_eq!(gateway["base_url"].as_str(), Some("http://localhost:11434"));
+    assert_eq!(gateway["chat_path"].as_str(), Some("/v1/chat/completions"));
+    assert_eq!(gateway["models_path"].as_str(), Some("/v1/models"));
+    assert_eq!(gateway["model"].as_str(), Some("llama3.2"));
+    assert_eq!(gateway["auth"]["method"].as_str(), Some("none"));
+}
+
+/// The generated config's non-`base_url` fields (flavor, paths, auth) must
+/// actually produce a working request against an OpenAI-compatible endpoint
+/// — the shape Ollama serves. This swaps only `base_url` to a local mock
+/// (standing in for a real `ollama serve`) and otherwise runs the file
+/// `kitsu init` wrote, byte-for-byte, through `kitsu ask`.
+#[tokio::test]
+#[serial]
+async fn test_init_generated_config_works_end_to_end_against_an_ollama_shaped_endpoint() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi from ollama-shaped mock"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("kitsu.toml");
+    let mut init = base_cmd(home.path());
+    init.args(["init", "--path", &config.to_string_lossy()])
+        .assert()
+        .success();
+    let generated = fs::read_to_string(&config).expect("starter config");
+    let live = generated.replace("http://localhost:11434", &server.uri());
+    assert_ne!(live, generated, "base_url substitution must actually apply");
+    fs::write(&config, live).unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args([
+        "--config",
+        &config.to_string_lossy(),
+        "--no-stream",
+        "ask",
+        "hi",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("hi from ollama-shaped mock"));
+    server.verify().await;
+}
+
 #[test]
 fn test_doctor_never_echoes_static_or_malformed_config_secrets() {
     let home = TempDir::new().expect("temp home");
@@ -6379,6 +6454,108 @@ fn test_allow_command_rejects_unknown_fields_and_relative_cwd() {
             .code(1)
             .stderr(predicate::str::contains(needle));
     }
+}
+
+// --- pregranted commands disclosed to the model (cycle 8 item 2) -----------
+
+/// Cycle-8 audit gap 3: the exact `--allow-command` pregrant must be named
+/// verbatim (argv + cwd) in the system prompt sent to the provider, not just
+/// surfaced through `/permissions`/JSONL — otherwise a tool-capable model can
+/// only guess an invocation. This never exercises the tool call itself: the
+/// disclosure must already be present in the very first request.
+#[tokio::test]
+#[serial]
+async fn test_system_prompt_discloses_the_exact_pregranted_command() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let proj = TempDir::new().unwrap();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let pregrant = serde_json::json!({"argv": ["pytest", "-v"], "cwd": proj.path()}).to_string();
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &pregrant,
+            "say hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .expect("request should carry a system message");
+    let content = system["content"].as_str().unwrap();
+    assert!(content.contains("Pre-approved commands"), "{content}");
+    assert!(content.contains("pytest"), "{content}");
+    assert!(
+        content.contains(&proj.path().to_string_lossy().to_string()),
+        "{content}"
+    );
+    server.verify().await;
+}
+
+// --- containment environment pass-through (cycle 8 item 1) ------------------
+
+/// Cycle-8 audit gap 1: a bare `--command-env NAME` pass-through of a
+/// secret-shaped name must be refused at startup, before any provider
+/// request is made — the fixed non-secret containment environment stays
+/// deny-by-default unless the caller uses the explicit `NAME=value` form.
+#[tokio::test]
+#[serial]
+async fn test_command_env_bare_passthrough_of_secret_shaped_name_is_refused_at_startup() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:0");
+    let proj = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_TEST_CLI_API_KEY", "should-never-leak")
+        .args([
+            "chat",
+            "--no-session",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--command-env",
+            "KITSU_TEST_CLI_API_KEY",
+            "hello",
+        ]);
+    cmd.assert().failure().code(1).stderr(
+        predicate::str::contains("KITSU_TEST_CLI_API_KEY")
+            .and(predicate::str::contains("secret-bearing")),
+    );
 }
 
 // --- host-owned workspace evidence (cycle 7 item 2) -------------------------
