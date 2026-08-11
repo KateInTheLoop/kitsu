@@ -1084,6 +1084,36 @@ fn tool_activity_formatting() {
     // Unknown tool / unparseable args fall back to the raw name.
     assert_eq!(format_tool_header("weird_tool", "not json"), "weird_tool");
 
+    // A dispatch receipt must name the worker and its task; without an arm the
+    // agent tools have no `path` and render as a bare tool name.
+    assert_eq!(
+        format_tool_header("spawn_agent_bg", r#"{"task":"review parser.rs"}"#),
+        "Agent(\"review parser.rs\")"
+    );
+    assert_eq!(
+        format_tool_header(
+            "spawn_agent_bg",
+            r#"{"task":"review parser.rs","profile":"reviewer"}"#
+        ),
+        "Agent(reviewer: \"review parser.rs\")"
+    );
+    assert_eq!(
+        format_tool_header("spawn_agents", r#"{"tasks":["one","two"]}"#),
+        "Agent(x2: \"one\", \"two\")"
+    );
+    assert_eq!(
+        format_tool_header("agent_result", r#"{"id":3}"#),
+        "AgentResult(#3)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "spawn_agent_bg",
+            "Started background agent #1. It runs detached.",
+            false
+        ),
+        "Started background agent #1. It runs detached."
+    );
+
     assert_eq!(
         format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
         "written · 42 bytes"

@@ -226,6 +226,9 @@ impl std::error::Error for AgentStartError {}
 pub struct AgentProgress {
     pub id: u64,
     pub task: String,
+    /// The specialist profile this agent was spawned with, if any. Presentation
+    /// only — the deck needs it to say *what kind* of worker a row is.
+    pub profile: Option<String>,
     pub status: AgentProgressStatus,
     pub elapsed_ms: u64,
     pub result_bytes: Option<usize>,
@@ -321,12 +324,15 @@ pub struct AgentRegistry {
 }
 
 /// Cheap state published whenever the externally visible agent registry
-/// changes. `terminal` includes done, failed, and cancelled agents.
+/// changes. `terminal` includes done, failed, and cancelled agents; `failed` is
+/// carried separately so a watcher can report a detached failure as a failure
+/// instead of as generic completion.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct AgentRegistrySnapshot {
     pub generation: u64,
     pub running: usize,
     pub terminal: usize,
+    pub failed: usize,
 }
 
 impl Default for AgentRegistry {
@@ -373,7 +379,7 @@ impl AgentRegistry {
 
     /// Register a new running agent, returning its id.
     #[cfg(test)]
-    fn start(&self, task: String) -> Result<u64, AgentStartError> {
+    pub(crate) fn start(&self, task: String) -> Result<u64, AgentStartError> {
         let (id, update) = {
             let mut agents = self.agents.lock().expect("agent registry");
             self.check_capacity(&agents)?;
@@ -514,7 +520,7 @@ impl AgentRegistry {
     }
 
     #[cfg(test)]
-    fn finish(&self, id: u64, result: Result<String, String>) {
+    pub(crate) fn finish(&self, id: u64, result: Result<String, String>) {
         self.finish_with_telemetry(id, result, None);
     }
 
@@ -715,7 +721,10 @@ impl AgentRegistry {
                     None,
                 ));
             }
-            let receipt = record.thread.submit_steering(id, correction)?;
+            let mut receipt = record.thread.submit_steering(id, correction)?;
+            // The restarted attempt begins from a fresh transcript, so every
+            // millisecond the thread has already spent is discarded.
+            receipt.discarded_ms = elapsed_millis(record.started_at, record.finished_at);
             (receipt, self.changed_snapshot(&agents))
         };
         self.publish(update);
@@ -800,6 +809,13 @@ impl AgentRegistry {
     pub async fn cancel_all(&self) -> Vec<AgentTerminalStatus> {
         self.cancel_matching(|_| true, "cancelled by user request")
             .await
+    }
+
+    /// Abort and join every running agent, recording why. The reason is the
+    /// text a user and a JSONL consumer both read back, so callers must pass
+    /// the cause that actually applies rather than reusing another path's.
+    pub async fn cancel_all_with_reason(&self, reason: &str) -> Vec<AgentTerminalStatus> {
+        self.cancel_matching(|_| true, reason).await
     }
 
     /// Abort detached agents created by a parent turn that is being rolled
@@ -1049,10 +1065,15 @@ impl AgentRegistry {
             .values()
             .filter(|record| matches!(record.status, AgentStatus::Running))
             .count();
+        let failed = agents
+            .values()
+            .filter(|record| matches!(record.status, AgentStatus::Failed(_)))
+            .count();
         AgentRegistrySnapshot {
             generation,
             running,
             terminal: agents.len().saturating_sub(running),
+            failed,
         }
     }
 
@@ -1098,6 +1119,7 @@ fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
     AgentProgress {
         id,
         task: record.task.clone(),
+        profile: record.thread.profile().map(str::to_string),
         status,
         elapsed_ms: elapsed_millis(record.started_at, record.finished_at),
         result_bytes,
@@ -1654,18 +1676,13 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                 if let Some(profile_model) = profile.model.as_ref() {
                     cfg.model = profile_model.clone();
                 }
-                cfg.reasoning_effort = Some(match profile.reasoning_effort {
-                    profile::AgentReasoningEffort::None => kitsu_providers::ReasoningEffort::None,
-                    profile::AgentReasoningEffort::Minimal => {
-                        kitsu_providers::ReasoningEffort::Minimal
-                    }
-                    profile::AgentReasoningEffort::Low => kitsu_providers::ReasoningEffort::Low,
-                    profile::AgentReasoningEffort::Medium => {
-                        kitsu_providers::ReasoningEffort::Medium
-                    }
-                    profile::AgentReasoningEffort::High => kitsu_providers::ReasoningEffort::High,
-                    profile::AgentReasoningEffort::XHigh => kitsu_providers::ReasoningEffort::XHigh,
-                });
+                // Forward-only-if-explicitly-requested, exactly like the parent
+                // `--reasoning-effort` flag. A profile that says nothing keeps
+                // the parent's omission, so gateways that reject the field are
+                // not broken by merely selecting a profile.
+                if let Some(effort) = profile.reasoning_effort.requested() {
+                    cfg.reasoning_effort = Some(effort);
+                }
                 if !profile.instructions.trim().is_empty() {
                     if !effective_system.is_empty() {
                         effective_system.push_str("\n\n");
@@ -1679,6 +1696,20 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
             let profile_name = selected_profile
                 .as_ref()
                 .map(|profile| profile.name.clone());
+            // A profile is the only thing that can add a request field the user
+            // never asked for, so a 4xx from a profile spawn gets the one hint
+            // that explains it. Built without borrowing the profile so the
+            // detached future stays 'static.
+            let rejected_field_hint = selected_profile.as_ref().and_then(|profile| {
+                profile.reasoning_effort.requested().map(|_| {
+                    format!(
+                        "profile '{}' requested reasoning_effort={} — this gateway rejected that \
+                         request field; see /profiles or spawn without a profile",
+                        profile.name,
+                        profile.reasoning_effort.label()
+                    )
+                })
+            });
             // Admission and task-handle attachment are atomic with respect to
             // cancel-all/session teardown; no externally visible running record
             // can exist without a joinable handle.
@@ -1689,7 +1720,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                     model,
                     profile_name,
                     move |id, running_registry, runtime| async move {
-                        kitsu_tools::scope_without_interactive_prompts(
+                        let mut report = kitsu_tools::scope_without_interactive_prompts(
                             run_subagent_report_with_progress(
                                 &provider,
                                 &effective_tools,
@@ -1700,7 +1731,18 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                                 Some(runtime),
                             ),
                         )
-                        .await
+                        .await;
+                        if report.telemetry.failure_class
+                            == Some(AgentFailureClass::ProviderClientError)
+                        {
+                            if let (Err(error), Some(hint)) =
+                                (&mut report.result, rejected_field_hint.as_ref())
+                            {
+                                error.push_str("; ");
+                                error.push_str(hint);
+                            }
+                        }
+                        report
                     },
                 )
                 .map_err(|error| ToolError::ExecError(error.to_string()))?;

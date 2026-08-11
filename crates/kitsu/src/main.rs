@@ -143,7 +143,43 @@ fn emit_jsonl_summary_with_local_failures(
     Ok(())
 }
 
+/// Exit status when the process that was reading kitsu's output went away
+/// first. Nothing failed on kitsu's side, and `cmd | head -1` is an everyday
+/// shell idiom, so this mirrors the Unix convention of a quiet success.
+const EXIT_BROKEN_PIPE: i32 = 0;
+
+/// True for the panic Rust's print macros raise when the reader closed the
+/// pipe. Message-shaped by necessity: `std` gives the hook no typed I/O error.
+fn panic_payload_is_broken_pipe(payload: &str) -> bool {
+    payload.starts_with("failed printing to std")
+        && (payload.contains("Broken pipe") || payload.contains("os error 32"))
+}
+
+/// Rust masks `SIGPIPE` at startup, so a closed stdout turns every `println!`
+/// into a panic and exit 101 — a code reserved for a real crash and absent from
+/// kitsu's documented taxonomy (`kitsu sessions | head -1` hit it). The masking
+/// is still wanted: the JSONL sink depends on seeing `BrokenPipe` as an error so
+/// it can exit typed instead of dying by signal. So the panic is intercepted
+/// here rather than the signal disposition being restored: a broken output pipe
+/// stops the process quietly, everything else keeps the normal panic report.
+fn install_broken_pipe_guard() {
+    let default_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let payload = info
+            .payload()
+            .downcast_ref::<String>()
+            .map(String::as_str)
+            .or_else(|| info.payload().downcast_ref::<&str>().copied())
+            .unwrap_or_default();
+        if panic_payload_is_broken_pipe(payload) {
+            std::process::exit(EXIT_BROKEN_PIPE);
+        }
+        default_hook(info);
+    }));
+}
+
 fn main() {
+    install_broken_pipe_guard();
     let jsonl_mode = jsonl_requested();
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
     // JSONL owns both output channels: stdout is framed events and routine
@@ -272,10 +308,14 @@ fn run() -> Result<(), CliError> {
                         "--jsonl cannot be combined with human --help or --version output",
                     ));
                 }
-                error
-                    .print()
-                    .map_err(|e| CliError::user(format!("failed to print command help: {e}")))?;
-                return Ok(());
+                // `kitsu --help | head -3` closes the pipe mid-help. That is the
+                // reader's choice, not a kitsu failure; every other write error
+                // still reports.
+                return match error.print() {
+                    Ok(()) => Ok(()),
+                    Err(e) if e.kind() == std::io::ErrorKind::BrokenPipe => Ok(()),
+                    Err(e) => Err(CliError::user(format!("failed to print command help: {e}"))),
+                };
             }
             _ => return Err(CliError::user(error.to_string())),
         },
@@ -445,17 +485,35 @@ fn reject_jsonl_for_management(cli: &Cli, replacement: &str) -> Result<(), CliEr
     }
 }
 
+/// True when an output failure is only "the reader stopped reading". A closed
+/// consumer (`| head -1`) is a normal shell idiom, not a kitsu error, and must
+/// not be reported as one. The JSONL event sink keeps its own stricter contract.
+fn output_error_is_broken_pipe(error: &std::io::Error) -> bool {
+    error.kind() == std::io::ErrorKind::BrokenPipe
+}
+
 fn print_json<T: serde::Serialize>(value: &T) -> Result<(), CliError> {
     use std::io::Write as _;
     let mut stdout = std::io::stdout().lock();
-    serde_json::to_writer_pretty(&mut stdout, value)
-        .map_err(|error| CliError::user(format!("failed to encode JSON output: {error}")))?;
-    stdout
-        .write_all(b"\n")
-        .map_err(|error| CliError::user(format!("failed to write output: {error}")))?;
-    stdout
-        .flush()
-        .map_err(|error| CliError::user(format!("failed to flush output: {error}")))
+    if let Err(error) = serde_json::to_writer_pretty(&mut stdout, value) {
+        if error.io_error_kind() == Some(std::io::ErrorKind::BrokenPipe) {
+            return Ok(());
+        }
+        return Err(CliError::user(format!(
+            "failed to encode JSON output: {error}"
+        )));
+    }
+    if let Err(error) = stdout.write_all(b"\n") {
+        if output_error_is_broken_pipe(&error) {
+            return Ok(());
+        }
+        return Err(CliError::user(format!("failed to write output: {error}")));
+    }
+    match stdout.flush() {
+        Ok(()) => Ok(()),
+        Err(error) if output_error_is_broken_pipe(&error) => Ok(()),
+        Err(error) => Err(CliError::user(format!("failed to flush output: {error}"))),
+    }
 }
 
 fn run_init(cli: &Cli, requested: Option<&std::path::Path>, json: bool) -> Result<(), CliError> {
@@ -2076,6 +2134,13 @@ fn cli_reasoning_effort(cli: &Cli) -> Option<kitsu_providers::ReasoningEffort> {
         "xhigh" => kitsu_providers::ReasoningEffort::XHigh,
         _ => unreachable!("clap validates reasoning effort"),
     })
+}
+
+/// The bound a non-interactive exit puts on joining live background agents.
+/// Unset means "as long as one model turn is allowed to take", which is the
+/// only other deadline the invocation already declared.
+fn agent_join_timeout(cli: &Cli) -> std::time::Duration {
+    std::time::Duration::from_secs(cli.agent_join_timeout.unwrap_or(cli.timeout_secs))
 }
 
 fn reasoning_effort_label(effort: Option<kitsu_providers::ReasoningEffort>) -> &'static str {
@@ -5478,11 +5543,36 @@ fn report_cancelled_agents(ids: Vec<u64>) {
     }
 }
 
+/// The severity a background transition should be announced with. A detached
+/// worker that failed is never reported as plain completion — that is the
+/// misreporting that let a failed profile spawn read as success.
+fn background_agent_notice_level(
+    previous: subagent::AgentRegistrySnapshot,
+    current: subagent::AgentRegistrySnapshot,
+) -> kitsu_render::AsyncNoticeLevel {
+    if current.failed > previous.failed {
+        kitsu_render::AsyncNoticeLevel::Error
+    } else {
+        kitsu_render::AsyncNoticeLevel::Info
+    }
+}
+
 fn background_agent_notice(
     previous: subagent::AgentRegistrySnapshot,
     current: subagent::AgentRegistrySnapshot,
 ) -> Option<String> {
+    let failed = current.failed.saturating_sub(previous.failed);
     let completed = current.terminal.saturating_sub(previous.terminal);
+    if failed > 0 {
+        return Some(format!(
+            "{failed} background agent(s) FAILED - /jobs list for the failure class{}",
+            if current.running > 0 {
+                format!("; {} still running", current.running)
+            } else {
+                String::new()
+            }
+        ));
+    }
     if completed > 0 {
         return Some(if current.running == 0 {
             format!("{completed} background agent(s) finished - /agents for results")
@@ -5530,10 +5620,37 @@ fn terminal_agent_status_label(status: &subagent::AgentStatus) -> &'static str {
     }
 }
 
+/// The deck marker for one agent row. A finished agent whose result nobody has
+/// collected yet is `◈` — a durable artifact awaiting custody — not a spent
+/// `◇`; that is the row the user still has to act on.
+fn agent_deck_state(
+    status: subagent::AgentProgressStatus,
+    result_collected: bool,
+) -> kitsu_render::DeckState {
+    match status {
+        subagent::AgentProgressStatus::Running => kitsu_render::DeckState::Running,
+        subagent::AgentProgressStatus::Done if !result_collected => {
+            kitsu_render::DeckState::ResultReady
+        }
+        subagent::AgentProgressStatus::Done => kitsu_render::DeckState::Stopped,
+        subagent::AgentProgressStatus::Failed => kitsu_render::DeckState::Failed,
+        subagent::AgentProgressStatus::Cancelled => kitsu_render::DeckState::Stopped,
+    }
+}
+
+/// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
+/// `command_result` payload is built from, using the DTO's own status spellings
+/// — no `{:?}` reaches the terminal.
 fn format_jobs(registry: &subagent::AgentRegistry) -> String {
     let snapshot = registry.progress_snapshot();
-    let mut output = format!(
-        "jobs: {} total | {} running | {} done | {} failed | {} cancelled\ncapacity: {} running slot(s), {} record slot(s) available",
+    let ready = registry
+        .thread_snapshots()
+        .into_iter()
+        .filter(|thread| thread.handoff == subagent::thread::AgentHandoffState::Ready)
+        .map(|thread| thread.id)
+        .collect::<std::collections::HashSet<_>>();
+    let mut output = kitsu_render::deck_header(&format!(
+        "agent deck — {} total · {} running · {} done · {} failed · {} cancelled · {} running slot(s) free · {} record slot(s) free",
         snapshot.total,
         snapshot.running,
         snapshot.done,
@@ -5541,9 +5658,9 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
         snapshot.cancelled,
         snapshot.available_running_slots,
         snapshot.available_record_slots,
-    );
+    ));
     if snapshot.agents.is_empty() {
-        output.push_str("\n  none");
+        output.push_str("\n  no background agents");
         return output;
     }
     for agent in snapshot.agents {
@@ -5567,10 +5684,18 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             .result_bytes
             .map(|bytes| format!(" | result {bytes} B"))
             .unwrap_or_default();
+        let state = agent_deck_state(agent.status, !ready.contains(&agent.id));
+        let profile = agent
+            .profile
+            .as_deref()
+            .map(terminal_inline)
+            .unwrap_or_else(|| "default profile".to_string());
         output.push_str(&format!(
-            "\n  #{} [{}] {}\n      {:.1}s | model {} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+            kitsu_render::deck_marker(state),
             agent.id,
             agent_progress_status_label(agent.status),
+            profile,
             terminal_inline(&agent.task),
             agent.elapsed_ms as f64 / 1000.0,
             model,
@@ -5592,6 +5717,12 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
                 .collect::<Vec<_>>()
                 .join(" -> ");
             output.push_str(&format!("\n      recent {recent}"));
+        }
+        if state == kitsu_render::DeckState::ResultReady {
+            output.push_str(&format!(
+                "\n      result ready and not yet collected - /jobs show {}",
+                agent.id
+            ));
         }
         if matches!(agent.status, subagent::AgentProgressStatus::Running) {
             output.push_str("\n      partial response text withheld until the job is terminal");
@@ -5655,11 +5786,42 @@ fn terminal_job_payload(status: &subagent::AgentTerminalStatus) -> serde_json::V
     })
 }
 
+/// The steering receipt, in the terms of what steering actually does.
+///
+/// A correction does not join the running attempt: `run_subagent_report_with_progress`
+/// drops the in-flight future and restarts the worker on a fresh transcript
+/// (system + task + latest correction). "Queued" implied the opposite, so the
+/// receipt names the restart, the elapsed work it throws away, and the effects
+/// that survive it.
+fn format_steering_receipt(receipt: &subagent::thread::AgentSteeringReceipt) -> String {
+    format!(
+        "restarting background agent #{} with your correction (sequence {}; {} queued) - {:.1}s of in-flight progress discarded; completed file changes kept",
+        receipt.id,
+        receipt.sequence,
+        receipt.pending,
+        receipt.discarded_ms as f64 / 1000.0,
+    )
+}
+
+/// Human `/jobs show`. Every label is the thread DTO's own spelling, so the
+/// terminal and the JSONL `thread` payload read identically.
 fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> String {
+    let state = match snapshot.phase {
+        subagent::thread::AgentThreadPhase::Running => kitsu_render::DeckState::Running,
+        subagent::thread::AgentThreadPhase::Done
+            if snapshot.handoff == subagent::thread::AgentHandoffState::Ready =>
+        {
+            kitsu_render::DeckState::ResultReady
+        }
+        subagent::thread::AgentThreadPhase::Done => kitsu_render::DeckState::Stopped,
+        subagent::thread::AgentThreadPhase::Failed => kitsu_render::DeckState::Failed,
+        subagent::thread::AgentThreadPhase::Cancelled => kitsu_render::DeckState::Stopped,
+    };
     let mut output = format!(
-        "agent #{} [{:?}] | model {} | profile {} | {:.1}s\n  task: {}\n  steering: {} ({} pending) | handoff: {:?}",
+        "{} agent #{} {} | model {} | profile {} | {:.1}s\n  task: {}\n  steering: {} ({} queued; each restarts the worker) | handoff: {}",
+        kitsu_render::deck_marker(state),
         snapshot.id,
-        snapshot.phase,
+        snapshot.phase.label(),
         terminal_inline(&snapshot.model),
         snapshot
             .profile
@@ -5670,7 +5832,7 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
         terminal_inline(&snapshot.task),
         if snapshot.steering_open { "open" } else { "closed" },
         snapshot.pending_steering,
-        snapshot.handoff,
+        snapshot.handoff.label(),
     );
     if snapshot.timeline.entries.is_empty() {
         output.push_str("\n  timeline: no retained events");
@@ -5678,10 +5840,10 @@ fn format_agent_thread(snapshot: &subagent::thread::AgentThreadSnapshot) -> Stri
         output.push_str("\n  bounded redacted timeline:");
         for entry in &snapshot.timeline.entries {
             output.push_str(&format!(
-                "\n    [{} +{:.1}s {:?}] {}{}",
+                "\n    [{} +{:.1}s {}] {}{}",
                 entry.sequence,
                 entry.elapsed_ms as f64 / 1000.0,
-                entry.kind,
+                entry.kind.label(),
                 kitsu_render::sanitize_terminal_text(&entry.text),
                 if entry.truncated { " [truncated]" } else { "" },
             ));
@@ -5760,10 +5922,7 @@ async fn handle_jobs_command(
             }
             match registry.steer(id, &correction) {
                 Ok(receipt) => {
-                    eprintln!(
-                        "~ steering queued for background agent #{} (sequence {}; {} pending)",
-                        receipt.id, receipt.sequence, receipt.pending
-                    );
+                    eprintln!("~ {}", format_steering_receipt(&receipt));
                     Ok(serde_json::json!({
                         "kind": "jobs",
                         "action": "steer",
@@ -5772,6 +5931,8 @@ async fn handle_jobs_command(
                             "id": receipt.id,
                             "sequence": receipt.sequence,
                             "pending": receipt.pending,
+                            "restarts_thread": true,
+                            "discarded_ms": receipt.discarded_ms,
                         },
                         "snapshot": jobs_snapshot_payload(registry),
                     }))
@@ -6046,30 +6207,74 @@ fn agent_profiles_payload(catalog: &subagent::profile::AgentProfileCatalog) -> s
     })
 }
 
+/// Human `/profiles`, rendered from the same catalog DTO the JSONL payload
+/// serializes: DTO spellings for effort, the tool names themselves instead of
+/// `AllowList([...])`, and the two fields that actually decide which profile to
+/// pick — the instruction line and whether it inherits session grants.
 fn format_agent_profiles(catalog: &subagent::profile::AgentProfileCatalog) -> String {
     if catalog.is_empty() {
         return "no background-agent profiles are available".to_string();
     }
-    let mut output = String::from("background-agent profiles:");
+    let mut output = kitsu_render::deck_header(&format!(
+        "background-agent profiles — {} available",
+        catalog.len()
+    ));
     for profile in catalog.iter() {
-        let tool_policy = if profile.tool_policy.is_tool_free() {
-            "none".to_string()
+        let (tools, can_act) = match &profile.tool_policy {
+            subagent::profile::AgentToolPolicy::None => {
+                ("no tools (reasoning only)".to_string(), false)
+            }
+            subagent::profile::AgentToolPolicy::Inherit => {
+                ("inherits this run's authorized tools".to_string(), true)
+            }
+            // An allow-list intersected down to nothing is honest behaviour with
+            // an invisible explanation; say why instead of printing `AllowList([])`.
+            subagent::profile::AgentToolPolicy::AllowList(tools) if tools.is_empty() => (
+                "no tools - this run granted no read roots".to_string(),
+                false,
+            ),
+            subagent::profile::AgentToolPolicy::AllowList(tools) => (
+                tools
+                    .iter()
+                    .map(|tool| terminal_inline(tool))
+                    .collect::<Vec<_>>()
+                    .join(", "),
+                true,
+            ),
+        };
+        // Filled = this profile can act; hollow = it can only reason.
+        let marker = if kitsu_render::plain_mode() {
+            "-"
+        } else if can_act {
+            kitsu_render::GLYPH_TOOL_CALL
         } else {
-            format!("{:?}", profile.tool_policy)
+            kitsu_render::GLYPH_TOOL_RESULT
         };
         output.push_str(&format!(
-            "\n  {} | model {} | reasoning {:?} | tools {}",
+            "\n  {} {} | model {} | effort {} | tools {} | {}",
+            marker,
             terminal_inline(&profile.name),
             profile
                 .model
                 .as_deref()
                 .map(terminal_inline)
-                .unwrap_or_else(|| "current".to_string()),
-            profile.reasoning_effort,
-            tool_policy,
+                .unwrap_or_else(|| "session model".to_string()),
+            profile.reasoning_effort.label(),
+            tools,
+            if profile.permission_defaults.inherit_session {
+                "inherits session grants"
+            } else {
+                "isolated from session grants"
+            },
         ));
+        if !profile.instructions.trim().is_empty() {
+            output.push_str(&format!(
+                "\n      {}",
+                terminal_inline(profile.instructions.trim())
+            ));
+        }
     }
-    output.push_str("\n  background agents select one with spawn_agent_bg({task, profile})");
+    output.push_str("\n~ background agents select one with spawn_agent_bg({task, profile})");
     output
 }
 
@@ -6099,6 +6304,98 @@ async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason
     }
 }
 
+/// Why a non-interactive shutdown stopped waiting. Only a bound that was
+/// actually hit may be named in the cancellation text.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShutdownJoinStop {
+    Timeout,
+    Interrupted,
+    RegistryClosed,
+}
+
+/// Non-interactive end-of-input handling for live background agents: join them
+/// the way `/quit wait` does, bounded by `timeout`, and cancel only when the
+/// bound (or an interrupt) is actually reached.
+///
+/// Returns the agents that had to be cancelled — empty when everything finished
+/// on its own, in which case the run's detached work is complete and its
+/// results are real results, not casualties of the exit path.
+async fn join_background_agents_at_exit(
+    registry: &Arc<subagent::AgentRegistry>,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    timeout: std::time::Duration,
+    quiet: bool,
+) -> Vec<subagent::AgentTerminalStatus> {
+    let running = registry.running();
+    if running == 0 {
+        return Vec::new();
+    }
+    if !quiet {
+        eprintln!(
+            "~ input ended with {running} background agent(s) running; joining them (up to {}s; Ctrl+C cancels, --agent-join-timeout adjusts)",
+            timeout.as_secs()
+        );
+    }
+    let mut changes = registry.subscribe();
+    let deadline = tokio::time::sleep(timeout);
+    tokio::pin!(deadline);
+    let mut stop = None;
+    while changes.borrow().running > 0 {
+        tokio::select! {
+            changed = changes.changed() => {
+                if changed.is_err() {
+                    stop = Some(ShutdownJoinStop::RegistryClosed);
+                    break;
+                }
+            }
+            () = &mut deadline => {
+                stop = Some(ShutdownJoinStop::Timeout);
+                break;
+            }
+            _ = tokio::signal::ctrl_c() => {
+                stop = Some(ShutdownJoinStop::Interrupted);
+                break;
+            }
+        }
+    }
+    let cancelled = match stop {
+        None => Vec::new(),
+        Some(stop) => {
+            let reason = match stop {
+                ShutdownJoinStop::Timeout => format!(
+                    "cancelled by shutdown policy: still running after the {}s exit join",
+                    timeout.as_secs()
+                ),
+                ShutdownJoinStop::Interrupted => {
+                    "cancelled by shutdown policy: the exit join was interrupted".to_string()
+                }
+                ShutdownJoinStop::RegistryClosed => {
+                    "cancelled by shutdown policy: the agent registry closed during the exit join"
+                        .to_string()
+                }
+            };
+            registry.cancel_all_with_reason(&reason).await
+        }
+    };
+    if !quiet {
+        if cancelled.is_empty() {
+            eprintln!("~ joined {running} background agent(s) before exit");
+        } else {
+            let ids = cancelled
+                .iter()
+                .map(|status| format!("#{}", status.id))
+                .collect::<Vec<_>>()
+                .join(", ");
+            eprintln!(
+                "~ cancelled {} unfinished background agent(s) by shutdown policy: {ids} (nothing was rolled back; completed file changes remain on disk)",
+                cancelled.len()
+            );
+        }
+    }
+    report_write_checkpoints(journal.drain_and_take_reports().await);
+    cancelled
+}
+
 /// Surface every completed detached result that was never opened through
 /// `/jobs show` or `agent_result`. Shutdown is the last point at which an
 /// interactive, in-memory registry can preserve that work, so silently dropping
@@ -6110,11 +6407,16 @@ fn print_background_results(results: &[subagent::AgentTerminalStatus]) {
             result.id,
             terminal_inline(&result.task)
         );
+        // A detached failure is rendered as an error, not as a body: a worker
+        // that never ran must never read like a delivered result.
+        if let subagent::AgentStatus::Failed(error) = &result.status {
+            kitsu_render::render_error(&format!("background job #{} failed: {error}", result.id));
+            continue;
+        }
         let body = match &result.status {
             subagent::AgentStatus::Done(body) => body.clone(),
-            subagent::AgentStatus::Failed(error) => format!("failed: {error}"),
             subagent::AgentStatus::Cancelled(reason) => format!("cancelled: {reason}"),
-            subagent::AgentStatus::Running => continue,
+            subagent::AgentStatus::Failed(_) | subagent::AgentStatus::Running => continue,
         };
         eprintln!("{}", kitsu_render::sanitize_terminal_text(&body));
     }
@@ -6328,15 +6630,18 @@ impl ScriptRunStatus {
 
 /// The single shutdown boundary for scripted chat. Every body exit reaches
 /// this function, including parse/persistence errors, cancellation, and a
-/// terminal JSONL sink. Detached tasks are cancelled and joined before their
-/// unobserved terminal results are surfaced. When JSONL remains writable, the
-/// run-level error (if needed) and final summary follow those results, making
-/// `final_summary` the last event.
+/// terminal JSONL sink. Detached tasks are JOINED (bounded by
+/// `agent_join_timeout`) before their unobserved terminal results are surfaced;
+/// only work that outlives that bound is cancelled, and it is reported as a
+/// shutdown-policy cancellation rather than as a rolled-back turn. When JSONL
+/// remains writable, the run-level error (if needed) and final summary follow
+/// those results, making `final_summary` the last event.
 async fn finalize_scripted_run(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     jsonl: bool,
     allow_turn_errors: bool,
+    agent_join_timeout: std::time::Duration,
     mut status: ScriptRunStatus,
     body_result: Result<(), CliError>,
 ) -> Result<(), CliError> {
@@ -6347,18 +6652,29 @@ async fn finalize_scripted_run(
         status.provider_failures += usize::from(error.exit_code() == EXIT_PROVIDER);
     }
 
-    let unfinished_agents = registry.running();
-    if unfinished_agents > 0 {
-        status.failures += 1;
-        status.provider_failures += 1;
+    // This awaits every task handle (joined or aborted). It must run even after
+    // the JSONL emitter becomes terminal and cannot accept another frame. An
+    // interrupted run is not made to wait: the user already asked to stop.
+    let agent_join_timeout = if primary_error
+        .as_ref()
+        .is_some_and(|error| error.exit_code() == EXIT_CANCELLED)
+    {
+        std::time::Duration::ZERO
+    } else {
+        agent_join_timeout
+    };
+    let cancelled_at_exit =
+        join_background_agents_at_exit(registry, journal, agent_join_timeout, jsonl).await;
+    if !cancelled_at_exit.is_empty() {
+        // Work kitsu had to stop is not successful automation. Work it waited
+        // for and collected is reported by its own terminal status below.
+        status.failures += cancelled_at_exit.len();
         if !jsonl {
             eprintln!(
-                "script ended with {unfinished_agents} unfinished background agent(s); detached work is not considered successful automation"
+                "script ended before {} background agent(s) finished; detached work that had to be cancelled is not successful automation",
+                cancelled_at_exit.len()
             );
         }
-        // This awaits every aborted task handle. It must run even after the
-        // JSONL emitter becomes terminal and cannot accept another frame.
-        cancel_agents_and_report_writes(registry, 0, journal).await;
     }
     // A detached writer may have finished immediately before the running-count
     // snapshot. Its standalone checkpoint still belongs to this script exit.
@@ -6509,6 +6825,7 @@ async fn run_scripted(
         journal,
         cli.jsonl,
         allow_turn_errors,
+        agent_join_timeout(cli),
         status,
         result,
     )
@@ -7299,10 +7616,7 @@ fn handle_active_jobs_command(
             let receipt = registry
                 .steer(id, &correction)
                 .map_err(|error| error.to_string())?;
-            Ok(format!(
-                "steering queued for agent #{} (sequence {}; {} pending)",
-                receipt.id, receipt.sequence, receipt.pending
-            ))
+            Ok(format_steering_receipt(&receipt))
         }
         "stop" => {
             let id = parts
@@ -7898,7 +8212,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         .insert(subagent::profile::AgentProfile {
             name: "reviewer".to_string(),
             model: None,
-            reasoning_effort: subagent::profile::AgentReasoningEffort::High,
+            // Inherit, never High: a profile that injects `reasoning_effort`
+            // into the request is rejected outright (HTTP 400) by gateways that
+            // do not know the field, which includes the default local Ollama
+            // gateway. Effort stays a parent-invocation decision.
+            reasoning_effort: subagent::profile::AgentReasoningEffort::Inherit,
             instructions: "Review the delegated evidence critically. Do not modify files or run developer commands; return concrete, prioritized findings.".to_string(),
             tool_policy: subagent::profile::AgentToolPolicy::AllowList(
                 reviewer_tools
@@ -8572,17 +8890,32 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         warn_context_window_evidence(cli, Some("piped:1"), &mut session_state)?;
         return match outcome {
             TurnOutcome::Completed(Ok(_)) => {
-                let unfinished_agents = agent_registry.running();
+                // A piped turn that delegated work joins it the way `/quit
+                // wait` does. Only agents that outlive the join bound are
+                // cancelled, and only then is the run incomplete.
+                let cancelled_at_exit = join_background_agents_at_exit(
+                    &agent_registry,
+                    &write_journal,
+                    agent_join_timeout(cli),
+                    cli.jsonl,
+                )
+                .await;
+                let background_results = agent_registry.take_unobserved_terminal_results();
+                emit_script_background_results(&background_results, cli.jsonl)?;
+                let failed_background = background_results
+                    .iter()
+                    .filter(|result| matches!(result.status, subagent::AgentStatus::Failed(_)))
+                    .count();
+                let unfinished_agents = cancelled_at_exit.len() + failed_background;
                 if unfinished_agents > 0 {
                     finish_assistant_disposition(
                         cli,
                         "piped:1",
                         AssistantDisposition::Discarded,
-                        Some("unfinished background agents made the turn incomplete"),
+                        Some("background agents did not complete, so the turn is incomplete"),
                     )?;
-                    cancel_agents_and_report_writes(&agent_registry, 0, &write_journal).await;
                     let mapped = CliError::provider(format!(
-                        "piped turn ended with {unfinished_agents} unfinished background agent(s)"
+                        "piped turn ended with {unfinished_agents} unfinished or failed background agent(s)"
                     ));
                     if cli.jsonl {
                         emit_jsonl(
@@ -8832,7 +9165,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 while changes.changed().await.is_ok() {
                     let current = *changes.borrow_and_update();
                     if let Some(message) = background_agent_notice(previous, current) {
-                        let notice = kitsu_render::PromptSafeAsyncNotice::info(message);
+                        let notice = kitsu_render::PromptSafeAsyncNotice::new(
+                            background_agent_notice_level(previous, current),
+                            message,
+                        );
                         if typeahead_active.load(Ordering::Acquire)
                             || notice.publish_with(|frame| printer.print(frame)).is_err()
                         {
@@ -11271,6 +11607,194 @@ mod tests {
         assert!(!h.highlight_char(pasted, 0, false));
     }
 
+    /// Rust `Debug` spellings that must never reach a human deck surface: the
+    /// JSONL beside them already carries a clean DTO string for each.
+    const DECK_DEBUG_LEAKS: [&str; 7] = [
+        "AllowList(",
+        "[Running]",
+        "Unavailable",
+        "Some(",
+        "None(",
+        "Medium",
+        "CamelCase",
+    ];
+
+    fn assert_no_debug_leak(rendered: &str) {
+        for leak in DECK_DEBUG_LEAKS {
+            assert!(
+                !rendered.contains(leak),
+                "human deck output leaked the Rust Debug form {leak}: {rendered}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_profile_view_renders_the_dto_not_its_debug_form() {
+        let mut catalog = subagent::profile::AgentProfileCatalog::new();
+        catalog
+            .insert(subagent::profile::AgentProfile {
+                name: "reviewer".to_string(),
+                model: None,
+                reasoning_effort: subagent::profile::AgentReasoningEffort::Inherit,
+                instructions: "Review the delegated evidence critically.".to_string(),
+                tool_policy: subagent::profile::AgentToolPolicy::AllowList(vec![
+                    "fs_read_file".to_string(),
+                    "fs_list_dir".to_string(),
+                ]),
+                permission_defaults: subagent::profile::AgentPermissionDefaults {
+                    inherit_session: true,
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        catalog
+            .insert(subagent::profile::AgentProfile::reasoning_only(
+                "reasoning",
+                "Reason from the supplied task only.",
+            ))
+            .unwrap();
+        let rendered = format_agent_profiles(&catalog);
+        assert_no_debug_leak(&rendered);
+        assert!(rendered.contains("fs_read_file, fs_list_dir"), "{rendered}");
+        assert!(rendered.contains("effort inherit"), "{rendered}");
+        // The two fields F5 found dropped from the human view only.
+        assert!(
+            rendered.contains("Review the delegated evidence critically."),
+            "{rendered}"
+        );
+        assert!(rendered.contains("inherits session grants"), "{rendered}");
+        assert!(
+            rendered.contains("isolated from session grants"),
+            "{rendered}"
+        );
+        // An empty allow-list explains itself instead of printing `AllowList([])`.
+        let mut narrowed = subagent::profile::AgentProfileCatalog::new();
+        narrowed
+            .insert(subagent::profile::AgentProfile {
+                name: "reviewer".to_string(),
+                model: None,
+                reasoning_effort: subagent::profile::AgentReasoningEffort::Inherit,
+                instructions: String::new(),
+                tool_policy: subagent::profile::AgentToolPolicy::AllowList(Vec::new()),
+                permission_defaults: subagent::profile::AgentPermissionDefaults::default(),
+            })
+            .unwrap();
+        let narrowed = format_agent_profiles(&narrowed);
+        assert_no_debug_leak(&narrowed);
+        assert!(
+            narrowed.contains("no tools - this run granted no read roots"),
+            "{narrowed}"
+        );
+    }
+
+    #[test]
+    fn the_thread_view_uses_the_dto_labels_for_phase_handoff_and_timeline() {
+        let snapshot = subagent::thread::AgentThreadSnapshot {
+            id: 1,
+            task: "review the parser".to_string(),
+            model: "test-model".to_string(),
+            profile: Some("reviewer".to_string()),
+            phase: subagent::thread::AgentThreadPhase::Running,
+            handoff: subagent::thread::AgentHandoffState::Unavailable,
+            elapsed_ms: 1200,
+            result_bytes: None,
+            steering_open: true,
+            pending_steering: 0,
+            timeline: subagent::thread::AgentTimelineSnapshot {
+                entries: vec![subagent::thread::AgentTimelineEntry {
+                    sequence: 1,
+                    elapsed_ms: 10,
+                    kind: subagent::thread::AgentTimelineKind::Provider,
+                    round: Some(1),
+                    text: "request started".to_string(),
+                    truncated: false,
+                }],
+                dropped_entries: 0,
+                retained_bytes: "request started".len(),
+                closed: false,
+            },
+        };
+        let rendered = format_agent_thread(&snapshot);
+        assert_no_debug_leak(&rendered);
+        assert!(rendered.contains("agent #1 running"), "{rendered}");
+        assert!(rendered.contains("handoff: unavailable"), "{rendered}");
+        assert!(rendered.contains("provider]"), "{rendered}");
+        // Every human label equals its DTO field value.
+        let dto = serde_json::to_value(subagent::thread::AgentThreadSnapshotDto::from_snapshot(
+            &snapshot,
+        ))
+        .unwrap();
+        assert_eq!(dto["thread"]["phase"], snapshot.phase.label());
+        assert_eq!(dto["thread"]["handoff"], snapshot.handoff.label());
+        assert_eq!(
+            dto["thread"]["timeline"]["entries"][0]["kind"],
+            snapshot.timeline.entries[0].kind.label()
+        );
+    }
+
+    #[test]
+    fn the_jobs_deck_marks_each_state_with_its_own_glyph() {
+        let registry = subagent::AgentRegistry::default();
+        let _running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        let failed = registry.start("broke".to_string()).unwrap();
+        registry.finish(done, Ok("collected later".to_string()));
+        registry.finish(failed, Err("provider request failed".to_string()));
+
+        // Non-TTY: glyphs, no escape bytes. (`--plain`'s ASCII markers are
+        // covered where the mode is an explicit argument, in kitsu-render, so
+        // this test never touches the process-wide plain flag.)
+        let styled = format_jobs(&registry);
+        assert_no_debug_leak(&styled);
+        assert!(!styled.contains('\u{1b}'), "{styled}");
+        assert!(styled.starts_with("◈ agent deck"), "{styled}");
+        assert!(styled.contains("◆ #"), "{styled}");
+        assert!(styled.contains("◈ #"), "{styled}");
+        assert!(styled.contains("◇ #"), "{styled}");
+        assert!(styled.contains(&format!("/jobs show {done}")), "{styled}");
+    }
+
+    #[test]
+    fn a_broken_output_pipe_is_not_a_crash() {
+        assert!(panic_payload_is_broken_pipe(
+            "failed printing to stdout: Broken pipe (os error 32)"
+        ));
+        assert!(panic_payload_is_broken_pipe(
+            "failed printing to stderr: Broken pipe (os error 32)"
+        ));
+        // A full disk is a real failure and must keep the normal panic report
+        // (the JSONL sink relies on a typed nonzero exit for it).
+        assert!(!panic_payload_is_broken_pipe(
+            "failed printing to stdout: No space left on device (os error 28)"
+        ));
+        assert!(!panic_payload_is_broken_pipe("index out of bounds"));
+        assert_eq!(EXIT_BROKEN_PIPE, 0);
+    }
+
+    #[test]
+    fn the_steering_receipt_says_the_worker_restarts() {
+        let receipt = subagent::thread::AgentSteeringReceipt {
+            id: 3,
+            sequence: 2,
+            pending: 1,
+            discarded_ms: 72_000,
+        };
+        let rendered = format_steering_receipt(&receipt);
+        assert!(
+            rendered.contains("restarting background agent #3"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("72.0s of in-flight progress discarded"),
+            "{rendered}"
+        );
+        assert!(
+            rendered.contains("completed file changes kept"),
+            "{rendered}"
+        );
+        assert!(!rendered.contains("queued for"), "{rendered}");
+    }
+
     #[test]
     fn plain_mode_disables_rustyline_bracketed_paste_sequences() {
         assert!(bracketed_paste_enabled(false));
@@ -11707,14 +12231,43 @@ mod tests {
             generation: 1,
             running: 0,
             terminal: 0,
+            failed: 0,
         };
         let current = subagent::AgentRegistrySnapshot {
             generation: 3,
             running: 0,
             terminal: 1,
+            failed: 0,
         };
         let notice = background_agent_notice(previous, current).unwrap();
         assert!(notice.contains("1 background agent(s) finished"));
+        assert_eq!(
+            background_agent_notice_level(previous, current),
+            kitsu_render::AsyncNoticeLevel::Info
+        );
+    }
+
+    #[test]
+    fn a_detached_failure_is_announced_as_a_failure_not_as_completion() {
+        let previous = subagent::AgentRegistrySnapshot {
+            generation: 1,
+            running: 1,
+            terminal: 0,
+            failed: 0,
+        };
+        let current = subagent::AgentRegistrySnapshot {
+            generation: 2,
+            running: 0,
+            terminal: 1,
+            failed: 1,
+        };
+        let notice = background_agent_notice(previous, current).unwrap();
+        assert!(notice.contains("FAILED"), "{notice}");
+        assert!(!notice.contains("finished"), "{notice}");
+        assert_eq!(
+            background_agent_notice_level(previous, current),
+            kitsu_render::AsyncNoticeLevel::Error
+        );
     }
 
     #[test]

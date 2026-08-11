@@ -82,6 +82,13 @@ guarantees requires a new schema identifier.
   `background_result` before `final_summary`; successful detached work is never
   silently lost when a script exits. An unacknowledged failed job also makes
   strict automation nonzero.
+  Scripted and piped exits **join** live background agents (bounded by
+  `--agent-join-timeout`, default `--timeout-secs`) instead of discarding them,
+  so a detached job that finishes during the join reports its real terminal
+  status with `joined: true`. Only work that outlives the bound is cancelled,
+  and its `background_result.result` then carries a shutdown-policy reason
+  (`cancelled by shutdown policy: ...`) — never the rolled-back-turn reason,
+  which belongs exclusively to agents discarded with a failed parent turn.
 - Script query commands may place one structured `command_result` between their
   matching `command_started` and `command_finished`; status, permissions,
   context, diff, model-catalog, model-switch, compaction, session inventory,
@@ -90,6 +97,16 @@ guarantees requires a new schema identifier.
   stderr. Status, permissions, and session inventory retain a compatibility
   `text` field alongside typed fields. Job mutations report both whether state
   changed and the resulting bounded registry/thread snapshot.
+  The `jobs`/`steer` receipt additionally carries `restarts_thread` (always
+  `true`) and `discarded_ms`: steering does not append to the running attempt,
+  it drops it and restarts the worker on a fresh transcript, discarding that
+  many milliseconds of elapsed work. Completed file effects survive.
+  An agent profile's `reasoning_effort` may be `"inherit"` — the default — which
+  means the spawn sends **no** `reasoning_effort` request field and keeps the
+  parent invocation's policy (itself omitted unless `--reasoning-effort` was
+  passed). `"none"` remains distinct: it explicitly sends the field. Both
+  built-in profiles ship as `"inherit"` so they work on gateways that reject
+  unknown request fields.
 - `assistant` follows that turn's runtime events when final text is available.
 - `assistant_disposition` follows the assistant payload and closes its
   provisional output transaction before `turn_finished`.

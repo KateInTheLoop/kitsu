@@ -97,6 +97,18 @@ pub struct Cli {
     )]
     pub timeout_secs: u64,
 
+    /// How long a non-interactive exit (scripted or piped chat) waits for live
+    /// background agents to finish before cancelling them. Scripted runs join
+    /// detached work instead of discarding it; this is the bound on that wait.
+    /// Defaults to `--timeout-secs`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(0..)
+    )]
+    pub agent_join_timeout: Option<u64>,
+
     /// Max output tokens per response. Unset lets the gateway apply its own cap
     /// (often 4096), which silently truncates long outputs like code reviews.
     /// Raise it (e.g. 16000) for long-form generation.

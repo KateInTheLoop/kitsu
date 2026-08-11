@@ -113,6 +113,22 @@ pub enum AgentTimelineKind {
     Lifecycle,
 }
 
+impl AgentTimelineKind {
+    /// The DTO spelling. Human rendering uses this too, so a `/jobs show`
+    /// timeline can never disagree with the JSONL beside it.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::UserTask => "user_task",
+            Self::Assistant => "assistant",
+            Self::Provider => "provider",
+            Self::Tool => "tool",
+            Self::Usage => "usage",
+            Self::Steering => "steering",
+            Self::Lifecycle => "lifecycle",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct AgentTimelineEntry {
@@ -143,12 +159,35 @@ pub enum AgentThreadPhase {
     Cancelled,
 }
 
+impl AgentThreadPhase {
+    /// The DTO spelling, shared with the human `/jobs` view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Running => "running",
+            Self::Done => "done",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentHandoffState {
     Unavailable,
     Ready,
     Acknowledged,
+}
+
+impl AgentHandoffState {
+    /// The DTO spelling, shared with the human `/jobs` view.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Unavailable => "unavailable",
+            Self::Ready => "ready",
+            Self::Acknowledged => "acknowledged",
+        }
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -276,11 +315,19 @@ pub struct AgentSteeringMessage {
     pub correction: String,
 }
 
+/// What a submitted correction actually does.
+///
+/// Steering restarts the worker: the in-flight attempt is dropped and the next
+/// one runs a fresh transcript (system + task + latest correction). Callers must
+/// be able to say so, and to say how much elapsed work that discards, so
+/// `discarded_ms` carries the thread's elapsed time at submission. It is filled
+/// in by the registry, which owns the clock.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct AgentSteeringReceipt {
     pub id: u64,
     pub sequence: u64,
     pub pending: usize,
+    pub discarded_ms: u64,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -543,6 +590,7 @@ impl AgentThreadState {
                     id,
                     sequence,
                     pending,
+                    discarded_ms: 0,
                 })
             }
             Err(mpsc::error::TrySendError::Full(_)) => Err(AgentSteeringError::new(
@@ -619,6 +667,10 @@ impl AgentThreadState {
 
     pub(crate) fn handoff(&self) -> AgentHandoffState {
         self.handoff
+    }
+
+    pub(crate) fn profile(&self) -> Option<&str> {
+        self.profile.as_deref()
     }
 
     pub(crate) fn snapshot(&self, id: u64, elapsed_ms: u64) -> AgentThreadSnapshot {

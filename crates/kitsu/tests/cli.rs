@@ -5650,3 +5650,395 @@ async fn test_piped_chat_system_prompt_names_cwd_and_granted_roots() {
         "system prompt must steer the model to explore: {system:?}"
     );
 }
+
+// --- agent deck: profile spawns, non-interactive joins, broken pipes ---------
+
+/// Cycle-7 F1: selecting a built-in profile must not inject a `reasoning_effort`
+/// field. The CLI flag is "omitted by default so non-reasoning endpoints receive
+/// no extra request field"; a profile spawn that ignored that rule made every
+/// profile 400 on the default local gateway while the model reported success.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_profile_background_spawn_sends_no_reasoning_effort_field() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"content\":\"profile audit task\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "PROFILE_RESULT_SENTINEL"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "profile-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"profile audit task\",\"profile\":\"reviewer\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("profile-spawn.script");
+    fs::write(&script, "delegate an audit\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("PROFILE_RESULT_SENTINEL"),
+        "stderr: {stderr}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert!(!requests.is_empty());
+    for request in &requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "a profile that requests no effort must not add the field: {body}"
+        );
+    }
+}
+
+/// Cycle-7 F2b / git-workflow gap 2: a script that ends while a background agent
+/// is healthy joins it (the `/quit wait` semantics), reports its real result, and
+/// exits 0 — instead of cancelling the work and blaming a turn that committed.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_script_exit_joins_live_background_agents_and_never_claims_a_rollback() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"content\":\"slow detached task\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(900))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "DETACHED_RESULT_SENTINEL"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "detached-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"slow detached task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("join-at-exit.script");
+    fs::write(&script, "start detached work\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let (human, jsonl) = tokio::task::spawn_blocking(move || {
+        let run = |jsonl: bool| {
+            let mut cmd = base_cmd(&home_path);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+            if jsonl {
+                cmd.arg("--jsonl");
+            }
+            cmd.args([
+                "--gateway",
+                "example",
+                "chat",
+                "--no-session",
+                "--allow-path",
+                &home_path.to_string_lossy(),
+                "--script",
+                &script_path,
+            ]);
+            cmd.output().unwrap()
+        };
+        (run(false), run(true))
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&human.stderr).into_owned();
+    assert!(human.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("joining them"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("joined 1 background agent(s) before exit"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("DETACHED_RESULT_SENTINEL"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rolled back"),
+        "the turn committed; nothing was rolled back: {stderr}"
+    );
+    assert!(!stderr.contains("cancelled"), "stderr: {stderr}");
+
+    assert!(
+        jsonl.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&jsonl.stderr)
+    );
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let background = events
+        .iter()
+        .find(|event| event["type"] == "background_result")
+        .expect("background result event");
+    assert_eq!(background["status"], "done");
+    assert_eq!(background["joined"], true);
+    assert_eq!(background["result"], "DETACHED_RESULT_SENTINEL");
+    let summary = events
+        .iter()
+        .find(|event| event["type"] == "final_summary")
+        .expect("final summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["failures"], 0);
+    server.verify().await;
+}
+
+/// When the bounded join really is exceeded, the cancellation names the policy
+/// that caused it. It must never reuse the rolled-back-turn wording.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_script_exit_cancellation_names_shutdown_policy_not_a_rollback() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"content\":\"endless detached task\"",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "never observed"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "endless-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"endless detached task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("cancel-at-exit.script");
+    fs::write(&script, "start endless work\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "--agent-join-timeout",
+            "0",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cancelled by shutdown policy"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("parent turn was rolled back"),
+        "the turn committed; the cancellation must not blame a rollback: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rolled-back turn"),
+        "the turn committed; the cancellation must not blame a rollback: {stderr}"
+    );
+}
+
+/// Git-workflow gap 3: `kitsu <cmd> | head -1` used to exit 101 with a Rust
+/// panic message. A reader that goes away first is not a crash.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_closed_output_pipe_exits_cleanly_without_a_panic() {
+    use std::process::Stdio;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    for args in [vec!["--help"], vec!["sessions"], vec!["sessions", "--json"]] {
+        let mut command = std::process::Command::new(
+            assert_cmd::cargo::cargo_bin("kitsu")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        command
+            .env("HOME", home.path())
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn kitsu");
+        // Close the read end before the child writes: exactly what `| head -1`
+        // does once it has what it wants.
+        drop(child.stdout.take());
+        let mut stderr = String::new();
+        if let Some(mut handle) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = handle.read_to_string(&mut stderr);
+        }
+        let status = child.wait().expect("wait for kitsu");
+        assert_ne!(
+            status.code(),
+            Some(101),
+            "{args:?} panicked on a closed stdout: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{args:?} printed a panic report: {stderr}"
+        );
+        assert_eq!(status.code(), Some(0), "{args:?} stderr: {stderr}");
+    }
+}
