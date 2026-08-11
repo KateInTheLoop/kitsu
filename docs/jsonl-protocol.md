@@ -78,6 +78,15 @@ guarantees requires a new schema identifier.
   resolved window from this evidence; `/context` reports it as provenance.
 - `tool_started` is followed by exactly one matching `tool_finished`, including
   cancellation.
+- When the model calls the `workspace_diff` tool (registered in chat when the
+  launch directory is a Git worktree; disabled by `--no-workspace-evidence` or
+  the `workspace_evidence = false` config key), the call is framed as a normal
+  `tool_started`/`tool_finished` pair and exactly one
+  `workspace_evidence_disclosure` event is emitted between them — the
+  `review_disclosure` field set generalized to the tool surface, plus
+  `source: "workspace_diff"`. It marks the moment bounded host-verified diff
+  bytes entered the model prompt; `model_read_root_granted` is always `false`
+  (see docs/workspace-diff-tool.md).
 - A detached job whose terminal result was not already consumed is emitted as a
   `background_result` before `final_summary`; successful detached work is never
   silently lost when a script exits. An unacknowledged failed job also makes
@@ -100,11 +109,15 @@ guarantees requires a new schema identifier.
   The `permissions` result carries `commands.exact_grants[].cwd_source`
   (`"explicit"`, `"launch_directory"`, or `null` for a grant created at runtime
   through the approval prompt) and a `host_evidence` object describing the
-  host-owned workspace-evidence root used by `/diff`, `/review`, and
-  `kitsu review`: `repository_root`, `consumers`, `model_read_root` (always
-  `false` — host evidence never becomes a model read root),
-  `prompt_disclosure`, and `excluded_private_paths`. Outside a Git worktree it
-  reports `repository_root: null` plus `unavailable`.
+  host-owned workspace-evidence root used by `/diff`, `/review`,
+  `kitsu review`, and the model-callable `workspace_diff` tool:
+  `repository_root`, `consumers` (including `"workspace_diff"` when the tool
+  is registered), `model_read_root` (always `false` — host evidence never
+  becomes a model read root), `prompt_disclosure`
+  (`"explicit_user_command_only"`, or
+  `"user_command_or_workspace_diff_tool"` when the tool is registered), and
+  `excluded_private_paths`. Outside a Git worktree it reports
+  `repository_root: null` plus `unavailable`.
   The `command_artifacts` result carries `cross_run` (`generation_count`,
   `bytes`) describing what earlier runs left on disk, alongside the
   in-process `usage`/`artifacts` fields.

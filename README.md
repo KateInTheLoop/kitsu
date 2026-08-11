@@ -519,6 +519,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
 | `--no-project-context` | off | Do not discover or send project `llms.txt`/`AGENTS.md` context or project skills. User skills remain available, including explicit `--skill` preloads. |
+| `--no-workspace-evidence` | off | Do not register the model-callable `workspace_diff` evidence tool for this run (see [Tools in chat](#tools-in-chat)). The config key `workspace_evidence = false` disables it permanently. |
 
 **Chat-only flags**
 
@@ -586,6 +587,18 @@ it won't ask again.
   which *do* consume model read authority: an attachment can name any file, and
   the grant is what bounds which files can be named, whereas evidence scope is
   fixed by the repository Kitsu was launched in.
+- **`workspace_diff` — the model can request that disclosure itself.** When
+  chat starts inside a Git worktree, the model gets a `workspace_diff` tool so
+  "explain my uncommitted changes" works in every chat mode without pasting a
+  diff or granting a read root. Each call is the same bounded, host-gathered,
+  Kitsu-private-excluding evidence as `/diff` for that scope
+  (working/staged/unstaged/base/commit), surfaced as a normal tool receipt and
+  announced with the same `~ disclosing N bytes …; no read root granted` line
+  (a `workspace_evidence_disclosure` event in `--jsonl`). It is never a
+  filesystem read: no read root is consulted, created, or widened. Opt out
+  with `--no-workspace-evidence` or `workspace_evidence = false` in the
+  config; the tool is then not registered at all. Design:
+  [docs/workspace-diff-tool.md](docs/workspace-diff-tool.md).
 - **In-session grants:** `/allow <path>`, `/allow-write <path>`, and
   `/allow-read-write <path>`. `/revoke-read <exact-root>` and
   `/revoke-write <exact-root>` remove a displayed root for the current session;
@@ -669,7 +682,7 @@ Slash commands inside the REPL:
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
 | `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
-| `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
+| `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |

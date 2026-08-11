@@ -21,6 +21,7 @@
     { "$ref": "#/$defs/command_result" },
     { "$ref": "#/$defs/command_finished" },
     { "$ref": "#/$defs/context_window_mismatch" },
+    { "$ref": "#/$defs/workspace_evidence_disclosure" },
     { "$ref": "#/$defs/error" },
     { "$ref": "#/$defs/final_summary" },
     { "$ref": "#/$defs/forward_compatible_event" }
@@ -534,6 +535,34 @@
         }
       ]
     },
+    "workspace_evidence_disclosure": {
+      "description": "One bounded disclosure of host-verified workspace evidence to the provider through the model-callable workspace_diff tool — the review_disclosure field set generalized to the tool surface. Emitted between the tool's tool_started and tool_finished frames.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "source",
+            "target",
+            "truncated",
+            "evidence_bytes",
+            "model_disclosed",
+            "model_read_root_granted"
+          ],
+          "properties": {
+            "type": { "const": "workspace_evidence_disclosure" },
+            "source": { "const": "workspace_diff" },
+            "target": { "type": "string", "minLength": 1 },
+            "resolved_revision": { "type": ["string", "null"] },
+            "merge_base": { "type": ["string", "null"] },
+            "truncated": { "type": "boolean" },
+            "evidence_bytes": { "type": "integer", "minimum": 0 },
+            "model_disclosed": { "const": true },
+            "model_read_root_granted": { "const": false }
+          }
+        }
+      ]
+    },
     "forward_compatible_event": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -560,6 +589,7 @@
                   "command_result",
                   "command_finished",
                   "context_window_mismatch",
+                  "workspace_evidence_disclosure",
                   "error",
                   "final_summary"
                 ]
