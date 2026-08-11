@@ -1064,6 +1064,10 @@ fn tool_activity_formatting() {
     assert_eq!(short_path("/x/y/deck1.md"), "…/y/deck1.md");
     assert_eq!(short_path("a/b"), "a/b");
     assert_eq!(short_path("deck.md"), "deck.md");
+    // Short absolute paths keep their leading slash: `/etc/hostname` must not
+    // display as the relative-looking `etc/hostname`.
+    assert_eq!(short_path("/etc/hostname"), "/etc/hostname");
+    assert_eq!(short_path("/etc"), "/etc");
 
     assert_eq!(
         format_tool_header("fs_read_file", r#"{"path":"/x/y/deck1.md"}"#),
@@ -1075,7 +1079,7 @@ fn tool_activity_formatting() {
     );
     assert_eq!(
         format_tool_header("repo_grep", r#"{"pattern":"TODO","path":"/a/src"}"#),
-        "Grep(\"TODO\", a/src)"
+        "Grep(\"TODO\", /a/src)"
     );
     // Unknown tool / unparseable args fall back to the raw name.
     assert_eq!(format_tool_header("weird_tool", "not json"), "weird_tool");

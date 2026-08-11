@@ -51,7 +51,7 @@ pub struct AgentConfig {
     /// replaces them with an LLM-written summary (opt-in — quality is model-
     /// dependent). Falls back to `Trim` if summarization fails.
     pub compaction: CompactionMode,
-    /// Suppress this turn's terminal narration (spinner, `⏺`/`⎿` tool activity,
+    /// Suppress this turn's terminal narration (spinner, `◆`/`◇` tool activity,
     /// and the `kitsu-usage:`/`kitsu-context:` lines). Set for BACKGROUND
     /// subagents so their output doesn't corrupt the interactive prompt while
     /// they run detached; their result is delivered via the agent registry.
@@ -772,6 +772,11 @@ where
 {
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
+    if !cfg.quiet {
+        // Reset the per-turn stdout marker so error handling can tell whether
+        // THIS turn streamed provisional output (quiet subagents never print).
+        kitsu_render::begin_turn_output();
+    }
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
@@ -806,7 +811,13 @@ where
             let budget = ContextBudget::new(window, cfg.max_tokens);
             (state.meter.estimate(messages), budget.effective, window)
         });
-        kitsu_render::emit_turn_stats(usage, context);
+        if result.is_ok() {
+            kitsu_render::emit_turn_stats(usage, context);
+        } else {
+            // A failed turn gets no human stats line — the error notice owns
+            // that moment — but redirected runs keep the machine records.
+            kitsu_render::emit_failed_turn_stats(usage, context);
+        }
     }
     result
 }
@@ -1142,7 +1153,7 @@ where
         // from earlier failures before finishing.
         turn_status.final_round_tool_errors = 0;
         for tc in tool_calls {
-            // Narrate the action (Claude-Code-style), e.g. `⏺ Read(deck1.md)`.
+            // Narrate the action, e.g. `◆ Read(deck1.md)`.
             if !cfg.quiet {
                 kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
             }
@@ -1189,7 +1200,12 @@ where
                 }
             };
             if !cfg.quiet {
-                kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
+                let summary = format_tool_result(&tc.tool_name, &content, is_err);
+                if is_err {
+                    kitsu_render::tool_result_error(&summary);
+                } else {
+                    kitsu_render::tool_result(&summary);
+                }
             }
             tool_event.finish(!is_err, &content);
             abort_if_event_sink_failed(cfg)?;
@@ -1615,11 +1631,16 @@ fn short_path(p: &str) -> String {
         .collect();
     match parts.as_slice() {
         [] => p.to_string(),
+        [one] if p.starts_with('/') => format!("/{one}"),
         [one] => (*one).to_string(),
         [.., a, b] => {
             let tail = format!("{a}/{b}");
             if parts.len() > 2 {
                 format!("…/{tail}")
+            } else if p.starts_with('/') {
+                // Keep short absolute paths exact: `/etc/hostname` must not
+                // display as the relative-looking `etc/hostname`.
+                format!("/{tail}")
             } else {
                 tail
             }

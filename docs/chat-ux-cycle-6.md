@@ -109,6 +109,55 @@ Fix pass B (identity & polish): items 5–7 via the design audit's ranked pack.
 Backlogged for a later cycle: items 8–10, review dead-end hint, export format
 inference, preflight budget consistency, session search, screen-reader mode.
 
+## Implementation outcome
+
+Two sequential fix passes closed the cycle scope on this branch:
+
+**Pass A (correctness, committed `7a941fb`):** the chat system prompt names the
+cwd and every granted root with its authority and tells the model to explore;
+deadline expiry in ask/piped/review preserves partial streamed output with an
+explicit `committed_partial` JSONL disposition instead of discarding delivered
+work (scripted turns intentionally keep rollback for history consistency);
+recovered edit-conflict turns commit, unreachable `/undo` hints are suppressed,
+and `--allow-turn-errors` no longer exits 0 when every turn failed; provider
+`prompt_tokens` evidence below the resolved context window warns once and shows
+in `/context` provenance; streamed stdout is always newline-terminated before
+stderr status. 19 regression tests. Descoped: cross-process checkpoint
+persistence (the false `/undo` advertisement it caused was removed instead).
+
+**Pass B (fox/kitsune identity, this commit):** success-path provider telemetry
+silenced (failures still report); errors render as one weighted EMBER notice
+with actionable hints and no failed-turn stats; the documented glyph set is
+real — `◆` tool call, `◇` result, `◈` receipt, `◉` approval, `⛩` milestones —
+replacing the borrowed `⏺ ⎿ ✻`; the cat mascot is gone: fox kaomoji banner and
+spinner frames, 🦊 title, closed box; one weighted unified permission prompt
+design for filesystem and command approval (leading-slash display bug fixed);
+`/help` renders six headed groups from the single shared registry; the six
+documented palette colors exist as named constants with amber/ember context-
+meter thresholds. `docs/ux-design.md` now exists as the actual spec.
+`--plain`/`NO_COLOR`/non-TTY remain byte-stable ASCII and `kitsu.chat.v1`
+JSONL is unaffected. 12 more regression tests. Descoped: syntect code-block
+boxes; CREAM reserved.
+
+## Release verification
+
+Final tree: fmt clean, workspace clippy clean (`-D warnings`, all targets and
+features), and 493 passing tests (190 bin unit, 2 provenance, 92 CLI
+integration, 84 core, 58 provider, 29 render, 130 tools/permissions). One
+PTY-dependent test (`test_query_only_interactive_session_does_not_create_a_
+snapshot`) fails in this sandboxed environment; it was verified to fail
+identically on the untouched baseline `20d57c1` before either pass. Maintainer
+spot-checks on a live pty confirmed the fox banner, and that `NO_COLOR` output
+contains zero escape sequences. No hosted inference or credentials were used.
+
+## Backlog (maintainer decision)
+
+Carried to a later cycle: decouple host-owned `/diff` from model read
+authority; explicit cwd for `--allow-command` pregrants; cross-run artifact
+retention/GC; `kitsu review <path>` clean-tree dead-end hint; `sessions export`
+format inference; preflight budget-number consistency; session search;
+screen-reader rendering mode; syntect code-block boxes.
+
 ## Report index
 
 1. [Codex CLI side-by-side](chat-ux-cycle-6-audits/raw/01-codex-parity.md)
