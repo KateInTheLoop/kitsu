@@ -1440,11 +1440,49 @@ fn format_tool_header(name: &str, args: &str) -> String {
         "repo_grep" => "Grep",
         "fs_write_file" => "Write",
         "fs_edit_file" => "Edit",
+        "spawn_agent" | "spawn_agents" | "spawn_agent_bg" => "Agent",
+        "agent_result" => "AgentResult",
         other => other,
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
         return friendly.to_string();
     };
+    // The agent tools carry no `path`, so without this arm the single most
+    // important receipt in the deck — "a worker was dispatched, doing X" —
+    // renders as a bare tool name.
+    if matches!(name, "spawn_agent" | "spawn_agent_bg") {
+        let task = bounded_human_value(v.get("task").and_then(|x| x.as_str()).unwrap_or(""), 96);
+        return match v.get("profile").and_then(|x| x.as_str()) {
+            Some(profile) => format!(
+                "{friendly}({}: \"{task}\")",
+                bounded_human_value(profile, 64)
+            ),
+            None => format!("{friendly}(\"{task}\")"),
+        };
+    }
+    if name == "spawn_agents" {
+        let tasks = v.get("tasks").and_then(|x| x.as_array());
+        let count = tasks.map_or(0, Vec::len);
+        let labels = tasks
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|task| task.as_str())
+                    .map(|task| format!("\"{}\"", bounded_human_value(task, 48)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("{friendly}(x{count}: {labels})");
+    }
+    if name == "agent_result" {
+        let id = v
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return format!("{friendly}(#{id})");
+    }
     if name == "repo_grep" {
         let pat = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("");
         let path = v
@@ -1515,6 +1553,11 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
                 let n = content.lines().count();
                 format!("{n} match{}", if n == 1 { "" } else { "es" })
             }
+        }
+        // "1 line" is useless for a dispatch receipt; the agent tools return a
+        // one-sentence status whose first line IS the summary.
+        "spawn_agent_bg" | "agent_result" => {
+            bounded_human_value(content.lines().next().unwrap_or_default(), 180)
         }
         _ => {
             let n = content.lines().count();

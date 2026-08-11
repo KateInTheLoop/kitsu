@@ -623,9 +623,9 @@ Slash commands inside the REPL:
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
-| `/profiles` | List validated background-agent profiles. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker. |
+| `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `/agents [id]` remains an alias. |
+| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
 | `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. |
 | `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
@@ -701,7 +701,12 @@ artifacts, help/tools, and job/thread slash commands emit typed
 
 `Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
 idle prompt it clears input. Automation emits a structured cancelled event and
-exits `130`. `Ctrl+D` or `/quit` does not silently discard live background agents.
+exits `130`. `Ctrl+D` or `/quit` does not silently discard live background agents,
+and neither does the end of a `--script` or piped run: it joins them the way
+`/quit wait` does, bounded by `--agent-join-timeout` (default `--timeout-secs`).
+Only agents still running when that bound expires are cancelled, and they are
+reported as cancelled by shutdown policy — never as casualties of a rolled-back
+turn.
 Completed filesystem side effects are never pretended away after cancellation—
 inspect them with `/diff` or restore a safe checkpoint with `/undo`. Interactive
 type-ahead collection is Unix-only: complete lines entered during generation are
@@ -853,7 +858,9 @@ always: false
   `--allow-turn-errors`), `1` CLI/input/config/missing-auth or other user-policy
   failure (including local tool failures and policy denials), `2`
   provider/HTTP/timeout or strict incomplete turn (length limit or exhausted
-  rounds), and `130` Ctrl+C cancellation.
+  rounds), and `130` Ctrl+C cancellation. A consumer that closes kitsu's stdout
+  early (`kitsu sessions | head -1`) is not a failure: kitsu stops quietly and
+  exits `0` instead of unwinding with the Rust panic code `101`.
 - **Platform hardening:** Unix uses descriptor-bound command working directories,
   process-group cancellation, and descriptor-relative no-follow file/session
   operations. Portable branches retain validation and direct-child cancellation,

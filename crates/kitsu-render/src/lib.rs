@@ -1038,6 +1038,86 @@ pub fn compaction_boundary() {
     milestone("context compacted (older turns summarized)");
 }
 
+/// The attention state of one agent-deck row (docs/ux-design.md D1). Fill level
+/// carries the state, matching the established glyph semantics: `◆` filled =
+/// live action, `◈` = a durable result awaiting custody, `◇` hollow = spent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeckState {
+    /// Working right now.
+    Running,
+    /// Finished; its result has not been collected yet.
+    ResultReady,
+    /// Finished by failing.
+    Failed,
+    /// Stopped by a user or by policy.
+    Stopped,
+}
+
+impl DeckState {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => GLYPH_TOOL_CALL,
+            Self::ResultReady => GLYPH_RECEIPT,
+            Self::Failed | Self::Stopped => GLYPH_TOOL_RESULT,
+        }
+    }
+
+    fn color(self) -> (u8, u8, u8) {
+        match self {
+            Self::Running | Self::ResultReady => FOX,
+            Self::Failed => EMBER,
+            Self::Stopped => AMBER,
+        }
+    }
+
+    /// The stable ASCII marker `--plain`/`NO_COLOR`/non-TTY receive.
+    fn plain_marker(self) -> &'static str {
+        match self {
+            Self::Running => "[run]",
+            Self::ResultReady => "[rdy]",
+            Self::Failed => "[err]",
+            Self::Stopped => "[stp]",
+        }
+    }
+}
+
+/// The `◈` header of a deck section (`/jobs`, `/profiles`), in highlight cream.
+/// `--plain` renders `# <summary>` with zero escape bytes.
+pub fn deck_header(summary: &str) -> String {
+    deck_header_with_mode(summary, stderr_style(), plain_mode())
+}
+
+fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
+    if plain {
+        return format!("# {}", sanitize_plain_inline(summary));
+    }
+    let line = format!("{GLYPH_RECEIPT} {}", sanitize_terminal_inline(summary));
+    if styled {
+        let (r, g, b) = CREAM;
+        format!("{}", line.truecolor(r, g, b).bold())
+    } else {
+        line
+    }
+}
+
+/// One deck row's state marker, already colored for the destination. Callers
+/// append their own (already sanitized) row text after it.
+pub fn deck_marker(state: DeckState) -> String {
+    deck_marker_with_mode(state, stderr_style(), plain_mode())
+}
+
+fn deck_marker_with_mode(state: DeckState, styled: bool, plain: bool) -> String {
+    if plain {
+        return state.plain_marker().to_string();
+    }
+    if styled {
+        let (r, g, b) = state.color();
+        format!("{}", state.glyph().truecolor(r, g, b))
+    } else {
+        state.glyph().to_string()
+    }
+}
+
 fn grouped_count(value: u64) -> String {
     let digits = value.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
@@ -1326,13 +1406,13 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        approval_header_with_mode, approval_options_with_mode, context_lines, display_width,
-        error_display_lines, format_message, grouped_count, human_turn_stats,
-        milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
-        sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line,
-        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
-        PromptSafeAsyncNotice, RenderMode, SpinnerMode, TerminalTextSanitizer, AMBER, EMBER, FOX,
-        SPINNER_FRAMES,
+        approval_header_with_mode, approval_options_with_mode, context_lines,
+        deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
+        format_message, grouped_count, human_turn_stats, milestone_line_with_mode,
+        sanitize_plain_inline, sanitize_terminal_inline, sanitize_terminal_text, section_heading,
+        spinner_mode, static_spinner_line, write_static_spinner, write_turn_stats,
+        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
+        SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -1708,5 +1788,51 @@ mod tests {
             "  * kitsu is thinking\n"
         );
         assert!(!output.contains(&b'\r'));
+    }
+
+    #[test]
+    fn deck_markers_carry_state_by_fill_and_degrade_to_stable_ascii() {
+        // Styled TTY: fill level is the state, colour is the severity.
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Running, true, false),
+            format!("{}◆\u{1b}[39m", sgr(FOX))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::ResultReady, true, false),
+            format!("{}◈\u{1b}[39m", sgr(FOX))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Failed, true, false),
+            format!("{}◇\u{1b}[39m", sgr(EMBER))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Stopped, true, false),
+            format!("{}◇\u{1b}[39m", sgr(AMBER))
+        );
+
+        // Non-TTY keeps the glyphs and drops the colour.
+        assert_eq!(deck_marker_with_mode(DeckState::Running, false, false), "◆");
+
+        // `--plain`/`NO_COLOR`: stable ASCII, zero escape bytes.
+        for (state, marker) in [
+            (DeckState::Running, "[run]"),
+            (DeckState::ResultReady, "[rdy]"),
+            (DeckState::Failed, "[err]"),
+            (DeckState::Stopped, "[stp]"),
+        ] {
+            let rendered = deck_marker_with_mode(state, true, true);
+            assert_eq!(rendered, marker);
+            assert!(!rendered.contains('\u{1b}'));
+        }
+
+        let styled_header = deck_header_with_mode("agent deck — 2 running", true, false);
+        assert!(styled_header.contains(&sgr(CREAM)));
+        assert_eq!(
+            sanitize_terminal_text(&styled_header),
+            "◈ agent deck — 2 running"
+        );
+        let plain_header = deck_header_with_mode("agent deck — 2 running", true, true);
+        assert_eq!(plain_header, "# agent deck - 2 running");
+        assert!(!plain_header.contains('\u{1b}'));
     }
 }
