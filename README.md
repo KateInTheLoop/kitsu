@@ -489,7 +489,7 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `ask <prompt>` | Ask a single question; stream the answer. |
 | `review [path]` | Run one tool-free review over host-verified working/staged/unstaged/base/commit evidence; supports JSONL, focus instructions, and opt-in session continuity. |
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
-| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `resume` launches chat on a TTY or emits exact argv otherwise. |
+| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
 | `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
@@ -673,7 +673,7 @@ Slash commands inside the REPL:
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |
-| `/sessions` | List saved sessions. |
+| `/sessions [filter]` | List saved sessions, optionally filtered by a case-insensitive substring over id and preview. |
 | `/resume <id\|last>` | Resume a saved session without restoring its old permissions. |
 | `/fork [id]` | Clone a saved session to a fresh ID, then switch with fresh runtime permissions. |
 | `/export <file> [markdown\|json]` | Export the active session without overwriting. If it has artifacts, also create `<file>.artifacts` and rewrite exact pointers to that sidecar. |

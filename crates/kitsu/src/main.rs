@@ -477,6 +477,7 @@ flavor = "openai"
 base_url = "http://localhost:11434"
 chat_path = "/v1/chat/completions"
 models_path = "/v1/models"
+# Pull this model first (ollama pull llama3.2) or set one you already have
 model = "llama3.2"
 context_window = 32768
 auth = { method = "none" }
@@ -951,19 +952,37 @@ async fn run_sessions(
     let sessions_dir = state_dir.join("sessions");
 
     match command {
-        None | Some(SessionCommand::List) => {
+        None => {
             let saved = session::SessionStore::list(&sessions_dir)
                 .map_err(|error| session_error("list", &config_path, error))?;
             if json {
                 print_json(&saved)
             } else if saved.is_empty() {
                 println!(
-                    "no saved sessions for config {}",
+                    "no saved sessions for config {} — start one with kitsu chat --session or /new",
                     shorten_home(&config_path)
                 );
                 Ok(())
             } else {
-                println!("{}", format_session_summaries(&saved, None));
+                println!("{}", format_session_summaries(&saved, None, ""));
+                Ok(())
+            }
+        }
+        Some(SessionCommand::List { filter }) => {
+            let saved = session::SessionStore::list(&sessions_dir)
+                .map_err(|error| session_error("list", &config_path, error))?;
+            let filter_str = filter.as_deref().unwrap_or("");
+            if json {
+                let filtered = filter_sessions(&saved, filter_str);
+                print_json(&filtered)
+            } else if saved.is_empty() {
+                println!(
+                    "no saved sessions for config {} — start one with kitsu chat --session or /new",
+                    shorten_home(&config_path)
+                );
+                Ok(())
+            } else {
+                println!("{}", format_session_summaries(&saved, None, filter_str));
                 Ok(())
             }
         }
@@ -2844,12 +2863,18 @@ fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
 /// (which always receives the unstyled variant).
 fn slash_help(model: &str, styled: bool) -> String {
     let model = terminal_inline(model);
-    let width = SLASH_COMMANDS
-        .iter()
-        .filter(|spec| spec.alias_of.is_none())
-        .map(|spec| spec.syntax().len())
-        .max()
-        .unwrap_or(0);
+    // Cap the first column width to avoid excessive padding when commands have
+    // long arguments. Longer commands will have their description on a new line.
+    const MAX_SYNTAX_WIDTH: usize = 50;
+    let width = std::cmp::min(
+        SLASH_COMMANDS
+            .iter()
+            .filter(|spec| spec.alias_of.is_none())
+            .map(|spec| spec.syntax().len())
+            .max()
+            .unwrap_or(0),
+        MAX_SYNTAX_WIDTH,
+    );
     let mut out = String::from("commands:\n");
     for group in CommandGroup::ORDER {
         out.push_str(&kitsu_render::section_heading(group.heading(), styled));
@@ -2866,7 +2891,13 @@ fn slash_help(model: &str, styled: bool) -> String {
             {
                 description.push_str(&format!(" (alias: /{})", alias.name));
             }
-            out.push_str(&format!("  {syntax:<width$}  {description}\n"));
+            if syntax.len() <= width {
+                out.push_str(&format!("  {syntax:<width$}  {description}\n"));
+            } else {
+                // Long commands wrap; description goes on the next line indented
+                out.push_str(&format!("  {syntax}\n"));
+                out.push_str(&format!("    {description}\n"));
+            }
         }
     }
     out.push_str(&format!("current model: {model}"));
@@ -3843,28 +3874,66 @@ fn authorized_workspace_review(
     )
 }
 
-fn format_sessions(dir: &std::path::Path, current: Option<&str>) -> Result<String, String> {
+fn filter_sessions(
+    sessions: &[session::SessionSummary],
+    filter: &str,
+) -> Vec<session::SessionSummary> {
+    let filter = filter.trim().to_lowercase();
+    if filter.is_empty() {
+        sessions.to_vec()
+    } else {
+        sessions
+            .iter()
+            .filter(|session| {
+                session.id.to_lowercase().contains(&filter)
+                    || session.preview.to_lowercase().contains(&filter)
+            })
+            .cloned()
+            .collect()
+    }
+}
+
+fn format_sessions(
+    dir: &std::path::Path,
+    current: Option<&str>,
+    filter: &str,
+) -> Result<String, String> {
     let sessions = session::SessionStore::list(dir)?;
-    Ok(format_session_summaries(&sessions, current))
+    Ok(format_session_summaries(&sessions, current, filter))
 }
 
 fn session_catalog_payload(
     dir: &std::path::Path,
     current: Option<&str>,
+    filter: &str,
 ) -> Result<serde_json::Value, String> {
     let sessions = session::SessionStore::list(dir)?;
+    let filtered = filter_sessions(&sessions, filter);
     Ok(serde_json::json!({
         "kind": "sessions",
         "current_session_id": current,
         "count": sessions.len(),
-        "sessions": sessions,
-        "text": format_session_summaries(&sessions, current),
+        "filtered_count": filtered.len(),
+        "sessions": filtered.clone(),
+        "text": format_session_summaries(&filtered, current, filter),
     }))
 }
 
-fn format_session_summaries(sessions: &[session::SessionSummary], current: Option<&str>) -> String {
+fn format_session_summaries(
+    sessions: &[session::SessionSummary],
+    current: Option<&str>,
+    filter: &str,
+) -> String {
     if sessions.is_empty() {
-        return "no saved sessions".to_string();
+        let filter = filter.trim();
+        if filter.is_empty() {
+            return "no saved sessions — start one with /new or use /resume to continue an archived session".to_string();
+        } else {
+            return format!(
+                "no sessions matched '{}' — try /sessions to see all saved sessions",
+                terminal_inline(filter)
+            );
+        }
     }
     let mut out = String::from("saved sessions:\n");
     for saved in sessions {
@@ -5291,10 +5360,10 @@ fn bounded_model_catalog_reason(error: &ProviderError) -> Option<String> {
 fn empty_model_catalog_message(filter: &str) -> String {
     let filter = filter.trim();
     if filter.is_empty() {
-        "the gateway model catalog is empty".to_string()
+        "no available models — check gateway connection or model availability".to_string()
     } else {
         format!(
-            "no models matched '{}' - retry without a filter to see the full catalog",
+            "no models matched '{}' — retry without a filter to see the full catalog",
             terminal_inline(filter)
         )
     }
@@ -5641,6 +5710,7 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
         let has_write = tool_names.iter().any(|name| name == "fs_write_file");
         let has_edit = tool_names.iter().any(|name| name == "fs_edit_file");
         let has_commands = tool_names.iter().any(|name| name == "command_exec");
+        let has_spawn = tool_names.iter().any(|name| name == "spawn_agent_bg");
         let mut prompt = format!(
             "You are kitsu, a concise, helpful CLI assistant with these tools: {}. ",
             tool_names.join(", ")
@@ -5708,6 +5778,11 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
                 }
                 prompt.push_str(". ");
             }
+        }
+        if has_spawn {
+            prompt.push_str(
+                "Use spawn_agent_bg only for explicitly parallel or long-running work; answer simple requests directly. ",
+            );
         }
         prompt.trim_end().to_string()
     }
@@ -6314,7 +6389,9 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
         snapshot.available_record_slots,
     ));
     if snapshot.agents.is_empty() {
-        output.push_str("\n  no background agents");
+        output.push_str(
+            "\n  no background agents — ask the model to delegate work, or see /profiles",
+        );
         return output;
     }
     for agent in snapshot.agents {
@@ -6719,6 +6796,9 @@ async fn handle_jobs_command(
             }
         }
         _ => {
+            if let Some(suggestion) = closest_jobs_subcommand(action) {
+                eprintln!("unknown action '{action}' - did you mean '{suggestion}'?");
+            }
             eprintln!("usage: /jobs [list|show <id>|steer <id> <text>|close-steering <id>|stop <id>|stop-all|prune <id|all>]");
             Err(())
         }
@@ -6843,7 +6923,7 @@ fn handle_command_artifacts(
     arg: &str,
 ) -> Result<serde_json::Value, ()> {
     let Some(sink) = sink else {
-        eprintln!("command artifacts are disabled because the command tool is not enabled");
+        eprintln!("no artifacts — enable command tool to capture artifact generations");
         return Err(());
     };
     let mut parts = arg.split_whitespace();
@@ -7216,9 +7296,10 @@ fn format_checkpoint_summaries(
     checkpoints: &[kitsu_tools::builtins::fs::JournalCheckpointSummary],
 ) -> String {
     if checkpoints.is_empty() {
-        return "no recoverable file checkpoints in this session".to_string();
+        return "no recoverable checkpoints — use /checkpoint <file> to save an editable state"
+            .to_string();
     }
-    let mut output = String::from("recoverable file checkpoints (oldest first):");
+    let mut output = kitsu_render::deck_header("recoverable file checkpoints (oldest first)");
     for checkpoint in checkpoints {
         output.push_str(&format!(
             "\n  #{}  {} ({} change{})",
@@ -7901,11 +7982,12 @@ async fn run_scripted_body(
                     }
                     continue;
                 }
-                SlashResult::ListSessions => {
+                SlashResult::ListSessions(filter) => {
                     let current = session.session_id.borrow().clone();
                     match session_catalog_payload(
                         &setup.state_dir.join("sessions"),
                         current.as_deref(),
+                        &filter,
                     ) {
                         Ok(output) => {
                             if !cli.jsonl {
@@ -10317,9 +10399,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     )));
                     continue;
                 }
-                SlashResult::ListSessions => {
+                SlashResult::ListSessions(filter) => {
                     let current = session.session_id.borrow().clone();
-                    match format_sessions(&sessions_dir, current.as_deref()) {
+                    match format_sessions(&sessions_dir, current.as_deref(), &filter) {
                         Ok(list) => eprintln!("{list}"),
                         Err(error) => eprintln!("cannot list sessions: {error}"),
                     }
@@ -10685,7 +10767,7 @@ enum SlashResult {
     Retry,
     NewSession,
     ResumeSession(String),
-    ListSessions,
+    ListSessions(String),
     ForkSession(Option<String>),
     ExportSession {
         destination: std::path::PathBuf,
@@ -10788,7 +10870,11 @@ fn execute_queue_command(
 ) -> Result<String, String> {
     match command {
         QueueCommand::List => {
-            let mut output = queue.status().to_string();
+            let status = queue.status();
+            let mut output = kitsu_render::deck_header(&format!(
+                "prompt queue — {} / {} prompts",
+                status.queued, status.capacity
+            ));
             for (index, prompt) in queue.iter().enumerate() {
                 output.push_str(&format!(
                     "\n  [{}] {}",
@@ -10879,6 +10965,24 @@ fn closest_slash_command(name: &str) -> Option<&'static str> {
         .min()
         .filter(|(distance, _)| *distance <= 3)
         .map(|(_, name)| name)
+}
+
+fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
+    const SUBCOMMANDS: &[&str] = &[
+        "list",
+        "show",
+        "steer",
+        "close-steering",
+        "stop",
+        "stop-all",
+        "prune",
+    ];
+    SUBCOMMANDS
+        .iter()
+        .map(|&cmd| (edit_distance(name, cmd), cmd))
+        .min()
+        .filter(|(distance, _)| *distance <= 3)
+        .map(|(_, cmd)| cmd)
 }
 
 fn slash_syntax(name: &str) -> String {
@@ -11487,7 +11591,7 @@ async fn handle_slash(
             return SlashResult::Error;
         }
         "retry" => return SlashResult::Retry,
-        "sessions" => return SlashResult::ListSessions,
+        "sessions" => return SlashResult::ListSessions(arg.to_string()),
         "tools" => {
             let (mode, behavior) = permission_mode_label(perms.mode());
             eprintln!(
@@ -11560,7 +11664,7 @@ async fn handle_slash(
         "skills" => {
             if skillset.is_empty() {
                 eprintln!(
-                    "no skills found - add SKILL.md dirs under .kitsu/skills/ or ~/.kitsu/skills/"
+                    "no skills found — add SKILL.md dirs under .kitsu/skills/ or ~/.kitsu/skills/"
                 );
             } else {
                 eprintln!("skills:\n{}", skillset.terminal_index(arg));
@@ -13007,6 +13111,20 @@ mod tests {
     }
 
     #[test]
+    fn system_prompt_with_spawn_agent_bg_scopes_use_to_parallel_or_long_running_work() {
+        let environment = PromptEnvironment::default();
+        let prompt = chat_system_prompt(&["spawn_agent_bg".to_string()], &environment);
+        assert!(
+            prompt.contains("Use spawn_agent_bg only for explicitly parallel or long-running work")
+        );
+        assert!(prompt.contains("answer simple requests directly"));
+
+        // Verify spawn guidance is absent when tool is not registered
+        let prompt_without = chat_system_prompt(&["fs_read_file".to_string()], &environment);
+        assert!(!prompt_without.contains("spawn_agent_bg"));
+    }
+
+    #[test]
     fn strict_turn_failure_commits_recovered_tool_errors() {
         // Recovered: an early failure, but the final tool round was clean.
         let recovered = kitsu_core::AgentTurnStatus {
@@ -13110,7 +13228,7 @@ mod tests {
             preview: "preview\r\nforged-preview-row".to_string(),
             turns: 1,
         }];
-        let catalog = format_session_summaries(&summaries, None);
+        let catalog = format_session_summaries(&summaries, None, "");
         assert!(!catalog.contains('\u{1b}'));
         assert!(!catalog.contains("https://evil.invalid"));
         assert!(!catalog.contains("\nforged-gateway-row"));
@@ -13329,8 +13447,27 @@ mod tests {
         assert_eq!(catalog, vec!["alpha".to_string()]);
         assert_eq!(
             empty_model_catalog_message(" Missing "),
-            "no models matched 'Missing' - retry without a filter to see the full catalog"
+            "no models matched 'Missing' — retry without a filter to see the full catalog"
         );
+    }
+
+    #[test]
+    fn empty_state_messages_follow_consistent_pattern() {
+        // Sessions empty state includes guidance
+        let sessions_empty = format_session_summaries(&[], None, "");
+        assert!(sessions_empty.contains("no saved sessions"));
+        assert!(sessions_empty.contains("—"));
+        assert!(sessions_empty.contains("/new"));
+
+        // Checkpoints empty state includes guidance
+        let checkpoints_empty = format_checkpoint_summaries(&[]);
+        assert!(checkpoints_empty.contains("no recoverable checkpoints"));
+        assert!(checkpoints_empty.contains("—"));
+        assert!(checkpoints_empty.contains("/checkpoint"));
+
+        // Models empty state messages use em dash
+        assert!(empty_model_catalog_message("").contains("—"));
+        assert!(empty_model_catalog_message("test").contains("—"));
     }
 
     #[test]

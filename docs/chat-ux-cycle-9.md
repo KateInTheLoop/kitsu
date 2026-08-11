@@ -54,6 +54,30 @@ search from the standing backlog: `kitsu sessions [filter]` and `/sessions
 [filter]` substring filtering, mirroring `/models`. Item 1 goes to backlog
 for a high-capability cycle.
 
+## Implementation outcome
+
+One Haiku fix pass closed items 2–6 plus session search (this commit): the
+system prompt scopes `spawn_agent_bg` to explicitly parallel or long-running
+work when the tool is registered; empty states across list surfaces follow
+one "what is empty — how to populate it" pattern; `/checkpoints` and
+`/queue list` adopt the ◈ deck header design (`--plain` ASCII unchanged);
+`/jobs` subaction typos get close-match suggestions; `/help` caps and wraps
+the syntax column; `kitsu sessions [filter]` and `/sessions [filter]` narrow
+by case-insensitive substring; and the generated config documents its model
+line. Maintainer review corrected two items before commit: the `/jobs` empty
+state no longer instructs the user to call a model-only tool (the cycle-7
+anti-pattern), and the README session rows were updated. Known scope trims:
+subaction suggestions landed for `/jobs` only (`/queue` deferred), and test
+coverage for items 4–6 is thinner than the pass-A–D standard.
+
+## Release verification
+
+Final tree: fmt clean, workspace clippy clean (`-D warnings`), 644 passing
+tests (218 bin unit, 116 CLI integration, 84 core, 58 provider, 136
+tools/permissions, 30 render, 2 provenance); the known PTY-environmental
+failure remains pre-existing. Gates were rerun by the maintainer after the
+two corrections.
+
 ## Report index
 
 1. [Onboarding and compaction](chat-ux-cycle-9-audits/raw/01-onboarding-compaction.md)
