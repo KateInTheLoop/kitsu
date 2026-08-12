@@ -108,6 +108,10 @@ pub struct AgentConfig {
     /// are retained in memory; a frontend may also install a synchronous,
     /// content-bounded observer to surface progress while the turn is active.
     pub event_log: Option<AgentEventLog>,
+    /// Skill names known to this session, so text-protocol recovery can tell
+    /// a skill invoked as a fake tool (`{"name": "code-review"}`) apart from
+    /// arbitrary JSON in a real answer. Empty when no skills are loaded.
+    pub skill_names: Vec<String>,
     /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
     /// the MAIN conversation's config; the orchestrator resets it when a turn
     /// starts. Subagent configs must leave this `None` so nested turns never
@@ -663,6 +667,7 @@ impl Default for AgentConfig {
             compaction: CompactionMode::Trim,
             quiet: false,
             event_log: None,
+            skill_names: Vec::new(),
             spawn_budget: None,
         }
     }
@@ -1161,8 +1166,9 @@ where
         // came back structured, try to parse one from the text and execute it.
         let mut synthesized_call = false;
         let mut malformed_text_calls = 0usize;
+        let mut skill_confusion: Option<String> = None;
         if tool_calls.is_empty() && tools_were_offered {
-            let recovered = parse_text_tool_calls(&assistant_text, tools);
+            let recovered = parse_text_tool_calls(&assistant_text, tools, &cfg.skill_names);
             if !recovered.calls.is_empty() {
                 tracing::debug!(
                     count = recovered.calls.len(),
@@ -1175,6 +1181,11 @@ where
                 // (it is not an answer) and spend the round on corrective
                 // feedback instead of committing garbage as the result.
                 malformed_text_calls = recovered.malformed;
+                synthesized_call = true;
+            } else if recovered.skill_confusion.is_some() {
+                // A skill invoked as a fake tool — same treatment, with a
+                // targeted correction naming the real path.
+                skill_confusion = recovered.skill_confusion;
                 synthesized_call = true;
             }
         }
@@ -1215,6 +1226,22 @@ where
             assistant_content,
             tool_calls.clone(),
         ));
+
+        if tool_calls.is_empty() && skill_confusion.is_some() {
+            let skill = skill_confusion.take().unwrap_or_default();
+            turn_status.tool_errors += 1;
+            if !cfg.quiet {
+                kitsu_render::tool_result_error(&format!(
+                    "ignored a text-form call to skill '{skill}' (skills are not tools); asked the model to load it via the skill tool"
+                ));
+            }
+            messages.push(ChatMessage::user(format!(
+                "'{skill}' is a SKILL, not a tool, and was NOT invoked. Load it by calling the \
+                 `skill` tool as a structured tool call with arguments {{\"name\": \"{skill}\"}}, \
+                 then follow the returned instructions."
+            )));
+            continue;
+        }
 
         if tool_calls.is_empty() && malformed_text_calls > 0 {
             // Cycle-12 audit: a malformed text-form tool attempt must neither
@@ -1376,6 +1403,11 @@ struct TextToolRecovery {
     /// after escape repair. They were NOT executed; the caller owes the model
     /// corrective feedback instead of printing the raw JSON as the answer.
     malformed: usize,
+    /// A well-formed call whose `name` is a known SKILL, not a tool — the
+    /// cycle-14 pattern where a model invokes `{"name": "code-review", …}`
+    /// directly instead of loading it through the `skill` tool. Carries the
+    /// skill name for a targeted corrective message.
+    skill_confusion: Option<String>,
 }
 
 /// Repair the common invalid-escape faults small models emit inside otherwise
@@ -1408,12 +1440,17 @@ fn relax_json_escapes(candidate: &str) -> String {
     out
 }
 
-fn parse_text_tool_calls(text: &str, tools: &Registry) -> TextToolRecovery {
+fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -> TextToolRecovery {
     let descriptors = tools.descriptors();
     let mut calls = Vec::new();
     let mut malformed = 0usize;
+    let mut skill_confusion = None;
     if descriptors.is_empty() {
-        return TextToolRecovery { calls, malformed };
+        return TextToolRecovery {
+            calls,
+            malformed,
+            skill_confusion,
+        };
     }
     for candidate in extract_json_objects(text) {
         let parsed = serde_json::from_str::<serde_json::Value>(&candidate).or_else(|_| {
@@ -1440,6 +1477,9 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> TextToolRecovery {
             continue;
         };
         if !descriptors.iter().any(|d| d.name == name) {
+            if skill_confusion.is_none() && skill_names.iter().any(|skill| skill == name) {
+                skill_confusion = Some(name.to_string());
+            }
             continue;
         }
         // `arguments` may be an object or a JSON-encoded string; `parameters` is a
@@ -1456,7 +1496,11 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> TextToolRecovery {
             call_id,
         });
     }
-    TextToolRecovery { calls, malformed }
+    TextToolRecovery {
+        calls,
+        malformed,
+        skill_confusion,
+    }
 }
 
 /// Return every balanced top-level `{…}` JSON object substring in `text`,

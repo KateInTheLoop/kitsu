@@ -238,6 +238,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
         event_log: None,
+        skill_names: Vec::new(),
         spawn_budget: None,
     }
 }
@@ -1059,6 +1060,53 @@ async fn test_text_protocol_malformed_call_feeds_back_instead_of_answering() {
             m.role == kitsu_providers::Role::User && m.content.contains("NOT executed")
         }),
         "round 2 must carry the corrective feedback"
+    );
+}
+
+/// A skill invoked as a fake tool (`{"name": "code-review"}`) gets targeted
+/// corrective feedback instead of the raw JSON committing as the answer;
+/// arbitrary unknown names (no matching skill) keep the old return-as-text
+/// behavior, so real answers containing JSON stay untouched.
+#[tokio::test]
+async fn test_text_protocol_skill_confusion_feeds_back_instead_of_answering() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(r#"{"name": "code-review", "arguments": {"path": "src"}}"#.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("loaded properly".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut config = cfg(10);
+    config.skill_names = vec!["code-review".to_string()];
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &config,
+        &mut state,
+    )
+    .await
+    .expect("retry round should produce the committed answer");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.call_count(), 2, "feedback round then answer round");
+    assert!(out.contains("loaded properly"), "{out}");
+    assert_eq!(state.last_turn.tool_errors, 1);
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::User
+                && m.content.contains("SKILL, not a tool")
+                && m.content.contains("`skill` tool")
+        }),
+        "round 2 must carry the skill-specific correction"
     );
 }
 
