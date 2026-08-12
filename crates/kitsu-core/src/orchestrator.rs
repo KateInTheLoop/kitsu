@@ -21,6 +21,54 @@ use thiserror::Error;
 #[path = "orchestrator_tests.rs"]
 mod orchestrator_tests;
 
+/// Per-turn budget for subagent spawns, shared between the frontend's spawn
+/// tools and the orchestrator. The orchestrator resets `used` at the start of
+/// each turn whose [`AgentConfig`] carries the budget (the main conversation);
+/// subagent configs carry no budget, so a nested turn never resets its
+/// parent's. Small local models demonstrably ignore prompt-level spawn
+/// guidance and fan out unboundedly on trivial turns — this is the hard stop
+/// that turns the storm into a model-visible tool error.
+#[derive(Debug, Default)]
+pub struct SpawnBudget {
+    cap: u32,
+    used: std::sync::atomic::AtomicU32,
+}
+
+impl SpawnBudget {
+    pub fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            used: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Admit up to `requested` spawns, returning how many were granted
+    /// (possibly zero). Saturating and race-free under concurrent tool calls.
+    pub fn admit(&self, requested: u32) -> u32 {
+        let mut granted = 0;
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                granted = requested.min(self.cap.saturating_sub(used));
+                Some(used + granted)
+            });
+        granted
+    }
+
+    /// Start a fresh turn: the whole cap is available again.
+    pub fn reset(&self) {
+        self.used.store(0, Ordering::Release);
+    }
+}
+
 /// Tuning for the agent loop.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -60,6 +108,11 @@ pub struct AgentConfig {
     /// are retained in memory; a frontend may also install a synchronous,
     /// content-bounded observer to surface progress while the turn is active.
     pub event_log: Option<AgentEventLog>,
+    /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
+    /// the MAIN conversation's config; the orchestrator resets it when a turn
+    /// starts. Subagent configs must leave this `None` so nested turns never
+    /// refresh the parent's budget mid-turn.
+    pub spawn_budget: Option<std::sync::Arc<SpawnBudget>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -610,6 +663,7 @@ impl Default for AgentConfig {
             compaction: CompactionMode::Trim,
             quiet: false,
             event_log: None,
+            spawn_budget: None,
         }
     }
 }
@@ -808,6 +862,9 @@ where
 {
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
+    if let Some(budget) = &cfg.spawn_budget {
+        budget.reset();
+    }
     if !cfg.quiet {
         // Reset the per-turn stdout marker so error handling can tell whether
         // THIS turn streamed provisional output (quiet subagents never print).

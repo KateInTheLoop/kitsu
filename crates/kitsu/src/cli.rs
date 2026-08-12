@@ -163,6 +163,14 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_workspace_evidence: bool,
 
+    /// Per-turn cap on subagent spawns (`spawn_agent`, `spawn_agents`,
+    /// `spawn_agent_bg` combined). Spawns beyond the cap return a tool error
+    /// the model sees, stopping agent storms from models that ignore prompt
+    /// guidance. Overrides the config key `agent_spawn_cap`. Defaults: 8 in
+    /// interactive chat, 2 in scripted/piped automation. 0 disables spawning.
+    #[arg(long, global = true, value_name = "N")]
+    pub agent_spawn_cap: Option<u32>,
+
     /// Preload a named skill's instructions for this run (repeatable). Works for
     /// `ask` and `chat` — the skill body is injected up front so it's available
     /// immediately (and to spawned agents), not just discovered on demand. See

@@ -238,7 +238,20 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
         event_log: None,
+        spawn_budget: None,
     }
+}
+
+#[test]
+fn spawn_budget_admits_saturates_and_resets() {
+    let budget = crate::orchestrator::SpawnBudget::new(3);
+    assert_eq!(budget.admit(2), 2);
+    assert_eq!(budget.admit(2), 1, "partial admission at the boundary");
+    assert_eq!(budget.admit(1), 0, "exhausted budget admits nothing");
+    assert_eq!(budget.used(), 3);
+    budget.reset();
+    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.admit(1), 1, "a fresh turn has the whole cap again");
 }
 
 /// A handler that always returns a fixed JSON string.

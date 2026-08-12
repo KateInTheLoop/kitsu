@@ -17,6 +17,13 @@ pub struct Config {
     /// `false` disables registration entirely, like `--no-workspace-evidence`.
     #[serde(default)]
     pub workspace_evidence: Option<bool>,
+    /// Per-turn cap on subagent spawns across `spawn_agent`, `spawn_agents`,
+    /// and `spawn_agent_bg`. Spawns beyond the cap return a tool error the
+    /// model sees. Unset: 8 in interactive chat, 2 in scripted/piped
+    /// automation (small local models storm agents on trivial turns).
+    /// `--agent-spawn-cap` overrides; 0 disables spawning for the run.
+    #[serde(default)]
+    pub agent_spawn_cap: Option<u32>,
     #[serde(default)]
     pub gateways: BTreeMap<String, Gateway>,
 }
