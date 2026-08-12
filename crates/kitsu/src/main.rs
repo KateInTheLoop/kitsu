@@ -1916,6 +1916,10 @@ struct ChatSetup {
     /// Config-level opt-out for the model-callable `workspace_diff` evidence
     /// tool (docs/workspace-diff-tool.md). Defaults to enabled.
     workspace_evidence: bool,
+    /// Config-level per-turn subagent spawn cap (`agent_spawn_cap`). `None`
+    /// falls back to the mode default (interactive 8, scripted/piped 2);
+    /// `--agent-spawn-cap` overrides.
+    agent_spawn_cap: Option<u32>,
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
@@ -2376,6 +2380,7 @@ fn build_agent_config(
         compaction: compaction_mode(cli),
         quiet: cli.jsonl,
         event_log: None,
+        spawn_budget: None,
     }
 }
 
@@ -3102,6 +3107,8 @@ struct SessionInfo {
     project_context: RefCell<Option<std::path::PathBuf>>,
     offload_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
     session_id: Rc<RefCell<Option<String>>>,
+    /// Per-turn subagent spawn budget shared with the spawn tools (G3).
+    spawn_budget: Arc<kitsu_core::SpawnBudget>,
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
@@ -5560,6 +5567,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         auth_status,
         model,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
+        agent_spawn_cap: config.agent_spawn_cap,
         context_window,
         context_window_pinned,
         context_window_provenance,
@@ -8120,6 +8128,7 @@ async fn run_scripted_body(
                 &mut state,
                 context_window,
                 &session.reasoning_effort,
+                &session.spawn_budget,
                 registry,
                 &format!("{path}:{line_number}"),
             )
@@ -8322,6 +8331,7 @@ async fn run_scripted_body(
                         &mut state,
                         context_window,
                         &session.reasoning_effort,
+                        &session.spawn_budget,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -8373,6 +8383,7 @@ async fn run_scripted_body(
                         &mut state,
                         context_window,
                         &session.reasoning_effort,
+                        &session.spawn_budget,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -8469,6 +8480,7 @@ async fn run_scripted_body(
             &mut state,
             context_window,
             &session.reasoning_effort,
+            &session.spawn_budget,
             registry,
             &format!("{path}:{line_number}"),
         )
@@ -8506,6 +8518,7 @@ async fn run_scripted_turn(
     state: &mut kitsu_core::AgentSessionState,
     context_window: &Rc<Cell<Option<u64>>>,
     reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
+    spawn_budget: &Arc<kitsu_core::SpawnBudget>,
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
 ) -> Result<(), ScriptFailureKind> {
@@ -8588,6 +8601,7 @@ async fn run_scripted_turn(
         offload_dir.clone(),
     );
     cfg.reasoning_effort = reasoning_effort.get();
+    cfg.spawn_budget = Some(spawn_budget.clone());
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
     let outcome = journal
@@ -9527,6 +9541,23 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     )
     .map_err(|error| CliError::user(format!("invalid background-thread limits: {error}")))?;
 
+    // G3 (docs/chat-ux-cycle-10.md): per-turn subagent spawn budget. Prompt
+    // guidance demonstrably does not restrain small local models from agent
+    // storms, so the cap is enforced at the tool boundary; the orchestrator
+    // resets it each main-conversation turn. Scripted/piped automation gets a
+    // deliberately low default — storms there burn the whole run unattended.
+    const SPAWN_CAP_INTERACTIVE_DEFAULT: u32 = 8;
+    const SPAWN_CAP_SCRIPTED_DEFAULT: u32 = 2;
+    let spawn_cap = cli
+        .agent_spawn_cap
+        .or(setup.agent_spawn_cap)
+        .unwrap_or(if interactive {
+            SPAWN_CAP_INTERACTIVE_DEFAULT
+        } else {
+            SPAWN_CAP_SCRIPTED_DEFAULT
+        });
+    let spawn_budget = Arc::new(kitsu_core::SpawnBudget::new(spawn_cap));
+
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
     let mut tools = Registry::new();
@@ -9556,6 +9587,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         sub_cfg.clone(),
         live_mw.clone(),
         sub_system.clone(),
+        spawn_budget.clone(),
     );
     tools.register_with_descriptor(d, h);
     // Stage B: fan several isolated subagents out in parallel.
@@ -9565,6 +9597,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         sub_cfg.clone(),
         live_mw.clone(),
         sub_system.clone(),
+        spawn_budget.clone(),
     );
     tools.register_with_descriptor(d, h);
     // Stage C: detached background subagent (runs quiet so it doesn't corrupt
@@ -9579,6 +9612,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         sub_system,
         agent_registry.clone(),
         subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
+        spawn_budget.clone(),
     );
     tools.register_with_descriptor(d, h);
     let (d, h) = subagent::agent_result_tool(agent_registry.clone());
@@ -9663,6 +9697,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let context_window = context_window.clone();
         let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
+        let spawn_budget = spawn_budget.clone();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
                 model,
@@ -9673,6 +9708,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     .flatten(),
             );
             config.reasoning_effort = reasoning_effort.get();
+            // Main-conversation turns carry the spawn budget so the
+            // orchestrator resets it at each turn start (subagent configs
+            // stay `None`).
+            config.spawn_budget = Some(spawn_budget.clone());
             config
         }
     };
@@ -9868,6 +9907,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         project_context: RefCell::new(project_context_source),
         offload_dir: offload_state.clone(),
         session_id,
+        spawn_budget: spawn_budget.clone(),
         tool_names: tool_names.clone(),
         command_roots: command_policy
             .as_ref()
@@ -9941,6 +9981,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // snapshot exists. New and resumed automation commit only after the
         // first successful turn or state-changing/query command, so an empty or
         // failed start cannot displace useful durable history.
+    }
+
+    if interactive {
+        // First-contact orientation (cycle-11 audit): one torii line at the
+        // session gate — the model/gateway you are talking to and the two
+        // things a new user needs (`/help`, how to leave). The torii is the
+        // session-boundary marker (docs/ui_guidelines.md), and opening the
+        // session is its most natural gate.
+        kitsu_render::milestone(&format!(
+            "kitsu chat — {} via {} · /help for commands · Ctrl+D exits",
+            model, setup.gateway_name
+        ));
     }
 
     let mut initial_review_submission = if let Some(review) = initial_review {

@@ -23,7 +23,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Instant;
 
 use futures::StreamExt;
-use kitsu_core::{run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent};
+use kitsu_core::{
+    run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent, SpawnBudget,
+};
 use kitsu_providers::{
     ChatMessage, Provider, ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError,
     ToolDescriptor,
@@ -52,6 +54,19 @@ struct ResultArgs {
 /// fan out unboundedly against the gateway. Extra tasks beyond this are still run
 /// — just not all at once (see `buffer` below).
 const MAX_PARALLEL: usize = 8;
+
+/// The model-visible error when the per-turn spawn budget is exhausted
+/// (config `agent_spawn_cap` / `--agent-spawn-cap`). Phrased as an instruction
+/// so a storming model course-corrects instead of retrying the spawn.
+fn spawn_cap_error(budget: &SpawnBudget) -> String {
+    format!(
+        "agent spawn cap reached: this turn already started {} of {} allowed subagents. Do the \
+         remaining work yourself, inline, without spawning agents; the user can raise the cap \
+         with `agent_spawn_cap` in the config or --agent-spawn-cap.",
+        budget.used(),
+        budget.cap()
+    )
+}
 /// Maximum number of content-free activity labels retained per background job.
 const RECENT_ACTIVITY_LIMIT: usize = 8;
 /// Default limit on simultaneously running detached subagents.
@@ -1482,6 +1497,7 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
     extra_system: String,
+    budget: Arc<SpawnBudget>,
 ) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "spawn_agent".to_string(),
@@ -1504,9 +1520,13 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
         let sub_cfg = sub_cfg.clone();
         let live = live.clone();
         let extra_system = extra_system.clone();
+        let budget = budget.clone();
         Box::pin(async move {
             let a: SpawnArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            if budget.admit(1) == 0 {
+                return Err(ToolError::ExecError(spawn_cap_error(&budget)));
+            }
             let cfg = resolve_cfg(&sub_cfg, &live);
             // Fresh state each call; the isolated loop runs to completion and only
             // its final answer is returned (child rounds never enter the parent).
@@ -1529,6 +1549,7 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
     extra_system: String,
+    budget: Arc<SpawnBudget>,
 ) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "spawn_agents".to_string(),
@@ -1556,6 +1577,7 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
         let sub_cfg = sub_cfg.clone();
         let live = live.clone();
         let extra_system = extra_system.clone();
+        let budget = budget.clone();
         Box::pin(async move {
             let a: SpawnManyArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
@@ -1564,10 +1586,26 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
                     "tasks must be non-empty".to_string(),
                 ));
             }
+            // Per-turn spawn budget: admit what fits, refuse the rest. The
+            // refused tasks still get labelled entries in the collected output
+            // so the model sees exactly which work it must now do inline.
+            let admitted = budget.admit(a.tasks.len() as u32) as usize;
+            if admitted == 0 {
+                return Err(ToolError::ExecError(spawn_cap_error(&budget)));
+            }
+            let refused: Vec<(usize, String)> = a
+                .tasks
+                .iter()
+                .enumerate()
+                .skip(admitted)
+                .map(|(i, task)| (i, task_preview(task)))
+                .collect();
+            let cap_note = (!refused.is_empty()).then(|| spawn_cap_error(&budget));
+            let tasks: Vec<String> = a.tasks.into_iter().take(admitted).collect();
             // Same model/window snapshot for the whole batch.
             let cfg = resolve_cfg(&sub_cfg, &live);
             // Run each task in its own subagent, at most MAX_PARALLEL at a time.
-            let stream = futures::stream::iter(a.tasks.into_iter().enumerate().map(|(i, task)| {
+            let stream = futures::stream::iter(tasks.into_iter().enumerate().map(|(i, task)| {
                 let provider = provider.clone();
                 let sub_tools = sub_tools.clone();
                 let cfg = cfg.clone();
@@ -1591,6 +1629,14 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
                     Err(e) => out.push_str(&format!("[{e}]")),
                 }
                 out.push_str("\n\n");
+            }
+            for (i, preview) in refused {
+                out.push_str(&format!(
+                    "=== subagent {} — {} ===\n[not started: {}]\n\n",
+                    i + 1,
+                    preview,
+                    cap_note.as_deref().unwrap_or("agent spawn cap reached")
+                ));
             }
             Ok(out.trim().to_string())
         })
@@ -1619,6 +1665,7 @@ impl BackgroundProfileRuntime {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     provider: Arc<P>,
     sub_tools: Arc<Registry>,
@@ -1627,6 +1674,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     extra_system: String,
     registry: Arc<AgentRegistry>,
     profile_runtime: BackgroundProfileRuntime,
+    budget: Arc<SpawnBudget>,
 ) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "spawn_agent_bg".to_string(),
@@ -1652,9 +1700,13 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
         let extra_system = extra_system.clone();
         let registry = registry.clone();
         let profile_runtime = profile_runtime.clone();
+        let budget = budget.clone();
         Box::pin(async move {
             let a: SpawnArgs =
                 serde_json::from_str(&args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+            if budget.admit(1) == 0 {
+                return Err(ToolError::ExecError(spawn_cap_error(&budget)));
+            }
             let selected_profile = match a.profile.as_deref() {
                 Some(name) => {
                     Some(profile_runtime.catalog.get(name).cloned().ok_or_else(|| {
@@ -1892,6 +1944,10 @@ mod tests {
         }
     }
 
+    fn open_budget() -> Arc<SpawnBudget> {
+        Arc::new(SpawnBudget::new(u32::MAX))
+    }
+
     fn empty_profile_runtime() -> BackgroundProfileRuntime {
         BackgroundProfileRuntime::new(
             Arc::new(profile::AgentProfileCatalog::new()),
@@ -1916,6 +1972,7 @@ mod tests {
             sub_cfg(),
             live,
             String::new(),
+            open_budget(),
         );
         assert_eq!(desc.name, "spawn_agent");
         let out = handler(r#"{"task":"do the thing"}"#.to_string())
@@ -1951,6 +2008,7 @@ mod tests {
             sub_cfg(),
             live.clone(),
             String::new(),
+            open_budget(),
         );
         // Switch the model as `/model` would, AFTER the tool was built.
         *live.lock().unwrap() = ("model-B".to_string(), Some(8_000));
@@ -1971,6 +2029,7 @@ mod tests {
             sub_cfg(),
             live,
             String::new(),
+            open_budget(),
         );
         assert_eq!(desc.name, "spawn_agents");
         let out = handler(r#"{"tasks":["alpha","beta","gamma"]}"#.to_string())
@@ -2006,6 +2065,7 @@ mod tests {
             String::new(),
             registry.clone(),
             profile_runtime,
+            open_budget(),
         );
         assert_eq!(desc.name, "spawn_agent_bg");
         // Returns immediately with an id (does not block on the subagent).
@@ -2075,6 +2135,7 @@ mod tests {
             String::new(),
             registry.clone(),
             profile_runtime,
+            open_budget(),
         );
         handler(
             r#"{"task":"review parser; token=hf_abcdefghijklmnopqrstuvwxyz123456"}"#.to_string(),
@@ -2257,6 +2318,7 @@ mod tests {
             String::new(),
             registry.clone(),
             profile_runtime,
+            open_budget(),
         );
 
         let error = handler(r#"{"task":"must not start"}"#.to_string())
@@ -2490,6 +2552,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn spawn_agent_refuses_when_spawn_cap_exhausted() {
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let (_d, handler) = spawn_agent_tool(
+            Arc::new(EchoProvider),
+            Arc::new(Registry::new()),
+            sub_cfg(),
+            live,
+            String::new(),
+            Arc::new(SpawnBudget::new(0)),
+        );
+        let error = handler(r#"{"task":"must not start"}"#.to_string())
+            .await
+            .unwrap_err();
+        assert!(
+            error.to_string().contains("agent spawn cap reached"),
+            "model-visible cap error expected: {error}"
+        );
+    }
+
+    #[tokio::test]
+    async fn spawn_agents_admits_up_to_cap_and_labels_the_rest() {
+        let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
+        let budget = Arc::new(SpawnBudget::new(1));
+        let (_d, handler) = spawn_agents_tool(
+            Arc::new(EchoProvider),
+            Arc::new(Registry::new()),
+            sub_cfg(),
+            live,
+            String::new(),
+            budget.clone(),
+        );
+        let out = handler(r#"{"tasks":["first task","second task"]}"#.to_string())
+            .await
+            .expect("the admitted task still runs");
+        assert!(out.contains("=== subagent 1"), "{out}");
+        assert!(
+            out.contains("[not started: agent spawn cap reached"),
+            "refused task must be labelled for the model: {out}"
+        );
+        assert_eq!(budget.used(), 1, "only the admitted spawn is counted");
+    }
+
+    #[tokio::test]
     async fn spawn_agents_rejects_empty_tasks() {
         let live: LiveModelWindow = Arc::new(Mutex::new(("m".to_string(), None)));
         let (_d, handler) = spawn_agents_tool(
@@ -2498,6 +2603,7 @@ mod tests {
             sub_cfg(),
             live,
             String::new(),
+            open_budget(),
         );
         assert!(handler(r#"{"tasks":[]}"#.to_string()).await.is_err());
     }
@@ -2515,6 +2621,7 @@ mod tests {
             sub_cfg(),
             live,
             String::new(),
+            open_budget(),
         );
         assert!(handler("not json".to_string()).await.is_err());
     }
