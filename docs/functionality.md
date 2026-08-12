@@ -212,8 +212,15 @@ commands: those remain in a unique protected runtime-state directory so a
 one-shot command never reports a dead recovery path.
 
 Scripted and piped chat are stateless by default. `--session` explicitly
-creates a durable conversation, and `--resume [id|last]` resumes and autosaves
-in interactive, scripted, or piped modes. Each successful automation turn is
+creates a durable conversation, and `--resume [id|name|last|auto]` resumes and
+autosaves in interactive, scripted, or piped modes — `auto` picks the newest
+session recorded in the current working directory. Sessions can carry a
+human-memorable name: `--name <name>` names (or renames) the live durable
+session, `kitsu sessions rename <id|name> [name]` names, renames, or clears
+one at rest, and names resolve anywhere a resume selector is accepted. Names
+are 1-40 characters of letters, digits, `-` or `_`; `last`, `auto`, and
+id-shaped (`s-…`) values are reserved, and duplicates are refused so a name
+never becomes ambiguous. Each successful automation turn is
 saved before the next one; a save failure makes the automation command fail.
 `--resume` already implies `--session`, so passing both explicitly is a
 harmless no-op confirmation rather than an error; `--no-session` conflicts
@@ -228,8 +235,9 @@ exact ID.
 
 The top-level lifecycle/inventory commands operate without constructing a
 provider or parsing the selected config. The resolved config path chooses the
-state namespace. `list` (also the default), `show`, `fork`, `export`,
-`archive`, `restore`, and `delete` support scripting through `--json`.
+state namespace. `list` (also the default), `show`, `rename`, `fork`,
+`export`, `archive`, `restore`, and `delete` support scripting through
+`--json`.
 `sessions resume` launches normal provider-backed chat on a TTY; outside a TTY
 or with `--json` it resolves the session and returns exact argv without making
 a network call. A missing namespace lists as an empty collection rather than an
