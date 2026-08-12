@@ -40,6 +40,11 @@ const EXIT_PROVIDER: i32 = 2;
 const EXIT_CANCELLED: i32 = 130;
 const JSONL_SCHEMA: &str = "kitsu.chat.v1";
 static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
+/// The run's durable session id, mirrored into `final_summary` so a CI
+/// consumer can extract "where did this conversation go" from the one frame
+/// it already parses, instead of scraping `run_started`/session events
+/// (cycle-12 automation audit #3). `None` renders as JSON null.
+static JSONL_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
 static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -138,6 +143,9 @@ fn emit_jsonl_summary_with_local_failures(
                 provider_failures + tool_failures + policy_failures + cancelled_failures
             ),
             "cancelled_failures": cancelled_failures,
+            "session_id": *JSONL_SESSION_ID
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner),
         }),
     )?;
     JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
@@ -7827,9 +7835,58 @@ impl ScriptRunStatus {
 /// shutdown-policy cancellation rather than as a rolled-back turn. When JSONL
 /// remains writable, the run-level error (if needed) and final summary follow
 /// those results, making `final_summary` the last event.
+/// One-line end-of-run receipt for non-interactive chat runs (cycle-11 audit
+/// gap #1). A multi-minute run that edits nothing and exits 0 must SAY so —
+/// silence reading as success cost a full audit run before anyone noticed the
+/// task was a no-op. Human stderr only: JSONL consumers already receive
+/// `turn_finished` and `run_summary` frames.
+fn emit_run_receipt(
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    registry: &Arc<subagent::AgentRegistry>,
+    session_id: Option<&str>,
+    turns_ok: usize,
+    turns_failed: usize,
+) {
+    let checkpoints = journal.checkpoint_summaries();
+    let files: std::collections::BTreeSet<&std::path::PathBuf> = checkpoints
+        .iter()
+        .flat_map(|checkpoint| checkpoint.paths.iter())
+        .collect();
+    let changes: usize = checkpoints
+        .iter()
+        .map(|checkpoint| checkpoint.change_count)
+        .sum();
+    let turns = if turns_failed > 0 {
+        format!("{turns_ok} turn(s) ok / {turns_failed} failed")
+    } else {
+        format!("{turns_ok} turn(s) ok")
+    };
+    let progress = registry.progress_snapshot();
+    let mut agents = String::new();
+    if progress.total > 0 {
+        // Zero-count qualifiers stay silent: "0 cancelled" on a clean exit
+        // reads as an incident that never happened.
+        agents = format!(", {} background agent(s)", progress.total);
+        if progress.failed > 0 {
+            agents.push_str(&format!(" ({} failed)", progress.failed));
+        }
+        if progress.cancelled > 0 {
+            agents.push_str(&format!(" ({} cancelled)", progress.cancelled));
+        }
+    }
+    eprintln!(
+        "~ run summary: {turns}, {} file(s) written ({} change(s)){agents}, session {}",
+        files.len(),
+        changes,
+        session_id.unwrap_or("not saved"),
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
 async fn finalize_scripted_run(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
+    session_id: Option<String>,
     jsonl: bool,
     allow_turn_errors: bool,
     agent_join_timeout: std::time::Duration,
@@ -7919,6 +7976,15 @@ async fn finalize_scripted_run(
 
     if body_completed && status.failures > 0 && !jsonl {
         eprintln!("script summary: {} failure(s)", status.failures);
+    }
+    if !jsonl {
+        emit_run_receipt(
+            journal,
+            registry,
+            session_id.as_deref(),
+            status.successes,
+            status.failures,
+        );
     }
     // Cycle-10 G1: retained-on-disk effects of rolled-back turns are part of
     // the run's truthful end state, not just of the turn that failed.
@@ -8019,9 +8085,11 @@ async fn run_scripted(
         &mut status,
     )
     .await;
+    let run_session_id = session.session_id.borrow().clone();
     finalize_scripted_run(
         registry,
         journal,
+        run_session_id,
         cli.jsonl,
         allow_turn_errors,
         agent_join_timeout(cli),
@@ -9934,6 +10002,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         max_tokens: cli.max_output_tokens,
         provenance: RefCell::new(provenance),
     };
+    // Mirror the planned/resumed durable session id for `final_summary`.
+    // Non-interactive runs cannot switch sessions mid-run (session commands
+    // require interactive chat), so a startup snapshot is authoritative here.
+    *JSONL_SESSION_ID
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = session.session_id.borrow().clone();
 
     if cli.jsonl {
         emit_jsonl(
@@ -10374,6 +10448,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     eprintln!(
                         "~ {} earlier tool error(s) were recovered within the turn; final state committed",
                         session_state.last_turn.tool_errors
+                    );
+                }
+                if !cli.jsonl {
+                    emit_run_receipt(
+                        &write_journal,
+                        &agent_registry,
+                        session.session_id.borrow().as_deref(),
+                        1,
+                        0,
                     );
                 }
                 if cli.jsonl {
