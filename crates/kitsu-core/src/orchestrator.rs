@@ -1354,23 +1354,41 @@ where
                     )
                 }
             };
-            if !cfg.quiet {
-                let summary = format_tool_result(&tc.tool_name, &content, is_err);
+            // Describe the result BEFORE any offload substitution, but print
+            // AFTER the decision so the receipt can disclose the swap — a
+            // `◇ 1828 lines` line over a 500-char preview is a lie the user
+            // has no way to detect (cycle-15 headline).
+            let summary = (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &content, is_err));
+            tool_event.finish(!is_err, &content);
+            abort_if_event_sink_failed(cfg)?;
+            // Offload a large successful result to disk (only under real
+            // context pressure), leaving a re-readable pointer, so one big
+            // result can't dominate a small window (Stage 2).
+            let (content, offloaded_to) = if is_err {
+                (content, None)
+            } else {
+                maybe_offload_for_tools(
+                    content,
+                    &tc.call_id,
+                    cfg.offload_dir.as_deref(),
+                    tools,
+                    messages,
+                    cfg,
+                )
+            };
+            if let Some(mut summary) = summary {
+                if let Some(path) = &offloaded_to {
+                    summary.push_str(&format!(
+                        " → context got a {OFFLOAD_PREVIEW_CHARS}-char preview; full text at {} (model can fs_read_file it)",
+                        path.display()
+                    ));
+                }
                 if is_err {
                     kitsu_render::tool_result_error(&summary);
                 } else {
                     kitsu_render::tool_result(&summary);
                 }
             }
-            tool_event.finish(!is_err, &content);
-            abort_if_event_sink_failed(cfg)?;
-            // Offload a large successful result to disk, leaving a re-readable
-            // pointer, so one big result can't dominate a small window (Stage 2).
-            let content = if is_err {
-                content
-            } else {
-                maybe_offload_for_tools(content, &tc.call_id, cfg.offload_dir.as_deref(), tools)
-            };
             messages.push(ChatMessage::tool(tc.call_id.clone(), content));
         }
         // continue to next round
@@ -1785,6 +1803,11 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
         // one-sentence status whose first line IS the summary.
         "spawn_agent_bg" | "agent_result" => {
             bounded_human_value(content.lines().next().unwrap_or_default(), 180)
+        }
+        // A directory listing's unit is entries, not lines (cycle-15 audit).
+        "fs_list_dir" => {
+            let n = content.lines().count();
+            format!("{n} entr{}", if n == 1 { "y" } else { "ies" })
         }
         _ => {
             let n = content.lines().count();
@@ -2817,22 +2840,41 @@ const OFFLOAD_POINTER_PREFIX: &str = "[tool output ";
 /// How much of an offloaded result to keep inline as a preview.
 const OFFLOAD_PREVIEW_CHARS: usize = 500;
 
+/// True when swapping this inline result for a preview is actually needed:
+/// keeping it inline would push the estimated prompt past half the effective
+/// budget. Below that, headroom is comfortable — and replacing full evidence
+/// with a 500-char preview only starves the model (cycle-15 headline: a
+/// 131k-window turn lost a 1828-line read at 1.5k tokens used, then answered
+/// honestly from the preview and was blamed for fabricating).
+fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) -> bool {
+    let Some(window) = cfg.context_window else {
+        return true; // unknown window: keep the old conservative behavior
+    };
+    let effective = ContextBudget::new(window, cfg.max_tokens).effective;
+    let used: u64 = messages.iter().map(message_tokens).sum();
+    let added = estimate_str(content);
+    used.saturating_add(added).saturating_mul(2) > effective
+}
+
 /// Offload only when the active model can actually recover the resulting
 /// pointer. A registered-but-unadvertised handler is insufficient: the model
 /// must receive an `fs_read_file` descriptor in this turn's tool catalog.
+/// Also requires genuine context pressure (see [`offload_pressure`]).
 fn maybe_offload_for_tools(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
     tools: &Registry,
-) -> String {
+    messages: &[ChatMessage],
+    cfg: &AgentConfig,
+) -> (String, Option<std::path::PathBuf>) {
     let can_read = tools.is_registered("fs_read_file")
         && tools
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_read_file");
-    if !can_read {
-        return content;
+    if !can_read || !offload_pressure(messages, &content, cfg) {
+        return (content, None);
     }
     maybe_offload(content, call_id, dir)
 }
@@ -2842,12 +2884,16 @@ fn maybe_offload_for_tools(
 /// preview the model can re-read via `fs_read_file`. Returns the content
 /// unchanged when there is no dir, it's under the cap, or the write fails (the
 /// trimming cascade still bounds it). The offload dir must be model-readable.
-fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) -> String {
+fn maybe_offload(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+) -> (String, Option<std::path::PathBuf>) {
     let Some(dir) = dir else {
-        return content;
+        return (content, None);
     };
     if content.len() <= OFFLOAD_CHAR_CAP {
-        return content;
+        return (content, None);
     }
     let safe_id: String = call_id
         .chars()
@@ -2861,15 +2907,16 @@ fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) 
     let path = match kitsu_tools::builtins::fs::write_unique_private_text_file(dir, &name, &content)
     {
         Ok(path) => path,
-        Err(_) => return content,
+        Err(_) => return (content, None),
     };
     let preview: String = content.chars().take(OFFLOAD_PREVIEW_CHARS).collect();
-    format!(
+    let pointer = format!(
         "{OFFLOAD_POINTER_PREFIX}{:.1} KB — full result saved to {}. Re-read it (or a line range) \
          with fs_read_file on that path.]\n\nPreview:\n{preview}…",
         content.len() as f64 / 1024.0,
         path.display(),
-    )
+    );
+    (pointer, Some(path))
 }
 
 /// How many recent user-delimited exchanges to always keep intact.

@@ -1711,8 +1711,9 @@ fn maybe_offload_writes_large_result_and_returns_pointer() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(20_000);
-    let out = maybe_offload(big.clone(), "call-1", Some(dir.path()));
+    let (out, offloaded_to) = maybe_offload(big.clone(), "call-1", Some(dir.path()));
     assert!(out.contains("saved to"), "returns a pointer");
+    assert!(offloaded_to.is_some(), "reports the artifact path");
     assert!(
         out.contains("fs_read_file"),
         "tells the model how to re-read"
@@ -1738,8 +1739,8 @@ fn maybe_offload_never_clobbers_an_earlier_result_for_the_same_call() {
     let first = "a".repeat(20_000);
     let second = "b".repeat(20_000);
 
-    let first_pointer = maybe_offload(first.clone(), "same-call", Some(dir.path()));
-    let second_pointer = maybe_offload(second.clone(), "same-call", Some(dir.path()));
+    let (first_pointer, _) = maybe_offload(first.clone(), "same-call", Some(dir.path()));
+    let (second_pointer, _) = maybe_offload(second.clone(), "same-call", Some(dir.path()));
 
     assert_ne!(first_pointer, second_pointer);
     let mut contents = std::fs::read_dir(dir.path())
@@ -1755,14 +1756,49 @@ fn maybe_offload_keeps_small_results_inline() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
     let small = "hello".to_string();
-    assert_eq!(maybe_offload(small.clone(), "c", Some(dir.path())), small);
+    assert_eq!(
+        maybe_offload(small.clone(), "c", Some(dir.path())),
+        (small, None)
+    );
 }
 
 #[test]
 fn maybe_offload_is_noop_without_a_dir() {
     use crate::orchestrator::maybe_offload;
     let big = "x".repeat(20_000);
-    assert_eq!(maybe_offload(big.clone(), "c", None), big);
+    assert_eq!(maybe_offload(big.clone(), "c", None), (big, None));
+}
+
+/// The cycle-15 headline regression: with a huge window and a nearly empty
+/// conversation, a big successful result must STAY INLINE — swapping it for
+/// a 500-char preview starves the model for no reason. Pressure returns once
+/// the estimated prompt would pass half the effective budget.
+#[test]
+fn offload_pressure_requires_real_window_pressure() {
+    use crate::orchestrator::offload_pressure;
+    let messages = initial_messages();
+    let big = "x".repeat(20_000); // ~5k estimated tokens
+
+    let mut roomy = cfg(10);
+    roomy.context_window = Some(131_072);
+    assert!(
+        !offload_pressure(&messages, &big, &roomy),
+        "1.5k used + 5k added in a 131k window is not pressure"
+    );
+
+    let mut tight = cfg(10);
+    tight.context_window = Some(8_192);
+    assert!(
+        offload_pressure(&messages, &big, &tight),
+        "the same result in an 8k window is pressure"
+    );
+
+    let mut unknown = cfg(10);
+    unknown.context_window = None;
+    assert!(
+        offload_pressure(&messages, &big, &unknown),
+        "unknown window keeps the conservative old behavior"
+    );
 }
 
 #[test]
@@ -1782,8 +1818,18 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         ok_handler("{}"),
     );
 
-    let inline = maybe_offload_for_tools(big.clone(), "command", Some(dir.path()), &tools);
-    assert_eq!(inline, big);
+    let mut tight = cfg(10);
+    tight.context_window = Some(8_192);
+    let msgs = initial_messages();
+    let inline = maybe_offload_for_tools(
+        big.clone(),
+        "command",
+        Some(dir.path()),
+        &tools,
+        &msgs,
+        &tight,
+    );
+    assert_eq!(inline, (big.clone(), None));
     assert!(
         std::fs::read_dir(dir.path()).unwrap().next().is_none(),
         "a command-only model cannot recover an fs_read_file pointer"
@@ -1797,9 +1843,11 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
-    let pointer = maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools);
+    let (pointer, offloaded_to) =
+        maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools, &msgs, &tight);
     assert!(pointer.contains("full result saved to"));
     assert!(pointer.contains("fs_read_file"));
+    assert!(offloaded_to.is_some());
 }
 
 // --- summarizing compaction (Stage 3) ---------------------------------------
@@ -2056,7 +2104,7 @@ fn trim_tool_results_preserves_offload_pointer_but_drops_preview() {
 
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(20_000);
-    let pointer = maybe_offload(big, "call-1", Some(dir.path()));
+    let (pointer, _) = maybe_offload(big, "call-1", Some(dir.path()));
     assert!(
         pointer.contains("saved to"),
         "sanity: got an offload pointer"
