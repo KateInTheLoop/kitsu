@@ -239,6 +239,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         quiet: false,
         event_log: None,
         skill_names: Vec::new(),
+        read_counter: None,
         spawn_budget: None,
     }
 }

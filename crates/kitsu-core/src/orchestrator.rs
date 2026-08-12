@@ -112,6 +112,11 @@ pub struct AgentConfig {
     /// a skill invoked as a fake tool (`{"name": "code-review"}`) apart from
     /// arbitrary JSON in a real answer. Empty when no skills are loaded.
     pub skill_names: Vec<String>,
+    /// Shared run-wide counter of successful `fs_read_file` calls. Unlike
+    /// `AgentSessionState.run_reads` (per-state), this Arc is shared across
+    /// the MAIN conversation and every spawned subagent, so the end-of-run
+    /// receipt counts delegated reads too (cycle-17 gap #1).
+    pub read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
     /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
     /// the MAIN conversation's config; the orchestrator resets it when a turn
     /// starts. Subagent configs must leave this `None` so nested turns never
@@ -668,6 +673,7 @@ impl Default for AgentConfig {
             quiet: false,
             event_log: None,
             skill_names: Vec::new(),
+            read_counter: None,
             spawn_budget: None,
         }
     }
@@ -1367,6 +1373,9 @@ where
                 (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &tc.args, &content, is_err));
             if !is_err && tc.tool_name == "fs_read_file" {
                 *run_reads += 1;
+                if let Some(counter) = &cfg.read_counter {
+                    counter.fetch_add(1, Ordering::AcqRel);
+                }
             }
             tool_event.finish(!is_err, &content);
             abort_if_event_sink_failed(cfg)?;
@@ -1822,7 +1831,13 @@ fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> St
         // reading lines 1-4 of a 1905-line file under a small window is
         // silent starvation unless the receipt discloses the slice).
         "fs_read_file" => {
-            let n = content.lines().count();
+            let truncated = content
+                .lines()
+                .any(|line| line.starts_with("...[truncated"));
+            let n = content
+                .lines()
+                .filter(|line| !line.starts_with("...[truncated"))
+                .count();
             let range = serde_json::from_str::<serde_json::Value>(args)
                 .ok()
                 .and_then(|value| {
@@ -1838,7 +1853,12 @@ fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> St
                     }
                 })
                 .unwrap_or_default();
-            format!("{n} line{}{range}", if n == 1 { "" } else { "s" })
+            let capped = if truncated {
+                ", capped at the byte limit"
+            } else {
+                ""
+            };
+            format!("{n} line{}{range}{capped}", if n == 1 { "" } else { "s" })
         }
         _ => {
             let n = content.lines().count();
