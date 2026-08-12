@@ -988,6 +988,80 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     );
 }
 
+/// Invalid escapes inside string literals are dropped; valid ones survive.
+#[test]
+fn relax_json_escapes_repairs_only_invalid_escapes() {
+    assert_eq!(
+        super::relax_json_escapes(r#"{"a": "it\'s"}"#),
+        r#"{"a": "it's"}"#
+    );
+    assert_eq!(
+        super::relax_json_escapes(r#"{"a": "keep\n\t\"quoted\" \\ intact"}"#),
+        r#"{"a": "keep\n\t\"quoted\" \\ intact"}"#
+    );
+}
+
+/// A text-form call whose only fault is a non-standard escape (`\'`) is
+/// repaired and executed instead of being dumped as the answer.
+#[tokio::test]
+async fn test_text_protocol_repairs_invalid_escape() {
+    assert_text_protocol_executes(
+        r#"{"name": "fs_write_file", "arguments": {"path": "x.py", "content": "print(\'hi\')"}}"#,
+    )
+    .await;
+}
+
+/// A tool attempt too broken to repair (structurally invalid JSON naming a
+/// real tool) must not masquerade as the answer: the model gets corrective
+/// feedback, retries, and the real answer from the next round is returned.
+#[tokio::test]
+async fn test_text_protocol_malformed_call_feeds_back_instead_of_answering() {
+    let provider = MockProvider::new(vec![
+        vec![
+            // Balanced braces, names a registered tool, but missing a comma —
+            // unparseable even after escape repair.
+            ChatDelta::Text(r#"{"name": "fs_write_file" "arguments": {}}"#.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("recovered answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("the retry round should produce the committed answer");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "nothing was executed");
+    assert_eq!(provider.call_count(), 2, "feedback round then answer round");
+    assert!(out.contains("recovered answer"), "{out}");
+    assert!(
+        !out.contains("fs_write_file"),
+        "raw tool JSON must not be the answer: {out}"
+    );
+    assert_eq!(
+        state.last_turn.tool_errors, 1,
+        "the ignored attempt is accounted as a tool error"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::User && m.content.contains("NOT executed")
+        }),
+        "round 2 must carry the corrective feedback"
+    );
+}
+
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
 
 /// A provider that ALWAYS emits the same failing tool call while tools are

@@ -386,6 +386,7 @@ fn run() -> Result<(), CliError> {
             allow_read_write,
             enable_commands,
             command_roots,
+            command_runtime_roots,
             command_env,
             allow_commands,
             script,
@@ -402,6 +403,7 @@ fn run() -> Result<(), CliError> {
                 allow_read_write,
                 enable_commands: *enable_commands,
                 command_roots,
+                command_runtime_roots,
                 command_env,
                 allow_commands,
                 script: script.as_deref(),
@@ -422,6 +424,7 @@ struct ChatInvocation<'a> {
     allow_read_write: &'a [String],
     enable_commands: bool,
     command_roots: &'a [String],
+    command_runtime_roots: &'a [String],
     command_env: &'a [String],
     allow_commands: &'a [String],
     script: Option<&'a str>,
@@ -456,6 +459,7 @@ async fn run_review(
             allow_read_write: &[],
             enable_commands: false,
             command_roots: &[],
+            command_runtime_roots: &[],
             command_env: &[],
             allow_commands: &[],
             script: None,
@@ -1042,6 +1046,7 @@ async fn run_sessions(
                         allow_read_write: &[],
                         enable_commands: false,
                         command_roots: &[],
+                        command_runtime_roots: &[],
                         command_env: &[],
                         allow_commands: &[],
                         script: None,
@@ -9317,6 +9322,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         allow_read_write,
         enable_commands,
         command_roots,
+        command_runtime_roots,
         command_env,
         allow_commands,
         script,
@@ -9342,6 +9348,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let durable_session = !no_session && (interactive || session_requested || resume.is_some());
     let command_requested = enable_commands
         || !command_roots.is_empty()
+        || !command_runtime_roots.is_empty()
         || !allow_commands.is_empty()
         || !command_env.is_empty();
     if cli.jsonl && interactive {
@@ -9475,6 +9482,27 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         };
         let mut policy = kitsu_tools::CommandPolicy::new(&roots, command_mode)
             .map_err(|error| CliError::user(format!("invalid command policy: {error}")))?;
+        if !command_runtime_roots.is_empty() {
+            // Toolchains outside /usr (rustup/cargo installs in particular)
+            // are invisible to contained commands without an explicit
+            // read-only mount. Every configured root is disclosed: a runtime
+            // root discloses its readable contents to approved commands.
+            let mut containment = kitsu_tools::CommandContainmentConfig::default();
+            for root in command_runtime_roots {
+                containment = containment
+                    .with_readonly_runtime_root(root)
+                    .map_err(|error| {
+                        CliError::user(format!("invalid --command-runtime-root: {error}"))
+                    })?;
+            }
+            for root in containment.readonly_runtime_roots() {
+                eprintln!(
+                    "~ command containment: read-only runtime root {} (contents readable by approved commands)",
+                    terminal_inline(&root.display().to_string())
+                );
+            }
+            policy = policy.with_containment_config(containment);
+        }
         if interactive {
             policy = policy.with_prompter(Arc::new(CliCommandPrompter));
         }

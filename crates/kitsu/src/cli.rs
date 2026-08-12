@@ -322,6 +322,18 @@ pub enum Command {
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
 
+        /// Mount one extra directory read-only inside command containment
+        /// (repeatable), for toolchains that live outside /usr — e.g.
+        /// `--command-runtime-root ~/.cargo --command-runtime-root ~/.rustup`
+        /// makes `cargo test` resolvable in the sandbox (each root's `bin/`
+        /// joins PATH; `.cargo`/`.rustup` roots also set CARGO_HOME /
+        /// RUSTUP_HOME). Read-only: commands can execute the toolchain but
+        /// never mutate it. Never pass a credential or whole-home directory —
+        /// every configured root is disclosed at startup. Implies
+        /// --enable-commands.
+        #[arg(long = "command-runtime-root", value_name = "PATH")]
+        command_runtime_roots: Vec<String>,
+
         /// Opt-in, explicit pass-through of one environment variable into
         /// contained commands (repeatable), layered on top of the fixed
         /// non-secret base set every contained command already receives
