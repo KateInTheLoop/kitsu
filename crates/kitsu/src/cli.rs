@@ -363,7 +363,9 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         script: Option<String>,
 
-        /// Resume and autosave a saved session by id, or use `last`. Works in
+        /// Resume and autosave a saved session by id, by NAME (see --name /
+        /// `kitsu sessions rename`), with `last` (newest anywhere), or with
+        /// `auto` (newest recorded in the current directory). Works in
         /// interactive, scripted, and piped chat. Saved permission grants are
         /// intentionally never restored.
         #[arg(long, value_name = "ID", default_missing_value = "last", num_args = 0..=1)]
@@ -379,6 +381,12 @@ pub enum Command {
         /// Disable automatic local session snapshots for this chat.
         #[arg(long, conflicts_with = "resume")]
         no_session: bool,
+
+        /// Name this durable session (1-40 chars: letters, digits, '-', '_').
+        /// Names show in listings and resolve in `--resume <name>`. Implies
+        /// --session; also renames when combined with --resume.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_session")]
+        name: Option<String>,
 
         /// Preserve the legacy script behavior of exiting 0 even when one or
         /// more scripted turns or slash commands fail.
@@ -418,7 +426,8 @@ pub enum SessionCommand {
     },
     /// Resume in interactive chat, or print an exact command outside a TTY.
     Resume {
-        /// Session id; defaults to `last`.
+        /// Session id or name; also `last` (newest anywhere, the default) or
+        /// `auto` (newest recorded in the current directory).
         #[arg(default_value = "last")]
         id: String,
     },
@@ -438,6 +447,13 @@ pub enum SessionCommand {
         /// a `.json` destination selects JSON and anything else Markdown.
         #[arg(long, value_parser = ["markdown", "json"])]
         format: Option<String>,
+    },
+    /// Name or rename a saved session (names resolve in `--resume <name>`).
+    Rename {
+        /// Session id or current name; `last` picks the newest session.
+        id: String,
+        /// New name: 1-40 chars of letters, digits, '-' or '_'. Omit to clear.
+        name: Option<String>,
     },
     /// Move an exact inactive session into recoverable archive storage.
     Archive { id: String },

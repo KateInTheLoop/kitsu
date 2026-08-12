@@ -393,6 +393,7 @@ fn run() -> Result<(), CliError> {
             resume,
             session,
             no_session,
+            name,
             allow_turn_errors,
         } => runtime.block_on(run_chat(
             &cli,
@@ -410,6 +411,7 @@ fn run() -> Result<(), CliError> {
                 resume: resume.as_deref(),
                 persist_session: *session,
                 no_session: *no_session,
+                session_name: name.as_deref(),
                 allow_turn_errors: *allow_turn_errors,
                 initial_review: None,
             },
@@ -431,6 +433,7 @@ struct ChatInvocation<'a> {
     resume: Option<&'a str>,
     persist_session: bool,
     no_session: bool,
+    session_name: Option<&'a str>,
     allow_turn_errors: bool,
     initial_review: Option<InitialReview>,
 }
@@ -466,6 +469,7 @@ async fn run_review(
             resume,
             persist_session,
             no_session: false,
+            session_name: None,
             allow_turn_errors: false,
             initial_review: Some(review),
         },
@@ -971,7 +975,7 @@ async fn run_sessions(
                 print_json(&saved)
             } else if saved.is_empty() {
                 println!(
-                    "no saved sessions for config {} — start one with kitsu chat --session or /new",
+                    "no saved sessions for config {} — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new",
                     shorten_home(&config_path)
                 );
                 Ok(())
@@ -989,7 +993,7 @@ async fn run_sessions(
                 print_json(&filtered)
             } else if saved.is_empty() {
                 println!(
-                    "no saved sessions for config {} — start one with kitsu chat --session or /new",
+                    "no saved sessions for config {} — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new",
                     shorten_home(&config_path)
                 );
                 Ok(())
@@ -1053,6 +1057,7 @@ async fn run_sessions(
                         resume: Some(&saved.id),
                         persist_session: false,
                         no_session: false,
+                        session_name: None,
                         allow_turn_errors: false,
                         initial_review: None,
                     },
@@ -1104,6 +1109,29 @@ async fn run_sessions(
                 print_json(&serde_json::json!({"action": "export", "path": output}))
             } else {
                 println!("exported session to {}", output.display());
+                Ok(())
+            }
+        }
+        Some(SessionCommand::Rename { id, name }) => {
+            require_session_namespace(&sessions_dir, "rename", &config_path)?;
+            let saved = session::SessionStore::rename(&sessions_dir, id, name.as_deref())
+                .map_err(|error| session_error("rename", &config_path, error))?;
+            if json {
+                print_json(&serde_json::json!({
+                    "action": "rename",
+                    "id": saved.id,
+                    "name": saved.name,
+                }))
+            } else {
+                match &saved.name {
+                    Some(new_name) => println!(
+                        "named session {} '{}' — resume it with `kitsu chat --resume {}`",
+                        terminal_inline(&saved.id),
+                        terminal_inline(new_name),
+                        terminal_inline(new_name),
+                    ),
+                    None => println!("cleared the name of session {}", terminal_inline(&saved.id)),
+                }
                 Ok(())
             }
         }
@@ -1570,7 +1598,10 @@ fn print_doctor_human(report: &serde_json::Value) {
         .map(Vec::as_slice)
         .unwrap_or(&[]);
     if issues.is_empty() {
-        println!("doctor: no blocking issues found");
+        // Terminal state must name the next step (cycle-14 config audit #4):
+        // "healthy" without "now what" strands exactly the new user doctor
+        // exists to help.
+        println!("doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`)");
     } else {
         println!("doctor: {} blocking issue(s)", issues.len());
         for issue in issues {
@@ -4126,6 +4157,10 @@ fn filter_sessions(
             .filter(|session| {
                 session.id.to_lowercase().contains(&filter)
                     || session.preview.to_lowercase().contains(&filter)
+                    || session
+                        .name
+                        .as_ref()
+                        .is_some_and(|name| name.to_lowercase().contains(&filter))
             })
             .cloned()
             .collect()
@@ -4181,7 +4216,10 @@ fn format_session_summaries(
         } else {
             " "
         };
-        let id = terminal_inline(&saved.id);
+        let id = match &saved.name {
+            Some(name) => format!("{} ({})", terminal_inline(name), terminal_inline(&saved.id)),
+            None => terminal_inline(&saved.id),
+        };
         let updated_at = terminal_inline(&saved.updated_at);
         let gateway = terminal_inline(&saved.gateway);
         let model = terminal_inline(&saved.model);
@@ -4197,7 +4235,9 @@ fn format_session_summaries(
             preview
         ));
     }
-    out.push_str("resume with /resume <id> or `kitsu chat --resume last`");
+    out.push_str(
+        "resume with /resume <id|name> or `kitsu chat --resume <id|name|last|auto>`; name one with `kitsu sessions rename <id> <name>`",
+    );
     out
 }
 
@@ -9329,6 +9369,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         resume,
         persist_session: session_requested,
         no_session,
+        session_name,
         allow_turn_errors,
         initial_review,
     } = invocation;
@@ -9345,7 +9386,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // Checkpoint blocks always print; the "/undo N" hint is only advertised
     // where a human can actually type it (the interactive REPL).
     UNDO_HINTS_ACTIONABLE.store(interactive, Ordering::Release);
-    let durable_session = !no_session && (interactive || session_requested || resume.is_some());
+    let durable_session = !no_session
+        && (interactive || session_requested || session_name.is_some() || resume.is_some());
     let command_requested = enable_commands
         || !command_roots.is_empty()
         || !command_runtime_roots.is_empty()
@@ -9401,6 +9443,28 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     } else {
         None
     };
+    if let Some(requested_name) = session_name {
+        let Some(store) = session_store.as_mut() else {
+            return Err(CliError::user(
+                "--name requires a durable session (drop --no-session)".to_string(),
+            ));
+        };
+        session::valid_session_name(requested_name).map_err(CliError::user)?;
+        // A name resolves in `--resume <name>`, so it must map to one session.
+        let taken = session::SessionStore::list(&sessions_dir)
+            .unwrap_or_default()
+            .into_iter()
+            .any(|summary| {
+                summary.id != store.id() && summary.name.as_deref() == Some(requested_name)
+            });
+        if taken {
+            return Err(CliError::user(format!(
+                "another session is already named '{requested_name}' — pick a different --name or rename it via `kitsu sessions rename`"
+            )));
+        }
+        store.set_name(Some(requested_name.to_string()));
+        eprintln!("~ session name: {}", terminal_inline(requested_name));
+    }
     let mode = if cli.dangerously_allow_all_filesystem {
         Mode::AutoAllow
     } else if cli.yes {
@@ -9983,9 +10047,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         for change in &resumed_skill_changes {
             eprintln!("~ {}", terminal_inline(change));
         }
+        let resumed_label = session_store
+            .as_ref()
+            .and_then(|store| store.name())
+            .map(|name| format!("'{}' ({})", terminal_inline(name), saved.id))
+            .unwrap_or_else(|| saved.id.clone());
         eprintln!("{}", kitsu_render::milestone_line(&format!(
             "resumed session {} (saved grants were not restored; runtime grants reset; invocation grants retained: {} read, {} write)",
-            saved.id,
+            resumed_label,
             perms.base_read_roots().len(),
             perms.base_write_roots().len(),
         )));
@@ -14270,6 +14339,7 @@ mod tests {
     #[test]
     fn session_catalog_and_checkpoint_metadata_are_terminal_sanitized() {
         let summaries = vec![session::SessionSummary {
+            name: None,
             id: "s-safe".to_string(),
             updated_at: "now".to_string(),
             model: "model\u{1b}]8;;https://evil.invalid\u{7}click\u{1b}]8;;\u{7}".to_string(),
@@ -14594,6 +14664,7 @@ mod tests {
     fn session_filtering_matches_id_and_preview_case_insensitively() {
         let summaries = vec![
             session::SessionSummary {
+                name: None,
                 id: "s-alpha-1".to_string(),
                 updated_at: "now".to_string(),
                 model: "m".to_string(),
@@ -14603,6 +14674,7 @@ mod tests {
                 turns: 1,
             },
             session::SessionSummary {
+                name: None,
                 id: "s-Beta-2".to_string(),
                 updated_at: "now".to_string(),
                 model: "m".to_string(),
@@ -15306,6 +15378,7 @@ mod tests {
     #[test]
     fn resume_project_context_opt_out_replaces_saved_system_message() {
         let saved = session::SavedSession {
+            name: None,
             version: 1,
             id: "s-test".to_string(),
             created_at: "now".to_string(),
