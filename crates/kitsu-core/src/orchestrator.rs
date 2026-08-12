@@ -21,6 +21,54 @@ use thiserror::Error;
 #[path = "orchestrator_tests.rs"]
 mod orchestrator_tests;
 
+/// Per-turn budget for subagent spawns, shared between the frontend's spawn
+/// tools and the orchestrator. The orchestrator resets `used` at the start of
+/// each turn whose [`AgentConfig`] carries the budget (the main conversation);
+/// subagent configs carry no budget, so a nested turn never resets its
+/// parent's. Small local models demonstrably ignore prompt-level spawn
+/// guidance and fan out unboundedly on trivial turns — this is the hard stop
+/// that turns the storm into a model-visible tool error.
+#[derive(Debug, Default)]
+pub struct SpawnBudget {
+    cap: u32,
+    used: std::sync::atomic::AtomicU32,
+}
+
+impl SpawnBudget {
+    pub fn new(cap: u32) -> Self {
+        Self {
+            cap,
+            used: std::sync::atomic::AtomicU32::new(0),
+        }
+    }
+
+    pub fn cap(&self) -> u32 {
+        self.cap
+    }
+
+    pub fn used(&self) -> u32 {
+        self.used.load(Ordering::Acquire)
+    }
+
+    /// Admit up to `requested` spawns, returning how many were granted
+    /// (possibly zero). Saturating and race-free under concurrent tool calls.
+    pub fn admit(&self, requested: u32) -> u32 {
+        let mut granted = 0;
+        let _ = self
+            .used
+            .fetch_update(Ordering::AcqRel, Ordering::Acquire, |used| {
+                granted = requested.min(self.cap.saturating_sub(used));
+                Some(used + granted)
+            });
+        granted
+    }
+
+    /// Start a fresh turn: the whole cap is available again.
+    pub fn reset(&self) {
+        self.used.store(0, Ordering::Release);
+    }
+}
+
 /// Tuning for the agent loop.
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
@@ -51,7 +99,7 @@ pub struct AgentConfig {
     /// replaces them with an LLM-written summary (opt-in — quality is model-
     /// dependent). Falls back to `Trim` if summarization fails.
     pub compaction: CompactionMode,
-    /// Suppress this turn's terminal narration (spinner, `⏺`/`⎿` tool activity,
+    /// Suppress this turn's terminal narration (spinner, `◆`/`◇` tool activity,
     /// and the `kitsu-usage:`/`kitsu-context:` lines). Set for BACKGROUND
     /// subagents so their output doesn't corrupt the interactive prompt while
     /// they run detached; their result is delivered via the agent registry.
@@ -60,6 +108,15 @@ pub struct AgentConfig {
     /// are retained in memory; a frontend may also install a synchronous,
     /// content-bounded observer to surface progress while the turn is active.
     pub event_log: Option<AgentEventLog>,
+    /// Skill names known to this session, so text-protocol recovery can tell
+    /// a skill invoked as a fake tool (`{"name": "code-review"}`) apart from
+    /// arbitrary JSON in a real answer. Empty when no skills are loaded.
+    pub skill_names: Vec<String>,
+    /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
+    /// the MAIN conversation's config; the orchestrator resets it when a turn
+    /// starts. Subagent configs must leave this `None` so nested turns never
+    /// refresh the parent's budget mid-turn.
+    pub spawn_budget: Option<std::sync::Arc<SpawnBudget>>,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
@@ -128,7 +185,7 @@ pub enum AgentRuntimeEvent {
         /// `command` instead of embedding minified JSON here.
         output: String,
         #[serde(skip_serializing_if = "Option::is_none")]
-        command: Option<CommandRuntimeResult>,
+        command: Option<Box<CommandRuntimeResult>>,
     },
     TurnFinished {
         success: bool,
@@ -170,6 +227,10 @@ pub struct CommandRuntimeResult {
     pub artifact: Option<CommandOutputArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact_error: Option<String>,
+    /// Host-authored containment remediation hint for missing-module/command
+    /// failure shapes (see `CommandOutput::containment_hint`). Additive.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub containment_hint: Option<String>,
 }
 
 type AgentEventObserver =
@@ -350,7 +411,8 @@ impl ToolEventGuard {
             let command = pending
                 .command
                 .as_ref()
-                .and_then(|_| command_runtime_result(output));
+                .and_then(|_| command_runtime_result(output))
+                .map(Box::new);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -375,7 +437,8 @@ impl Drop for ToolEventGuard {
                 .command_progress
                 .as_ref()
                 .and_then(|progress| progress.lock().expect("command progress").clone())
-                .map(command_runtime_result_from_output);
+                .map(command_runtime_result_from_output)
+                .map(Box::new);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -384,17 +447,21 @@ impl Drop for ToolEventGuard {
                 cancelled: true,
                 output: "[cancelled: tool execution interrupted]".to_string(),
                 command: observed_command.or_else(|| {
-                    pending.command.as_ref().map(|invocation| {
-                        let executable_name = invocation.argv.first().cloned().unwrap_or_default();
-                        let executable_path = std::path::Path::new(&executable_name);
-                        let executable_resolution = if executable_path.is_absolute()
-                            || executable_path.components().count() > 1
-                        {
-                            CommandExecutableResolution::InvocationPath
-                        } else {
-                            CommandExecutableResolution::AmbientPath
-                        };
-                        CommandRuntimeResult {
+                    pending
+                        .command
+                        .as_ref()
+                        .map(|invocation| {
+                            let executable_name =
+                                invocation.argv.first().cloned().unwrap_or_default();
+                            let executable_path = std::path::Path::new(&executable_name);
+                            let executable_resolution = if executable_path.is_absolute()
+                                || executable_path.components().count() > 1
+                            {
+                                CommandExecutableResolution::InvocationPath
+                            } else {
+                                CommandExecutableResolution::AmbientPath
+                            };
+                            CommandRuntimeResult {
                         termination: CommandTermination::Cancelled,
                         success: false,
                         exit_code: None,
@@ -427,8 +494,10 @@ impl Drop for ToolEventGuard {
                              cleanup requirement is unverified and no cleanup is claimed"
                                 .to_string(),
                         ),
+                        containment_hint: None,
                     }
-                    })
+                        })
+                        .map(Box::new)
                 }),
             });
         }
@@ -598,6 +667,8 @@ impl Default for AgentConfig {
             compaction: CompactionMode::Trim,
             quiet: false,
             event_log: None,
+            skill_names: Vec::new(),
+            spawn_budget: None,
         }
     }
 }
@@ -611,7 +682,8 @@ pub enum AgentError {
     Loop(String),
 
     #[error(
-        "context preflight stopped an oversized provider request: protected prompt needs about {required} {unit}, but the configured target is {target} {unit}; shorten the latest request or system instructions, disable large tool schemas, lower max output tokens, clear/compact history, or select a model with a larger context window"
+        "context preflight stopped an oversized provider request: protected prompt needs about {required} {unit}, but the trim target is {target} {unit}{}; shorten the latest request or system instructions, disable large tool schemas, raise the window with --context-window <n>, lower --max-output-tokens, clear/compact history, or select a model with a larger context window",
+        context_budget_detail(*window, *effective, *target, *unit)
     )]
     ContextOverflow {
         required: u64,
@@ -620,12 +692,35 @@ pub enum AgentError {
         /// The resolved model window for token checks; `None` identifies the
         /// coarse byte-budget fallback used when model metadata is unavailable.
         window: Option<u64>,
+        /// The prompt budget the `kitsu-context:` line reports (window minus the
+        /// output reservation). `None` in the byte fallback, where the target is
+        /// the whole budget. Carried so the two numbers a user sees side by side
+        /// can explain their own difference instead of silently disagreeing.
+        effective: Option<u64>,
     },
 
     #[error(
         "manual compaction needs a resolved model context window; configure context_window or select a model whose window Kitsu can discover"
     )]
     ContextWindowUnknown,
+}
+
+/// Spell out the relationship between the window, the effective prompt budget,
+/// and the trim target so the preflight error and the `kitsu-context:` line
+/// never present two unexplained numbers for the same limit.
+fn context_budget_detail(
+    window: Option<u64>,
+    effective: Option<u64>,
+    target: u64,
+    unit: ContextUnit,
+) -> String {
+    match (window, effective) {
+        (Some(window), Some(effective)) => format!(
+            " (window {window} {unit}, effective prompt budget {effective} {unit}, trim target = effective minus a {} {unit} reserve)",
+            effective.saturating_sub(target)
+        ),
+        _ => String::new(),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -661,6 +756,53 @@ pub struct AgentSessionState {
     /// still show partial/recovered answers, while strict scripted callers can
     /// reject incomplete automation without scraping display markers.
     pub last_turn: AgentTurnStatus,
+    /// Runtime evidence that the serving backend's real context window is
+    /// smaller than the resolved one (see [`ContextWindowEvidence`]). This is
+    /// backend telemetry, not conversation state: callers that roll a failed
+    /// turn back should preserve it.
+    pub window_evidence: Option<ContextWindowEvidence>,
+}
+
+/// Evidence, gathered from a provider `usage` report, that the server accepted
+/// markedly fewer prompt tokens than the request was estimated to contain —
+/// the signature of a gateway silently truncating input to a context window
+/// smaller than the resolved one (e.g. a config claiming 8192 while Ollama
+/// serves `num_ctx = 4096`). Kitsu records the discrepancy, warns once, and
+/// surfaces it in `/context` provenance; it never silently rewrites the
+/// resolved window, because token estimates are heuristic.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ContextWindowEvidence {
+    /// `prompt_tokens` from the provider's usage report.
+    pub reported_prompt_tokens: u64,
+    /// Kitsu's preflight estimate for the request that produced the report.
+    pub estimated_sent_tokens: u64,
+    /// The resolved window the request was budgeted against.
+    pub resolved_window: u64,
+    /// The one-time warning for this evidence has already been emitted.
+    pub warned: bool,
+}
+
+/// Truncation heuristic for [`ContextWindowEvidence`]. Estimates are chars/4
+/// fuzzy, so a bare `reported < estimated` would cry wolf on every model whose
+/// tokenizer beats the heuristic. Require the reported count to fall below the
+/// resolved window AND either miss the estimate by a wide margin (>= 1/8 of the
+/// estimate, minimum 256 tokens) or sit exactly on a power-of-two boundary of
+/// at least 2048 — the shape of a clamped server-side `num_ctx`.
+fn context_window_shortfall(reported: u64, estimated_sent: u64, window: u64) -> bool {
+    if reported == 0 || reported >= window || reported >= estimated_sent {
+        return false;
+    }
+    let shortfall = estimated_sent - reported;
+    let wide_margin = shortfall >= (estimated_sent / 8).max(256);
+    let clamped_boundary = reported.is_power_of_two() && reported >= 2048;
+    // A clamp hypothesis claims the server's real window IS `reported`. When
+    // that implied window is under a quarter of the resolved one and sits on
+    // no clamp-shaped boundary, the far likelier story is the chars/4
+    // estimator overshooting an accurate tokenizer (hosted routers report
+    // exact counts) — cycle-14's HF audit saw this warning on nearly every
+    // turn. Stay quiet rather than crying wolf.
+    let plausible_clamp = reported.saturating_mul(4) >= window;
+    clamped_boundary || (wide_margin && plausible_clamp)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
@@ -677,6 +819,12 @@ pub struct AgentTurnStatus {
     pub tool_errors: u32,
     /// Subset of `tool_errors` caused by an explicit local authority denial.
     pub policy_errors: u32,
+    /// Tool errors in the LAST round that executed tool calls. Zero when the
+    /// model recovered from earlier failures in a later round — the normal
+    /// agentic retry pattern (e.g. an `fs_edit_file` precondition conflict
+    /// followed by a corrected, successful edit). Strict callers should judge
+    /// the turn's final state by this, not by the cumulative `tool_errors`.
+    pub final_round_tool_errors: u32,
 }
 
 /// Run one user turn through the agent loop, with no state persisted across
@@ -726,6 +874,14 @@ where
 {
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
+    if let Some(budget) = &cfg.spawn_budget {
+        budget.reset();
+    }
+    if !cfg.quiet {
+        // Reset the per-turn stdout marker so error handling can tell whether
+        // THIS turn streamed provisional output (quiet subagents never print).
+        kitsu_render::begin_turn_output();
+    }
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
@@ -760,7 +916,13 @@ where
             let budget = ContextBudget::new(window, cfg.max_tokens);
             (state.meter.estimate(messages), budget.effective, window)
         });
-        kitsu_render::emit_turn_stats(usage, context);
+        if result.is_ok() {
+            kitsu_render::emit_turn_stats(usage, context);
+        } else {
+            // A failed turn gets no human stats line — the error notice owns
+            // that moment — but redirected runs keep the machine records.
+            kitsu_render::emit_failed_turn_stats(usage, context);
+        }
     }
     result
 }
@@ -783,6 +945,7 @@ where
         compact_failures,
         compaction_ledger,
         last_turn: turn_status,
+        window_evidence,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
@@ -884,7 +1047,11 @@ where
         // edit adds another message or tool mutation between compaction and
         // request construction, this check fails locally instead of leaking an
         // oversized request to the gateway.
-        ensure_chat_request_fits(&req, cfg, meter)?;
+        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter)?;
+        // Token-denominated estimate of the request being sent, kept so the
+        // usage report below can be cross-checked against what left the door.
+        let sent_estimate_tokens =
+            (sent_measurement.unit == ContextUnit::Tokens).then_some(sent_measurement.used);
         if let Some(log) = &cfg.event_log {
             log.record(AgentRuntimeEvent::ProviderRequest {
                 round,
@@ -958,6 +1125,26 @@ where
                     // ContextMeter::anchor_includes_schema).
                     meter.record(u.prompt_tokens, sent_len, tools_were_offered);
                     turn_usage.add(u);
+                    // Cross-check the resolved window against runtime truth:
+                    // a usage report far below the sent estimate (and below
+                    // the window) means the server truncated the prompt to a
+                    // smaller real window. Record once per resolved window;
+                    // the CLI warns and surfaces it in /context provenance.
+                    if let (Some(window), Some(sent_estimate)) =
+                        (cfg.context_window, sent_estimate_tokens)
+                    {
+                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window)
+                            && window_evidence
+                                .map_or(true, |evidence| evidence.resolved_window != window)
+                        {
+                            *window_evidence = Some(ContextWindowEvidence {
+                                reported_prompt_tokens: u.prompt_tokens,
+                                estimated_sent_tokens: sent_estimate,
+                                resolved_window: window,
+                                warned: false,
+                            });
+                        }
+                    }
                     if let Some(log) = &cfg.event_log {
                         log.record(AgentRuntimeEvent::Usage {
                             round,
@@ -978,14 +1165,27 @@ where
         // structured `tool_calls`. If tools were advertised this round and none
         // came back structured, try to parse one from the text and execute it.
         let mut synthesized_call = false;
+        let mut malformed_text_calls = 0usize;
+        let mut skill_confusion: Option<String> = None;
         if tool_calls.is_empty() && tools_were_offered {
-            let recovered = parse_text_tool_calls(&assistant_text, tools);
-            if !recovered.is_empty() {
+            let recovered = parse_text_tool_calls(&assistant_text, tools, &cfg.skill_names);
+            if !recovered.calls.is_empty() {
                 tracing::debug!(
-                    count = recovered.len(),
+                    count = recovered.calls.len(),
                     "recovered text-protocol tool call(s)"
                 );
-                tool_calls.extend(recovered);
+                tool_calls.extend(recovered.calls);
+                synthesized_call = true;
+            } else if recovered.malformed > 0 {
+                // A tool attempt too broken to repair. Suppress the raw JSON
+                // (it is not an answer) and spend the round on corrective
+                // feedback instead of committing garbage as the result.
+                malformed_text_calls = recovered.malformed;
+                synthesized_call = true;
+            } else if recovered.skill_confusion.is_some() {
+                // A skill invoked as a fake tool — same treatment, with a
+                // targeted correction naming the real path.
+                skill_confusion = recovered.skill_confusion;
                 synthesized_call = true;
             }
         }
@@ -1027,6 +1227,43 @@ where
             tool_calls.clone(),
         ));
 
+        if tool_calls.is_empty() && skill_confusion.is_some() {
+            let skill = skill_confusion.take().unwrap_or_default();
+            turn_status.tool_errors += 1;
+            if !cfg.quiet {
+                kitsu_render::tool_result_error(&format!(
+                    "ignored a text-form call to skill '{skill}' (skills are not tools); asked the model to load it via the skill tool"
+                ));
+            }
+            messages.push(ChatMessage::user(format!(
+                "'{skill}' is a SKILL, not a tool, and was NOT invoked. Load it by calling the \
+                 `skill` tool as a structured tool call with arguments {{\"name\": \"{skill}\"}}, \
+                 then follow the returned instructions."
+            )));
+            continue;
+        }
+
+        if tool_calls.is_empty() && malformed_text_calls > 0 {
+            // Cycle-12 audit: a malformed text-form tool attempt must neither
+            // masquerade as the committed answer nor vanish silently — the
+            // user sees an ignored-call receipt, the model gets told exactly
+            // how to re-issue, and the retry stays bounded by max_rounds.
+            turn_status.tool_errors += malformed_text_calls as u32;
+            if !cfg.quiet {
+                kitsu_render::tool_result_error(&format!(
+                    "ignored {malformed_text_calls} malformed text-form tool call(s) (unparseable JSON); asked the model to re-issue"
+                ));
+            }
+            messages.push(ChatMessage::user(
+                "Your last message contained a text-form tool call whose JSON could not be parsed \
+                 (for example an invalid escape sequence). It was NOT executed. Re-issue it as a \
+                 proper structured tool call, or as strictly valid JSON of the form \
+                 {\"name\": \"<tool_name>\", \"arguments\": { ... }} with no surrounding prose."
+                    .to_string(),
+            ));
+            continue;
+        }
+
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
             match finish {
@@ -1066,8 +1303,12 @@ where
         }
 
         // Tool calls present: run each, feed result (or error) back as a tool msg.
+        // Each tool round overwrites `final_round_tool_errors`, so after the turn
+        // it reports the LAST executed tool round — zero when the model recovered
+        // from earlier failures before finishing.
+        turn_status.final_round_tool_errors = 0;
         for tc in tool_calls {
-            // Narrate the action (Claude-Code-style), e.g. `⏺ Read(deck1.md)`.
+            // Narrate the action, e.g. `◆ Read(deck1.md)`.
             if !cfg.quiet {
                 kitsu_render::tool_activity(&format_tool_header(&tc.tool_name, &tc.args));
             }
@@ -1101,6 +1342,8 @@ where
                         force_final_next = true;
                     }
                     turn_status.tool_errors = turn_status.tool_errors.saturating_add(1);
+                    turn_status.final_round_tool_errors =
+                        turn_status.final_round_tool_errors.saturating_add(1);
                     if matches!(e, kitsu_tools::ToolError::PolicyDenied(_)) {
                         turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
                     }
@@ -1112,7 +1355,12 @@ where
                 }
             };
             if !cfg.quiet {
-                kitsu_render::tool_result(&format_tool_result(&tc.tool_name, &content, is_err));
+                let summary = format_tool_result(&tc.tool_name, &content, is_err);
+                if is_err {
+                    kitsu_render::tool_result_error(&summary);
+                } else {
+                    kitsu_render::tool_result(&summary);
+                }
             }
             tool_event.finish(!is_err, &content);
             abort_if_event_sink_failed(cfg)?;
@@ -1148,14 +1396,78 @@ fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescrip
 /// multiple files). Parse EVERY balanced JSON object from `text`; for each with a
 /// `name` matching an advertised tool plus `arguments`/`parameters`, synthesize a
 /// [`ToolCall`]. Returns them in order (empty if none parse/match).
-fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
+/// What scanning assistant text for text-protocol tool calls found.
+struct TextToolRecovery {
+    calls: Vec<ToolCall>,
+    /// Candidates that named a registered tool but stayed unparseable even
+    /// after escape repair. They were NOT executed; the caller owes the model
+    /// corrective feedback instead of printing the raw JSON as the answer.
+    malformed: usize,
+    /// A well-formed call whose `name` is a known SKILL, not a tool — the
+    /// cycle-14 pattern where a model invokes `{"name": "code-review", …}`
+    /// directly instead of loading it through the `skill` tool. Carries the
+    /// skill name for a targeted corrective message.
+    skill_confusion: Option<String>,
+}
+
+/// Repair the common invalid-escape faults small models emit inside otherwise
+/// well-shaped tool-call JSON (`\'` in particular): inside string literals,
+/// a backslash before a character that is not a valid JSON escape is dropped,
+/// keeping the character. Everything else passes through untouched.
+fn relax_json_escapes(candidate: &str) -> String {
+    let mut out = String::with_capacity(candidate.len());
+    let mut chars = candidate.chars();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string && c == '\\' {
+            match chars.next() {
+                Some(next)
+                    if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') =>
+                {
+                    out.push('\\');
+                    out.push(next);
+                }
+                Some(next) => out.push(next),
+                None => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -> TextToolRecovery {
     let descriptors = tools.descriptors();
     let mut calls = Vec::new();
+    let mut malformed = 0usize;
+    let mut skill_confusion = None;
     if descriptors.is_empty() {
-        return calls;
+        return TextToolRecovery {
+            calls,
+            malformed,
+            skill_confusion,
+        };
     }
     for candidate in extract_json_objects(text) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
+        let parsed = serde_json::from_str::<serde_json::Value>(&candidate).or_else(|_| {
+            serde_json::from_str::<serde_json::Value>(&relax_json_escapes(&candidate))
+        });
+        let Ok(value) = parsed else {
+            // Narrow detection to keep false positives out: only an object
+            // that has a "name" key AND quotes a registered tool name counts
+            // as a failed tool attempt (arbitrary JSON in a real answer does
+            // not trip this).
+            if candidate.contains("\"name\"")
+                && descriptors
+                    .iter()
+                    .any(|d| candidate.contains(&format!("\"{}\"", d.name)))
+            {
+                malformed += 1;
+            }
             continue;
         };
         let Some(obj) = value.as_object() else {
@@ -1165,6 +1477,9 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
             continue;
         };
         if !descriptors.iter().any(|d| d.name == name) {
+            if skill_confusion.is_none() && skill_names.iter().any(|skill| skill == name) {
+                skill_confusion = Some(name.to_string());
+            }
             continue;
         }
         // `arguments` may be an object or a JSON-encoded string; `parameters` is a
@@ -1181,7 +1496,11 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
             call_id,
         });
     }
-    calls
+    TextToolRecovery {
+        calls,
+        malformed,
+        skill_confusion,
+    }
 }
 
 /// Return every balanced top-level `{…}` JSON object substring in `text`,
@@ -1290,6 +1609,7 @@ fn command_runtime_result_from_output(output: CommandOutput) -> CommandRuntimeRe
         ambient_authority: output.ambient_authority,
         artifact: output.artifact,
         artifact_error: output.artifact_error,
+        containment_hint: output.containment_hint,
     }
 }
 
@@ -1347,11 +1667,49 @@ fn format_tool_header(name: &str, args: &str) -> String {
         "repo_grep" => "Grep",
         "fs_write_file" => "Write",
         "fs_edit_file" => "Edit",
+        "spawn_agent" | "spawn_agents" | "spawn_agent_bg" => "Agent",
+        "agent_result" => "AgentResult",
         other => other,
     };
     let Ok(v) = serde_json::from_str::<serde_json::Value>(args) else {
         return friendly.to_string();
     };
+    // The agent tools carry no `path`, so without this arm the single most
+    // important receipt in the deck — "a worker was dispatched, doing X" —
+    // renders as a bare tool name.
+    if matches!(name, "spawn_agent" | "spawn_agent_bg") {
+        let task = bounded_human_value(v.get("task").and_then(|x| x.as_str()).unwrap_or(""), 96);
+        return match v.get("profile").and_then(|x| x.as_str()) {
+            Some(profile) => format!(
+                "{friendly}({}: \"{task}\")",
+                bounded_human_value(profile, 64)
+            ),
+            None => format!("{friendly}(\"{task}\")"),
+        };
+    }
+    if name == "spawn_agents" {
+        let tasks = v.get("tasks").and_then(|x| x.as_array());
+        let count = tasks.map_or(0, Vec::len);
+        let labels = tasks
+            .map(|tasks| {
+                tasks
+                    .iter()
+                    .filter_map(|task| task.as_str())
+                    .map(|task| format!("\"{}\"", bounded_human_value(task, 48)))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            })
+            .unwrap_or_default();
+        return format!("{friendly}(x{count}: {labels})");
+    }
+    if name == "agent_result" {
+        let id = v
+            .get("id")
+            .and_then(serde_json::Value::as_u64)
+            .map(|id| id.to_string())
+            .unwrap_or_else(|| "?".to_string());
+        return format!("{friendly}(#{id})");
+    }
     if name == "repo_grep" {
         let pat = v.get("pattern").and_then(|x| x.as_str()).unwrap_or("");
         let path = v
@@ -1423,6 +1781,11 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
                 format!("{n} match{}", if n == 1 { "" } else { "es" })
             }
         }
+        // "1 line" is useless for a dispatch receipt; the agent tools return a
+        // one-sentence status whose first line IS the summary.
+        "spawn_agent_bg" | "agent_result" => {
+            bounded_human_value(content.lines().next().unwrap_or_default(), 180)
+        }
         _ => {
             let n = content.lines().count();
             format!("{n} line{}", if n == 1 { "" } else { "s" })
@@ -1465,16 +1828,22 @@ fn format_command_result(output: &CommandOutput) -> String {
         output.stderr_truncated,
         output.stderr_capture_complete,
     );
-    if let Some(artifact) = &output.artifact {
-        fields.push(format!(
-            "full output={:?}",
-            bounded_human_value(&artifact.reference, 160)
-        ));
-    }
     if let Some(status) = &output.artifact_error {
         fields.push(format!(
             "artifact status={:?}",
             bounded_human_value(status, 160)
+        ));
+    }
+    if let Some(hint) = &output.containment_hint {
+        fields.push(format!("hint: {}", bounded_human_value(hint, 480)));
+    }
+    // The artifact path is the one pointer to the complete output, so it is
+    // never elided (every other field is bounded instead) and stays last:
+    // when a terminal wraps the receipt, the line ends with a copyable path.
+    if let Some(artifact) = &output.artifact {
+        fields.push(format!(
+            "full output={:?}",
+            terminal_safe_inline(&artifact.reference)
         ));
     }
     fields.join(" | ")
@@ -1538,11 +1907,16 @@ fn short_path(p: &str) -> String {
         .collect();
     match parts.as_slice() {
         [] => p.to_string(),
+        [one] if p.starts_with('/') => format!("/{one}"),
         [one] => (*one).to_string(),
         [.., a, b] => {
             let tail = format!("{a}/{b}");
             if parts.len() > 2 {
                 format!("…/{tail}")
+            } else if p.starts_with('/') {
+                // Keep short absolute paths exact: `/etc/hostname` must not
+                // display as the relative-looking `etc/hostname`.
+                format!("/{tail}")
             } else {
                 tail
             }
@@ -1555,6 +1929,7 @@ struct RequestMeasurement {
     used: u64,
     target: u64,
     window: Option<u64>,
+    effective: Option<u64>,
     unit: ContextUnit,
 }
 
@@ -1599,10 +1974,12 @@ fn request_measurement(
             } else {
                 schema_tokens
             };
+        let budget = ContextBudget::new(window, max_tokens);
         RequestMeasurement {
             used,
-            target: ContextBudget::new(window, max_tokens).target,
+            target: budget.target,
             window: Some(window),
+            effective: Some(budget.effective),
             unit: ContextUnit::Tokens,
         }
     } else {
@@ -1615,6 +1992,7 @@ fn request_measurement(
             used: messages.iter().map(|m| m.byte_size() as u64).sum::<u64>() + schema_bytes,
             target: cfg.max_context_bytes as u64,
             window: None,
+            effective: None,
             unit: ContextUnit::Bytes,
         }
     }
@@ -1627,6 +2005,7 @@ fn check_measurement(measurement: RequestMeasurement) -> Result<RequestMeasureme
             target: measurement.target,
             unit: measurement.unit,
             window: measurement.window,
+            effective: measurement.effective,
         });
     }
     Ok(measurement)

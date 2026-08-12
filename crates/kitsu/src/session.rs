@@ -36,6 +36,10 @@ pub struct SavedSession {
     pub directory: String,
     pub gateway: String,
     pub model: String,
+    /// Optional human-memorable name (cycle-13 session audit). Resolvable in
+    /// `--resume <name>`; absent for unnamed sessions and in old snapshots.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_context: Option<String>,
     pub messages: Vec<ChatMessage>,
@@ -44,6 +48,8 @@ pub struct SavedSession {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionSummary {
     pub id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub name: Option<String>,
     pub updated_at: String,
     pub model: String,
     pub gateway: String,
@@ -64,6 +70,7 @@ pub struct SessionStore {
     directory: PrivateDirectory,
     id: String,
     created_at: String,
+    name: Option<String>,
     lease: SessionLease,
 }
 
@@ -162,10 +169,90 @@ fn valid_id(id: &str) -> bool {
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
 }
 
+/// A user-chosen session name: short, filesystem-safe, and unambiguous with
+/// the selector vocabulary (`last`, `auto`) and generated ids (`s-…`).
+pub fn valid_session_name(name: &str) -> Result<(), String> {
+    if name.is_empty() || name.chars().count() > 40 {
+        return Err("session name must be 1-40 characters".to_string());
+    }
+    if !name
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_'))
+    {
+        return Err("session name may contain only letters, digits, '-' and '_'".to_string());
+    }
+    if name == "last" || name == "auto" {
+        return Err(format!("'{name}' is a reserved resume selector"));
+    }
+    if name.starts_with("s-") {
+        return Err("session names starting with 's-' would shadow session ids".to_string());
+    }
+    Ok(())
+}
+
+/// Resolve a resume selector to a session id: `last`/empty → newest with a
+/// real turn; `auto` → newest whose recorded working directory is the current
+/// one; a valid existing id → itself; otherwise an exact match on session
+/// NAME (ambiguity is an error listing the candidate ids).
+fn resolve_selector(
+    summaries: &[SessionSummary],
+    selector: &str,
+    excluded_id: Option<&str>,
+) -> Result<String, String> {
+    if selector == "last" || selector.is_empty() {
+        return preferred_last_id(summaries, excluded_id).ok_or_else(|| {
+            "no saved sessions — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new".to_string()
+        });
+    }
+    if selector == "auto" {
+        let cwd = std::env::current_dir()
+            .map_err(|error| format!("cannot resolve the current directory: {error}"))?
+            .display()
+            .to_string();
+        return summaries
+            .iter()
+            .filter(|summary| excluded_id != Some(summary.id.as_str()))
+            .find(|summary| summary.directory == cwd)
+            .map(|summary| summary.id.clone())
+            .ok_or_else(|| {
+                format!("no saved session recorded in this directory ({cwd}); try --resume last or /sessions")
+            });
+    }
+    if valid_id(selector) && summaries.iter().any(|summary| summary.id == selector) {
+        return Ok(selector.to_string());
+    }
+    let named: Vec<&SessionSummary> = summaries
+        .iter()
+        .filter(|summary| summary.name.as_deref() == Some(selector))
+        .collect();
+    match named.as_slice() {
+        [only] => Ok(only.id.clone()),
+        // Only id-SHAPED selectors may fall through to a direct read (they can
+        // address snapshots outside the live listing). A mistyped NAME must
+        // hit the friendly error below, never a raw filesystem path.
+        [] if selector.starts_with("s-") && valid_id(selector) => Ok(selector.to_string()),
+        [] => Err(format!(
+            "no session named '{selector}' — see /sessions or `kitsu sessions`"
+        )),
+        many => Err(format!(
+            "session name '{selector}' is ambiguous; use an id: {}",
+            many.iter()
+                .map(|summary| summary.id.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
+
 fn exact_id<'a>(selector: &'a str, operation: &str) -> Result<&'a str, String> {
     if selector.is_empty() || selector == "last" {
         return Err(format!(
             "{operation} requires an exact session id; 'last' is not accepted"
+        ));
+    }
+    if !selector.starts_with("s-") {
+        return Err(format!(
+            "{operation} requires an exact session id — if '{selector}' is a session name, find its id with `kitsu sessions {selector}`"
         ));
     }
     if !valid_id(selector) {
@@ -1823,6 +1910,7 @@ fn list_in(directory: &PrivateDirectory) -> Result<Vec<SessionSummary>, String> 
             .unwrap_or_else(|| "(no prompt yet)".to_string());
         summaries.push(SessionSummary {
             id: saved.id,
+            name: saved.name,
             updated_at: saved.updated_at,
             model: saved.model,
             gateway: saved.gateway,
@@ -1867,6 +1955,7 @@ impl SessionStore {
             directory,
             id,
             created_at,
+            name: None,
             lease,
         })
     }
@@ -1892,12 +1981,24 @@ impl SessionStore {
             directory,
             id: saved.id.clone(),
             created_at: saved.created_at.clone(),
+            name: saved.name.clone(),
             lease,
         })
     }
 
     pub fn id(&self) -> &str {
         &self.id
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.name.as_deref()
+    }
+
+    /// Set or clear the session's human-memorable name. Validation is the
+    /// caller's job via [`valid_session_name`]; persistence happens on the
+    /// next save.
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.name = name;
     }
 
     pub fn artifacts_dir(&self) -> PathBuf {
@@ -1931,6 +2032,7 @@ impl SessionStore {
             directory: directory.display().to_string(),
             gateway: gateway.to_string(),
             model: model.to_string(),
+            name: self.name.clone(),
             project_context: project_context.map(|path| path.display().to_string()),
             messages: messages.to_vec(),
         };
@@ -1944,14 +2046,7 @@ impl SessionStore {
 
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        let id = if selector == "last" || selector.is_empty() {
-            preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?
-        } else if valid_id(selector) {
-            selector.to_string()
-        } else {
-            return Err(format!("invalid session id '{selector}'"));
-        };
+        let id = resolve_selector(&list_in(&directory)?, selector, None)?;
         directory.read_saved(&id)
     }
 
@@ -1964,18 +2059,40 @@ impl SessionStore {
         active_id: Option<&str>,
     ) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        if selector == "last" || selector.is_empty() {
-            let id = preferred_last_id(&list_in(&directory)?, active_id)
-                .ok_or_else(|| "no other saved session in this config directory".to_string())?;
-            return directory.read_saved(&id);
-        }
-        if active_id == Some(selector) {
+        let id = resolve_selector(&list_in(&directory)?, selector, active_id)?;
+        if active_id == Some(id.as_str()) {
             return Err(format!("session '{selector}' is already active"));
         }
-        if !valid_id(selector) {
-            return Err(format!("invalid session id '{selector}'"));
+        directory.read_saved(&id)
+    }
+
+    /// Set or clear a saved session's name without touching its transcript or
+    /// its `updated_at` (a rename must not hijack `last` resolution). The
+    /// active session's next autosave wins over a concurrent rename — rename
+    /// idle sessions, or use `--name` on the live one.
+    pub fn rename(
+        dir: &Path,
+        selector: &str,
+        new_name: Option<&str>,
+    ) -> Result<SavedSession, String> {
+        if let Some(name) = new_name {
+            valid_session_name(name)?;
         }
-        directory.read_saved(selector)
+        let directory = open_session_directory(dir)?;
+        let summaries = list_in(&directory)?;
+        let id = resolve_selector(&summaries, selector, None)?;
+        if let Some(name) = new_name {
+            if summaries
+                .iter()
+                .any(|summary| summary.id != id && summary.name.as_deref() == Some(name))
+            {
+                return Err(format!("another session is already named '{name}'"));
+            }
+        }
+        let mut saved = directory.read_saved(&id)?;
+        saved.name = new_name.map(str::to_string);
+        write_saved_file(&directory, &saved, true).map_err(|error| error.to_string())?;
+        Ok(saved)
     }
 
     /// Clone a saved conversation into a new, durable session. Only snapshot
@@ -1986,8 +2103,9 @@ impl SessionStore {
     pub fn fork(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
         let mut forked = if selector == "last" || selector.is_empty() {
-            let id = preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
+            let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
+                "no saved sessions — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new".to_string()
+            })?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
             directory.read_saved(selector)?
@@ -2065,8 +2183,9 @@ impl SessionStore {
     ) -> Result<PathBuf, String> {
         let directory = open_session_directory(dir)?;
         let mut saved = if selector == "last" || selector.is_empty() {
-            let id = preferred_last_id(&list_in(&directory)?, None)
-                .ok_or_else(|| "no saved sessions in this config directory".to_string())?;
+            let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
+                "no saved sessions — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new".to_string()
+            })?;
             directory.read_saved(&id)?
         } else if valid_id(selector) {
             directory.read_saved(selector)?
@@ -2422,6 +2541,52 @@ mod tests {
     }
 
     #[test]
+    fn session_names_validate_resolve_and_stay_unique() {
+        assert!(valid_session_name("friday-refactor").is_ok());
+        for bad in ["last", "auto", "s-123", "has space", ""] {
+            assert!(valid_session_name(bad).is_err(), "{bad} must be rejected");
+        }
+
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let messages = vec![ChatMessage::system("system"), ChatMessage::user("hello")];
+
+        let store = SessionStore::create(dir.clone()).unwrap();
+        store
+            .save(root.path(), "local", "model-a", None, &messages)
+            .unwrap();
+        let first = store.id().to_string();
+        drop(store);
+
+        let renamed = SessionStore::rename(&dir, &first, Some("fox-den")).unwrap();
+        assert_eq!(renamed.name.as_deref(), Some("fox-den"));
+        assert_eq!(
+            SessionStore::load(&dir, "fox-den").unwrap().id,
+            first,
+            "a name resolves in resume selectors"
+        );
+        assert_eq!(
+            SessionStore::list(&dir).unwrap()[0].name.as_deref(),
+            Some("fox-den"),
+            "listings carry the name"
+        );
+
+        let second = SessionStore::create(dir.clone()).unwrap();
+        second
+            .save(root.path(), "local", "model-a", None, &messages)
+            .unwrap();
+        let second_id = second.id().to_string();
+        drop(second);
+        assert!(
+            SessionStore::rename(&dir, &second_id, Some("fox-den")).is_err(),
+            "duplicate names would make resume ambiguous"
+        );
+        // Clearing a name works and frees it up.
+        SessionStore::rename(&dir, &first, None).unwrap();
+        assert!(SessionStore::rename(&dir, &second_id, Some("fox-den")).is_ok());
+    }
+
+    #[test]
     fn saves_loads_and_lists_without_credentials() {
         let root = tempfile::tempdir().unwrap();
         let mut store = SessionStore::create(root.path().join("sessions")).unwrap();
@@ -2665,8 +2830,8 @@ mod tests {
         let root = tempfile::tempdir().unwrap();
         let outside = root.path().join("outside.json");
         std::fs::write(&outside, "{}").unwrap();
-        symlink(&outside, root.path().join("safe-id.json")).unwrap();
-        let error = SessionStore::load(root.path(), "safe-id").unwrap_err();
+        symlink(&outside, root.path().join("s-safe-id.json")).unwrap();
+        let error = SessionStore::load(root.path(), "s-safe-id").unwrap_err();
         assert!(error.contains("not a regular file"));
     }
 

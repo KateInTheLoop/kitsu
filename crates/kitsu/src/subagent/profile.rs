@@ -19,17 +19,57 @@ pub const MAX_AGENT_TOOL_NAME_CHARS: usize = 128;
 pub const MAX_AGENT_PERMISSION_ROOTS: usize = 32;
 pub const MAX_AGENT_PERMISSION_ROOT_BYTES: usize = 4 * 1024;
 
+/// A profile's requested reasoning effort.
+///
+/// `Inherit` is the default and the only value that adds nothing to the
+/// provider request: the spawn keeps whatever the parent invocation configured
+/// (nothing, unless `--reasoning-effort` was passed). This mirrors the CLI flag,
+/// which is "omitted by default so non-reasoning endpoints receive no extra
+/// request field" — endpoints such as Ollama reject an unknown
+/// `reasoning_effort` with HTTP 400, so a profile must not inject one on its
+/// own. `None` remains distinct: it explicitly *sends* `reasoning_effort: none`.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentReasoningEffort {
+    #[default]
+    Inherit,
     None,
     Minimal,
     Low,
-    #[default]
     Medium,
     High,
     #[serde(rename = "xhigh", alias = "x_high")]
     XHigh,
+}
+
+impl AgentReasoningEffort {
+    /// The provider-level effort this profile explicitly requests. `Inherit`
+    /// yields `None`, so the spawned request carries no `reasoning_effort` key
+    /// unless the parent invocation already set one.
+    pub fn requested(self) -> Option<kitsu_providers::ReasoningEffort> {
+        match self {
+            Self::Inherit => Option::None,
+            Self::None => Some(kitsu_providers::ReasoningEffort::None),
+            Self::Minimal => Some(kitsu_providers::ReasoningEffort::Minimal),
+            Self::Low => Some(kitsu_providers::ReasoningEffort::Low),
+            Self::Medium => Some(kitsu_providers::ReasoningEffort::Medium),
+            Self::High => Some(kitsu_providers::ReasoningEffort::High),
+            Self::XHigh => Some(kitsu_providers::ReasoningEffort::XHigh),
+        }
+    }
+
+    /// The DTO spelling, so human rendering and JSONL never disagree.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Inherit => "inherit",
+            Self::None => "none",
+            Self::Minimal => "minimal",
+            Self::Low => "low",
+            Self::Medium => "medium",
+            Self::High => "high",
+            Self::XHigh => "xhigh",
+        }
+    }
 }
 
 /// Tools a profile asks a frontend to expose.
@@ -49,6 +89,7 @@ pub enum AgentToolPolicy {
 }
 
 impl AgentToolPolicy {
+    #[allow(dead_code)] // Part of the policy API; rendering matches the variants directly.
     pub fn is_tool_free(&self) -> bool {
         matches!(self, Self::None)
     }
@@ -103,7 +144,7 @@ impl AgentProfile {
         Self {
             name: name.into(),
             model: None,
-            reasoning_effort: AgentReasoningEffort::Medium,
+            reasoning_effort: AgentReasoningEffort::Inherit,
             instructions: instructions.into(),
             tool_policy: AgentToolPolicy::None,
             permission_defaults: AgentPermissionDefaults::default(),
@@ -412,6 +453,26 @@ mod tests {
             profile.permission_defaults,
             AgentPermissionDefaults::default()
         );
+    }
+
+    #[test]
+    fn an_unset_reasoning_effort_requests_nothing_from_the_provider() {
+        let profile: AgentProfile = serde_json::from_str(r#"{"name":"thinker"}"#).unwrap();
+        assert_eq!(profile.reasoning_effort, AgentReasoningEffort::Inherit);
+        assert_eq!(profile.reasoning_effort.requested(), None);
+        assert_eq!(profile.reasoning_effort.label(), "inherit");
+        assert_eq!(
+            AgentReasoningEffort::None.requested(),
+            Some(kitsu_providers::ReasoningEffort::None),
+            "an explicit `none` still sends the field"
+        );
+        assert_eq!(
+            AgentReasoningEffort::High.requested(),
+            Some(kitsu_providers::ReasoningEffort::High)
+        );
+        let explicit: AgentProfile =
+            serde_json::from_str(r#"{"name":"thinker","reasoning_effort":"high"}"#).unwrap();
+        assert_eq!(explicit.reasoning_effort, AgentReasoningEffort::High);
     }
 
     #[test]

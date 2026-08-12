@@ -182,6 +182,31 @@ kitsu sessions delete <exact-id>
 kitsu sessions resume last --json  # prints exact argv outside interactive chat
 ```
 
+### Artifacts on disk
+
+Developer-command output is captured in full into Kitsu-private *generation*
+directories so a one-shot automation run can still read it after the process
+exits. That retention is deliberate, which also means generations accumulate
+across runs. Inspect and reclaim them without contacting a provider:
+
+```bash
+kitsu artifacts                       # list retained generations across runs
+kitsu artifacts list --json           # same, for automation
+kitsu artifacts prune all --dry-run   # report what would be reclaimed
+kitsu artifacts prune all             # reclaim it
+kitsu artifacts prune <id> --older-than 7d
+```
+
+`kitsu artifacts` is **host-only**: it runs outside any chat, no model authority
+is involved, and none is created. Safety is biased toward keeping data — a
+generation held by a live process (proven by an advisory lock the kernel
+releases on process death, not by a reusable pid) is skipped with a named
+reason, session-owned sidecars are skipped, and only exact
+`runtime-<pid>-<nanos>-<gen>` and `<session-id>.artifacts` directories are ever
+touched. Chat startup additionally sweeps *provably empty* orphans, which
+destroys nothing of value, and prints a one-line notice — never a deletion —
+when non-empty leftovers pass a threshold.
+
 ---
 
 ## Add any OpenAI-compatible endpoint (the general recipe)
@@ -464,7 +489,8 @@ kitsu [GLOBAL FLAGS] <COMMAND>
 | `ask <prompt>` | Ask a single question; stream the answer. |
 | `review [path]` | Run one tool-free review over host-verified working/staged/unstaged/base/commit evidence; supports JSONL, focus instructions, and opt-in session continuity. |
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
-| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `resume` launches chat on a TTY or emits exact argv otherwise. |
+| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
+| `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 
 **Global flags** (apply to any command)
@@ -484,7 +510,8 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--temperature <f>` | unset | Sampling temperature. Omitted from the request unless set (some models reject it). |
 | `--reasoning-effort <level>` | unset | Forward `none`, `minimal`, `low`, `medium`, `high`, or `xhigh` to compatible gateways; omitted otherwise. `/reasoning` can change it between chat turns. |
 | `--max-rounds <n>` | `10` | Max agent tool-call rounds per turn (minimum `1`). Raise (e.g. `40`) for tool-heavy work. |
-| `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. |
+| `--timeout-secs <n>` | `120` | Total request deadline, including retries, backoff, and streamed body reads. One-shot chat also charges piped-input and attachment acquisition to the same deadline; a positional prompt never waits for unrelated stdin EOF. If the deadline expires after real output already streamed, one-shot runs keep it: the answer ends with a `[stopped: deadline expired …]` marker and is labeled partial (exit code stays `2`). |
+| `--agent-join-timeout <n>` | `--timeout-secs` | How long a non-interactive exit (scripted or piped chat) waits for live background agents to finish before cancelling them. |
 | `--max-output-tokens <n>` | unset (gateway default) | Cap output tokens. Required by some gateways (e.g. Anthropic); raise for long-form output. |
 | `--yes` | off | Never prompt for filesystem access; enabled tools remain confined to explicit/current roots and requests outside them are denied. Never enables tools or approves developer commands. |
 | `--dangerously-allow-all-filesystem` | off | **DANGER:** let enabled filesystem tools access every non-protected host path without prompting. This is the explicit global bypass; it still never enables tools or approves commands. |
@@ -492,6 +519,7 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--compaction <trim\|summarize>` | `trim` | Choose how older context is reclaimed. |
 | `--skill <name>` | unset | Preload a local skill (repeatable; accepted before or after the subcommand). |
 | `--no-project-context` | off | Do not discover or send project `llms.txt`/`AGENTS.md` context or project skills. User skills remain available, including explicit `--skill` preloads. |
+| `--no-workspace-evidence` | off | Do not register the model-callable `workspace_diff` evidence tool for this run (see [Tools in chat](#tools-in-chat)). The config key `workspace_evidence = false` disables it permanently. |
 
 **Chat-only flags**
 
@@ -501,13 +529,14 @@ The date is provenance from Git history, not the wall-clock build time.
 | `--allow-write <PATH>` | Allow the model to **generate/write files** under `PATH` (repeatable) via `fs_write_file`. Deny-by-default, independent of `--allow-path`. |
 | `--allow-read-write <PATH>` | Explicitly allow both reads and writes under `PATH` (repeatable) for read-modify-write workflows. |
 | `--enable-commands` | Enable guarded literal-argv developer commands. Approval is independent from filesystem access and `--yes`. |
-| `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. |
-| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv in the launch directory, e.g. `'["cargo","test"]'` (repeatable). |
+| `--command-root <PATH>` | Add an existing writable root to mandatory Linux command containment (repeatable; implies `--enable-commands`). Exact argv/cwd approval remains a separate gate. **The approved executable's own directory is a second, independent root requirement** — if a tool lives outside every `--command-root` (e.g. `~/.local/bin/pytest`), containment denies it at run time; the denial names the exact missing directory and the `--command-root` flag to add. |
+| `--allow-command <JSON_ARGV>` | Pre-approve one exact argv (repeatable). `'["cargo","test"]'` binds it to the launch directory; `'{"argv":["cargo","test"],"cwd":"/abs/dir"}'` binds it to an explicit directory inside a `--command-root`. The grant is exact argv **and** exact cwd. Every pregrant is also named verbatim (argv + cwd) in the system prompt, so the model can call it directly instead of guessing. |
+| `--command-env <NAME[=VALUE]>` | Opt-in, explicit environment pass-through into contained commands (repeatable), layered on top of the fixed non-secret base set (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`). Needed for interpreter-based toolchains (`pytest`, `npm test`, ...) whose module search path is env-driven (`PYTHONPATH`, `NODE_PATH`, ...). Bare `NAME` reads the value from kitsu's own environment and is refused for names that look secret-bearing (case-insensitive substring match on `KEY`/`TOKEN`/`SECRET`/`PASSWORD`); use `NAME=value` to pass an explicit literal value regardless of name. Nothing else is inherited from the host — deny-by-default is unchanged. Disclosed in `/permissions` and JSONL (secret-shaped values are redacted there even though the contained process receives the real value). |
 | `--script <FILE>` | Run turns from a file non-interactively (deterministic multi-turn). One turn per line; `#` comments and blank lines skipped; `/slash` commands work; a `<<< … >>>` block is a single multi-line turn. |
-| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. |
+| `--resume [ID]` | Resume and autosave a saved session in interactive, scripted, or piped chat; omit the ID for `last`. Saved permissions are never restored; current invocation grants remain. `--resume` already implies `--session`, so passing both explicitly is a harmless no-op confirmation, not an error. |
 | `--session` | Explicitly create and autosave a new scripted or piped session. |
 | `--no-session` | Disable conversation snapshots and prompt-history persistence for this chat. |
-| `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. |
+| `--allow-turn-errors` | Let a script exit 0 after failed turns/commands; strict nonzero exit is the default. Accepts *partial* success only: if every turn and command failed, the script still exits nonzero. |
 
 Examples:
 
@@ -532,8 +561,8 @@ In an interactive `chat` the model has filesystem tools (`fs_read_file`,
 similar to Claude Code — it asks before touching paths you haven't allowed:
 
 ```
-⏺ kitsu wants to write /home/you/project/notes.md
-  [y] allow once   [a] always (this dir)   [n] deny
+◉ permission — kitsu wants to write /home/you/project/notes.md
+  [y] allow once · [a] always (/home/you/project) · [n] deny
 >
 ```
 
@@ -547,6 +576,29 @@ it won't ask again.
   repeatable. Read and write authority stay independent unless the combined
   flag is used — e.g. read a whole repo but confine generated files to one
   scratch dir.
+- **Host-owned evidence is not model authority.** `/diff`, `/review`,
+  `kitsu review`, and `/checkpoint <id>` are produced by Kitsu's own `git`, not
+  by a model tool, so they need **no** read grant and never create one. `/diff`
+  renders to your terminal only. `/review` discloses exactly one bounded diff to
+  the model and says so (`~ disclosing N bytes of host-verified evidence …; no
+  read root granted`) — a one-shot disclosure, not standing authority to read
+  anything else. `/permissions` shows the host-evidence root under
+  `host evidence`. This is deliberately different from `@file` attachments,
+  which *do* consume model read authority: an attachment can name any file, and
+  the grant is what bounds which files can be named, whereas evidence scope is
+  fixed by the repository Kitsu was launched in.
+- **`workspace_diff` — the model can request that disclosure itself.** When
+  chat starts inside a Git worktree, the model gets a `workspace_diff` tool so
+  "explain my uncommitted changes" works in every chat mode without pasting a
+  diff or granting a read root. Each call is the same bounded, host-gathered,
+  Kitsu-private-excluding evidence as `/diff` for that scope
+  (working/staged/unstaged/base/commit), surfaced as a normal tool receipt and
+  announced with the same `~ disclosing N bytes …; no read root granted` line
+  (a `workspace_evidence_disclosure` event in `--jsonl`). It is never a
+  filesystem read: no read root is consulted, created, or widened. Opt out
+  with `--no-workspace-evidence` or `workspace_evidence = false` in the
+  config; the tool is then not registered at all. Design:
+  [docs/workspace-diff-tool.md](docs/workspace-diff-tool.md).
 - **In-session grants:** `/allow <path>`, `/allow-write <path>`, and
   `/allow-read-write <path>`. `/revoke-read <exact-root>` and
   `/revoke-write <exact-root>` remove a displayed root for the current session;
@@ -578,8 +630,24 @@ it won't ask again.
   process must also pass a fingerprinted Bubblewrap preflight: approved command
   roots are writable mounts, required runtime paths are read-only, network/PID/
   IPC/UTS namespaces are isolated, capabilities are dropped, and the child gets
-  a fixed non-secret environment. Missing, changed, or unsupported containment
+  a fixed non-secret environment (`PATH`, `HOME`, `LANG`, `LC_ALL`, `TERM`,
+  `TMPDIR`, `USER`, `LOGNAME`), optionally extended with explicit
+  `--command-env` pass-through variables — never anything else inherited from
+  the host. Missing, changed, or unsupported containment
   fails before prompting or launching; exact approval never substitutes for it.
+  **Known limitation — pip/npm user-level installs:** the host home directory is
+  never mounted inside containment (`HOME` points at an empty tmpfs), so
+  toolchains installed per-user (e.g. `pip install --user pytest` under
+  `~/.local`) are invisible even when the identical command passes on the host,
+  and typically fail with `No module named ...` / `command not found`. Kitsu
+  deliberately does not auto-mount `~/.local`: it can hold sensitive
+  user-service data (e.g. `~/.local/share/keyrings`), and silently widening the
+  sandbox would break the deny-by-default posture. When a contained command
+  fails in that shape, the receipt and the model-visible result carry a
+  host-authored hint naming the remedies; the recipe is explicit opt-in:
+  `--command-root ~/.local` (makes the tree visible at its real path) plus
+  `--command-env PYTHONPATH=$HOME/.local/lib/pythonX.Y/site-packages` (or
+  `NODE_PATH`/`PATH` equivalents) so the interpreter can find it.
   `/permissions` numbers exact argv/cwd grants with invocation/runtime
   provenance; `/revoke-command <number>` removes one for the current session.
   A session grant is bound to the observed executable identity and is revoked
@@ -607,8 +675,8 @@ Slash commands inside the REPL:
 | `/models [filter]` | List the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. Great for exploring a big catalog like Hugging Face; the listed IDs are what you pass to `/model`. |
 | `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
 | `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
-| `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. |
-| `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. The top-level `kitsu review` provides the noninteractive form. |
+| `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. Host-owned: needs no read grant, and the bytes never leave your terminal. |
+| `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. Discloses one bounded diff to the model without granting a read root. The top-level `kitsu review` provides the noninteractive form. |
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
 | `/permissions` | Show effective filesystem authority with invocation/session provenance, revoked invocation roots, protected/internal reads, protected writes, and the command non-sandbox warning. |
 | `/tools` | Show enabled tools and the effective permission behavior. |
@@ -623,15 +691,15 @@ Slash commands inside the REPL:
 | `/save <file>` | Write the last response to `<file>` — just the fenced code blocks if present, else the whole message. |
 | `/context [refresh]` | Show detailed context provenance, or refresh unpinned model metadata without discarding the current known window on failure. |
 | `/compact` | Compact eligible older exchanges now and report the actual method and savings. |
-| `/profiles` | List validated background-agent profiles. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker. |
+| `/profiles` | List validated background-agent profiles with their instructions, requested reasoning effort, tool grant, and session-grant inheritance. Built-ins are a read-only `reviewer` and tool-free `reasoning` worker; both inherit the invocation's reasoning-effort policy rather than requesting one, so they never add a request field a gateway may reject. |
 | `/agent [list\|show ID\|steer ID TEXT\|stop ID\|close ID]` | Inspect one bounded, redacted agent timeline; steer or stop that thread; acknowledge and close retained results. |
-| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. `/agents [id]` remains an alias. |
-| `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. |
-| `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. |
+| `/jobs [list\|show ID\|steer ID TEXT\|close-steering ID\|stop ID\|stop-all\|prune ID\|prune all]` | Inspect bounded job/thread state, targeted steering, model/usage/tool/write activity, terminal handoff, joined cancellation, and pruning. Steering **restarts** the worker with the correction on a fresh transcript — the receipt reports the elapsed work that discards; completed file changes are kept. `/agents [id]` remains an alias. |
+| `/artifacts [list\|prune ID\|prune all]` | Inspect aggregate command-artifact quota/usage and explicitly prune retained evidence. Also reports what earlier runs left on disk; reclaim that with the host-only `kitsu artifacts`. |
+| `/queue [list\|add\|remove\|edit\|move\|promote\|clear]` | Inspect and edit the bounded eight-prompt FIFO; `/queue <prompt>` remains shorthand for add. A single word one edit away from a subaction (e.g. `/queue lst`) gets a close-match suggestion instead of being silently queued; `/queue add <word>` queues it verbatim. |
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |
-| `/sessions` | List saved sessions. |
+| `/sessions [filter]` | List saved sessions, optionally filtered by a case-insensitive substring over id and preview. |
 | `/resume <id\|last>` | Resume a saved session without restoring its old permissions. |
 | `/fork [id]` | Clone a saved session to a fresh ID, then switch with fresh runtime permissions. |
 | `/export <file> [markdown\|json]` | Export the active session without overwriting. If it has artifacts, also create `<file>.artifacts` and rewrite exact pointers to that sidecar. |
@@ -641,7 +709,7 @@ Slash commands inside the REPL:
 | `/undo [id]` | Restore the latest or selected model-write checkpoint only when its files still match. |
 | `/clear` | Clear the conversation (keeps the system prompt). |
 | `/help` | Show help. |
-| `/quit [wait\|cancel]` (or `/exit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
+| `/exit [wait\|cancel]` (or `/quit`) | Exit only when jobs are done, explicitly wait, or immediately cancel the foreground plus queued/background work and join it first. |
 
 ### Coding workflows: paste & file generation
 
@@ -675,8 +743,12 @@ kitsu --gateway ollama chat --allow-write ./out --script gen.txt
 
 Script failures include the file and line, roll the failed conversation turn
 back, and return exit `1` (command/input/auth setup, tool failure, or local
-policy denial) or `2` (provider, truncation, or exhausted rounds). Use
-`--allow-turn-errors` only when partial success is intentional.
+policy denial) or `2` (provider, truncation, or exhausted rounds). A tool error
+the model recovers from within the same turn (for example an edit-precondition
+conflict followed by a corrected, successful edit) does not fail the turn: the
+turn is judged by its final tool round, and only policy denials always fail.
+Use `--allow-turn-errors` only when partial success is intentional; it accepts
+partial success, so a script where everything failed still exits nonzero.
 
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
@@ -685,7 +757,11 @@ to determine the outcome. Provider streaming remains enabled unless
 `--no-stream` is set; text arrives in ordered, JSON-escaped `assistant_delta`
 records whose concatenation matches the final assistant event. Treat it as
 provisional until `assistant_disposition` says `committed`; strict rollback
-closes it as `discarded`. `run_started` distinguishes disabled, pending, and
+closes it as `discarded`, and a deadline that expires mid-answer in a one-shot
+run closes it as `committed_partial` (kept, marked, still exit `2`). A
+`context_window_mismatch` event reports runtime evidence that the server's
+real context window is smaller than the resolved one. `run_started`
+distinguishes disabled, pending, and
 resumable session snapshots. Status, permissions, context, diff, model,
 reasoning, compaction, session/checkpoint inventory, skills, profiles, command
 artifacts, help/tools, and job/thread slash commands emit typed
@@ -693,7 +769,12 @@ artifacts, help/tools, and job/thread slash commands emit typed
 
 `Ctrl+C` cancels an in-flight response and makes it available to `/retry`; at an
 idle prompt it clears input. Automation emits a structured cancelled event and
-exits `130`. `Ctrl+D` or `/quit` does not silently discard live background agents.
+exits `130`. `Ctrl+D` or `/exit` does not silently discard live background agents,
+and neither does the end of a `--script` or piped run: it joins them the way
+`/exit wait` does, bounded by `--agent-join-timeout` (default `--timeout-secs`).
+Only agents still running when that bound expires are cancelled, and they are
+reported as cancelled by shutdown policy — never as casualties of a rolled-back
+turn.
 Completed filesystem side effects are never pretended away after cancellation—
 inspect them with `/diff` or restore a safe checkpoint with `/undo`. Interactive
 type-ahead collection is Unix-only: complete lines entered during generation are
@@ -845,7 +926,9 @@ always: false
   `--allow-turn-errors`), `1` CLI/input/config/missing-auth or other user-policy
   failure (including local tool failures and policy denials), `2`
   provider/HTTP/timeout or strict incomplete turn (length limit or exhausted
-  rounds), and `130` Ctrl+C cancellation.
+  rounds), and `130` Ctrl+C cancellation. A consumer that closes kitsu's stdout
+  early (`kitsu sessions | head -1`) is not a failure: kitsu stops quietly and
+  exits `0` instead of unwinding with the Rust panic code `101`.
 - **Platform hardening:** Unix uses descriptor-bound command working directories,
   process-group cancellation, and descriptor-relative no-follow file/session
   operations. Portable branches retain validation and direct-child cancellation,

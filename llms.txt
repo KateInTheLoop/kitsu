@@ -6,10 +6,10 @@
 
 Kitsu is a Cargo workspace of five crates:
 
-- `kitsu` — `init`, `doctor`, `ask`, verified `review`, `models`, `sessions`, and
-  `chat`; slash commands; JSONL automation; `@file`; editable queues/steering;
-  project context; bounded background-agent threads/profiles; reasoning control;
-  and aggregate command-artifact lifecycle management.
+- `kitsu` — `init`, `doctor`, `ask`, verified `review`, `models`, `sessions`,
+  `artifacts`, and `chat`; slash commands; JSONL automation; `@file`; editable
+  queues/steering; project context; bounded background-agent threads/profiles;
+  reasoning control; and aggregate command-artifact lifecycle management.
 - `kitsu-core` — the provider/tool agent loop, checked context preflight,
   offload/trim/summarize cascade, manual compaction, and compaction telemetry.
 - `kitsu-providers` — provider traits and the shared OpenAI-compatible client,
@@ -38,12 +38,14 @@ only when the complete rendered file fits within one quarter of that window.
 
 ## Optional
 
-- [Cycle-2 UX audit](docs/chat-ux-cycle-2.md): reviewer findings, implemented
-  outcomes, verification gates, and platform residuals.
-- [Cycle-3 UX audit](docs/chat-ux-cycle-3.md): ten-agent dogfood findings and
-  the accepted improvement scope.
+- [UX design](docs/ux-design.md): palette, glyphs, and degradation-tier
+  contract for every rendered surface.
+- [JSONL protocol](docs/jsonl-protocol.md): the `kitsu.chat.v1` automation
+  event contract.
+- [Cycle-6 UX audit](docs/chat-ux-cycle-6.md) and
+  [Cycle-7 UX audit](docs/chat-ux-cycle-7.md): most recent dogfood findings
+  and implemented outcomes (agent-deck correctness, artifact GC, host-owned
+  evidence).
 - [UI guidelines](docs/ui_guidelines.md): terminal UX conventions.
-- [Development stages](docs/context-management-stages.md): historical staged
-  context-management plan.
 - [Codex comparison](docs/claude-code-comparison.md): historical product
   comparison and roadmap notes.

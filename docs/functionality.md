@@ -1,6 +1,6 @@
 # Kitsu — supported functionality
 
-> Status: 2026-08-10. This is a source- and test-backed description of the
+> Status: 2026-08-11. This is a source- and test-backed description of the
 > current CLI. Hosted-provider availability, credentials, billing, and the
 > quality of a particular model remain external to this contract.
 
@@ -15,6 +15,7 @@ top-level entry points are:
 | `kitsu review [path]` | One tool-free turn over host-verified working/staged/unstaged/base/commit evidence, with optional JSONL and session continuity. |
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
 | `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`. |
+| `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and
@@ -115,6 +116,16 @@ stdin.
 - `/diff` derives bounded working/staged/unstaged+untracked/base/commit/checkpoint
   evidence from Git, the journal, and filesystem. `/review` submits exactly that
   evidence in a no-tools turn. `kitsu review` is the one-shot automation surface.
+  All three are **host-owned**: the evidence is produced by Kitsu's own `git`,
+  not by a model tool, so they require no filesystem grant and never create one.
+  Scope is fixed by the repository root of the launch directory and a path
+  argument can only narrow it; a workspace inside Kitsu-private state is refused
+  outright. `/diff` renders to the terminal only; `/review` and `kitsu review`
+  perform one bounded disclosure of that diff to the provider and say so
+  (`~ disclosing N bytes …; no read root granted`). `/permissions` reports the
+  evidence root, its private exclusions, and that it is not a model read root.
+  This differs from `@file` attachments, which do consume model read authority
+  because their scope is user-nameable.
 
 Developer commands are an independent, explicit capability. `--enable-commands`
 registers `command_exec`; roots come from `--command-root` or the launch
@@ -125,7 +136,13 @@ full-output artifact. The completed serialized artifact is capped at 16 MiB,
 including JSONL framing and hex expansion; it reports separately how many raw
 stdout/stderr bytes were retained, marks truncation, and keeps draining both
 child pipes. Interactive invocations have their own approval
-prompt; automation must use exact `--allow-command` grants. `--yes` and
+prompt; automation must use exact `--allow-command` grants, either as a JSON
+argv array bound to the launch directory or as
+`{"argv":[…],"cwd":"/abs/dir"}` bound to an explicit directory inside a command
+root. Both forms are exact argv **and** exact cwd, are validated at startup
+(failing closed with the object syntax named when the launch directory is
+outside the roots), and are re-applied to their own recorded cwd across `/new`
+and `/resume`. `--yes` and
 filesystem grants do not approve commands. Exact approval is followed by a
 mandatory Linux Bubblewrap boundary: approved command roots are writable,
 required runtime paths are read-only, network/PID/IPC/UTS namespaces and the
@@ -133,7 +150,19 @@ environment are isolated, and capabilities are dropped. Backend absence,
 replacement, or unsupported platforms fail closed before a prompt or child
 launch.
 Session grants also bind the executable observed at approval time; replacement
-or changed `PATH` resolution invalidates the grant before execution.
+or changed `PATH` resolution invalidates the grant before execution. The
+approved executable's own directory is a second, independent containment root
+requirement on top of the cwd root; a denial for a toolchain outside every
+`--command-root` names the exact missing directory and the flag to add.
+Contained commands receive a fixed non-secret environment (`PATH`, `HOME`,
+`LANG`, `LC_ALL`, `TERM`, `TMPDIR`, `USER`, `LOGNAME`); `--command-env
+NAME[=VALUE]` opts one variable at a time into that set (bare `NAME` reads
+kitsu's own environment and is refused for secret-shaped names; `NAME=value`
+always allows an explicit literal), which is what makes interpreter-based
+toolchains (pytest, npm test, ...) with an env-driven module search path work
+under mandatory containment. Every exact `--allow-command` pregrant is also
+named verbatim (argv and cwd) in the system prompt sent to the model, so it
+can call one directly instead of guessing an invocation.
 Windows command execution currently fails closed before approval because Kitsu
 does not yet have equivalent containment, loader-extension resolution, and
 executable-image validation; it never substitutes a pathname-only fingerprint.
@@ -183,10 +212,19 @@ commands: those remain in a unique protected runtime-state directory so a
 one-shot command never reports a dead recovery path.
 
 Scripted and piped chat are stateless by default. `--session` explicitly
-creates a durable conversation, and `--resume [id|last]` resumes and autosaves
-in interactive, scripted, or piped modes. Each successful automation turn is
+creates a durable conversation, and `--resume [id|name|last|auto]` resumes and
+autosaves in interactive, scripted, or piped modes — `auto` picks the newest
+session recorded in the current working directory. Sessions can carry a
+human-memorable name: `--name <name>` names (or renames) the live durable
+session, `kitsu sessions rename <id|name> [name]` names, renames, or clears
+one at rest, and names resolve anywhere a resume selector is accepted. Names
+are 1-40 characters of letters, digits, `-` or `_`; `last`, `auto`, and
+id-shaped (`s-…`) values are reserved, and duplicates are refused so a name
+never becomes ambiguous. Each successful automation turn is
 saved before the next one; a save failure makes the automation command fail.
-`--no-session` conflicts with both continuity forms. Resume/new-session
+`--resume` already implies `--session`, so passing both explicitly is a
+harmless no-op confirmation rather than an error; `--no-session` conflicts
+with both continuity forms. Resume/new-session
 boundaries drop runtime grants and restore current invocation roots; no saved
 session can restore authority.
 A newly requested durable session is not published until its first successful
@@ -197,8 +235,9 @@ exact ID.
 
 The top-level lifecycle/inventory commands operate without constructing a
 provider or parsing the selected config. The resolved config path chooses the
-state namespace. `list` (also the default), `show`, `fork`, `export`,
-`archive`, `restore`, and `delete` support scripting through `--json`.
+state namespace. `list` (also the default), `show`, `rename`, `fork`,
+`export`, `archive`, `restore`, and `delete` support scripting through
+`--json`.
 `sessions resume` launches normal provider-backed chat on a TTY; outside a TTY
 or with `--json` it resolves the session and returns exact argv without making
 a network call. A missing namespace lists as an empty collection rather than an
@@ -219,6 +258,17 @@ error.
   ID and permanently removes its validated snapshot/artifacts.
 - Leases prevent concurrent activation or lifecycle mutation of the same saved
   session. Lifecycle commands reject symlinked or irregular private entries.
+
+Command-artifact generations survive process exit by design, so they accumulate
+across runs. `kitsu artifacts` lists and prunes them without a provider and
+outside any chat: no model authority is involved and none is created. Removal
+requires an exact `runtime-<pid>-<nanos>-<gen>` or `<session-id>.artifacts`
+name, a real directory rather than a symlink, and proof of non-liveness through
+an advisory lock the kernel releases on process death — pids are reused, so they
+are never trusted. Chat startup sweeps only provably empty orphans (including
+sidecars whose session never committed a snapshot) and otherwise prints a
+threshold notice rather than deleting anything. In-session `/artifacts` reports
+what other runs left on disk alongside this session's own usage.
 
 ## Context management
 
