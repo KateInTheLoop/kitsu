@@ -171,7 +171,10 @@ run-level error and a nonzero exit.
 Its counters distinguish provider/incomplete-model failures, ordinary tool
 failures, local policy denials, user/command failures, and cancellations.
 Local tool and policy failures exit 1; provider or incomplete-model failures
-exit 2.
+exit 2. `final_summary.session_id` carries the run's durable session id (or
+`null` when nothing was persisted), so a consumer can learn where the
+conversation went from the one frame it already parses instead of scraping
+`run_started`.
 
 Events associated with a turn carry `turn_id`. Provider and tool runtime events
 also carry the one-based agent `round`. Provider operations initiated by a
