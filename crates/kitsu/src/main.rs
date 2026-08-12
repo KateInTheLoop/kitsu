@@ -7848,6 +7848,9 @@ fn note_rollback_retained_changes(
 
 #[derive(Default)]
 struct ScriptRunStatus {
+    /// Successful file reads across the run (mirrored from
+    /// `AgentSessionState.run_reads` for the end-of-run receipt).
+    file_reads: u64,
     /// Turns and commands that completed successfully. `--allow-turn-errors`
     /// accepts PARTIAL success; a run where nothing succeeded stays an error.
     successes: usize,
@@ -7892,6 +7895,7 @@ fn emit_run_receipt(
     session_id: Option<&str>,
     turns_ok: usize,
     turns_failed: usize,
+    file_reads: u64,
 ) {
     let checkpoints = journal.checkpoint_summaries();
     let files: std::collections::BTreeSet<&std::path::PathBuf> = checkpoints
@@ -7920,8 +7924,11 @@ fn emit_run_receipt(
             agents.push_str(&format!(" ({} cancelled)", progress.cancelled));
         }
     }
+    // Reads render unconditionally: "1 file written, 0 files read" is the
+    // visible signature of a model summarizing sources it never opened
+    // (cycle-16 M1).
     eprintln!(
-        "~ run summary: {turns}, {} file(s) written ({} change(s)){agents}, session {}",
+        "~ run summary: {turns}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}, session {}",
         files.len(),
         changes,
         session_id.unwrap_or("not saved"),
@@ -8030,6 +8037,7 @@ async fn finalize_scripted_run(
             session_id.as_deref(),
             status.successes,
             status.failures,
+            status.file_reads,
         );
     }
     // Cycle-10 G1: retained-on-disk effects of rolled-back turns are part of
@@ -8605,6 +8613,9 @@ async fn run_scripted_body(
             &format!("{path}:{line_number}"),
         )
         .await;
+        // Mirror after every turn (not just at the end) so cancelled or
+        // failing scripts still report the reads that actually happened.
+        status.file_reads = state.run_reads;
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
@@ -8618,6 +8629,7 @@ async fn run_scripted_body(
             }
         }
     }
+    status.file_reads = state.run_reads;
     Ok(())
 }
 
@@ -10566,6 +10578,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         session.session_id.borrow().as_deref(),
                         1,
                         0,
+                        session_state.run_reads,
                     );
                 }
                 if cli.jsonl {

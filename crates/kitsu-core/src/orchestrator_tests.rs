@@ -1243,6 +1243,7 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "spawn_agent_bg",
+            "{}",
             "Started background agent #1. It runs detached.",
             false
         ),
@@ -1250,12 +1251,18 @@ fn tool_activity_formatting() {
     );
 
     assert_eq!(
-        format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
+        format_tool_result(
+            "fs_write_file",
+            "{}",
+            r#"{"written":"x","bytes":42}"#,
+            false
+        ),
         "written · 42 bytes"
     );
     assert_eq!(
         format_tool_result(
             "fs_write_file",
+            "{}",
             r#"{"written":"x","bytes":42,"change":"unchanged"}"#,
             false
         ),
@@ -1266,6 +1273,7 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "fs_write_file",
+            "{}",
             r#"{"written":"x","bytes":42,"change":"created","warning":"looks corrupted"}"#,
             false
         ),
@@ -1278,23 +1286,48 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "fs_edit_file",
+            "{}",
             r#"{"edited":"x","bytes":10,"change":"updated"}"#,
             false
         ),
         "updated · 10 bytes"
     );
     assert_eq!(
-        format_tool_result("repo_grep", "l1\nl2\nl3", false),
+        format_tool_result("repo_grep", "{}", "l1\nl2\nl3", false),
         "3 matches"
     );
     assert_eq!(
-        format_tool_result("repo_grep", "(no matches)", false),
+        format_tool_result("repo_grep", "{}", "(no matches)", false),
         "no matches"
     );
-    assert_eq!(format_tool_result("fs_read_file", "a\nb", false), "2 lines");
+    assert_eq!(
+        format_tool_result("fs_read_file", "{}", "a\nb", false),
+        "2 lines"
+    );
+    // A ranged read discloses its slice (cycle-16: silent 4-line reads of a
+    // 1905-line file were invisible starvation).
     assert_eq!(
         format_tool_result(
             "fs_read_file",
+            r#"{"path":"x.rs","start_line":1,"end_line":4}"#,
+            "a\nb\nc\nd",
+            false
+        ),
+        "4 lines (ranged read 1-4)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_read_file",
+            r#"{"path":"x.rs","start_line":100}"#,
+            "a\nb",
+            false
+        ),
+        "2 lines (ranged read 100-end)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_read_file",
+            "{}",
             r#"{"error":"PolicyDenied","detail":"nope"}"#,
             true
         ),
@@ -1341,7 +1374,8 @@ fn tool_activity_formatting() {
             "artifact": {"reference": "session:command-1"},
             "artifact_error": null
     });
-    let command_result = format_tool_result("command_exec", &command_output.to_string(), false);
+    let command_result =
+        format_tool_result("command_exec", "{}", &command_output.to_string(), false);
     assert!(command_result.contains("exit 7 | 42 ms"));
     assert!(command_result.contains("stdout 4/9 B truncated"));
     assert!(command_result.contains("89"));
@@ -1356,6 +1390,7 @@ fn tool_activity_formatting() {
         serde_json::json!("no full-output artifact was created; no cleanup was required");
     let cancelled_result = format_tool_result(
         "command_exec",
+        "{}",
         &cancelled_without_artifact.to_string(),
         false,
     );
@@ -1367,7 +1402,7 @@ fn tool_activity_formatting() {
     signaled["exit_code"] = serde_json::Value::Null;
     signaled["signal"] = serde_json::json!(15);
     assert!(
-        format_tool_result("command_exec", &signaled.to_string(), false)
+        format_tool_result("command_exec", "{}", &signaled.to_string(), false)
             .starts_with("signal 15 | 42 ms")
     );
 
@@ -1376,7 +1411,7 @@ fn tool_activity_formatting() {
     timed_out["exit_code"] = serde_json::Value::Null;
     timed_out["signal"] = serde_json::json!(9);
     assert!(
-        format_tool_result("command_exec", &timed_out.to_string(), false)
+        format_tool_result("command_exec", "{}", &timed_out.to_string(), false)
             .starts_with("timeout (signal 9) | 42 ms")
     );
 
@@ -1394,6 +1429,7 @@ fn tool_activity_formatting() {
 
     let sanitized_warning = format_tool_result(
         "fs_write_file",
+        "{}",
         r#"{"bytes":1,"warning":"raw <|im_start|> marker"}"#,
         false,
     );
@@ -1450,7 +1486,7 @@ fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
         "artifact_error": null,
         "containment_hint": "output matches 'No module named' — try --command-env / --command-root"
     });
-    let receipt = format_tool_result("command_exec", &output.to_string(), false);
+    let receipt = format_tool_result("command_exec", "{}", &output.to_string(), false);
     assert!(
         receipt.contains(&format!("full output={long_reference:?}")),
         "artifact path must appear complete and unelided: {receipt}"

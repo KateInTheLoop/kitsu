@@ -761,6 +761,10 @@ pub struct AgentSessionState {
     /// backend telemetry, not conversation state: callers that roll a failed
     /// turn back should preserve it.
     pub window_evidence: Option<ContextWindowEvidence>,
+    /// Successful `fs_read_file` calls across the whole run. Rendered in the
+    /// end-of-run receipt so "wrote a summary of files it never opened"
+    /// (cycle-16 M1) is visible at a glance.
+    pub run_reads: u64,
 }
 
 /// Evidence, gathered from a provider `usage` report, that the server accepted
@@ -946,6 +950,7 @@ where
         compaction_ledger,
         last_turn: turn_status,
         window_evidence,
+        run_reads,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
@@ -1358,7 +1363,11 @@ where
             // AFTER the decision so the receipt can disclose the swap — a
             // `◇ 1828 lines` line over a 500-char preview is a lie the user
             // has no way to detect (cycle-15 headline).
-            let summary = (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &content, is_err));
+            let summary =
+                (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &tc.args, &content, is_err));
+            if !is_err && tc.tool_name == "fs_read_file" {
+                *run_reads += 1;
+            }
             tool_event.finish(!is_err, &content);
             abort_if_event_sink_failed(cfg)?;
             // Offload a large successful result to disk (only under real
@@ -1745,7 +1754,7 @@ fn format_tool_header(name: &str, args: &str) -> String {
 
 /// Result summary shown under a tool call — bytes for writes, matches for grep,
 /// lines otherwise; the error kind on failure.
-fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
+fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> String {
     if is_err {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
             if let Some(kind) = v.get("error").and_then(|x| x.as_str()) {
@@ -1808,6 +1817,28 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
         "fs_list_dir" => {
             let n = content.lines().count();
             format!("{n} entr{}", if n == 1 { "y" } else { "ies" })
+        }
+        // A ranged read must SAY it was ranged (cycle-16 audit: a model
+        // reading lines 1-4 of a 1905-line file under a small window is
+        // silent starvation unless the receipt discloses the slice).
+        "fs_read_file" => {
+            let n = content.lines().count();
+            let range = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|value| {
+                    let start = value.get("start_line").and_then(|v| v.as_u64());
+                    let end = value.get("end_line").and_then(|v| v.as_u64());
+                    match (start, end) {
+                        (None, None) => None,
+                        (start, end) => Some(format!(
+                            " (ranged read {}-{})",
+                            start.map_or("start".to_string(), |v| v.to_string()),
+                            end.map_or("end".to_string(), |v| v.to_string()),
+                        )),
+                    }
+                })
+                .unwrap_or_default();
+            format!("{n} line{}{range}", if n == 1 { "" } else { "s" })
         }
         _ => {
             let n = content.lines().count();
