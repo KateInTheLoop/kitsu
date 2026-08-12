@@ -3381,6 +3381,12 @@ fn test_context_window_shortfall_heuristic() {
     // Non-power-of-two clamps still trigger on a wide margin.
     assert!(!context_window_shortfall(3900, 4100, 8192));
     assert!(context_window_shortfall(3000, 5000, 8192));
+    // Cycle-14 HF false positive: an exact hosted tokenizer far under a big
+    // resolved window is estimator overshoot, not a clamp — stay quiet.
+    assert!(!context_window_shortfall(1007, 2178, 131_072));
+    assert!(!context_window_shortfall(1007, 2178, 32_768));
+    // …but a power-of-two clamp stays detectable even under a big window.
+    assert!(context_window_shortfall(4096, 9000, 131_072));
 }
 
 /// A usage report far below the sent estimate records durable window evidence

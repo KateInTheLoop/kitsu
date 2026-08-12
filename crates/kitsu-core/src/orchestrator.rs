@@ -790,7 +790,14 @@ fn context_window_shortfall(reported: u64, estimated_sent: u64, window: u64) -> 
     let shortfall = estimated_sent - reported;
     let wide_margin = shortfall >= (estimated_sent / 8).max(256);
     let clamped_boundary = reported.is_power_of_two() && reported >= 2048;
-    wide_margin || clamped_boundary
+    // A clamp hypothesis claims the server's real window IS `reported`. When
+    // that implied window is under a quarter of the resolved one and sits on
+    // no clamp-shaped boundary, the far likelier story is the chars/4
+    // estimator overshooting an accurate tokenizer (hosted routers report
+    // exact counts) — cycle-14's HF audit saw this warning on nearly every
+    // turn. Stay quiet rather than crying wolf.
+    let plausible_clamp = reported.saturating_mul(4) >= window;
+    clamped_boundary || (wide_margin && plausible_clamp)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
