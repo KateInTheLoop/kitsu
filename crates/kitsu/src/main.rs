@@ -2425,6 +2425,7 @@ fn build_agent_config(
         quiet: cli.jsonl,
         event_log: None,
         skill_names: Vec::new(),
+        read_counter: None,
         spawn_budget: None,
     }
 }
@@ -3154,6 +3155,8 @@ struct SessionInfo {
     session_id: Rc<RefCell<Option<String>>>,
     /// Per-turn subagent spawn budget shared with the spawn tools (G3).
     spawn_budget: Arc<kitsu_core::SpawnBudget>,
+    /// Run-wide shared read counter (parent + subagents) for receipts.
+    read_counter: Arc<std::sync::atomic::AtomicU64>,
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
@@ -8253,6 +8256,7 @@ async fn run_scripted_body(
                 context_window,
                 &session.reasoning_effort,
                 &session.spawn_budget,
+                &session.read_counter,
                 &scripted_skill_names,
                 registry,
                 &format!("{path}:{line_number}"),
@@ -8457,6 +8461,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &session.read_counter,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8510,6 +8515,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &session.read_counter,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8608,14 +8614,16 @@ async fn run_scripted_body(
             context_window,
             &session.reasoning_effort,
             &session.spawn_budget,
+            &session.read_counter,
             &scripted_skill_names,
             registry,
             &format!("{path}:{line_number}"),
         )
         .await;
         // Mirror after every turn (not just at the end) so cancelled or
-        // failing scripts still report the reads that actually happened.
-        status.file_reads = state.run_reads;
+        // failing scripts still report the reads that actually happened —
+        // from the SHARED counter, so delegated subagent reads count too.
+        status.file_reads = session.read_counter.load(Ordering::Acquire);
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
@@ -8629,7 +8637,7 @@ async fn run_scripted_body(
             }
         }
     }
-    status.file_reads = state.run_reads;
+    status.file_reads = session.read_counter.load(Ordering::Acquire);
     Ok(())
 }
 
@@ -8651,6 +8659,7 @@ async fn run_scripted_turn(
     context_window: &Rc<Cell<Option<u64>>>,
     reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     spawn_budget: &Arc<kitsu_core::SpawnBudget>,
+    read_counter: &Arc<std::sync::atomic::AtomicU64>,
     skill_names: &[String],
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
@@ -8735,6 +8744,7 @@ async fn run_scripted_turn(
     );
     cfg.reasoning_effort = reasoning_effort.get();
     cfg.spawn_budget = Some(spawn_budget.clone());
+    cfg.read_counter = Some(read_counter.clone());
     cfg.skill_names = skill_names.to_vec();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
@@ -9738,6 +9748,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             SPAWN_CAP_SCRIPTED_DEFAULT
         });
     let spawn_budget = Arc::new(kitsu_core::SpawnBudget::new(spawn_cap));
+    // One run-wide read counter shared by the main conversation and every
+    // spawned subagent, so the receipt's "N file(s) read" includes delegated
+    // reads (cycle-17 gap #1).
+    let run_read_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
 
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
@@ -9754,6 +9768,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
     sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
+    sub_cfg.read_counter = Some(run_read_counter.clone());
     let sub_system = if skillset.is_empty() {
         String::new()
     } else {
@@ -9880,6 +9895,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
         let spawn_budget = spawn_budget.clone();
+        let run_read_counter = run_read_counter.clone();
         let skill_names: Vec<String> = skillset.names().into_iter().map(str::to_string).collect();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
@@ -9892,6 +9908,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             );
             config.reasoning_effort = reasoning_effort.get();
             config.skill_names = skill_names.clone();
+            config.read_counter = Some(run_read_counter.clone());
             // Main-conversation turns carry the spawn budget so the
             // orchestrator resets it at each turn start (subagent configs
             // stay `None`).
@@ -10097,6 +10114,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         offload_dir: offload_state.clone(),
         session_id,
         spawn_budget: spawn_budget.clone(),
+        read_counter: run_read_counter.clone(),
         tool_names: tool_names.clone(),
         command_roots: command_policy
             .as_ref()
@@ -10578,7 +10596,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         session.session_id.borrow().as_deref(),
                         1,
                         0,
-                        session_state.run_reads,
+                        session.read_counter.load(Ordering::Acquire),
                     );
                 }
                 if cli.jsonl {
