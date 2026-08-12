@@ -1020,7 +1020,12 @@ impl CommandContainmentBackend for BubblewrapBackend {
         {
             use std::os::fd::AsRawFd;
 
-            let mut arguments = base_bubblewrap_arguments(&[], &policy.passthrough_environment);
+            // Runtime-root env first, then user pass-through: an explicit
+            // --command-env entry of the same name wins (last one merged).
+            let mut launch_environment =
+                runtime_root_environment(self.config.readonly_runtime_roots());
+            launch_environment.extend(policy.passthrough_environment.iter().cloned());
+            let mut arguments = base_bubblewrap_arguments(&[], &launch_environment);
             let mut inherited_paths = Vec::with_capacity(
                 ready
                     .readonly_runtime_roots
@@ -1195,6 +1200,44 @@ fn runtime_mount_paths(
         }
     }
     Ok(mounts)
+}
+
+/// Environment adjustments derived from configured read-only runtime roots.
+/// A toolchain mounted into the sandbox is useless if nothing points at it:
+/// each root's `bin/` directory joins the fixed containment PATH, and
+/// `.cargo` / `.rustup` roots name CARGO_HOME / RUSTUP_HOME so their
+/// launchers resolve without the (deliberately absent) real $HOME. Explicit
+/// `--command-env` pass-through entries still override these by name.
+fn runtime_root_environment(roots: &[PathBuf]) -> Vec<(String, String)> {
+    let mut environment = Vec::new();
+    let mut path_additions = Vec::new();
+    for root in roots {
+        let bin = root.join("bin");
+        if bin.is_dir() {
+            path_additions.push(bin.display().to_string());
+        }
+        match root.file_name().and_then(|name| name.to_str()) {
+            Some(".cargo") => {
+                environment.push(("CARGO_HOME".to_string(), root.display().to_string()));
+            }
+            Some(".rustup") => {
+                environment.push(("RUSTUP_HOME".to_string(), root.display().to_string()));
+            }
+            _ => {}
+        }
+    }
+    if !path_additions.is_empty() {
+        let base_path = COMMAND_CONTAINMENT_ENVIRONMENT
+            .iter()
+            .find(|(name, _)| *name == "PATH")
+            .map(|(_, value)| *value)
+            .unwrap_or_default();
+        environment.push((
+            "PATH".to_string(),
+            format!("{}:{base_path}", path_additions.join(":")),
+        ));
+    }
+    environment
 }
 
 #[cfg(target_os = "linux")]
@@ -3872,6 +3915,40 @@ mod tests {
                 "{name} should not look secret"
             );
         }
+    }
+
+    #[test]
+    fn runtime_root_environment_wires_toolchain_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let cargo = dir.path().join(".cargo");
+        std::fs::create_dir_all(cargo.join("bin")).unwrap();
+        let rustup = dir.path().join(".rustup");
+        std::fs::create_dir_all(&rustup).unwrap();
+
+        let environment = runtime_root_environment(&[cargo.clone(), rustup.clone()]);
+        let lookup = |name: &str| {
+            environment
+                .iter()
+                .find(|(entry, _)| entry == name)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(
+            lookup("CARGO_HOME"),
+            Some(cargo.display().to_string()).as_deref()
+        );
+        assert_eq!(
+            lookup("RUSTUP_HOME"),
+            Some(rustup.display().to_string()).as_deref()
+        );
+        let path = lookup("PATH").expect("cargo bin joins PATH");
+        assert!(
+            path.starts_with(&cargo.join("bin").display().to_string()),
+            "{path}"
+        );
+        assert!(path.contains("/usr/bin"), "base PATH retained: {path}");
+
+        // No roots, no adjustments — the fixed environment stands alone.
+        assert!(runtime_root_environment(&[]).is_empty());
     }
 
     #[test]

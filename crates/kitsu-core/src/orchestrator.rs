@@ -1153,14 +1153,21 @@ where
         // structured `tool_calls`. If tools were advertised this round and none
         // came back structured, try to parse one from the text and execute it.
         let mut synthesized_call = false;
+        let mut malformed_text_calls = 0usize;
         if tool_calls.is_empty() && tools_were_offered {
             let recovered = parse_text_tool_calls(&assistant_text, tools);
-            if !recovered.is_empty() {
+            if !recovered.calls.is_empty() {
                 tracing::debug!(
-                    count = recovered.len(),
+                    count = recovered.calls.len(),
                     "recovered text-protocol tool call(s)"
                 );
-                tool_calls.extend(recovered);
+                tool_calls.extend(recovered.calls);
+                synthesized_call = true;
+            } else if recovered.malformed > 0 {
+                // A tool attempt too broken to repair. Suppress the raw JSON
+                // (it is not an answer) and spend the round on corrective
+                // feedback instead of committing garbage as the result.
+                malformed_text_calls = recovered.malformed;
                 synthesized_call = true;
             }
         }
@@ -1201,6 +1208,27 @@ where
             assistant_content,
             tool_calls.clone(),
         ));
+
+        if tool_calls.is_empty() && malformed_text_calls > 0 {
+            // Cycle-12 audit: a malformed text-form tool attempt must neither
+            // masquerade as the committed answer nor vanish silently — the
+            // user sees an ignored-call receipt, the model gets told exactly
+            // how to re-issue, and the retry stays bounded by max_rounds.
+            turn_status.tool_errors += malformed_text_calls as u32;
+            if !cfg.quiet {
+                kitsu_render::tool_result_error(&format!(
+                    "ignored {malformed_text_calls} malformed text-form tool call(s) (unparseable JSON); asked the model to re-issue"
+                ));
+            }
+            messages.push(ChatMessage::user(
+                "Your last message contained a text-form tool call whose JSON could not be parsed \
+                 (for example an invalid escape sequence). It was NOT executed. Re-issue it as a \
+                 proper structured tool call, or as strictly valid JSON of the form \
+                 {\"name\": \"<tool_name>\", \"arguments\": { ... }} with no surrounding prose."
+                    .to_string(),
+            ));
+            continue;
+        }
 
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
@@ -1334,14 +1362,68 @@ fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescrip
 /// multiple files). Parse EVERY balanced JSON object from `text`; for each with a
 /// `name` matching an advertised tool plus `arguments`/`parameters`, synthesize a
 /// [`ToolCall`]. Returns them in order (empty if none parse/match).
-fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
+/// What scanning assistant text for text-protocol tool calls found.
+struct TextToolRecovery {
+    calls: Vec<ToolCall>,
+    /// Candidates that named a registered tool but stayed unparseable even
+    /// after escape repair. They were NOT executed; the caller owes the model
+    /// corrective feedback instead of printing the raw JSON as the answer.
+    malformed: usize,
+}
+
+/// Repair the common invalid-escape faults small models emit inside otherwise
+/// well-shaped tool-call JSON (`\'` in particular): inside string literals,
+/// a backslash before a character that is not a valid JSON escape is dropped,
+/// keeping the character. Everything else passes through untouched.
+fn relax_json_escapes(candidate: &str) -> String {
+    let mut out = String::with_capacity(candidate.len());
+    let mut chars = candidate.chars();
+    let mut in_string = false;
+    while let Some(c) = chars.next() {
+        if in_string && c == '\\' {
+            match chars.next() {
+                Some(next)
+                    if matches!(next, '"' | '\\' | '/' | 'b' | 'f' | 'n' | 'r' | 't' | 'u') =>
+                {
+                    out.push('\\');
+                    out.push(next);
+                }
+                Some(next) => out.push(next),
+                None => {}
+            }
+            continue;
+        }
+        if c == '"' {
+            in_string = !in_string;
+        }
+        out.push(c);
+    }
+    out
+}
+
+fn parse_text_tool_calls(text: &str, tools: &Registry) -> TextToolRecovery {
     let descriptors = tools.descriptors();
     let mut calls = Vec::new();
+    let mut malformed = 0usize;
     if descriptors.is_empty() {
-        return calls;
+        return TextToolRecovery { calls, malformed };
     }
     for candidate in extract_json_objects(text) {
-        let Ok(value) = serde_json::from_str::<serde_json::Value>(&candidate) else {
+        let parsed = serde_json::from_str::<serde_json::Value>(&candidate).or_else(|_| {
+            serde_json::from_str::<serde_json::Value>(&relax_json_escapes(&candidate))
+        });
+        let Ok(value) = parsed else {
+            // Narrow detection to keep false positives out: only an object
+            // that has a "name" key AND quotes a registered tool name counts
+            // as a failed tool attempt (arbitrary JSON in a real answer does
+            // not trip this).
+            if candidate.contains("\"name\"")
+                && descriptors
+                    .iter()
+                    .any(|d| candidate.contains(&format!("\"{}\"", d.name)))
+            {
+                malformed += 1;
+            }
             continue;
         };
         let Some(obj) = value.as_object() else {
@@ -1367,7 +1449,7 @@ fn parse_text_tool_calls(text: &str, tools: &Registry) -> Vec<ToolCall> {
             call_id,
         });
     }
-    calls
+    TextToolRecovery { calls, malformed }
 }
 
 /// Return every balanced top-level `{…}` JSON object substring in `text`,
