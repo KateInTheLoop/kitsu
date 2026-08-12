@@ -2424,6 +2424,7 @@ fn build_agent_config(
         compaction: compaction_mode(cli),
         quiet: cli.jsonl,
         event_log: None,
+        skill_names: Vec::new(),
         spawn_budget: None,
     }
 }
@@ -8180,6 +8181,8 @@ async fn run_scripted_body(
     // compaction circuit breaker persist across turns, matching interactive chat
     // (a script is a multi-turn session, not a series of independent one-shots).
     let mut state = kitsu_core::AgentSessionState::default();
+    let scripted_skill_names: Vec<String> =
+        skillset.names().into_iter().map(str::to_string).collect();
     let lines: Vec<&str> = content.lines().collect();
     let mut idx = 0;
     let mut last_failed: Option<SubmittedPrompt> = None;
@@ -8242,6 +8245,7 @@ async fn run_scripted_body(
                 context_window,
                 &session.reasoning_effort,
                 &session.spawn_budget,
+                &scripted_skill_names,
                 registry,
                 &format!("{path}:{line_number}"),
             )
@@ -8445,6 +8449,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -8497,6 +8502,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
                     )
@@ -8594,6 +8600,7 @@ async fn run_scripted_body(
             context_window,
             &session.reasoning_effort,
             &session.spawn_budget,
+            &scripted_skill_names,
             registry,
             &format!("{path}:{line_number}"),
         )
@@ -8632,6 +8639,7 @@ async fn run_scripted_turn(
     context_window: &Rc<Cell<Option<u64>>>,
     reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     spawn_budget: &Arc<kitsu_core::SpawnBudget>,
+    skill_names: &[String],
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
 ) -> Result<(), ScriptFailureKind> {
@@ -8715,6 +8723,7 @@ async fn run_scripted_turn(
     );
     cfg.reasoning_effort = reasoning_effort.get();
     cfg.spawn_budget = Some(spawn_budget.clone());
+    cfg.skill_names = skill_names.to_vec();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
     let outcome = journal
@@ -9732,6 +9741,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     );
     let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
+    sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
     let sub_system = if skillset.is_empty() {
         String::new()
     } else {
@@ -9858,6 +9868,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
         let spawn_budget = spawn_budget.clone();
+        let skill_names: Vec<String> = skillset.names().into_iter().map(str::to_string).collect();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
                 model,
@@ -9868,6 +9879,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     .flatten(),
             );
             config.reasoning_effort = reasoning_effort.get();
+            config.skill_names = skill_names.clone();
             // Main-conversation turns carry the spawn budget so the
             // orchestrator resets it at each turn start (subagent configs
             // stay `None`).
@@ -14475,6 +14487,27 @@ mod tests {
         assert!(!bad_model.contains("provider-body-secret"));
         assert!(!bad_model.contains('\n'));
         assert!(!bad_model.contains('\u{1b}'));
+    }
+
+    /// The shipped huggingface profile's hint must SURVIVE the credential
+    /// filter — cycle-14's HF audit found the previous wording self-suppressed
+    /// on every 401, leaving users with no guidance at all.
+    #[test]
+    fn shipped_huggingface_refresh_hint_survives_the_credential_filter() {
+        let template = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../kitsu.toml");
+        let config = config::Config::load(&template).expect("repo kitsu.toml parses");
+        let hint = config
+            .gateways
+            .get("huggingface")
+            .expect("huggingface profile exists")
+            .auth
+            .refresh_hint
+            .clone()
+            .expect("huggingface profile ships a refresh hint");
+        assert!(
+            safe_auth_refresh_hint(Some(&hint)).is_some(),
+            "template hint must not trip the credential filter: {hint}"
+        );
     }
 
     #[test]

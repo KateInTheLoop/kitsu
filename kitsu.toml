@@ -69,7 +69,10 @@ model       = "meta-llama/Llama-3.3-70B-Instruct"
 # 8192 fallback (which false-alarms the mismatch heuristic). Override per
 # model with --context-window.
 context_window = 131072
-auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a token at https://huggingface.co/settings/tokens and `export HF_TOKEN=hf_...`" }
+# Hint wording is deliberately filter-safe: kitsu suppresses any hint that
+# resembles a credential (URL schemes, `hf_`/`sk-` prefixes, bare `token`
+# labels), so this must describe the fix without quoting one.
+auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Inference Providers key under huggingface.co settings, then export HF_TOKEN" }
 
 # ── OpenAI (hosted) ──────────────────────────────────────────────────────────
 [gateways.openai]
