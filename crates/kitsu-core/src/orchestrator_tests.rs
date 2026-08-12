@@ -238,7 +238,21 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
         event_log: None,
+        skill_names: Vec::new(),
+        spawn_budget: None,
     }
+}
+
+#[test]
+fn spawn_budget_admits_saturates_and_resets() {
+    let budget = crate::orchestrator::SpawnBudget::new(3);
+    assert_eq!(budget.admit(2), 2);
+    assert_eq!(budget.admit(2), 1, "partial admission at the boundary");
+    assert_eq!(budget.admit(1), 0, "exhausted budget admits nothing");
+    assert_eq!(budget.used(), 3);
+    budget.reset();
+    assert_eq!(budget.used(), 0);
+    assert_eq!(budget.admit(1), 1, "a fresh turn has the whole cap again");
 }
 
 /// A handler that always returns a fixed JSON string.
@@ -975,6 +989,127 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     );
 }
 
+/// Invalid escapes inside string literals are dropped; valid ones survive.
+#[test]
+fn relax_json_escapes_repairs_only_invalid_escapes() {
+    assert_eq!(
+        super::relax_json_escapes(r#"{"a": "it\'s"}"#),
+        r#"{"a": "it's"}"#
+    );
+    assert_eq!(
+        super::relax_json_escapes(r#"{"a": "keep\n\t\"quoted\" \\ intact"}"#),
+        r#"{"a": "keep\n\t\"quoted\" \\ intact"}"#
+    );
+}
+
+/// A text-form call whose only fault is a non-standard escape (`\'`) is
+/// repaired and executed instead of being dumped as the answer.
+#[tokio::test]
+async fn test_text_protocol_repairs_invalid_escape() {
+    assert_text_protocol_executes(
+        r#"{"name": "fs_write_file", "arguments": {"path": "x.py", "content": "print(\'hi\')"}}"#,
+    )
+    .await;
+}
+
+/// A tool attempt too broken to repair (structurally invalid JSON naming a
+/// real tool) must not masquerade as the answer: the model gets corrective
+/// feedback, retries, and the real answer from the next round is returned.
+#[tokio::test]
+async fn test_text_protocol_malformed_call_feeds_back_instead_of_answering() {
+    let provider = MockProvider::new(vec![
+        vec![
+            // Balanced braces, names a registered tool, but missing a comma —
+            // unparseable even after escape repair.
+            ChatDelta::Text(r#"{"name": "fs_write_file" "arguments": {}}"#.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("recovered answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("the retry round should produce the committed answer");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0, "nothing was executed");
+    assert_eq!(provider.call_count(), 2, "feedback round then answer round");
+    assert!(out.contains("recovered answer"), "{out}");
+    assert!(
+        !out.contains("fs_write_file"),
+        "raw tool JSON must not be the answer: {out}"
+    );
+    assert_eq!(
+        state.last_turn.tool_errors, 1,
+        "the ignored attempt is accounted as a tool error"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::User && m.content.contains("NOT executed")
+        }),
+        "round 2 must carry the corrective feedback"
+    );
+}
+
+/// A skill invoked as a fake tool (`{"name": "code-review"}`) gets targeted
+/// corrective feedback instead of the raw JSON committing as the answer;
+/// arbitrary unknown names (no matching skill) keep the old return-as-text
+/// behavior, so real answers containing JSON stay untouched.
+#[tokio::test]
+async fn test_text_protocol_skill_confusion_feeds_back_instead_of_answering() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text(r#"{"name": "code-review", "arguments": {"path": "src"}}"#.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text("loaded properly".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let tools = writing_registry(ran.clone());
+    let mut config = cfg(10);
+    config.skill_names = vec!["code-review".to_string()];
+
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &config,
+        &mut state,
+    )
+    .await
+    .expect("retry round should produce the committed answer");
+
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert_eq!(provider.call_count(), 2, "feedback round then answer round");
+    assert!(out.contains("loaded properly"), "{out}");
+    assert_eq!(state.last_turn.tool_errors, 1);
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::User
+                && m.content.contains("SKILL, not a tool")
+                && m.content.contains("`skill` tool")
+        }),
+        "round 2 must carry the skill-specific correction"
+    );
+}
+
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
 
 /// A provider that ALWAYS emits the same failing tool call while tools are
@@ -1064,6 +1199,10 @@ fn tool_activity_formatting() {
     assert_eq!(short_path("/x/y/deck1.md"), "…/y/deck1.md");
     assert_eq!(short_path("a/b"), "a/b");
     assert_eq!(short_path("deck.md"), "deck.md");
+    // Short absolute paths keep their leading slash: `/etc/hostname` must not
+    // display as the relative-looking `etc/hostname`.
+    assert_eq!(short_path("/etc/hostname"), "/etc/hostname");
+    assert_eq!(short_path("/etc"), "/etc");
 
     assert_eq!(
         format_tool_header("fs_read_file", r#"{"path":"/x/y/deck1.md"}"#),
@@ -1075,10 +1214,40 @@ fn tool_activity_formatting() {
     );
     assert_eq!(
         format_tool_header("repo_grep", r#"{"pattern":"TODO","path":"/a/src"}"#),
-        "Grep(\"TODO\", a/src)"
+        "Grep(\"TODO\", /a/src)"
     );
     // Unknown tool / unparseable args fall back to the raw name.
     assert_eq!(format_tool_header("weird_tool", "not json"), "weird_tool");
+
+    // A dispatch receipt must name the worker and its task; without an arm the
+    // agent tools have no `path` and render as a bare tool name.
+    assert_eq!(
+        format_tool_header("spawn_agent_bg", r#"{"task":"review parser.rs"}"#),
+        "Agent(\"review parser.rs\")"
+    );
+    assert_eq!(
+        format_tool_header(
+            "spawn_agent_bg",
+            r#"{"task":"review parser.rs","profile":"reviewer"}"#
+        ),
+        "Agent(reviewer: \"review parser.rs\")"
+    );
+    assert_eq!(
+        format_tool_header("spawn_agents", r#"{"tasks":["one","two"]}"#),
+        "Agent(x2: \"one\", \"two\")"
+    );
+    assert_eq!(
+        format_tool_header("agent_result", r#"{"id":3}"#),
+        "AgentResult(#3)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "spawn_agent_bg",
+            "Started background agent #1. It runs detached.",
+            false
+        ),
+        "Started background agent #1. It runs detached."
+    );
 
     assert_eq!(
         format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
@@ -1230,6 +1399,70 @@ fn tool_activity_formatting() {
     );
     assert!(!sanitized_warning.contains("<|im_start|>"));
     assert!(sanitized_warning.contains("[chat-template marker]"));
+}
+
+/// Cycle-10 G5: the `full output=` artifact path is the one pointer to the
+/// complete command output. It must never be elided — a real profile-scoped
+/// artifact path routinely exceeds the old 160-char cap and was cut
+/// mid-filename — and it stays the receipt's final field so a wrapped line
+/// ends with a copyable path. Cycle-10 G2: a containment hint, when present,
+/// is rendered as its own bounded receipt field.
+#[test]
+fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
+    use crate::orchestrator::format_tool_result;
+
+    let long_reference = format!(
+        "/home/user/.kitsu/profiles/v1-fnv128-{}/sessions/s-1786459292594577016-2717952-0.artifacts/runtime-2718000-1786459292594577016-1/command-output-1.txt",
+        "a".repeat(32)
+    );
+    assert!(long_reference.chars().count() > 160);
+    let output = serde_json::json!({
+        "argv": ["python3", "-m", "pytest", "-q"],
+        "cwd": "/workspace/project",
+        "executable": {
+            "invocation": "python3",
+            "resolution": "ambient_path",
+            "observed_path": "/usr/bin/python3",
+            "pinned": false
+        },
+        "ambient_authority": {
+            "inherits_environment": false,
+            "filesystem_confined_to_command_roots": true,
+            "network_confined": true,
+            "executable_identity_pinned": true
+        },
+        "termination": "exited",
+        "success": false,
+        "exit_code": 1,
+        "signal": null,
+        "stdout": "",
+        "stderr": "/usr/bin/python3: No module named pytest",
+        "stdout_bytes": 0,
+        "stderr_bytes": 40,
+        "stdout_retained_bytes": 0,
+        "stderr_retained_bytes": 40,
+        "stdout_truncated": false,
+        "stderr_truncated": false,
+        "stdout_capture_complete": true,
+        "stderr_capture_complete": true,
+        "elapsed_ms": 23,
+        "artifact": {"reference": long_reference},
+        "artifact_error": null,
+        "containment_hint": "output matches 'No module named' — try --command-env / --command-root"
+    });
+    let receipt = format_tool_result("command_exec", &output.to_string(), false);
+    assert!(
+        receipt.contains(&format!("full output={long_reference:?}")),
+        "artifact path must appear complete and unelided: {receipt}"
+    );
+    assert!(
+        receipt.trim_end_matches('"').ends_with(&long_reference),
+        "artifact path must be the receipt's final field: {receipt}"
+    );
+    assert!(
+        receipt.contains("hint: output matches 'No module named'"),
+        "containment hint must be rendered: {receipt}"
+    );
 }
 
 // --- context trimming (Stage 1c) --------------------------------------------
@@ -2180,6 +2413,7 @@ async fn protected_token_overflow_fails_locally_without_calling_provider() {
             target: 80,
             unit: ContextUnit::Tokens,
             window: Some(200),
+            effective: Some(100),
         } if required > 80
     ));
     assert_eq!(
@@ -3081,4 +3315,180 @@ async fn failed_live_event_sink_stops_before_tool_mutation() {
             ..
         } if call_id == "call-must-not-run"
     )));
+}
+
+// --- recovered tool errors & final-round status ------------------------------
+
+/// A tool failure the model corrects in a later round is the normal agentic
+/// retry pattern: cumulative `tool_errors` still reports it, but
+/// `final_round_tool_errors` must be zero so strict callers can commit the
+/// turn on its successful final state.
+#[tokio::test]
+async fn test_recovered_tool_error_clears_final_round_status() {
+    let provider = MockProvider::new(vec![
+        // round 1: the failing call
+        vec![
+            ChatDelta::ToolCall(tc("flaky", "call_1", "{\"try\":1}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        // round 2: the corrected call succeeds
+        vec![
+            ChatDelta::ToolCall(tc("flaky", "call_2", "{\"try\":2}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        // round 3: final answer
+        vec![
+            ChatDelta::Text("fixed".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    tools.register("flaky", {
+        let calls = calls.clone();
+        Box::new(move |_args: String| {
+            let calls = calls.clone();
+            Box::pin(async move {
+                if calls.fetch_add(1, Ordering::SeqCst) == 0 {
+                    Err::<String, ToolError>(ToolError::ExecError(
+                        "edit conflict: old_text matched 2 times".to_string(),
+                    ))
+                } else {
+                    Ok::<String, ToolError>("updated".to_string())
+                }
+            })
+        })
+    });
+    let mut state = AgentSessionState::default();
+    let out = run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("a recovered tool error must not abort the loop");
+    assert!(out.contains("fixed"));
+    assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.policy_errors, 0);
+    assert_eq!(
+        state.last_turn.final_round_tool_errors, 0,
+        "the last executed tool round succeeded, so the recovery must be visible"
+    );
+    assert_eq!(state.last_turn.completion, TurnCompletion::Complete);
+}
+
+/// An UNrecovered tool failure (the last tool round still failed) keeps a
+/// nonzero `final_round_tool_errors` so strict callers still reject the turn.
+#[tokio::test]
+async fn test_unrecovered_tool_error_keeps_final_round_status() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("bad_tool", "call_err", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("gave up".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let mut tools = Registry::new();
+    tools.register("bad_tool", err_handler(ran.clone()));
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(
+        &provider,
+        &tools,
+        &mut initial_messages(),
+        &cfg(10),
+        &mut state,
+    )
+    .await
+    .expect("a failing tool must not abort the loop");
+    assert_eq!(state.last_turn.tool_errors, 1);
+    assert_eq!(state.last_turn.final_round_tool_errors, 1);
+}
+
+// --- context-window runtime cross-check --------------------------------------
+
+#[test]
+fn test_context_window_shortfall_heuristic() {
+    use crate::orchestrator::context_window_shortfall;
+    // The audited Ollama case: resolved 8192, sent ~4299, server clamped 4096.
+    assert!(context_window_shortfall(4096, 4299, 8192));
+    // Acceptance-test shape: 5000-token prompt clamped to 4096.
+    assert!(context_window_shortfall(4096, 5000, 8192));
+    // Reported at/above the window is the window working as resolved.
+    assert!(!context_window_shortfall(8192, 9000, 8192));
+    // Small estimate noise (tokenizer beating chars/4) must not warn.
+    assert!(!context_window_shortfall(4000, 4100, 8192));
+    // Tiny prompts never trigger.
+    assert!(!context_window_shortfall(90, 100, 8192));
+    assert!(!context_window_shortfall(0, 100, 8192));
+    // Non-power-of-two clamps still trigger on a wide margin.
+    assert!(!context_window_shortfall(3900, 4100, 8192));
+    assert!(context_window_shortfall(3000, 5000, 8192));
+    // Cycle-14 HF false positive: an exact hosted tokenizer far under a big
+    // resolved window is estimator overshoot, not a clamp — stay quiet.
+    assert!(!context_window_shortfall(1007, 2178, 131_072));
+    assert!(!context_window_shortfall(1007, 2178, 32_768));
+    // …but a power-of-two clamp stays detectable even under a big window.
+    assert!(context_window_shortfall(4096, 9000, 131_072));
+}
+
+/// A usage report far below the sent estimate records durable window evidence
+/// on the session state (without rewriting the resolved window).
+#[tokio::test]
+async fn test_usage_shortfall_records_window_evidence() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("short answer".to_string()),
+        ChatDelta::Usage(kitsu_providers::Usage {
+            prompt_tokens: 4096,
+            completion_tokens: 3,
+            total_tokens: 4099,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(2);
+    c.context_window = Some(8192);
+    c.quiet = true;
+    // ~20k chars => ~5k estimated tokens: inside the budget, far above 4096.
+    let mut messages = vec![kitsu_providers::ChatMessage::user("x".repeat(20_000))];
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .expect("turn should succeed");
+    let evidence = state
+        .window_evidence
+        .expect("shortfall evidence must be recorded");
+    assert_eq!(evidence.reported_prompt_tokens, 4096);
+    assert_eq!(evidence.resolved_window, 8192);
+    assert!(evidence.estimated_sent_tokens > 4096);
+    assert!(!evidence.warned, "warning is the CLI's one-time job");
+}
+
+/// A healthy usage report records no evidence.
+#[tokio::test]
+async fn test_healthy_usage_records_no_window_evidence() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ok".to_string()),
+        ChatDelta::Usage(kitsu_providers::Usage {
+            prompt_tokens: 5100,
+            completion_tokens: 2,
+            total_tokens: 5102,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let mut c = cfg(2);
+    c.context_window = Some(8192);
+    c.quiet = true;
+    let mut messages = vec![kitsu_providers::ChatMessage::user("x".repeat(20_000))];
+    let mut state = AgentSessionState::default();
+    run_agent_turn_with_state(&provider, &tools, &mut messages, &c, &mut state)
+        .await
+        .expect("turn should succeed");
+    assert!(state.window_evidence.is_none());
 }

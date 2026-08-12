@@ -21,7 +21,7 @@ pub const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
-    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n  kitsu artifacts --help  Host-only command-artifact storage\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
 pub struct Cli {
     /// Gateway profile to use (from [gateways.<name>] in the config).
@@ -97,6 +97,18 @@ pub struct Cli {
     )]
     pub timeout_secs: u64,
 
+    /// How long a non-interactive exit (scripted or piped chat) waits for live
+    /// background agents to finish before cancelling them. Scripted runs join
+    /// detached work instead of discarding it; this is the bound on that wait.
+    /// Defaults to `--timeout-secs`.
+    #[arg(
+        long,
+        global = true,
+        value_name = "SECONDS",
+        value_parser = clap::value_parser!(u64).range(0..)
+    )]
+    pub agent_join_timeout: Option<u64>,
+
     /// Max output tokens per response. Unset lets the gateway apply its own cap
     /// (often 4096), which silently truncates long outputs like code reviews.
     /// Raise it (e.g. 16000) for long-form generation.
@@ -142,6 +154,22 @@ pub struct Cli {
     /// this run. Useful for privacy-sensitive or isolated automation.
     #[arg(long, global = true)]
     pub no_project_context: bool,
+
+    /// Do not register the model-callable `workspace_diff` tool for this run.
+    /// The tool discloses bounded host-verified diff evidence (like /review)
+    /// and never grants filesystem access; with this flag the model is not
+    /// told the tool exists. The config key `workspace_evidence = false`
+    /// disables it permanently.
+    #[arg(long, global = true)]
+    pub no_workspace_evidence: bool,
+
+    /// Per-turn cap on subagent spawns (`spawn_agent`, `spawn_agents`,
+    /// `spawn_agent_bg` combined). Spawns beyond the cap return a tool error
+    /// the model sees, stopping agent storms from models that ignore prompt
+    /// guidance. Overrides the config key `agent_spawn_cap`. Defaults: 8 in
+    /// interactive chat, 2 in scripted/piped automation. 0 disables spawning.
+    #[arg(long, global = true, value_name = "N")]
+    pub agent_spawn_cap: Option<u32>,
 
     /// Preload a named skill's instructions for this run (repeatable). Works for
     /// `ask` and `chat` — the skill body is injected up front so it's available
@@ -240,6 +268,18 @@ pub enum Command {
         #[command(subcommand)]
         command: Option<SessionCommand>,
     },
+    /// Inspect or reclaim command-artifact storage left by earlier runs.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu artifacts\n  kitsu artifacts list --json\n  kitsu artifacts prune all --dry-run\n  kitsu artifacts prune all --older-than 7d\n\nHost-only: these paths are Kitsu-private, no model authority is involved, and the config path only selects the isolated namespace. Generations held by a live process are never removed."
+    )]
+    Artifacts {
+        /// Emit one JSON result instead of human text.
+        #[arg(long, global = true)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: Option<ArtifactCommand>,
+    },
     /// Interactive chat, scripted multi-turn work, or one piped turn.
     #[command(
         after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
@@ -276,12 +316,42 @@ pub enum Command {
         /// (repeatable). These become writable mounts inside mandatory Linux
         /// OS containment; exact argv/cwd approval remains a separate gate.
         /// Implies --enable-commands. With no explicit root, --enable-commands
-        /// uses the launch directory.
+        /// uses the launch directory. If the approved executable itself lives
+        /// outside every command root, containment denies it — pass its own
+        /// directory too (the denial names the exact directory to add).
         #[arg(long = "command-root", value_name = "PATH")]
         command_roots: Vec<String>,
 
-        /// Pre-approve one exact argv in the launch directory, encoded as a
-        /// JSON string array, for example '["cargo","test"]'. Repeatable and
+        /// Mount one extra directory read-only inside command containment
+        /// (repeatable), for toolchains that live outside /usr — e.g.
+        /// `--command-runtime-root ~/.cargo --command-runtime-root ~/.rustup`
+        /// makes `cargo test` resolvable in the sandbox (each root's `bin/`
+        /// joins PATH; `.cargo`/`.rustup` roots also set CARGO_HOME /
+        /// RUSTUP_HOME). Read-only: commands can execute the toolchain but
+        /// never mutate it. Never pass a credential or whole-home directory —
+        /// every configured root is disclosed at startup. Implies
+        /// --enable-commands.
+        #[arg(long = "command-runtime-root", value_name = "PATH")]
+        command_runtime_roots: Vec<String>,
+
+        /// Opt-in, explicit pass-through of one environment variable into
+        /// contained commands (repeatable), layered on top of the fixed
+        /// non-secret base set every contained command already receives
+        /// (PATH, HOME, LANG, LC_ALL, TERM, TMPDIR, USER, LOGNAME) — needed
+        /// for interpreter-based toolchains (pytest, npm test, ...) whose
+        /// module search path is env-driven (e.g. PYTHONPATH, NODE_PATH).
+        /// Bare `NAME` reads the value from kitsu's own environment and is
+        /// refused for names that look secret-bearing (case-insensitive
+        /// substring match on KEY/TOKEN/SECRET/PASSWORD); use `NAME=value`
+        /// to pass an explicit literal value regardless of name. Nothing
+        /// else is inherited from the host — deny-by-default is unchanged.
+        #[arg(long = "command-env", value_name = "NAME[=VALUE]")]
+        command_env: Vec<String>,
+
+        /// Pre-approve one exact argv, encoded either as a JSON string array
+        /// run in the launch directory, for example '["cargo","test"]', or as
+        /// '{"argv":["cargo","test"],"cwd":"/abs/dir"}' to bind it to an
+        /// explicit working directory inside a --command-root. Repeatable and
         /// intended for non-interactive scripts.
         #[arg(long = "allow-command", value_name = "JSON_ARGV")]
         allow_commands: Vec<String>,
@@ -293,20 +363,30 @@ pub enum Command {
         #[arg(long, value_name = "FILE")]
         script: Option<String>,
 
-        /// Resume and autosave a saved session by id, or use `last`. Works in
+        /// Resume and autosave a saved session by id, by NAME (see --name /
+        /// `kitsu sessions rename`), with `last` (newest anywhere), or with
+        /// `auto` (newest recorded in the current directory). Works in
         /// interactive, scripted, and piped chat. Saved permission grants are
         /// intentionally never restored.
         #[arg(long, value_name = "ID", default_missing_value = "last", num_args = 0..=1)]
         resume: Option<String>,
 
         /// Persist a new scripted or piped chat and autosave successful turns.
-        /// Interactive chat already persists by default; --resume implies this.
-        #[arg(long, conflicts_with_all = ["resume", "no_session"])]
+        /// Interactive chat already persists by default; --resume implies this,
+        /// so passing both is a harmless no-op confirmation rather than an
+        /// error.
+        #[arg(long, conflicts_with = "no_session")]
         session: bool,
 
         /// Disable automatic local session snapshots for this chat.
         #[arg(long, conflicts_with = "resume")]
         no_session: bool,
+
+        /// Name this durable session (1-40 chars: letters, digits, '-', '_').
+        /// Names show in listings and resolve in `--resume <name>`. Implies
+        /// --session; also renames when combined with --resume.
+        #[arg(long, value_name = "NAME", conflicts_with = "no_session")]
+        name: Option<String>,
 
         /// Preserve the legacy script behavior of exiting 0 even when one or
         /// more scripted turns or slash commands fail.
@@ -316,9 +396,29 @@ pub enum Command {
 }
 
 #[derive(Debug, Subcommand)]
-pub enum SessionCommand {
-    /// List saved sessions (the default when no action is given).
+pub enum ArtifactCommand {
+    /// List retained generations across runs (the default when no action is given).
     List,
+    /// Remove exact generations. Live and still-owned generations are skipped.
+    Prune {
+        /// Exact generation id, or `all`.
+        target: String,
+        /// Only remove generations at least this old (for example `7d`, `12h`).
+        #[arg(long, value_name = "DURATION")]
+        older_than: Option<String>,
+        /// Report what would be removed without removing anything.
+        #[arg(long)]
+        dry_run: bool,
+    },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SessionCommand {
+    /// List saved sessions (the default when no action is given). Optional filter is a case-insensitive substring matched against session id and preview text.
+    List {
+        /// Optional case-insensitive substring filter over session id and preview text.
+        filter: Option<String>,
+    },
     /// Show one saved session and its bounded transcript.
     Show {
         /// Exact session id, or `last`.
@@ -326,7 +426,8 @@ pub enum SessionCommand {
     },
     /// Resume in interactive chat, or print an exact command outside a TTY.
     Resume {
-        /// Session id; defaults to `last`.
+        /// Session id or name; also `last` (newest anywhere, the default) or
+        /// `auto` (newest recorded in the current directory).
         #[arg(default_value = "last")]
         id: String,
     },
@@ -342,9 +443,17 @@ pub enum SessionCommand {
         id: String,
         /// New output file; an artifact sidecar may be created beside it.
         destination: std::path::PathBuf,
-        /// Human-readable Markdown or the complete JSON snapshot.
-        #[arg(long, default_value = "markdown", value_parser = ["markdown", "json"])]
-        format: String,
+        /// Human-readable Markdown or the complete JSON snapshot. When omitted,
+        /// a `.json` destination selects JSON and anything else Markdown.
+        #[arg(long, value_parser = ["markdown", "json"])]
+        format: Option<String>,
+    },
+    /// Name or rename a saved session (names resolve in `--resume <name>`).
+    Rename {
+        /// Session id or current name; `last` picks the newest session.
+        id: String,
+        /// New name: 1-40 chars of letters, digits, '-' or '_'. Omit to clear.
+        name: Option<String>,
     },
     /// Move an exact inactive session into recoverable archive storage.
     Archive { id: String },

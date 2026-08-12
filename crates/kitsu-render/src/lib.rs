@@ -14,6 +14,7 @@ const CSI: char = '\u{009b}';
 const OSC: char = '\u{009d}';
 const ST: char = '\u{009c}';
 static ASSISTANT_OUTPUT_WRITTEN: AtomicBool = AtomicBool::new(false);
+static TURN_ASSISTANT_OUTPUT: AtomicBool = AtomicBool::new(false);
 static FORCE_PLAIN: AtomicBool = AtomicBool::new(false);
 static FORCE_REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
@@ -214,8 +215,10 @@ fn ascii_structural_markers(input: &str) -> String {
             '■' => output.push('#'),
             '↳' => output.push_str("->"),
             '…' => output.push_str("..."),
-            '✻' | '⏺' => output.push('*'),
-            '⎿' => output.push('>'),
+            '✻' | '⏺' | '◆' | '⛩' => output.push('*'),
+            '⎿' | '◇' => output.push('>'),
+            '◉' => output.push('o'),
+            '◈' => output.push('#'),
             '╭' | '╮' | '╰' | '╯' => output.push('+'),
             _ => output.push(ch),
         }
@@ -278,6 +281,7 @@ pub fn print_fragment(s: &str) {
         .push(s);
     if !sanitized.is_empty() {
         ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+        TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
     }
     let mut out = io::stdout();
     let _ = out.write_all(sanitized.as_bytes());
@@ -292,6 +296,7 @@ pub fn print_message(s: &str) {
     let rendered = format_message(&sanitized, stdout_style());
     if !rendered.is_empty() {
         ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+        TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
     }
     let mut out = io::stdout();
     let _ = out.write_all(rendered.as_bytes());
@@ -338,12 +343,63 @@ fn format_message(s: &str, styled: bool) -> String {
     out
 }
 
-/// Fox-orange (kitsune) accent colour used across the UI.
-const FOX: (u8, u8, u8) = (255, 140, 0);
+/// Named kitsune palette (design.md §8, docs/ux-design.md). Truecolor RGB,
+/// used only when the destination is a styled TTY.
+/// Fox-orange identity accent used across the UI.
+pub const FOX: (u8, u8, u8) = (255, 140, 0);
+/// Warnings and high (>=80%) context utilization.
+pub const AMBER: (u8, u8, u8) = (255, 191, 0);
+/// Highlight text.
+pub const CREAM: (u8, u8, u8) = (255, 253, 240);
+/// Informational notices and links.
+pub const TEAL: (u8, u8, u8) = (54, 117, 136);
+/// Success notices.
+pub const SAGE: (u8, u8, u8) = (155, 175, 131);
+/// Errors and critical (>=95%) context utilization.
+pub const EMBER: (u8, u8, u8) = (228, 87, 46);
 
-/// A Codex-style startup banner with kitsu's fox/cat mascot and a Japanese
-/// accent (狐 = kitsune). Printed to stderr at chat start. On a non-TTY it
-/// degrades to a single plain line so piped output stays clean.
+/// Kitsu's own structural glyph set (design.md §8). Defined once here so every
+/// surface uses the same symbols; `--plain` maps each to stable ASCII via
+/// [`ascii_structural_markers`].
+/// Tool call marker (`--plain`: the `tool>` prefix).
+pub const GLYPH_TOOL_CALL: &str = "◆";
+/// Tool result marker (`--plain`: the `result>` prefix).
+pub const GLYPH_TOOL_RESULT: &str = "◇";
+/// Approval/permission prompt marker (`--plain`: `o`).
+pub const GLYPH_APPROVAL: &str = "◉";
+/// Receipt/section marker (`--plain`: `#`).
+pub const GLYPH_RECEIPT: &str = "◈";
+/// Torii session-boundary milestone marker (`--plain`: `*`).
+pub const GLYPH_TORII: &str = "⛩";
+
+/// Approximate terminal display width of one char: 2 for CJK/emoji ranges the
+/// banner and its dynamic values can reasonably contain, else 1. Control and
+/// zero-width characters are removed by sanitization before this runs.
+fn char_display_width(ch: char) -> usize {
+    match ch as u32 {
+        0x1100..=0x115F
+        | 0x2E80..=0xA4CF
+        | 0xAC00..=0xD7A3
+        | 0xF900..=0xFAFF
+        | 0xFE30..=0xFE4F
+        | 0xFF00..=0xFF60
+        | 0xFFE0..=0xFFE6
+        | 0x1F300..=0x1FAFF
+        | 0x20000..=0x3FFFD => 2,
+        _ => 1,
+    }
+}
+
+fn display_width(s: &str) -> usize {
+    s.chars().map(char_display_width).sum()
+}
+
+/// Content cells between the banner box's side bars.
+const BANNER_INNER_WIDTH: usize = 56;
+
+/// A Codex-style startup banner with kitsu's fox mascot and a Japanese accent
+/// (狐 = kitsune). Printed to stderr at chat start. On a non-TTY it degrades to
+/// a single plain line so piped output stays clean.
 pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     let plain = plain_mode();
     let clean = |value: &str| {
@@ -373,7 +429,6 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     }
     let (r, g, b) = FOX;
     let bar = "│".truecolor(r, g, b);
-    let rule: String = "─".repeat(42);
     let tools_str = if tools.is_empty() {
         "none (read-only chat)".to_string()
     } else if tools.join(", ").chars().count() > 64 {
@@ -381,31 +436,54 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
     } else {
         tools.join(", ")
     };
-    let row = |label: &str, value: &str| {
-        let l = format!("{label:<9}");
-        eprintln!("  {}  {}   {}", bar, l.dimmed(), value);
+    // Closed box: top/bottom rules share one width and rows pad to the right
+    // bar. A row whose value overflows the box keeps only the left bar rather
+    // than truncating information.
+    let boxed = |plain_row: &str, styled_row: &str| {
+        let width = display_width(plain_row);
+        if width <= BANNER_INNER_WIDTH {
+            let pad = " ".repeat(BANNER_INNER_WIDTH - width);
+            eprintln!("  {bar}{styled_row}{pad}{bar}");
+        } else {
+            eprintln!("  {bar}{styled_row}");
+        }
     };
+    let row = |label: &str, value: &str| {
+        let plain_row = format!("  {label:<9}   {value}");
+        let styled_row = format!("  {}   {value}", format!("{label:<9}").dimmed());
+        boxed(&plain_row, &styled_row);
+    };
+    let title = "🦊 kitsu 狐";
+    // "╭─ " + title + " " + fill + "╮" spans BANNER_INNER_WIDTH + 2 cells.
+    let fill = (BANNER_INNER_WIDTH + 1).saturating_sub(4 + display_width(title));
     eprintln!();
     eprintln!(
         "  {} {} {}",
         "╭─".truecolor(r, g, b),
-        "kitsu 狐".truecolor(r, g, b).bold(),
-        rule.truecolor(r, g, b)
+        title.truecolor(r, g, b).bold(),
+        format!("{}╮", "─".repeat(fill)).truecolor(r, g, b)
     );
-    eprintln!("  {}   {}", bar, r"/\_/\".truecolor(r, g, b));
-    eprintln!(
-        "  {}  {}   {}",
-        bar,
-        "( o.o )".truecolor(r, g, b),
-        "multi-gateway LLM familiar".dimmed()
+    boxed(
+        r"   /\   /\",
+        &format!("{}", r"   /\   /\".truecolor(r, g, b)),
     );
-    eprintln!("  {}   {}", bar, "> ω <".truecolor(r, g, b));
-    eprintln!("  {}", bar);
+    boxed(
+        "  ( ･ᴥ･ )   multi-gateway LLM familiar",
+        &format!(
+            "  {}   {}",
+            "( ･ᴥ･ )".truecolor(r, g, b),
+            "multi-gateway LLM familiar".dimmed()
+        ),
+    );
+    boxed("", "");
     row("gateway", &gateway);
     row("model", &model);
     row("directory", &dir);
     row("tools", &tools_str);
-    eprintln!("  {}", format!("╰{rule}────").truecolor(r, g, b));
+    eprintln!(
+        "  {}",
+        format!("╰{}╯", "─".repeat(BANNER_INNER_WIDTH)).truecolor(r, g, b)
+    );
     eprintln!(
         "  {}",
         "Enter / for commands · Tab completes prefixes · Ctrl+D exits".dimmed()
@@ -416,10 +494,18 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
 /// The interactive chat prompt. Fox-orange on a TTY, plain otherwise.
 pub fn prompt_string() -> String {
     if stdout_style() {
-        format!("{} ", "kitsu>".truecolor(255, 140, 0).bold())
+        let (r, g, b) = FOX;
+        format!("{} ", "kitsu>".truecolor(r, g, b).bold())
     } else {
         "kitsu> ".to_string()
     }
+}
+
+/// Whether stderr output is currently styled (TTY and not plain). Callers that
+/// assemble their own stderr text (e.g. `/help`) can use this instead of
+/// re-deriving the mode.
+pub fn stderr_styled() -> bool {
+    stderr_style()
 }
 
 /// Severity of a notice produced while an interactive input prompt may be
@@ -525,17 +611,53 @@ impl PromptSafeAsyncNotice {
         if !styled || plain {
             return line;
         }
-        match self.level {
-            AsyncNoticeLevel::Info => format!("{}", line.truecolor(255, 140, 0)),
-            AsyncNoticeLevel::Success => format!("{}", line.green()),
-            AsyncNoticeLevel::Warning => format!("{}", line.yellow()),
-            AsyncNoticeLevel::Error => format!("{}", line.red()),
-        }
+        let (r, g, b) = match self.level {
+            AsyncNoticeLevel::Info => TEAL,
+            AsyncNoticeLevel::Success => SAGE,
+            AsyncNoticeLevel::Warning => AMBER,
+            AsyncNoticeLevel::Error => EMBER,
+        };
+        format!("{}", line.truecolor(r, g, b))
     }
 }
 
+/// Render a terminal failure to stderr as one weighted error notice: the first
+/// line carries the `! error:` marker (ember-red on a styled TTY); any
+/// following hint lines pass through untinted. `--plain`/non-TTY receive the
+/// same text with no ANSI.
+pub fn render_error(message: &str) {
+    for line in error_lines(message) {
+        eprintln!("{line}");
+    }
+}
+
+/// The [`render_error`] payload as lines, for callers that own the printing
+/// (e.g. to apply JSONL-mode suppression).
+pub fn error_lines(message: &str) -> Vec<String> {
+    error_display_lines(message, stderr_style(), plain_mode())
+}
+
+fn error_display_lines(message: &str, styled: bool, plain: bool) -> Vec<String> {
+    let message = if plain {
+        ascii_structural_markers(&sanitize_terminal_text(message))
+    } else {
+        sanitize_terminal_text(message)
+    };
+    let mut lines = message.lines();
+    let first = format!("! error: {}", lines.next().unwrap_or_default());
+    let mut output = Vec::new();
+    if styled && !plain {
+        let (r, g, b) = EMBER;
+        output.push(format!("{}", first.truecolor(r, g, b).bold()));
+    } else {
+        output.push(first);
+    }
+    output.extend(lines.map(str::to_string));
+    output
+}
+
 /// A "vibing kitsu" spinner shown on stderr while the model is working (the wait
-/// before the first token). Animates a cat/fox kaomoji in fox-orange on a TTY.
+/// before the first token). Animates a fox kaomoji in fox-orange on a TTY.
 /// A redirected/piped stderr gets a periodic plain-text heartbeat instead of
 /// nothing, so a slow-but-working scripted run against a local model is
 /// distinguishable from a hung one. Plain and reduced-motion modes show a
@@ -556,6 +678,35 @@ enum SpinnerMode {
     StaticPlain,
     StaticStyled,
     Animated,
+}
+
+/// The animated fox-kaomoji frames (kitsune, not neko): fixed ᴥ-muzzle face
+/// with a sweeping tail. Plain/reduced-motion modes never see these.
+const SPINNER_FRAMES: [&str; 4] = ["( ･ᴥ･ )ﾉ", "( ･ᴥ･ )～", "( ･ᴥ･ ) ～", "( ﾉᴥﾉ )～"];
+
+/// Backed-off cadence shared by line-based waiting heartbeats (cycle-10 G4):
+/// 15s, 30s, 60s, then every 120s. A long wait stays visibly alive without
+/// `~ still waiting` lines stacking 10-15 deep between receipts and drowning
+/// the ◆/◇ landmarks in the transcript.
+pub fn heartbeat_backoff(beat_index: u32) -> std::time::Duration {
+    const CADENCE_SECS: [u64; 3] = [15, 30, 60];
+    std::time::Duration::from_secs(
+        CADENCE_SECS
+            .get(beat_index as usize)
+            .copied()
+            .unwrap_or(120),
+    )
+}
+
+/// Cumulative wait time for heartbeat lines: `45s`, then `4m30s` past a
+/// minute, so a long transcript shows total elapsed wait at a glance.
+pub fn format_wait_elapsed(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs();
+    if secs < 60 {
+        format!("{secs}s")
+    } else {
+        format!("{}m{:02}s", secs / 60, secs % 60)
+    }
 }
 
 fn spinner_mode(destination_is_tty: bool, plain: bool, reduced_motion: bool) -> SpinnerMode {
@@ -600,15 +751,22 @@ impl Spinner {
                     // Long enough that a normal request never logs anything;
                     // only a genuinely slow round (the exact case with no other
                     // progress signal — heavy tool-calling on a local model)
-                    // does. Repeats so a multi-minute wait doesn't go silent.
-                    const FIRST_BEAT: std::time::Duration = std::time::Duration::from_secs(10);
-                    const INTERVAL: std::time::Duration = std::time::Duration::from_secs(15);
-                    tokio::time::sleep(FIRST_BEAT).await;
-                    let mut waited = FIRST_BEAT;
+                    // does. The line-based render path cannot rewrite in
+                    // place, so repeats back off exponentially (15s, 30s,
+                    // 60s, then every 120s) with cumulative elapsed time,
+                    // keeping a multi-minute wait visible without drowning
+                    // the receipt landmarks (cycle-10 G4).
+                    let mut waited = std::time::Duration::ZERO;
+                    let mut beat = 0u32;
                     loop {
-                        eprintln!("~ still waiting on the model ({}s)...", waited.as_secs());
-                        tokio::time::sleep(INTERVAL).await;
-                        waited += INTERVAL;
+                        let interval = heartbeat_backoff(beat);
+                        tokio::time::sleep(interval).await;
+                        waited += interval;
+                        beat += 1;
+                        eprintln!(
+                            "~ still waiting on the model ({})...",
+                            format_wait_elapsed(waited)
+                        );
                     }
                 });
                 return Self {
@@ -641,25 +799,23 @@ impl Spinner {
             SpinnerMode::Animated => {}
         }
         let handle = tokio::spawn(async move {
-            // Kitsu is vibing while the model does the hard work.
-            const FRAMES: [&str; 6] = [
-                "(=^･ω･^=)",
-                "(=^･ｪ･^=)",
-                "(=ↀωↀ=)",
-                "(=^‥^=)",
-                "ฅ(^•ω•^)ฅ",
-                "(=①ω①=)",
-            ];
+            // Kitsu is vibing while the model does the hard work: a fox face
+            // (ᴥ muzzle, no cat ω/ฅ) with a sweeping tail.
+            const FRAMES: [&str; 4] = SPINNER_FRAMES;
             const DOTS: [&str; 4] = ["   ", "･  ", "･･ ", "･･･"];
             let (r, g, b) = FOX;
             let mut i = 0usize;
             // Avoid a distracting flash for fast local responses.
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
+            let frame_width = FRAMES.iter().map(|frame| display_width(frame)).max();
             loop {
                 let frame = FRAMES[i % FRAMES.len()];
+                // Pad the sweeping tail to one width so a shorter frame never
+                // leaves residue from a longer predecessor on the status line.
+                let pad = " ".repeat(frame_width.unwrap_or(0) - display_width(frame));
                 let dots = DOTS[i % DOTS.len()];
                 eprint!(
-                    "\r  {} {}{}",
+                    "\r  {}{pad} {}{}",
                     frame.truecolor(r, g, b),
                     "kitsu is thinking".dimmed(),
                     dots.dimmed()
@@ -698,6 +854,21 @@ impl Drop for Spinner {
     }
 }
 
+/// Mark the start of one foreground model turn's stdout transaction. The
+/// orchestrator calls this so [`turn_wrote_assistant_output`] answers "did
+/// THIS turn stream anything" rather than remembering earlier turns.
+pub fn begin_turn_output() {
+    TURN_ASSISTANT_OUTPUT.store(false, Ordering::Release);
+}
+
+/// Whether the current (or just-finished) turn wrote assistant text to stdout.
+/// Unlike the newline-discipline flag consumed by [`finish_line`], this
+/// survives mid-turn status lines, so an error path can decide honestly
+/// whether provisional output existed at all.
+pub fn turn_wrote_assistant_output() -> bool {
+    TURN_ASSISTANT_OUTPUT.load(Ordering::Acquire)
+}
+
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
     stream_sanitizer()
@@ -713,7 +884,7 @@ pub fn finish_line() {
 }
 
 /// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
-/// friendly line — e.g. `⏺ Read(deck1.md)`. Fox-orange marker on a TTY.
+/// friendly line — e.g. `◆ Read(deck1.md)`. Fox-orange marker on a TTY.
 pub fn tool_activity(header: &str) {
     let plain = plain_mode();
     let header = if plain {
@@ -722,30 +893,112 @@ pub fn tool_activity(header: &str) {
         sanitize_terminal_inline(header)
     };
     if stderr_is_tty() && !plain {
-        eprintln!("{} {header}", "⏺".truecolor(255, 140, 0));
+        let (r, g, b) = FOX;
+        eprintln!("{} {header}", GLYPH_TOOL_CALL.truecolor(r, g, b));
     } else if plain {
         eprintln!("tool> {header}");
     } else {
-        eprintln!("⏺ {header}");
+        eprintln!("{GLYPH_TOOL_CALL} {header}");
     }
 }
 
-/// The result summary line under a tool call — e.g. `  ⎿ 128 lines`. Dimmed on a
+/// The result summary line under a tool call — e.g. `  ◇ 128 lines`. Dimmed on a
 /// TTY. Goes to stderr so stdout stays assistant-text only.
 pub fn tool_result(summary: &str) {
+    tool_result_with_weight(summary, false)
+}
+
+/// A failed tool call's result line. Ember-red on a styled TTY so an error is
+/// emphasized rather than dimmed; identical to [`tool_result`] otherwise.
+pub fn tool_result_error(summary: &str) {
+    tool_result_with_weight(summary, true)
+}
+
+fn tool_result_with_weight(summary: &str, is_error: bool) {
     let plain = plain_mode();
     let summary = if plain {
         sanitize_plain_inline(summary)
     } else {
         sanitize_terminal_inline(summary)
     };
-    let line = format!("  ⎿ {summary}");
+    let line = format!("  {GLYPH_TOOL_RESULT} {summary}");
     if stderr_is_tty() && !plain {
-        eprintln!("{}", line.dimmed());
+        if is_error {
+            let (r, g, b) = EMBER;
+            eprintln!("{}", line.truecolor(r, g, b));
+        } else {
+            eprintln!("{}", line.dimmed());
+        }
     } else if plain {
         eprintln!("result> {summary}");
     } else {
         eprintln!("{line}");
+    }
+}
+
+/// A section heading (e.g. one `/help` group). Bold when `styled`, verbatim
+/// otherwise, so plain output keeps identical text with zero escape bytes.
+pub fn section_heading(text: &str, styled: bool) -> String {
+    if styled {
+        format!("{}", text.bold())
+    } else {
+        text.to_string()
+    }
+}
+
+/// The shared header of the two approval surfaces (filesystem and command):
+/// `◉ permission — <request>`, with the glyph and word carrying bold
+/// fox-orange weight on a styled TTY. `--plain` callers keep their existing
+/// `permission>` text and must not call this.
+pub fn approval_header(request: &str) -> String {
+    approval_header_with_mode(request, stderr_style())
+}
+
+fn approval_header_with_mode(request: &str, styled: bool) -> String {
+    let request = sanitize_terminal_inline(request);
+    if styled {
+        let (r, g, b) = FOX;
+        format!(
+            "{} — {request}",
+            format!("{GLYPH_APPROVAL} permission")
+                .truecolor(r, g, b)
+                .bold()
+        )
+    } else {
+        format!("{GLYPH_APPROVAL} permission — {request}")
+    }
+}
+
+/// The aligned approval option line `[y] allow once · [a] <label> · [n] deny`,
+/// with the answer letters bold on a styled TTY.
+pub fn approval_options(always_label: &str) -> String {
+    approval_options_with_mode(always_label, stderr_style())
+}
+
+fn approval_options_with_mode(always_label: &str, styled: bool) -> String {
+    let always_label = sanitize_terminal_inline(always_label);
+    let key = |k: &str| {
+        if styled {
+            format!("{}", format!("[{k}]").bold())
+        } else {
+            format!("[{k}]")
+        }
+    };
+    format!(
+        "  {} allow once · {} {always_label} · {} deny",
+        key("y"),
+        key("a"),
+        key("n")
+    )
+}
+
+/// A dimmed detail row beneath an approval header (cwd, executable, timeout).
+pub fn approval_detail(text: &str) -> String {
+    let text = sanitize_terminal_inline(text);
+    if stderr_style() {
+        format!("  {}", text.dimmed())
+    } else {
+        format!("  {text}")
     }
 }
 
@@ -784,19 +1037,116 @@ pub fn render_diff(diff: &str) {
     }
 }
 
-/// Announce a summarizing compaction to stderr, like Claude Code's boundary, so
-/// the user knows older history was replaced by a summary.
-pub fn compaction_boundary() {
-    if plain_mode() {
-        eprintln!("* context compacted (older turns summarized)");
-    } else if stderr_style() {
-        let (r, g, b) = FOX;
-        eprintln!(
-            "{}",
-            "✻ context compacted (older turns summarized)".truecolor(r, g, b)
-        );
+/// One torii (⛩) milestone line for a session-boundary event — compaction,
+/// `/new`, `/resume`, checkpoint `/undo`. The torii marks the session passing a
+/// gate; at most one line per event, never in tool receipts. `--plain` renders
+/// the same text behind the ASCII `*` marker.
+pub fn milestone(message: &str) {
+    eprintln!("{}", milestone_line(message));
+}
+
+/// The [`milestone`] payload as a string, for callers that route output.
+pub fn milestone_line(message: &str) -> String {
+    milestone_line_with_mode(message, stderr_style(), plain_mode())
+}
+
+fn milestone_line_with_mode(message: &str, styled: bool, plain: bool) -> String {
+    if plain {
+        format!("* {}", sanitize_plain_inline(message))
     } else {
-        eprintln!("✻ context compacted (older turns summarized)");
+        let line = format!("{GLYPH_TORII} {}", sanitize_terminal_inline(message));
+        if styled {
+            let (r, g, b) = FOX;
+            format!("{}", line.truecolor(r, g, b))
+        } else {
+            line
+        }
+    }
+}
+
+/// Announce a summarizing compaction to stderr so the user knows older history
+/// was replaced by a summary.
+pub fn compaction_boundary() {
+    milestone("context compacted (older turns summarized)");
+}
+
+/// The attention state of one agent-deck row (docs/ux-design.md D1). Fill level
+/// carries the state, matching the established glyph semantics: `◆` filled =
+/// live action, `◈` = a durable result awaiting custody, `◇` hollow = spent.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum DeckState {
+    /// Working right now.
+    Running,
+    /// Finished; its result has not been collected yet.
+    ResultReady,
+    /// Finished by failing.
+    Failed,
+    /// Stopped by a user or by policy.
+    Stopped,
+}
+
+impl DeckState {
+    fn glyph(self) -> &'static str {
+        match self {
+            Self::Running => GLYPH_TOOL_CALL,
+            Self::ResultReady => GLYPH_RECEIPT,
+            Self::Failed | Self::Stopped => GLYPH_TOOL_RESULT,
+        }
+    }
+
+    fn color(self) -> (u8, u8, u8) {
+        match self {
+            Self::Running | Self::ResultReady => FOX,
+            Self::Failed => EMBER,
+            Self::Stopped => AMBER,
+        }
+    }
+
+    /// The stable ASCII marker `--plain`/`NO_COLOR`/non-TTY receive.
+    fn plain_marker(self) -> &'static str {
+        match self {
+            Self::Running => "[run]",
+            Self::ResultReady => "[rdy]",
+            Self::Failed => "[err]",
+            Self::Stopped => "[stp]",
+        }
+    }
+}
+
+/// The `◈` header of a deck section (`/jobs`, `/profiles`), in highlight cream.
+/// `--plain` renders `# <summary>` with zero escape bytes.
+pub fn deck_header(summary: &str) -> String {
+    deck_header_with_mode(summary, stderr_style(), plain_mode())
+}
+
+fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
+    if plain {
+        return format!("# {}", sanitize_plain_inline(summary));
+    }
+    let line = format!("{GLYPH_RECEIPT} {}", sanitize_terminal_inline(summary));
+    if styled {
+        let (r, g, b) = CREAM;
+        format!("{}", line.truecolor(r, g, b).bold())
+    } else {
+        line
+    }
+}
+
+/// One deck row's state marker, already colored for the destination. Callers
+/// append their own (already sanitized) row text after it.
+pub fn deck_marker(state: DeckState) -> String {
+    deck_marker_with_mode(state, stderr_style(), plain_mode())
+}
+
+fn deck_marker_with_mode(state: DeckState, styled: bool, plain: bool) -> String {
+    if plain {
+        return state.plain_marker().to_string();
+    }
+    if styled {
+        let (r, g, b) = state.color();
+        format!("{}", state.glyph().truecolor(r, g, b))
+    } else {
+        state.glyph().to_string()
     }
 }
 
@@ -851,6 +1201,18 @@ pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64
     let mut err = io::stderr();
     let destination_is_tty = err.is_terminal();
     let _ = write_turn_stats(&mut err, destination_is_tty, usage, context);
+}
+
+/// End-of-turn telemetry for a FAILED turn. A person at a terminal gets no
+/// stats line — a turn that produced nothing should not be billed a summary —
+/// while redirected output keeps the stable `kitsu-usage:`/`kitsu-context:`
+/// records so automation still observes what the failed attempt consumed.
+pub fn emit_failed_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
+    let mut err = io::stderr();
+    if err.is_terminal() {
+        return;
+    }
+    let _ = write_turn_stats(&mut err, false, usage, context);
 }
 
 /// Write end-of-turn telemetry to an explicit destination.
@@ -1012,9 +1374,8 @@ fn context_lines(
     } else {
         ('■', '□')
     };
-    let bar: String = (0..CELLS)
-        .map(|i| if i < filled { filled_cell } else { empty_cell })
-        .collect();
+    let filled_cells: String = (0..filled).map(|_| filled_cell).collect();
+    let empty_cells: String = (filled..CELLS).map(|_| empty_cell).collect();
     let win = if note.is_empty() {
         format!("{window}")
     } else {
@@ -1022,9 +1383,21 @@ fn context_lines(
     };
     let mut lines = vec![format!("model: {model}   window: {win}")];
     let bar_disp = if mode.styled {
-        format!("{}", bar.truecolor(r, g, b))
+        // Fill state reads by color as well as glyph shape: FOX below 80%
+        // utilization, AMBER at >=80%, EMBER at >=95% — a quiet capacity
+        // warning. Empty cells are dimmed so the boundary is visible.
+        let (r, g, b) = match pct {
+            p if p >= 95 => EMBER,
+            p if p >= 80 => AMBER,
+            _ => (r, g, b),
+        };
+        format!(
+            "{}{}",
+            filled_cells.truecolor(r, g, b),
+            empty_cells.dimmed()
+        )
     } else {
-        bar
+        format!("{filled_cells}{empty_cells}")
     };
     lines.push(format!(
         "used {used} / {effective} effective  [{bar_disp}]  {pct}%   headroom: {headroom}"
@@ -1065,11 +1438,18 @@ pub fn emit_usage(prompt_tokens: u64, completion_tokens: u64, total_tokens: u64)
 #[cfg(test)]
 mod tests {
     use super::{
-        context_lines, format_message, grouped_count, human_turn_stats, sanitize_plain_inline,
-        sanitize_terminal_inline, sanitize_terminal_text, spinner_mode, static_spinner_line,
-        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
-        PromptSafeAsyncNotice, RenderMode, SpinnerMode, TerminalTextSanitizer,
+        approval_header_with_mode, approval_options_with_mode, context_lines,
+        deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
+        format_message, grouped_count, human_turn_stats, milestone_line_with_mode,
+        sanitize_plain_inline, sanitize_terminal_inline, sanitize_terminal_text, section_heading,
+        spinner_mode, static_spinner_line, write_static_spinner, write_turn_stats,
+        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
+        SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
     };
+
+    fn sgr(rgb: (u8, u8, u8)) -> String {
+        format!("\x1b[38;2;{};{};{}m", rgb.0, rgb.1, rgb.2)
+    }
 
     #[test]
     fn strips_terminal_sequences_and_unsafe_controls() {
@@ -1287,6 +1667,123 @@ mod tests {
     }
 
     #[test]
+    fn spinner_frames_are_fox_kaomoji_not_cat() {
+        for frame in SPINNER_FRAMES {
+            assert!(frame.contains('ᴥ'), "fox muzzle missing in {frame:?}");
+            assert!(!frame.contains('ω'), "cat mouth in {frame:?}");
+            assert!(!frame.contains('ฅ'), "cat paws in {frame:?}");
+        }
+        // Frame widths stay within the padding budget applied at render time.
+        let widths: Vec<usize> = SPINNER_FRAMES.iter().map(|f| display_width(f)).collect();
+        let max = *widths.iter().max().unwrap();
+        assert!(widths.iter().all(|w| max - w <= 2), "{widths:?}");
+    }
+
+    #[test]
+    fn display_width_accounts_for_wide_identity_glyphs() {
+        assert_eq!(display_width("kitsu"), 5);
+        assert_eq!(display_width("🦊 kitsu 狐"), 11);
+        assert_eq!(display_width("( ･ᴥ･ )"), 7);
+    }
+
+    #[test]
+    fn own_glyph_set_maps_to_stable_ascii_in_plain_mode() {
+        assert_eq!(sanitize_plain_inline("◆ ◇ ◉ ◈ ⛩"), "* > o # *");
+        // The retired borrowed glyphs still degrade if they ever appear.
+        assert_eq!(sanitize_plain_inline("⏺ ⎿ ✻"), "* > *");
+    }
+
+    #[test]
+    fn milestone_is_a_torii_line_with_ascii_plain_fallback() {
+        let plain =
+            milestone_line_with_mode("context compacted (older turns summarized)", false, true);
+        assert_eq!(plain, "* context compacted (older turns summarized)");
+        assert!(plain.is_ascii());
+
+        let unstyled = milestone_line_with_mode("resumed abc123", false, false);
+        assert_eq!(unstyled, "⛩ resumed abc123");
+
+        let styled = milestone_line_with_mode("resumed abc123", true, false);
+        assert!(styled.contains(&sgr(FOX)));
+        assert_eq!(sanitize_terminal_text(&styled), "⛩ resumed abc123");
+    }
+
+    #[test]
+    fn error_notice_is_weighted_on_a_tty_and_stable_ascii_elsewhere() {
+        let message = "chat request could not reach the gateway - run `kitsu doctor --online`";
+        let styled = error_display_lines(message, true, false);
+        assert_eq!(styled.len(), 1);
+        assert!(styled[0].contains(&sgr(EMBER)));
+        assert_eq!(
+            sanitize_terminal_text(&styled[0]),
+            format!("! error: {message}")
+        );
+
+        let plain = error_display_lines(message, false, true);
+        assert_eq!(plain, vec![format!("! error: {message}")]);
+        assert!(!plain[0].contains('\u{1b}'));
+
+        // Extra lines are the actionable hint and stay untinted.
+        let multi = error_display_lines("first\nhint line", true, false);
+        assert_eq!(multi.len(), 2);
+        assert_eq!(multi[1], "hint line");
+        assert!(!multi[1].contains('\u{1b}'));
+    }
+
+    #[test]
+    fn approval_prompt_shares_one_weighted_design() {
+        let styled = approval_header_with_mode("kitsu wants to read /etc/hostname", true);
+        assert!(styled.contains("◉ permission"));
+        assert!(styled.contains("\x1b[1m"), "header must carry bold weight");
+        assert!(styled.contains(&sgr(FOX)));
+        assert_eq!(
+            sanitize_terminal_text(&styled),
+            "◉ permission — kitsu wants to read /etc/hostname"
+        );
+
+        let unstyled = approval_header_with_mode("run rm -rf /tmp/x", false);
+        assert_eq!(unstyled, "◉ permission — run rm -rf /tmp/x");
+
+        let options = approval_options_with_mode("always (/etc)", true);
+        assert_eq!(
+            sanitize_terminal_text(&options),
+            "  [y] allow once · [a] always (/etc) · [n] deny"
+        );
+        assert!(options.contains("\x1b[1m"));
+        assert!(!approval_options_with_mode("always (/etc)", false).contains('\u{1b}'));
+    }
+
+    #[test]
+    fn section_heading_is_bold_only_when_styled() {
+        assert_eq!(section_heading("permissions", false), "permissions");
+        let styled = section_heading("permissions", true);
+        assert!(styled.contains("\x1b[1m"));
+        assert_eq!(sanitize_terminal_text(&styled), "permissions");
+    }
+
+    #[test]
+    fn context_meter_tints_fill_by_utilization_thresholds() {
+        let mode = RenderMode {
+            styled: true,
+            plain: false,
+        };
+        let low = context_lines("m", 8_000, "", 8_000, 2_000, &[], mode).join("\n");
+        assert!(low.contains(&sgr(FOX)));
+        assert!(low.contains("\x1b[2m"), "empty cells must be dimmed");
+        assert!(!low.contains(&sgr(AMBER)));
+        assert!(!low.contains(&sgr(EMBER)));
+
+        let high = context_lines("m", 8_000, "", 8_000, 6_800, &[], mode).join("\n");
+        assert!(high.contains(&sgr(AMBER)), "85% utilization tints amber");
+
+        let critical = context_lines("m", 8_000, "", 8_000, 7_700, &[], mode).join("\n");
+        assert!(
+            critical.contains(&sgr(EMBER)),
+            "96% utilization tints ember"
+        );
+    }
+
+    #[test]
     fn reduced_motion_selects_a_visible_static_status() {
         assert_eq!(spinner_mode(false, false, true), SpinnerMode::Heartbeat);
         assert_eq!(spinner_mode(true, false, true), SpinnerMode::StaticStyled);
@@ -1323,5 +1820,86 @@ mod tests {
             "  * kitsu is thinking\n"
         );
         assert!(!output.contains(&b'\r'));
+    }
+
+    /// Cycle-10 G4: line-based heartbeats back off exponentially — 15s, 30s,
+    /// 60s, then every 120s — so ten minutes of waiting produces a handful of
+    /// lines instead of dozens, and each line's elapsed field is cumulative.
+    #[test]
+    fn heartbeat_cadence_backs_off_and_elapsed_is_cumulative() {
+        use super::{format_wait_elapsed, heartbeat_backoff};
+        let cadence: Vec<u64> = (0..6).map(|i| heartbeat_backoff(i).as_secs()).collect();
+        assert_eq!(cadence, [15, 30, 60, 120, 120, 120]);
+
+        // Ten minutes of waiting: 15+30+60 then 120-steps → 7 lines total.
+        let mut waited = std::time::Duration::ZERO;
+        let mut beats = 0u32;
+        while waited < std::time::Duration::from_secs(600) {
+            waited += heartbeat_backoff(beats);
+            beats += 1;
+        }
+        assert!(
+            beats <= 8,
+            "ten minutes must not stack more than 8 heartbeat lines, got {beats}"
+        );
+
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(45)),
+            "45s"
+        );
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(270)),
+            "4m30s"
+        );
+        assert_eq!(
+            format_wait_elapsed(std::time::Duration::from_secs(600)),
+            "10m00s"
+        );
+    }
+
+    #[test]
+    fn deck_markers_carry_state_by_fill_and_degrade_to_stable_ascii() {
+        // Styled TTY: fill level is the state, colour is the severity.
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Running, true, false),
+            format!("{}◆\u{1b}[39m", sgr(FOX))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::ResultReady, true, false),
+            format!("{}◈\u{1b}[39m", sgr(FOX))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Failed, true, false),
+            format!("{}◇\u{1b}[39m", sgr(EMBER))
+        );
+        assert_eq!(
+            deck_marker_with_mode(DeckState::Stopped, true, false),
+            format!("{}◇\u{1b}[39m", sgr(AMBER))
+        );
+
+        // Non-TTY keeps the glyphs and drops the colour.
+        assert_eq!(deck_marker_with_mode(DeckState::Running, false, false), "◆");
+
+        // `--plain`/`NO_COLOR`: stable ASCII, zero escape bytes.
+        for (state, marker) in [
+            (DeckState::Running, "[run]"),
+            (DeckState::ResultReady, "[rdy]"),
+            (DeckState::Failed, "[err]"),
+            (DeckState::Stopped, "[stp]"),
+        ] {
+            let rendered = deck_marker_with_mode(state, true, true);
+            assert_eq!(rendered, marker);
+            assert!(!rendered.contains('\u{1b}'));
+        }
+
+        let styled_header = deck_header_with_mode("agent deck — 2 running", true, false);
+        assert!(styled_header.contains(&sgr(CREAM)));
+        assert_eq!(
+            sanitize_terminal_text(&styled_header),
+            "◈ agent deck — 2 running"
+        );
+        let plain_header = deck_header_with_mode("agent deck — 2 running", true, true);
+        assert_eq!(plain_header, "# agent deck - 2 running");
+        assert!(!plain_header.contains('\u{1b}'));
     }
 }

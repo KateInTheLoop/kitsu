@@ -57,13 +57,22 @@ auth        = { method = "bearer-env", env = "CUSTOM_GATEWAY_TOKEN", refresh_hin
 # Token: huggingface.co/settings/tokens ("Make calls to Inference Providers").
 # HF PRO adds monthly inference credits + higher limits, spent via the token.
 # Model = "<org>/<model>", optionally pin a provider: "<org>/<model>:together".
+# Reasoning models (e.g. openai/gpt-oss-120b) spend hidden reasoning tokens;
+# pass a generous --max-output-tokens or short answers come back empty.
 [gateways.huggingface]
 flavor      = "openai"
 base_url    = "https://router.huggingface.co"
 chat_path   = "/v1/chat/completions"
 models_path = "/v1/models"
 model       = "meta-llama/Llama-3.3-70B-Instruct"
-auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a token at https://huggingface.co/settings/tokens and `export HF_TOKEN=hf_...`" }
+# Llama-3.3-70B's window; hosted models are far larger than the local-model
+# 8192 fallback (which false-alarms the mismatch heuristic). Override per
+# model with --context-window.
+context_window = 131072
+# Hint wording is deliberately filter-safe: kitsu suppresses any hint that
+# resembles a credential (URL schemes, `hf_`/`sk-` prefixes, bare `token`
+# labels), so this must describe the fix without quoting one.
+auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Inference Providers key under huggingface.co settings, then export HF_TOKEN" }
 
 # ── OpenAI (hosted) ──────────────────────────────────────────────────────────
 [gateways.openai]

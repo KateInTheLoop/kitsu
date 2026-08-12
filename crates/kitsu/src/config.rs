@@ -12,12 +12,27 @@ use serde::Deserialize;
 pub struct Config {
     #[serde(default)]
     pub default_gateway: Option<String>,
+    /// Register the model-callable `workspace_diff` evidence tool in chat when
+    /// the launch directory is a Git worktree (docs/workspace-diff-tool.md).
+    /// `false` disables registration entirely, like `--no-workspace-evidence`.
+    #[serde(default)]
+    pub workspace_evidence: Option<bool>,
+    /// Per-turn cap on subagent spawns across `spawn_agent`, `spawn_agents`,
+    /// and `spawn_agent_bg`. Spawns beyond the cap return a tool error the
+    /// model sees. Unset: 8 in interactive chat, 2 in scripted/piped
+    /// automation (small local models storm agents on trivial turns).
+    /// `--agent-spawn-cap` overrides; 0 disables spawning for the run.
+    #[serde(default)]
+    pub agent_spawn_cap: Option<u32>,
     #[serde(default)]
     pub gateways: BTreeMap<String, Gateway>,
 }
 
-/// A single named gateway profile.
+/// A single named gateway profile. Unknown keys are rejected loudly: a typo
+/// like `token_env` (the real key is `auth.env`) silently changing behavior
+/// cost a cycle-14 audit journey its credentials.
 #[derive(Debug, Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Gateway {
     pub flavor: String,
     pub base_url: String,
@@ -47,6 +62,7 @@ fn default_chat_path() -> String {
 /// hint must never leak via `{:?}` / `debug!(?config)`. `Gateway` and `Config`
 /// derive `Debug` and delegate here.
 #[derive(Clone, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthConfig {
     #[serde(default = "default_auth_method")]
     pub method: String,
@@ -133,6 +149,10 @@ pub enum ConfigError {
     Parse {
         line: Option<usize>,
         column: Option<usize>,
+        /// Field-name-level detail that is safe to echo (serde's
+        /// "unknown field `x`, expected one of …" names keys, never values).
+        /// Everything else stays withheld.
+        hint: Option<String>,
     },
     UnknownGateway {
         name: String,
@@ -159,10 +179,20 @@ impl std::fmt::Display for ConfigError {
             ConfigError::Parse {
                 line: Some(line),
                 column: Some(column),
-            } => write!(
-                f,
-                "config error: TOML parse failed at line {line}, column {column} (source excerpt withheld to avoid echoing credentials)"
-            ),
+                hint,
+            } => {
+                write!(
+                    f,
+                    "config error: TOML parse failed at line {line}, column {column}"
+                )?;
+                match hint {
+                    Some(hint) => write!(f, ": {hint}"),
+                    None => write!(f, " (source excerpt withheld to avoid echoing credentials)"),
+                }
+            }
+            ConfigError::Parse { hint: Some(hint), .. } => {
+                write!(f, "config error: TOML parse failed: {hint}")
+            }
             ConfigError::Parse { .. } => write!(
                 f,
                 "config error: TOML parse failed (source excerpt withheld to avoid echoing credentials)"
@@ -235,9 +265,14 @@ impl Config {
                         + 1;
                     Some((line, column))
                 });
+                // serde's unknown-field message enumerates key NAMES only —
+                // safe to surface, and exactly what a typo'd key needs.
+                let message = error.message().to_string();
+                let hint = message.starts_with("unknown field").then_some(message);
                 ConfigError::Parse {
                     line: location.map(|(line, _)| line),
                     column: location.map(|(_, column)| column),
+                    hint,
                 }
             }),
             Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(Config::default()),
@@ -364,6 +399,29 @@ mod tests {
             !format!("{gw:?}").contains("super-secret-token-value"),
             "token leaked through Gateway Debug"
         );
+    }
+
+    /// A typo'd config key (the cycle-14 audit hit `token_env` for `env`) must
+    /// fail loudly with the key names — and never fall back to a silently
+    /// different auth behavior.
+    #[test]
+    fn unknown_auth_key_is_rejected_with_field_names_only() {
+        const SECRET: &str = "hf_unknown_field_secret_value";
+        let directory = tempfile::tempdir().expect("temp config directory");
+        let path = directory.path().join("config.toml");
+        std::fs::write(
+            &path,
+            format!(
+                "[gateways.example]\nflavor = \"openai\"\nbase_url = \"https://x\"\nauth = {{ method = \"bearer-env\", token_env = \"{SECRET}\" }}\n"
+            ),
+        )
+        .expect("write config with unknown auth key");
+
+        let error = Config::load(&path).expect_err("unknown key must be rejected");
+        let display = error.to_string();
+        assert!(display.contains("unknown field"), "{display}");
+        assert!(display.contains("token_env"), "{display}");
+        assert!(!display.contains(SECRET), "value leaked: {display}");
     }
 
     #[test]

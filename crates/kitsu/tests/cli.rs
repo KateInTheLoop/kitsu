@@ -415,6 +415,81 @@ fn test_init_is_no_clobber_and_doctor_is_read_only_json() {
     assert!(!home.path().join(".kitsu").exists());
 }
 
+/// Cycle-8 docs-drift finding: `kitsu init` used to emit `flavor = "ollama"`
+/// and `127.0.0.1`, disagreeing with every README provider recipe (which all
+/// use `flavor = "openai"`), and defaulted to a model tag
+/// (`qwen2.5-coder:7b`) that 404s against what `ollama pull qwen2.5-coder`
+/// actually produces. The starter config must now match README's "Ollama
+/// (local)" recipe exactly on the fields that matter (flavor, base_url,
+/// chat_path, models_path, model, auth).
+#[test]
+fn test_init_generated_config_matches_the_readme_ollama_recipe() {
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("kitsu.toml");
+    let mut init = base_cmd(home.path());
+    init.args(["init", "--path", &config.to_string_lossy()])
+        .assert()
+        .success();
+    let contents = fs::read_to_string(&config).expect("starter config");
+    let parsed: toml::Value = contents.parse().expect("starter config is valid TOML");
+    let gateway = &parsed["gateways"]["ollama"];
+    assert_eq!(gateway["flavor"].as_str(), Some("openai"));
+    assert_eq!(gateway["base_url"].as_str(), Some("http://localhost:11434"));
+    assert_eq!(gateway["chat_path"].as_str(), Some("/v1/chat/completions"));
+    assert_eq!(gateway["models_path"].as_str(), Some("/v1/models"));
+    assert_eq!(gateway["model"].as_str(), Some("llama3.2"));
+    assert_eq!(gateway["auth"]["method"].as_str(), Some("none"));
+}
+
+/// The generated config's non-`base_url` fields (flavor, paths, auth) must
+/// actually produce a working request against an OpenAI-compatible endpoint
+/// — the shape Ollama serves. This swaps only `base_url` to a local mock
+/// (standing in for a real `ollama serve`) and otherwise runs the file
+/// `kitsu init` wrote, byte-for-byte, through `kitsu ask`.
+#[tokio::test]
+#[serial]
+async fn test_init_generated_config_works_end_to_end_against_an_ollama_shaped_endpoint() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/chat/completions"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "hi from ollama-shaped mock"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("kitsu.toml");
+    let mut init = base_cmd(home.path());
+    init.args(["init", "--path", &config.to_string_lossy()])
+        .assert()
+        .success();
+    let generated = fs::read_to_string(&config).expect("starter config");
+    let live = generated.replace("http://localhost:11434", &server.uri());
+    assert_ne!(live, generated, "base_url substitution must actually apply");
+    fs::write(&config, live).unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args([
+        "--config",
+        &config.to_string_lossy(),
+        "--no-stream",
+        "ask",
+        "hi",
+    ])
+    .assert()
+    .success()
+    .stdout(predicate::str::contains("hi from ollama-shaped mock"));
+    server.verify().await;
+}
+
 #[test]
 fn test_doctor_never_echoes_static_or_malformed_config_secrets() {
     let home = TempDir::new().expect("temp home");
@@ -851,6 +926,42 @@ async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
             .assert()
             .success();
         assert!(export.is_file());
+
+        // No --format: the destination extension decides, and says so.
+        let inferred = home_path.join("inferred-export.json");
+        let mut inferred_cmd = base_cmd(&home_path);
+        inferred_cmd
+            .args([
+                "sessions",
+                "export",
+                &forked_id,
+                &inferred.to_string_lossy(),
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains(
+                "inferred --format json from the .json destination",
+            ));
+        serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&inferred).unwrap())
+            .expect("inferred export is a JSON snapshot");
+
+        // Anything else keeps the Markdown default, silently.
+        let markdown = home_path.join("inferred-export.md");
+        let mut markdown_cmd = base_cmd(&home_path);
+        markdown_cmd
+            .args([
+                "sessions",
+                "export",
+                &forked_id,
+                &markdown.to_string_lossy(),
+            ])
+            .assert()
+            .success()
+            .stderr(predicate::str::contains("inferred --format").not());
+        assert!(
+            serde_json::from_str::<serde_json::Value>(&fs::read_to_string(&markdown).unwrap())
+                .is_err()
+        );
 
         let mut archive = base_cmd(&home_path);
         archive
@@ -1737,6 +1848,9 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
         [
             "run_started",
             "command_started",
+            // The one-shot evidence disclosure is framed inside the command that
+            // caused it, before the prompt that carries the bytes.
+            "command_result",
             "turn_started",
             "provider_request",
             "provider_attempt",
@@ -1747,13 +1861,17 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
             "final_summary",
         ]
     );
-    assert_eq!(events[4]["category"], "cancelled");
-    assert_eq!(events[4]["outcome"], "cancelled");
-    assert_eq!(events[5]["status"], "discarded");
-    assert_eq!(events[6]["kind"], "cancelled");
-    assert_eq!(events[7]["status"], "cancelled");
+    assert_eq!(events[2]["result"]["kind"], "review_disclosure");
+    assert_eq!(events[2]["result"]["model_disclosed"], true);
+    assert_eq!(events[2]["result"]["model_read_root_granted"], false);
+    assert!(events[2]["result"]["evidence_bytes"].as_u64().unwrap() > 0);
+    assert_eq!(events[5]["category"], "cancelled");
+    assert_eq!(events[5]["outcome"], "cancelled");
+    assert_eq!(events[6]["status"], "discarded");
+    assert_eq!(events[7]["kind"], "cancelled");
     assert_eq!(events[8]["status"], "cancelled");
     assert_eq!(events[9]["status"], "cancelled");
+    assert_eq!(events[10]["status"], "cancelled");
 }
 
 #[tokio::test]
@@ -2707,20 +2825,41 @@ async fn test_invalid_model_friendly_error() {
 #[tokio::test]
 #[serial]
 async fn test_script_allow_turn_errors_preserves_zero_exit() {
-    use wiremock::matchers::{method, path};
+    use wiremock::matchers::{body_string_contains, method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
+    // --allow-turn-errors accepts PARTIAL success: one turn fails, one turn
+    // succeeds, and the script still exits 0 with a failure summary.
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
+        .and(body_string_contains("will fail"))
         .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"still works"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .with_priority(10)
         .mount(&server)
         .await;
 
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), &server.uri());
     let script_path = home.path().join("allow-errors.txt");
-    fs::write(&script_path, "will fail\n").unwrap();
+    fs::write(&script_path, "will fail\nthis one works\n").unwrap();
     let script = script_path.to_string_lossy().to_string();
     let home_path = home.path().to_path_buf();
 
@@ -2737,7 +2876,157 @@ async fn test_script_allow_turn_errors_preserves_zero_exit() {
         ]);
         cmd.assert()
             .success()
+            .stdout(predicate::str::contains("still works"))
             .stderr(predicate::str::contains("script summary: 1 failure"));
+    })
+    .await
+    .expect("join");
+}
+
+/// `--allow-turn-errors` accepts partial success, not total failure: a script
+/// where every turn failed must still exit nonzero.
+#[tokio::test]
+#[serial]
+async fn test_script_allow_turn_errors_all_failed_exits_nonzero() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(503).set_body_string("temporarily unavailable"))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("all-failed.txt");
+    fs::write(&script_path, "will fail\n").unwrap();
+    let script = script_path.to_string_lossy().to_string();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script,
+            "--allow-turn-errors",
+        ]);
+        cmd.assert()
+            .failure()
+            .code(2)
+            .stderr(predicate::str::contains(
+                "all 1 turn(s) or command(s) failed",
+            ));
+    })
+    .await
+    .expect("join");
+}
+
+/// F2 (cycle 6): a tool error the model recovers from within the turn (failed
+/// call, then a corrected successful call, then a final answer) must COMMIT in
+/// strict scripted mode — the turn is judged by its final state, not by the
+/// cumulative error count.
+#[tokio::test]
+#[serial]
+async fn test_scripted_recovered_tool_error_commits_turn() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    // Round 3: after the successful read result ("median-ok") is fed back,
+    // finish with the answer.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("median-ok"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "recovered and finished"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Round 2: the first tool call failed; retry with corrected arguments.
+    let data_path_holder = TempDir::new().unwrap();
+    let data_path = data_path_holder.path().join("data.txt");
+    fs::write(&data_path, "median-ok").unwrap();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "retry_ok",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_read_file",
+                            "arguments": serde_json::json!({"path": data_path}).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .mount(&server)
+        .await;
+    // Round 1: a malformed tool call that fails locally (bad arguments).
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "first_try",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("recover.script");
+    fs::write(&script, "read the data file\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let allowed = data_path_holder.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--allow-path",
+            &allowed.to_string_lossy(),
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("recovered and finished"))
+            .stderr(predicate::str::contains(
+                "1 earlier tool error(s) were recovered within the turn",
+            ))
+            .stderr(predicate::str::contains("strict scripted turn failed").not());
     })
     .await
     .expect("join");
@@ -2983,6 +3272,136 @@ async fn test_failed_script_turn_is_transactionally_rolled_back() {
     );
 }
 
+/// Cycle-10 G1 acceptance: a strict scripted turn that completes a file write
+/// and then fails is rolled back, but the retained on-disk change is not
+/// orphaned — the next turn's request carries a host-authored note naming the
+/// written path (so the model can name its own edits without re-reading
+/// blind), stderr says what was retained, and the end-of-run summary repeats
+/// the count.
+#[tokio::test]
+#[serial]
+async fn test_rolled_back_turn_briefs_next_turn_about_retained_file_changes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().unwrap();
+    let written = repo.path().join("retained.txt");
+    let write_args = format!(
+        r#"{{\"path\":\"{}\",\"content\":\"RETAINED-CONTENT-SENTINEL\"}}"#,
+        written.to_string_lossy().replace('\\', "\\\\")
+    );
+    let write_round = [
+        format!(
+            r#"data: {{"choices":[{{"index":0,"delta":{{"tool_calls":[{{"index":0,"id":"call_write","type":"function","function":{{"name":"fs_write_file","arguments":"{write_args}"}}}}]}},"finish_reason":null}}]}}"#
+        ),
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#.to_string(),
+        "data: [DONE]".to_string(),
+        String::new(),
+    ]
+    .join("\n\n");
+    let denied_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":"call_denied","type":"function","function":{"name":"fs_read_file","arguments":"{\"path\":\"/etc/hostname\"}"}}]},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let finish_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"attempt finished"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    let second_round = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"second turn done"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let sse = if body.contains("SECOND_TURN_PROMPT") {
+                second_round.clone()
+            } else if body.contains("PolicyDenied") {
+                finish_round.clone()
+            } else if body.contains("\"role\":\"tool\"") {
+                denied_round.clone()
+            } else {
+                write_round.clone()
+            };
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse)
+        })
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script_path = home.path().join("retained.txt.script");
+    fs::write(&script_path, "WRITE_THEN_FAIL_PROMPT\nSECOND_TURN_PROMPT\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script = script_path.to_string_lossy().to_string();
+
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        cmd.current_dir(&repo_path);
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--allow-read-write",
+            &repo_path.to_string_lossy(),
+            "--script",
+            &script,
+        ]);
+        cmd.assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("failed turn rolled back"))
+            .stderr(predicate::str::contains(
+                "file change(s) from the rolled-back turn remain on disk",
+            ))
+            .stderr(predicate::str::contains(
+                "file change(s) from rolled-back turn(s) remain on disk",
+            ));
+    })
+    .await
+    .expect("join");
+
+    // Ground truth: the write from the rolled-back turn is still on disk.
+    assert_eq!(
+        fs::read_to_string(&written).expect("retained write must survive the rollback"),
+        "RETAINED-CONTENT-SENTINEL"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let recovery = requests
+        .iter()
+        .find(|request| String::from_utf8_lossy(&request.body).contains("SECOND_TURN_PROMPT"))
+        .expect("second turn request");
+    let body = String::from_utf8_lossy(&recovery.body);
+    assert!(
+        body.contains("failed turn retained file changes"),
+        "next turn was not briefed about retained changes: {body}"
+    );
+    assert!(
+        body.contains("retained.txt"),
+        "the briefing must name the retained path: {body}"
+    );
+    assert!(
+        !body.contains("WRITE_THEN_FAIL_PROMPT"),
+        "rolled-back turn content leaked into the next turn: {body}"
+    );
+}
+
 #[test]
 fn test_unterminated_script_block_is_line_aware_and_nonzero() {
     let home = TempDir::new().expect("temp home");
@@ -3087,8 +3506,13 @@ fn test_diff_command_reports_verified_tracked_and_untracked_changes() {
         .stderr(predicate::str::contains("+new evidence"));
 }
 
+/// `/diff` is host-owned evidence, not a model read: launched in a
+/// subdirectory with **no** filesystem grant at all it still resolves the
+/// pathspec against the repository root and renders the diff, and
+/// `/permissions` reports no model read roots while naming the host-evidence
+/// root it used.
 #[test]
-fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
+fn test_diff_from_subdirectory_resolves_filter_without_grants() {
     let home = TempDir::new().unwrap();
     write_config(home.path(), "http://127.0.0.1:1");
     let repo = TempDir::new().unwrap();
@@ -3120,28 +3544,35 @@ fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
     let script = package.join("diff-script.txt");
     fs::write(&script, "/diff src/lib.rs\n/quit\n").unwrap();
 
-    let mut denied = base_cmd(home.path());
-    denied.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-    denied.current_dir(&package);
-    denied.args([
+    fs::write(&script, "/diff src/lib.rs\n/permissions\n/quit\n").unwrap();
+
+    let mut ungranted = base_cmd(home.path());
+    ungranted.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    ungranted.current_dir(&package);
+    ungranted.args([
         "--gateway",
         "example",
         "chat",
-        "--allow-path",
-        &package.to_string_lossy(),
         "--script",
         &script.to_string_lossy(),
     ]);
-    denied
+    ungranted
         .assert()
-        .failure()
-        .code(1)
-        .stderr(predicate::str::contains("read permission required"));
+        .success()
+        .stderr(predicate::str::contains("crates/widget/src/lib.rs"))
+        .stderr(predicate::str::contains("+after"))
+        .stderr(predicate::str::contains("read permission required").not())
+        .stderr(predicate::str::contains("read roots   none"))
+        .stderr(predicate::str::contains("host evidence"))
+        .stderr(predicate::str::contains(
+            "never a model read root, never a model filesystem target",
+        ));
 
-    let mut allowed = base_cmd(home.path());
-    allowed.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-    allowed.current_dir(&package);
-    allowed.args([
+    // A read grant neither widens nor narrows the host-evidence scope.
+    let mut granted = base_cmd(home.path());
+    granted.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    granted.current_dir(&package);
+    granted.args([
         "--gateway",
         "example",
         "chat",
@@ -3150,7 +3581,7 @@ fn test_diff_from_subdirectory_requires_root_permission_and_resolves_filter() {
         "--script",
         &script.to_string_lossy(),
     ]);
-    allowed
+    granted
         .assert()
         .success()
         .stderr(predicate::str::contains("crates/widget/src/lib.rs"))
@@ -3559,6 +3990,33 @@ fn test_unknown_script_command_is_echoed_suggested_and_nonzero() {
         .stderr(predicate::str::contains("command> /statsu"))
         .stderr(predicate::str::contains("did you mean /status"))
         .stderr(predicate::str::contains("typo.txt:1"));
+}
+
+/// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is
+/// intercepted with a close-match suggestion and an escape hatch, instead of
+/// being silently queued as a prompt.
+#[test]
+#[serial]
+fn test_queue_subaction_typo_suggests_close_match_instead_of_queueing() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("queue-typo.txt");
+    fs::write(&script_path, "/queue lst\n").unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+    cmd.args([
+        "--gateway",
+        "example",
+        "chat",
+        "--script",
+        &script_path.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("did you mean '/queue list'"))
+        .stderr(predicate::str::contains("/queue add lst"))
+        .stderr(predicate::str::contains("1 / 8 prompts queued").not());
 }
 
 #[test]
@@ -5050,4 +5508,2214 @@ auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
     })
     .await
     .expect("join");
+}
+
+// --- deadline expiry preserves delivered partial output (cycle 6) ------------
+
+/// SSE server that streams one real fragment and then stalls until the client
+/// gives up, so the inference deadline expires mid-answer. Serves any number
+/// of connections; abort the returned handle when done.
+async fn spawn_stalling_sse_server() -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let address = listener.local_addr().unwrap();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                return;
+            };
+            tokio::spawn(async move {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 2048];
+                while !request.windows(4).any(|window| window == b"\r\n\r\n") {
+                    let Ok(read) = socket.read(&mut buffer).await else {
+                        return;
+                    };
+                    if read == 0 {
+                        return;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let _ = socket
+                    .write_all(
+                        b"HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ntransfer-encoding: chunked\r\nconnection: close\r\n\r\n",
+                    )
+                    .await;
+                let fragment = b"data: {\"choices\":[{\"index\":0,\"delta\":{\"content\":\"partial answer under deadline\"},\"finish_reason\":null}]}\n\n";
+                let _ = socket
+                    .write_all(format!("{:x}\r\n", fragment.len()).as_bytes())
+                    .await;
+                let _ = socket.write_all(fragment).await;
+                let _ = socket.write_all(b"\r\n").await;
+                let _ = socket.flush().await;
+                // Stall: never finish the body. The client's deadline fires.
+                tokio::time::sleep(std::time::Duration::from_secs(60)).await;
+            });
+        }
+    });
+    (address, server)
+}
+
+/// Human mode: a deadline that expires mid-stream keeps the delivered partial
+/// answer, closes it with an in-band truncation marker plus a trailing newline
+/// (so stderr never fuses onto the stream), and reports a partial notice
+/// instead of DISCARDED scare text. The exit code stays 2.
+#[tokio::test]
+#[serial]
+async fn test_ask_timeout_preserves_partial_streamed_answer() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--timeout-secs", "2", "ask", "long question"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stdout.contains("partial answer under deadline"),
+        "delivered partial text must be kept: {stdout:?}"
+    );
+    assert!(
+        stdout.contains("[stopped: deadline expired - answer is partial]"),
+        "stdout must carry an in-band truncation marker: {stdout:?}"
+    );
+    assert!(
+        stdout.ends_with('\n'),
+        "the partial stream must be newline-terminated: {stdout:?}"
+    );
+    assert!(
+        stderr.contains("timed out after 2s - the answer above is partial"),
+        "stderr must explain the partial outcome: {stderr:?}"
+    );
+    assert!(
+        !stderr.contains("DISCARDED"),
+        "delivered output must not be labeled DISCARDED: {stderr:?}"
+    );
+}
+
+/// JSONL mode: the same expiry closes the provisional-output transaction as
+/// `committed_partial` with a final `assistant` payload matching the delta
+/// concatenation, while the turn still fails (error event, exit 2).
+#[tokio::test]
+#[serial]
+async fn test_jsonl_ask_timeout_emits_committed_partial_disposition() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "--timeout-secs", "2", "ask", "long question"])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let deltas: String = events
+        .iter()
+        .filter(|event| event["type"] == "assistant_delta")
+        .map(|event| event["text"].as_str().unwrap())
+        .collect();
+    let assistant = events
+        .iter()
+        .position(|event| event["type"] == "assistant")
+        .expect("partial assistant payload must be emitted");
+    assert_eq!(events[assistant]["text"].as_str().unwrap(), deltas);
+    assert!(deltas.contains("partial answer under deadline"));
+    assert!(deltas.ends_with("[stopped: deadline expired - answer is partial]"));
+    let disposition = events
+        .iter()
+        .position(|event| event["type"] == "assistant_disposition")
+        .expect("disposition must close the transaction");
+    assert_eq!(events[disposition]["status"], "committed_partial");
+    assert!(events[disposition]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("timed out after 2s"));
+    let error = events
+        .iter()
+        .position(|event| event["type"] == "error")
+        .expect("the turn still fails");
+    assert_eq!(events[error]["exit_code"], 2);
+    assert!(assistant < disposition && disposition < error);
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "error");
+}
+
+/// The one-shot piped path (here: top-level `review`, which streams without
+/// tools) gets the same honest partial outcome on deadline expiry.
+#[tokio::test]
+#[serial]
+async fn test_review_timeout_preserves_partial_streamed_answer() {
+    let (address, server) = spawn_stalling_sse_server().await;
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("review-me.rs"), "fn reviewed() {}\n").unwrap();
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &format!("http://{address}"));
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--timeout-secs",
+                "2",
+                "review",
+                "--instructions",
+                "review the working tree",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    server.abort();
+    assert_eq!(output.status.code(), Some(2));
+    let stdout = String::from_utf8(output.stdout).unwrap();
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(stdout.contains("partial answer under deadline"));
+    assert!(stdout.contains("[stopped: deadline expired - answer is partial]"));
+    assert!(stderr.contains("timed out after 2s - the answer above is partial"));
+    assert!(!stderr.contains("DISCARDED"));
+}
+
+// --- context-window runtime cross-check (cycle 6) ----------------------------
+
+fn window_mismatch_sse() -> String {
+    [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"generic answer"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        r#"data: {"choices":[],"usage":{"prompt_tokens":4096,"completion_tokens":2,"total_tokens":4098}}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n")
+}
+
+/// When the provider reports accepting far fewer prompt tokens than the sent
+/// estimate (the shape of a server clamping to a smaller real window), human
+/// mode warns once on stderr without failing the turn.
+#[tokio::test]
+#[serial]
+async fn test_context_window_mismatch_warns_on_stderr() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let big_prompt = "review this attachment ".repeat(1000); // ~23k chars ≈ 5.7k tokens
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["ask", &big_prompt])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let stderr = String::from_utf8(output.stderr).unwrap();
+    assert!(
+        stderr.contains("context window mismatch suspected"),
+        "stderr must warn about the truncating server window: {stderr:?}"
+    );
+    assert!(stderr.contains("accepted 4096"));
+}
+
+/// JSONL mode surfaces the same evidence as a typed event.
+#[tokio::test]
+#[serial]
+async fn test_jsonl_context_window_mismatch_emits_typed_event() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let big_prompt = "review this attachment ".repeat(1000);
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "ask", &big_prompt])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let mismatch = events
+        .iter()
+        .find(|event| event["type"] == "context_window_mismatch")
+        .unwrap_or_else(|| panic!("typed mismatch event missing: {events:#?}"));
+    assert_eq!(mismatch["reported_prompt_tokens"], 4096);
+    assert_eq!(mismatch["resolved_window"], 8192);
+    assert!(mismatch["estimated_sent_tokens"].as_u64().unwrap() > 4096);
+    assert_eq!(events.last().unwrap()["status"], "ok");
+}
+
+/// A scripted `/context` after the mismatch turn carries the evidence in its
+/// provenance payload, and the stderr warning fires exactly once.
+#[tokio::test]
+#[serial]
+async fn test_context_command_surfaces_window_runtime_evidence() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(window_mismatch_sse()),
+        )
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("mismatch.script");
+    let big_prompt = "review this attachment ".repeat(1000).replace('\n', " ");
+    fs::write(&script, format!("{big_prompt}\n/context\n")).unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().to_string();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "chat", "--script", &script_path])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "context_window_mismatch")
+            .count(),
+        1,
+        "the mismatch warning must fire exactly once: {events:#?}"
+    );
+    let context = events
+        .iter()
+        .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "context")
+        .expect("scripted /context result");
+    let evidence = &context["result"]["runtime_evidence"];
+    assert_eq!(evidence["reported_prompt_tokens"], 4096);
+    assert_eq!(evidence["resolved_window"], 8192);
+}
+
+/// Gap 1 (cycle 6): the system prompt sent to the provider must tell the model
+/// its working directory and every granted root with its authority, and steer
+/// it to explore instead of asking the user for paths.
+#[tokio::test]
+#[serial]
+async fn test_piped_chat_system_prompt_names_cwd_and_granted_roots() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        r#"data: {"choices":[{"index":0,"delta":{"content":"ok"},"finish_reason":null}]}"#,
+        r#"data: {"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}"#,
+        "data: [DONE]",
+        "",
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse),
+        )
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    let workdir = TempDir::new().unwrap();
+    let granted = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let workdir_path = workdir.path().to_path_buf();
+    let granted_path = granted.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&workdir_path)
+            .args([
+                "--gateway",
+                "example",
+                "chat",
+                "--allow-path",
+                &granted_path.to_string_lossy(),
+                "Explain this codebase",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+    assert_eq!(output.status.code(), Some(0));
+
+    let requests = server.received_requests().await.unwrap();
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let system = body["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("Current working directory:"),
+        "system prompt must name the cwd: {system:?}"
+    );
+    // Paths may be canonicalized for display; assert on the directory name.
+    let granted_name = granted.path().file_name().unwrap().to_string_lossy();
+    assert!(
+        system.contains(&format!("{granted_name} (read-only)")),
+        "system prompt must list the granted root with its authority: {system:?}"
+    );
+    assert!(
+        system.contains("explore the granted roots"),
+        "system prompt must steer the model to explore: {system:?}"
+    );
+}
+
+// --- agent deck: profile spawns, non-interactive joins, broken pipes ---------
+
+/// Cycle-7 F1: selecting a built-in profile must not inject a `reasoning_effort`
+/// field. The CLI flag is "omitted by default so non-reasoning endpoints receive
+/// no extra request field"; a profile spawn that ignored that rule made every
+/// profile 400 on the default local gateway while the model reported success.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_profile_background_spawn_sends_no_reasoning_effort_field() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"content\":\"profile audit task\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "PROFILE_RESULT_SENTINEL"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "profile-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"profile audit task\",\"profile\":\"reviewer\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("profile-spawn.script");
+    fs::write(&script, "delegate an audit\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("PROFILE_RESULT_SENTINEL"),
+        "stderr: {stderr}"
+    );
+
+    let requests = server.received_requests().await.expect("recorded requests");
+    assert!(!requests.is_empty());
+    for request in &requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("reasoning_effort").is_none(),
+            "a profile that requests no effort must not add the field: {body}"
+        );
+    }
+}
+
+/// Cycle-7 F2b / git-workflow gap 2: a script that ends while a background agent
+/// is healthy joins it (the `/quit wait` semantics), reports its real result, and
+/// exits 0 — instead of cancelling the work and blaming a turn that committed.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_script_exit_joins_live_background_agents_and_never_claims_a_rollback() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"content\":\"slow detached task\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(900))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "DETACHED_RESULT_SENTINEL"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "detached-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"slow detached task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("join-at-exit.script");
+    fs::write(&script, "start detached work\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let (human, jsonl) = tokio::task::spawn_blocking(move || {
+        let run = |jsonl: bool| {
+            let mut cmd = base_cmd(&home_path);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+            if jsonl {
+                cmd.arg("--jsonl");
+            }
+            cmd.args([
+                "--gateway",
+                "example",
+                "chat",
+                "--no-session",
+                "--allow-path",
+                &home_path.to_string_lossy(),
+                "--script",
+                &script_path,
+            ]);
+            cmd.output().unwrap()
+        };
+        (run(false), run(true))
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&human.stderr).into_owned();
+    assert!(human.status.success(), "stderr: {stderr}");
+    assert!(stderr.contains("joining them"), "stderr: {stderr}");
+    assert!(
+        stderr.contains("joined 1 background agent(s) before exit"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("DETACHED_RESULT_SENTINEL"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rolled back"),
+        "the turn committed; nothing was rolled back: {stderr}"
+    );
+    assert!(!stderr.contains("cancelled"), "stderr: {stderr}");
+
+    assert!(
+        jsonl.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&jsonl.stderr)
+    );
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let background = events
+        .iter()
+        .find(|event| event["type"] == "background_result")
+        .expect("background result event");
+    assert_eq!(background["status"], "done");
+    assert_eq!(background["joined"], true);
+    assert_eq!(background["result"], "DETACHED_RESULT_SENTINEL");
+    let summary = events
+        .iter()
+        .find(|event| event["type"] == "final_summary")
+        .expect("final summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["failures"], 0);
+    server.verify().await;
+}
+
+/// When the bounded join really is exceeded, the cancellation names the policy
+/// that caused it. It must never reuse the rolled-back-turn wording.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_script_exit_cancellation_names_shutdown_policy_not_a_rollback() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"content\":\"endless detached task\"",
+        ))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "never observed"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "foreground complete"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "endless-call-1",
+                        "type": "function",
+                        "function": {
+                            "name": "spawn_agent_bg",
+                            "arguments": "{\"task\":\"endless detached task\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("cancel-at-exit.script");
+    fs::write(&script, "start endless work\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).arg("--no-stream");
+        cmd.args([
+            "--gateway",
+            "example",
+            "--agent-join-timeout",
+            "0",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            "--script",
+            &script_path,
+        ]);
+        cmd.output().unwrap()
+    })
+    .await
+    .unwrap();
+
+    let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+    assert!(!output.status.success(), "stderr: {stderr}");
+    assert!(
+        stderr.contains("cancelled by shutdown policy"),
+        "stderr: {stderr}"
+    );
+    assert!(
+        !stderr.contains("parent turn was rolled back"),
+        "the turn committed; the cancellation must not blame a rollback: {stderr}"
+    );
+    assert!(
+        !stderr.contains("rolled-back turn"),
+        "the turn committed; the cancellation must not blame a rollback: {stderr}"
+    );
+}
+
+/// Git-workflow gap 3: `kitsu <cmd> | head -1` used to exit 101 with a Rust
+/// panic message. A reader that goes away first is not a crash.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_closed_output_pipe_exits_cleanly_without_a_panic() {
+    use std::process::Stdio;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    for args in [vec!["--help"], vec!["sessions"], vec!["sessions", "--json"]] {
+        let mut command = std::process::Command::new(
+            assert_cmd::cargo::cargo_bin("kitsu")
+                .to_string_lossy()
+                .into_owned(),
+        );
+        command
+            .env("HOME", home.path())
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+            .args(&args)
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let mut child = command.spawn().expect("spawn kitsu");
+        // Close the read end before the child writes: exactly what `| head -1`
+        // does once it has what it wants.
+        drop(child.stdout.take());
+        let mut stderr = String::new();
+        if let Some(mut handle) = child.stderr.take() {
+            use std::io::Read as _;
+            let _ = handle.read_to_string(&mut stderr);
+        }
+        let status = child.wait().expect("wait for kitsu");
+        assert_ne!(
+            status.code(),
+            Some(101),
+            "{args:?} panicked on a closed stdout: {stderr}"
+        );
+        assert!(
+            !stderr.contains("panicked at"),
+            "{args:?} printed a panic report: {stderr}"
+        );
+        assert_eq!(status.code(), Some(0), "{args:?} stderr: {stderr}");
+    }
+}
+
+// --- --allow-command explicit cwd (cycle 7 item 1) --------------------------
+
+/// The object form binds a pregrant to a working directory the user names, so
+/// automation launched outside a `--command-root` no longer has to `cd` first.
+/// The grant stays exact argv *and* exact cwd: a sibling directory inside the
+/// same root is not authorized by it.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_allow_command_object_form_binds_explicit_cwd_exactly() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let proj = TempDir::new().unwrap();
+    let launch = TempDir::new().unwrap();
+    let sub = proj.path().join("sub");
+    fs::create_dir_all(&sub).unwrap();
+    let argv = vec!["/bin/echo".to_string(), "KITSU_EXPLICIT_CWD".to_string()];
+
+    let run = |cwd: std::path::PathBuf| {
+        let argv = argv.clone();
+        let proj_root = proj.path().to_path_buf();
+        let launch_dir = launch.path().to_path_buf();
+        async move {
+            let server = MockServer::start().await;
+            let tool_args = serde_json::json!({"argv": argv, "cwd": cwd}).to_string();
+            Mock::given(method("POST"))
+                .and(path(CHAT_PATH))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "command_call_1",
+                                "type": "function",
+                                "function": {"name": "command_exec", "arguments": tool_args}
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })))
+                .with_priority(10)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(CHAT_PATH))
+                .and(body_string_contains("\"role\":\"tool\""))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "done"},
+                        "finish_reason": "stop"
+                    }]
+                })))
+                .with_priority(1)
+                .mount(&server)
+                .await;
+
+            let home = TempDir::new().unwrap();
+            write_config(home.path(), &server.uri());
+            let pregrant = serde_json::json!({"argv": argv, "cwd": proj_root}).to_string();
+            let mut cmd = base_cmd(home.path());
+            let output = cmd
+                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .current_dir(&launch_dir)
+                .args([
+                    "--gateway",
+                    "example",
+                    "--jsonl",
+                    "--no-stream",
+                    "chat",
+                    "--no-session",
+                    "--command-root",
+                    &proj_root.to_string_lossy(),
+                    "--allow-command",
+                    &pregrant,
+                    "run the pre-approved command",
+                ])
+                .output()
+                .unwrap();
+            // `home` must outlive the child process.
+            drop(home);
+            output
+        }
+    };
+
+    // Granted cwd: startup succeeds from a launch directory outside the root and
+    // the command runs unprompted.
+    let granted = run(proj.path().to_path_buf()).await;
+    assert!(
+        granted.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&granted.stderr),
+        String::from_utf8_lossy(&granted.stdout)
+    );
+    let events = String::from_utf8(granted.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("tool_finished event");
+    assert_eq!(finished["command"]["exit_code"], 0);
+    assert!(finished["command"]["stdout_tail"]
+        .as_str()
+        .unwrap()
+        .contains("KITSU_EXPLICIT_CWD"));
+
+    // A subdirectory of the same command root is a different cwd: still denied.
+    let sibling = run(sub).await;
+    let sibling_events = String::from_utf8(sibling.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(
+        !sibling_events
+            .iter()
+            .any(|event| event["type"] == "tool_finished"
+                && event["command"]["exit_code"] == serde_json::json!(0)),
+        "an explicit-cwd grant must not authorize a sibling directory: {sibling_events:?}"
+    );
+}
+
+/// The bare array form keeps meaning "the launch directory", and `/permissions`
+/// says which of the two the user actually wrote.
+#[test]
+#[serial]
+fn test_allow_command_permissions_report_cwd_provenance() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/permissions\n/quit\n").unwrap();
+
+    let mut legacy = base_cmd(home.path());
+    legacy
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "chat",
+            "--allow-command",
+            r#"["/bin/echo","hi"]"#,
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    legacy
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("launch directory"))
+        .stderr(predicate::str::contains("explicit cwd").not());
+
+    let explicit_spec =
+        serde_json::json!({"argv": ["/bin/echo", "hi"], "cwd": proj.path()}).to_string();
+    let mut explicit = base_cmd(home.path());
+    explicit
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &explicit_spec,
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    explicit
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("explicit cwd"));
+}
+
+/// `/permissions --jsonl` carries the same provenance as an additive key.
+#[test]
+#[serial]
+fn test_permissions_payload_reports_cwd_source() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let script = home.path().join("permissions.txt");
+    fs::write(&script, "/permissions\n/quit\n").unwrap();
+    let spec = serde_json::json!({"argv": ["/bin/echo", "hi"], "cwd": proj.path()}).to_string();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "--jsonl",
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &spec,
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("permissions script");
+    assert!(output.status.success());
+    let permissions = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .find(|event| event["result"]["kind"] == "permissions")
+        .expect("permissions payload");
+    assert_eq!(
+        permissions["result"]["commands"]["exact_grants"][0]["cwd_source"],
+        "explicit"
+    );
+}
+
+/// When the legacy form is unsatisfiable because the launch directory sits
+/// outside the roots, the startup error names the object syntax that fixes it.
+#[test]
+#[serial]
+fn test_allow_command_launch_cwd_outside_roots_names_object_syntax() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let launch = TempDir::new().expect("launch dir");
+    let root = proj.path().canonicalize().unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(launch.path())
+        .args([
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            r#"["/bin/echo","hi"]"#,
+            "--no-session",
+            "hello",
+        ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("\"cwd\""))
+        .stderr(predicate::str::contains(root.to_string_lossy().to_string()));
+}
+
+/// Ambiguous spellings fail closed at startup rather than silently degrading to
+/// a launch-directory grant.
+#[test]
+#[serial]
+fn test_allow_command_rejects_unknown_fields_and_relative_cwd() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+
+    for (spec, needle) in [
+        (
+            r#"{"argv":["/bin/echo"],"cd":"/tmp"}"#,
+            "invalid --allow-command value",
+        ),
+        (
+            r#"{"argv":["/bin/echo"],"cwd":"relative"}"#,
+            "must be an absolute path",
+        ),
+    ] {
+        let mut cmd = base_cmd(home.path());
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(proj.path())
+            .args([
+                "chat",
+                "--command-root",
+                &proj.path().to_string_lossy(),
+                "--allow-command",
+                spec,
+                "--no-session",
+                "hello",
+            ]);
+        cmd.assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains(needle));
+    }
+}
+
+// --- pregranted commands disclosed to the model (cycle 8 item 2) -----------
+
+/// Cycle-8 audit gap 3: the exact `--allow-command` pregrant must be named
+/// verbatim (argv + cwd) in the system prompt sent to the provider, not just
+/// surfaced through `/permissions`/JSONL — otherwise a tool-capable model can
+/// only guess an invocation. This never exercises the tool call itself: the
+/// disclosure must already be present in the very first request.
+#[tokio::test]
+#[serial]
+async fn test_system_prompt_discloses_the_exact_pregranted_command() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let proj = TempDir::new().unwrap();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let pregrant = serde_json::json!({"argv": ["pytest", "-v"], "cwd": proj.path()}).to_string();
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--allow-command",
+            &pregrant,
+            "say hi",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .expect("request should carry a system message");
+    let content = system["content"].as_str().unwrap();
+    assert!(content.contains("Pre-approved commands"), "{content}");
+    assert!(content.contains("pytest"), "{content}");
+    assert!(
+        content.contains(&proj.path().to_string_lossy().to_string()),
+        "{content}"
+    );
+    server.verify().await;
+}
+
+// --- containment environment pass-through (cycle 8 item 1) ------------------
+
+/// Cycle-8 audit gap 1: a bare `--command-env NAME` pass-through of a
+/// secret-shaped name must be refused at startup, before any provider
+/// request is made — the fixed non-secret containment environment stays
+/// deny-by-default unless the caller uses the explicit `NAME=value` form.
+#[tokio::test]
+#[serial]
+async fn test_command_env_bare_passthrough_of_secret_shaped_name_is_refused_at_startup() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:0");
+    let proj = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_TEST_CLI_API_KEY", "should-never-leak")
+        .args([
+            "chat",
+            "--no-session",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--command-env",
+            "KITSU_TEST_CLI_API_KEY",
+            "hello",
+        ]);
+    cmd.assert().failure().code(1).stderr(
+        predicate::str::contains("KITSU_TEST_CLI_API_KEY")
+            .and(predicate::str::contains("secret-bearing")),
+    );
+}
+
+// --- host-owned workspace evidence (cycle 7 item 2) -------------------------
+
+/// Host evidence is not model authority. `/diff` succeeds with no grants, and
+/// the same session still advertises no filesystem tools and reports no read
+/// roots — the diff bytes reached the terminal, never the model's reach.
+#[test]
+#[serial]
+fn test_diff_authority_does_not_make_files_model_readable() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(repo.path().join("secret.txt"), "before\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(repo.path().join("secret.txt"), "after\n").unwrap();
+    let script = repo.path().join("script.txt");
+    fs::write(&script, "/diff\n/tools\n/permissions\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("+after"))
+        .stderr(predicate::str::contains("fs_read_file").not())
+        .stderr(predicate::str::contains("read roots   none"))
+        .stderr(predicate::str::contains("host evidence"));
+}
+
+/// `/diff --jsonl` carries the host bytes and says plainly that nothing was
+/// disclosed to the model, and the stream contains no grant of any kind.
+#[test]
+#[serial]
+fn test_diff_jsonl_reports_host_only_evidence() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("new.txt"), "fresh\n").unwrap();
+    let script = repo.path().join("script.txt");
+    fs::write(&script, "/diff\n/permissions\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let diffs = events
+        .iter()
+        .filter(|event| event["result"]["kind"] == "diff")
+        .collect::<Vec<_>>();
+    assert_eq!(diffs.len(), 1);
+    assert_eq!(diffs[0]["result"]["model_disclosed"], false);
+    assert!(diffs[0]["result"]["evidence_bytes"].as_u64().unwrap() > 0);
+    assert!(diffs[0]["result"]["diff"]
+        .as_str()
+        .unwrap()
+        .contains("fresh"));
+
+    let permissions = events
+        .iter()
+        .find(|event| event["result"]["kind"] == "permissions")
+        .expect("permissions payload");
+    assert_eq!(
+        permissions["result"]["host_evidence"]["model_read_root"],
+        false
+    );
+    // The workspace_diff tool is registered in this worktree, so prompt
+    // disclosure can also be initiated by an announced model tool call.
+    assert_eq!(
+        permissions["result"]["host_evidence"]["prompt_disclosure"],
+        "user_command_or_workspace_diff_tool"
+    );
+    assert!(permissions["result"]["host_evidence"]["consumers"]
+        .as_array()
+        .unwrap()
+        .contains(&serde_json::json!("workspace_diff")));
+    assert!(permissions["result"]["host_evidence"]["repository_root"].is_string());
+    assert!(
+        permissions["result"]["filesystem"]["read"]["active_invocation"]
+            .as_array()
+            .unwrap()
+            .is_empty()
+    );
+}
+
+/// A workspace that lives inside Kitsu's own private state is refused outright
+/// rather than disclosed as "workspace" evidence.
+#[test]
+#[serial]
+fn test_evidence_root_inside_private_state_is_refused() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let inside = home.path().join(".kitsu/inside-repo");
+    fs::create_dir_all(&inside).unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(&inside)
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(inside.join("note.txt"), "private\n").unwrap();
+    let script = home.path().join("script.txt");
+    fs::write(&script, "/diff\n/quit\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(&inside)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    cmd.assert().failure().stderr(predicate::str::contains(
+        "refusing to gather workspace evidence from inside Kitsu-private state",
+    ));
+}
+
+/// `kitsu review` no longer fabricates a repository read root for itself. It
+/// discloses exactly one bounded diff and says so.
+#[tokio::test]
+#[serial]
+async fn test_review_discloses_evidence_without_granting_read_root() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "no findings"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 21, "completion_tokens": 3, "total_tokens": 24}
+        })))
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    assert!(std::process::Command::new("git")
+        .arg("-C")
+        .arg(repo.path())
+        .args(["init", "--quiet"])
+        .status()
+        .unwrap()
+        .success());
+    fs::write(repo.path().join("review-me.rs"), "fn main() {}\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args(["--gateway", "example", "--no-stream", "review"]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "bytes of host-verified evidence to example-model-v1",
+        ))
+        .stderr(predicate::str::contains("no read root granted"))
+        .stderr(predicate::str::contains("read roots 1").not());
+
+    let requests = server.received_requests().await.unwrap();
+    assert!(!requests.is_empty());
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("tools")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(true),
+            "review advertised tools: {body}"
+        );
+        let prompt = body["messages"].as_array().unwrap().last().unwrap()["content"]
+            .as_str()
+            .unwrap();
+        assert!(prompt.contains("review-me.rs"));
+    }
+}
+
+// --- cycle 7 cheap wins -----------------------------------------------------
+
+/// A clean tree is not a dead end: echo the path the user typed and name the
+/// targets that would actually have something to review.
+#[test]
+#[serial]
+fn test_review_on_clean_tree_suggests_reachable_targets() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo.path())
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::create_dir_all(repo.path().join("src")).unwrap();
+    fs::write(repo.path().join("src/lib.rs"), "fn clean() {}\n").unwrap();
+    git(&["add", "."]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+
+    let mut top_level = base_cmd(home.path());
+    top_level
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args(["--gateway", "example", "review", "src/lib.rs"]);
+    top_level
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("at src/lib.rs"))
+        .stderr(predicate::str::contains("--commit HEAD src/lib.rs"))
+        .stderr(predicate::str::contains("@src/lib.rs"));
+
+    let script = repo.path().join("review.txt");
+    fs::write(&script, "/review src/lib.rs\n/quit\n").unwrap();
+    let mut slash = base_cmd(home.path());
+    slash
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    slash
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("/review commit HEAD src/lib.rs"))
+        .stderr(predicate::str::contains("@src/lib.rs"));
+}
+
+/// The preflight error explains its own numbers: window, effective prompt
+/// budget, and the reserve that separates the target from it — and it names
+/// `--context-window`, the most direct lever.
+#[test]
+#[serial]
+fn test_context_preflight_error_explains_its_budget_numbers() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--gateway",
+        "example",
+        "--context-window",
+        "2048",
+        "ask",
+        &"overflowing prompt ".repeat(4000),
+    ]);
+    cmd.assert()
+        .failure()
+        .stderr(predicate::str::contains("trim target is"))
+        .stderr(predicate::str::contains("effective prompt budget"))
+        .stderr(predicate::str::contains("window 2048 tokens"))
+        .stderr(predicate::str::contains("reserve)"))
+        .stderr(predicate::str::contains("--context-window <n>"));
+}
+
+// --- cross-run artifact retention (cycle 7 item 4) --------------------------
+
+/// A stateless `--enable-commands` run leaves its generation on disk after
+/// exit — deliberately, so the captured output stays readable — and
+/// `kitsu artifacts` is what finds and reclaims it afterwards.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_artifacts_list_and_prune_reclaim_cross_run_generations() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let argv = vec!["/bin/echo".to_string(), "KITSU_RETAINED".to_string()];
+    let tool_args = serde_json::json!({"argv": argv, "cwd": work.path()}).to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "command_call_1",
+                        "type": "function",
+                        "function": {"name": "command_exec", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "ok"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let pregrant = serde_json::to_string(&argv).unwrap();
+    let mut cmd = base_cmd(home.path());
+    let run = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args([
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "--allow-command",
+            &pregrant,
+            "run it",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        run.status.success(),
+        "stderr: {}",
+        String::from_utf8_lossy(&run.stderr)
+    );
+
+    // The generation survived process exit, and cross-run listing finds it.
+    let mut list = base_cmd(home.path());
+    let listed = list
+        .args(["artifacts", "list", "--json"])
+        .output()
+        .expect("artifact inventory");
+    assert!(listed.status.success());
+    let inventory: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+    let generations = inventory["generations"].as_array().unwrap();
+    let retained = generations
+        .iter()
+        .find(|generation| generation["namespace"] == "runtime")
+        .expect("a retained runtime generation");
+    assert_eq!(retained["state"], "orphaned");
+    assert_eq!(retained["prunable"], true);
+    assert!(retained["files"].as_u64().unwrap() >= 1);
+    assert!(retained["bytes"].as_u64().unwrap() > 0);
+    let generation_path = retained["path"].as_str().unwrap().to_string();
+    assert!(Path::new(&generation_path).exists());
+
+    // --dry-run reports without removing.
+    let mut dry = base_cmd(home.path());
+    dry.args(["artifacts", "prune", "all", "--dry-run"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("would remove 1 generation(s)"));
+    assert!(Path::new(&generation_path).exists());
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+    assert!(!Path::new(&generation_path).exists());
+
+    // An unmatched selector is an error, consistent with `sessions delete`.
+    let mut missing = base_cmd(home.path());
+    missing
+        .args(["artifacts", "prune", "runtime-0-0-0"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no retained artifact generation"));
+}
+
+/// Pruning must never touch sessions, config, locks, or anything that is not an
+/// artifact generation — and must refuse a symlink wearing a generation name.
+#[test]
+#[serial]
+fn test_artifacts_prune_never_touches_sessions_or_foreign_entries() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let state = home.path().join(".kitsu");
+    let artifacts = state.join("artifacts");
+    let sessions = state.join("sessions");
+    let outside = TempDir::new().unwrap();
+    fs::write(outside.path().join("precious.txt"), "do not delete\n").unwrap();
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir_all(sessions.join(".locks")).unwrap();
+    fs::create_dir_all(&state).unwrap();
+
+    let generation = artifacts.join("runtime-11-22-0");
+    fs::create_dir(&generation).unwrap();
+    fs::write(generation.join(".lock"), "").unwrap();
+    fs::write(generation.join("command-output-0.txt"), "removable\n").unwrap();
+    fs::create_dir(artifacts.join("not-an-artifact")).unwrap();
+    fs::write(artifacts.join("not-an-artifact/keep.txt"), "keep\n").unwrap();
+    fs::write(sessions.join("s-1-2-0.json"), "{}").unwrap();
+    fs::create_dir(sessions.join("s-1-2-0.artifacts")).unwrap();
+    fs::write(sessions.join("s-1-2-0.artifacts/kept.txt"), "owned\n").unwrap();
+    fs::write(state.join("history"), "line\n").unwrap();
+    #[cfg(unix)]
+    std::os::unix::fs::symlink(outside.path(), artifacts.join("runtime-33-44-0")).unwrap();
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+
+    assert!(!generation.exists());
+    assert!(artifacts.join("not-an-artifact/keep.txt").exists());
+    assert!(sessions.join("s-1-2-0.json").exists());
+    assert!(sessions.join("s-1-2-0.artifacts/kept.txt").exists());
+    assert!(sessions.join(".locks").exists());
+    assert!(state.join("history").exists());
+    assert!(state.join("config.toml").exists());
+    assert!(outside.path().join("precious.txt").exists());
+    #[cfg(unix)]
+    assert!(fs::symlink_metadata(artifacts.join("runtime-33-44-0")).is_ok());
+}
+
+/// Listing creates nothing: inspecting disk state must not materialize a
+/// profile directory.
+#[test]
+#[serial]
+fn test_artifacts_list_is_read_only() {
+    let home = TempDir::new().unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["artifacts"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("no retained command artifacts"));
+
+    assert!(
+        !home.path().join(".kitsu").exists(),
+        "listing artifacts must not create Kitsu state"
+    );
+}
+
+/// The startup sweep removes provably empty orphans and nothing else, and
+/// `/artifacts` stops reporting "0 retained" while other runs sit on disk.
+#[test]
+#[serial]
+fn test_startup_sweep_removes_only_empty_orphans_and_slash_reports_cross_run() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let state = home.path().join(".kitsu");
+    let artifacts = state.join("artifacts");
+    let sessions = state.join("sessions");
+    fs::create_dir_all(&artifacts).unwrap();
+    fs::create_dir_all(&sessions).unwrap();
+
+    // Empty orphan generation with a released lock: sweepable.
+    let empty = artifacts.join("runtime-11-22-0");
+    fs::create_dir(&empty).unwrap();
+    fs::write(empty.join(".lock"), "").unwrap();
+    // Non-empty orphan: retained, never swept.
+    let populated = artifacts.join("runtime-11-22-1");
+    fs::create_dir(&populated).unwrap();
+    fs::write(populated.join(".lock"), "").unwrap();
+    fs::write(populated.join("command-output-0.txt"), "keep me\n").unwrap();
+    // Empty orphan sidecar with a released lock: sweepable.
+    let empty_sidecar = sessions.join("s-9-9-9.artifacts");
+    fs::create_dir(&empty_sidecar).unwrap();
+    fs::create_dir_all(sessions.join(".locks")).unwrap();
+    fs::write(sessions.join(".locks/s-9-9-9.lock"), "").unwrap();
+    // Sidecar whose session still exists: never swept.
+    fs::write(sessions.join("s-1-2-0.json"), "{}").unwrap();
+    let owned_sidecar = sessions.join("s-1-2-0.artifacts");
+    fs::create_dir(&owned_sidecar).unwrap();
+
+    let script = home.path().join("script.txt");
+    fs::write(&script, "/artifacts\n/quit\n").unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+        "--gateway",
+        "example",
+        "chat",
+        "--enable-commands",
+        "--script",
+        &script.to_string_lossy(),
+    ]);
+    cmd.assert()
+        .success()
+        .stderr(predicate::str::contains("other runs:"))
+        .stderr(predicate::str::contains("kitsu artifacts list"));
+
+    assert!(!empty.exists(), "empty orphan generation should be swept");
+    assert!(
+        !empty_sidecar.exists(),
+        "empty orphan sidecar should be swept"
+    );
+    assert!(populated.exists(), "non-empty orphan must survive");
+    assert!(owned_sidecar.exists(), "owned sidecar must survive");
+    assert!(sessions.join("s-1-2-0.json").exists());
+}
+
+/// A generation whose lock is held by a live process is never removed, and the
+/// prune says why rather than failing silently.
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_artifacts_prune_skips_live_generation() {
+    use std::os::unix::io::AsRawFd as _;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let artifacts = home.path().join(".kitsu/artifacts");
+    fs::create_dir_all(&artifacts).unwrap();
+    let live = artifacts.join("runtime-55-66-0");
+    fs::create_dir(&live).unwrap();
+    fs::write(live.join("command-output-0.txt"), "in flight\n").unwrap();
+    let lock = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .open(live.join(".lock"))
+        .unwrap();
+    // SAFETY: `lock` is an open descriptor owned by this test.
+    assert_eq!(
+        unsafe { libc::flock(lock.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) },
+        0
+    );
+
+    let mut prune = base_cmd(home.path());
+    prune
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .failure()
+        .stdout(predicate::str::contains("removed 0 generation(s)"))
+        .stdout(predicate::str::contains(
+            "a live process holds this generation's lock",
+        ))
+        .stderr(predicate::str::contains("nothing was removed"));
+
+    assert!(live.join("command-output-0.txt").exists());
+    drop(lock);
+
+    // Once the owner is gone the same command reclaims it.
+    let mut again = base_cmd(home.path());
+    again
+        .args(["artifacts", "prune", "all"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("removed 1 generation(s)"));
+    assert!(!live.exists());
+}
+
+// --- cycle 10: model-callable workspace_diff evidence tool -------------------
+
+/// Prepare a git repo with one committed file that has an uncommitted edit.
+fn init_dirty_repo(repo: &Path) {
+    let git = |args: &[&str]| {
+        assert!(std::process::Command::new("git")
+            .arg("-C")
+            .arg(repo)
+            .args(args)
+            .status()
+            .unwrap()
+            .success());
+    };
+    git(&["init", "--quiet"]);
+    fs::write(repo.join("code.txt"), "before\n").unwrap();
+    git(&["add", "code.txt"]);
+    git(&[
+        "-c",
+        "user.name=Test",
+        "-c",
+        "user.email=test@example.com",
+        "commit",
+        "--quiet",
+        "-m",
+        "base",
+    ]);
+    fs::write(repo.join("code.txt"), "after\n").unwrap();
+}
+
+/// The cycle-9 gap, closed: in a chat with no filesystem grants the model can
+/// call `workspace_diff` and receive the host-verified diff, the disclosure is
+/// announced like /review's, and no read root exists before or after.
+#[tokio::test]
+#[serial]
+async fn test_workspace_diff_tool_discloses_evidence_in_scripted_chat() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "diff_call_1",
+                        "type": "function",
+                        "function": {
+                            "name": "workspace_diff",
+                            "arguments": "{\"scope\":\"working\"}"
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "your uncommitted change replaces before with after"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("explain.txt");
+    fs::write(
+        &script,
+        "explain what my uncommitted changes do\n/permissions\n/quit\n",
+    )
+    .unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script_path = script.clone();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--no-stream",
+                "chat",
+                "--script",
+                &script_path.to_string_lossy(),
+            ])
+            .output()
+            .expect("run scripted workspace_diff chat");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        // The call surfaces like every other tool receipt, and the standing
+        // disclosure rule applies at the moment of disclosure.
+        assert!(stderr.contains("workspace_diff"), "{stderr}");
+        assert!(
+            stderr.contains("bytes of host-verified evidence to example-model-v1"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("no read root granted"), "{stderr}");
+        // The diff-backed answer reached the transcript.
+        assert!(
+            stdout.contains("your uncommitted change replaces before with after"),
+            "{stdout}"
+        );
+        // Still zero model read roots; /permissions names the tool as a
+        // host-evidence consumer.
+        assert!(stderr.contains("read roots   none"), "{stderr}");
+        assert!(stderr.contains("workspace_diff tool"), "{stderr}");
+        assert!(
+            stderr.contains("workspace_diff discloses one bounded diff per model call"),
+            "{stderr}"
+        );
+    })
+    .await
+    .unwrap();
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    // The tool is advertised and the system prompt teaches the model to fetch
+    // verified diffs itself instead of flailing.
+    let tools = first["tools"].as_array().expect("advertised tools");
+    assert!(
+        tools
+            .iter()
+            .any(|tool| tool["function"]["name"] == "workspace_diff"),
+        "{first}"
+    );
+    let system = first["messages"][0]["content"].as_str().unwrap();
+    assert!(
+        system.contains("Use workspace_diff to fetch the user's verified git diff"),
+        "{system}"
+    );
+    // The tool result fed back to the model carries the actual diff bytes.
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_message = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .expect("tool result message");
+    let content = tool_message["content"].as_str().unwrap();
+    assert!(content.contains("+after"), "{content}");
+    assert!(content.contains("\"target\":\"working_tree\""), "{content}");
+}
+
+/// JSONL framing: the workspace_diff call is a normal tool frame, and the
+/// disclosure is a `workspace_evidence_disclosure` event between
+/// `tool_started` and `tool_finished`, shaped like `review_disclosure`.
+#[tokio::test]
+#[serial]
+async fn test_workspace_diff_jsonl_emits_disclosure_event_between_tool_frames() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "diff_call_1",
+                        "type": "function",
+                        "function": {"name": "workspace_diff", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "explained"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("explain.txt");
+    fs::write(&script, "explain my changes\n/quit\n").unwrap();
+
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let script_path = script.clone();
+    let events = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&repo_path)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--script",
+                &script_path.to_string_lossy(),
+            ])
+            .output()
+            .expect("run jsonl workspace_diff chat");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .unwrap();
+
+    let started = events
+        .iter()
+        .position(|event| event["type"] == "tool_started" && event["name"] == "workspace_diff")
+        .expect("tool_started for workspace_diff");
+    let finished = events
+        .iter()
+        .position(|event| event["type"] == "tool_finished" && event["name"] == "workspace_diff")
+        .expect("tool_finished for workspace_diff");
+    let disclosure = events
+        .iter()
+        .position(|event| event["type"] == "workspace_evidence_disclosure")
+        .expect("workspace_evidence_disclosure event");
+    assert!(started < disclosure && disclosure < finished);
+
+    let disclosure = &events[disclosure];
+    assert_eq!(disclosure["schema"], "kitsu.chat.v1");
+    assert_eq!(disclosure["source"], "workspace_diff");
+    assert_eq!(disclosure["target"], "working_tree");
+    assert_eq!(disclosure["model_disclosed"], true);
+    assert_eq!(disclosure["model_read_root_granted"], false);
+    assert_eq!(disclosure["truncated"], false);
+    assert!(disclosure["evidence_bytes"].as_u64().unwrap() > 0);
+
+    // The tool result inside the frame carries the diff; no permission or
+    // grant event appears anywhere in the stream.
+    let finished = &events[finished];
+    assert!(finished["output"].as_str().unwrap().contains("+after"));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "permission_prompt"));
+}
+
+/// Both opt-outs unregister the tool entirely, and a non-worktree directory
+/// never registers it in the first place.
+#[test]
+#[serial]
+fn test_no_workspace_evidence_flag_and_config_unregister_the_tool() {
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), "http://127.0.0.1:1");
+    let repo = TempDir::new().unwrap();
+    init_dirty_repo(repo.path());
+    let script = repo.path().join("tools.txt");
+    fs::write(&script, "/tools\n/quit\n").unwrap();
+
+    // Baseline: the worktree registers the tool.
+    let mut with_tool = base_cmd(home.path());
+    with_tool
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    with_tool
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff"));
+
+    // Flag opt-out.
+    let mut flagged = base_cmd(home.path());
+    flagged
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "--no-workspace-evidence",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    flagged
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
+
+    // Config opt-out.
+    let config_path = home.path().join(".kitsu/config.toml");
+    let config = fs::read_to_string(&config_path).unwrap();
+    fs::write(
+        &config_path,
+        format!("workspace_evidence = false\n{config}"),
+    )
+    .unwrap();
+    let mut configured = base_cmd(home.path());
+    configured
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(repo.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    configured
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
+
+    // Outside a git worktree there is nothing to disclose: not registered.
+    fs::write(&config_path, config).unwrap();
+    let plain = TempDir::new().unwrap();
+    let plain_script = plain.path().join("tools.txt");
+    fs::write(&plain_script, "/tools\n/quit\n").unwrap();
+    let mut no_worktree = base_cmd(home.path());
+    no_worktree
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(plain.path())
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &plain_script.to_string_lossy(),
+        ]);
+    no_worktree
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("workspace_diff").not());
 }
