@@ -112,11 +112,10 @@ pub struct AgentConfig {
     /// a skill invoked as a fake tool (`{"name": "code-review"}`) apart from
     /// arbitrary JSON in a real answer. Empty when no skills are loaded.
     pub skill_names: Vec<String>,
-    /// Shared run-wide counter of successful `fs_read_file` calls. Unlike
-    /// `AgentSessionState.run_reads` (per-state), this Arc is shared across
-    /// the MAIN conversation and every spawned subagent, so the end-of-run
-    /// receipt counts delegated reads too (cycle-17 gap #1).
-    pub read_counter: Option<std::sync::Arc<std::sync::atomic::AtomicU64>>,
+    /// Shared run-wide tallies (reads/denied/failed). Unlike per-state
+    /// fields, this Arc spans the MAIN conversation and every subagent, so
+    /// end-of-run receipts count delegated work (cycle-17 #1, cycle-19 #5).
+    pub run_tallies: Option<std::sync::Arc<RunTallies>>,
     /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
     /// the MAIN conversation's config; the orchestrator resets it when a turn
     /// starts. Subagent configs must leave this `None` so nested turns never
@@ -673,7 +672,7 @@ impl Default for AgentConfig {
             quiet: false,
             event_log: None,
             skill_names: Vec::new(),
-            read_counter: None,
+            run_tallies: None,
             spawn_budget: None,
         }
     }
@@ -1357,6 +1356,9 @@ where
                         turn_status.final_round_tool_errors.saturating_add(1);
                     if matches!(e, kitsu_tools::ToolError::PolicyDenied(_)) {
                         turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
+                        if let Some(tallies) = &cfg.run_tallies {
+                            tallies.denied.fetch_add(1, Ordering::AcqRel);
+                        }
                     }
                     (
                         serde_json::json!({ "error": e.kind(), "detail": e.to_string() })
@@ -1373,8 +1375,12 @@ where
                 (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &tc.args, &content, is_err));
             if !is_err && tc.tool_name == "fs_read_file" {
                 *run_reads += 1;
-                if let Some(counter) = &cfg.read_counter {
-                    counter.fetch_add(1, Ordering::AcqRel);
+            }
+            if let Some(tallies) = &cfg.run_tallies {
+                if is_err {
+                    tallies.failed.fetch_add(1, Ordering::AcqRel);
+                } else if tc.tool_name == "fs_read_file" {
+                    tallies.reads.fetch_add(1, Ordering::AcqRel);
                 }
             }
             tool_event.finish(!is_err, &content);
@@ -1767,14 +1773,21 @@ fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> St
     if is_err {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
             if let Some(kind) = v.get("error").and_then(|x| x.as_str()) {
-                let detail = v
+                // Keep the WHOLE detail (newlines flattened) up to a bound,
+                // with an explicit ellipsis — the old first-line/180-char cut
+                // silently ate the remedy clauses kitsu itself appends
+                // (cycle-19 audit #3).
+                let raw = v
                     .get("detail")
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("");
-                let detail: String = detail.chars().take(180).collect();
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut detail: String = raw.chars().take(360).collect();
+                if raw.chars().count() > 360 {
+                    detail.push('…');
+                }
                 return if detail.is_empty() {
                     format!("error: {kind}")
                 } else {
@@ -2890,6 +2903,17 @@ const OFFLOAD_CHAR_CAP: usize = 8 * 1024;
 const OFFLOAD_POINTER_PREFIX: &str = "[tool output ";
 /// How much of an offloaded result to keep inline as a preview.
 const OFFLOAD_PREVIEW_CHARS: usize = 500;
+
+/// Run-wide tallies shared across the MAIN conversation and every spawned
+/// subagent (one Arc, like the spawn budget), so end-of-run receipts count
+/// delegated work too: successful reads, denied tool calls, failed tool
+/// calls (denied is a subset of failed).
+#[derive(Debug, Default)]
+pub struct RunTallies {
+    pub reads: std::sync::atomic::AtomicU64,
+    pub denied: std::sync::atomic::AtomicU64,
+    pub failed: std::sync::atomic::AtomicU64,
+}
 
 /// True when swapping this inline result for a preview is actually needed:
 /// keeping it inline would push the estimated prompt past half the effective
