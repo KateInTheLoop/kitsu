@@ -10595,6 +10595,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         AssistantDisposition::Discarded,
                         Some("background agents did not complete, so the turn is incomplete"),
                     )?;
+                    if !cli.jsonl {
+                        emit_run_receipt(
+                            &write_journal,
+                            &agent_registry,
+                            session.session_id.borrow().as_deref(),
+                            0,
+                            1,
+                            session.run_tallies.reads.load(Ordering::Acquire),
+                            session.run_tallies.denied.load(Ordering::Acquire),
+                            session.run_tallies.failed.load(Ordering::Acquire),
+                        );
+                    }
                     let mapped = CliError::provider(format!(
                         "piped turn ended with {unfinished_agents} unfinished or failed background agent(s)"
                     ));
@@ -10639,6 +10651,20 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         &retained,
                         tools.is_registered("workspace_diff"),
                     )?;
+                    if !cli.jsonl {
+                        // Cycle-20 audit: a failing exit still owes the run
+                        // receipt — denied/failed tallies especially.
+                        emit_run_receipt(
+                            &write_journal,
+                            &agent_registry,
+                            session.session_id.borrow().as_deref(),
+                            0,
+                            1,
+                            session.run_tallies.reads.load(Ordering::Acquire),
+                            session.run_tallies.denied.load(Ordering::Acquire),
+                            session.run_tallies.failed.load(Ordering::Acquire),
+                        );
+                    }
                     let mapped = if kind == ScriptFailureKind::Provider {
                         CliError::provider(format!("incomplete turn: {issue}"))
                     } else {
