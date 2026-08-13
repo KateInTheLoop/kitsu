@@ -770,6 +770,10 @@ pub struct AgentSessionState {
     /// end-of-run receipt so "wrote a summary of files it never opened"
     /// (cycle-16 M1) is visible at a glance.
     pub run_reads: u64,
+    /// Cumulative provider usage across the run, for `/cost`.
+    pub run_usage: kitsu_providers::Usage,
+    /// Completed model turns across the run, for `/cost`.
+    pub run_turns: u32,
 }
 
 /// Evidence, gathered from a provider `usage` report, that the server accepted
@@ -892,6 +896,10 @@ where
         kitsu_render::begin_turn_output();
     }
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
+    state.run_usage.prompt_tokens += turn_usage.prompt_tokens;
+    state.run_usage.completion_tokens += turn_usage.completion_tokens;
+    state.run_usage.total_tokens += turn_usage.total_tokens;
+    state.run_turns += 1;
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
             TurnCompletion::Complete => "complete",
@@ -956,6 +964,8 @@ where
         last_turn: turn_status,
         window_evidence,
         run_reads,
+        run_usage: _,
+        run_turns: _,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
