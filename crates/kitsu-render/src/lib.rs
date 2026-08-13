@@ -652,6 +652,46 @@ fn display_width(s: &str) -> usize {
     s.chars().map(char_display_width).sum()
 }
 
+/// Fit a banner value into a given display width.
+/// Short values are returned exactly; long values are elided middle-out
+/// with a leading `…` keeping the tail (the informative end of a path).
+/// Returns a string with display_width ≤ width.
+fn fit_banner_value(value: &str, width: usize) -> String {
+    if display_width(value) <= width {
+        return value.to_string();
+    }
+
+    if width == 0 {
+        return String::new();
+    }
+
+    // Elide middle-out: keep leading `…` and tail
+    let available_for_tail = width.saturating_sub(1); // `…` takes 1 display width
+
+    if available_for_tail == 0 {
+        return "…".to_string();
+    }
+
+    let chars: Vec<char> = value.chars().collect();
+    let mut current_width = 0;
+    let mut tail_start = chars.len();
+
+    // Iterate from the end, include characters that fit
+    for i in (0..chars.len()).rev() {
+        let ch_width = char_display_width(chars[i]);
+        if current_width + ch_width <= available_for_tail {
+            current_width += ch_width;
+            tail_start = i;
+        } else {
+            break;
+        }
+    }
+
+    let mut result = String::from("…");
+    result.push_str(&chars[tail_start..].iter().collect::<String>());
+    result
+}
+
 /// Content cells between the banner box's side bars.
 const BANNER_INNER_WIDTH: usize = 56;
 
@@ -711,6 +751,16 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
         let styled_row = format!("  {}   {value}", format!("{label:<9}").dimmed());
         boxed(&plain_row, &styled_row);
     };
+
+    // Calculate available width for values: "  " (2) + label (9) + "   " (3) = 14 chars
+    let value_width = BANNER_INNER_WIDTH.saturating_sub(14);
+
+    // Fit values to available width to keep the box closed
+    let gateway = fit_banner_value(&gateway, value_width);
+    let model = fit_banner_value(&model, value_width);
+    let dir = fit_banner_value(&dir, value_width);
+    let tools_str = fit_banner_value(&tools_str, value_width);
+
     let title = "🦊 kitsu 狐";
     // "╭─ " + title + " " + fill + "╮" spans BANNER_INNER_WIDTH + 2 cells.
     let fill = (BANNER_INNER_WIDTH + 1).saturating_sub(4 + display_width(title));
@@ -1756,12 +1806,12 @@ mod tests {
     use super::{
         approval_header_with_mode, approval_options_with_mode, context_lines,
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
-        format_message, grouped_count, human_turn_stats, milestone_line_with_mode,
-        sanitize_plain_inline, sanitize_terminal_inline, sanitize_terminal_text, section_heading,
-        spinner_mode, static_spinner_line, theme_row, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
-        SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
-        SPINNER_VERBS, THEMES,
+        fit_banner_value, format_message, grouped_count, human_turn_stats,
+        milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
+        sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
+        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
+        DeckState, PromptSafeAsyncNotice, RenderMode, SpinnerMode, TerminalTextSanitizer, AMBER,
+        CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -2103,6 +2153,51 @@ mod tests {
         assert_eq!(display_width("kitsu"), 5);
         assert_eq!(display_width("🦊 kitsu 狐"), 11);
         assert_eq!(display_width("( ･ᴥ･ )"), 7);
+    }
+
+    #[test]
+    fn fit_banner_value_keeps_short_values_exact() {
+        assert_eq!(fit_banner_value("short", 20), "short");
+        assert_eq!(fit_banner_value("exact", 5), "exact");
+    }
+
+    #[test]
+    fn fit_banner_value_elides_long_values_with_leading_ellipsis() {
+        let long = "~/very/deep/nested/path/to/some/file";
+        let fitted = fit_banner_value(long, 20);
+        assert!(fitted.starts_with("…"), "should start with …");
+        assert!(display_width(&fitted) <= 20, "should fit in width");
+        assert!(fitted.contains("file"), "should keep the tail (file)");
+    }
+
+    #[test]
+    fn fit_banner_value_respects_display_width_with_wide_chars() {
+        let wide = "狐 kitsu 狐 kitsu 狐 kitsu";
+        let fitted = fit_banner_value(wide, 15);
+        assert!(display_width(&fitted) <= 15, "should respect display_width");
+        assert!(
+            fitted.starts_with("…") || fitted == wide,
+            "should elide or keep exact"
+        );
+    }
+
+    #[test]
+    fn fit_banner_value_negative_case_renders_byte_identical_for_short_values() {
+        // Verify that short values that fit within the width are returned exactly
+        let short = "~/.local/project";
+        assert_eq!(
+            fit_banner_value(short, 42),
+            short,
+            "short value should be byte-identical"
+        );
+        // Also verify the typical directory value width calculation
+        // Available width: BANNER_INNER_WIDTH (56) - 14 (overhead) = 42
+        let typical = "~/workspace/kitsu";
+        assert_eq!(
+            fit_banner_value(typical, 42),
+            typical,
+            "typical directory should fit unchanged"
+        );
     }
 
     #[test]

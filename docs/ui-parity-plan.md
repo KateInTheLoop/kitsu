@@ -223,7 +223,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   plain row equals today's text; scripted `/theme` output unchanged;
   workspace tests green.
 
-- [ ] **8. Banner: elide the directory row and keep the box closed** (S)
+- [x] **8. Banner: elide the directory row and keep the box closed** (S) (done 2026-08-13)
   Observed live: a long cwd overflows `BANNER_INNER_WIDTH` (56) and the row
   drops its right bar, breaking the box. In `chat_banner`
   (`crates/kitsu-render/src/lib.rs:516-605`), when a **value** would
