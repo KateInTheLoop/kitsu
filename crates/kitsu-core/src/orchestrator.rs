@@ -885,6 +885,7 @@ pub async fn run_agent_turn_with_state<P>(
 where
     P: Provider,
 {
+    let turn_start = std::time::Instant::now();
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
     if let Some(budget) = &cfg.spawn_budget {
@@ -896,6 +897,7 @@ where
         kitsu_render::begin_turn_output();
     }
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
+    let elapsed = turn_start.elapsed();
     state.run_usage.prompt_tokens += turn_usage.prompt_tokens;
     state.run_usage.completion_tokens += turn_usage.completion_tokens;
     state.run_usage.total_tokens += turn_usage.total_tokens;
@@ -946,11 +948,11 @@ where
             (state.meter.estimate(messages), budget.effective, window)
         });
         if result.is_ok() {
-            kitsu_render::emit_turn_stats(usage, context);
+            kitsu_render::emit_turn_stats(usage, context, Some(elapsed));
         } else {
             // A failed turn gets no human stats line — the error notice owns
             // that moment — but redirected runs keep the machine records.
-            kitsu_render::emit_failed_turn_stats(usage, context);
+            kitsu_render::emit_failed_turn_stats(usage, context, Some(elapsed));
         }
     }
     result
