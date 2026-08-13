@@ -10761,28 +10761,63 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     return Err(mapped);
                 }
                 if let Some((kind, issue)) = strict_turn_failure(&session_state.last_turn) {
-                    finish_assistant_disposition(
-                        cli,
-                        "piped:1",
-                        AssistantDisposition::Discarded,
-                        Some(&issue),
-                    )?;
-                    let mut retained = turn_reports;
-                    retained.extend(
-                        cancel_agents_and_report_writes(
-                            &agent_registry,
-                            agent_watermark,
-                            &write_journal,
-                        )
-                        .await,
-                    );
-                    note_rollback_retained_changes(
-                        cli,
-                        Some("piped:1"),
-                        &mut messages,
-                        &retained,
-                        tools.is_registered("workspace_diff"),
-                    )?;
+                    // Cycle-30 (queued since the cycle-19 audit): a POLICY
+                    // strict failure whose turn still completed a real final
+                    // answer commits that answer as PARTIAL — the model was
+                    // refused, adapted, and answered truthfully; destroying
+                    // the answer punished honesty. The run still FAILS
+                    // exactly as before: same exit code, same JSONL error
+                    // and turn_finished frames — automation contracts are
+                    // unchanged. Provider-kind failures (incomplete turns)
+                    // keep the full rollback: there is no real answer to
+                    // keep.
+                    let commit_partial = kind == ScriptFailureKind::Policy;
+                    if commit_partial {
+                        finish_assistant_disposition(
+                            cli,
+                            "piped:1",
+                            AssistantDisposition::CommittedPartial,
+                            Some(&issue),
+                        )?;
+                        if let Err(persist_error) =
+                            persist_session_required(&session_store, &session, &model, &messages)
+                        {
+                            if !cli.jsonl {
+                                eprintln!(
+                                    "~ warning: could not save the partial turn: {}",
+                                    terminal_inline(&persist_error.to_string())
+                                );
+                            }
+                        }
+                        if !cli.jsonl {
+                            eprintln!(
+                                "~ the answer above is COMMITTED AS PARTIAL: {issue}; the run still fails so automation notices"
+                            );
+                        }
+                    } else {
+                        finish_assistant_disposition(
+                            cli,
+                            "piped:1",
+                            AssistantDisposition::Discarded,
+                            Some(&issue),
+                        )?;
+                        let mut retained = turn_reports;
+                        retained.extend(
+                            cancel_agents_and_report_writes(
+                                &agent_registry,
+                                agent_watermark,
+                                &write_journal,
+                            )
+                            .await,
+                        );
+                        note_rollback_retained_changes(
+                            cli,
+                            Some("piped:1"),
+                            &mut messages,
+                            &retained,
+                            tools.is_registered("workspace_diff"),
+                        )?;
+                    }
                     if !cli.jsonl {
                         // Cycle-20 audit: a failing exit still owes the run
                         // receipt — denied/failed tallies especially.
