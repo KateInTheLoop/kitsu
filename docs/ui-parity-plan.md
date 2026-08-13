@@ -136,7 +136,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   "…/c/d/e.rs"`, `short_path("/etc/hostname") == "/etc/hostname"`,
   `short_path("a/b") == "a/b"`; `cargo test -p kitsu-core` green.
 
-- [ ] **2. Wall-clock duration in the turn stats footer** (S)
+- [x] **2. Wall-clock duration in the turn stats footer** (S) — done 2026-08-12
   Codex ends every run with a timing line; Claude Code shows elapsed in its
   spinner. Kitsu's `↳ 1,311 input · 5 output · … context` footer has no
   time. Thread the turn's elapsed `Duration` into

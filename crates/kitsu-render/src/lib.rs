@@ -1275,12 +1275,27 @@ fn grouped_count(value: u64) -> String {
     out
 }
 
+/// Format elapsed duration for the turn stats footer.
+/// Format: <1s → `0.9s`; <60s → `4.2s`; longer → reuse `format_wait_elapsed`.
+fn format_turn_duration(elapsed: std::time::Duration) -> String {
+    let secs = elapsed.as_secs_f64();
+    if secs < 60.0 {
+        format!("{:.1}s", secs)
+    } else {
+        format_wait_elapsed(elapsed)
+    }
+}
+
 fn human_turn_stats(
     usage: Option<(u64, u64, u64)>,
     context: Option<(u64, u64, u64)>,
+    elapsed: Option<std::time::Duration>,
     ascii: bool,
 ) -> Option<String> {
     let mut parts = Vec::new();
+    if let Some(duration) = elapsed {
+        parts.push(format_turn_duration(duration));
+    }
     if let Some((prompt, completion, _total)) = usage {
         parts.push(format!("{} input", grouped_count(prompt)));
         parts.push(format!("{} output", grouped_count(completion)));
@@ -1310,22 +1325,30 @@ fn human_turn_stats(
 /// compact, human-readable status line; redirected output retains the stable
 /// `kitsu-usage:` and `kitsu-context:` JSON records for automation. Formatting
 /// follows stderr's TTY state because stderr is the destination.
-pub fn emit_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
+pub fn emit_turn_stats(
+    usage: Option<(u64, u64, u64)>,
+    context: Option<(u64, u64, u64)>,
+    elapsed: Option<std::time::Duration>,
+) {
     let mut err = io::stderr();
     let destination_is_tty = err.is_terminal();
-    let _ = write_turn_stats(&mut err, destination_is_tty, usage, context);
+    let _ = write_turn_stats(&mut err, destination_is_tty, usage, context, elapsed);
 }
 
 /// End-of-turn telemetry for a FAILED turn. A person at a terminal gets no
 /// stats line — a turn that produced nothing should not be billed a summary —
 /// while redirected output keeps the stable `kitsu-usage:`/`kitsu-context:`
 /// records so automation still observes what the failed attempt consumed.
-pub fn emit_failed_turn_stats(usage: Option<(u64, u64, u64)>, context: Option<(u64, u64, u64)>) {
+pub fn emit_failed_turn_stats(
+    usage: Option<(u64, u64, u64)>,
+    context: Option<(u64, u64, u64)>,
+    elapsed: Option<std::time::Duration>,
+) {
     let mut err = io::stderr();
     if err.is_terminal() {
         return;
     }
-    let _ = write_turn_stats(&mut err, false, usage, context);
+    let _ = write_turn_stats(&mut err, false, usage, context, elapsed);
 }
 
 /// Write end-of-turn telemetry to an explicit destination.
@@ -1338,6 +1361,7 @@ pub fn write_turn_stats<W: Write>(
     destination_is_tty: bool,
     usage: Option<(u64, u64, u64)>,
     context: Option<(u64, u64, u64)>,
+    elapsed: Option<std::time::Duration>,
 ) -> io::Result<()> {
     write_turn_stats_with_mode(
         destination,
@@ -1345,6 +1369,7 @@ pub fn write_turn_stats<W: Write>(
         plain_mode(),
         usage,
         context,
+        elapsed,
     )
 }
 
@@ -1354,9 +1379,10 @@ fn write_turn_stats_with_mode<W: Write>(
     plain: bool,
     usage: Option<(u64, u64, u64)>,
     context: Option<(u64, u64, u64)>,
+    elapsed: Option<std::time::Duration>,
 ) -> io::Result<()> {
     if destination_is_tty {
-        if let Some(line) = human_turn_stats(usage, context, plain) {
+        if let Some(line) = human_turn_stats(usage, context, elapsed, plain) {
             if plain {
                 writeln!(destination, "{line}")?;
             } else {
@@ -1706,25 +1732,33 @@ mod tests {
 
     #[test]
     fn combines_usage_and_context_into_one_status_line() {
+        let duration = std::time::Duration::from_millis(4200);
         assert_eq!(
-            human_turn_stats(Some((11, 3, 14)), Some((2_000, 8_000, 8_192)), false),
-            Some("  ↳ 11 input · 3 output · 2,000 / 8,000 context (25% used)".into())
+            human_turn_stats(
+                Some((11, 3, 14)),
+                Some((2_000, 8_000, 8_192)),
+                Some(duration),
+                false
+            ),
+            Some("  ↳ 4.2s · 11 input · 3 output · 2,000 / 8,000 context (25% used)".into())
         );
     }
 
     #[test]
     fn omits_status_line_without_stats() {
-        assert_eq!(human_turn_stats(None, None, false), None);
+        assert_eq!(human_turn_stats(None, None, None, false), None);
     }
 
     #[test]
     fn telemetry_uses_the_explicit_destination_tty_state() {
+        let duration = std::time::Duration::from_millis(4200);
         let mut redirected = Vec::new();
         write_turn_stats(
             &mut redirected,
             false,
             Some((11, 3, 14)),
             Some((2_000, 8_000, 8_192)),
+            Some(duration),
         )
         .unwrap();
         assert_eq!(
@@ -1742,12 +1776,13 @@ mod tests {
             true,
             Some((11, 3, 14)),
             Some((2_000, 8_000, 8_192)),
+            Some(duration),
         )
         .unwrap();
         let terminal = String::from_utf8(terminal).unwrap();
         assert_eq!(
             terminal,
-            "  -> 11 input | 3 output | 2,000 / 8,000 context (25% used)\n"
+            "  -> 4.2s | 11 input | 3 output | 2,000 / 8,000 context (25% used)\n"
         );
         assert!(terminal.is_ascii());
         assert!(!terminal.contains('\x1b'));
