@@ -167,7 +167,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   orchestrator tests' fake tools) shows `result>`/`◇` lines ending in a
   duration; `cargo test` workspace green.
 
-- [ ] **4. Inline markdown styling: bold, inline code, list bullets** (S)
+- [x] **4. Inline markdown styling: bold, inline code, list bullets** (S) (done 2026-08-13)
   `format_message` (`crates/kitsu-render/src/lib.rs:306-344`) styles only
   `#`-headings and diff fences. Add, outside code fences: `**bold**` spans
   rendered bold, `` `inline code` `` spans tinted with `theme().highlight`,

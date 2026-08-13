@@ -303,6 +303,93 @@ pub fn print_message(s: &str) {
     let _ = out.flush();
 }
 
+/// Style inline markdown elements in a line: bold, inline code, and list markers.
+/// Respects code fence state (does not style inside fenced code blocks).
+/// Unclosed markers are left unstyled.
+fn style_inline_markdown(line: &str, in_fence: bool) -> String {
+    if in_fence {
+        return line.to_string();
+    }
+
+    let (r, g, b) = theme().highlight;
+    let mut out = String::with_capacity(line.len() * 2);
+    let chars: Vec<char> = line.chars().collect();
+    let mut i = 0;
+
+    // Handle list markers at the start of the line (after optional indent)
+    {
+        let trimmed = line.trim_start();
+        let indent_len = line.len() - trimmed.len();
+        let trimmed_chars: Vec<char> = trimmed.chars().collect();
+        if trimmed_chars.len() >= 2 {
+            if (trimmed_chars[0] == '-' || trimmed_chars[0] == '*') && trimmed_chars[1] == ' ' {
+                // Unordered list: "- " or "* "
+                out.push_str(&line[..indent_len]);
+                out.push_str(&format!("{}", trimmed_chars[0].to_string().dimmed()));
+                out.push_str(&format!("{}", trimmed_chars[1].to_string().dimmed()));
+                i = indent_len + 2;
+            } else if trimmed_chars[0].is_ascii_digit() {
+                // Ordered list: "1. " etc
+                let mut j = 0;
+                while j < trimmed_chars.len() && trimmed_chars[j].is_ascii_digit() {
+                    j += 1;
+                }
+                if j < trimmed_chars.len() - 1
+                    && trimmed_chars[j] == '.'
+                    && trimmed_chars[j + 1] == ' '
+                {
+                    // Valid ordered list marker
+                    out.push_str(&line[..indent_len]);
+                    for ch in &trimmed_chars[..j] {
+                        out.push_str(&format!("{}", ch.to_string().dimmed()));
+                    }
+                    out.push_str(&format!("{}", trimmed_chars[j].to_string().dimmed()));
+                    out.push_str(&format!("{}", trimmed_chars[j + 1].to_string().dimmed()));
+                    i = indent_len + j + 2;
+                }
+            }
+        }
+    }
+
+    // Style only CLOSED spans (the spec: unclosed markers pass through
+    // unstyled). Each span is pushed as ONE styled chunk, not per-char
+    // escapes.
+    while i < chars.len() {
+        if chars[i] == '*' && i + 1 < chars.len() && chars[i + 1] == '*' {
+            if let Some(close) = find_pair(&chars, i + 2, &['*', '*']) {
+                let span: String = chars[i + 2..close].iter().collect();
+                out.push_str(&format!("{}", format!("**{span}**").bold()));
+                i = close + 2;
+                continue;
+            }
+            out.push_str("**");
+            i += 2;
+        } else if chars[i] == '`' {
+            if let Some(close) = find_pair(&chars, i + 1, &['`']) {
+                let span: String = chars[i + 1..close].iter().collect();
+                out.push_str(&format!("{}", format!("`{span}`").truecolor(r, g, b)));
+                i = close + 1;
+                continue;
+            }
+            out.push('`');
+            i += 1;
+        } else {
+            out.push(chars[i]);
+            i += 1;
+        }
+    }
+
+    out
+}
+
+/// Index where `needle` next occurs in `chars` at or after `from`, or None.
+fn find_pair(chars: &[char], from: usize, needle: &[char]) -> Option<usize> {
+    if needle.is_empty() || chars.len() < needle.len() {
+        return None;
+    }
+    (from..=chars.len() - needle.len()).find(|&idx| chars[idx..idx + needle.len()] == *needle)
+}
+
 fn format_message(s: &str, styled: bool) -> String {
     if !styled {
         return s.to_string();
@@ -322,6 +409,7 @@ fn format_message(s: &str, styled: bool) -> String {
             out.push_str(newline);
             continue;
         }
+        let in_fence = fence.is_some();
         let rendered = if fence.as_deref() == Some("diff") || fence.as_deref() == Some("patch") {
             if line.starts_with('+') && !line.starts_with("+++") {
                 format!("{}", line.green())
@@ -335,7 +423,7 @@ fn format_message(s: &str, styled: bool) -> String {
         } else if line.starts_with("### ") || line.starts_with("## ") || line.starts_with("# ") {
             format!("{}", line.bold())
         } else {
-            line.to_string()
+            style_inline_markdown(line, in_fence)
         };
         out.push_str(&rendered);
         out.push_str(newline);
@@ -1720,6 +1808,72 @@ mod tests {
         assert!(rendered.contains('\x1b'), "TTY rendering should be styled");
         assert_eq!(sanitize_terminal_text(&rendered), message);
         assert_eq!(format_message(message, false), message);
+
+        // Test bold styling
+        let bold_message = "This is **bold text** in a line\n";
+        let bold_rendered = format_message(bold_message, true);
+        assert!(
+            bold_rendered.contains('\x1b'),
+            "TTY rendering should include bold"
+        );
+        assert_eq!(sanitize_terminal_text(&bold_rendered), bold_message);
+
+        // Test inline code styling
+        let code_message = "Use `inline_code()` function here\n";
+        let code_rendered = format_message(code_message, true);
+        assert!(
+            code_rendered.contains('\x1b'),
+            "TTY rendering should include inline code"
+        );
+        assert_eq!(sanitize_terminal_text(&code_rendered), code_message);
+
+        // Test list markers
+        let list_message = "- First item\n* Second item\n1. Third item\n";
+        let list_rendered = format_message(list_message, true);
+        assert!(
+            list_rendered.contains('\x1b'),
+            "TTY rendering should include list markers"
+        );
+        assert_eq!(sanitize_terminal_text(&list_rendered), list_message);
+
+        // Test unclosed bold marker (must be left completely unstyled)
+        let unclosed_bold = "This has an unclosed **bold marker\n";
+        let unclosed_rendered = format_message(unclosed_bold, true);
+        assert_eq!(
+            unclosed_rendered, unclosed_bold,
+            "no styling on unclosed **"
+        );
+        assert_eq!(sanitize_terminal_text(&unclosed_rendered), unclosed_bold);
+
+        // Test unclosed code marker (must be left completely unstyled)
+        let unclosed_code = "This has an unclosed `code marker\n";
+        let unclosed_code_rendered = format_message(unclosed_code, true);
+        assert_eq!(
+            unclosed_code_rendered, unclosed_code,
+            "no styling on unclosed `"
+        );
+        assert_eq!(
+            sanitize_terminal_text(&unclosed_code_rendered),
+            unclosed_code
+        );
+
+        // Test combined markdown
+        let combined = "# Title\n\nSome **bold** and `code` with a list:\n- Item 1\n* Item 2\n";
+        let combined_rendered = format_message(combined, true);
+        assert!(
+            combined_rendered.contains('\x1b'),
+            "TTY rendering should be styled"
+        );
+        assert_eq!(sanitize_terminal_text(&combined_rendered), combined);
+
+        // Test that styling is not applied inside code fences
+        let fenced = "```rust\n**not bold**\n`not code`\n```\n";
+        let fenced_rendered = format_message(fenced, true);
+        assert_eq!(sanitize_terminal_text(&fenced_rendered), fenced);
+
+        // Test plain mode returns original text
+        assert_eq!(format_message(bold_message, false), bold_message);
+        assert_eq!(format_message(list_message, false), list_message);
     }
 
     #[test]
