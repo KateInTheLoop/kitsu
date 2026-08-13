@@ -181,7 +181,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   case proving an unclosed `**` is left untouched; `cargo test -p
   kitsu-render` green.
 
-- [ ] **5. Theme-aware agent-join heartbeats** (S)
+- [x] **5. Theme-aware agent-join heartbeats** (S) — done 2026-08-13
   The join-wait heartbeat is a bare `eprintln!("~ still waiting …")`
   (`crates/kitsu/src/main.rs:7596-7614`), so on a styled TTY it is the only
   untinted `~` line — every other info notice goes teal via
