@@ -990,6 +990,66 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     );
 }
 
+/// Cycle-27: identical SUCCESSFUL calls stop re-executing past the limit;
+/// the model gets a reminder result instead.
+#[tokio::test]
+async fn identical_successful_repeats_short_circuit_after_limit() {
+    let call = |id: &str| {
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "echo".to_string(),
+                args: r#"{"x":1}"#.to_string(),
+                call_id: id.to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ]
+    };
+    let provider = MockProvider::new(vec![
+        call("c1"),
+        call("c2"),
+        call("c3"),
+        call("c4"),
+        call("c5"),
+        vec![
+            ChatDelta::Text("stopped".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran2 = ran.clone();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "echo".to_string(),
+            description: "echo".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let ran = ran2.clone();
+            Box::pin(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>("{}".to_string())
+            })
+        }),
+    );
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .unwrap();
+    assert!(out.contains("stopped"));
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        3,
+        "calls 4 and 5 must be short-circuited after 3 identical successes"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::Tool && m.content.contains("identical call repeated")
+        }),
+        "the reminder result reaches the model"
+    );
+}
+
 /// Receipt durations: milliseconds under a second, one-decimal seconds after.
 #[test]
 fn format_tool_elapsed_formats_ms_and_seconds() {

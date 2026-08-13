@@ -999,6 +999,13 @@ where
     // final answer instead of burning every round. Signature = tool_name + args.
     let mut consecutive_failures: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    // Cycle-27 audit: nine byte-identical SUCCESSFUL workspace_diff calls
+    // cost 6.7x tokens — the failure breaker never sees successful repeats.
+    // After this many identical successes, further identical calls are
+    // answered with a short reminder instead of re-executing.
+    const REPEAT_SUCCESS_LIMIT: u32 = 3;
+    let mut consecutive_successes: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut force_final_next = false;
     const REPEAT_FAIL_LIMIT: u32 = 2;
     // Cycle-23 audit: the spawn cap's polite refusal was ignored 6x by a
@@ -1380,15 +1387,28 @@ where
             abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
             let call_started = std::time::Instant::now();
-            let tool_result = match tool_event.command_progress_sink() {
-                Some(sink) => {
-                    scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone())).await
+            let repeat_count = consecutive_successes.get(&sig).copied().unwrap_or(0);
+            let tool_result = if repeat_count >= REPEAT_SUCCESS_LIMIT {
+                // Identical successful call repeated past the limit: answer
+                // with a reminder instead of re-running (and re-paying for)
+                // the same result.
+                Ok(format!(
+                    "[identical call repeated: this exact {} call already succeeded {repeat_count} time(s) this turn and its result is above — use it, or change the arguments]",
+                    tc.tool_name
+                ))
+            } else {
+                match tool_event.command_progress_sink() {
+                    Some(sink) => {
+                        scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone()))
+                            .await
+                    }
+                    None => tools.run(&tc.tool_name, tc.args.clone()).await,
                 }
-                None => tools.run(&tc.tool_name, tc.args.clone()).await,
             };
             let (content, is_err) = match tool_result {
                 Ok(out) => {
                     consecutive_failures.remove(&sig); // a success resets the streak
+                    *consecutive_successes.entry(sig.clone()).or_insert(0) += 1;
                     (out, false)
                 }
                 Err(e) => {
