@@ -41,6 +41,18 @@ Shipped in this pass: `/cost` and `/loop`.
   `/queue` inspects, `/queue clear` aborts). Interactive-only by the queue's
   design; scripted runs express loops as repeated lines.
 
+## Also shipped in this pass (second wave)
+
+- **`/help <command>`** — every command now explains itself: syntax,
+  description, in-depth details for the 30 highest-traffic commands
+  (fallback to the description elsewhere), and alias resolution.
+- **`/theme`** — six built-in color themes (kitsune, sakura, ocean, forest,
+  ember, mono) switchable live; glyph vocabulary stays theme-independent.
+  Persist with `theme = "<name>"` in the config or `--theme`; `--plain`
+  wins over any theme. Claude Code equivalent: /config theme.
+- **`/cost` context line** — the live window position (used of effective,
+  percent, resolved window) renders beside cumulative usage.
+
 ## Queued next (parity backlog)
 
 1. Interactive `/resume` picker (long-standing).

@@ -344,7 +344,9 @@ fn format_message(s: &str, styled: bool) -> String {
 }
 
 /// Named kitsune palette (design.md §8, docs/ux-design.md). Truecolor RGB,
-/// used only when the destination is a styled TTY.
+/// used only when the destination is a styled TTY. These constants are the
+/// DEFAULT theme's values; live rendering reads the active [`Theme`] instead
+/// so `/theme` can restyle the whole surface at runtime.
 /// Fox-orange identity accent used across the UI.
 pub const FOX: (u8, u8, u8) = (255, 140, 0);
 /// Warnings and high (>=80%) context utilization.
@@ -357,6 +359,117 @@ pub const TEAL: (u8, u8, u8) = (54, 117, 136);
 pub const SAGE: (u8, u8, u8) = (155, 175, 131);
 /// Errors and critical (>=95%) context utilization.
 pub const EMBER: (u8, u8, u8) = (228, 87, 46);
+
+/// One color theme: the six palette roles every styled surface draws from.
+/// Structural glyphs are theme-independent (they are vocabulary, not skin).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct Theme {
+    pub name: &'static str,
+    pub description: &'static str,
+    /// Identity accent (prompt, banner, milestones).
+    pub accent: (u8, u8, u8),
+    /// Warnings and high context utilization.
+    pub warn: (u8, u8, u8),
+    /// Highlight text.
+    pub highlight: (u8, u8, u8),
+    /// Informational notices and links.
+    pub info: (u8, u8, u8),
+    /// Success notices.
+    pub success: (u8, u8, u8),
+    /// Errors and critical context utilization.
+    pub error: (u8, u8, u8),
+}
+
+/// Built-in themes. `kitsune` is the identity default; the rest restyle the
+/// same roles without touching glyphs or layout.
+pub const THEMES: &[Theme] = &[
+    Theme {
+        name: "kitsune",
+        description: "fox-orange identity default",
+        accent: FOX,
+        warn: AMBER,
+        highlight: CREAM,
+        info: TEAL,
+        success: SAGE,
+        error: EMBER,
+    },
+    Theme {
+        name: "sakura",
+        description: "cherry-blossom pinks over plum",
+        accent: (244, 128, 170),
+        warn: (255, 183, 120),
+        highlight: (255, 245, 248),
+        info: (142, 88, 143),
+        success: (156, 194, 145),
+        error: (224, 82, 99),
+    },
+    Theme {
+        name: "ocean",
+        description: "deep-sea blues and surf teal",
+        accent: (64, 156, 255),
+        warn: (255, 196, 84),
+        highlight: (235, 248, 255),
+        info: (0, 168, 204),
+        success: (88, 205, 165),
+        error: (255, 99, 92),
+    },
+    Theme {
+        name: "forest",
+        description: "moss green with lantern amber",
+        accent: (96, 176, 80),
+        warn: (230, 178, 60),
+        highlight: (244, 250, 236),
+        info: (110, 140, 205),
+        success: (140, 200, 120),
+        error: (210, 90, 60),
+    },
+    Theme {
+        name: "ember",
+        description: "coal reds and warm grays",
+        accent: (235, 94, 40),
+        warn: (250, 165, 70),
+        highlight: (252, 244, 236),
+        info: (170, 140, 130),
+        success: (180, 190, 120),
+        error: (255, 60, 60),
+    },
+    Theme {
+        name: "mono",
+        description: "single-ink minimal (still styled; use --plain for ASCII)",
+        accent: (200, 200, 200),
+        warn: (230, 230, 230),
+        highlight: (255, 255, 255),
+        info: (170, 170, 170),
+        success: (210, 210, 210),
+        error: (245, 245, 245),
+    },
+];
+
+static ACTIVE_THEME: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+/// The active theme (defaults to `kitsune`).
+pub fn theme() -> &'static Theme {
+    let index = ACTIVE_THEME.load(std::sync::atomic::Ordering::Acquire);
+    THEMES.get(index).unwrap_or(&THEMES[0])
+}
+
+/// Switch the active theme by name. Unknown names list the valid set.
+pub fn set_theme(name: &str) -> Result<&'static Theme, String> {
+    match THEMES.iter().position(|theme| theme.name == name) {
+        Some(index) => {
+            ACTIVE_THEME.store(index, std::sync::atomic::Ordering::Release);
+            Ok(&THEMES[index])
+        }
+        None => Err(format!(
+            "unknown theme '{name}' — available: {}",
+            THEMES
+                .iter()
+                .map(|theme| theme.name)
+                .collect::<Vec<_>>()
+                .join(", ")
+        )),
+    }
+}
 
 /// Kitsu's own structural glyph set (design.md §8). Defined once here so every
 /// surface uses the same symbols; `--plain` maps each to stable ASCII via
@@ -427,7 +540,7 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
         );
         return;
     }
-    let (r, g, b) = FOX;
+    let (r, g, b) = theme().accent;
     let bar = "│".truecolor(r, g, b);
     let tools_str = if tools.is_empty() {
         "none (read-only chat)".to_string()
@@ -494,7 +607,7 @@ pub fn chat_banner(gateway: &str, model: &str, dir: &str, tools: &[String]) {
 /// The interactive chat prompt. Fox-orange on a TTY, plain otherwise.
 pub fn prompt_string() -> String {
     if stdout_style() {
-        let (r, g, b) = FOX;
+        let (r, g, b) = theme().accent;
         format!("{} ", "kitsu>".truecolor(r, g, b).bold())
     } else {
         "kitsu> ".to_string()
@@ -612,10 +725,10 @@ impl PromptSafeAsyncNotice {
             return line;
         }
         let (r, g, b) = match self.level {
-            AsyncNoticeLevel::Info => TEAL,
-            AsyncNoticeLevel::Success => SAGE,
-            AsyncNoticeLevel::Warning => AMBER,
-            AsyncNoticeLevel::Error => EMBER,
+            AsyncNoticeLevel::Info => theme().info,
+            AsyncNoticeLevel::Success => theme().success,
+            AsyncNoticeLevel::Warning => theme().warn,
+            AsyncNoticeLevel::Error => theme().error,
         };
         format!("{}", line.truecolor(r, g, b))
     }
@@ -647,7 +760,7 @@ fn error_display_lines(message: &str, styled: bool, plain: bool) -> Vec<String> 
     let first = format!("! error: {}", lines.next().unwrap_or_default());
     let mut output = Vec::new();
     if styled && !plain {
-        let (r, g, b) = EMBER;
+        let (r, g, b) = theme().error;
         output.push(format!("{}", first.truecolor(r, g, b).bold()));
     } else {
         output.push(first);
@@ -723,7 +836,7 @@ fn spinner_mode(destination_is_tty: bool, plain: bool, reduced_motion: bool) -> 
 
 fn static_spinner_line(styled: bool) -> String {
     if styled {
-        let (r, g, b) = FOX;
+        let (r, g, b) = theme().accent;
         format!(
             "  {} {}",
             "*".truecolor(r, g, b),
@@ -803,7 +916,7 @@ impl Spinner {
             // (ᴥ muzzle, no cat ω/ฅ) with a sweeping tail.
             const FRAMES: [&str; 4] = SPINNER_FRAMES;
             const DOTS: [&str; 4] = ["   ", "･  ", "･･ ", "･･･"];
-            let (r, g, b) = FOX;
+            let (r, g, b) = theme().accent;
             let mut i = 0usize;
             // Avoid a distracting flash for fast local responses.
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
@@ -893,7 +1006,7 @@ pub fn tool_activity(header: &str) {
         sanitize_terminal_inline(header)
     };
     if stderr_is_tty() && !plain {
-        let (r, g, b) = FOX;
+        let (r, g, b) = theme().accent;
         eprintln!("{} {header}", GLYPH_TOOL_CALL.truecolor(r, g, b));
     } else if plain {
         eprintln!("tool> {header}");
@@ -924,7 +1037,7 @@ fn tool_result_with_weight(summary: &str, is_error: bool) {
     let line = format!("  {GLYPH_TOOL_RESULT} {summary}");
     if stderr_is_tty() && !plain {
         if is_error {
-            let (r, g, b) = EMBER;
+            let (r, g, b) = theme().error;
             eprintln!("{}", line.truecolor(r, g, b));
         } else {
             eprintln!("{}", line.dimmed());
@@ -957,7 +1070,7 @@ pub fn approval_header(request: &str) -> String {
 fn approval_header_with_mode(request: &str, styled: bool) -> String {
     let request = sanitize_terminal_inline(request);
     if styled {
-        let (r, g, b) = FOX;
+        let (r, g, b) = theme().accent;
         format!(
             "{} — {request}",
             format!("{GLYPH_APPROVAL} permission")
@@ -1056,7 +1169,7 @@ fn milestone_line_with_mode(message: &str, styled: bool, plain: bool) -> String 
     } else {
         let line = format!("{GLYPH_TORII} {}", sanitize_terminal_inline(message));
         if styled {
-            let (r, g, b) = FOX;
+            let (r, g, b) = theme().accent;
             format!("{}", line.truecolor(r, g, b))
         } else {
             line
@@ -1096,9 +1209,9 @@ impl DeckState {
 
     fn color(self) -> (u8, u8, u8) {
         match self {
-            Self::Running | Self::ResultReady => FOX,
-            Self::Failed => EMBER,
-            Self::Stopped => AMBER,
+            Self::Running | Self::ResultReady => theme().accent,
+            Self::Failed => theme().error,
+            Self::Stopped => theme().warn,
         }
     }
 
@@ -1125,7 +1238,7 @@ fn deck_header_with_mode(summary: &str, styled: bool, plain: bool) -> String {
     }
     let line = format!("{GLYPH_RECEIPT} {}", sanitize_terminal_inline(summary));
     if styled {
-        let (r, g, b) = CREAM;
+        let (r, g, b) = theme().highlight;
         format!("{}", line.truecolor(r, g, b).bold())
     } else {
         line
@@ -1342,7 +1455,7 @@ fn context_lines(
     rows: &[(&str, u64, &str, &str)],
     mode: RenderMode,
 ) -> Vec<String> {
-    let (r, g, b) = FOX;
+    let (r, g, b) = theme().accent;
     let clean = |value: &str| {
         if mode.plain {
             sanitize_plain_inline(value)
@@ -1387,8 +1500,8 @@ fn context_lines(
         // utilization, AMBER at >=80%, EMBER at >=95% — a quiet capacity
         // warning. Empty cells are dimmed so the boundary is visible.
         let (r, g, b) = match pct {
-            p if p >= 95 => EMBER,
-            p if p >= 80 => AMBER,
+            p if p >= 95 => theme().error,
+            p if p >= 80 => theme().warn,
             _ => (r, g, b),
         };
         format!(

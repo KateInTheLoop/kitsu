@@ -24,6 +24,10 @@ pub struct Config {
     /// `--agent-spawn-cap` overrides; 0 disables spawning for the run.
     #[serde(default)]
     pub agent_spawn_cap: Option<u32>,
+    /// Default color theme for styled output (see `/theme` for the list).
+    /// `--theme` overrides per run; `--plain` disables styling entirely.
+    #[serde(default)]
+    pub theme: Option<String>,
     #[serde(default)]
     pub gateways: BTreeMap<String, Gateway>,
 }

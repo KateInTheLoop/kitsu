@@ -2588,6 +2588,9 @@ struct SlashCommandSpec {
     name: &'static str,
     args: &'static str,
     description: &'static str,
+    /// Longer explanation for `/help <command>`: behavior, constraints, and
+    /// an example where one helps. Empty falls back to `description`.
+    details: &'static str,
     group: CommandGroup,
     /// A backward-compatible alias folds into its parent's `/help` row while
     /// remaining a first-class registry entry for completion and dispatch.
@@ -2611,6 +2614,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "agent",
         args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
         description: "inspect and control one background agent thread",
+        details: "Per-thread control of one background agent: `show` streams its bounded transcript, `steer` injects a correction, `stop` cancels, `close` acknowledges a finished thread. Ids come from /jobs.",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -2618,6 +2622,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "agents",
         args: "[id]",
         description: "backward-compatible alias for /jobs",
+        details: "",
         group: CommandGroup::AgentsJobs,
         alias_of: Some("jobs"),
     },
@@ -2625,6 +2630,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow",
         args: "<path>",
         description: "grant read access for this session",
+        details: "Grants READ access to a path for this session only. Runtime grants are dropped on /new, /resume, and /fork; invocation-flag roots persist. Example: /allow ../other-crate",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2632,6 +2638,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow-read-write",
         args: "<path>",
         description: "grant read and write access for this session",
+        details: "Grants read AND write access to a path for this session. Writes are journaled into checkpoints (/checkpoints, /undo).",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2639,6 +2646,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow-write",
         args: "<path>",
         description: "grant write access for this session",
+        details: "Grants WRITE-ONLY access — the model can create/replace files there but cannot read them back; use /allow-read-write when edits need readback.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2646,6 +2654,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "archive",
         args: "<id>",
         description: "archive an inactive saved conversation",
+        details: "Moves an inactive saved session into recoverable archive storage. Restore later with /restore <id>; archived sessions leave /sessions listings.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2653,6 +2662,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "artifacts",
         args: "[list|prune <id|all>]",
         description: "inspect or prune retained command-output artifacts",
+        details: "",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2660,6 +2670,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "checkpoint",
         args: "<id>",
         description: "preview one recoverable verified file checkpoint",
+        details: "Previews one write checkpoint: its files, sizes, and a bounded verified diff. Restore it with /undo <id>.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2667,6 +2678,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "checkpoints",
         args: "",
         description: "list recoverable verified file checkpoints",
+        details: "Lists write checkpoints (grouped successful model writes) with ids — each is restorable via /undo <id> while its files still match.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2674,6 +2686,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "clear",
         args: "",
         description: "clear conversation history",
+        details: "",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2681,6 +2694,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "compact",
         args: "",
         description: "compact older conversation context now",
+        details: "Reclaims context: trim drops the oldest exchanges; summarize replaces them with an LLM-written summary (falls back to trim on failure). /context shows the savings ledger afterwards.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2688,6 +2702,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "context",
         args: "[refresh]",
         description: "show context utilization or refresh discovered window metadata",
+        details: "Source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `refresh` re-discovers window metadata from the gateway.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2695,6 +2710,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "cost",
         args: "",
         description: "cumulative session token usage across all turns",
+        details: "Cumulative session usage: prompt + completion = total tokens across all completed turns, plus the live context-window position. Kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2702,6 +2718,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "delete",
         args: "<id>",
         description: "permanently delete an inactive live session",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2709,6 +2726,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "diff",
         args: "[scope] [path]",
         description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
+        details: "Host-owned bounded diff evidence from Git and the write journal: working/staged/unstaged/base/commit/checkpoint scopes. Renders to the terminal only — nothing is sent to the provider (that is /review's job) and no filesystem grant is created or needed.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2716,6 +2734,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "exit",
         args: "[wait|cancel]",
         description: "exit chat with an explicit background-job policy",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2723,6 +2742,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "export",
         args: "<file> [markdown|json]",
         description: "export the active session without overwriting",
+        details: "Writes the session transcript to a new file (never overwrites): markdown for humans, JSON for automation; artifact sidecars may be created next to it.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2730,6 +2750,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "fork",
         args: "[id]",
         description: "clone and switch to a fresh session",
+        details: "Clones a saved session under a fresh id and switches to it. Permission grants are deliberately NOT carried — a fork starts with invocation roots only.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2737,6 +2758,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "help",
         args: "",
         description: "show command help",
+        details: "Grouped command list. `/help <command>` shows that command's syntax, explanation, and aliases.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2744,6 +2766,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "jobs",
         args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
+        details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -2751,6 +2774,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "loop",
         args: "<count> <prompt>",
         description: "queue a prompt to run <count> times in sequence (2-20)",
+        details: "Queues <count> copies (2-20) of a plain prompt onto the bounded prompt queue; they run in sequence after the current turn. Inspect with /queue, abort with /queue clear. Interactive chat only — scripted runs repeat lines natively. Example: /loop 3 run the tests and fix one failure",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2758,6 +2782,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "model",
         args: "<name>",
         description: "switch model while keeping history",
+        details: "Shows or switches the model. Switching re-discovers the context window (unless pinned by --context-window) and applies to subagents spawned afterwards.",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2765,6 +2790,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "models",
         args: "[filter]",
         description: "list gateway models",
+        details: "",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2772,6 +2798,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "new",
         args: "",
         description: "start and autosave a fresh conversation",
+        details: "Starts a fresh session: clean history, runtime grants dropped, invocation roots restored, background registry reset. The old session stays resumable if it was durable.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2779,6 +2806,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "permissions",
         args: "",
         description: "show filesystem access policy",
+        details: "Full authority disclosure: read/write roots split by invocation vs runtime, protected kitsu-private paths, exact command grants (numbered, revocable), containment status, and the workspace-evidence tool's standing disclosure.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2786,6 +2814,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "profiles",
         args: "",
         description: "show available specialist background-agent profiles",
+        details: "",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -2793,6 +2822,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "queue",
         args: "[list|add|remove|edit|move|promote|clear]",
         description: "inspect or edit the bounded prompt queue",
+        details: "Bounded 8-slot FIFO of upcoming prompts: list/add/remove/edit/move/promote/clear. On Unix, complete lines typed during a running turn are collected here automatically.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2800,6 +2830,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "quit",
         args: "[wait|cancel]",
         description: "exit, wait for jobs, or cancel and join them",
+        details: "",
         group: CommandGroup::Session,
         alias_of: Some("exit"),
     },
@@ -2807,6 +2838,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "reasoning",
         args: "[default|none|minimal|low|medium|high|xhigh]",
         description: "show or change reasoning effort for subsequent turns",
+        details: "Sets the reasoning-effort hint (none..xhigh) sent to compatible gateways; `default` omits the field entirely so strict endpoints never see it. Applies to later turns and spawned subagents.",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2814,6 +2846,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "restore",
         args: "<id>",
         description: "restore an archived session",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2821,6 +2854,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "resume",
         args: "<id|last>",
         description: "resume a saved conversation",
+        details: "Switches to a saved session by id or NAME; `last` picks the newest anywhere, `auto` the newest recorded in this directory. Saved permission grants are never restored; the saved gateway and working directory must match.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2828,6 +2862,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "retry",
         args: "",
         description: "retry the last failed or cancelled prompt",
+        details: "Resubmits the last failed or cancelled prompt exactly as typed.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2835,6 +2870,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "review",
         args: "[scope] [path]",
         description: "review a verified working/staged/unstaged/base/commit/checkpoint diff",
+        details: "Sends host-verified diff evidence (same scopes as /diff) to the model in a tool-free turn and prints its review. One bounded disclosure, clearly announced; no filesystem grant involved.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2842,6 +2878,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-command",
         args: "<number>",
         description: "revoke a numbered exact command grant",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2849,6 +2886,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-read",
         args: "<exact-root>",
         description: "revoke an exact read root for this session",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2856,6 +2894,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-write",
         args: "<exact-root>",
         description: "revoke an exact write root for this session",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2863,6 +2902,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "save",
         args: "<file>",
         description: "save the latest response",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2870,6 +2910,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "sessions",
         args: "",
         description: "list locally saved conversations",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2877,6 +2918,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "skill",
         args: "<name>",
         description: "load a skill into context",
+        details: "Loads one named skill's instructions into context (granting no filesystem access); its body then guides the model. Subagents inherit loaded skills.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2884,6 +2926,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "skills",
         args: "[filter]",
         description: "list available skills",
+        details: "Lists discovered skills with descriptions and provenance hashes; project skill metadata is untrusted until explicitly loaded.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2891,6 +2934,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "status",
         args: "",
         description: "show model, context, tools, and session state",
+        details: "One-screen session health: session id/name, endpoint, model, window + provenance, directory and Git state, project context source, tool/permission state, command roots, background agents, compaction totals.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2898,6 +2942,15 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "steer",
         args: "<correction>",
         description: "redirect the active response and restart that turn",
+        details: "Mid-turn correction: rolls the partial turn back (completed file effects are kept and reported), injects your correction, and restarts the turn ahead of queued prompts.",
+        group: CommandGroup::Session,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "theme",
+        args: "[name]",
+        description: "list color themes or switch the live theme",
+        details: "Restyles every styled surface immediately (prompt, banner, receipts, notices); structural glyphs stay put. Bare /theme lists themes with the active one marked. Persist a choice with `theme = \"<name>\"` in the config or --theme. --plain disables styling entirely and wins over any theme.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2905,6 +2958,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "tools",
         args: "",
         description: "show enabled tools and effective access",
+        details: "Lists the tools advertised to the model this session, with the permission state that gates each.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2912,6 +2966,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "undo",
         args: "[id]",
         description: "undo the latest or selected conflict-free file checkpoint",
+        details: "Restores a write checkpoint (default: the latest) after verifying its files still match the recorded state; refuses while background agents run. /checkpoints lists candidates.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2968,7 +3023,9 @@ fn slash_help(model: &str, styled: bool) -> String {
             }
         }
     }
-    out.push_str(&format!("current model: {model}"));
+    out.push_str(&format!(
+        "current model: {model} — /help <command> explains one command in detail"
+    ));
     out
 }
 
@@ -5626,6 +5683,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
                 provenance.discovery = discovery;
             }
         });
+    }
+
+    if let Some(name) = cli.theme.as_deref().or(config.theme.as_deref()) {
+        kitsu_render::set_theme(name).map_err(CliError::user)?;
     }
 
     Ok(ChatSetup {
@@ -11927,6 +11988,62 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         .map(|(_, cmd)| cmd)
 }
 
+/// `/help <command>`: syntax, explanation, and aliases for one command.
+/// Aliases resolve to their parent; unknown names get a nearest-help nudge.
+fn slash_command_help(query: &str) -> String {
+    let query = query.trim_start_matches('/');
+    let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == query) else {
+        return format!(
+            "no command named /{} — /help lists every command",
+            terminal_inline(query)
+        );
+    };
+    // An alias explains its parent (and says so).
+    let (spec, alias_note) = match spec.alias_of {
+        Some(parent) => (
+            SLASH_COMMANDS
+                .iter()
+                .find(|candidate| candidate.name == parent)
+                .unwrap_or(spec),
+            Some(format!("/{} is an alias of /{parent}.", spec.name)),
+        ),
+        None => (spec, None),
+    };
+    let mut out = spec.syntax();
+    out.push_str(
+        "
+  ",
+    );
+    out.push_str(spec.description);
+    let details = spec.details.trim();
+    if !details.is_empty() {
+        out.push_str(
+            "
+  ",
+        );
+        out.push_str(details);
+    }
+    let aliases: Vec<&str> = SLASH_COMMANDS
+        .iter()
+        .filter(|candidate| candidate.alias_of == Some(spec.name))
+        .map(|candidate| candidate.name)
+        .collect();
+    if !aliases.is_empty() {
+        out.push_str(&format!(
+            "
+  aliases: /{}",
+            aliases.join(", /")
+        ));
+    }
+    if let Some(note) = alias_note {
+        out.push_str(&format!(
+            "
+  {note}"
+        ));
+    }
+    out
+}
+
 fn slash_syntax(name: &str) -> String {
     SLASH_COMMANDS
         .iter()
@@ -12115,7 +12232,6 @@ async fn handle_slash(
                 | "checkpoints"
                 | "compact"
                 | "cost"
-                | "help"
                 | "new"
                 | "permissions"
                 | "profiles"
@@ -12155,6 +12271,15 @@ async fn handle_slash(
             return SlashResult::Quit;
         }
         "" | "help" => {
+            if !arg.is_empty() {
+                let text = slash_command_help(arg);
+                eprintln!("{text}");
+                return SlashResult::Continue(Some(serde_json::json!({
+                    "kind": "help",
+                    "command": arg,
+                    "text": text,
+                })));
+            }
             // The JSONL payload always carries the unstyled text; only the
             // live terminal gets bold group headings.
             let text = slash_help(model, false);
@@ -12499,6 +12624,15 @@ async fn handle_slash(
                 terminal_inline(model),
                 terminal_inline(&session.gateway),
             );
+            if let Some(window) = context_window.get() {
+                let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
+                let used = state.meter.estimate(messages);
+                let percent = (used.saturating_mul(100)) / budget.effective.max(1);
+                eprintln!(
+                    "context window: {used} of {} effective token(s) used ({percent}%), window {window} — /context for provenance",
+                    budget.effective,
+                );
+            }
             eprintln!(
                 "~ kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire"
             );
@@ -12520,6 +12654,34 @@ async fn handle_slash(
                 return SlashResult::Error;
             }
             return SlashResult::QueueAction(QueueCommand::AddCopies { prompt, count });
+        }
+        "theme" => {
+            if arg.is_empty() {
+                let active = kitsu_render::theme().name;
+                eprintln!("themes (active marked *):");
+                for theme in kitsu_render::THEMES {
+                    let marker = if theme.name == active { "*" } else { " " };
+                    eprintln!(" {marker} {:<8} {}", theme.name, theme.description);
+                }
+                eprintln!("switch with /theme <name>; persist via `theme = \"<name>\"` in the config or --theme");
+                return SlashResult::Continue(None);
+            }
+            return match kitsu_render::set_theme(arg) {
+                Ok(theme) => {
+                    eprintln!(
+                        "{}",
+                        kitsu_render::milestone_line(&format!(
+                            "theme: {} — {}",
+                            theme.name, theme.description
+                        ))
+                    );
+                    SlashResult::Continue(None)
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    SlashResult::Error
+                }
+            };
         }
         "queue" => {
             return match parse_queue_command(arg) {
@@ -13718,7 +13880,9 @@ mod tests {
                 }
             }
         }
-        assert!(help.ends_with("current model: test-model"));
+        assert!(help.ends_with(
+            "current model: test-model — /help <command> explains one command in detail"
+        ));
     }
 
     #[test]
