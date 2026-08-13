@@ -163,6 +163,12 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_workspace_evidence: bool,
 
+    /// Color theme for styled output (kitsune, sakura, ocean, forest, ember,
+    /// mono — see `/theme`). Overrides the config key `theme`; `--plain`
+    /// disables styling entirely and wins over any theme.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub theme: Option<String>,
+
     /// Per-turn cap on subagent spawns (`spawn_agent`, `spawn_agents`,
     /// `spawn_agent_bg` combined). Spawns beyond the cap return a tool error
     /// the model sees, stopping agent storms from models that ignore prompt
