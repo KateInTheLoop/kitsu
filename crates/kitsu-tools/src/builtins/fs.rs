@@ -324,6 +324,10 @@ fn create_unique_private_artifact_with_sequence(
 struct CappedText {
     text: String,
     truncated: bool,
+    /// Total on-disk size in bytes (cheap via metadata) so a capped read can
+    /// disclose how much was NOT served (cycle-19/29 audits: a model read
+    /// 1731 of 15682 lines and said DONE with nothing marking the gap).
+    total_bytes: u64,
 }
 
 fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Result<CappedText> {
@@ -351,7 +355,11 @@ fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Resul
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
         }
     };
-    Ok(CappedText { text, truncated })
+    Ok(CappedText {
+        text,
+        truncated,
+        total_bytes: metadata.len(),
+    })
 }
 
 fn open_read_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -439,6 +447,7 @@ where
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
 
+    let served_bytes = content.text.len();
     let sliced = match (a.start_line, a.end_line) {
         (None, None) => content.text,
         (start, end) => {
@@ -457,11 +466,19 @@ where
                 .join("\n")
         }
     };
-    let mut sliced = sliced;
+    // The size disclosure is appended AFTER policy capping: cap_output trims
+    // the tail, so an earlier append would be eaten and replaced by its
+    // generic marker (the pre-fix behavior). The ~100-byte overflow past the
+    // cap is deliberate — the disclosure is the point.
+    let mut capped = policy.cap_output(sliced);
     if content.truncated {
-        sliced.push_str("\n...[truncated: output exceeded byte cap]");
+        capped.push_str(&format!(
+            "\n...[truncated: output exceeded byte cap — served {} KiB of {} KiB total; re-read a line range for the rest]",
+            served_bytes / 1024,
+            content.total_bytes / 1024,
+        ));
     }
-    Ok(policy.cap_output(sliced))
+    Ok(capped)
 }
 
 /// Accept both `1` and `"1"` for optional line numbers: small models emit

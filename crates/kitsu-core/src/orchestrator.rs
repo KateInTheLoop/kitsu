@@ -1977,9 +1977,21 @@ fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> St
                 })
                 .unwrap_or_default();
             let capped = if truncated {
-                ", capped at the byte limit"
+                // Quote the served-of-total detail from the marker so the
+                // human sees the gap size without opening the raw result.
+                content
+                    .lines()
+                    .find(|line| line.starts_with("...[truncated"))
+                    .and_then(|line| line.split(" — ").nth(1))
+                    .map(|detail| {
+                        format!(
+                            ", capped: {}",
+                            detail.split(';').next().unwrap_or(detail).trim()
+                        )
+                    })
+                    .unwrap_or_else(|| ", capped at the byte limit".to_string())
             } else {
-                ""
+                String::new()
             };
             format!("{n} line{}{range}{capped}", if n == 1 { "" } else { "s" })
         }
