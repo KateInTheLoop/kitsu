@@ -47,6 +47,9 @@ The implemented chat controls include:
   untrusted until an explicit load.
 - Scheduling: editable `/queue` controls plus active-turn `/steer`, `/jobs
   steer|stop|stop-all`, and `/quit cancel` on Unix.
+- Cumulative session token usage: `/cost` (tokens + turn count; kitsu
+  meters tokens, not currency). Repeat a prompt N times: `/loop <count>
+  <prompt>` (2-20, via the bounded prompt queue; interactive chat only).
 - Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
   `/restore`, and `/delete`.
 

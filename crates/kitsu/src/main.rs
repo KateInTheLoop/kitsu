@@ -2692,6 +2692,13 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         alias_of: None,
     },
     SlashCommandSpec {
+        name: "cost",
+        args: "",
+        description: "cumulative session token usage across all turns",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
+    },
+    SlashCommandSpec {
         name: "delete",
         args: "<id>",
         description: "permanently delete an inactive live session",
@@ -2738,6 +2745,13 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
         group: CommandGroup::AgentsJobs,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "loop",
+        args: "<count> <prompt>",
+        description: "queue a prompt to run <count> times in sequence (2-20)",
+        group: CommandGroup::Session,
         alias_of: None,
     },
     SlashCommandSpec {
@@ -11650,9 +11664,17 @@ enum SlashResult {
 enum QueueCommand {
     List,
     Add(String),
+    /// `/loop`: enqueue the same prompt several times in sequence.
+    AddCopies {
+        prompt: String,
+        count: usize,
+    },
     Remove(usize),
     Edit(usize, String),
-    Move { from: usize, to: usize },
+    Move {
+        from: usize,
+        to: usize,
+    },
     Promote(usize),
     Clear,
 }
@@ -11779,6 +11801,30 @@ fn execute_queue_command(
                 ));
             }
             Ok(output)
+        }
+        QueueCommand::AddCopies { prompt, count } => {
+            let mut queued = 0usize;
+            for _ in 0..count {
+                if queue.enqueue(prompt.clone()).is_err() {
+                    break;
+                }
+                queued += 1;
+            }
+            if queued == 0 {
+                Err(format!(
+                    "queue is at capacity {}; finish or remove a queued turn and try again",
+                    queue.status().capacity
+                ))
+            } else if queued < count {
+                Ok(format!(
+                    "queued {queued} of {count} copies (queue reached capacity {}); they run in sequence after the current turn",
+                    queue.status().capacity
+                ))
+            } else {
+                Ok(format!(
+                    "queued {count} copies; they run in sequence after the current turn — /queue to inspect, /queue clear to abort"
+                ))
+            }
         }
         QueueCommand::Add(prompt) => match queue.enqueue(prompt) {
             Ok(status) => Ok(status.to_string()),
@@ -12068,6 +12114,7 @@ async fn handle_slash(
             "clear"
                 | "checkpoints"
                 | "compact"
+                | "cost"
                 | "help"
                 | "new"
                 | "permissions"
@@ -12440,6 +12487,39 @@ async fn handle_slash(
             } else {
                 arg.to_string()
             });
+        }
+        "cost" => {
+            let usage = &state.run_usage;
+            eprintln!(
+                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s) ({} via {})",
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                state.run_turns,
+                terminal_inline(model),
+                terminal_inline(&session.gateway),
+            );
+            eprintln!(
+                "~ kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire"
+            );
+            return SlashResult::Continue(None);
+        }
+        "loop" => {
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            let count = parts.next().unwrap_or("").parse::<usize>().ok();
+            let prompt = parts.next().unwrap_or("").trim().to_string();
+            let Some(count) = count.filter(|count| (2..=20).contains(count)) else {
+                eprintln!("usage: {} (count 2-20)", slash_syntax("loop"));
+                return SlashResult::Error;
+            };
+            if prompt.is_empty() || prompt.starts_with('/') {
+                eprintln!(
+                    "usage: {} — the prompt must be a plain model turn, not a slash command",
+                    slash_syntax("loop")
+                );
+                return SlashResult::Error;
+            }
+            return SlashResult::QueueAction(QueueCommand::AddCopies { prompt, count });
         }
         "queue" => {
             return match parse_queue_command(arg) {
