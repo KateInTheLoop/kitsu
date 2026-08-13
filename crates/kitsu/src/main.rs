@@ -5119,6 +5119,27 @@ fn permissions_payload(
 /// Render `/context`: the static provenance rows (what loaded and why) plus the
 /// live conversation, with token cost and policy per source. The per-turn
 /// `kitsu-context:` line carries the usage-anchored number; this is an estimate.
+/// The ONE context-used figure both `/context` and `/cost` report: the
+/// meter's provider-anchored estimate when available, else the sum of the
+/// provenance rows (system sources + tool schemas) and the live
+/// conversation breakdown. Cycle-23 audit: the two commands disagreed by
+/// exactly the tool-schema size because /cost read the bare meter.
+fn session_context_used(
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) -> (u64, u64) {
+    let b = ContextMeter::new().breakdown(messages);
+    let prov_total: u64 = session.provenance.borrow().iter().map(|e| e.tokens).sum();
+    let estimated = prov_total + b.user + b.assistant + b.tool_results;
+    let used = if state.meter.anchored(messages) {
+        state.meter.estimate(messages)
+    } else {
+        estimated
+    };
+    (used, estimated)
+}
+
 fn render_context_command(
     model: &str,
     messages: &[ChatMessage],
@@ -5134,6 +5155,9 @@ fn render_context_command(
     } else {
         "default - set context_window or --context-window"
     };
+    // One accounting truth, computed before the provenance borrow below
+    // (session_context_used takes its own borrow).
+    let (used, estimated) = session_context_used(messages, session, state);
     // Static provenance (system prompt sources + tool schemas) then the live
     // conversation. breakdown.system is already covered by the provenance rows.
     let provenance = session.provenance.borrow();
@@ -5151,14 +5175,20 @@ fn render_context_command(
             ),
         ])
         .collect();
-    let prov_total: u64 = provenance.iter().map(|e| e.tokens).sum();
-    let estimated = prov_total + b.user + b.assistant + b.tool_results;
-    let used = if state.meter.anchored(messages) {
-        state.meter.estimate(messages)
-    } else {
-        estimated
-    };
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
+    if used != estimated {
+        // Rows are chars/4 estimates; the total is anchored to the
+        // provider's reported prompt tokens. Say so instead of letting the
+        // arithmetic silently disagree (cycle-23 audit).
+        let (sign, diff) = if used >= estimated {
+            ("+", used - estimated)
+        } else {
+            ("-", estimated - used)
+        };
+        eprintln!(
+            "rows sum to {estimated} (chars/4 estimates); used total is provider-anchored ({sign}{diff} adjustment)"
+        );
+    }
     let window_provenance = context_window_provenance(&session.window_provenance);
     eprintln!(
         "context window source: {}",
@@ -12774,7 +12804,7 @@ async fn handle_slash(
             );
             if let Some(window) = context_window.get() {
                 let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
-                let used = state.meter.estimate(messages);
+                let (used, _) = session_context_used(messages, session, state);
                 let percent = (used.saturating_mul(100)) / budget.effective.max(1);
                 eprintln!(
                     "context window: {used} of {} effective token(s) used ({percent}%), window {window} — /context for provenance",
