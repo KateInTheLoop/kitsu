@@ -1241,7 +1241,15 @@ async fn test_loop_breaker_on_repeated_failure() {
 fn tool_activity_formatting() {
     use crate::orchestrator::{format_tool_header, format_tool_result, short_path};
 
-    assert_eq!(short_path("/x/y/deck1.md"), "…/y/deck1.md");
+    // Three-segment paths preserve crate identity (cycle-15 G5).
+    assert_eq!(short_path("/x/y/deck1.md"), "/x/y/deck1.md");
+    // Paths with 4+ segments show the last three with a leading `…`.
+    assert_eq!(short_path("/a/b/c/d/e.rs"), "…/c/d/e.rs");
+    assert_eq!(
+        short_path("crates/kitsu-render/src/lib.rs"),
+        "…/kitsu-render/src/lib.rs"
+    );
+    // Two-segment paths stay exact (relative or absolute).
     assert_eq!(short_path("a/b"), "a/b");
     assert_eq!(short_path("deck.md"), "deck.md");
     // Short absolute paths keep their leading slash: `/etc/hostname` must not
@@ -1251,7 +1259,7 @@ fn tool_activity_formatting() {
 
     assert_eq!(
         format_tool_header("fs_read_file", r#"{"path":"/x/y/deck1.md"}"#),
-        "Read(…/y/deck1.md)"
+        "Read(/x/y/deck1.md)"
     );
     assert_eq!(
         format_tool_header("fs_write_file", r#"{"path":"out/fb.py","content":"x"}"#),

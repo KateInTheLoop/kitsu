@@ -122,7 +122,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
 (`sanitize_terminal_text(styled) == plain_text`) must hold. Update
 `docs/ux-design.md` when you change a surface it documents.
 
-- [ ] **1. G5: stop eliding the crate segment in tool receipt paths** (S)
+- [x] **1. G5: stop eliding the crate segment in tool receipt paths** (S) — done 2026-08-12
   `short_path` (`crates/kitsu-core/src/orchestrator.rs:1999`) keeps only the
   last two path segments, so `crates/kitsu-render/src/lib.rs` renders as
   `…/src/lib.rs` — every `src/lib.rs` in a workspace looks identical.

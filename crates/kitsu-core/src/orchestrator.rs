@@ -1994,8 +1994,9 @@ fn safe_warning_summary(warning: &str) -> String {
     bounded_human_value(&safe, 180)
 }
 
-/// Compact a path to at most its last two segments (with a leading `…` when more
-/// were dropped), so activity lines stay short.
+/// Compact a path to at most its last three segments (with a leading `…` when more
+/// were dropped), so activity lines stay short while preserving crate identity.
+/// Cycle-15 G5 finding: distinguish `kitsu-render/src/lib.rs` from `kitsu-core/src/lib.rs`.
 fn short_path(p: &str) -> String {
     let parts: Vec<&str> = p
         .trim_end_matches('/')
@@ -2006,13 +2007,21 @@ fn short_path(p: &str) -> String {
         [] => p.to_string(),
         [one] if p.starts_with('/') => format!("/{one}"),
         [one] => (*one).to_string(),
-        [.., a, b] => {
+        [a, b] => {
             let tail = format!("{a}/{b}");
-            if parts.len() > 2 {
-                format!("…/{tail}")
-            } else if p.starts_with('/') {
+            if p.starts_with('/') {
                 // Keep short absolute paths exact: `/etc/hostname` must not
                 // display as the relative-looking `etc/hostname`.
+                format!("/{tail}")
+            } else {
+                tail
+            }
+        }
+        [.., a, b, c] => {
+            let tail = format!("{a}/{b}/{c}");
+            if parts.len() > 3 {
+                format!("…/{tail}")
+            } else if p.starts_with('/') {
                 format!("/{tail}")
             } else {
                 tail
