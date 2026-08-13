@@ -12855,8 +12855,14 @@ async fn handle_slash(
                 let active = kitsu_render::theme().name;
                 eprintln!("themes (active marked *):");
                 for theme in kitsu_render::THEMES {
-                    let marker = if theme.name == active { "*" } else { " " };
-                    eprintln!(" {marker} {:<8} {}", theme.name, theme.description);
+                    let active_mark = theme.name == active;
+                    let row = kitsu_render::theme_row(
+                        theme,
+                        active_mark,
+                        kitsu_render::stderr_styled(),
+                        kitsu_render::plain_mode(),
+                    );
+                    eprintln!("{}", row);
                 }
                 eprintln!("switch with /theme <name>; persist via `theme = \"<name>\"` in the config or --theme");
                 return SlashResult::Continue(None);

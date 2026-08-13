@@ -559,6 +559,63 @@ pub fn set_theme(name: &str) -> Result<&'static Theme, String> {
     }
 }
 
+/// Format a single theme listing row for `/theme` output.
+/// Returns exactly the current byte-compatible format for `plain`, or styled with
+/// the theme's accent color on the name and a six-dot palette swatch when `styled`.
+pub fn theme_row(theme: &Theme, active: bool, styled: bool, plain: bool) -> String {
+    let marker = if active { "*" } else { " " };
+    let name = theme.name;
+    let description = theme.description;
+
+    if plain {
+        format!(" {marker} {name:<8} {description}")
+    } else {
+        let formatted = format!(" {marker} {name:<8} {description}");
+        if styled {
+            // Tint the name in the theme's accent color
+            let colored_name = format!(
+                "{}",
+                name.truecolor(theme.accent.0, theme.accent.1, theme.accent.2)
+            );
+            // Pad to 8 chars display width (names are ASCII)
+            let padding = " ".repeat(8_usize.saturating_sub(name.len()));
+
+            // Build the swatch: ● in each of the six colors, space-separated
+            let dot = "●";
+            let dot_accent = format!(
+                "{}",
+                dot.truecolor(theme.accent.0, theme.accent.1, theme.accent.2)
+            );
+            let dot_warn = format!(
+                " {}",
+                dot.truecolor(theme.warn.0, theme.warn.1, theme.warn.2)
+            );
+            let dot_highlight = format!(
+                " {}",
+                dot.truecolor(theme.highlight.0, theme.highlight.1, theme.highlight.2)
+            );
+            let dot_info = format!(
+                " {}",
+                dot.truecolor(theme.info.0, theme.info.1, theme.info.2)
+            );
+            let dot_success = format!(
+                " {}",
+                dot.truecolor(theme.success.0, theme.success.1, theme.success.2)
+            );
+            let dot_error = format!(
+                " {}",
+                dot.truecolor(theme.error.0, theme.error.1, theme.error.2)
+            );
+            let swatch =
+                format!(" {dot_accent}{dot_warn}{dot_highlight}{dot_info}{dot_success}{dot_error}");
+
+            format!(" {marker} {colored_name}{padding} {description}{swatch}")
+        } else {
+            formatted
+        }
+    }
+}
+
 /// Kitsu's own structural glyph set (design.md §8). Defined once here so every
 /// surface uses the same symbols; `--plain` maps each to stable ASCII via
 /// [`ascii_structural_markers`].
@@ -1701,10 +1758,10 @@ mod tests {
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
         format_message, grouped_count, human_turn_stats, milestone_line_with_mode,
         sanitize_plain_inline, sanitize_terminal_inline, sanitize_terminal_text, section_heading,
-        spinner_mode, static_spinner_line, write_static_spinner, write_turn_stats,
+        spinner_mode, static_spinner_line, theme_row, write_static_spinner, write_turn_stats,
         write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
         SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
-        SPINNER_VERBS,
+        SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -2263,5 +2320,70 @@ mod tests {
         let plain_header = deck_header_with_mode("agent deck — 2 running", true, true);
         assert_eq!(plain_header, "# agent deck - 2 running");
         assert!(!plain_header.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn theme_row_renders_styled_with_palette_swatch() {
+        let kitsune_theme = &THEMES[0]; // kitsune theme
+
+        // Plain mode: byte-exact current format
+        let plain_row = theme_row(kitsune_theme, true, false, true);
+        assert_eq!(plain_row, " * kitsune  fox-orange identity default");
+
+        let plain_row_inactive = theme_row(kitsune_theme, false, false, true);
+        assert_eq!(
+            plain_row_inactive,
+            "   kitsune  fox-orange identity default"
+        );
+
+        // Non-TTY (styled=false): same as plain for text, but no SGR codes
+        let non_tty_row = theme_row(kitsune_theme, true, false, false);
+        assert_eq!(non_tty_row, " * kitsune  fox-orange identity default");
+
+        // Styled TTY mode: contains name's accent SGR and palette swatch
+        let styled_row = theme_row(kitsune_theme, true, true, false);
+
+        // Should contain the SGR code for the accent color
+        let accent_sgr = sgr(kitsune_theme.accent);
+        assert!(
+            styled_row.contains(&accent_sgr),
+            "styled row should contain accent SGR"
+        );
+
+        // Should contain bullet dots (but they'll be colored)
+        assert!(styled_row.contains('●'));
+
+        // Should contain the theme name and description
+        assert!(styled_row.contains("kitsune"));
+        assert!(styled_row.contains("fox-orange identity default"));
+
+        // Sanitized version should match plain text (dots and color codes removed)
+        let sanitized = sanitize_terminal_text(&styled_row);
+        assert!(sanitized.contains("kitsune"));
+        assert!(sanitized.contains("fox-orange identity default"));
+        // Dots get sanitized (● is kept as-is by sanitize, so we should see them)
+        assert!(sanitized.contains('●'));
+    }
+
+    #[test]
+    fn theme_row_handles_all_themes() {
+        // Verify that all themes produce valid rows
+        for (idx, theme) in THEMES.iter().enumerate() {
+            let plain_row = theme_row(theme, idx == 0, false, true);
+            let styled_row = theme_row(theme, idx == 0, true, false);
+
+            // Plain row should match the expected format
+            let marker = if idx == 0 { "*" } else { " " };
+            assert!(plain_row.starts_with(&format!(" {marker} ")));
+            assert!(plain_row.contains(theme.name));
+            assert!(plain_row.contains(theme.description));
+
+            // Styled row should contain the theme name and description
+            assert!(styled_row.contains(theme.name));
+            assert!(styled_row.contains(theme.description));
+
+            // Styled row should contain bullet dots
+            assert!(styled_row.contains('●'));
+        }
     }
 }

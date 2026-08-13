@@ -209,7 +209,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   contains "thinking" first; `spinner_frames_are_fox_kaomoji_not_cat` still
   passes; `cargo test -p kitsu-render` green.
 
-- [ ] **7. `/theme` list with live palette swatches** (S)
+- [x] **7. `/theme` list with live palette swatches** (S) — done 2026-08-13
   The `/theme` listing is plain text. On a styled TTY, render each theme row
   with its name tinted in that theme's accent and a six-dot swatch —
   `● ● ● ● ● ●` in accent/warn/highlight/info/success/error truecolor —
