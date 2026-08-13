@@ -195,7 +195,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   `~ still waiting …` byte-compatible lines; `cargo test -p kitsu` (121 CLI
   tests, known PTY failure allowed) green.
 
-- [ ] **6. Spinner elapsed counter and verb rotation** (S)
+- [x] **6. Spinner elapsed counter and verb rotation** (S) (done 2026-08-13)
   Claude Code's spinner shows a verb + elapsed seconds. Extend the animated
   spinner loop (`crates/kitsu-render/src/lib.rs`, `Spinner::start`,
   ~line 914-940): after 5s of waiting, append a dimmed ` (Ns)` elapsed

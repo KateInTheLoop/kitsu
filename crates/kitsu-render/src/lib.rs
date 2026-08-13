@@ -885,6 +885,18 @@ enum SpinnerMode {
 /// with a sweeping tail. Plain/reduced-motion modes never see these.
 const SPINNER_FRAMES: [&str; 4] = ["( ･ᴥ･ )ﾉ", "( ･ᴥ･ )～", "( ･ᴥ･ ) ～", "( ﾉᴥﾉ )～"];
 
+/// Fox-flavored but professional verb phrases for spinner rotation. "thinking"
+/// is always first — the initial phrase shown when the spinner starts.
+/// Each verb is lowercase, ASCII-safe, and ≤ 20 characters.
+const SPINNER_VERBS: [&str; 6] = [
+    "thinking",
+    "sniffing the trail",
+    "foraging",
+    "circling back",
+    "tracking patterns",
+    "listening intently",
+];
+
 /// Backed-off cadence shared by line-based waiting heartbeats (cycle-10 G4):
 /// 15s, 30s, 60s, then every 120s. A long wait stays visibly alive without
 /// `~ still waiting` lines stacking 10-15 deep between receipts and drowning
@@ -1004,8 +1016,10 @@ impl Spinner {
             // (ᴥ muzzle, no cat ω/ฅ) with a sweeping tail.
             const FRAMES: [&str; 4] = SPINNER_FRAMES;
             const DOTS: [&str; 4] = ["   ", "･  ", "･･ ", "･･･"];
+            const VERBS: [&str; 6] = SPINNER_VERBS;
             let (r, g, b) = theme().accent;
             let mut i = 0usize;
+            let start_time = std::time::Instant::now();
             // Avoid a distracting flash for fast local responses.
             tokio::time::sleep(std::time::Duration::from_millis(180)).await;
             let frame_width = FRAMES.iter().map(|frame| display_width(frame)).max();
@@ -1015,10 +1029,28 @@ impl Spinner {
                 // leaves residue from a longer predecessor on the status line.
                 let pad = " ".repeat(frame_width.unwrap_or(0) - display_width(frame));
                 let dots = DOTS[i % DOTS.len()];
+
+                // Rotate verb every ~4s (every 25 frames at 160ms per frame).
+                let verb_index = (i / 25) % VERBS.len();
+                let verb = VERBS[verb_index];
+
+                // Show elapsed time after 5s.
+                let elapsed = start_time.elapsed();
+                let elapsed_suffix = if elapsed.as_secs() >= 5 {
+                    format!(" ({})", format_wait_elapsed(elapsed))
+                        .dimmed()
+                        .to_string()
+                } else {
+                    String::new()
+                };
+
+                // Clear to end of line: verbs and the elapsed suffix vary in
+                // length, and a shrinking line must not leave residue.
                 eprint!(
-                    "\r  {}{pad} {}{}",
+                    "\r  {}{pad} {}{}{}\x1b[K",
                     frame.truecolor(r, g, b),
-                    "kitsu is thinking".dimmed(),
+                    format!("kitsu is {}", verb).dimmed(),
+                    elapsed_suffix,
                     dots.dimmed()
                 );
                 let _ = io::stderr().flush();
@@ -1672,6 +1704,7 @@ mod tests {
         spinner_mode, static_spinner_line, write_static_spinner, write_turn_stats,
         write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
         SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
+        SPINNER_VERBS,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -1979,6 +2012,33 @@ mod tests {
         let widths: Vec<usize> = SPINNER_FRAMES.iter().map(|f| display_width(f)).collect();
         let max = *widths.iter().max().unwrap();
         assert!(widths.iter().all(|w| max - w <= 2), "{widths:?}");
+    }
+
+    #[test]
+    fn spinner_verbs_are_professional_and_fox_flavored() {
+        assert!(!SPINNER_VERBS.is_empty(), "SPINNER_VERBS must not be empty");
+        assert_eq!(
+            SPINNER_VERBS[0], "thinking",
+            "first verb must always be 'thinking'"
+        );
+        for (i, verb) in SPINNER_VERBS.iter().enumerate() {
+            assert!(
+                verb.len() <= 20,
+                "verb at index {} is too long: {verb:?} ({} chars)",
+                i,
+                verb.len()
+            );
+            assert!(
+                verb.is_ascii(),
+                "verb at index {} is not ASCII-safe: {verb:?}",
+                i
+            );
+            assert!(
+                verb.chars().all(|c| c.is_lowercase() || !c.is_alphabetic()),
+                "verb at index {} contains uppercase letters: {verb:?}",
+                i
+            );
+        }
     }
 
     #[test]
