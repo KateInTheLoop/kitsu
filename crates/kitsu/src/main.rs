@@ -12802,6 +12802,20 @@ async fn handle_slash(
                 terminal_inline(model),
                 terminal_inline(&session.gateway),
             );
+            {
+                let per_model = tallies
+                    .per_model
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if per_model.len() > 1 {
+                    for (bin_model, (prompt, completion, total)) in per_model.iter() {
+                        eprintln!(
+                            "  {}: {prompt} prompt + {completion} completion = {total} total",
+                            terminal_inline(bin_model)
+                        );
+                    }
+                }
+            }
             if let Some(window) = context_window.get() {
                 let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
                 let (used, _) = session_context_used(messages, session, state);

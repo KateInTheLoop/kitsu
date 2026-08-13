@@ -913,6 +913,16 @@ where
             .total_tokens
             .fetch_add(turn_usage.total_tokens, Ordering::AcqRel);
         tallies.turns.fetch_add(1, Ordering::AcqRel);
+        if !turn_usage.is_empty() {
+            let mut per_model = tallies
+                .per_model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bin = per_model.entry(cfg.model.clone()).or_insert((0, 0, 0));
+            bin.0 += turn_usage.prompt_tokens;
+            bin.1 += turn_usage.completion_tokens;
+            bin.2 += turn_usage.total_tokens;
+        }
     }
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
@@ -3010,6 +3020,9 @@ pub struct RunTallies {
     pub completion_tokens: std::sync::atomic::AtomicU64,
     pub total_tokens: std::sync::atomic::AtomicU64,
     pub turns: std::sync::atomic::AtomicU64,
+    /// Per-model spend bins: `/model` mid-session must not blur attribution
+    /// (cycle-25 audit). Key = model id; value = (prompt, completion, total).
+    pub per_model: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64, u64)>>,
 }
 
 /// True when swapping this inline result for a preview is actually needed:
