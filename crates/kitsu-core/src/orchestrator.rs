@@ -900,6 +900,18 @@ where
     state.run_usage.completion_tokens += turn_usage.completion_tokens;
     state.run_usage.total_tokens += turn_usage.total_tokens;
     state.run_turns += 1;
+    if let Some(tallies) = &cfg.run_tallies {
+        tallies
+            .prompt_tokens
+            .fetch_add(turn_usage.prompt_tokens, Ordering::AcqRel);
+        tallies
+            .completion_tokens
+            .fetch_add(turn_usage.completion_tokens, Ordering::AcqRel);
+        tallies
+            .total_tokens
+            .fetch_add(turn_usage.total_tokens, Ordering::AcqRel);
+        tallies.turns.fetch_add(1, Ordering::AcqRel);
+    }
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
             TurnCompletion::Complete => "complete",
@@ -977,6 +989,13 @@ where
         std::collections::HashMap::new();
     let mut force_final_next = false;
     const REPEAT_FAIL_LIMIT: u32 = 2;
+    // Cycle-23 audit: the spawn cap's polite refusal was ignored 6x by a
+    // hosted model. After this many refusals in one turn the spawn tools are
+    // WITHHELD for the turn's remainder (ISSUE-007 pattern applied to
+    // spawning) — the model keeps its other tools and must work inline.
+    const SPAWN_REFUSAL_LIMIT: u32 = 2;
+    let mut spawn_cap_refusals: u32 = 0;
+    let mut spawn_tools_withheld = false;
 
     // The tool set is fixed for the whole turn (every round advertises the same
     // descriptors), so serialize the schema once here rather than redoing it on
@@ -1012,6 +1031,13 @@ where
         let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
         let offered_tools = if is_final_round {
             None
+        } else if spawn_tools_withheld {
+            tool_descriptors(tools).map(|descriptors| {
+                descriptors
+                    .into_iter()
+                    .filter(|descriptor| !descriptor.name.starts_with("spawn_agent"))
+                    .collect::<Vec<_>>()
+            })
         } else {
             tool_descriptors(tools)
         };
@@ -1368,6 +1394,25 @@ where
                         turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
                         if let Some(tallies) = &cfg.run_tallies {
                             tallies.denied.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    if tc.tool_name.starts_with("spawn_agent")
+                        && e.to_string().contains("agent spawn cap reached")
+                    {
+                        spawn_cap_refusals = spawn_cap_refusals.saturating_add(1);
+                        if spawn_cap_refusals >= SPAWN_REFUSAL_LIMIT && !spawn_tools_withheld {
+                            spawn_tools_withheld = true;
+                            if !cfg.quiet {
+                                kitsu_render::tool_result_error(
+                                    "spawn cap refusals ignored — spawn tools withheld for the rest of this turn; the model keeps its other tools",
+                                );
+                            }
+                            messages.push(ChatMessage::user(
+                                "The agent spawn cap was reached and further spawn attempts were refused. \
+                                 Spawn tools are now WITHDRAWN for the rest of this turn: do the remaining \
+                                 work yourself with your other tools, then give your final answer."
+                                    .to_string(),
+                            ));
                         }
                     }
                     (
@@ -2932,6 +2977,14 @@ pub struct RunTallies {
     pub reads: std::sync::atomic::AtomicU64,
     pub denied: std::sync::atomic::AtomicU64,
     pub failed: std::sync::atomic::AtomicU64,
+    /// Billed usage across the run — accumulated at turn end regardless of
+    /// later rollback (cycle-23: a rolled-back turn erased ~9.8k billed
+    /// tokens from /cost), and shared with subagent configs so delegated
+    /// spend counts too.
+    pub prompt_tokens: std::sync::atomic::AtomicU64,
+    pub completion_tokens: std::sync::atomic::AtomicU64,
+    pub total_tokens: std::sync::atomic::AtomicU64,
+    pub turns: std::sync::atomic::AtomicU64,
 }
 
 /// True when swapping this inline result for a preview is actually needed:

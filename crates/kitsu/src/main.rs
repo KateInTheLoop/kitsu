@@ -12760,13 +12760,15 @@ async fn handle_slash(
             };
         }
         "cost" => {
-            let usage = &state.run_usage;
+            // Billed truth lives in the shared tallies: they survive turn
+            // rollback and include subagent spend (cycle-23 audit #3).
+            let tallies = &session.run_tallies;
             eprintln!(
-                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s) ({} via {})",
-                usage.prompt_tokens,
-                usage.completion_tokens,
-                usage.total_tokens,
-                state.run_turns,
+                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s), subagent spend included ({} via {})",
+                tallies.prompt_tokens.load(Ordering::Acquire),
+                tallies.completion_tokens.load(Ordering::Acquire),
+                tallies.total_tokens.load(Ordering::Acquire),
+                tallies.turns.load(Ordering::Acquire),
                 terminal_inline(model),
                 terminal_inline(&session.gateway),
             );

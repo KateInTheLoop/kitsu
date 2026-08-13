@@ -1155,6 +1155,89 @@ async fn run_tallies_count_reads_failures_and_denials() {
     assert_eq!(tallies.reads.load(Ordering::Acquire), 0);
 }
 
+/// Cycle-23 audit: after SPAWN_REFUSAL_LIMIT cap refusals the spawn tools
+/// are withheld for the rest of the turn — later rounds advertise fewer
+/// tools, and the model gets an explicit withdrawal notice.
+#[tokio::test]
+async fn spawn_cap_refusals_withhold_spawn_tools_for_the_turn() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    // Distinct args per attempt: a real storm varies its tasks, which is
+    // exactly why the identical-signature loop-breaker never catches it.
+    let spam = |id: &str, task: &str| {
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "spawn_agent".to_string(),
+                args: format!(r#"{{"task":"{task}"}}"#),
+                call_id: id.to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ]
+    };
+    let provider = MockProvider::new(vec![
+        spam("s1", "first"),
+        spam("s2", "second"),
+        vec![
+            ChatDelta::Text("done inline".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "spawn_agent".to_string(),
+            description: "spawn".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(|_args: String| {
+            Box::pin(async move {
+                Err::<String, ToolError>(ToolError::ExecError(
+                    "agent spawn cap reached: this turn already started 0 of 0 allowed subagents."
+                        .to_string(),
+                ))
+            })
+        }),
+    );
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "other_tool".to_string(),
+            description: "still available".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let log = AgentEventLog::default();
+    let mut config = cfg(10);
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect("turn completes inline after withdrawal");
+    assert!(out.contains("done inline"));
+
+    let offered: Vec<usize> = log
+        .take()
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::ProviderRequest { tools_offered, .. } => Some(*tools_offered),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offered,
+        vec![2, 2, 1],
+        "third round must advertise only the non-spawn tool: {offered:?}"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last()
+            .unwrap()
+            .iter()
+            .any(|m| { m.role == kitsu_providers::Role::User && m.content.contains("WITHDRAWN") }),
+        "the model gets the withdrawal notice"
+    );
+}
+
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
 
 /// A provider that ALWAYS emits the same failing tool call while tools are
