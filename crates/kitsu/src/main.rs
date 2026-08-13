@@ -7669,10 +7669,13 @@ async fn join_background_agents_at_exit(
                 } else {
                     String::new()
                 };
-                eprintln!(
-                    "~ still waiting {} — {live} background agent(s) running, {finished} finished{failures}",
+                let message = format!(
+                    "still waiting {} — {live} background agent(s) running, {finished} finished{failures}",
                     kitsu_render::format_wait_elapsed(join_started.elapsed())
                 );
+                kitsu_render::PromptSafeAsyncNotice::info(message)
+                    .write_line(&mut std::io::stderr())
+                    .ok();
                 beat += 1;
                 heartbeat
                     .as_mut()
