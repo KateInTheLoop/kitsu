@@ -385,9 +385,9 @@ where
 struct ReadFileArgs {
     path: String,
     /// Optional 1-based inclusive line range [start, end].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     start_line: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     end_line: Option<usize>,
 }
 
@@ -462,6 +462,30 @@ where
         sliced.push_str("\n...[truncated: output exceeded byte cap]");
     }
     Ok(policy.cap_output(sliced))
+}
+
+/// Accept both `1` and `"1"` for optional line numbers: small models emit
+/// numeric strings constantly, and rejecting them burned a round per call
+/// with no repair hint (cycle-27 audit).
+fn lenient_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(usize),
+        Text(String),
+    }
+    match Option::<Lenient>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Lenient::Number(value)) => Ok(Some(value)),
+        Some(Lenient::Text(text)) => text.trim().parse::<usize>().map(Some).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "expected a line number, got '{text}' — pass an integer like 12 (quoted \"12\" is also accepted)"
+            ))
+        }),
+    }
 }
 
 // --- fs.list_dir ------------------------------------------------------------

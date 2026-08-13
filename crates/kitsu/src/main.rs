@@ -13277,7 +13277,16 @@ async fn handle_slash(
                 let catalog_validated = match catalog {
                     Ok(Some(models)) => {
                         let models = filter_model_catalog(models, "");
-                        if !models.iter().any(|candidate| candidate == arg) {
+                        // Provider-pin / policy suffixes (HF router:
+                        // `model:fastest`, `model:cheapest`, `model:provider`)
+                        // are legitimate ids the catalog never lists — the
+                        // config's own recipes document them. Validate the
+                        // BASE id and accept the suffix (cycle-27 audit #3).
+                        let base = arg.split_once(':').map_or(arg, |(base, _)| base);
+                        if !models
+                            .iter()
+                            .any(|candidate| candidate == arg || candidate == base)
+                        {
                             eprintln!(
                                 "model '{}' is not in the gateway catalog - run /models",
                                 terminal_inline(arg)
