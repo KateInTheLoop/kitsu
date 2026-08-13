@@ -1369,6 +1369,7 @@ where
             );
             abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
+            let call_started = std::time::Instant::now();
             let tool_result = match tool_event.command_progress_sink() {
                 Some(sink) => {
                     scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone())).await
@@ -1428,8 +1429,18 @@ where
             // AFTER the decision so the receipt can disclose the swap — a
             // `◇ 1828 lines` line over a 500-char preview is a lie the user
             // has no way to detect (cycle-15 headline).
-            let summary =
-                (!cfg.quiet).then(|| format_tool_result(&tc.tool_name, &tc.args, &content, is_err));
+            let summary = (!cfg.quiet).then(|| {
+                let mut summary = format_tool_result(&tc.tool_name, &tc.args, &content, is_err);
+                // UI-parity item 3: every receipt carries its duration, except
+                // command_exec whose result already reports its own elapsed.
+                if tc.tool_name != "command_exec" {
+                    summary.push_str(&format!(
+                        " · {}",
+                        format_tool_elapsed(call_started.elapsed())
+                    ));
+                }
+                summary
+            });
             if !is_err && tc.tool_name == "fs_read_file" {
                 *run_reads += 1;
             }
@@ -1826,6 +1837,18 @@ fn format_tool_header(name: &str, args: &str) -> String {
 
 /// Result summary shown under a tool call — bytes for writes, matches for grep,
 /// lines otherwise; the error kind on failure.
+/// Compact duration for tool receipts: `34ms` under a second, `2.1s` beyond.
+fn format_tool_elapsed(elapsed: std::time::Duration) -> String {
+    if elapsed.as_secs() == 0
+        && elapsed.subsec_millis() < 1000
+        && elapsed < std::time::Duration::from_secs(1)
+    {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
 fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> String {
     if is_err {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {

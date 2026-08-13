@@ -990,6 +990,17 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     );
 }
 
+/// Receipt durations: milliseconds under a second, one-decimal seconds after.
+#[test]
+fn format_tool_elapsed_formats_ms_and_seconds() {
+    use crate::orchestrator::format_tool_elapsed;
+    use std::time::Duration;
+    assert_eq!(format_tool_elapsed(Duration::from_millis(34)), "34ms");
+    assert_eq!(format_tool_elapsed(Duration::from_millis(999)), "999ms");
+    assert_eq!(format_tool_elapsed(Duration::from_millis(2100)), "2.1s");
+    assert_eq!(format_tool_elapsed(Duration::from_secs(61)), "61.0s");
+}
+
 /// Invalid escapes inside string literals are dropped; valid ones survive.
 #[test]
 fn relax_json_escapes_repairs_only_invalid_escapes() {

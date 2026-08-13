@@ -153,7 +153,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   duration part on TTY; redirected output unchanged); `cargo test -p
   kitsu-render -p kitsu-core` green.
 
-- [ ] **3. Durations on tool result receipts** (S)
+- [x] **3. Durations on tool result receipts** (S) (done 2026-08-13)
   `command_exec` results already show `N ms`; `Read`/`List`/`Grep`/`Write`/
   `Edit` results show none. In the tool-dispatch loop
   (`crates/kitsu-core/src/orchestrator.rs:1330-1360`), capture
