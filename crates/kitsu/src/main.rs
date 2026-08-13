@@ -10024,6 +10024,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     );
     let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
+                            // Foreground subagents run QUIET (cycle-15 audit #3 / cycle-27 double
+                            // print): their inner narration corrupted the answer channel and their
+                            // final text arrived twice — streamed by the child, then repeated by the
+                            // parent. The ◆ Agent(...) header and ◇ result receipt remain the
+                            // progress surface; the answer arrives once, through the parent.
+    sub_cfg.quiet = true;
     sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
     sub_cfg.run_tallies = Some(run_tallies.clone());
     let sub_system = if skillset.is_empty() {
