@@ -2854,7 +2854,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "resume",
         args: "<id|last>",
         description: "resume a saved conversation",
-        details: "Switches to a saved session by id or NAME; `last` picks the newest anywhere, `auto` the newest recorded in this directory. Saved permission grants are never restored; the saved gateway and working directory must match.",
+        details: "Bare /resume on a TTY opens a numbered picker over saved sessions (Enter = last, q = cancel). With an argument: id or NAME; `last` picks the newest anywhere, `auto` the newest recorded in this directory. Saved permission grants are never restored; the saved gateway and working directory must match.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -4266,6 +4266,69 @@ fn session_catalog_payload(
         "sessions": filtered.clone(),
         "text": format_session_summaries(&filtered, current, filter),
     }))
+}
+
+/// Interactive chooser for bare `/resume`: numbered list of saved sessions
+/// (name-first), then one line of input — a number, a name, an id, `last`,
+/// `auto`, or Enter for `last`. Empty list or read failure cancels quietly.
+fn resume_picker(session: &SessionInfo) -> Option<String> {
+    let sessions_dir = session.state_dir.join("sessions");
+    let summaries = match session::SessionStore::list(&sessions_dir) {
+        Ok(summaries) if !summaries.is_empty() => summaries,
+        Ok(_) => {
+            eprintln!(
+                "no saved sessions — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new"
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return None;
+        }
+    };
+    let active = session.session_id.borrow().clone();
+    eprintln!("saved sessions:");
+    for (index, saved) in summaries.iter().enumerate().take(9) {
+        let marker = if active.as_deref() == Some(saved.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        let label = match &saved.name {
+            Some(name) => format!("{} ({})", terminal_inline(name), terminal_inline(&saved.id)),
+            None => terminal_inline(&saved.id),
+        };
+        eprintln!(
+            " {marker}[{}] {label}  {}  {} turn(s)\n      {}",
+            index + 1,
+            terminal_inline(&saved.updated_at),
+            saved.turns,
+            terminal_inline(&saved.preview),
+        );
+    }
+    if summaries.len() > 9 {
+        eprintln!("  … {} more — /sessions lists all", summaries.len() - 9);
+    }
+    let line = match read_assistive_stdin_line(
+        "resume which? [1-9, name, id, last, auto; Enter = last, q = cancel] ",
+    ) {
+        Ok(Some(line)) => line.trim().to_string(),
+        _ => return None,
+    };
+    match line.as_str() {
+        "" => Some("last".to_string()),
+        "q" | "quit" | "cancel" => None,
+        choice => match choice.parse::<usize>() {
+            Ok(number) if (1..=summaries.len().min(9)).contains(&number) => {
+                Some(summaries[number - 1].id.clone())
+            }
+            Ok(_) => {
+                eprintln!("no session numbered {choice}");
+                None
+            }
+            Err(_) => Some(choice.to_string()),
+        },
+    }
 }
 
 fn format_session_summaries(
@@ -12633,6 +12696,14 @@ async fn handle_slash(
         "restore" => return SlashResult::RestoreSession(arg.to_string()),
         "delete" => return SlashResult::DeleteSession(arg.to_string()),
         "resume" => {
+            // Bare /resume on a TTY opens the picker (cycle-13 parity item:
+            // claude's bare `--resume` offers a chooser; ids are unmemorable).
+            if arg.is_empty() && kitsu_render::stdin_is_tty() {
+                return match resume_picker(session) {
+                    Some(selector) => SlashResult::ResumeSession(selector),
+                    None => SlashResult::Continue(None),
+                };
+            }
             return SlashResult::ResumeSession(if arg.is_empty() {
                 "last".to_string()
             } else {
