@@ -1583,12 +1583,29 @@ fn print_doctor_human(report: &serde_json::Value) {
         doctor_text(report, "/runtime_state/path_display"),
         doctor_text(report, "/runtime_state/status"),
     );
+    let online_status = doctor_text(report, "/online/status");
+    let online_scope_note = if online_status == "reachable"
+        && report
+            .pointer("/online/chat_route_probed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        // The probe validates the MODEL CATALOG route only. Claiming more
+        // told a user with an invalid credential "you're ready" (cycle-23
+        // audit): say exactly what was and was not checked.
+        let models = report
+            .pointer("/online/models")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        format!(
+            "reachable ({models} models in catalog) — catalog route only; credentials and the chat route are NOT validated until a real turn"
+        )
+    } else {
+        online_status
+    };
+    println!("[info] provider check: {online_scope_note}");
     println!(
-        "[info] provider check: {}",
-        doctor_text(report, "/online/status"),
-    );
-    println!(
-        "[info] tools: filesystem={} commands={}",
+        "[info] tools: filesystem={}; commands={}",
         doctor_text(report, "/tool_policy/filesystem"),
         doctor_text(report, "/tool_policy/commands"),
     );
@@ -1601,7 +1618,18 @@ fn print_doctor_human(report: &serde_json::Value) {
         // Terminal state must name the next step (cycle-14 config audit #4):
         // "healthy" without "now what" strands exactly the new user doctor
         // exists to help.
-        println!("doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`)");
+        let credential_caveat = if report
+            .pointer("/online/chat_route_probed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            " (config checks passed; the first real turn is what validates credentials)"
+        } else {
+            ""
+        };
+        println!(
+            "doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`){credential_caveat}"
+        );
     } else {
         println!("doctor: {} blocking issue(s)", issues.len());
         for issue in issues {
@@ -2728,6 +2756,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
         details: "Host-owned bounded diff evidence from Git and the write journal: working/staged/unstaged/base/commit/checkpoint scopes. Renders to the terminal only — nothing is sent to the provider (that is /review's job) and no filesystem grant is created or needed.",
         group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "doctor",
+        args: "[online]",
+        description: "read-only config/auth/context/state diagnostics without leaving chat",
+        details: "Runs the same diagnostics as `kitsu doctor` in-session: config validity, gateway/auth status (credential PRESENCE only, never values), context-window provenance and cache, runtime state, project context, and tool policy. `online` adds the opt-in network probes (endpoint reachability, model catalog). Always read-only.",
+        group: CommandGroup::Session,
         alias_of: None,
     },
     SlashCommandSpec {
@@ -12709,6 +12745,19 @@ async fn handle_slash(
             } else {
                 arg.to_string()
             });
+        }
+        "doctor" => {
+            if !arg.is_empty() && arg != "online" {
+                eprintln!("usage: {}", slash_syntax("doctor"));
+                return SlashResult::Error;
+            }
+            return match run_doctor(cli, arg == "online", false).await {
+                Ok(()) => SlashResult::Continue(None),
+                Err(error) => {
+                    eprintln!("{error}");
+                    SlashResult::Error
+                }
+            };
         }
         "cost" => {
             let usage = &state.run_usage;
