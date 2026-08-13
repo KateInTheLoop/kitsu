@@ -2425,7 +2425,7 @@ fn build_agent_config(
         quiet: cli.jsonl,
         event_log: None,
         skill_names: Vec::new(),
-        read_counter: None,
+        run_tallies: None,
         spawn_budget: None,
     }
 }
@@ -3155,8 +3155,8 @@ struct SessionInfo {
     session_id: Rc<RefCell<Option<String>>>,
     /// Per-turn subagent spawn budget shared with the spawn tools (G3).
     spawn_budget: Arc<kitsu_core::SpawnBudget>,
-    /// Run-wide shared read counter (parent + subagents) for receipts.
-    read_counter: Arc<std::sync::atomic::AtomicU64>,
+    /// Run-wide shared tallies (parent + subagents) for receipts.
+    run_tallies: Arc<kitsu_core::RunTallies>,
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
@@ -7851,9 +7851,11 @@ fn note_rollback_retained_changes(
 
 #[derive(Default)]
 struct ScriptRunStatus {
-    /// Successful file reads across the run (mirrored from
-    /// `AgentSessionState.run_reads` for the end-of-run receipt).
+    /// Run-wide tallies mirrored from the shared `RunTallies` for the
+    /// end-of-run receipt.
     file_reads: u64,
+    denied_calls: u64,
+    failed_calls: u64,
     /// Turns and commands that completed successfully. `--allow-turn-errors`
     /// accepts PARTIAL success; a run where nothing succeeded stays an error.
     successes: usize,
@@ -7892,6 +7894,7 @@ impl ScriptRunStatus {
 /// silence reading as success cost a full audit run before anyone noticed the
 /// task was a no-op. Human stderr only: JSONL consumers already receive
 /// `turn_finished` and `run_summary` frames.
+#[allow(clippy::too_many_arguments)]
 fn emit_run_receipt(
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     registry: &Arc<subagent::AgentRegistry>,
@@ -7899,6 +7902,8 @@ fn emit_run_receipt(
     turns_ok: usize,
     turns_failed: usize,
     file_reads: u64,
+    denied_calls: u64,
+    failed_calls: u64,
 ) {
     let checkpoints = journal.checkpoint_summaries();
     let files: std::collections::BTreeSet<&std::path::PathBuf> = checkpoints
@@ -7929,9 +7934,18 @@ fn emit_run_receipt(
     }
     // Reads render unconditionally: "1 file written, 0 files read" is the
     // visible signature of a model summarizing sources it never opened
-    // (cycle-16 M1).
+    // (cycle-16 M1). Denied/failed calls render only when non-zero — but
+    // then always (cycle-19 #5: "1 turn(s) ok" was hiding denials).
+    let mut trouble = String::new();
+    if denied_calls > 0 {
+        trouble.push_str(&format!(", {denied_calls} denied tool call(s)"));
+    }
+    let plain_failures = failed_calls.saturating_sub(denied_calls);
+    if plain_failures > 0 {
+        trouble.push_str(&format!(", {plain_failures} failed tool call(s)"));
+    }
     eprintln!(
-        "~ run summary: {turns}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}, session {}",
+        "~ run summary: {turns}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}{trouble}, session {}",
         files.len(),
         changes,
         session_id.unwrap_or("not saved"),
@@ -8041,6 +8055,8 @@ async fn finalize_scripted_run(
             status.successes,
             status.failures,
             status.file_reads,
+            status.denied_calls,
+            status.failed_calls,
         );
     }
     // Cycle-10 G1: retained-on-disk effects of rolled-back turns are part of
@@ -8256,7 +8272,7 @@ async fn run_scripted_body(
                 context_window,
                 &session.reasoning_effort,
                 &session.spawn_budget,
-                &session.read_counter,
+                &session.run_tallies,
                 &scripted_skill_names,
                 registry,
                 &format!("{path}:{line_number}"),
@@ -8461,7 +8477,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
-                        &session.read_counter,
+                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8515,7 +8531,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
-                        &session.read_counter,
+                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8614,7 +8630,7 @@ async fn run_scripted_body(
             context_window,
             &session.reasoning_effort,
             &session.spawn_budget,
-            &session.read_counter,
+            &session.run_tallies,
             &scripted_skill_names,
             registry,
             &format!("{path}:{line_number}"),
@@ -8623,7 +8639,9 @@ async fn run_scripted_body(
         // Mirror after every turn (not just at the end) so cancelled or
         // failing scripts still report the reads that actually happened —
         // from the SHARED counter, so delegated subagent reads count too.
-        status.file_reads = session.read_counter.load(Ordering::Acquire);
+        status.file_reads = session.run_tallies.reads.load(Ordering::Acquire);
+        status.denied_calls = session.run_tallies.denied.load(Ordering::Acquire);
+        status.failed_calls = session.run_tallies.failed.load(Ordering::Acquire);
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
@@ -8637,7 +8655,9 @@ async fn run_scripted_body(
             }
         }
     }
-    status.file_reads = session.read_counter.load(Ordering::Acquire);
+    status.file_reads = session.run_tallies.reads.load(Ordering::Acquire);
+    status.denied_calls = session.run_tallies.denied.load(Ordering::Acquire);
+    status.failed_calls = session.run_tallies.failed.load(Ordering::Acquire);
     Ok(())
 }
 
@@ -8659,7 +8679,7 @@ async fn run_scripted_turn(
     context_window: &Rc<Cell<Option<u64>>>,
     reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     spawn_budget: &Arc<kitsu_core::SpawnBudget>,
-    read_counter: &Arc<std::sync::atomic::AtomicU64>,
+    run_tallies: &Arc<kitsu_core::RunTallies>,
     skill_names: &[String],
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
@@ -8744,7 +8764,7 @@ async fn run_scripted_turn(
     );
     cfg.reasoning_effort = reasoning_effort.get();
     cfg.spawn_budget = Some(spawn_budget.clone());
-    cfg.read_counter = Some(read_counter.clone());
+    cfg.run_tallies = Some(run_tallies.clone());
     cfg.skill_names = skill_names.to_vec();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
@@ -9625,6 +9645,37 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     CliError::user(pregrant_error(grant, &roots, &error.to_string()))
                 })?;
             grant.cwd = canonical;
+            // Cycle-19 audit #2: a path-form executable outside every command
+            // and runtime root can never actually launch under containment —
+            // catch it here, not after the model has burned rounds on it.
+            if let Some(executable) = grant.argv.first().filter(|arg| arg.contains('/')) {
+                let resolved = grant.cwd.join(executable);
+                if let Ok(resolved) = std::fs::canonicalize(&resolved) {
+                    // Containment always binds the standard system prefixes
+                    // read-only (see runtime_mount_paths), so system binaries
+                    // are inherently visible.
+                    let system_visible = ["/usr", "/bin", "/lib", "/lib64", "/sbin"]
+                        .iter()
+                        .any(|prefix| resolved.starts_with(prefix));
+                    let visible = system_visible
+                        || policy
+                            .command_roots()
+                            .iter()
+                            .any(|root| resolved.starts_with(root))
+                        || policy
+                            .containment_config()
+                            .readonly_runtime_roots()
+                            .iter()
+                            .any(|root| resolved.starts_with(root));
+                    if !visible {
+                        return Err(CliError::user(format!(
+                            "--allow-command executable '{}' is outside every command/runtime root and can never run under containment — add its directory with --command-root or --command-runtime-root {}",
+                            resolved.display(),
+                            shorten_home(resolved.parent().unwrap_or(&resolved)),
+                        )));
+                    }
+                }
+            }
         }
         Some(policy)
     } else {
@@ -9748,10 +9799,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             SPAWN_CAP_SCRIPTED_DEFAULT
         });
     let spawn_budget = Arc::new(kitsu_core::SpawnBudget::new(spawn_cap));
-    // One run-wide read counter shared by the main conversation and every
-    // spawned subagent, so the receipt's "N file(s) read" includes delegated
-    // reads (cycle-17 gap #1).
-    let run_read_counter = Arc::new(std::sync::atomic::AtomicU64::new(0));
+    // Run-wide tallies (reads/denied/failed) shared by the main conversation
+    // and every spawned subagent, feeding the end-of-run receipt.
+    let run_tallies = Arc::new(kitsu_core::RunTallies::default());
 
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
@@ -9768,7 +9818,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
     sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
-    sub_cfg.read_counter = Some(run_read_counter.clone());
+    sub_cfg.run_tallies = Some(run_tallies.clone());
     let sub_system = if skillset.is_empty() {
         String::new()
     } else {
@@ -9895,7 +9945,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
         let spawn_budget = spawn_budget.clone();
-        let run_read_counter = run_read_counter.clone();
+        let run_tallies = run_tallies.clone();
         let skill_names: Vec<String> = skillset.names().into_iter().map(str::to_string).collect();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
@@ -9908,7 +9958,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             );
             config.reasoning_effort = reasoning_effort.get();
             config.skill_names = skill_names.clone();
-            config.read_counter = Some(run_read_counter.clone());
+            config.run_tallies = Some(run_tallies.clone());
             // Main-conversation turns carry the spawn budget so the
             // orchestrator resets it at each turn start (subagent configs
             // stay `None`).
@@ -10114,7 +10164,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         offload_dir: offload_state.clone(),
         session_id,
         spawn_budget: spawn_budget.clone(),
-        read_counter: run_read_counter.clone(),
+        run_tallies: run_tallies.clone(),
         tool_names: tool_names.clone(),
         command_roots: command_policy
             .as_ref()
@@ -10596,7 +10646,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         session.session_id.borrow().as_deref(),
                         1,
                         0,
-                        session.read_counter.load(Ordering::Acquire),
+                        session.run_tallies.reads.load(Ordering::Acquire),
+                        session.run_tallies.denied.load(Ordering::Acquire),
+                        session.run_tallies.failed.load(Ordering::Acquire),
                     );
                 }
                 if cli.jsonl {

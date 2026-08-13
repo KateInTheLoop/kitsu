@@ -239,7 +239,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         quiet: false,
         event_log: None,
         skill_names: Vec::new(),
-        read_counter: None,
+        run_tallies: None,
         spawn_budget: None,
     }
 }
@@ -1109,6 +1109,50 @@ async fn test_text_protocol_skill_confusion_feeds_back_instead_of_answering() {
         }),
         "round 2 must carry the skill-specific correction"
     );
+}
+
+/// Shared run tallies count reads, failures, and denials — including from
+/// any config that carries the same Arc (subagents share it).
+#[tokio::test]
+async fn run_tallies_count_reads_failures_and_denials() {
+    use crate::orchestrator::RunTallies;
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "denied_tool".to_string(),
+                args: "{}".to_string(),
+                call_id: "c1".to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "denied_tool".to_string(),
+            description: "always denied".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(|_args: String| {
+            Box::pin(async move {
+                Err::<String, ToolError>(ToolError::PolicyDenied("nope".to_string()))
+            })
+        }),
+    );
+    let tallies = std::sync::Arc::new(RunTallies::default());
+    let mut config = cfg(10);
+    config.run_tallies = Some(tallies.clone());
+
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &config).await;
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(tallies.failed.load(Ordering::Acquire), 1);
+    assert_eq!(tallies.denied.load(Ordering::Acquire), 1);
+    assert_eq!(tallies.reads.load(Ordering::Acquire), 0);
 }
 
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
