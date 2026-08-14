@@ -179,6 +179,94 @@ fn test_missing_auth_preflight_and_doctor_share_safe_recovery_guidance() {
 
 #[test]
 #[serial]
+fn test_loopback_ollama_connection_failure_has_scoped_secret_free_recovery() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create ~/.kitsu");
+    let url_secret = "kitsu-url-secret-633";
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "ollama"
+[gateways.ollama]
+flavor = "openai"
+base_url = "http://user:{url_secret}@127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "local-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#
+        ),
+    )
+    .expect("write config.toml");
+
+    let output = base_cmd(home.path())
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--timeout-secs",
+            "1",
+            "ask",
+            "hello",
+        ])
+        .output()
+        .expect("run unreachable local Ollama ask");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed provider error");
+    assert_eq!(error["kind"], "provider");
+    assert_eq!(error["exit_code"], 2);
+    let message = error["message"].as_str().expect("error message");
+    assert!(message.contains("local Ollama"), "{message}");
+    assert!(
+        message.contains("configured loopback endpoint"),
+        "{message}"
+    );
+    assert!(message.contains("`ollama serve`"), "{message}");
+    assert!(message.contains("select another gateway"), "{message}");
+    assert!(!message.contains(url_secret), "{message}");
+    assert!(!message.contains("127.0.0.1"), "{message}");
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("final_summary")
+    );
+    assert_eq!(events.last().unwrap()["provider_failures"], 1);
+
+    let doctor = base_cmd(home.path())
+        .args(["--timeout-secs", "1", "doctor", "--online", "--json"])
+        .output()
+        .expect("run unreachable local Ollama doctor");
+    assert_eq!(doctor.status.code(), Some(1), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["online"]["request_sent"], true);
+    let status = report["online"]["status"].as_str().expect("online status");
+    assert!(status.contains("local Ollama"), "{status}");
+    assert!(status.contains("`ollama serve`"), "{status}");
+    assert!(!status.contains(url_secret), "{status}");
+
+    let models = base_cmd(home.path())
+        .args(["--timeout-secs", "1", "models"])
+        .output()
+        .expect("run unreachable local Ollama catalog");
+    assert_eq!(models.status.code(), Some(2), "{models:?}");
+    assert!(models.stdout.is_empty(), "{models:?}");
+    let models_stderr = String::from_utf8(models.stderr).unwrap();
+    assert!(models_stderr.contains("local Ollama"), "{models_stderr}");
+    assert!(models_stderr.contains("`ollama serve`"), "{models_stderr}");
+    assert!(!models_stderr.contains(url_secret), "{models_stderr}");
+}
+
+#[test]
+#[serial]
 fn test_doctor_reports_config_artifact_storage_disable() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), "http://127.0.0.1:1");
