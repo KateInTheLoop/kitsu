@@ -25,6 +25,11 @@ pub enum EditorAction {
     /// Tab outside a paste: the collector may accept an inline
     /// completion hint (the editor itself knows nothing about hints).
     CompleteRequest,
+    /// ↑ on an empty, walk-free draft: the collector may recall a queued
+    /// prompt into the editor first (the editor knows nothing about the
+    /// prompt queue); if it declines, it calls
+    /// [`TypeaheadEditor::history_prev_forced`] for the plain history walk.
+    RecallRequest,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -396,6 +401,19 @@ impl TypeaheadEditor {
     }
 
     fn history_prev(&mut self, outcome: &mut FeedOutcome) {
+        // The very first ↑ on an untouched draft is a recall point: queued
+        // prompts (owned by the collector) take precedence over history.
+        if self.buffer.is_empty() && self.history_cursor.is_none() {
+            outcome.actions.push(EditorAction::RecallRequest);
+            return;
+        }
+        self.history_prev_forced(outcome);
+    }
+
+    /// The plain history walk, bypassing the queued-prompt recall point.
+    /// Public so the collector can fall through to it when the queue is
+    /// empty; any draft change is reported through `outcome.changed`.
+    pub fn history_prev_forced(&mut self, outcome: &mut FeedOutcome) {
         let next_index = match self.history_cursor {
             None if self.history.is_empty() => return,
             None => {
@@ -448,7 +466,9 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 EditorAction::Submit(line) => Some(line.as_str()),
-                EditorAction::Eof | EditorAction::CompleteRequest => None,
+                EditorAction::Eof | EditorAction::CompleteRequest | EditorAction::RecallRequest => {
+                    None
+                }
             })
             .collect()
     }
@@ -510,10 +530,42 @@ mod tests {
         let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
         editor.feed(b"new\r");
         editor.feed(b"new\r");
-        editor.feed(b"\x1b[A");
+        // Post-submit the draft is empty, so ↑ goes through the recall
+        // point; the forced walk is what the collector falls back to.
+        let mut outcome = FeedOutcome::default();
+        editor.history_prev_forced(&mut outcome);
         assert_eq!(editor.buffer_string(), "new");
         editor.feed(b"\x1b[A");
         assert_eq!(editor.buffer_string(), "old");
+    }
+
+    #[test]
+    fn up_on_an_untouched_empty_draft_requests_recall_without_state_change() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        let outcome = editor.feed(b"\x1b[A");
+        assert_eq!(outcome.actions, vec![EditorAction::RecallRequest]);
+        assert_eq!(editor.buffer_string(), "");
+        // The collector's fallback then performs the plain walk.
+        let mut forced = FeedOutcome::default();
+        editor.history_prev_forced(&mut forced);
+        assert!(forced.changed);
+        assert_eq!(editor.buffer_string(), "old");
+    }
+
+    #[test]
+    fn up_after_recall_into_the_draft_walks_history_normally() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        // Collector recalled a queued prompt into the draft.
+        editor.replace_buffer("queued prompt");
+        let outcome = editor.feed(b"\x1b[A");
+        assert!(
+            outcome.actions.is_empty(),
+            "non-empty draft never re-requests recall"
+        );
+        assert_eq!(editor.buffer_string(), "old");
+        // ↓ restores the recalled prompt from the stash.
+        editor.feed(b"\x1b[B");
+        assert_eq!(editor.buffer_string(), "queued prompt");
     }
 
     #[test]
