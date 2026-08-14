@@ -365,9 +365,16 @@ as escalation); findings are re-verified before applying. Cycle log:
   parity build caches, failing up to 17 unrelated fs tests with
   StorageFull — freed 5.1G; watch /tmp in future cycles (the kimi
   worktree lives there too).
-- Backlog (next cycles): queued-message stack rendered under the status
-  row; multi-line draft wrap; Ctrl+R history search mid-turn; unit-test
-  seam for the collector poll loop.
+- **Cycle 6 (2026-08-14, 0c8e604 + follow-up 27b2ab5)**: dimmed
+  `[N queued]` tag on the status row keeps the pending stack visible all
+  turn (syncs at editor start, after submissions//queue edits, after ↑
+  recall; width participates in fit math). Review caught a one-frame
+  cross-turn staleness — depth now syncs before the row's first paint.
+  Deliberate scope cut: full stacked-rows rendering deferred (multi-row
+  live region needs a renderer rewrite).
+- Backlog (next cycles): queued-message full stack rendered under the
+  status row (multi-row live region); multi-line draft wrap; Ctrl+R
+  history search mid-turn; unit-test seam for the collector poll loop.
 
 ## Protocol
 
