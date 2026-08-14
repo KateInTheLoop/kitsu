@@ -424,8 +424,31 @@ as escalation); findings are re-verified before applying. Cycle log:
   post-batch (last wins) and the recall notice now follows the draft
   update. Recall + Ctrl+C PTY smokes unchanged. Testability debt: paid
   in full.
-- Backlog: soft-wrap of overlong single lines (nice-to-have; horizontal
-  window suffices). The loop is otherwise in maintenance mode.
+- **Cycle 13 (2026-08-14, bffb128)**: original-queue item 12 shipped —
+  tool-call headers render the verb accent-bold and the detail dimmed
+  (testable tool_activity_line, three-tier byte-identity + sanitize
+  round-trip unit-tested per the item's acceptance).
+- **OPEN INVESTIGATION — intermittent idle-input crawl (found cycle
+  13).** In some windows, rustyline's idle prompt processes stdin at
+  ~1 byte per multi-second wakeup: '/help\\r' not consumed in 6s, typed
+  chars echo one at a time (0/5 fast across repeated runs), while
+  MINUTES earlier the same binary consumed a 48-char line instantly
+  (pty_recall.py end-to-end pass). Mid-turn input (raw-mode collector)
+  unaffected. Repro sketch: pty.fork + spawn chat, wait for prompt,
+  write bytes without/with \\r, time the echo/consumption. Suspects,
+  unproven: (a) rustyline ExternalPrinter wakeup integration (agent
+  notifications register one; a lost stdin-readiness wakeup would drain
+  one byte per printer ping); (b) interference from a concurrent codex
+  parity session on this host (bwrap sandbox waiters binding /tmp,
+  started 08:49 — exactly when fast runs stopped). Next probe when it
+  recurs: run with the notification task disabled, and on a host
+  without the concurrent session; if (a), the fix likely lives in the
+  rustyline event-loop wiring. This is the SAME symptom class as the
+  loop's founding complaint ('cursor stuck') — highest-priority item
+  when reproducible.
+- Backlog: soft-wrap of overlong single lines (nice-to-have); original
+  queue items 10 (syntect), 11 (/diff header), 13 (agent deck rows)
+  remain available for future ticks.
 
 ## Protocol
 
