@@ -5,7 +5,7 @@
 
 use std::collections::VecDeque;
 #[cfg(unix)]
-use std::ffi::{CStr, CString, OsString};
+use std::ffi::{CStr, CString, OsStr, OsString};
 use std::future::Future;
 use std::io::{Read, Write};
 #[cfg(unix)]
@@ -13,12 +13,19 @@ use std::os::fd::{AsRawFd, FromRawFd, IntoRawFd};
 #[cfg(unix)]
 use std::os::unix::ffi::{OsStrExt, OsStringExt};
 use std::path::{Path, PathBuf};
+#[cfg(any(not(unix), test))]
 use std::process::{ExitStatus, Stdio};
+#[cfg(unix)]
+use std::sync::atomic::AtomicBool;
 use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
+#[cfg(unix)]
+use std::time::Instant;
 
+use regex::Regex;
 use serde::Deserialize;
+#[cfg(any(not(unix), test))]
 use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::error::ToolError;
@@ -637,11 +644,25 @@ struct GrepArgs {
     path: String,
     #[serde(default)]
     max_count: Option<usize>,
+    #[serde(default)]
+    literal: bool,
 }
 
 const GREP_TIMEOUT: Duration = Duration::from_secs(10);
 const GREP_DEFAULT_MAX: usize = 100;
+const GREP_MAX_MATCHES: usize = 1_000;
+#[cfg(unix)]
+const GREP_MAX_FILES: usize = 10_000;
+#[cfg(unix)]
+const GREP_MAX_ENTRIES: usize = 20_000;
+#[cfg(unix)]
+const GREP_MAX_FILE_BYTES: usize = 1024 * 1024;
+#[cfg(unix)]
+const GREP_MAX_SCAN_BYTES: usize = 16 * 1024 * 1024;
+#[cfg(unix)]
+const GREP_OUTPUT_RESERVE: usize = 256;
 
+#[cfg(any(not(unix), test))]
 fn escape_rg_glob_literal(path: &str) -> String {
     let mut escaped = String::with_capacity(path.len());
     for character in path.chars() {
@@ -656,6 +677,7 @@ fn escape_rg_glob_literal(path: &str) -> String {
     escaped
 }
 
+#[cfg(not(unix))]
 fn relative_path_to_rg_glob_literal(path: &Path) -> Option<String> {
     use std::path::Component;
 
@@ -676,9 +698,10 @@ fn relative_path_to_rg_glob_literal(path: &Path) -> Option<String> {
 }
 
 struct PinnedGrepRoot {
+    #[cfg(not(unix))]
     command_path: PathBuf,
     #[cfg(unix)]
-    _descriptor: std::fs::File,
+    descriptor: std::fs::File,
 }
 
 impl PinnedGrepRoot {
@@ -692,28 +715,7 @@ impl PinnedGrepRoot {
                     "grep target is not a regular file or directory",
                 ));
             }
-
-            #[cfg(any(target_os = "linux", target_os = "android"))]
-            {
-                // `F_DUPFD` intentionally produces a descriptor without
-                // FD_CLOEXEC. The child opens this stable capability through
-                // procfs after exec; the parent keeps it alive until rg exits.
-                let inherited = unsafe { libc::fcntl(descriptor.as_raw_fd(), libc::F_DUPFD, 3) };
-                if inherited < 0 {
-                    return Err(std::io::Error::last_os_error());
-                }
-                let inherited = unsafe { std::fs::File::from_raw_fd(inherited) };
-                Ok(Self {
-                    command_path: PathBuf::from(format!("/proc/self/fd/{}", inherited.as_raw_fd())),
-                    _descriptor: inherited,
-                })
-            }
-
-            #[cfg(not(any(target_os = "linux", target_os = "android")))]
-            Ok(Self {
-                command_path: path.to_path_buf(),
-                _descriptor: descriptor,
-            })
+            Ok(Self { descriptor })
         }
 
         #[cfg(not(unix))]
@@ -723,6 +725,491 @@ impl PinnedGrepRoot {
     }
 }
 
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeSearchStop {
+    MatchLimit,
+    OutputLimit,
+    ScanByteLimit,
+    FileLimit,
+    EntryLimit,
+    DepthLimit,
+    Deadline,
+    Cancelled,
+}
+
+#[cfg(unix)]
+impl NativeSearchStop {
+    fn label(self) -> &'static str {
+        match self {
+            Self::MatchLimit => "match limit reached",
+            Self::OutputLimit => "output byte limit reached",
+            Self::ScanByteLimit => "scan byte limit reached",
+            Self::FileLimit => "file limit reached",
+            Self::EntryLimit => "directory entry limit reached",
+            Self::DepthLimit => "directory depth limit reached",
+            Self::Deadline => "search deadline reached",
+            Self::Cancelled => "search cancelled",
+        }
+    }
+}
+
+#[cfg(unix)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum NativeEntryKind {
+    File,
+    Directory,
+}
+
+#[cfg(unix)]
+#[derive(Debug)]
+struct NativeDirectoryEntry {
+    name: OsString,
+    kind: NativeEntryKind,
+}
+
+#[cfg(unix)]
+struct NativeDirectoryRead {
+    entries: Vec<NativeDirectoryEntry>,
+    entries_seen: usize,
+    stop: Option<NativeSearchStop>,
+}
+
+#[cfg(unix)]
+fn read_pinned_directory(
+    directory: &std::fs::File,
+    max_entries: usize,
+    deadline: Instant,
+    cancelled: &AtomicBool,
+) -> std::io::Result<NativeDirectoryRead> {
+    let duplicate = unsafe { libc::dup(directory.as_raw_fd()) };
+    if duplicate < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    let stream = unsafe { libc::fdopendir(duplicate) };
+    if stream.is_null() {
+        let error = std::io::Error::last_os_error();
+        unsafe {
+            libc::close(duplicate);
+        }
+        return Err(error);
+    }
+    let stream = DirectoryStream(stream);
+    let mut entries = Vec::new();
+    let mut entries_seen = 0_usize;
+    loop {
+        if cancelled.load(Ordering::Acquire) {
+            return Ok(NativeDirectoryRead {
+                entries,
+                entries_seen,
+                stop: Some(NativeSearchStop::Cancelled),
+            });
+        }
+        if Instant::now() >= deadline {
+            return Ok(NativeDirectoryRead {
+                entries,
+                entries_seen,
+                stop: Some(NativeSearchStop::Deadline),
+            });
+        }
+        let entry = unsafe { libc::readdir(stream.0) };
+        if entry.is_null() {
+            break;
+        }
+        let name = unsafe { CStr::from_ptr((*entry).d_name.as_ptr()) }.to_bytes();
+        if matches!(name, b"." | b"..") {
+            continue;
+        }
+        if entries_seen >= max_entries {
+            return Ok(NativeDirectoryRead {
+                entries,
+                entries_seen,
+                stop: Some(NativeSearchStop::EntryLimit),
+            });
+        }
+        entries_seen = entries_seen.saturating_add(1);
+        let name = OsString::from_vec(name.to_vec());
+        // Match ripgrep's established default: hidden entries are excluded
+        // unless a future explicit schema option requests them.
+        if name.as_bytes().starts_with(b".") {
+            continue;
+        }
+        let encoded = CString::new(name.as_bytes()).map_err(|_| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                "directory entry contains an interior NUL byte",
+            )
+        })?;
+        let mut stat = std::mem::MaybeUninit::<libc::stat>::uninit();
+        let status = unsafe {
+            libc::fstatat(
+                libc::dirfd(stream.0),
+                encoded.as_ptr(),
+                stat.as_mut_ptr(),
+                libc::AT_SYMLINK_NOFOLLOW,
+            )
+        };
+        if status != 0 {
+            continue;
+        }
+        let mode = unsafe { stat.assume_init().st_mode } & libc::S_IFMT;
+        let kind = if mode == libc::S_IFREG {
+            NativeEntryKind::File
+        } else if mode == libc::S_IFDIR {
+            NativeEntryKind::Directory
+        } else {
+            // Symlinks, devices, sockets, and FIFOs are never search inputs.
+            continue;
+        };
+        entries.push(NativeDirectoryEntry { name, kind });
+    }
+    entries.sort_by(|left, right| left.name.as_bytes().cmp(right.name.as_bytes()));
+    Ok(NativeDirectoryRead {
+        entries,
+        entries_seen,
+        stop: None,
+    })
+}
+
+#[cfg(unix)]
+fn open_pinned_child(
+    directory: &std::fs::File,
+    name: &OsStr,
+    kind: NativeEntryKind,
+) -> std::io::Result<std::fs::File> {
+    let name = CString::new(name.as_bytes()).map_err(|_| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "directory entry contains an interior NUL byte",
+        )
+    })?;
+    let kind_flags = match kind {
+        NativeEntryKind::File => 0,
+        NativeEntryKind::Directory => libc::O_DIRECTORY,
+    };
+    let descriptor = unsafe {
+        libc::openat(
+            directory.as_raw_fd(),
+            name.as_ptr(),
+            libc::O_RDONLY | libc::O_NONBLOCK | libc::O_NOFOLLOW | libc::O_CLOEXEC | kind_flags,
+        )
+    };
+    if descriptor < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(unsafe { std::fs::File::from_raw_fd(descriptor) })
+}
+
+#[cfg(unix)]
+struct NativeSearchCancellation(Arc<AtomicBool>);
+
+#[cfg(unix)]
+impl Drop for NativeSearchCancellation {
+    fn drop(&mut self) {
+        self.0.store(true, Ordering::Release);
+    }
+}
+
+#[cfg(unix)]
+struct NativeSearch<'a> {
+    permissions: &'a Permissions,
+    expression: &'a Regex,
+    canonical_root: &'a Path,
+    root_is_file: bool,
+    max_matches: usize,
+    output_budget: usize,
+    deadline: Instant,
+    cancelled: &'a AtomicBool,
+    output: String,
+    matches: usize,
+    files: usize,
+    entries: usize,
+    scanned_bytes: usize,
+    skipped_files: usize,
+    root_skip_reason: Option<&'static str>,
+    stop: Option<NativeSearchStop>,
+}
+
+#[cfg(unix)]
+impl NativeSearch<'_> {
+    fn check_stop(&mut self) -> bool {
+        if self.stop.is_some() {
+            return true;
+        }
+        if self.cancelled.load(Ordering::Acquire) {
+            self.stop = Some(NativeSearchStop::Cancelled);
+        } else if Instant::now() >= self.deadline {
+            self.stop = Some(NativeSearchStop::Deadline);
+        }
+        self.stop.is_some()
+    }
+
+    fn stable_path(&self, relative: &Path) -> PathBuf {
+        if self.root_is_file || relative.as_os_str().is_empty() {
+            self.canonical_root.to_path_buf()
+        } else {
+            self.canonical_root.join(relative)
+        }
+    }
+
+    fn display_path(&self, relative: &Path) -> String {
+        if self.root_is_file {
+            self.canonical_root
+                .file_name()
+                .unwrap_or(self.canonical_root.as_os_str())
+                .to_string_lossy()
+                .into_owned()
+        } else {
+            relative.to_string_lossy().into_owned()
+        }
+    }
+
+    fn skip_file(&mut self, reason: &'static str) {
+        self.skipped_files = self.skipped_files.saturating_add(1);
+        if self.root_is_file {
+            self.root_skip_reason = Some(reason);
+        }
+    }
+
+    fn search_file(&mut self, relative: &Path, mut file: std::fs::File) -> std::io::Result<()> {
+        if self.check_stop() {
+            return Ok(());
+        }
+        if self.files >= GREP_MAX_FILES {
+            self.stop = Some(NativeSearchStop::FileLimit);
+            return Ok(());
+        }
+        let stable_path = self.stable_path(relative);
+        if self
+            .permissions
+            .validate_opened_model_read(&stable_path, &stable_path, &file)
+            .is_err()
+        {
+            self.skip_file("the opened file was no longer authorized");
+            return Ok(());
+        }
+        self.files = self.files.saturating_add(1);
+        let remaining = GREP_MAX_SCAN_BYTES.saturating_sub(self.scanned_bytes);
+        if remaining == 0 {
+            self.stop = Some(NativeSearchStop::ScanByteLimit);
+            return Ok(());
+        }
+        let metadata = file.metadata()?;
+        if metadata.len() > GREP_MAX_FILE_BYTES as u64 {
+            self.skip_file("file exceeds the 1 MiB per-file limit");
+            return Ok(());
+        }
+        let read_budget = remaining.min(GREP_MAX_FILE_BYTES);
+        let mut bytes = Vec::with_capacity(
+            usize::try_from(metadata.len())
+                .unwrap_or(read_budget)
+                .min(read_budget.saturating_add(1)),
+        );
+        Read::by_ref(&mut file)
+            .take(read_budget.saturating_add(1) as u64)
+            .read_to_end(&mut bytes)?;
+        let hit_read_limit = bytes.len() > read_budget;
+        bytes.truncate(bytes.len().min(read_budget));
+        self.scanned_bytes = self.scanned_bytes.saturating_add(bytes.len());
+        if bytes.contains(&0) {
+            self.skip_file("file contains binary data");
+            if hit_read_limit && remaining <= GREP_MAX_FILE_BYTES {
+                self.stop = Some(NativeSearchStop::ScanByteLimit);
+            }
+            return Ok(());
+        }
+        let text = match std::str::from_utf8(&bytes) {
+            Ok(text) => text,
+            Err(error) if hit_read_limit && error.error_len().is_none() => {
+                std::str::from_utf8(&bytes[..error.valid_up_to()]).expect("validated UTF-8 prefix")
+            }
+            Err(_) => {
+                self.skip_file("file is not valid UTF-8 text");
+                if hit_read_limit && remaining <= GREP_MAX_FILE_BYTES {
+                    self.stop = Some(NativeSearchStop::ScanByteLimit);
+                }
+                return Ok(());
+            }
+        };
+        if hit_read_limit && remaining > GREP_MAX_FILE_BYTES {
+            // Metadata can under-report length on virtual files. Do not emit a
+            // partial match set from a file that exceeded the per-file cap.
+            self.skip_file("file exceeds the 1 MiB per-file limit");
+            return Ok(());
+        }
+        let display_path = self.display_path(relative);
+        for (index, line) in text.lines().enumerate() {
+            if self.check_stop() {
+                break;
+            }
+            if !self.expression.is_match(line) {
+                continue;
+            }
+            let rendered = format!("{display_path}:{}:{line}", index + 1);
+            let separator = usize::from(!self.output.is_empty());
+            if self
+                .output
+                .len()
+                .saturating_add(separator)
+                .saturating_add(rendered.len())
+                > self.output_budget
+            {
+                self.stop = Some(NativeSearchStop::OutputLimit);
+                break;
+            }
+            if separator == 1 {
+                self.output.push('\n');
+            }
+            self.output.push_str(&rendered);
+            self.matches = self.matches.saturating_add(1);
+            if self.matches >= self.max_matches {
+                self.stop = Some(NativeSearchStop::MatchLimit);
+                break;
+            }
+        }
+        if hit_read_limit && self.stop.is_none() {
+            self.stop = Some(NativeSearchStop::ScanByteLimit);
+        }
+        Ok(())
+    }
+
+    fn search_directory(
+        &mut self,
+        relative: &Path,
+        directory: &std::fs::File,
+        depth: usize,
+    ) -> std::io::Result<()> {
+        if self.check_stop() {
+            return Ok(());
+        }
+        if depth > 64 {
+            self.stop = Some(NativeSearchStop::DepthLimit);
+            return Ok(());
+        }
+        let remaining_entries = GREP_MAX_ENTRIES.saturating_sub(self.entries);
+        let directory_read =
+            read_pinned_directory(directory, remaining_entries, self.deadline, self.cancelled)?;
+        self.entries = self.entries.saturating_add(directory_read.entries_seen);
+        if matches!(
+            directory_read.stop,
+            Some(NativeSearchStop::Cancelled | NativeSearchStop::Deadline)
+        ) {
+            self.stop = directory_read.stop;
+            return Ok(());
+        }
+        for entry in directory_read.entries {
+            if self.check_stop() {
+                break;
+            }
+            let child_relative = relative.join(&entry.name);
+            let stable_path = self.stable_path(&child_relative);
+            if self.permissions.is_read_protected(&stable_path) {
+                continue;
+            }
+            let child = match open_pinned_child(directory, &entry.name, entry.kind) {
+                Ok(child) => child,
+                Err(_) => {
+                    self.skipped_files = self.skipped_files.saturating_add(1);
+                    continue;
+                }
+            };
+            match entry.kind {
+                NativeEntryKind::File => self.search_file(&child_relative, child)?,
+                NativeEntryKind::Directory => {
+                    if self
+                        .search_directory(&child_relative, &child, depth.saturating_add(1))
+                        .is_err()
+                    {
+                        self.skipped_files = self.skipped_files.saturating_add(1);
+                    }
+                }
+            }
+        }
+        if self.stop.is_none() {
+            self.stop = directory_read.stop;
+        }
+        Ok(())
+    }
+
+    fn finish(mut self) -> Result<String, ToolError> {
+        if self.stop == Some(NativeSearchStop::Cancelled) {
+            return Err(ToolError::ExecError("search cancelled".to_string()));
+        }
+        if self.output.is_empty() {
+            if let Some(reason) = self.root_skip_reason {
+                self.output.push_str("(file not searched: ");
+                self.output.push_str(reason);
+                self.output.push(')');
+            } else {
+                self.output.push_str(if self.stop.is_some() {
+                    "(no matches before search stopped)"
+                } else {
+                    "(no matches)"
+                });
+            }
+        }
+        if let Some(stop) = self.stop {
+            self.output.push_str(&format!(
+                "\n...[search truncated: {}; matches={}; files={}; entries={}; scanned_bytes={}; skipped_files={}]",
+                stop.label(),
+                self.matches,
+                self.files,
+                self.entries,
+                self.scanned_bytes,
+                self.skipped_files,
+            ));
+        }
+        Ok(self.permissions.cap_output(self.output))
+    }
+}
+
+#[cfg(unix)]
+fn native_grep(
+    permissions: &Permissions,
+    expression: &Regex,
+    canonical_root: &Path,
+    grep_root: PinnedGrepRoot,
+    max_matches: usize,
+    output_limit: usize,
+    cancelled: &AtomicBool,
+) -> Result<String, ToolError> {
+    let metadata = grep_root
+        .descriptor
+        .metadata()
+        .map_err(|error| ToolError::ExecError(format!("search root changed: {error}")))?;
+    let root_is_file = metadata.is_file();
+    let reserve = GREP_OUTPUT_RESERVE.min(output_limit / 2);
+    let mut search = NativeSearch {
+        permissions,
+        expression,
+        canonical_root,
+        root_is_file,
+        max_matches,
+        output_budget: output_limit.saturating_sub(reserve),
+        deadline: Instant::now() + GREP_TIMEOUT,
+        cancelled,
+        output: String::new(),
+        matches: 0,
+        files: 0,
+        entries: 0,
+        scanned_bytes: 0,
+        skipped_files: 0,
+        root_skip_reason: None,
+        stop: None,
+    };
+    if root_is_file {
+        search
+            .search_file(Path::new(""), grep_root.descriptor)
+            .map_err(|error| ToolError::ExecError(format!("search failed: {error}")))?;
+    } else {
+        search
+            .search_directory(Path::new(""), &grep_root.descriptor, 0)
+            .map_err(|error| ToolError::ExecError(format!("search failed: {error}")))?;
+    }
+    search.finish()
+}
+
+#[cfg(any(not(unix), test))]
 #[derive(Debug)]
 enum ProcessTermination {
     Exited(ExitStatus),
@@ -730,6 +1217,7 @@ enum ProcessTermination {
     Cancelled,
 }
 
+#[cfg(any(not(unix), test))]
 #[derive(Debug)]
 struct CapturedProcess {
     termination: ProcessTermination,
@@ -739,14 +1227,17 @@ struct CapturedProcess {
 
 /// Notify the detached process supervisor when the caller's future is dropped.
 /// The supervisor owns the child, so it can both kill and reap it asynchronously.
+#[cfg(any(not(unix), test))]
 struct CancelChildOnDrop(Option<tokio::sync::oneshot::Sender<()>>);
 
+#[cfg(any(not(unix), test))]
 impl CancelChildOnDrop {
     fn disarm(&mut self) {
         self.0.take();
     }
 }
 
+#[cfg(any(not(unix), test))]
 impl Drop for CancelChildOnDrop {
     fn drop(&mut self) {
         if let Some(cancel) = self.0.take() {
@@ -755,6 +1246,7 @@ impl Drop for CancelChildOnDrop {
     }
 }
 
+#[cfg(any(not(unix), test))]
 async fn capture_capped<R>(mut stream: R, max_bytes: usize) -> std::io::Result<Vec<u8>>
 where
     R: AsyncRead + Unpin,
@@ -776,6 +1268,7 @@ where
     Ok(captured)
 }
 
+#[cfg(any(not(unix), test))]
 async fn terminate_and_reap(child: &mut tokio::process::Child) -> std::io::Result<()> {
     // `start_kill` can lose a race with natural process exit. Waiting is the
     // authoritative cleanup step and reaps the child on Unix either way.
@@ -791,6 +1284,7 @@ async fn terminate_and_reap(child: &mut tokio::process::Child) -> std::io::Resul
     }
 }
 
+#[cfg(any(not(unix), test))]
 async fn supervise_child(
     mut child: tokio::process::Child,
     mut cancel: tokio::sync::oneshot::Receiver<()>,
@@ -837,6 +1331,7 @@ async fn supervise_child(
     })
 }
 
+#[cfg(any(not(unix), test))]
 async fn run_captured_command(
     command: &mut tokio::process::Command,
     timeout: Duration,
@@ -861,32 +1356,35 @@ async fn run_captured_command(
 pub fn grep_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "repo_grep".to_string(),
-        description: "Search file contents under an allowed path using ripgrep. Returns matching \
-                      lines with file:line prefixes."
+        description: "Search UTF-8 file contents recursively under an allowed file or directory. \
+                      Returns deterministic path:line:text matches. Unix hosts use a native \
+                      descriptor-relative walker; other hosts use a fixed-argv ripgrep fallback. \
+                      Search work, matches, and output are bounded."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
             "properties": {
-                "pattern": {"type": "string", "description": "Regex/text to search for"},
+                "pattern": {"type": "string", "maxLength": 4096, "description": "Regular expression, or exact text when literal=true"},
                 "path": {"type": "string", "description": "Directory or file to search under"},
-                "max_count": {"type": "integer", "description": "Max matching lines (default 100)"}
+                "max_count": {"type": "integer", "minimum": 1, "maximum": GREP_MAX_MATCHES, "description": "Maximum matching lines (default 100; global on native Unix search)"},
+                "literal": {"type": "boolean", "description": "Treat pattern as exact text instead of a regular expression (default false)"}
             },
             "required": ["pattern", "path"]
         }),
     };
     let handler: HandlerFn = Box::new(move |args: String| {
         let policy = policy.clone();
-        Box::pin(async move { grep_run(&policy, &args).await })
+        Box::pin(async move { grep_run(policy, &args).await })
     });
     (descriptor, handler)
 }
 
-async fn grep_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+async fn grep_run(policy: Arc<Permissions>, args: &str) -> Result<String, ToolError> {
     grep_run_with_hook(policy, args, || {}).await
 }
 
 async fn grep_run_with_hook<F>(
-    policy: &Permissions,
+    policy: Arc<Permissions>,
     args: &str,
     after_pin: F,
 ) -> Result<String, ToolError>
@@ -895,6 +1393,24 @@ where
 {
     let a: GrepArgs =
         serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    if a.pattern.len() > 4 * 1024 {
+        return Err(ToolError::InvalidArgs(
+            "search pattern exceeds the 4096-byte limit".to_string(),
+        ));
+    }
+    let max = a.max_count.unwrap_or(GREP_DEFAULT_MAX);
+    if !(1..=GREP_MAX_MATCHES).contains(&max) {
+        return Err(ToolError::InvalidArgs(format!(
+            "max_count must be between 1 and {GREP_MAX_MATCHES}"
+        )));
+    }
+    let compiled_pattern = if a.literal {
+        regex::escape(&a.pattern)
+    } else {
+        a.pattern.clone()
+    };
+    let expression = Regex::new(&compiled_pattern)
+        .map_err(|error| ToolError::InvalidArgs(format!("invalid search pattern: {error}")))?;
     let canon = policy.check_read(Path::new(&a.path)).await?;
     let pin_path = canon.clone();
     let grep_root = tokio::task::spawn_blocking(move || PinnedGrepRoot::open(&pin_path))
@@ -902,77 +1418,106 @@ where
         .map_err(|error| ToolError::ExecError(format!("grep pin join error: {error}")))?
         .map_err(|error| ToolError::ExecError(format!("grep target changed: {error}")))?;
     after_pin();
-    let max = a.max_count.unwrap_or(GREP_DEFAULT_MAX);
-    let pattern = a.pattern.clone();
 
-    // Fixed argv, never a shell. Pattern and path are separate argv elements.
-    let mut command = tokio::process::Command::new("rg");
-    command
-        .arg("--line-number")
-        .arg("--no-heading")
-        .arg("--color=never")
-        .arg("--max-count")
-        .arg(max.to_string());
-    for private in policy.protected_read_roots() {
-        if let Ok(relative) = private.strip_prefix(&canon) {
-            let relative = relative_path_to_rg_glob_literal(relative).ok_or_else(|| {
-                ToolError::PolicyDenied(format!(
-                    "cannot safely exclude protected path '{}' from repository search",
-                    private.display()
-                ))
-            })?;
-            command.arg("--glob").arg(format!("!{relative}"));
-            command.arg("--glob").arg(format!("!{relative}/**"));
-        }
-    }
-    command.arg("--").arg(&pattern).arg(&grep_root.command_path);
-
-    let output = run_captured_command(&mut command, GREP_TIMEOUT, policy.max_bytes())
+    #[cfg(unix)]
+    {
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let _cancel_on_drop = NativeSearchCancellation(cancelled.clone());
+        let worker_policy = policy.clone();
+        let output_limit = policy.max_bytes();
+        tokio::task::spawn_blocking(move || {
+            native_grep(
+                &worker_policy,
+                &expression,
+                &canon,
+                grep_root,
+                max,
+                output_limit,
+                &cancelled,
+            )
+        })
         .await
-        .map_err(|e| ToolError::ExecError(format!("rg failed: {e}")))?;
-    drop(grep_root);
-    let stdout = policy.cap_output(String::from_utf8_lossy(&output.stdout).into_owned());
-    let stderr = policy.cap_output(String::from_utf8_lossy(&output.stderr).into_owned());
-    let diagnostics = stderr.trim();
+        .map_err(|error| ToolError::ExecError(format!("search worker join error: {error}")))?
+    }
 
-    match output.termination {
-        ProcessTermination::Exited(status) => match status.code() {
-            Some(0) => Ok(stdout),
-            // rg documents exit 1 as a successful search with no matches.
-            Some(1) => Ok("(no matches)".to_string()),
-            Some(code) => {
-                let detail = if diagnostics.is_empty() {
-                    "no diagnostics".to_string()
-                } else {
-                    diagnostics.to_string()
-                };
-                Err(ToolError::ExecError(format!(
-                    "rg exited with status {code}: {detail}"
-                )))
-            }
-            None => {
-                let detail = if diagnostics.is_empty() {
-                    "no diagnostics".to_string()
-                } else {
-                    diagnostics.to_string()
-                };
-                Err(ToolError::ExecError(format!(
-                    "rg terminated without an exit code: {detail}"
-                )))
-            }
-        },
-        ProcessTermination::TimedOut => {
-            let detail = if diagnostics.is_empty() {
-                String::new()
-            } else {
-                format!(": {diagnostics}")
-            };
-            Err(ToolError::ExecError(format!(
-                "rg timed out after {} seconds{detail}",
-                GREP_TIMEOUT.as_secs()
-            )))
+    #[cfg(not(unix))]
+    {
+        let _ = expression;
+        let pattern = a.pattern.clone();
+        // Fixed argv, never a shell. Pattern and path are separate argv
+        // elements. Non-Unix retains the established ripgrep backend until a
+        // descriptor-relative no-reparse walker is available there.
+        let mut command = tokio::process::Command::new("rg");
+        command
+            .arg("--line-number")
+            .arg("--no-heading")
+            .arg("--color=never")
+            .arg("--max-count")
+            .arg(max.to_string());
+        if a.literal {
+            command.arg("--fixed-strings");
         }
-        ProcessTermination::Cancelled => Err(ToolError::ExecError("rg cancelled".to_string())),
+        for private in policy.protected_read_roots() {
+            if let Ok(relative) = private.strip_prefix(&canon) {
+                let relative = relative_path_to_rg_glob_literal(relative).ok_or_else(|| {
+                    ToolError::PolicyDenied(format!(
+                        "cannot safely exclude protected path '{}' from repository search",
+                        private.display()
+                    ))
+                })?;
+                command.arg("--glob").arg(format!("!{relative}"));
+                command.arg("--glob").arg(format!("!{relative}/**"));
+            }
+        }
+        command.arg("--").arg(&pattern).arg(&grep_root.command_path);
+
+        let output = run_captured_command(&mut command, GREP_TIMEOUT, policy.max_bytes())
+            .await
+            .map_err(|e| ToolError::ExecError(format!("rg failed: {e}")))?;
+        drop(grep_root);
+        let stdout = policy.cap_output(String::from_utf8_lossy(&output.stdout).into_owned());
+        let stderr = policy.cap_output(String::from_utf8_lossy(&output.stderr).into_owned());
+        let diagnostics = stderr.trim();
+
+        match output.termination {
+            ProcessTermination::Exited(status) => match status.code() {
+                Some(0) => Ok(stdout),
+                // rg documents exit 1 as a successful search with no matches.
+                Some(1) => Ok("(no matches)".to_string()),
+                Some(code) => {
+                    let detail = if diagnostics.is_empty() {
+                        "no diagnostics".to_string()
+                    } else {
+                        diagnostics.to_string()
+                    };
+                    Err(ToolError::ExecError(format!(
+                        "rg exited with status {code}: {detail}"
+                    )))
+                }
+                None => {
+                    let detail = if diagnostics.is_empty() {
+                        "no diagnostics".to_string()
+                    } else {
+                        diagnostics.to_string()
+                    };
+                    Err(ToolError::ExecError(format!(
+                        "rg terminated without an exit code: {detail}"
+                    )))
+                }
+            },
+            ProcessTermination::TimedOut => {
+                let detail = if diagnostics.is_empty() {
+                    String::new()
+                } else {
+                    format!(": {diagnostics}")
+                };
+                Err(ToolError::ExecError(format!(
+                    "rg timed out after {} seconds{detail}",
+                    GREP_TIMEOUT.as_secs()
+                )))
+            }
+            ProcessTermination::Cancelled => Err(ToolError::ExecError("rg cancelled".to_string())),
+        }
     }
 }
 
@@ -1165,6 +1710,37 @@ pub struct JournalCheckpointSummary {
     pub paths: Vec<PathBuf>,
 }
 
+/// Host verification for a required filesystem effect. This never exposes the
+/// retained snapshots: callers get only byte counts and whether the path's
+/// current identity, metadata, and contents still match the latest verified
+/// model-tool write.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JournalWriteVerification {
+    pub initial_bytes: Option<usize>,
+    pub final_bytes: usize,
+    pub net_content_changed: bool,
+    pub current_matches_latest_write: bool,
+}
+
+/// Read an already-authorized write target through the same descriptor-pinned,
+/// no-follow path machinery used by atomic model writes. This is host evidence
+/// for completion postconditions, not a model read grant; callers must resolve
+/// and authorize `path` with [`Permissions::check_write`] first.
+pub fn read_verified_write_target(
+    path: &Path,
+    max_bytes: usize,
+) -> Result<Option<Vec<u8>>, ToolError> {
+    MutationTarget::pin(path)
+        .and_then(|target| target.read_snapshot_limited(max_bytes))
+        .map(|snapshot| snapshot.map(|snapshot| snapshot.content))
+        .map_err(|error| {
+            ToolError::ExecError(format!(
+                "cannot inspect authorized write target '{}': {error}",
+                path.display()
+            ))
+        })
+}
+
 impl WriteJournal {
     pub fn new() -> Self {
         Self::default()
@@ -1323,6 +1899,79 @@ impl WriteJournal {
                     .collect(),
             })
             .collect()
+    }
+
+    /// Verify the net model-filesystem effect recorded for `path` during this
+    /// journal lifetime, including the currently active attributed turn.
+    /// `None` means no retained verified write names the exact resolved path.
+    /// A later external mutation (or deletion) makes
+    /// `current_matches_latest_write` false, so a completion contract cannot
+    /// bless state that changed after the model tool returned.
+    pub fn verify_written_path(
+        &self,
+        path: &Path,
+    ) -> Result<Option<JournalWriteVerification>, ToolError> {
+        self.verify_written_path_with_current_content(path, |_| ())
+            .map(|verification| verification.map(|(verification, ())| verification))
+    }
+
+    /// Verify a required write and derive one host-owned observation from the
+    /// exact same descriptor-pinned current snapshot used for identity/content
+    /// matching. This avoids accepting a digest read through a second open
+    /// after the journal check. The snapshot bytes never escape except through
+    /// the caller's bounded return value.
+    pub fn verify_written_path_with_current_content<R>(
+        &self,
+        path: &Path,
+        inspect: impl FnOnce(Option<&[u8]>) -> R,
+    ) -> Result<Option<(JournalWriteVerification, R)>, ToolError> {
+        let snapshots = {
+            let state = self.inner.lock().expect("write journal");
+            let mut first_before = None;
+            let mut saw_first = false;
+            let mut latest_after = None;
+            for change in state
+                .history
+                .iter()
+                .flat_map(|turn| turn.changes.iter())
+                .chain(state.active.iter().flat_map(|turn| turn.changes.iter()))
+                .filter(|change| change.path == path)
+            {
+                if !saw_first {
+                    first_before = change.before.clone();
+                    saw_first = true;
+                }
+                latest_after = Some(change.after.clone());
+            }
+            latest_after.map(|after| (first_before, after))
+        };
+        let Some((before, after)) = snapshots else {
+            return Ok(None);
+        };
+        let current = MutationTarget::pin(path)
+            .and_then(|target| target.read_snapshot_limited(after.content.len()))
+            .map_err(|error| {
+                ToolError::ExecError(format!(
+                    "cannot verify required write '{}': {error}",
+                    path.display()
+                ))
+            })?;
+        let current_matches_latest_write = current
+            .as_ref()
+            .is_some_and(|current| after.matches(current));
+        let net_content_changed = before
+            .as_ref()
+            .map_or(true, |before| before.content != after.content);
+        let observation = inspect(current.as_ref().map(|snapshot| snapshot.content.as_slice()));
+        Ok(Some((
+            JournalWriteVerification {
+                initial_bytes: before.as_ref().map(|snapshot| snapshot.content.len()),
+                final_bytes: after.content.len(),
+                net_content_changed,
+                current_matches_latest_write,
+            },
+            observation,
+        )))
     }
 
     /// Return one recoverable checkpoint with bounded, snapshot-derived diff
@@ -3544,7 +4193,7 @@ mod tests {
         std::fs::write(&secret, "TRANSCRIPT_SECRET").unwrap();
         let artifacts = private.join("artifacts");
         std::fs::create_dir(&artifacts).unwrap();
-        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
         policy
             .protect_read_path(&private.to_string_lossy())
             .unwrap();
@@ -3571,20 +4220,17 @@ mod tests {
                 .await
                 .unwrap();
         assert_eq!(artifact_read, "TRUSTED_RESULT");
-        if std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .is_ok()
+        #[cfg(unix)]
         {
             let grep = grep_run(
-                &policy,
+                policy.clone(),
                 &serde_json::json!({"path": root, "pattern": "TRANSCRIPT_SECRET"}).to_string(),
             )
             .await
             .unwrap();
             assert_eq!(grep, "(no matches)");
             let artifact_grep = grep_run(
-                &policy,
+                policy.clone(),
                 &serde_json::json!({"path": artifacts, "pattern": "TRUSTED_RESULT"}).to_string(),
             )
             .await
@@ -3593,25 +4239,19 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn grep_escapes_protected_paths_with_glob_metacharacters() {
-        if std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let secret = dir.path().join("[private].toml");
         std::fs::write(&secret, "GLOB_META_SECRET").unwrap();
         std::fs::write(dir.path().join("visible.txt"), "visible").unwrap();
         let root = dir.path().to_string_lossy().into_owned();
-        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
         policy.protect_read_path(&secret.to_string_lossy()).unwrap();
 
         let output = grep_run(
-            &policy,
+            policy,
             &serde_json::json!({"path": root, "pattern": "GLOB_META_SECRET"}).to_string(),
         )
         .await
@@ -3631,16 +4271,9 @@ mod tests {
     #[cfg(unix)]
     #[tokio::test]
     async fn grep_excludes_multiple_literal_metacharacter_names() {
-        if std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path().to_string_lossy().into_owned();
-        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
         for name in [
             "*private*.txt",
             "private?.txt",
@@ -3654,7 +4287,7 @@ mod tests {
         }
 
         let output = grep_run(
-            &policy,
+            policy,
             &serde_json::json!({
                 "path": root,
                 "pattern": "ALL_GLOB_METACHARS_SECRET"
@@ -3670,13 +4303,6 @@ mod tests {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     #[tokio::test]
     async fn grep_uses_the_pinned_root_after_an_ancestor_swap() {
-        if std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let dir = tempfile::tempdir().unwrap();
         let allowed = dir.path().join("allowed");
         let nested = allowed.join("nested");
@@ -3685,12 +4311,13 @@ mod tests {
         std::fs::create_dir(&outside).unwrap();
         std::fs::write(nested.join("source.txt"), "PINNED_AUTHORIZED").unwrap();
         std::fs::write(outside.join("source.txt"), "PINNED_OUTSIDE").unwrap();
-        let policy =
-            Permissions::for_roots(&[allowed.to_string_lossy().into_owned()], &[]).unwrap();
+        let policy = Arc::new(
+            Permissions::for_roots(&[allowed.to_string_lossy().into_owned()], &[]).unwrap(),
+        );
         let moved = allowed.join("moved-nested");
         let args = serde_json::json!({"path": nested, "pattern": "PINNED_"}).to_string();
 
-        let output = grep_run_with_hook(&policy, &args, || {
+        let output = grep_run_with_hook(policy, &args, || {
             std::fs::rename(&nested, &moved).unwrap();
             std::os::unix::fs::symlink(&outside, &nested).unwrap();
         })
@@ -3701,20 +4328,14 @@ mod tests {
         assert!(!output.contains("PINNED_OUTSIDE"), "{output}");
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn grep_distinguishes_no_matches_from_process_errors() {
-        if std::process::Command::new("rg")
-            .arg("--version")
-            .output()
-            .is_err()
-        {
-            return;
-        }
         let (dir, root) = temp_with_file("a.txt", "present\n");
-        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
 
         let no_match = grep_run(
-            &policy,
+            policy.clone(),
             &serde_json::json!({"path": root, "pattern": "absent"}).to_string(),
         )
         .await
@@ -3722,18 +4343,219 @@ mod tests {
         assert_eq!(no_match, "(no matches)");
 
         let invalid = grep_run(
-            &policy,
+            policy,
             &serde_json::json!({"path": dir.path(), "pattern": "["}).to_string(),
         )
         .await
-        .expect_err("invalid regex must be a process error, not no matches");
+        .expect_err("invalid regex must be rejected, not reported as no matches");
         match invalid {
-            ToolError::ExecError(message) => {
-                assert!(message.contains("status 2"), "{message}");
-                assert!(message.to_ascii_lowercase().contains("regex"), "{message}");
+            ToolError::InvalidArgs(message) => {
+                assert!(message.contains("invalid search pattern"), "{message}");
             }
             other => panic!("unexpected error: {other}"),
         }
+    }
+
+    #[tokio::test]
+    async fn grep_rejects_unbounded_arguments_before_touching_the_filesystem() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        for max_count in [0, GREP_MAX_MATCHES + 1] {
+            let error = grep_run(
+                policy.clone(),
+                &serde_json::json!({
+                    "path": "/does/not/exist",
+                    "pattern": "x",
+                    "max_count": max_count
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap_err();
+            assert!(matches!(
+                error,
+                ToolError::InvalidArgs(message) if message.contains("max_count")
+            ));
+        }
+
+        let error = grep_run(
+            policy,
+            &serde_json::json!({
+                "path": "/does/not/exist",
+                "pattern": "x".repeat(4 * 1024 + 1)
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap_err();
+        assert!(matches!(
+            error,
+            ToolError::InvalidArgs(message) if message.contains("4096-byte limit")
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_grep_is_deterministic_literal_and_glob_independent() {
+        let dir = tempfile::tempdir().unwrap();
+        let nested = dir.path().join("nested");
+        std::fs::create_dir(&nested).unwrap();
+        std::fs::write(dir.path().join("z.txt"), "aaab\na+b\n").unwrap();
+        std::fs::write(dir.path().join("a.txt"), "a+b\n").unwrap();
+        std::fs::write(nested.join("m.txt"), "prefix a+b suffix\n").unwrap();
+        std::fs::write(dir.path().join(".hidden.txt"), "a+b\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
+
+        let output = grep_run(
+            policy,
+            &serde_json::json!({
+                "path": root,
+                "pattern": "a+b",
+                "literal": true
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "a.txt:1:a+b\nnested/m.txt:1:prefix a+b suffix\nz.txt:2:a+b"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_grep_skips_an_oversized_file_without_starving_later_sources() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("a-large.txt"),
+            "x".repeat(GREP_MAX_FILE_BYTES + 1),
+        )
+        .unwrap();
+        std::fs::write(dir.path().join("z-source.rs"), "NEEDLE\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
+
+        let output = grep_run(
+            policy,
+            &serde_json::json!({"path": root, "pattern": "NEEDLE"}).to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, "z-source.rs:1:NEEDLE");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_grep_reports_when_an_explicit_file_is_too_large_to_search() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("large.txt");
+        std::fs::write(&path, "x".repeat(GREP_MAX_FILE_BYTES + 1)).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(&[root], &[]).unwrap());
+
+        let output = grep_run(
+            policy,
+            &serde_json::json!({"path": path, "pattern": "x"}).to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(
+            output,
+            "(file not searched: file exceeds the 1 MiB per-file limit)"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn native_grep_honors_cancellation_before_consuming_a_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("source.txt");
+        std::fs::write(&path, "NEEDLE\n").unwrap();
+        let path = std::fs::canonicalize(path).unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).unwrap();
+        let grep_root = PinnedGrepRoot::open(&path).unwrap();
+        let expression = Regex::new("NEEDLE").unwrap();
+        let cancelled = AtomicBool::new(true);
+
+        let error = native_grep(
+            &policy,
+            &expression,
+            &path,
+            grep_root,
+            GREP_DEFAULT_MAX,
+            policy.max_bytes(),
+            &cancelled,
+        )
+        .unwrap_err();
+
+        assert!(matches!(
+            error,
+            ToolError::ExecError(message) if message == "search cancelled"
+        ));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_grep_applies_a_global_match_limit_with_a_typed_receipt() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "MATCH one\nMATCH two\n").unwrap();
+        std::fs::write(dir.path().join("b.txt"), "MATCH three\n").unwrap();
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
+
+        let output = grep_run(
+            policy,
+            &serde_json::json!({"path": root, "pattern": "MATCH", "max_count": 1}).to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert!(output.starts_with("a.txt:1:MATCH one\n"), "{output}");
+        assert!(
+            output.contains("search truncated: match limit reached"),
+            "{output}"
+        );
+        assert!(output.contains("matches=1; files=1"), "{output}");
+        assert!(!output.contains("MATCH two"), "{output}");
+        assert!(!output.contains("MATCH three"), "{output}");
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn native_grep_skips_symlinks_and_protected_hard_link_aliases() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let private = allowed.join("private");
+        let outside = dir.path().join("outside.txt");
+        std::fs::create_dir_all(&private).unwrap();
+        std::fs::write(&outside, "OUTSIDE_SECRET\n").unwrap();
+        std::os::unix::fs::symlink(&outside, allowed.join("outside-link.txt")).unwrap();
+        let secret = private.join("session.json");
+        std::fs::write(&secret, "PRIVATE_SECRET\n").unwrap();
+        std::fs::write(allowed.join("visible.txt"), "VISIBLE\n").unwrap();
+        let root = allowed.to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap());
+        policy
+            .protect_read_path(&private.to_string_lossy())
+            .unwrap();
+        // Create the alias after protection registration. Descriptor
+        // validation must refresh the private identity set before reading it.
+        let alias = allowed.join("innocent.txt");
+        std::fs::hard_link(&secret, &alias).unwrap();
+
+        let output = grep_run(
+            policy,
+            &serde_json::json!({"path": root, "pattern": "SECRET|VISIBLE"}).to_string(),
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(output, "visible.txt:1:VISIBLE");
     }
 
     #[cfg(unix)]
@@ -3766,6 +4588,22 @@ mod tests {
             .parse::<i32>()
             .unwrap();
         assert_process_is_reaped(pid).await;
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn captured_command_reports_a_natural_exit_status() {
+        let mut command = tokio::process::Command::new("sh");
+        command.arg("-c").arg("exit 7");
+
+        let output = run_captured_command(&mut command, Duration::from_secs(1), 32)
+            .await
+            .unwrap();
+
+        assert!(matches!(
+            output.termination,
+            ProcessTermination::Exited(status) if status.code() == Some(7)
+        ));
     }
 
     #[cfg(unix)]
@@ -4384,6 +5222,113 @@ mod tests {
         assert_eq!(summaries[0].paths, vec![target]);
         assert_eq!(journal.checkpoint_preview(report.id), Some(report.clone()));
         assert!(journal.checkpoint_preview(report.id + 1).is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_required_write_verification_is_exact_and_detects_later_mutation() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("required.txt");
+        std::fs::write(&target, "before").unwrap();
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+        let args = serde_json::json!({
+            "path": target,
+            "content": "after",
+            "expected_previous_content": "before"
+        })
+        .to_string();
+        run_journaled_write(&journal, &policy, "required effect", &args).await;
+
+        let verified = journal
+            .verify_written_path(&target)
+            .unwrap()
+            .expect("recorded write");
+        assert_eq!(verified.initial_bytes, Some(6));
+        assert_eq!(verified.final_bytes, 5);
+        assert!(verified.net_content_changed);
+        assert!(verified.current_matches_latest_write);
+
+        let (verified, observed) = journal
+            .verify_written_path_with_current_content(&target, |content| {
+                content.map(ToOwned::to_owned)
+            })
+            .unwrap()
+            .expect("recorded write and same-snapshot observation");
+        assert!(verified.current_matches_latest_write);
+        assert_eq!(observed.as_deref(), Some(b"after".as_slice()));
+
+        std::fs::write(&target, "other").unwrap();
+        let conflicted = journal
+            .verify_written_path(&target)
+            .unwrap()
+            .expect("record remains");
+        assert!(conflicted.net_content_changed);
+        assert!(!conflicted.current_matches_latest_write);
+        let (conflicted, observed) = journal
+            .verify_written_path_with_current_content(&target, |content| {
+                content.map(ToOwned::to_owned)
+            })
+            .unwrap()
+            .expect("record and current postimage remain observable");
+        assert!(!conflicted.current_matches_latest_write);
+        assert_eq!(observed.as_deref(), Some(b"other".as_slice()));
+        assert!(journal
+            .verify_written_path(&dir.path().join("never-written.txt"))
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn journal_required_write_verification_includes_the_active_turn() {
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("active-required.txt");
+        let policy =
+            Permissions::for_roots(&[], &[dir.path().to_string_lossy().to_string()]).unwrap();
+        let journal = WriteJournal::new();
+        let start = journal.begin_attributed_turn("active exact repair");
+        let args = serde_json::json!({
+            "path": target,
+            "content": "active postimage"
+        })
+        .to_string();
+        journal
+            .scope_turn(&start.token, async {
+                write_file_run_with_journal(&policy, Some(&journal), &args)
+                    .await
+                    .unwrap();
+            })
+            .await;
+        journal.drain_mutations().await;
+
+        let (verified, observed) = journal
+            .verify_written_path_with_current_content(&target, |content| {
+                content.map(ToOwned::to_owned)
+            })
+            .unwrap()
+            .expect("the active attributed write is immediately verifiable");
+        assert!(verified.net_content_changed);
+        assert!(verified.current_matches_latest_write);
+        assert_eq!(observed.as_deref(), Some(b"active postimage".as_slice()));
+        assert_eq!(journal.undo_depth(), 0, "the turn is not finalized yet");
+
+        journal.finish_attributed_turn(&start.token).unwrap();
+        assert_eq!(journal.undo_depth(), 1);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn required_write_evidence_never_follows_a_raced_final_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let authorized = dir.path().join("authorized.txt");
+        let outside = dir.path().join("outside.txt");
+        std::fs::write(&outside, "private outside bytes").unwrap();
+        symlink(&outside, &authorized).unwrap();
+
+        let error = read_verified_write_target(&authorized, 1024).unwrap_err();
+        assert!(error.to_string().contains("authorized write target"));
     }
 
     #[tokio::test]

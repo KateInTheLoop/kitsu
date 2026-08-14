@@ -10,7 +10,8 @@ use std::sync::{Arc, Mutex};
 
 use futures::stream;
 use kitsu_providers::{
-    ChatDelta, ChatRequest, ChatStream, FinishReason, Provider, ProviderError, ToolCall,
+    ChatDelta, ChatRequest, ChatStream, FinishReason, JsonSchemaFormat, Provider, ProviderError,
+    ToolCall,
 };
 use kitsu_tools::{HandlerFn, Registry, ToolError};
 
@@ -39,6 +40,8 @@ struct MockProvider {
     seen_tools: Arc<Mutex<Vec<Option<Vec<kitsu_providers::ToolDescriptor>>>>>,
     /// Records the `max_tokens` field of every request.
     seen_max_tokens: Arc<Mutex<Vec<Option<u32>>>>,
+    /// Records provider-native structured-output constraints.
+    seen_response_formats: Arc<Mutex<Vec<Option<JsonSchemaFormat>>>>,
 }
 
 impl MockProvider {
@@ -49,6 +52,7 @@ impl MockProvider {
             seen_messages: Arc::new(Mutex::new(Vec::new())),
             seen_tools: Arc::new(Mutex::new(Vec::new())),
             seen_max_tokens: Arc::new(Mutex::new(Vec::new())),
+            seen_response_formats: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -70,6 +74,10 @@ impl Provider for MockProvider {
             .push(req.messages.clone());
         self.seen_tools.lock().unwrap().push(req.tools.clone());
         self.seen_max_tokens.lock().unwrap().push(req.max_tokens);
+        self.seen_response_formats
+            .lock()
+            .unwrap()
+            .push(req.response_format.clone());
 
         let script = self
             .scripts
@@ -231,10 +239,14 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         max_context_bytes: 128 * 1024,
         context_window: None,
         offload_dir: None,
+        artifact_policy: crate::orchestrator::ArtifactStoragePolicy::Automatic,
         stream: false,
         temperature: None,
         reasoning_effort: None,
         max_tokens: None,
+        response_format: None,
+        defer_response_format_until_final: false,
+        structured_finalization_gate: None,
         compaction: crate::orchestrator::CompactionMode::Trim,
         quiet: false,
         event_log: None,
@@ -304,6 +316,525 @@ async fn test_loop_single_round_no_tools() {
         provider.call_count(),
         1,
         "no-tools path should make exactly one call"
+    );
+}
+
+#[tokio::test]
+async fn test_loop_forwards_and_discloses_structured_output_constraint() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text(r#"{"answer":"42"}"#.to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let tools = Registry::new();
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    let log = AgentEventLog::default();
+    let mut config = cfg(1);
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: schema.clone(),
+        strict: true,
+    });
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let output = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect("structured turn should complete");
+    assert_eq!(output, r#"{"answer":"42"}"#);
+    assert_eq!(
+        provider.seen_response_formats.lock().unwrap().as_slice(),
+        &[Some(JsonSchemaFormat {
+            name: "kitsu_output".to_string(),
+            schema,
+            strict: true,
+        })]
+    );
+    assert!(log.take().iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ProviderRequest {
+            structured_output: true,
+            tools_offered: 0,
+            ..
+        }
+    )));
+}
+
+#[tokio::test]
+async fn structured_output_can_be_reserved_for_a_tool_free_finalization_round() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("write_result", "write_1", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("provisional action-phase answer".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text(r#"{"answer":"verified"}"#.to_string()),
+            ChatDelta::Usage(kitsu_providers::Usage {
+                prompt_tokens: 100,
+                completion_tokens: 5,
+                total_tokens: 105,
+            }),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "write_result".to_string(),
+            description: "write the required result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"changed":true}"#),
+    );
+    let schema = serde_json::json!({
+        "type": "object",
+        "properties": {"answer": {"type": "string"}},
+        "required": ["answer"],
+        "additionalProperties": false
+    });
+    let response_format = JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema,
+        strict: true,
+    };
+    let log = AgentEventLog::default();
+    let mut config = cfg(4);
+    config.response_format = Some(response_format.clone());
+    config.defer_response_format_until_final = true;
+    config.stream = true;
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let mut messages = initial_messages();
+    let mut state = AgentSessionState::default();
+    let output = run_agent_turn_with_state(&provider, &tools, &mut messages, &config, &mut state)
+        .await
+        .expect("two-phase structured turn should complete");
+
+    assert_eq!(output, r#"{"answer":"verified"}"#);
+    assert_eq!(
+        provider.seen_response_formats.lock().unwrap().as_slice(),
+        &[None, None, Some(response_format)]
+    );
+    let seen_tools = provider.seen_tools.lock().unwrap();
+    assert!(seen_tools[0].is_some());
+    assert!(seen_tools[1].is_some());
+    assert!(seen_tools[2].is_none());
+    let third_messages = &provider.seen_messages.lock().unwrap()[2];
+    assert!(third_messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::User
+            && message.content.contains("tool-action phase is complete")
+    }));
+    assert!(third_messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::Assistant
+            && message.content == "provisional action-phase answer"
+    }));
+
+    let events = log.take();
+    let requests = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::ProviderRequest {
+                tools_offered,
+                structured_output,
+                ..
+            } => Some((*tools_offered, *structured_output)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests, vec![(1, false), (1, false), (0, true)]);
+    let streamed = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::AssistantDelta { text, .. } => Some(text.as_str()),
+            _ => None,
+        })
+        .collect::<String>();
+    assert_eq!(
+        streamed, output,
+        "the provisional action answer stays hidden"
+    );
+    assert!(messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.call_id == "write_1")
+    }));
+    assert!(messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::Tool
+            && message.tool_call_id.as_deref() == Some("write_1")
+    }));
+    assert!(messages.iter().all(|message| {
+        message.content != "provisional action-phase answer"
+            && !message.content.contains("tool-action phase is complete")
+    }));
+    assert_eq!(
+        messages.last().map(|message| message.content.as_str()),
+        Some(r#"{"answer":"verified"}"#)
+    );
+    assert!(
+        !state.meter.anchored(&messages),
+        "removing request-local handoff messages must invalidate the final request anchor"
+    );
+}
+
+#[tokio::test]
+async fn exact_output_gate_keeps_tools_available_for_one_bounded_repair() {
+    use crate::orchestrator::{
+        AgentEventLog, AgentRuntimeEvent, StructuredFinalizationGate, StructuredFinalizationRepair,
+        StructuredFinalizationRepairTarget,
+    };
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("write_result", "write_wrong", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("provisional before repair".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::ToolCall(tc("write_result", "write_corrected", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("provisional after repair".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text(r#"{"answer":"verified"}"#.to_string()),
+            ChatDelta::Usage(kitsu_providers::Usage {
+                prompt_tokens: 120,
+                completion_tokens: 5,
+                total_tokens: 125,
+            }),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "write_result".to_string(),
+            description: "write the required result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"changed":true}"#),
+    );
+    let response_format = JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: serde_json::json!({"type": "object"}),
+        strict: true,
+    };
+    let evaluations = Arc::new(AtomicUsize::new(0));
+    let gate_evaluations = evaluations.clone();
+    let repair_instruction = "repair the exact bytes before finalizing".to_string();
+    let gate_instruction = repair_instruction.clone();
+    let target = StructuredFinalizationRepairTarget {
+        path: "/work/result.json".to_string(),
+        expected_sha256: "a".repeat(64),
+        actual_sha256: "b".repeat(64),
+    };
+    let gate_target = target.clone();
+    let log = AgentEventLog::default();
+    let mut config = cfg(5);
+    config.response_format = Some(response_format.clone());
+    config.defer_response_format_until_final = true;
+    config.structured_finalization_gate = Some(StructuredFinalizationGate::new(move || {
+        (gate_evaluations.fetch_add(1, Ordering::SeqCst) == 0).then(|| {
+            StructuredFinalizationRepair {
+                cause: "required_write_sha256_mismatch".to_string(),
+                instruction: gate_instruction.clone(),
+                targets: vec![gate_target.clone()],
+            }
+        })
+    }));
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let mut messages = initial_messages();
+    let mut state = AgentSessionState::default();
+    let output = run_agent_turn_with_state(&provider, &tools, &mut messages, &config, &mut state)
+        .await
+        .expect("the repaired turn should reach its reserved finalizer");
+
+    assert_eq!(output, r#"{"answer":"verified"}"#);
+    assert_eq!(
+        evaluations.load(Ordering::SeqCst),
+        1,
+        "the remaining round is reserved without re-evaluating the repair gate"
+    );
+    assert_eq!(
+        provider.seen_response_formats.lock().unwrap().as_slice(),
+        &[None, None, None, None, Some(response_format)]
+    );
+    assert_eq!(
+        provider
+            .seen_tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>(),
+        vec![true, true, true, true, false]
+    );
+    let seen_messages = provider.seen_messages.lock().unwrap();
+    assert!(seen_messages[2]
+        .iter()
+        .any(|message| message.role == kitsu_providers::Role::User
+            && message.content == repair_instruction));
+    assert!(seen_messages[2]
+        .iter()
+        .all(|message| message.content != "provisional before repair"));
+    assert!(seen_messages[4]
+        .iter()
+        .any(|message| message.content == "provisional after repair"));
+    assert!(seen_messages[4]
+        .iter()
+        .any(|message| message.content.contains("tool-action phase is complete")));
+    drop(seen_messages);
+
+    let events = log.take();
+    assert!(events.iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::StructuredFinalizationDeferred {
+            round: 2,
+            repair_round: 3,
+            finalization_round_reserved: true,
+            cause,
+            targets,
+            repair_instruction_disclosed: true,
+            write_authority_granted: false,
+        } if cause == "required_write_sha256_mismatch" && targets == &vec![target.clone()]
+    )));
+    assert!(messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::Assistant
+            && message
+                .tool_calls
+                .iter()
+                .any(|call| call.call_id == "write_corrected")
+    }));
+    assert!(messages.iter().all(|message| {
+        message.content != repair_instruction
+            && message.content != "provisional before repair"
+            && message.content != "provisional after repair"
+            && !message.content.contains("tool-action phase is complete")
+    }));
+    assert_eq!(
+        messages.last().map(|message| message.content.as_str()),
+        Some(r#"{"answer":"verified"}"#)
+    );
+    assert!(
+        !state.meter.anchored(&messages),
+        "request-local repair and finalization scaffolding invalidate usage anchors"
+    );
+}
+
+#[tokio::test]
+async fn exact_output_gate_does_not_consume_the_only_reserved_finalizer_round() {
+    use crate::orchestrator::{
+        AgentEventLog, AgentRuntimeEvent, StructuredFinalizationGate, StructuredFinalizationRepair,
+    };
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("write_result", "write_wrong", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("provisional mismatch".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::Text(r#"{"answer":"final"}"#.to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "write_result".to_string(),
+            description: "write the required result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"changed":true}"#),
+    );
+    let gate_calls = Arc::new(AtomicUsize::new(0));
+    let observed_gate_calls = gate_calls.clone();
+    let log = AgentEventLog::default();
+    let mut config = cfg(3);
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: serde_json::json!({"type": "object"}),
+        strict: true,
+    });
+    config.defer_response_format_until_final = true;
+    config.structured_finalization_gate = Some(StructuredFinalizationGate::new(move || {
+        observed_gate_calls.fetch_add(1, Ordering::SeqCst);
+        Some(StructuredFinalizationRepair {
+            cause: "required_write_sha256_mismatch".to_string(),
+            instruction: "repair".to_string(),
+            targets: Vec::new(),
+        })
+    }));
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let output = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect("the finalizer remains available for terminal postcondition handling");
+
+    assert_eq!(output, r#"{"answer":"final"}"#);
+    assert_eq!(gate_calls.load(Ordering::SeqCst), 0);
+    assert_eq!(
+        provider
+            .seen_tools
+            .lock()
+            .unwrap()
+            .iter()
+            .map(Option::is_some)
+            .collect::<Vec<_>>(),
+        vec![true, true, false]
+    );
+    assert!(!log.take().iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::StructuredFinalizationDeferred { .. }
+    )));
+}
+
+#[tokio::test]
+async fn deferred_structured_output_refuses_an_impossible_single_round_budget() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("must not be requested".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut config = cfg(1);
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: serde_json::json!({"type": "object"}),
+        strict: true,
+    });
+    config.defer_response_format_until_final = true;
+
+    let error = run_agent_turn(
+        &provider,
+        &Registry::new(),
+        &mut initial_messages(),
+        &config,
+    )
+    .await
+    .expect_err("one round cannot contain action and structured finalization");
+
+    assert!(error.to_string().contains("at least two rounds"));
+    assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test]
+async fn deferred_structured_finalization_never_executes_an_unoffered_tool_call() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Text("ready to finalize".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+        vec![
+            ChatDelta::ToolCall(tc("write_result", "forbidden_final_call", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let handler_runs = ran.clone();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "write_result".to_string(),
+            description: "write a result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let handler_runs = handler_runs.clone();
+            Box::pin(async move {
+                handler_runs.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>(r#"{"changed":true}"#.to_string())
+            })
+        }),
+    );
+    let mut config = cfg(3);
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: serde_json::json!({"type": "object"}),
+        strict: true,
+    });
+    config.defer_response_format_until_final = true;
+
+    let error = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect_err("an unoffered finalization tool call must fail closed");
+
+    assert!(matches!(
+        error,
+        crate::orchestrator::AgentError::ToolCallDuringToolFreeFinalization
+    ));
+    assert_eq!(ran.load(Ordering::SeqCst), 0);
+    assert!(provider.seen_tools.lock().unwrap()[1].is_none());
+}
+
+#[tokio::test]
+async fn deferred_finalization_remeasures_the_changed_response_schema() {
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("ready to finalize".to_string()),
+        ChatDelta::Usage(kitsu_providers::Usage {
+            prompt_tokens: 10,
+            completion_tokens: 2,
+            total_tokens: 12,
+        }),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "write_result".to_string(),
+            description: "write a result".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler(r#"{"changed":true}"#),
+    );
+    let mut config = cfg(3);
+    config.context_window = Some(3_000);
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        schema: serde_json::json!({
+            "type": "object",
+            "description": "x".repeat(12_000)
+        }),
+        strict: true,
+    });
+    config.defer_response_format_until_final = true;
+
+    let error = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect_err("the changed final schema must be remeasured before provider contact");
+
+    assert!(matches!(
+        error,
+        crate::orchestrator::AgentError::ContextOverflow { .. }
+    ));
+    assert_eq!(
+        provider.call_count(),
+        1,
+        "the oversized final schema must be blocked before a second provider request"
     );
 }
 
@@ -1707,6 +2238,100 @@ async fn enforce_budget_cascade_drops_turns_when_elision_insufficient() {
 // --- tool-result offload (Stage 2, Tier 0) ----------------------------------
 
 #[test]
+fn artifact_free_inline_bound_is_utf8_safe_and_byte_exact() {
+    use crate::orchestrator::bound_inline_output;
+
+    let original = format!("HEAD{}TAIL", "🦀".repeat(3_000));
+    let bounded = bound_inline_output(original.clone());
+
+    assert!(bounded.truncated);
+    assert!(bounded.content.len() <= 8 * 1024);
+    assert_eq!(bounded.original_bytes, original.len() as u64);
+    assert_eq!(
+        bounded.original_bytes,
+        bounded.retained_bytes.saturating_add(bounded.omitted_bytes)
+    );
+    assert!(bounded.retained_bytes <= 8 * 1024);
+    assert!(bounded.content.starts_with("HEAD"));
+    assert!(bounded.content.ends_with("TAIL"));
+    assert!(bounded
+        .content
+        .contains("bytes omitted by artifact-free policy"));
+    assert!(bounded
+        .content
+        .contains(&format!("original {} bytes", original.len())));
+}
+
+#[tokio::test]
+async fn artifact_free_large_tool_result_is_bounded_before_next_request() {
+    use crate::orchestrator::{
+        AgentEventLog, AgentRuntimeEvent, ArtifactStoragePolicy, ToolArtifactStatus,
+    };
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("read", "large-result", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let result = format!(
+        "HEAD{}CENTER_SENTINEL{}TAIL",
+        "a".repeat(5_000),
+        "b".repeat(5_000)
+    );
+    let original_bytes = result.len() as u64;
+    let mut tools = Registry::new();
+    tools.register(
+        "read",
+        Box::new(move |_args: String| {
+            let result = result.clone();
+            Box::pin(async move { Ok::<String, ToolError>(result) })
+        }),
+    );
+    let log = AgentEventLog::default();
+    let mut config = cfg(2);
+    config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
+    config.event_log = Some(log.clone());
+    config.quiet = true;
+
+    let answer = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .unwrap();
+    assert_eq!(answer, "done");
+
+    let requests = provider.seen_messages.lock().unwrap();
+    let tool_result = requests[1]
+        .iter()
+        .find(|message| message.role == kitsu_providers::Role::Tool)
+        .expect("second request includes the tool result");
+    assert!(tool_result.content.starts_with("HEAD"));
+    assert!(tool_result.content.ends_with("TAIL"));
+    assert!(tool_result
+        .content
+        .contains("bytes omitted by artifact-free policy"));
+    assert!(!tool_result.content.contains("CENTER_SENTINEL"));
+    drop(requests);
+
+    assert!(log.take().iter().any(|event| matches!(
+        event,
+        AgentRuntimeEvent::ToolFinished {
+            call_id,
+            output_bytes,
+            output_retained_bytes,
+            output_truncated: true,
+            artifact_status: ToolArtifactStatus::SuppressedByPolicy,
+            ..
+        } if call_id == "large-result"
+            && *output_bytes == original_bytes
+            && *output_retained_bytes <= 8 * 1024
+    )));
+}
+
+#[test]
 fn maybe_offload_writes_large_result_and_returns_pointer() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
@@ -2450,6 +3075,46 @@ async fn protected_byte_overflow_also_fails_before_provider_when_window_unknown(
         }
     ));
     assert_eq!(provider.call_count(), 0);
+}
+
+#[tokio::test]
+async fn structured_output_schema_is_budgeted_before_provider_contact() {
+    use crate::orchestrator::{AgentError, ContextUnit};
+    use kitsu_providers::ChatMessage;
+
+    let provider = MockProvider::new(vec![vec![ChatDelta::Done(FinishReason::Stop)]]);
+    let tools = Registry::new();
+    let mut config = cfg(1);
+    config.context_window = None;
+    config.max_context_bytes = 128;
+    config.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        strict: true,
+        schema: serde_json::json!({
+            "type": "object",
+            "description": "s".repeat(1_000),
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+    });
+    let mut messages = vec![ChatMessage::user("small prompt")];
+
+    let error = run_agent_turn(&provider, &tools, &mut messages, &config)
+        .await
+        .unwrap_err();
+    assert!(matches!(
+        error,
+        AgentError::ContextOverflow {
+            unit: ContextUnit::Bytes,
+            ..
+        }
+    ));
+    assert_eq!(
+        provider.call_count(),
+        0,
+        "the response schema must fit before any request is sent"
+    );
 }
 
 #[tokio::test]

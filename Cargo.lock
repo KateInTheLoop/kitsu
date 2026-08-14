@@ -817,6 +817,7 @@ dependencies = [
  "kitsu-tools",
  "libc",
  "predicates",
+ "regex",
  "rustyline",
  "serde",
  "serde_json",
@@ -826,7 +827,9 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "unicode-width",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -860,6 +863,7 @@ dependencies = [
  "tokio-stream",
  "tracing",
  "wiremock",
+ "zeroize",
 ]
 
 [[package]]
@@ -879,6 +883,7 @@ dependencies = [
  "chrono",
  "kitsu-providers",
  "libc",
+ "regex",
  "serde",
  "serde_json",
  "tempfile",

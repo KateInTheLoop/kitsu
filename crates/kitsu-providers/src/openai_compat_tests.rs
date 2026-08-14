@@ -19,7 +19,7 @@ use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::{ProviderError, ProviderResponsePart};
 use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use crate::telemetry::{ProviderAttemptCategory, ProviderAttemptOutcome, ProviderTelemetrySink};
-use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason};
+use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat};
 use crate::Provider;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -78,6 +78,7 @@ fn simple_request() -> ChatRequest {
         temperature: Some(0.2),
         reasoning_effort: None,
         max_tokens: None,
+        response_format: None,
     }
 }
 
@@ -189,6 +190,59 @@ async fn test_gateway_chat_stream_ok() {
         finish,
         Some(FinishReason::Stop),
         "final delta should be Done(Stop)"
+    );
+}
+
+#[tokio::test]
+async fn test_gateway_forwards_strict_json_schema_response_format() {
+    let server = MockServer::start().await;
+    let captured: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed = Arc::clone(&captured);
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            *observed.lock().unwrap() = serde_json::from_slice(&request.body).ok();
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_two_text_deltas())
+        })
+        .mount(&server)
+        .await;
+
+    let mut request = simple_request();
+    request.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        strict: true,
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    });
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let stream = provider
+        .chat_stream(request)
+        .await
+        .expect("structured request should reach the provider");
+    let _ = collect_stream(stream).await;
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("request JSON should be captured");
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"],
+        "kitsu_output"
+    );
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["properties"]["answer"]["type"],
+        "string"
     );
 }
 

@@ -612,6 +612,13 @@ impl Permissions {
         self.max_bytes
     }
 
+    /// Maximum exact file size accepted by model write tools. Host-side
+    /// postconditions use the same bound when fingerprinting declared output
+    /// targets, so verification cannot read more than the model could write.
+    pub fn max_write_bytes(&self) -> usize {
+        self.max_write_bytes
+    }
+
     /// Current fallback policy for paths not already covered by a session root.
     pub fn mode(&self) -> Mode {
         self.mode
@@ -1213,6 +1220,27 @@ impl Permissions {
             }
         }
         self.ensure_opened_read_allowed(&apparent, &canonical, &metadata, false)
+    }
+
+    /// Validate a descriptor opened by a read tool while walking an already
+    /// authorized directory capability. `apparent` and `canonical` are the
+    /// stable namespace paths beneath that pinned root. This preserves the
+    /// same private-path, hard-link identity, and internal-artifact rules as an
+    /// exact [`ReadAuthorization`] without re-resolving a pathname that may
+    /// have been renamed after the root descriptor was acquired.
+    pub(crate) fn validate_opened_model_read(
+        &self,
+        apparent: &Path,
+        canonical: &Path,
+        file: &std::fs::File,
+    ) -> Result<(), ToolError> {
+        let metadata = file.metadata().map_err(|error| {
+            ToolError::PolicyDenied(format!(
+                "cannot inspect opened read target '{}': {error}",
+                canonical.display()
+            ))
+        })?;
+        self.ensure_opened_read_allowed(apparent, canonical, &metadata, true)
     }
 
     /// Snapshot one host-selected directory for implicit prompt inputs without

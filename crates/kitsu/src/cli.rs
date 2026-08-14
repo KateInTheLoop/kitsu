@@ -1,5 +1,5 @@
-//! CLI surface (clap derive). MVP: global `--gateway`, `--model`, `--config`,
-//! and the `ask` subcommand (docs/architecture.md §6).
+//! CLI surface (clap derive). Bare `kitsu` opens chat; global gateway/model
+//! selectors and `-p` cover the common launch paths without a subcommand.
 
 use clap::{Parser, Subcommand};
 
@@ -21,16 +21,42 @@ pub const LONG_VERSION: &str = concat!(
     version,
     long_version = LONG_VERSION,
     about = "kitsu — multi-gateway model CLI",
-    after_help = "GET STARTED:\n  kitsu init\n  kitsu --config ./kitsu.toml doctor\n  kitsu --config ./kitsu.toml chat\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu sessions --help   Provider-free session management\n  kitsu artifacts --help  Host-only command-artifact storage\n\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
+    after_help = "GET STARTED:\n  kitsu                              Open interactive chat\n  kitsu -p 'Explain this project'    Run one prompt and exit\n  kitsu init                         Create a starter config\n  kitsu doctor                       Check configuration\n\nDISCOVER:\n  kitsu chat --help       Chat, permissions, and continuity\n  kitsu review --help     Verified one-shot code review\n  kitsu models --help     Model discovery\n  kitsu auth --help       Managed credential login/status/logout\n  kitsu sessions --help   Provider-free session management\n  kitsu artifacts --help  Host-only command-artifact storage\n\nSelection precedence: --gateway/--model, then $KITSU_GATEWAY/$KITSU_MODEL, then config defaults.\nConfiguration lookup: --config, then $KITSU_CONFIG, then ~/.kitsu/config.toml"
 )]
 pub struct Cli {
-    /// Gateway profile to use (from [gateways.<name>] in the config).
-    #[arg(long, global = true)]
+    /// Gateway profile to use (from [gateways.<name>] in the config). Overrides
+    /// KITSU_GATEWAY, which overrides default_gateway.
+    #[arg(long, global = true, env = "KITSU_GATEWAY", hide_env_values = true)]
     pub gateway: Option<String>,
 
-    /// Override the model id (takes precedence over the gateway's default).
-    #[arg(long, global = true)]
+    /// Override the model id. Precedence: --model, KITSU_MODEL, then the
+    /// selected gateway's configured model; interactive /model wins afterward.
+    #[arg(long, global = true, env = "KITSU_MODEL", hide_env_values = true)]
     pub model: Option<String>,
+
+    /// Run one prompt non-interactively and exit (shorthand for `kitsu ask
+    /// <PROMPT>`). This top-level mode does not combine with a subcommand.
+    #[arg(short = 'p', long = "prompt", global = true, value_name = "PROMPT")]
+    pub print_prompt: Option<String>,
+
+    /// Atomically write the last fully committed assistant message to this
+    /// host-owned file. Supported by non-interactive ask, review, piped chat,
+    /// and scripted chat; normal stdout or JSONL output is unchanged.
+    #[arg(
+        short = 'o',
+        long = "output-last-message",
+        global = true,
+        value_name = "PATH"
+    )]
+    pub output_last_message: Option<std::path::PathBuf>,
+
+    /// Constrain and locally validate each non-interactive final assistant
+    /// message with this bounded JSON Schema. The root must be a strict object
+    /// schema supported by the configured OpenAI-compatible gateway. When
+    /// paired with a chat required-write contract, tool rounds are
+    /// unconstrained and one tool-free schema finalization round is reserved.
+    #[arg(long = "output-schema", global = true, value_name = "PATH")]
+    pub output_schema: Option<std::path::PathBuf>,
 
     /// Path to the config file. Falls back to $KITSU_CONFIG, then
     /// ~/.kitsu/config.toml.
@@ -47,10 +73,16 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub jsonl: bool,
 
-    /// Use stable ASCII terminal markers and disable color/animation. The
-    /// KITSU_PLAIN and NO_COLOR environment variables remain supported.
+    /// Use stable ASCII terminal markers, disable color/animation, and select
+    /// literal line-oriented input. KITSU_PLAIN remains supported. NO_COLOR
+    /// selects the same rendering without changing the input editor.
     #[arg(long, global = true)]
     pub plain: bool,
+
+    /// Use escape-free, literal line-oriented input and plain rendering for
+    /// assistive technology. KITSU_SCREEN_READER remains supported.
+    #[arg(long, global = true)]
+    pub screen_reader: bool,
 
     /// Keep styled output but replace animated waiting indicators with a
     /// visible static status. KITSU_REDUCED_MOTION remains supported.
@@ -85,10 +117,10 @@ pub struct Cli {
     pub max_rounds: u32,
 
     /// Total inference deadline in seconds, including retries, retry backoff,
-    /// and response-body streaming. A heavy tool-aware round on a slower model
-    /// (local Ollama/vLLM in particular) routinely exceeds even this default
-    /// and fails the turn; raise it further (e.g. 300) for tool-heavy review
-    /// work.
+    /// response-body streaming, and every provider/tool round in one scripted
+    /// turn. A heavy tool-aware turn on a slower model (local Ollama/vLLM in
+    /// particular) routinely exceeds even this default and fails; raise it
+    /// further (e.g. 300) for tool-heavy review work.
     #[arg(
         long,
         global = true,
@@ -163,11 +195,20 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub no_workspace_evidence: bool,
 
+    /// Disable Kitsu-created automatic command-output and oversized tool-result
+    /// artifacts for this run. Commands keep bounded previews and oversized
+    /// generic results become explicitly lossy head/tail previews. Existing
+    /// artifacts are untouched; sessions, credentials, -o, schemas, required
+    /// writes, and other explicit destinations keep their normal behavior.
+    #[arg(long, global = true)]
+    pub no_artifacts: bool,
+
     /// Per-turn cap on subagent spawns (`spawn_agent`, `spawn_agents`,
     /// `spawn_agent_bg` combined). Spawns beyond the cap return a tool error
     /// the model sees, stopping agent storms from models that ignore prompt
     /// guidance. Overrides the config key `agent_spawn_cap`. Defaults: 8 in
-    /// interactive chat, 2 in scripted/piped automation. 0 disables spawning.
+    /// interactive chat, 2 in scripted/piped automation. 0 disables spawning
+    /// and unregisters every multi-agent tool, including `agent_result`.
     #[arg(long, global = true, value_name = "N")]
     pub agent_spawn_cap: Option<u32>,
 
@@ -179,7 +220,7 @@ pub struct Cli {
     pub skill: Vec<String>,
 
     #[command(subcommand)]
-    pub command: Command,
+    pub command: Option<Command>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -195,17 +236,35 @@ pub enum Command {
         #[arg(long)]
         json: bool,
     },
-    /// Run read-only configuration, auth, cache, and runtime diagnostics.
+    /// Run offline configuration, auth, cache, and runtime diagnostics.
     Doctor {
         /// Also contact and validate the configured model-catalog endpoint.
         /// This verifies catalog reachability/model presence, not a billable
         /// chat completion; offline checks are the default.
-        #[arg(long)]
+        #[arg(long, conflicts_with = "inference")]
         online: bool,
+
+        /// Send one minimal, tool-free chat completion to verify inference
+        /// access. This is an explicit online, potentially billable probe and
+        /// cannot be combined with the catalog-only --online check.
+        #[arg(long, conflicts_with = "online")]
+        inference: bool,
 
         /// Emit one JSON report instead of human text.
         #[arg(long)]
         json: bool,
+    },
+    /// Manage one config-scoped gateway credential without contacting it.
+    #[command(
+        after_help = "EXAMPLES:\n  kitsu --gateway huggingface auth login\n  printf '%s\\n' \"$HF_TOKEN\" | kitsu --gateway huggingface auth login --token-stdin\n  kitsu --gateway huggingface auth status --json\n  kitsu --gateway huggingface auth logout\n\nOnly bearer-env profiles support managed credentials. A non-empty configured environment variable always takes precedence. Login stores an opaque token locally; use `doctor --inference` for an explicit remote validity check. Secrets are never accepted as command-line values."
+    )]
+    Auth {
+        /// Emit one secret-free JSON result instead of human text.
+        #[arg(long, global = true)]
+        json: bool,
+
+        #[command(subcommand)]
+        command: AuthCommand,
     },
     /// Ask a single question and stream the answer (one user turn).
     Ask {
@@ -282,12 +341,29 @@ pub enum Command {
     },
     /// Interactive chat, scripted multi-turn work, or one piped turn.
     #[command(
-        after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
+        after_help = "CONTINUITY:\n  Interactive chat autosaves by default.\n  kitsu chat --session --script turns.txt     Autosave a new scripted session\n  kitsu chat --resume last --script more.txt  Resume and autosave explicitly\n  echo 'next' | kitsu chat --resume <id>      Resume from piped input\n\nTOOL CONTROL:\n  kitsu chat --no-tools 'Draft a concise summary'\n  --no-tools keeps client-side context and attachments but offers no model tools. Use --allow-path for client-side reads in scripted or piped chat.\n\nFILESYSTEM CAPABILITIES:\n  --allow-path is read-only, --allow-write is write-only, and --allow-read-write is explicit combined authority. --yes suppresses prompts but preserves roots."
     )]
     Chat {
         /// Optional first prompt; queued as the first turn. In non-TTY mode
         /// (piped stdin) this (or stdin) is the single turn.
         prompt: Option<String>,
+
+        /// Offer no tools to the model for this chat. Client-side project
+        /// context, explicit skill preloads, attachments, and session
+        /// continuity remain available.
+        #[arg(
+            long,
+            conflicts_with_all = [
+                "allow_write",
+                "allow_read_write",
+                "enable_commands",
+                "command_roots",
+                "command_runtime_roots",
+                "command_env",
+                "allow_commands"
+            ]
+        )]
+        no_tools: bool,
 
         /// Pre-grant filesystem reads under this path (repeatable). Interactive
         /// chat also offers filesystem tools and asks before any unlisted path;
@@ -305,6 +381,22 @@ pub enum Command {
         /// --allow-write alone remains write-only.
         #[arg(long = "allow-read-write", value_name = "PATH")]
         allow_read_write: Vec<String>,
+
+        /// Fail the automation run unless this file receives a verified model
+        /// filesystem mutation and its final contents differ from launch.
+        /// Repeatable; does not grant write authority, so every path must also
+        /// be covered by --allow-write or --allow-read-write. An existing target
+        /// also needs read authority so the model can replace it safely; use
+        /// --allow-read-write (or combine --allow-path with --allow-write).
+        #[arg(long = "require-write", value_name = "PATH")]
+        require_writes: Vec<String>,
+
+        /// Fail the automation run unless this file receives the verified
+        /// model mutation/net change required by --require-write and its exact
+        /// final raw bytes have this SHA-256. Repeatable; split on the final
+        /// '=' so PATH may contain '='. This grants no authority.
+        #[arg(long = "require-write-sha256", value_name = "PATH=SHA256")]
+        require_write_sha256: Vec<String>,
 
         /// Explicitly enable the guarded developer-command tool. Commands have
         /// an independent approval policy and are never authorized by --yes or
@@ -393,6 +485,21 @@ pub enum Command {
         #[arg(long)]
         allow_turn_errors: bool,
     },
+}
+
+#[derive(Debug, Subcommand)]
+pub enum AuthCommand {
+    /// Read and atomically store a managed bearer credential.
+    Login {
+        /// Read the credential from stdin for secret-manager pipelines. Without
+        /// this flag, login requires a terminal and disables input echo.
+        #[arg(long)]
+        token_stdin: bool,
+    },
+    /// Report the effective local credential source without revealing it.
+    Status,
+    /// Remove only Kitsu's managed credential; environment/config auth remains.
+    Logout,
 }
 
 #[derive(Debug, Subcommand)]

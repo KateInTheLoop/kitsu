@@ -16,6 +16,7 @@ const ST: char = '\u{009c}';
 static ASSISTANT_OUTPUT_WRITTEN: AtomicBool = AtomicBool::new(false);
 static TURN_ASSISTANT_OUTPUT: AtomicBool = AtomicBool::new(false);
 static FORCE_PLAIN: AtomicBool = AtomicBool::new(false);
+static FORCE_SCREEN_READER: AtomicBool = AtomicBool::new(false);
 static FORCE_REDUCED_MOTION: AtomicBool = AtomicBool::new(false);
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -242,17 +243,34 @@ fn stderr_is_tty() -> bool {
 /// Whether terminal decoration should be replaced with stable ASCII output.
 pub fn plain_mode() -> bool {
     FORCE_PLAIN.load(Ordering::Relaxed)
+        || FORCE_SCREEN_READER.load(Ordering::Relaxed)
         || std::env::var_os("KITSU_PLAIN").is_some()
+        || std::env::var_os("KITSU_SCREEN_READER").is_some()
         || std::env::var_os("NO_COLOR").is_some()
+        || std::env::var("TERM").is_ok_and(|term| term == "dumb")
+}
+
+/// Whether interactive input should use Kitsu's literal, line-oriented reader.
+///
+/// This is deliberately narrower than [`plain_mode`]: `NO_COLOR` controls
+/// rendering only and must not silently remove Rustyline history, completion,
+/// or bracketed multi-line paste. Explicit plain/screen-reader modes and a
+/// `dumb` terminal retain the escape-free canonical input contract.
+pub fn assistive_input_mode() -> bool {
+    FORCE_PLAIN.load(Ordering::Relaxed)
+        || FORCE_SCREEN_READER.load(Ordering::Relaxed)
+        || std::env::var_os("KITSU_PLAIN").is_some()
+        || std::env::var_os("KITSU_SCREEN_READER").is_some()
         || std::env::var("TERM").is_ok_and(|term| term == "dumb")
 }
 
 /// Configure process-wide terminal accessibility overrides before worker
 /// threads or renderers are started. Environment variables remain supported;
 /// these flags make the same behavior discoverable from the CLI.
-pub fn configure_terminal_modes(plain: bool, reduced_motion: bool) {
+pub fn configure_terminal_modes(plain: bool, reduced_motion: bool, screen_reader: bool) {
     FORCE_PLAIN.store(plain, Ordering::Relaxed);
     FORCE_REDUCED_MOTION.store(reduced_motion, Ordering::Relaxed);
+    FORCE_SCREEN_READER.store(screen_reader, Ordering::Relaxed);
 }
 
 fn reduced_motion_mode() -> bool {
@@ -1162,6 +1180,85 @@ fn grouped_count(value: u64) -> String {
     out
 }
 
+/// Terminal state attached to the model-command timing receipt. Keeping this
+/// closed prevents an arbitrary status string from entering the stable
+/// redirected record or a terminal line.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum RunTimingStatus {
+    Ok,
+    Error,
+    Cancelled,
+}
+
+impl RunTimingStatus {
+    fn record_label(self) -> &'static str {
+        match self {
+            Self::Ok => "ok",
+            Self::Error => "error",
+            Self::Cancelled => "cancelled",
+        }
+    }
+
+    fn human_phrase(self) -> &'static str {
+        match self {
+            Self::Ok => "completed in",
+            Self::Error => "failed after",
+            Self::Cancelled => "cancelled after",
+        }
+    }
+}
+
+fn format_run_elapsed(elapsed: std::time::Duration) -> String {
+    let millis = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+    if millis < 1_000 {
+        format!("{millis} ms")
+    } else if millis < 60_000 {
+        format!("{}.{:01} s", millis / 1_000, (millis % 1_000) / 100)
+    } else {
+        format_wait_elapsed(elapsed)
+    }
+}
+
+/// Emit one end-of-run timing receipt for model commands. A person at a
+/// terminal gets the same compact secondary-row language as turn statistics;
+/// redirected stderr gets a stable, greppable JSON record. Management-only
+/// commands do not call this function.
+pub fn emit_run_timing(elapsed: std::time::Duration, status: RunTimingStatus) {
+    let mut err = io::stderr();
+    let destination_is_tty = err.is_terminal();
+    let _ = write_run_timing_with_mode(&mut err, destination_is_tty, plain_mode(), elapsed, status);
+}
+
+fn write_run_timing_with_mode<W: Write>(
+    destination: &mut W,
+    destination_is_tty: bool,
+    plain: bool,
+    elapsed: std::time::Duration,
+    status: RunTimingStatus,
+) -> io::Result<()> {
+    if destination_is_tty {
+        let marker = if plain { "->" } else { "↳" };
+        let line = format!(
+            "  {marker} {} {}",
+            status.human_phrase(),
+            format_run_elapsed(elapsed)
+        );
+        if plain {
+            writeln!(destination, "{line}")?;
+        } else {
+            writeln!(destination, "{}", line.dimmed())?;
+        }
+    } else {
+        let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
+        writeln!(
+            destination,
+            "kitsu-timing: {{\"duration_ms\":{duration_ms},\"status\":\"{}\"}}",
+            status.record_label()
+        )?;
+    }
+    destination.flush()
+}
+
 fn human_turn_stats(
     usage: Option<(u64, u64, u64)>,
     context: Option<(u64, u64, u64)>,
@@ -1442,9 +1539,10 @@ mod tests {
         deck_header_with_mode, deck_marker_with_mode, display_width, error_display_lines,
         format_message, grouped_count, human_turn_stats, milestone_line_with_mode,
         sanitize_plain_inline, sanitize_terminal_inline, sanitize_terminal_text, section_heading,
-        spinner_mode, static_spinner_line, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, PromptSafeAsyncNotice, RenderMode,
-        SpinnerMode, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
+        spinner_mode, static_spinner_line, write_run_timing_with_mode, write_static_spinner,
+        write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel, DeckState,
+        PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, TerminalTextSanitizer,
+        AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -1602,6 +1700,48 @@ mod tests {
     #[test]
     fn omits_status_line_without_stats() {
         assert_eq!(human_turn_stats(None, None, false), None);
+    }
+
+    #[test]
+    fn run_timing_is_compact_for_people_and_stable_when_redirected() {
+        let elapsed = std::time::Duration::from_millis(1_250);
+        let mut terminal = Vec::new();
+        write_run_timing_with_mode(&mut terminal, true, true, elapsed, RunTimingStatus::Ok)
+            .unwrap();
+        assert_eq!(
+            String::from_utf8(terminal).unwrap(),
+            "  -> completed in 1.2 s\n"
+        );
+
+        let mut styled = Vec::new();
+        write_run_timing_with_mode(
+            &mut styled,
+            true,
+            false,
+            elapsed,
+            RunTimingStatus::Cancelled,
+        )
+        .unwrap();
+        let styled = String::from_utf8(styled).unwrap();
+        assert!(styled.contains('\x1b'));
+        assert_eq!(
+            sanitize_terminal_text(&styled),
+            "  ↳ cancelled after 1.2 s\n"
+        );
+
+        let mut redirected = Vec::new();
+        write_run_timing_with_mode(
+            &mut redirected,
+            false,
+            false,
+            elapsed,
+            RunTimingStatus::Error,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(redirected).unwrap(),
+            "kitsu-timing: {\"duration_ms\":1250,\"status\":\"error\"}\n"
+        );
     }
 
     #[test]

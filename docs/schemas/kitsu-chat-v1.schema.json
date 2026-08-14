@@ -8,6 +8,7 @@
     { "$ref": "#/$defs/model_catalog" },
     { "$ref": "#/$defs/turn_started" },
     { "$ref": "#/$defs/provider_request" },
+    { "$ref": "#/$defs/structured_finalization_deferred" },
     { "$ref": "#/$defs/provider_attempt" },
     { "$ref": "#/$defs/assistant_delta" },
     { "$ref": "#/$defs/usage" },
@@ -17,10 +18,14 @@
     { "$ref": "#/$defs/assistant" },
     { "$ref": "#/$defs/assistant_disposition" },
     { "$ref": "#/$defs/turn_finished" },
+    { "$ref": "#/$defs/output_schema" },
+    { "$ref": "#/$defs/completion_postcondition" },
+    { "$ref": "#/$defs/output_last_message" },
     { "$ref": "#/$defs/command_started" },
     { "$ref": "#/$defs/command_result" },
     { "$ref": "#/$defs/command_finished" },
     { "$ref": "#/$defs/context_window_mismatch" },
+    { "$ref": "#/$defs/review_disclosure" },
     { "$ref": "#/$defs/workspace_evidence_disclosure" },
     { "$ref": "#/$defs/rollback_retained_changes" },
     { "$ref": "#/$defs/error" },
@@ -96,6 +101,27 @@
         "executable_identity_pinned": { "type": "boolean" }
       }
     },
+    "artifact_policy": {
+      "type": "object",
+      "required": [
+        "mode",
+        "source",
+        "new_automatic_artifact_writes",
+        "command_output_persistence",
+        "tool_result_offload",
+        "existing_artifacts_unchanged",
+        "model_artifact_read_root_granted"
+      ],
+      "properties": {
+        "mode": { "enum": ["automatic", "disabled"] },
+        "source": { "enum": ["default", "config", "cli"] },
+        "new_automatic_artifact_writes": { "type": "boolean" },
+        "command_output_persistence": { "type": "boolean" },
+        "tool_result_offload": { "type": "boolean" },
+        "existing_artifacts_unchanged": { "type": "boolean" },
+        "model_artifact_read_root_granted": { "type": "boolean" }
+      }
+    },
     "command_execution_result": {
       "type": "object",
       "required": [
@@ -135,6 +161,9 @@
         "stderr_tail": { "type": "string" },
         "executable": { "$ref": "#/$defs/command_executable" },
         "ambient_authority": { "$ref": "#/$defs/command_ambient_authority" },
+        "artifact_status": {
+          "enum": ["not_needed", "retained", "suppressed_by_policy", "unavailable", "failed"]
+        },
         "artifact": {
           "type": "object",
           "required": ["reference", "captured_bytes", "truncated", "limit_bytes", "artifact_bytes"],
@@ -169,7 +198,8 @@
             "skill_context_changes": {
               "type": "array",
               "items": { "type": "string" }
-            }
+            },
+            "artifact_policy": { "$ref": "#/$defs/artifact_policy" }
           }
         }
       ]
@@ -218,7 +248,49 @@
             "round": { "type": "integer", "minimum": 1 },
             "purpose": { "enum": ["inference", "compaction"] },
             "message_count": { "type": "integer", "minimum": 0 },
-            "tools_offered": { "type": "integer", "minimum": 0 }
+            "tools_offered": { "type": "integer", "minimum": 0 },
+            "structured_output": { "type": "boolean" }
+          }
+        }
+      ]
+    },
+    "structured_finalization_deferred": {
+      "description": "A descriptor-verified exact-output mismatch deferred the structured finalizer so one bounded repair round could keep the existing filesystem tools. The host instruction is request-local and grants no new authority.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": [
+            "round",
+            "repair_round",
+            "finalization_round_reserved",
+            "cause",
+            "targets",
+            "repair_instruction_disclosed",
+            "write_authority_granted"
+          ],
+          "properties": {
+            "type": { "const": "structured_finalization_deferred" },
+            "round": { "type": "integer", "minimum": 1 },
+            "repair_round": { "type": "integer", "minimum": 2 },
+            "finalization_round_reserved": { "const": true },
+            "cause": { "const": "required_write_sha256_mismatch" },
+            "targets": {
+              "type": "array",
+              "minItems": 1,
+              "items": {
+                "type": "object",
+                "required": ["path", "expected_sha256", "actual_sha256"],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "expected_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+                  "actual_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                }
+              }
+            },
+            "repair_instruction_disclosed": { "const": true },
+            "write_authority_granted": { "const": false }
           }
         }
       ]
@@ -355,6 +427,12 @@
             "success": { "type": "boolean" },
             "cancelled": { "type": "boolean" },
             "output": { "type": "string" },
+            "output_bytes": { "type": "integer", "minimum": 0 },
+            "output_retained_bytes": { "type": "integer", "minimum": 0 },
+            "output_truncated": { "type": "boolean" },
+            "artifact_status": {
+              "enum": ["not_needed", "retained", "suppressed_by_policy", "unavailable", "failed"]
+            },
             "command": { "$ref": "#/$defs/command_execution_result" }
           }
         }
@@ -423,6 +501,147 @@
         }
       ]
     },
+    "output_schema": {
+      "description": "Host-validated structured-output constraint active for this automation run. The schema body and source path are intentionally omitted.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "name",
+            "bytes",
+            "sha256",
+            "strict",
+            "provider_format",
+            "schema_preflight_validated",
+            "local_validation",
+            "schema_content_included",
+            "model_file_authority"
+          ],
+          "properties": {
+            "type": { "const": "output_schema" },
+            "name": { "const": "kitsu_output" },
+            "bytes": { "type": "integer", "minimum": 1, "maximum": 65536 },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "strict": { "const": true },
+            "provider_format": { "const": "json_schema" },
+            "schema_preflight_validated": { "const": true },
+            "local_validation": { "const": true },
+            "schema_content_included": { "const": false },
+            "model_file_authority": { "const": false }
+          }
+        }
+      ]
+    },
+    "completion_postcondition": {
+      "description": "Host-enforced automation completion contract requested by --require-write and/or --require-write-sha256. The armed receipt precedes the first turn; the evaluated receipt follows completed turns and precedes any output_last_message installation.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "phase",
+            "condition",
+            "status",
+            "targets",
+            "results",
+            "verification",
+            "model_disclosed",
+            "write_authority_granted"
+          ],
+          "properties": {
+            "type": { "const": "completion_postcondition" },
+            "phase": { "enum": ["armed", "evaluated"] },
+            "condition": { "const": "required_write" },
+            "status": { "enum": ["pending", "satisfied", "failed"] },
+            "targets": {
+              "type": "array",
+              "minItems": 1,
+              "items": { "type": "string", "minLength": 1 }
+            },
+            "expectations": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": ["path", "sha256"],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+                }
+              }
+            },
+            "results": {
+              "type": "array",
+              "items": {
+                "type": "object",
+                "required": [
+                  "path",
+                  "requested_path",
+                  "satisfied",
+                  "journal_recorded",
+                  "journal_net_content_changed",
+                  "current_matches_latest_write",
+                  "final_state_changed",
+                  "initial_bytes",
+                  "initial_sha256",
+                  "final_bytes",
+                  "final_sha256",
+                  "reason"
+                ],
+                "properties": {
+                  "path": { "type": "string", "minLength": 1 },
+                  "requested_path": { "type": "string", "minLength": 1 },
+                  "satisfied": { "type": "boolean" },
+                  "journal_recorded": { "type": "boolean" },
+                  "journal_net_content_changed": { "type": "boolean" },
+                  "current_matches_latest_write": { "type": "boolean" },
+                  "final_state_changed": { "type": "boolean" },
+                  "initial_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "initial_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                  "final_bytes": { "type": ["integer", "null"], "minimum": 0 },
+                  "final_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                  "expected_sha256": { "type": ["string", "null"], "pattern": "^[0-9a-f]{64}$" },
+                  "expected_sha256_matches": { "type": ["boolean", "null"] },
+                  "reason": { "type": ["string", "null"] }
+                }
+              }
+            },
+            "verification": { "const": "verified_model_fs_write_and_final_state_change" },
+            "model_disclosed": { "const": true },
+            "write_authority_granted": { "const": false }
+          }
+        }
+      ]
+    },
+    "output_last_message": {
+      "description": "Host-owned atomic installation of the last fully committed assistant message requested by --output-last-message. The message body is not duplicated in this receipt.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        { "$ref": "#/$defs/turn_identity" },
+        {
+          "type": "object",
+          "required": [
+            "destination",
+            "bytes",
+            "sha256",
+            "atomic",
+            "assistant_committed",
+            "content_included",
+            "model_write_authority"
+          ],
+          "properties": {
+            "type": { "const": "output_last_message" },
+            "destination": { "type": "string", "minLength": 1 },
+            "bytes": { "type": "integer", "minimum": 0 },
+            "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "atomic": { "const": true },
+            "assistant_committed": { "const": true },
+            "content_included": { "const": false },
+            "model_write_authority": { "const": false }
+          }
+        }
+      ]
+    },
     "command_started": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -482,10 +701,16 @@
             "line": { "type": "integer", "minimum": 1 },
             "command": { "type": "string" },
             "kind": { "type": "string" },
+            "cause": {
+              "enum": ["tool_call_during_tool_free_finalization"]
+            },
             "message": { "type": "string" },
             "exit_code": { "type": "integer" },
             "tool_errors": { "type": "integer", "minimum": 0 },
-            "policy_errors": { "type": "integer", "minimum": 0 }
+            "policy_errors": { "type": "integer", "minimum": 0 },
+            "schema_sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" },
+            "instance_path": { "type": "string", "pattern": "^\\$" },
+            "validation_keyword": { "type": "string", "minLength": 1 }
           }
         }
       ]
@@ -509,10 +734,19 @@
             "status": { "enum": ["ok", "partial", "error", "cancelled"] },
             "failures": { "type": "integer", "minimum": 0 },
             "provider_failures": { "type": "integer", "minimum": 0 },
+            "output_schema_failures": { "type": "integer", "minimum": 0 },
+            "postcondition_failures": { "type": "integer", "minimum": 0 },
             "tool_failures": { "type": "integer", "minimum": 0 },
             "policy_failures": { "type": "integer", "minimum": 0 },
+            "tool_errors": { "type": "integer", "minimum": 0 },
+            "policy_errors": { "type": "integer", "minimum": 0 },
+            "recovered_tool_errors": { "type": "integer", "minimum": 0 },
+            "recovered_policy_errors": { "type": "integer", "minimum": 0 },
             "user_failures": { "type": "integer", "minimum": 0 },
-            "cancelled_failures": { "type": "integer", "minimum": 0 }
+            "cancelled_failures": { "type": "integer", "minimum": 0 },
+            "duration_ms": { "type": "integer", "minimum": 0 },
+            "session_id": { "type": ["string", "null"] },
+            "session_snapshot_state": { "enum": ["disabled", "pending_until_first_success", "resumable"] }
           }
         }
       ]
@@ -533,6 +767,34 @@
             "reported_prompt_tokens": { "type": "integer", "minimum": 0 },
             "estimated_sent_tokens": { "type": "integer", "minimum": 0 },
             "resolved_window": { "type": "integer", "minimum": 0 }
+          }
+        }
+      ]
+    },
+    "review_disclosure": {
+      "description": "One bounded disclosure of host-verified workspace evidence by the top-level kitsu review command. Emitted after run_started and before turn_started; it grants no model read root.",
+      "allOf": [
+        { "$ref": "#/$defs/envelope" },
+        {
+          "type": "object",
+          "required": [
+            "source",
+            "target",
+            "truncated",
+            "evidence_bytes",
+            "model_disclosed",
+            "model_read_root_granted"
+          ],
+          "properties": {
+            "type": { "const": "review_disclosure" },
+            "source": { "const": "top_level_review" },
+            "target": { "type": "string", "minLength": 1 },
+            "resolved_revision": { "type": ["string", "null"] },
+            "merge_base": { "type": ["string", "null"] },
+            "truncated": { "type": "boolean" },
+            "evidence_bytes": { "type": "integer", "minimum": 0 },
+            "model_disclosed": { "const": true },
+            "model_read_root_granted": { "const": false }
           }
         }
       ]
@@ -603,6 +865,7 @@
                   "model_catalog",
                   "turn_started",
                   "provider_request",
+                  "structured_finalization_deferred",
                   "provider_attempt",
                   "assistant_delta",
                   "usage",
@@ -612,10 +875,14 @@
                   "assistant",
                   "assistant_disposition",
                   "turn_finished",
+                  "output_schema",
+                  "completion_postcondition",
+                  "output_last_message",
                   "command_started",
                   "command_result",
                   "command_finished",
                   "context_window_mismatch",
+                  "review_disclosure",
                   "workspace_evidence_disclosure",
                   "rollback_retained_changes",
                   "error",
