@@ -9769,6 +9769,35 @@ fn run_live_typeahead(
                         needs_redraw = true;
                     }
                 }
+                typeahead_editor::EditorAction::RecallRequest => {
+                    // ↑ on an empty draft: pull the newest queued prompt back
+                    // into the editor (it leaves the queue — the draft is now
+                    // its only copy; submitting re-enqueues it at the back,
+                    // which for the newest prompt is its original position).
+                    let recalled = {
+                        let mut queue = dispatcher.queue.lock().expect("prompt queue");
+                        let queued = queue.status().queued;
+                        queued
+                            .checked_sub(1)
+                            .and_then(|newest| queue.remove(newest))
+                            .map(|prompt| (prompt, queued - 1))
+                    };
+                    match recalled {
+                        Some((prompt, remaining)) => {
+                            let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
+                                "recalled queued prompt for editing ({remaining} still queued)"
+                            ))
+                            .write_line(&mut std::io::stderr());
+                            editor.replace_buffer(&prompt);
+                        }
+                        None => {
+                            // Queue empty: plain history walk, as before.
+                            let mut forced = typeahead_editor::FeedOutcome::default();
+                            editor.history_prev_forced(&mut forced);
+                        }
+                    }
+                    needs_redraw = true;
+                }
             }
         }
         if result.eof {
