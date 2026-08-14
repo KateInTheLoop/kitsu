@@ -31,6 +31,14 @@ user/configuration errors (exit `1`), and configured recovery prose is shown
 only after terminal sanitization, length bounding, and credential-pattern
 filtering.
 
+Connection failures are provider errors (exit `2`) and never interpolate the
+provider's URL/body detail. When the selected profile is named or flavored
+`ollama` and its configured URL host is structurally loopback (`localhost`, a
+`127.0.0.0/8` address, or `::1`), the bounded remedy identifies local Ollama,
+suggests starting or verifying `ollama serve`, and offers another gateway as an
+alternative. Non-loopback and non-Ollama profiles retain the generic gateway,
+network-access, availability, and `doctor --online` guidance.
+
 For `bearer-env`, a non-empty configured environment value wins over the
 managed credential. A malformed/non-Unicode environment value fails closed and
 never falls back. Managed values are bounded, atomically replaced, `0600`
