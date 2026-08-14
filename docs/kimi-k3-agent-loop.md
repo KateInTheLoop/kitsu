@@ -574,6 +574,98 @@ router billing/quota status for the loop's `HF_TOKEN` against
 change; (b) all cycle 1/2 backlog items (a-e above) remain open and
 untouched by this cycle; carry forward as-is.
 
+### Cycle 4 (2026-08-14)
+
+**FIRST BANKED DELIVERABLE.** After three straight failed cycles (1:
+ranged-read thrash → `429`; 2: unbounded sub-agent detour → wall-clock/
+output-limit exhaustion; 3: HF `402` billing block), pre-flight passed
+(`HTTP 200`) and the ramp's deliberately narrow cycle-4 task — one named
+file, one read, one write, no sub-agents — succeeded on the **first
+attempt, no retry needed**.
+
+**Run stats.**
+
+| | attempt 1 (no retry required) |
+|---|---|
+| wall time | 59s |
+| tool calls | 2 (1 `Read`, 1 `Write`) — zero extraneous reads, zero list calls, zero `Agent` spawns |
+| `kitsu-usage` prompt/completion/total | 17,617 / 6,282 / 23,899 |
+| `kitsu-context` used/effective/window | 8,911 / 117,072 / 131,072 |
+| truncation warnings | 0 |
+| outcome | committed: `reviews/kimi-cycle-4.md`, 133 lines / 8,207 bytes, 5 ranked proposals |
+
+Total tokens (23,899) came in well under the cycle's 40K target and far
+below cycles 1-2's 187K-434K burns — confirming the ramp's core thesis:
+scoping the task to one named file with no sub-agent path eliminates
+essentially all of the failure surface the first three cycles hit.
+
+**Deliverable grade: A (pass).** `reviews/kimi-cycle-4.md` is a genuine,
+model-authored review of `context.rs` alone: 5 ranked proposals (task
+asked for 3-6), each with exact line citations, a concrete change, a
+stated reason it wins, and a stated risk — no vague advice. **Every cited
+line range was spot-checked against the actual file
+(`/tmp/kimi-k3-cycle1/crates/kitsu-core/src/context.rs`) and found
+accurate — zero hallucinated citations.** Spot-check detail: `estimate`
+100-107, `anchored` 111-113, `anchor_includes_schema` 122-124, `record`
+79-81, `invalidate` 83-93, `message_tokens` 35-43, rate constants 16-18,
+`estimate_str` 29-31, `buffer` line 166, `ContextBudget::new` 159-173,
+`MIN_OUTPUT_RESERVE` 24-25, `DEFAULT_CONTEXT_WINDOW` 20-22, anchor-field
+doc 63-68 — all confirmed to describe exactly what those lines contain.
+Numeric reasoning was also checked: proposal 5's worked example
+(`window=8192, max_output=Some(8192)` → `reserve = 8192.max(512).min(4096)
+= 4096`) is arithmetically correct against `ContextBudget::new`'s actual
+formula. Actionable-vs-vague ratio: 5/5 proposals actionable (concrete
+code change named, not just "improve accuracy"). Top proposals worth
+acting on:
+
+1. **`crates/kitsu-core/src/context.rs:100-107`** — anchor validity is
+   length-only (`sent_len <= messages.len()`), so an in-place edit inside
+   the anchored prefix (steering edit, rewritten tool result) keeps the
+   anchor "valid" while silently describing content it never measured.
+   Proposed fix: a cheap prefix fingerprint or generation counter checked
+   alongside the length guard.
+2. **`crates/kitsu-core/src/context.rs:79-81` + `:100-107`** — no sanity
+   bound on gateway-reported `prompt_tokens`; a buggy/proxying gateway
+   value poisons every estimate until the next `record`. Proposed fix:
+   distrust an anchor that diverges from the anchor-free full estimate
+   beyond a wide band (e.g. 0.4x-2.5x), falling back to full recompute.
+3. **`crates/kitsu-core/src/context.rs:166`** — trim buffer is
+   `min(window/10, 2048)`, flat above a 20,480-token window even though
+   absolute chars/token estimate error grows with prompt size; proposed
+   scaling the cap (or deriving it from fill-proportional error) so
+   large-context models get proportionally more headroom.
+
+**Weaknesses/observations (none rise to a new backlog item — this was a
+clean run):**
+
+1. **None of cycles 1-3's failure modes were exercised, by design.** No
+   ranged-read thrash (only one whole-file read, no ranges), no `429`/
+   `402` (pre-flight already confirmed `200`), no sub-agent spawn (task
+   forbade it and the model complied — first cycle where the prohibition
+   actually held), no wall-clock cancellation, no truncation. This cycle
+   provides zero new evidence on backlog items 1, 2, 5, 6, 7, 8, 10
+   below — they carry forward unconfirmed, not because they were
+   refuted but because the narrow task never touched those paths.
+2. **The widened `--max-output-tokens 14000` (vs. cycle 2's 6000) appears
+   to have been sufficient headroom for a reasoning model on a
+   read-one-write-one task**: `completion_tokens: 6282` against the
+   14000 cap, zero truncation warnings, full deliverable produced. This
+   is operational mitigation, not a kitsu fix — backlog item 9
+   (no separate reasoning-headroom knob/warning) remains open as a real
+   gap; a larger or more reasoning-heavy task at the same cap could still
+   exhaust it the way cycle 2 did at 6000.
+3. **`kitsu-usage` did not report `cached_tokens`**, consistent with
+   backlog item 2 (still open, unconfirmed either way — this run may
+   simply not have had cacheable content given it was a fresh session).
+4. **Backlog item 7 (cancelled turns print zero usage) was not
+   exercised** — no cancellation occurred this cycle; still open per
+   cycle 3's note that it remains unconfirmed/unrefuted.
+
+**Ramp verdict: ADVANCE to cycle 5.** The first-success gate is cleared —
+Kimi-K3 has a genuine, accurately-cited, banked contribution. Proceed to
+the cycle-5 task (usage/caching slice over `crates/kitsu-providers/src`)
+per the Success ramp at the top of this doc.
+
 ### Cycle 7 — 2026-08-14 — FIRST CODE CONTRIBUTION (grade A-)
 
 Kimi implemented its own cycle-6 P3 design: surface `cached_tokens`
