@@ -380,6 +380,15 @@ as escalation); findings are re-verified before applying. Cycle log:
   the PTY smoke caught the suppress-on-window rule hiding the status for
   long matches. SHIP-AS-IS review (second clean in a row; all 7
   negative-case traces held).
+- **Cycle 8 (2026-08-14, 09ead7f + follow-up b7975ce)**: draft-aware
+  Ctrl+C (Claude semantics: first press clears the draft, empty-draft
+  press cancels via re-raised SIGINT; search aborts; paste noise;
+  approvals keep kernel ^C). Review caught the ISIG side effect killing
+  Ctrl+Z/Ctrl+\\ — restored via Suspend/Quit actions that drop raw mode
+  before re-raising the real signals, reusing the approval re-engage
+  machinery. PTY-verified: first ^C clears while streaming continues,
+  second cancels, session stays alive. Known caveat (pre-existing
+  class): kill -9 mid-turn leaves the terminal raw — `reset` recovers.
 - Backlog (next cycles): queued-message full stack rendered under the
   status row (multi-row live region); multi-line draft wrap; unit-test
   seam for the collector poll loop.
