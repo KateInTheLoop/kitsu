@@ -335,9 +335,11 @@ fn compose_draft_context_rows(buffer: &str, cursor: usize, cols: usize) -> Vec<S
     }
     let after = lines.len().saturating_sub(cursor_line + 1);
     if after > 0 {
+        // Name the submit semantics: only the cursor line is visible on the
+        // status row, but Enter sends the whole draft (review, cycle 10).
         rows.push(format!(
             "{}",
-            clamp(format!("  ⋮ +{after} line(s) below cursor")).dimmed()
+            clamp(format!("  ⋮ +{after} line(s) below — Enter submits all")).dimmed()
         ));
     }
     rows
@@ -879,7 +881,7 @@ mod tests {
         assert!(plain[0].contains("+2 earlier line(s)"), "{plain:?}");
         assert!(plain[1].contains("l3"));
         assert!(plain[2].contains("l4"));
-        assert!(plain[3].contains("+1 line(s) below cursor"));
+        assert!(plain[3].contains("+1 line(s) below — Enter submits all"));
         assert_eq!(plain.len(), 4);
         // Single-line drafts produce no context rows.
         assert!(compose_draft_context_rows("plain", 3, 80).is_empty());
