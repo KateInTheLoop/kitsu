@@ -64,6 +64,15 @@ guarantees requires a new schema identifier.
   during backoff, a statusless terminal event for its attempt number closes the
   earlier nonterminal disposition even though no HTTP send began. Retries never
   add another `provider_request`.
+- When a connection failure belongs to a selected Ollama profile whose
+  configured host is structurally loopback, the terminal `error` also carries
+  `diagnostic_code: "local_ollama_unreachable"` and the bounded
+  `recovery_actions` values `start_ollama_serve`, `verify_ollama_serve`, and
+  `select_another_gateway`. These optional fields describe only facts derived
+  from trusted configuration; they never contain the configured URL, provider
+  detail, or credentials. Remote Ollama and non-Ollama loopback failures omit
+  them and retain generic gateway recovery. Historical v1 streams may omit both
+  fields, so consumers must still accept the human `message` as opaque text.
 - Streaming text that is safe to display appears as ordered `assistant_delta`
   records. Text from a tool-capable round is held until Kitsu has ruled out a
   text-protocol tool call, so raw tool JSON is never mislabeled as an answer.

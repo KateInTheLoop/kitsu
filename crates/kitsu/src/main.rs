@@ -1070,21 +1070,14 @@ fn main() {
                     && !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire)
                 {
                     let cancelled = e.exit_code() == EXIT_CANCELLED;
-                    let frame_result = emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "kind": e.jsonl_kind(),
-                            "message": e.to_string(),
-                            "exit_code": e.exit_code(),
-                        }),
-                    )
-                    .and_then(|()| {
-                        emit_jsonl_summary(
-                            if cancelled { "cancelled" } else { "error" },
-                            1,
-                            usize::from(e.exit_code() == EXIT_PROVIDER),
-                        )
-                    });
+                    let frame_result =
+                        emit_jsonl("error", e.jsonl_error_payload()).and_then(|()| {
+                            emit_jsonl_summary(
+                                if cancelled { "cancelled" } else { "error" },
+                                1,
+                                usize::from(e.exit_code() == EXIT_PROVIDER),
+                            )
+                        });
                     // `jsonl_output_failure` below reports the retained
                     // terminal error exactly once when framing itself fails.
                     let _ = frame_result;
@@ -1116,6 +1109,7 @@ fn main() {
 struct CliError {
     message: String,
     code: i32,
+    diagnostic: Option<ProviderDiagnosticCode>,
 }
 
 impl CliError {
@@ -1123,19 +1117,27 @@ impl CliError {
         Self {
             message: message.into(),
             code: EXIT_USER,
+            diagnostic: None,
         }
     }
     fn provider(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: EXIT_PROVIDER,
+            diagnostic: None,
         }
     }
     fn cancelled(message: impl Into<String>) -> Self {
         Self {
             message: message.into(),
             code: EXIT_CANCELLED,
+            diagnostic: None,
         }
+    }
+
+    fn with_diagnostic(mut self, diagnostic: Option<ProviderDiagnosticCode>) -> Self {
+        self.diagnostic = diagnostic;
+        self
     }
 
     fn jsonl_output(error: kitsu_render::jsonl::JsonlEmitError) -> Self {
@@ -1151,6 +1153,19 @@ impl CliError {
             EXIT_CANCELLED => "cancelled",
             _ => "user",
         }
+    }
+
+    fn jsonl_error_payload(&self) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "kind": self.jsonl_kind(),
+            "message": self.to_string(),
+            "exit_code": self.exit_code(),
+        });
+        if let Some(diagnostic) = self.diagnostic {
+            payload["diagnostic_code"] = serde_json::json!(diagnostic.code());
+            payload["recovery_actions"] = serde_json::json!(diagnostic.recovery_actions());
+        }
+        payload
     }
 }
 
@@ -2531,12 +2546,46 @@ struct ProviderDiagnosticContext {
     loopback_ollama: bool,
 }
 
+/// Stable, secret-free machine diagnostics for provider failures whose cause
+/// Kitsu can determine from trusted configuration. These codes supplement the
+/// human message; they never contain provider text or endpoint components.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ProviderDiagnosticCode {
+    LocalOllamaUnreachable,
+}
+
+impl ProviderDiagnosticCode {
+    const fn code(self) -> &'static str {
+        match self {
+            Self::LocalOllamaUnreachable => "local_ollama_unreachable",
+        }
+    }
+
+    const fn recovery_actions(self) -> &'static [&'static str] {
+        match self {
+            Self::LocalOllamaUnreachable => &[
+                "start_ollama_serve",
+                "verify_ollama_serve",
+                "select_another_gateway",
+            ],
+        }
+    }
+}
+
 impl ProviderDiagnosticContext {
     fn from_gateway(gateway_name: &str, gateway: &Gateway) -> Self {
         let ollama_profile = gateway_name.eq_ignore_ascii_case("ollama")
             || gateway.flavor.eq_ignore_ascii_case("ollama");
         Self {
             loopback_ollama: ollama_profile && base_url_has_loopback_host(&gateway.base_url),
+        }
+    }
+
+    fn code_for(self, error: &ProviderError) -> Option<ProviderDiagnosticCode> {
+        if self.loopback_ollama && matches!(error, ProviderError::Connection(_)) {
+            Some(ProviderDiagnosticCode::LocalOllamaUnreachable)
+        } else {
+            None
         }
     }
 }
@@ -8316,12 +8365,8 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 setup.provider_diagnostics,
             );
             if cli.jsonl {
-                let mut payload = serde_json::json!({
-                    "turn_id": "ask:1",
-                    "kind": mapped.jsonl_kind(),
-                    "message": mapped.to_string(),
-                    "exit_code": mapped.exit_code(),
-                });
+                let mut payload = mapped.jsonl_error_payload();
+                payload["turn_id"] = serde_json::json!("ask:1");
                 if let Some(cause) = cause {
                     payload["cause"] = serde_json::json!(cause);
                 }
@@ -11663,21 +11708,18 @@ async fn run_scripted_turn(
             .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             let cause = agent_error_jsonl_cause(&e);
             let kind = script_failure_kind(&e);
-            let error_message = chat_error_message_with_diagnostics(
+            let mapped = map_agent_error_with_diagnostics(
                 e,
-                model,
-                cli.timeout_secs,
+                ProviderOperation::Chat { model },
+                Some(cli.timeout_secs),
                 session.provider_diagnostics,
             );
+            let error_message = mapped.to_string();
             if cli.jsonl {
-                let mut payload = serde_json::json!({
-                    "turn_id": location,
-                    "kind": if kind == ScriptFailureKind::Provider { "provider" } else { "user" },
-                    "message": error_message,
-                    "tool_errors": state.last_turn.tool_errors,
-                    "policy_errors": state.last_turn.policy_errors,
-                    "exit_code": if kind == ScriptFailureKind::Provider { EXIT_PROVIDER } else { EXIT_USER },
-                });
+                let mut payload = mapped.jsonl_error_payload();
+                payload["turn_id"] = serde_json::json!(location);
+                payload["tool_errors"] = serde_json::json!(state.last_turn.tool_errors);
+                payload["policy_errors"] = serde_json::json!(state.last_turn.policy_errors);
                 if let Some(cause) = cause {
                     payload["cause"] = serde_json::json!(cause);
                 }
@@ -14305,12 +14347,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     setup.provider_diagnostics,
                 );
                 if cli.jsonl {
-                    let mut payload = serde_json::json!({
-                        "turn_id": "piped:1",
-                        "kind": mapped.jsonl_kind(),
-                        "message": mapped.to_string(),
-                        "exit_code": mapped.exit_code(),
-                    });
+                    let mut payload = mapped.jsonl_error_payload();
+                    payload["turn_id"] = serde_json::json!("piped:1");
                     if let Some(cause) = cause {
                         payload["cause"] = serde_json::json!(cause);
                     }
@@ -17393,11 +17431,12 @@ fn map_provider_error_with_diagnostics(
     diagnostics: ProviderDiagnosticContext,
 ) -> CliError {
     let user_error = matches!(error, ProviderError::Auth(_));
+    let diagnostic = diagnostics.code_for(&error);
     let message = safe_provider_error_message(&error, operation, timeout_secs, diagnostics);
     if user_error {
         CliError::user(message)
     } else {
-        CliError::provider(message)
+        CliError::provider(message).with_diagnostic(diagnostic)
     }
 }
 
@@ -19025,6 +19064,27 @@ mod tests {
         assert!(!message.contains("super-secret"));
         assert!(!message.contains("api_key"));
         assert!(!message.contains("127.0.0.7"));
+        let typed = map_provider_error_with_diagnostics(
+            ProviderError::Connection(format!("request failed for {secret_url}")),
+            ProviderOperation::Chat {
+                model: "test-model",
+            },
+            Some(17),
+            diagnostics,
+        )
+        .jsonl_error_payload();
+        assert_eq!(typed["diagnostic_code"], "local_ollama_unreachable");
+        assert_eq!(
+            typed["recovery_actions"],
+            serde_json::json!([
+                "start_ollama_serve",
+                "verify_ollama_serve",
+                "select_another_gateway",
+            ])
+        );
+        assert!(!typed.to_string().contains("super-secret"));
+        assert!(!typed.to_string().contains("api_key"));
+        assert!(!typed.to_string().contains("127.0.0.7"));
 
         let flavored = gateway("ollama", "http://[::1]:11434");
         assert!(ProviderDiagnosticContext::from_gateway("custom-local", &flavored).loopback_ollama);
@@ -19046,6 +19106,15 @@ mod tests {
             assert!(generic.contains("selected gateway's base_url"));
             assert!(!generic.contains("ollama serve"));
             assert!(!generic.contains("provider-controlled detail"));
+            let typed = map_provider_error_with_diagnostics(
+                ProviderError::Connection("provider-controlled detail".to_string()),
+                ProviderOperation::ModelCatalog,
+                Some(17),
+                diagnostics,
+            )
+            .jsonl_error_payload();
+            assert!(typed.get("diagnostic_code").is_none(), "{typed}");
+            assert!(typed.get("recovery_actions").is_none(), "{typed}");
         }
 
         for base_url in [

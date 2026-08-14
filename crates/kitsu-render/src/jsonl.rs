@@ -339,6 +339,22 @@ mod tests {
             false
         );
         assert_eq!(
+            defs["error"]["allOf"][1]["properties"]["diagnostic_code"]["enum"][0],
+            "local_ollama_unreachable"
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["dependentRequired"]["diagnostic_code"][0],
+            "recovery_actions"
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["properties"]["recovery_actions"]["items"]["enum"],
+            serde_json::json!([
+                "start_ollama_serve",
+                "verify_ollama_serve",
+                "select_another_gateway"
+            ])
+        );
+        assert_eq!(
             defs["error"]["allOf"][1]["properties"]["schema_sha256"]["pattern"],
             "^[0-9a-f]{64}$"
         );
