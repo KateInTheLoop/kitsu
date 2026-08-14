@@ -420,15 +420,25 @@ fn redraw_locked(row_state: &mut LiveRowState) {
         return;
     }
     let mut err = io::stderr().lock();
+    let cols = terminal_cols();
+    render_region(&mut err, row_state, cols);
+}
+
+/// The full region-painting state machine, with the writer and terminal
+/// width injected so branch selection (fast path vs full repaint, shrink,
+/// clear) and `drawn_rows` transitions are unit-testable byte-for-byte —
+/// the exact territory where the cycle-9 review found bugs. The public
+/// wrappers supply `io::stderr()` and the real ioctl width; behavior is
+/// identical.
+fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize) {
     if row_state.spinner.is_none() && row_state.draft.is_none() {
         if row_state.drawn_rows > 0 {
-            clear_region_locked(&mut err, row_state.drawn_rows);
+            clear_region_locked(err, row_state.drawn_rows);
             let _ = err.flush();
             row_state.drawn_rows = 0;
         }
         return;
     }
-    let cols = terminal_cols();
     // A resize invalidates the painted stack rows (they hold the old
     // width); force the full-repaint path (sonnet review, cycle 9).
     if cols != row_state.last_cols {
@@ -464,7 +474,7 @@ fn redraw_locked(row_state: &mut LiveRowState) {
         // changed; upper stack rows stay put — no flicker.
         let _ = write!(err, "\r\x1b[2K{status}");
     } else {
-        clear_region_locked(&mut err, row_state.drawn_rows);
+        clear_region_locked(err, row_state.drawn_rows);
         // When the region SHRINKS, the cleared excess rows sit below the
         // new region; step down through them first so the shorter region
         // still hugs the bottom of the screen instead of floating above
@@ -911,6 +921,107 @@ mod tests {
                 );
             }
         }
+    }
+
+    fn drafted_state() -> LiveRowState {
+        LiveRowState {
+            spinner: Some("* thinking".to_string()),
+            draft: Some(LiveDraft {
+                prompt: "kitsu> ".to_string(),
+                buffer: "abc".to_string(),
+                cursor: 3,
+                ..LiveDraft::default()
+            }),
+            ..LiveRowState::default()
+        }
+    }
+
+    #[test]
+    fn render_region_first_paint_then_fast_path_then_full_repaint() {
+        let mut state = drafted_state();
+        let mut out: Vec<u8> = Vec::new();
+        // First paint: full path (last_cols 0 → dirty), one row.
+        render_region(&mut out, &mut state, 80);
+        assert_eq!(state.drawn_rows, 1);
+        assert!(!state.region_dirty);
+        // Steady state: the fast path repaints ONLY the bottom row in place.
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        let bytes = String::from_utf8(out.clone()).unwrap();
+        assert!(bytes.starts_with("\r\u{1b}[2K"), "fast path clears one row");
+        assert!(
+            !bytes.contains("\r\n"),
+            "fast path must not touch upper rows: {bytes:?}"
+        );
+        assert_eq!(state.drawn_rows, 1);
+        // Queue content appears: full repaint grows the region.
+        state.queued = 2;
+        state.previews = vec!["first".to_string(), "second".to_string()];
+        state.region_dirty = true;
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert_eq!(state.drawn_rows, 3);
+        let bytes = String::from_utf8(out).unwrap();
+        assert_eq!(bytes.matches("\r\n").count(), 2, "two upper rows painted");
+        assert_eq!(state.last_upper.len(), 2);
+    }
+
+    #[test]
+    fn render_region_shrink_steps_down_and_clear_ends_at_zero() {
+        let mut state = drafted_state();
+        state.queued = 2;
+        state.previews = vec!["first".to_string(), "second".to_string()];
+        let mut out: Vec<u8> = Vec::new();
+        render_region(&mut out, &mut state, 80);
+        assert_eq!(state.drawn_rows, 3);
+        // Draft hidden (approval handoff): spinner-only, shrink 3 → 1.
+        state.draft = None;
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert_eq!(state.drawn_rows, 1);
+        let bytes = String::from_utf8(out.clone()).unwrap();
+        // Old region cleared bottom-up (two 1A2K pairs), then two \n steps
+        // down so the shorter region hugs the bottom.
+        assert!(bytes.contains("\u{1b}[1A\u{1b}[2K\u{1b}[1A\u{1b}[2K"));
+        assert!(bytes.contains("\n\n"), "shrink steps down: {bytes:?}");
+        // Everything gone: clear-only branch zeroes the region.
+        state.spinner = None;
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert_eq!(state.drawn_rows, 0);
+        // And a further call writes nothing at all.
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn render_region_resize_and_upper_content_changes_force_full_repaint() {
+        let mut state = drafted_state();
+        state.draft.as_mut().unwrap().buffer = "one\ntwo\nthree".to_string();
+        state.draft.as_mut().unwrap().cursor = 13; // end of "three"
+        let mut out: Vec<u8> = Vec::new();
+        render_region(&mut out, &mut state, 80);
+        let rows_before = state.drawn_rows;
+        assert!(rows_before > 1, "multi-line draft has context rows");
+        // Same content, same width: fast path (no upper repaint).
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert!(!String::from_utf8(out.clone()).unwrap().contains("\r\n"));
+        // Cursor crosses a line boundary: same row count possible, but the
+        // upper CONTENT changes → last_upper comparison forces full repaint.
+        state.draft.as_mut().unwrap().cursor = 5; // inside "two"
+        out.clear();
+        render_region(&mut out, &mut state, 80);
+        assert!(
+            String::from_utf8(out.clone()).unwrap().contains("\r\n"),
+            "upper-content change repaints fully"
+        );
+        // Resize: content identical but width changed → full repaint.
+        out.clear();
+        render_region(&mut out, &mut state, 60);
+        assert!(String::from_utf8(out).unwrap().contains("\r\n"));
+        assert_eq!(state.last_cols, 60);
     }
 
     #[test]
