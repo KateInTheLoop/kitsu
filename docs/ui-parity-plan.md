@@ -273,7 +273,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   sanitized or unstyled; `cargo build` time impact noted in the commit
   message; workspace green.
 
-- [ ] **11. Diff header and per-file stat line in `/diff` output** (S)
+- [x] **11. Diff header and per-file stat line in `/diff` output** (S) — done 2026-08-14 (f260143, interactive loop cycle 15)
   `render_diff` (`crates/kitsu-render/src/lib.rs:1120-1151`) prints a bare
   `verified workspace diff (N line(s)):` count. Upgrade the header to the
   receipt form used elsewhere: `◈ verified workspace diff — N file(s), +A
@@ -285,7 +285,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   helper on a two-file fixture diff; header renders in all three tiers with
   the sanitize round-trip holding; render tests green.
 
-- [ ] **12. Tool-call header polish: accent verb, dim arguments** (S)
+- [x] **12. Tool-call header polish: accent verb, dim arguments** (S) — done 2026-08-14 (bffb128 + 3bcfad4, interactive loop cycle 13)
   `◆ Read(crates/kitsu-render/src/lib.rs)` currently tints only the `◆`;
   Claude Code's cards read faster because the verb and detail have distinct
   weights. In `tool_activity` (`crates/kitsu-render/src/lib.rs:1001-1016`),
@@ -460,9 +460,14 @@ as escalation); findings are re-verified before applying. Cycle log:
   crawl SOLVED — see the resolved investigation entry above. The loop's
   founding symptom class ('cursor stuck / input laggy') is now closed
   at both ends: mid-turn (cycles 0-12) and idle (this cycle).
+- **Cycle 15 (2026-08-14, f260143)**: original-queue item 11 shipped —
+  /diff receipt header with per-file/+/- stats via pure diff_summary;
+  three tiers round-trip; live-verified in a scripted repo. SHIP-AS-IS
+  review (4th clean): counting edges correct or acceptable-rare
+  (diff-of-diff inflation, diff --cc undercount).
 - Backlog: soft-wrap of overlong single lines (nice-to-have); original
-  queue items 10 (syntect), 11 (/diff header), 13 (agent deck rows)
-  remain available for future ticks.
+  queue items 10 (syntect) and 13 (agent deck rows) remain available
+  for future ticks.
 
 ## Protocol
 
