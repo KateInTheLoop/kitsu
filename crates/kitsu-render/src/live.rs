@@ -85,9 +85,11 @@ fn display_char(ch: char) -> char {
 }
 
 /// Clamp `buffer` to `avail` display columns, keeping the cursor visible.
-/// Trimmed edges are marked with `…`. Returns the visible slice and the
-/// display width of the visible text left of the cursor.
-fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize) {
+/// Trimmed edges are marked with `…`. Returns the visible slice, the display
+/// width of the visible text left of the cursor, and whether the buffer was
+/// windowed (authoritative — a literal `…` in the buffer must not be
+/// mistaken for a trim marker).
+fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize, bool) {
     let chars: Vec<char> = buffer.chars().map(display_char).collect();
     let cursor = cursor.min(chars.len());
     let widths: Vec<usize> = chars
@@ -96,12 +98,12 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
         .collect();
     let total: usize = widths.iter().sum();
     if total <= avail {
-        return (chars.iter().collect(), widths[..cursor].iter().sum());
+        return (chars.iter().collect(), widths[..cursor].iter().sum(), false);
     }
     if avail < 4 {
         // Too narrow for a meaningful window; show nothing but keep the
         // cursor parked at the start so the row still fits.
-        return (String::new(), 0);
+        return (String::new(), 0, true);
     }
     // Expand a window around the cursor greedily; reserve one column per
     // trimmed edge for its `…` marker.
@@ -136,7 +138,7 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
     if hi < chars.len() {
         visible.push('…');
     }
-    (visible, cursor_offset)
+    (visible, cursor_offset, true)
 }
 
 /// Compose the styled row and the 1-based cursor column (when a draft is
@@ -161,7 +163,7 @@ fn compose_row(
     let lead = spinner.map(|(_, width)| width + 2).unwrap_or(0);
     // One column is reserved so an end-of-buffer cursor never wraps the row.
     let avail = cols.saturating_sub(lead + prompt_width + 1);
-    let (visible, cursor_offset) = fit_draft_window(&draft.buffer, draft.cursor, avail);
+    let (visible, cursor_offset, windowed) = fit_draft_window(&draft.buffer, draft.cursor, avail);
     let mut row = String::new();
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
@@ -175,10 +177,9 @@ fn compose_row(
     // cursor column stays before the hint so typing continues over it.
     let buffer_chars = draft.buffer.chars().count();
     let buffer_width = display_width(&visible);
-    let unwindowed = !visible.contains('…') || draft.buffer.contains('…');
     if !draft.hint.is_empty()
         && draft.cursor == buffer_chars
-        && unwindowed
+        && !windowed
         && cursor_offset == buffer_width
     {
         let space = avail.saturating_sub(buffer_width);
@@ -329,7 +330,8 @@ mod tests {
 
     #[test]
     fn short_draft_fits_unclipped_with_cursor_after_prefix() {
-        let (visible, offset) = fit_draft_window("hello world", 5, 40);
+        let (visible, offset, windowed) = fit_draft_window("hello world", 5, 40);
+        assert!(!windowed);
         assert_eq!(visible, "hello world");
         assert_eq!(offset, 5);
     }
@@ -337,7 +339,8 @@ mod tests {
     #[test]
     fn long_draft_windows_around_cursor_with_ellipses() {
         let buffer = "abcdefghijklmnopqrstuvwxyz";
-        let (visible, offset) = fit_draft_window(buffer, 13, 10);
+        let (visible, offset, windowed) = fit_draft_window(buffer, 13, 10);
+        assert!(windowed);
         assert!(visible.starts_with('…') && visible.ends_with('…'));
         assert!(display_width(&visible) <= 10);
         let core: String = visible.chars().filter(|c| *c != '…').collect();
@@ -348,7 +351,7 @@ mod tests {
     #[test]
     fn cursor_at_end_of_long_draft_shows_tail() {
         let buffer = "abcdefghijklmnopqrstuvwxyz";
-        let (visible, offset) = fit_draft_window(buffer, 26, 10);
+        let (visible, offset, _) = fit_draft_window(buffer, 26, 10);
         assert!(visible.starts_with('…'));
         assert!(visible.ends_with('z'));
         assert_eq!(offset, display_width(&visible));
@@ -391,7 +394,7 @@ mod tests {
 
     #[test]
     fn newlines_and_tabs_render_as_visible_placeholders() {
-        let (visible, offset) = fit_draft_window("one\ntwo\tend", 4, 40);
+        let (visible, offset, _) = fit_draft_window("one\ntwo\tend", 4, 40);
         assert_eq!(visible, "one⏎two⇥end");
         // Cursor sits just past the rendered ⏎.
         assert_eq!(offset, 3 + display_width("⏎"));
@@ -435,6 +438,34 @@ mod tests {
             !row.contains("extra"),
             "hint must never displace text: {row:?}"
         );
+    }
+
+    #[test]
+    fn hint_respects_windowing_even_when_the_buffer_contains_a_literal_ellipsis() {
+        // Windowed + literal `…` in the buffer: the hint must stay hidden
+        // (the pre-fix heuristic sniffed `…` out of the visible text and
+        // wrongly rendered a hint over trimmed content).
+        let trimmed = LiveDraft {
+            prompt: "> ".to_string(),
+            buffer: "/que…something-long-enough-to-trim".to_string(),
+            cursor: 34,
+            hint: "ue".to_string(),
+        };
+        let (row, _) = compose_row(None, Some(&trimmed), 16);
+        assert!(
+            !row.contains("\u{1b}[2m"),
+            "no hint on a windowed draft: {row:?}"
+        );
+
+        // Unwindowed + literal `…`: the hint still renders.
+        let fits = LiveDraft {
+            prompt: "> ".to_string(),
+            buffer: "/que".to_string(),
+            cursor: 4,
+            hint: "ue".to_string(),
+        };
+        let (row, _) = compose_row(None, Some(&fits), 80);
+        assert!(row.contains("\u{1b}[2m"));
     }
 
     #[test]
