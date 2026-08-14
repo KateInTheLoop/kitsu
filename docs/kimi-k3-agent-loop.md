@@ -65,28 +65,28 @@ concrete, file-referenced proposals ranked by value; no vague advice.
   to window 8192; explicit `--context-window` was required).
 - [ ] Surface provider `cached_tokens` (HF router reports it in usage)
   in `kitsu-usage:` records and `/cost`, so caching wins are measurable.
-- [ ] **New, confirmed 2026-08-13 (cycle 1):** ranged reads in the
-  `fs_read_file` tool cap at 64 KiB measured from the *absolute start of
-  the file*, not from the requested range's start line. A ranged read
-  whose `start_line` falls past the 64 KiB absolute mark returns almost
-  nothing regardless of the requested range's width. Root cause:
-  `crates/kitsu-tools/src/builtins/fs.rs:333-363` (`read_capped_text`)
-  applies the byte cap before `crates/kitsu-tools/src/builtins/fs.rs:445-468`
-  slices out the requested line range; the cap needs to be relative to
-  the range, not the file start. Verified: `orchestrator.rs` line 1533
-  begins at byte 65,678 (just past 65,536 = 64 KiB), matching exactly
-  where every "full" and ranged read stalled. See
-  `reviews/kimi-cycle-1.md` for the full trace.
-- [ ] The `served {X} KiB of {Y} KiB total` disclosure in
-  `crates/kitsu-tools/src/builtins/fs.rs:474-480` measures `served_bytes`
-  *before* the line-range slice is applied, so it reports the pre-slice
-  absolute read, not what the caller actually received — misleading on
-  its own even before the cap-placement bug above.
-- [ ] Add an `orchestrator_tests.rs` case for a ranged read whose
-  `start_line` sits past the file's first 64 KiB, so the bug above (and
-  any fix) is regression-tested; the existing ranged-read tests
-  (`crates/kitsu-core/src/orchestrator_tests.rs:1514-1532`) only use
-  small files and never exercise this path.
+- [x] fixed on main (f3d579c) — ranged reads in the `fs_read_file` tool
+  used to cap at 64 KiB measured from the *absolute start of the file*,
+  not from the requested range's start line, so a range whose
+  `start_line` fell past the 64 KiB absolute mark returned almost
+  nothing regardless of the requested range's width. Fixed by
+  `read_capped_line_range` (`crates/kitsu-tools/src/builtins/fs.rs:372-421`
+  on main), which streams to the requested lines and caps relative to
+  the served range. **Confirmed under real load in cycle 2:** both
+  cycle-2 attempts read `orchestrator.rs` (3221 lines / ~128 KiB) in
+  three wide ranges (1-1100, 1100-2200, 2200-3221) with zero thrash
+  reads, versus 6-7 near-empty reads per attempt in cycle 1. See
+  `reviews/kimi-cycle-1.md` for the original trace and
+  `reviews/kimi-cycle-2.md` for the confirmation.
+- [x] fixed on main (f3d579c) — the `served {X} KiB of {Y} KiB total`
+  disclosure used to measure `served_bytes` *before* the line-range
+  slice, reporting the pre-slice absolute read instead of what the
+  caller actually received. Fixed at
+  `crates/kitsu-tools/src/builtins/fs.rs:530` (main), which now computes
+  `served_bytes` from `content.text` post-slice. Two regression tests
+  were added in the same commit (a range starting past 64 KiB serves
+  the requested lines uncapped; disclosures report served bytes) —
+  covers the gap the cycle-1 backlog item asked for.
 - [ ] Retry/backoff on `HTTP 429` gives up after 3 attempts with short,
   fixed-feeling backoffs (~210ms, ~420ms) even when the per-turn
   deadline has ~298 of 300 seconds still unused. Consider honoring
@@ -100,6 +100,54 @@ concrete, file-referenced proposals ranked by value; no vague advice.
   Consider allowing a retried turn to resume from prior tool results
   within the same process, or at least surfacing a hint to the operator
   that a `--resume` session would have preserved them.
+- [ ] **New, cycle 2:** a turn cancelled by the outer `--timeout-secs`
+  wall clock (`error: chat request timed out after 120s`) prints zero
+  `kitsu-usage`/`kitsu-context` receipts, even though the provider call
+  itself reported `cancelled; HTTP 200; cancelled; terminal=true;
+  107590ms deadline remaining` — i.e. kitsu's own per-attempt inference
+  budget still had ~108s left when the *outer* wall clock cut it off.
+  Operators are left with zero token-cost visibility into a turn that
+  ran ~120s of real inference. Consider (a) reporting whatever partial
+  usage the provider returns on a cancelled call, and (b) reconciling
+  the outer `--timeout-secs` wall clock against the inner per-attempt
+  deadline so one doesn't silently starve the other.
+- [ ] **New, cycle 2:** the model's own `Agent(...)` sub-agent tool is
+  expensive (64-71s wall time per spawn in both cycle-2 attempts) and
+  unbounded — nothing in kitsu stops the model from spawning it for
+  work outside the task's stated scope (both cycle-2 attempts read
+  every file the task named cleanly, then spawned `Agent(...)` to go
+  chasing "EXACT file:line" citations in `crates/kitsu/src/{cli,config,
+  main}.rs`, files the task never mentioned). That single detour is
+  what exhausted the wall-clock budget in attempt 1 and drove ~80% of
+  attempt 2's 425,660 prompt tokens. Consider a cheaper mechanism for
+  "confirm this line number" than a full sub-agent spawn, and/or a
+  soft per-turn budget on sub-agent tool calls that's visible to the
+  model.
+- [ ] **New, cycle 2:** with a reasoning model and a `--max-output-tokens`
+  budget sized for the *visible* answer (6000, per the loop's own
+  "generous, >= 4000" guidance), hidden reasoning tokens can still
+  exhaust it before any visible output is emitted — cycle 2 attempt 2
+  hit `response truncated: model hit its output length limit` twice
+  before the turn was discarded with `completion_tokens: 8852` against
+  a 6000 budget (so completion tokens exceeded the nominal cap, all
+  apparently spent on reasoning/tool-call scaffolding rather than the
+  requested file). This is precisely the "output-budget headroom for
+  reasoning models" risk the standing task asks Kimi to write about;
+  kitsu itself has no separate reasoning-token headroom knob or warning
+  when a reasoning-capable model is selected with a budget sized only
+  for final output.
+- [ ] **New, cycle 2:** kitsu's own context-offload path (large tool
+  results written to `/tmp/kitsu-offload-*/...txt` with a 500-char
+  in-context preview, "model can fs_read_file it") can trigger
+  self-inflicted re-reads: in both cycle-2 attempts the model, having
+  triggered an offload on its own out-of-scope read, then issued
+  further `fs_read_file` calls against the *offloaded copy* of the file
+  it had just read, in shrinking ranges — a second, milder echo of
+  cycle 1's thrash pattern, this time caused by the offload preview
+  being too thin for the model to tell it already had the content
+  nearby. Worth checking whether the preview could hint the byte range
+  already covered, or whether the model's own prior read should be
+  reusable without a second tool round-trip.
 
 ## Cycle log
 
@@ -183,3 +231,114 @@ the model at it the same way. Consider also lowering the per-attempt
 token cost of the standing prompt (e.g. permit `wc -l`-style line-count
 disclosure up front so the model doesn't need to discover file length by
 binary search) as a mitigation independent of the fix.
+
+### Cycle 2 (2026-08-13)
+
+**Run stats.** Two attempts (one run + the one permitted retry, per the
+loop's cost bound), both discarded before commit, for two different
+root causes — neither a repeat of cycle 1's ranged-read bug.
+
+| | attempt 1 (no explicit `--timeout-secs`, so CLI default `120` applied) | attempt 2 (retry, `--timeout-secs 300`) |
+|---|---|---|
+| wall time | 120.0s | 238.1s |
+| tool calls | 21 (2 list + 17 read + 1 `Agent` spawn) | 15 (2 list + 11 read + 1 `Agent` round, incl. 3 parallel sub-agents in one round) |
+| ranged-read thrash on `orchestrator.rs`/target files | **0** — three wide ranges (1-1100, 1100-2200, 2200-3221) each returned full-width, no cap stalls | **0** — same three ranges, same result |
+| off-task detour | listed+read `crates/kitsu/src/{cli,config}.rs` (never named in task), 1 `Agent` spawn (65.2s) | listed+read `crates/kitsu/src/main.rs` (never named in task), 1 `Agent` spawn (64.7s) + 3 parallel `Agent` spawns (70.9s) |
+| `kitsu-usage` prompt/completion/total | **none printed** — turn cancelled before a usage line was ever emitted | 425,660 / 8,852 / 434,512 |
+| `kitsu-context` used/effective/window | none printed | 57,452 / 125,072 / 131,072 |
+| outcome | discarded, outer 120s wall-clock timeout (`inference provider attempt 1/3: cancelled; ...; 107590ms deadline remaining` — the *inner* per-attempt budget still had time left) | discarded, `model output was truncated by its length limit` (`--max-output-tokens 6000` exhausted, 2x `response truncated` warnings) |
+
+Combined accounted tokens: 434,512 (attempt 1 reported none despite ~120s
+of real inference — a receipts gap, see backlog). Both figures are far
+above the loop's "low tens of thousands of tokens" cost bound, driven
+almost entirely by the unplanned `crates/kitsu/src` detour rather than
+by the three files the task actually named.
+
+**Deliverable grade: F (no deliverable), same as cycle 1 but for new
+reasons.** `reviews/kimi-cycle-2.md` is a supervisor-authored failure
+record. The model never reached the "write the review" step in either
+attempt. Every read of the task's named files (`context.rs`,
+`orchestrator.rs`, `crates/kitsu-providers/src`) was clean, correctly
+scoped, and — critically — free of cycle 1's ranged-read thrash. What
+sank both attempts instead was the model spawning its own `Agent(...)`
+sub-agent tool to chase file:line citations in files the task never
+named (`crates/kitsu/src/{cli,config,main}.rs`), which alone accounted
+for the bulk of both the wall-clock and token overrun. The standing
+caching/context-window review carries over to cycle 3 unchanged.
+
+**Ranged-read fix: confirmed held under real load.** Verified against
+the *main checkout's* `crates/kitsu-tools/src/builtins/fs.rs` (the
+worktree's own checkout is still pre-fix; the binary run in this cycle
+was built from main, which has the fix at commit `f3d579c`):
+`read_capped_line_range` (`fs.rs:372-421`) streams to the requested
+range and caps relative to it, dispatched from `fs.rs:515-522` whenever
+`start_line`/`end_line` is present, with the `served`/`total` disclosure
+at `fs.rs:530` now computed post-slice. Both cycle-2 attempts read the
+same ~128 KiB `orchestrator.rs` in the same three wide ranges cycle 1
+thrashed on, and both came back full-width with zero stalls. **The
+served-of-total disclosures matched reality this time** — no ranged
+read under-reported what it actually returned, unlike cycle 1.
+
+**Weaknesses observed (ranked):**
+
+1. **A wall-clock-cancelled turn reports zero cost receipts.** Repro:
+   run a tool-heavy turn against a slow/queued provider without an
+   explicit `--timeout-secs` (CLI default is 120s, confirmed at
+   `crates/kitsu/src/cli.rs:95` in the worktree checkout); when the
+   outer wall clock cuts the turn off, no `kitsu-usage`/`kitsu-context`
+   line is ever printed, even though the provider's own status line
+   (`inference provider attempt 1/3: cancelled; HTTP 200; cancelled;
+   terminal=true; 107590ms deadline remaining`) shows real inference
+   time was spent and the *inner* per-attempt deadline still had ~108s
+   left when the *outer* deadline killed it. An operator has no way to
+   see what a cancelled-but-not-yet-billed-looking turn actually cost.
+2. **The model's `Agent(...)` sub-agent tool is expensive and
+   unbounded.** Repro: give kitsu a scoped task naming exact files; in
+   both cycle-2 attempts the model read every named file cleanly, then
+   spawned `Agent(...)` (65-71s per spawn, including three *parallel*
+   spawns in one round in attempt 2) to verify citations in files the
+   task never mentioned. Nothing in kitsu bounds or surfaces sub-agent
+   cost to the model mid-turn; the detour alone consumed the entire
+   wall-clock budget in attempt 1 and ~80% of the token budget in
+   attempt 2.
+3. **Reasoning-token consumption can exhaust `--max-output-tokens` with
+   zero visible output.** Repro: run a reasoning-capable model
+   (Kimi-K3) with `--max-output-tokens 6000` on a tool-heavy turn;
+   attempt 2 hit `response truncated: model hit its output length
+   limit` twice and finished with `completion_tokens: 8852` (over the
+   nominal 6000 cap) with no deliverable ever written. kitsu has no
+   separate headroom knob or warning for reasoning models whose hidden
+   reasoning eats the same budget as final output — this is exactly one
+   of the context-window-management risks the standing task itself asks
+   the model to analyze.
+4. **The offload-preview path can trigger a second-order,
+   self-inflicted thrash.** Repro: read a large out-of-scope file so it
+   gets offloaded (`/tmp/kitsu-offload-*/...txt`, 500-char in-context
+   preview); in both attempts the model then issued further
+   `fs_read_file` calls against its *own offloaded output* in shrinking
+   ranges (700→400→350→150 lines) rather than recognizing it already
+   had the content. Milder than cycle 1's thrash but the same underlying
+   shape: the model unsure how much of a file it already has visibility
+   into.
+5. **The literal cycle-2 command (no explicit `--timeout-secs`) fails
+   fast against the CLI's 120s default** as soon as the model does
+   anything beyond the minimum scoped reads — the supervisor deviated
+   from the literal spec on the retry (`--timeout-secs 300`, matching
+   cycle 1's own precedent) specifically to give the model room to
+   finish; even then it failed for a different reason (finding 3). The
+   loop's standing-task guidance doesn't currently pin a
+   `--timeout-secs` value, which made this cycle's attempt-1 failure
+   mode a process gap as much as a kitsu one.
+
+**Improvements to schedule:** (a) surface partial/cancelled-call usage
+so timed-out turns aren't a total token-cost blackout (weakness 1); (b)
+give the model (or the operator) visibility into cumulative sub-agent
+time/token cost mid-turn, and/or cap sub-agent depth or count per turn
+(weakness 2); (c) consider a reasoning-headroom option — either a
+separate hidden-reasoning budget or a warning when `--max-output-tokens`
+looks small relative to a known reasoning model (weakness 3); (d) make
+the offload preview disclose enough (e.g. line-range coverage) that a
+re-read of the model's own offloaded output isn't the default move
+(weakness 4); (e) pin `--timeout-secs 300` explicitly in this loop's
+standing task/rules doc so cycle 3 doesn't repeat attempt 1's
+easily-avoidable timeout.
