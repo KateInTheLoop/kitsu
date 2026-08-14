@@ -52,11 +52,16 @@ guarantees requires a new schema identifier.
   New producers include `structured_output`; it is true only when that request
   carried a provider-native strict JSON Schema response format. The schema body
   is never duplicated in this event.
-- Provider requests, attempts, and usage carry `purpose: "inference"` for the
-  answer-producing loop or `purpose: "compaction"` for a hidden summarizer
-  call. A scripted manual `/compact` associates those records with its `line`
-  and `command`, between `command_started` and `command_finished`; automatic
-  compaction uses the surrounding `turn_id` and round.
+- Provider requests and attempts carry `purpose: "inference"` for the
+  answer-producing loop, `purpose: "compaction"` for a hidden summarizer, or
+  `purpose: "model_catalog"` for an explicit catalog lookup. Usage records
+  exist only for inference and compaction. A top-level `kitsu models` lookup
+  uses `operation_id: "models:1"`; scripted `/models` and `/model ...` lookups
+  use their `line` and `command`, between `command_started` and
+  `command_finished`. Manual `/compact` uses the same command identity, while
+  automatic compaction uses the surrounding `turn_id` and round. Catalog
+  requests have `message_count: 0`, `tools_offered: 0`, and
+  `structured_output: false`.
 - Each completed physical HTTP send produces one `provider_attempt`
   disposition. It is nonterminal only when `retry_scheduled` commits to a later
   attempt; final rejection, transport/body failure, success, and cancellation
@@ -64,6 +69,11 @@ guarantees requires a new schema identifier.
   during backoff, a statusless terminal event for its attempt number closes the
   earlier nonterminal disposition even though no HTTP send began. Retries never
   add another `provider_request`.
+- Model-catalog cache hits still have a logical `provider_request` but no
+  `provider_attempt`, because no HTTP send occurred. An uncached catalog GET
+  has `max_attempts: 1`; its bounded body read and catalog-shape validation are
+  part of that attempt, so malformed or oversized successful bodies terminate
+  as `body_failed` rather than being mislabeled as transport success.
 - When a connection failure belongs to a selected Ollama profile whose
   configured host is structurally loopback, the terminal `error` also carries
   `diagnostic_code: "local_ollama_unreachable"` and the bounded

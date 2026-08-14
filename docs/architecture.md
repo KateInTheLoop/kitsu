@@ -66,18 +66,27 @@ construction-time concern, not a trait concern.
 - The "profile" concept gives the user the `--gateway <name>` UX (one tool, many gateways)
   without coupling that selection to the provider taxonomy, and keeps existing Phase 1/2 work intact.
 
-### Trait shape (reuses design.md §5.1, no signature change)
+### Trait shape
 
 ```rust
 // kitsu-providers
 pub trait Provider {
     async fn healthcheck(&self) -> Result<(), ProviderError>;
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError>;
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError>;
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError>;
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError>;
 }
 ```
 
-`OpenAICompatProvider` gains construction-time fields (not new trait methods):
+`OpenAICompatProvider` uses these construction-time fields:
 
 ```rust
 pub struct OpenAICompatProvider {

@@ -167,7 +167,11 @@ Human `kitsu models` output on a terminal and interactive `/models` show a
 12-row preview with the active model pinned and marked first, plus an exact
 substring-filter hint. Redirected `kitsu models` stdout remains the complete
 newline-delimited ID list for scripts; `--jsonl` likewise retains the complete
-structured catalog.
+structured catalog. JSONL catalog traffic is causally framed as a logical
+`provider_request` with `purpose: "model_catalog"`, followed by one
+`provider_attempt` for an actual GET (and none for a cache hit), before the
+catalog or typed error. Top-level lookup uses `operation_id: "models:1"`;
+scripted slash lookups retain their `line` and `command` identity.
 
 Input history and interactive conversation snapshots live in private Kitsu state
 under `~/.kitsu/` (project-local configs get an isolated, stable versioned profile

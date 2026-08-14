@@ -42,6 +42,14 @@ same scoped failure adds `diagnostic_code: "local_ollama_unreachable"` and
 bounded recovery-action enums, so automation does not need to parse prose;
 generic connection failures omit those optional fields.
 
+JSONL catalog discovery does not hide its network lifecycle. Top-level
+`kitsu models` and scripted `/models` or `/model ...` emit a logical
+`provider_request` with `purpose: "model_catalog"`; each uncached physical GET
+then emits one bounded, secret-free `provider_attempt` before the catalog or
+typed error. Top-level events use `operation_id: "models:1"`, while scripted
+events keep their command line and text. A provider-local cache hit emits no
+attempt because it performs no send.
+
 For `bearer-env`, a non-empty configured environment value wins over the
 managed credential. A malformed/non-Unicode environment value fails closed and
 never falls back. Managed values are bounded, atomically replaced, `0600`
