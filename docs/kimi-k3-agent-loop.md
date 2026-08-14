@@ -666,6 +666,97 @@ Kimi-K3 has a genuine, accurately-cited, banked contribution. Proceed to
 the cycle-5 task (usage/caching slice over `crates/kitsu-providers/src`)
 per the Success ramp at the top of this doc.
 
+### Cycle 5 (2026-08-14)
+
+**FAILED — output-budget truncation, no retry taken.** Pre-flight passed
+(HTTP 200); the cycle-5 usage/caching task (read `types.rs` whole +
+`openai_compat.rs` in two ranges, then write a two-part review) reached the
+model cleanly but was truncated by `--max-output-tokens 14000` before any
+visible output was produced. This is **not** a second consecutive banked
+deliverable — the cycle-4→5 streak is broken.
+
+**Run stats.**
+
+| | attempt 1 (no retry — see below) |
+|---|---|
+| wall time | 106.8s |
+| tool calls | 3 (`Read` types.rs whole, `Read` openai_compat.rs 1-850, `Read` openai_compat.rs 850-1694) — 0 list calls, 0 `Agent` spawns |
+| ranged-read behavior | both ranges on the 1,694-line file returned full width instantly (0ms each) — the range-cap fix (confirmed cycle 2, re-confirmed cycle 4) held again under this cycle's load |
+| visible output before truncation | one sentence ("I'll read the two files now — all three ranges in parallel."), then nothing |
+| `kitsu-usage` prompt/completion/total | 19,620 / 14,322 / 33,942 — **completion_tokens exceeded the nominal 14,000 cap** (first cycle where this happened, not merely approached it) |
+| `kitsu-context` used/effective/window | 17,007 / 117,072 / 131,072 |
+| truncation warnings | 1 (`response truncated: model hit its output length limit`) |
+| outcome | provisional output DISCARDED, 0 files written, exit code 2 |
+
+**Why no retry.** The loop's rules permit a retry only "on transport
+failure" (HTTP-layer errors like cycle 1's `429` or cycle 3's `402`). This
+attempt was HTTP-200 throughout — both files were read successfully, and
+the failure was kitsu's own output-length enforcement, not a network/rate-
+limit/billing fault. Retrying the identical command would very likely
+reproduce the same truncation, so no retry was taken; the cycle is recorded
+as a single-attempt failure per the rules as written.
+
+**Deliverable grade: F (no model deliverable).** `reviews/kimi-cycle-5.md`
+is a supervisor-authored failure record (following the cycle 1/3
+precedent), not a Kimi-authored review — there were no model citations to
+spot-check. To keep the record useful, the supervisor independently
+grounded the `cached_tokens`-drop half of the task directly in the same two
+files: `crates/kitsu-providers/src/types.rs:136-144` defines `Usage` with
+exactly `prompt_tokens`/`completion_tokens`/`total_tokens`, no
+`deny_unknown_fields`, so HF's `prompt_tokens_details.cached_tokens` is
+silently dropped by serde during deserialization before any Rust code sees
+it; both the streaming path (`openai_compat.rs:252/294/373-374/449-453/
+534-535`) and non-streaming path (`openai_compat.rs:616-618`) decode into
+that same `Usage` type, so the drop is uniform across both. The 2-4 ranked
+caching proposals the task asked for were **not** attempted by the
+supervisor (that synthesis needs the full 1,694-line file read the model
+never got to use) and remain open for the next attempt.
+
+**Weaknesses observed (ranked):**
+
+1. **Reasoning-token exhaustion can now overshoot the cap, not just
+   approach it.** Repro: same command class as cycle 2 (reasoning model,
+   tool-heavy but small turn) except this time `completion_tokens: 14322`
+   *exceeded* `--max-output-tokens 14000` outright, versus cycle 2's
+   `8852` against `6000` (also an overshoot, but on a much smaller,
+   already-known-insufficient budget) and cycle 4's clean finish at
+   `6282`/`14000`. This reconfirms the still-open backlog item
+   ("reasoning models can exhaust `--max-output-tokens` entirely on hidden
+   reasoning") with a second, independent data point on a *generous*
+   budget (14,000, more than double cycle 2's), showing the failure mode
+   scales with task complexity (two files + two-part analytical ask) more
+   than with the nominal cap size.
+2. **A turn that read 100% of its scoped material still loses everything
+   on truncation.** Repro: this attempt performed exactly the 3 reads the
+   task named, cleanly, then was truncated — reconfirming the open backlog
+   item that failed turns discard all prior tool-call work wholesale, this
+   time with the smallest possible "wasted work" case (3 clean, correctly-
+   scoped reads, zero thrash) still fully discarded.
+3. **The range-cap fix continues to hold under real load** — both ranges
+   of the 1,694-line `openai_compat.rs` came back full-width in 0ms,
+   matching cycles 2 and 4's confirmation. No new evidence needed here;
+   noted only because this cycle's file was the largest single ranged-read
+   target attempted so far (1,694 lines vs cycle 2's 3,221-line file read
+   in three ranges, so still smaller, but the largest under the *current*,
+   narrower ramp scope).
+
+**Backlog status:** no items resolved this cycle. Reconfirmed (not newly
+opened): the reasoning-headroom item (now with two independent overshoot
+data points) and the failed-turn-discards-everything item. The
+`cached_tokens` backlog item is grounded more precisely (exact struct and
+line numbers identified above) but remains unchecked — no code change was
+made, and this run's own `kitsu-usage:` line predictably had no
+`cached_tokens` key (fresh single-turn session, not proof either way).
+
+**Ramp verdict: RETRY cycle 5** (not advance to cycle 6). Before the next
+attempt: raise `--max-output-tokens` further (e.g. 20,000-24,000) for any
+task asking the model to read *and analyze* two non-trivial files, or split
+the task further (locate-and-cite the drop as one narrow attempt, produce
+the ranked caching proposals as a second) — mirroring the ramp's own
+strategy of narrowing scope until a turn reliably completes, applied one
+notch further given this cycle's evidence that two-file analytical tasks
+need materially more budget than cycle 4's single-file, single-ask task.
+
 ### Cycle 7 — 2026-08-14 — FIRST CODE CONTRIBUTION (grade A-)
 
 Kimi implemented its own cycle-6 P3 design: surface `cached_tokens`
