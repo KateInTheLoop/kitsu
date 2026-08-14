@@ -1,11 +1,12 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **BLOCKED AT BIRTH 2026-08-14: the HF test token was rotated** (401 on
-> `whoami-v2`; the router's `/v1/models` is public, so listings still
-> "work" — do not mistake that for auth). The same rotation breaks the
-> Kimi loop. Each hourly tick runs a single cheap auth probe first; on
-> 401/402 the tick ends silently (no agent spawned). The loop goes live
-> the moment a fresh token is present.
+> **LIVE 2026-08-14 — cycle 1 banked (grade B).** A working HF token
+> (Inference-Providers scope) is at `~/.cache/kitsu-hf-token`; each tick
+> reads it there and probes once — on 401/402/403 or missing file the
+> tick ends silently. DeepSeek-V4-Pro reaches the `:together` provider,
+> tool calls come back intact, and `--reasoning-effort low` is
+> load-bearing (see cycle 1). See the Cycle log for the standing
+> weakness backlog this loop has produced.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -82,4 +83,47 @@ contributors in the same hour.
 
 ## Cycle log
 
-(appended by the supervisor each cycle, newest last)
+(appended by the supervisor each cycle, newest last; per-cycle detail
+also lives in this doc's copy on `dogfood/deepseek-v4`)
+
+### Cycle 1 — 2026-08-14 — DeepSeek debut (grade B)
+
+Branch `dogfood/deepseek-v4` off clean `origin/main` (ff329eb); same
+`context.rs` review task Kimi banked at A in its cycle 4, for a direct
+cross-model comparison. Commit `8cac2fa`, Kate identity verified, pushed.
+
+**Phase A — router format probes (`DeepSeek-V4-Pro:together`):**
+- Hidden reasoning is returned under the key **`reasoning`** (the spec
+  guessed `reasoning_content`; kitsu should tolerate both). `--reasoning-effort
+  low` shrinks it measurably (24 vs 49 reasoning tokens) and is
+  **load-bearing, not just cost**: without it a tight `max_tokens` was
+  fully consumed by reasoning → empty `content`, `finish_reason:length`.
+- Forced tool call returns structurally intact from `:together` (valid
+  id/type/name, well-formed JSON args) — one clean sample.
+- `prompt_tokens_details.cached_tokens` present (0 on one-off calls);
+  `completion_tokens_details.reasoning_tokens` also present.
+
+**Phase B — review:** 8 concrete, non-hallucinated proposals (spotted
+the doc-comment "circuit breaker" that isn't implemented, binary
+`had_schema` losing granularity, a stale buffer cap). kitsu-usage
+31,447 / 4,817 / 36,264 — under the 40K target, cheaper than Kimi
+cycle 4. **Docked to B:** citation accuracy degrades past the first
+third (buffer-cap cited at "line 203", actually 166; `ContextBudget::new`
+at "186–205" vs real 159–173), and the model's own unprompted
+"verification" pass rubber-stamped the drift instead of catching it.
+
+**Comparison to Kimi cycle 4 (A):** Kimi's citations were letter-perfect
+with per-proposal risk analysis; DeepSeek shipped more proposals but
+weaker grounding and no risk sections. **Kimi cycle 4 remains the higher
+bar.** DeepSeek's ramp lesson mirrors Kimi's: it needs the write-first,
+cite-carefully discipline; a citation-verification step in the brief may
+help next cycle.
+
+**kitsu weaknesses filed (backlog for the main capability loop):**
+- W1: top-level `kitsu --allow-path/--allow-write/--agent-spawn-cap`
+  fail without hinting the flag lives under the `chat` subcommand — a
+  clear-error-with-suggestion opportunity (cost the supervisor one retry).
+- W2: a response with empty `content` + `finish_reason:length` +
+  `reasoning_tokens` near the cap is a silent-truncation footgun — kitsu
+  should emit a warning ("output budget consumed entirely by hidden
+  reasoning; raise --max-output-tokens or lower --reasoning-effort").

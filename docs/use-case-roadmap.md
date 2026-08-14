@@ -152,6 +152,20 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
 - R4.5 **Retry/resume ergonomics**: a failed unattended run resumes from
   its last good turn. *Accept:* killing a `--script` run mid-way and
   re-running with `--resume` continues past completed steps.
+- R4.6 **Reasoning-exhaustion warning** (surfaced by both Kimi and
+  DeepSeek loops): when a turn returns empty `content` with
+  `finish_reason:length` and reasoning tokens at/near the output cap, the
+  whole budget was silently consumed by hidden reasoning — an unattended
+  run just burns tokens producing nothing. kitsu should detect this and
+  emit an actionable warning ("output budget consumed by hidden
+  reasoning; raise --max-output-tokens or lower --reasoning-effort"),
+  ideally as a distinct machine-record field. *Accept:* a forced
+  reasoning-overflow turn emits the warning on stderr and a flag in the
+  JSONL/usage record; a normal turn does not.
+- R4.7 **Subcommand-flag hint** (surfaced by the DeepSeek loop): top-level
+  `kitsu --allow-path/--allow-write/--agent-spawn-cap …` fails because
+  those are `chat` subcommand flags, with no hint pointing there. *Accept:*
+  the error names the flag and suggests it belongs under `chat`.
 
 ## 5. Security tooling — *described, deprioritized*
 
