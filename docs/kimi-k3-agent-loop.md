@@ -91,7 +91,28 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 - **Never** run the Kimi loop and edit the same files from the main
   session simultaneously; the branches keep the work disjoint.
 
+> **FIRST BANKED DELIVERABLE — 2026-08-14, ramp cycle 4.** Credits
+> returned; the narrow-scope ramp worked exactly as designed: one Read,
+> one Write, 59s, 23,899 tokens (vs 187K-434K in the failed cycles),
+> zero spawns, zero truncation. `reviews/kimi-cycle-4.md` (commit
+> `47a95ff` on dogfood/kimi-k3): 5 ranked proposals on context.rs, every
+> line citation independently verified accurate, grade A. Ramp advanced
+> to cycle 5 (providers usage/caching slice).
+
 ## Improvement backlog (fed by supervisor observations)
+
+Kimi-authored proposals from cycle 4 (verified citations; triage into
+kitsu-core work as capacity allows):
+
+- [ ] `context.rs:100-107` — anchor validity is length-only; an in-place
+  edit inside the anchored prefix keeps a stale anchor "valid". Add a
+  prefix fingerprint or generation counter.
+- [ ] `context.rs:79-81` — gateway-reported `prompt_tokens` is trusted
+  unsanitized; one bad value poisons estimates until the next record.
+  Distrust anchors diverging >~2.5x from the full estimate.
+- [ ] `context.rs:166` — trim buffer `min(window/10, 2048)` goes flat
+  above 20,480-token windows while absolute estimate error keeps
+  growing; scale the cap with the window.
 
 - [ ] `--model` override drops the gateway profile's `context_window`
   (observed 2026-08-13: `ask` with `--model moonshotai/Kimi-K3` fell back
