@@ -113,10 +113,27 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 > spot-checked (context.rs exact; orchestrator ≤15-line drift). The
 > loop's founding goal — the definitive caching + context-window
 > review — exists at reviews/kimi-cycle-6.md on the work branch.
-> **LOOP HOLDING**: ticks now pre-flight and stop with a one-line
-> status until the user picks the next act: (a) retire the loop,
-> (b) new ramp on a different focus area, or (c) implementation cycles
-> turning P1-P11 into code.
+> **FRONTIER ROOT-CAUSE COMPLETE — 2026-08-14 (user-directed).** Why
+> did open-ended tasks fail while spoon-fed ramp cycles succeeded?
+> Five tracked runs (A-E) + 10 router probes answered it. TWO causes:
+> (1) COST — hidden reasoning burn; the router honors
+> `reasoning_effort` (low: 542→82 completion tokens, tool-calling
+> intact) and `chat_template_kwargs {thinking:false}` (→26); kitsu's
+> existing `--reasoning-effort low` flag was simply never used by this
+> loop. (2) RELIABILITY — after long exploration (~11+ rounds), Kimi
+> emits its trailing Write in native `<|...|>` token format; weak
+> providers (featherless-class) mangle it into text debris (observed
+> debris contained the Write's file path), stronger ones (:together)
+> silently drop or the instruction drifts. Run E proved the fix: pin
+> `:together` + bound exploration ("at most N files") + write-FIRST
+> mandate → deliverable written cleanly (5 tool calls, 95K tokens).
+> kitsu now also detects the debris and re-prompts the destroyed call
+> (commit 20264cb). **THE FRONTIER RECIPE** for open-ended Kimi work
+> through kitsu: `--model moonshotai/Kimi-K3:together`,
+> `--reasoning-effort low` for exploration tasks (default thinking for
+> hard synthesis), bounded exploration in the prompt, write-early flow.
+> **LOOP RE-ARMED**: next ticks run open-ended cycles under the recipe
+> (implementation-grade tasks from the P1-P11 review are fair game).
 
 > **FIRST BANKED DELIVERABLE — 2026-08-14, ramp cycle 4.** Credits
 > returned; the narrow-scope ramp worked exactly as designed: one Read,
