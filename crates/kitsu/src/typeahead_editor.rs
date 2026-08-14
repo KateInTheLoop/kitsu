@@ -69,6 +69,11 @@ pub struct TypeaheadEditor {
     in_paste: bool,
     /// The previous pasted byte, for collapsing `\r\n` into one newline.
     last_paste_byte: u8,
+    /// A RecallRequest was already emitted in the current `feed` batch.
+    /// Without this gate, ↑↑ arriving in one read would emit twice and the
+    /// collector's second queue-pop would overwrite (lose) the first
+    /// recalled prompt.
+    recall_emitted: bool,
 }
 
 impl TypeaheadEditor {
@@ -93,6 +98,7 @@ impl TypeaheadEditor {
             utf8: Vec::new(),
             in_paste: false,
             last_paste_byte: 0,
+            recall_emitted: false,
         }
     }
 
@@ -136,6 +142,7 @@ impl TypeaheadEditor {
     /// Feed raw stdin bytes; returns whether a redraw is needed and any
     /// submissions/EOF that completed.
     pub fn feed(&mut self, bytes: &[u8]) -> FeedOutcome {
+        self.recall_emitted = false;
         let mut outcome = FeedOutcome::default();
         for &byte in bytes {
             self.feed_byte(byte, &mut outcome);
@@ -403,7 +410,11 @@ impl TypeaheadEditor {
     fn history_prev(&mut self, outcome: &mut FeedOutcome) {
         // The very first ↑ on an untouched draft is a recall point: queued
         // prompts (owned by the collector) take precedence over history.
-        if self.buffer.is_empty() && self.history_cursor.is_none() {
+        // At most one recall per feed batch — a second ↑ in the same read
+        // walks history instead, exactly as it would in a separate batch
+        // once the recall has landed in the draft.
+        if self.buffer.is_empty() && self.history_cursor.is_none() && !self.recall_emitted {
+            self.recall_emitted = true;
             outcome.actions.push(EditorAction::RecallRequest);
             return;
         }
@@ -550,6 +561,27 @@ mod tests {
         editor.history_prev_forced(&mut forced);
         assert!(forced.changed);
         assert_eq!(editor.buffer_string(), "old");
+    }
+
+    #[test]
+    fn double_up_in_one_batch_emits_a_single_recall_then_walks_history() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        // ↑↑ arriving in one read: exactly one RecallRequest (the collector
+        // pops exactly one queued prompt — nothing can be overwritten), and
+        // the second ↑ walks history as it would in a separate batch.
+        let outcome = editor.feed(b"\x1b[A\x1b[A");
+        let recalls = outcome
+            .actions
+            .iter()
+            .filter(|action| **action == EditorAction::RecallRequest)
+            .count();
+        assert_eq!(recalls, 1);
+        assert_eq!(editor.buffer_string(), "old");
+        // A fresh batch re-arms the recall point once the draft is empty.
+        editor.feed(b"\x15"); // Ctrl+U clears the walked entry
+        editor.replace_buffer("");
+        let outcome = editor.feed(b"\x1b[A");
+        assert_eq!(outcome.actions, vec![EditorAction::RecallRequest]);
     }
 
     #[test]
