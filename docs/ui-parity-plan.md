@@ -332,6 +332,20 @@ as escalation); findings are re-verified before applying. Cycle log:
   paste-state reset, escape sequences inert inside paste, C1-injection
   dropped. Deferred cosmetic: multi-line entries split on rustyline
   history-file reload next session.
+- **Cycle 2 (2026-08-13, 2dbcb8a + follow-up b5d503d)**: inline slash-command
+  hint (fish-style, dimmed) + Tab completion on the live mid-turn editor,
+  resolved against the SLASH_COMMANDS registry; editor stays hint-agnostic
+  (CompleteRequest action + replace_buffer). Haiku review caught the
+  windowing heuristic bug — fit_draft_window now reports windowing
+  authoritatively. PTY-verified: hint after "/queu", Tab completes to
+  /queue. Gates lesson recorded: run `cargo test --workspace
+  --no-fail-fast` — fail-fast at the known cli PTY failure was masking a
+  stale kitsu-tools assertion since cycle 31 (fixed in f3d579c alongside
+  the kimi-loop ranged-read cap fix).
+- Backlog (next cycles): hint ranking should prefer mid-turn-actionable
+  commands (/steer, /jobs, /queue) over registry order; Esc-to-clear
+  draft; queued-message stack visibility with ↑ recall of queued prompts;
+  multi-line draft wrap; Ctrl+R history search mid-turn.
 
 ## Protocol
 
