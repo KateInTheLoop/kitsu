@@ -8,12 +8,18 @@
 #
 # Auth methods:
 #   { method = "none" }                                   # no token (local servers)
-#   { method = "bearer-env", env = "SOME_TOKEN" }         # Authorization: Bearer $SOME_TOKEN
+#   { method = "bearer-env", env = "SOME_TOKEN" }         # env first; `kitsu auth login` fallback
 #   { method = "static", token = "..." }                  # inline token (discouraged)
 #
 # See README.md for the full guide and per-provider recipes.
 
 default_gateway = "ollama"
+
+# Optional privacy default: do not create automatic command-output or
+# oversized tool-result artifacts. Explicit sessions, credentials, -o, and
+# model filesystem writes are unaffected. The per-run equivalent is
+# `--no-artifacts`.
+# artifact_storage = false
 
 # ── Local: Ollama ────────────────────────────────────────────────────────────
 # `ollama serve` then `ollama pull llama3.2`. No credentials required.
@@ -55,6 +61,7 @@ auth        = { method = "bearer-env", env = "CUSTOM_GATEWAY_TOKEN", refresh_hin
 
 # ── Hugging Face Inference Providers (hosted) ────────────────────────────────
 # Token: huggingface.co/settings/tokens ("Make calls to Inference Providers").
+# Store it without shell persistence: `kitsu --gateway huggingface auth login`.
 # HF PRO adds monthly inference credits + higher limits, spent via the token.
 # Model = "<org>/<model>", optionally pin a provider: "<org>/<model>:together".
 # Reasoning models (e.g. openai/gpt-oss-120b) spend hidden reasoning tokens;
@@ -72,7 +79,7 @@ context_window = 131072
 # Hint wording is deliberately filter-safe: kitsu suppresses any hint that
 # resembles a credential (URL schemes, `hf_`/`sk-` prefixes, bare `token`
 # labels), so this must describe the fix without quoting one.
-auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Inference Providers key under huggingface.co settings, then export HF_TOKEN" }
+auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Hugging Face credential with 'Make calls to Inference Providers', then set HF_TOKEN" }
 
 # ── OpenAI (hosted) ──────────────────────────────────────────────────────────
 [gateways.openai]

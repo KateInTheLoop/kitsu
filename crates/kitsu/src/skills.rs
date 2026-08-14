@@ -53,7 +53,7 @@ const MAX_SKILL_RESOURCES_TOTAL_BYTES: usize = 512 * 1024;
 #[cfg(unix)]
 const MAX_RESOURCE_DIRECTORY_ENTRIES: usize = 64;
 
-fn stable_content_hash(bytes: &[u8]) -> String {
+pub(crate) fn content_sha256_hex(bytes: &[u8]) -> String {
     // Small dependency-free SHA-256 implementation for persisted provenance.
     // Filesystem authorization still comes from the pinned descriptor policy;
     // the digest gives resume/drift checks collision-resistant content identity.
@@ -194,9 +194,13 @@ fn stable_content_hash(bytes: &[u8]) -> String {
         }
     }
     format!(
-        "sha256-{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
+        "{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}{:08x}",
         state[0], state[1], state[2], state[3], state[4], state[5], state[6], state[7]
     )
+}
+
+fn stable_content_hash(bytes: &[u8]) -> String {
+    format!("sha256-{}", content_sha256_hex(bytes))
 }
 
 #[cfg(unix)]

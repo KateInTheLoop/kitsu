@@ -6,10 +6,12 @@ mod attachments;
 mod cli;
 mod command_artifact;
 mod config;
+mod credential_store;
 mod llms;
 mod prompt_queue;
 mod session;
 mod skills;
+mod structured_output;
 mod subagent;
 mod typeahead_editor;
 mod workspace;
@@ -18,18 +20,20 @@ use std::cell::{Cell, RefCell};
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use clap::Parser;
 use rustyline::ExternalPrinter as _;
 
-use cli::{Cli, Command, SessionCommand};
+use cli::{AuthCommand, Cli, Command, SessionCommand};
 use config::{Config, ConfigError, Gateway};
 use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
-use kitsu_core::{run_agent_turn_with_state, AgentConfig, CompactionMode};
+use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
-use kitsu_providers::{ChatMessage, Provider, ProviderError};
+use kitsu_providers::{
+    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderError,
+};
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
     PermissionRequest, Permissions, Prompter, Registry,
@@ -41,11 +45,59 @@ const EXIT_PROVIDER: i32 = 2;
 const EXIT_CANCELLED: i32 = 130;
 const JSONL_SCHEMA: &str = "kitsu.chat.v1";
 static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
-/// The run's durable session id, mirrored into `final_summary` so a CI
-/// consumer can extract "where did this conversation go" from the one frame
-/// it already parses, instead of scraping `run_started`/session events
-/// (cycle-12 automation audit #3). `None` renders as JSON null.
-static JSONL_SESSION_ID: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+/// Process-entry clock used by both human model-command receipts and JSONL's
+/// terminal summary. `Instant` avoids wall-clock jumps; conversion saturates
+/// for completeness even though a CLI process cannot realistically reach it.
+static RUN_STARTED_AT: OnceLock<Instant> = OnceLock::new();
+/// Set only by inference-capable commands, keeping management/help output free
+/// of an unrelated timing footer.
+static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+static OUTPUT_SCHEMA: OnceLock<structured_output::OutputSchema> = OnceLock::new();
+/// Terminal durability state mirrored into `final_summary`. A fresh session has
+/// a planned id before its first snapshot exists; exposing that id as resumable
+/// sent automation toward a file that was never created. Keep the plan and its
+/// materialization state together so the terminal id/state receipt cannot
+/// disagree (cycle-18 automation audit).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SessionSnapshotState {
+    Disabled,
+    PendingUntilFirstSuccess,
+    Resumable,
+}
+
+impl SessionSnapshotState {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Disabled => "disabled",
+            Self::PendingUntilFirstSuccess => "pending_until_first_success",
+            Self::Resumable => "resumable",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct JsonlSessionReceipt {
+    planned_id: Option<String>,
+    snapshot_state: SessionSnapshotState,
+}
+
+impl JsonlSessionReceipt {
+    const fn disabled() -> Self {
+        Self {
+            planned_id: None,
+            snapshot_state: SessionSnapshotState::Disabled,
+        }
+    }
+
+    fn terminal_id(&self) -> Option<String> {
+        (self.snapshot_state == SessionSnapshotState::Resumable)
+            .then(|| self.planned_id.clone())
+            .flatten()
+    }
+}
+
+static JSONL_SESSION_RECEIPT: Mutex<JsonlSessionReceipt> =
+    Mutex::new(JsonlSessionReceipt::disabled());
 static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
@@ -87,6 +139,14 @@ fn jsonl_run_id() -> &'static str {
     })
 }
 
+fn run_elapsed() -> Duration {
+    RUN_STARTED_AT.get_or_init(Instant::now).elapsed()
+}
+
+fn run_elapsed_ms() -> u64 {
+    u64::try_from(run_elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn jsonl_emitter() -> &'static Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::Stdout>> {
     static EMITTER: OnceLock<Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::Stdout>>> =
         OnceLock::new();
@@ -116,40 +176,823 @@ fn jsonl_output_failure() -> Option<CliError> {
         .map(CliError::jsonl_output)
 }
 
+/// Run-level counts of individual foreground tool-call errors. These are
+/// deliberately separate from `*_failures`, which count failed requested
+/// operations/turns. Policy errors are a subset of tool errors; recovered
+/// errors belong to a turn that ultimately committed.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ToolErrorTotals {
+    tool_errors: u64,
+    policy_errors: u64,
+    recovered_tool_errors: u64,
+    recovered_policy_errors: u64,
+}
+
+impl ToolErrorTotals {
+    fn from_turn(status: &kitsu_core::AgentTurnStatus, recovered: bool) -> Self {
+        let mut totals = Self::default();
+        totals.record_turn(status, recovered);
+        totals
+    }
+
+    fn record_turn(&mut self, status: &kitsu_core::AgentTurnStatus, recovered: bool) {
+        let tool_errors = u64::from(status.tool_errors);
+        let policy_errors = u64::from(status.policy_errors);
+        debug_assert!(policy_errors <= tool_errors);
+        self.tool_errors = self.tool_errors.saturating_add(tool_errors);
+        self.policy_errors = self.policy_errors.saturating_add(policy_errors);
+        if recovered {
+            self.recovered_tool_errors = self.recovered_tool_errors.saturating_add(tool_errors);
+            self.recovered_policy_errors =
+                self.recovered_policy_errors.saturating_add(policy_errors);
+        }
+    }
+}
+
 fn emit_jsonl_summary(
     status: &str,
     failures: usize,
     provider_failures: usize,
 ) -> Result<(), CliError> {
-    emit_jsonl_summary_with_local_failures(status, failures, provider_failures, 0, 0)
+    emit_jsonl_summary_with_local_failures(
+        status,
+        failures,
+        provider_failures,
+        0,
+        0,
+        0,
+        ToolErrorTotals::default(),
+    )
 }
 
 fn emit_jsonl_summary_with_local_failures(
     status: &str,
     failures: usize,
     provider_failures: usize,
+    output_schema_failures: usize,
     tool_failures: usize,
     policy_failures: usize,
+    tool_error_totals: ToolErrorTotals,
 ) -> Result<(), CliError> {
+    emit_jsonl_summary_with_postcondition_failures(
+        status,
+        failures,
+        provider_failures,
+        output_schema_failures,
+        0,
+        tool_failures,
+        policy_failures,
+        tool_error_totals,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_jsonl_summary_with_postcondition_failures(
+    status: &str,
+    failures: usize,
+    provider_failures: usize,
+    output_schema_failures: usize,
+    postcondition_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+    tool_error_totals: ToolErrorTotals,
+) -> Result<(), CliError> {
+    debug_assert!(output_schema_failures <= provider_failures);
     let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
+    let user_failures = failures
+        .saturating_sub(provider_failures + tool_failures + policy_failures + cancelled_failures);
+    debug_assert!(postcondition_failures <= user_failures);
+    let (session_id, session_snapshot_state) = {
+        let receipt = JSONL_SESSION_RECEIPT
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        (receipt.terminal_id(), receipt.snapshot_state.as_str())
+    };
     emit_jsonl(
         "final_summary",
         serde_json::json!({
             "status": status,
             "failures": failures,
             "provider_failures": provider_failures,
+            "output_schema_failures": output_schema_failures,
+            "postcondition_failures": postcondition_failures,
             "tool_failures": tool_failures,
             "policy_failures": policy_failures,
-            "user_failures": failures.saturating_sub(
-                provider_failures + tool_failures + policy_failures + cancelled_failures
-            ),
+            "tool_errors": tool_error_totals.tool_errors,
+            "policy_errors": tool_error_totals.policy_errors,
+            "recovered_tool_errors": tool_error_totals.recovered_tool_errors,
+            "recovered_policy_errors": tool_error_totals.recovered_policy_errors,
+            "user_failures": user_failures,
             "cancelled_failures": cancelled_failures,
-            "session_id": *JSONL_SESSION_ID
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner),
+            "duration_ms": run_elapsed_ms(),
+            "session_id": session_id,
+            "session_snapshot_state": session_snapshot_state,
         }),
     )?;
     JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
+    Ok(())
+}
+
+fn set_jsonl_session_receipt(planned_id: Option<String>, snapshot_state: SessionSnapshotState) {
+    *JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = JsonlSessionReceipt {
+        planned_id,
+        snapshot_state,
+    };
+}
+
+fn mark_jsonl_session_resumable(session_id: &str) {
+    set_jsonl_session_receipt(
+        Some(session_id.to_string()),
+        SessionSnapshotState::Resumable,
+    );
+}
+
+fn validate_output_last_message_surface(cli: &Cli) -> Result<(), CliError> {
+    let Some(destination) = cli.output_last_message.as_deref() else {
+        return Ok(());
+    };
+    let inference_surface = cli.print_prompt.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Ask { .. })
+                | Some(Command::Review { .. })
+                | Some(Command::Chat { .. })
+        );
+    if !inference_surface {
+        return Err(CliError::user(
+            "--output-last-message is supported only by non-interactive ask, review, piped chat, and scripted chat"
+                .to_string(),
+        ));
+    }
+    if cli.jsonl && destination.to_str().is_none() {
+        return Err(CliError::user(
+            "--output-last-message PATH must be valid UTF-8 when combined with --jsonl".to_string(),
+        ));
+    }
+    let interactive_surface = cli.print_prompt.is_none()
+        && match cli.command.as_ref() {
+            None => kitsu_render::stdin_is_tty(),
+            Some(Command::Chat { script, .. }) => script.is_none() && kitsu_render::stdin_is_tty(),
+            _ => false,
+        };
+    if interactive_surface {
+        return Err(CliError::user(
+            "--output-last-message is an automation mode; use --script, pipe one prompt, `ask`, or `review`"
+                .to_string(),
+        ));
+    }
+    session::validate_output_file_target(destination).map_err(CliError::user)
+}
+
+fn validate_output_schema_surface(cli: &Cli) -> Result<(), CliError> {
+    let Some(path) = cli.output_schema.as_deref() else {
+        return Ok(());
+    };
+    let inference_surface = cli.print_prompt.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Ask { .. })
+                | Some(Command::Review { .. })
+                | Some(Command::Chat { .. })
+        );
+    if !inference_surface {
+        return Err(CliError::user(
+            "--output-schema is supported only by non-interactive ask, review, piped chat, and scripted chat"
+                .to_string(),
+        ));
+    }
+    let interactive_surface = cli.print_prompt.is_none()
+        && match cli.command.as_ref() {
+            None => kitsu_render::stdin_is_tty(),
+            Some(Command::Chat { script, .. }) => script.is_none() && kitsu_render::stdin_is_tty(),
+            _ => false,
+        };
+    if interactive_surface {
+        return Err(CliError::user(
+            "--output-schema is an automation mode; use --script, pipe one prompt, `ask`, or `review`"
+                .to_string(),
+        ));
+    }
+    let schema = structured_output::OutputSchema::load(path).map_err(CliError::user)?;
+    OUTPUT_SCHEMA
+        .set(schema)
+        .map_err(|_| CliError::user("--output-schema was initialized more than once".to_string()))
+}
+
+fn active_output_schema() -> Option<&'static structured_output::OutputSchema> {
+    OUTPUT_SCHEMA.get()
+}
+
+fn emit_output_schema_receipt(cli: &Cli) -> Result<(), CliError> {
+    let Some(schema) = active_output_schema() else {
+        return Ok(());
+    };
+    if cli.jsonl {
+        emit_jsonl(
+            "output_schema",
+            serde_json::json!({
+                "name": "kitsu_output",
+                "bytes": schema.bytes,
+                "sha256": schema.sha256,
+                "strict": true,
+                "provider_format": "json_schema",
+                "schema_preflight_validated": true,
+                "local_validation": true,
+                "schema_content_included": false,
+                "model_file_authority": false,
+            }),
+        )?;
+    } else {
+        eprintln!(
+            "~ structured output: strict JSON Schema ({} bytes, sha256 {})",
+            schema.bytes, schema.sha256
+        );
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequiredWriteFingerprint {
+    bytes: usize,
+    sha256: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct RequiredWriteContract {
+    requested: String,
+    resolved: std::path::PathBuf,
+    initial: Option<RequiredWriteFingerprint>,
+    expected_sha256: Option<String>,
+}
+
+struct RequiredWriteEvaluation {
+    satisfied: bool,
+    results: Vec<serde_json::Value>,
+    failure: Option<CliError>,
+}
+
+fn required_write_fingerprint(
+    path: &std::path::Path,
+    perms: &Permissions,
+) -> Result<Option<RequiredWriteFingerprint>, String> {
+    let Some(bytes) =
+        kitsu_tools::builtins::fs::read_verified_write_target(path, perms.max_write_bytes())
+            .map_err(|error| error.to_string())?
+    else {
+        return Ok(None);
+    };
+    perms.check_write_size(bytes.len()).map_err(|error| {
+        format!(
+            "required-write target '{}' cannot be verified: {error}",
+            path.display()
+        )
+    })?;
+    Ok(Some(RequiredWriteFingerprint {
+        bytes: bytes.len(),
+        sha256: skills::content_sha256_hex(&bytes),
+    }))
+}
+
+fn required_write_fingerprint_bytes(bytes: &[u8]) -> RequiredWriteFingerprint {
+    RequiredWriteFingerprint {
+        bytes: bytes.len(),
+        sha256: skills::content_sha256_hex(bytes),
+    }
+}
+
+async fn prepare_required_writes(
+    requested_paths: &[String],
+    requested_sha256: &[String],
+    perms: &Permissions,
+) -> Result<Vec<RequiredWriteContract>, CliError> {
+    let mut requested_contracts = requested_paths
+        .iter()
+        .map(|requested| (requested.clone(), None, "--require-write"))
+        .collect::<Vec<_>>();
+    for encoded in requested_sha256 {
+        let (requested, sha256) = parse_required_write_sha256(encoded)?;
+        requested_contracts.push((requested, Some(sha256), "--require-write-sha256"));
+    }
+
+    let mut contracts: Vec<RequiredWriteContract> = Vec::with_capacity(requested_contracts.len());
+    for (requested, expected_sha256, option) in requested_contracts {
+        let resolved = perms
+            .check_write(std::path::Path::new(&requested))
+            .await
+            .map_err(|error| {
+                CliError::user(format!(
+                    "{option} target '{}' has no active model filesystem write authority: {error}; add --allow-write or --allow-read-write for its parent",
+                    requested
+                ))
+            })?;
+        if let Some(existing) = contracts
+            .iter_mut()
+            .find(|contract| contract.resolved == resolved)
+        {
+            if let Some(expected_sha256) = expected_sha256 {
+                match existing.expected_sha256.as_deref() {
+                    Some(existing_sha256) if existing_sha256 != expected_sha256 => {
+                        return Err(CliError::user(format!(
+                            "conflicting --require-write-sha256 expectations for '{}': {existing_sha256} and {expected_sha256}",
+                            resolved.display()
+                        )));
+                    }
+                    Some(_) => {}
+                    None => {
+                        if existing
+                            .initial
+                            .as_ref()
+                            .is_some_and(|initial| initial.sha256 == expected_sha256)
+                        {
+                            return Err(CliError::user(format!(
+                                "--require-write-sha256 target '{}' already has the required SHA-256 {expected_sha256} at launch; the required-write contract also requires a final content change, so this expectation cannot be satisfied",
+                                requested
+                            )));
+                        }
+                        existing.expected_sha256 = Some(expected_sha256);
+                    }
+                }
+            }
+            continue;
+        }
+        let initial = required_write_fingerprint(&resolved, perms).map_err(CliError::user)?;
+        if initial.is_some() {
+            perms.check_read(&resolved).await.map_err(|error| {
+                CliError::user(format!(
+                    "{option} target '{}' already exists but has no active model filesystem read authority: {error}; existing targets need --allow-read-write for their parent (or matching --allow-path in addition to write authority), while --allow-write alone is only valid for creating a new file",
+                    requested
+                ))
+            })?;
+        }
+        if let (Some(initial), Some(expected_sha256)) = (&initial, &expected_sha256) {
+            if initial.sha256 == *expected_sha256 {
+                return Err(CliError::user(format!(
+                    "--require-write-sha256 target '{}' already has the required SHA-256 {expected_sha256} at launch; the required-write contract also requires a final content change, so this expectation cannot be satisfied",
+                    requested
+                )));
+            }
+        }
+        contracts.push(RequiredWriteContract {
+            requested,
+            resolved,
+            initial,
+            expected_sha256,
+        });
+    }
+    Ok(contracts)
+}
+
+fn parse_required_write_sha256(encoded: &str) -> Result<(String, String), CliError> {
+    let Some((path, sha256)) = encoded.rsplit_once('=') else {
+        return Err(CliError::user(
+            "--require-write-sha256 expects PATH=SHA256 (PATH may contain '=')".to_string(),
+        ));
+    };
+    if path.is_empty() {
+        return Err(CliError::user(
+            "--require-write-sha256 expects a non-empty PATH before the final '='".to_string(),
+        ));
+    }
+    if sha256.len() != 64 || !sha256.bytes().all(|byte| byte.is_ascii_hexdigit()) {
+        return Err(CliError::user(
+            "--require-write-sha256 expects exactly 64 hexadecimal SHA-256 characters after the final '='"
+                .to_string(),
+        ));
+    }
+    Ok((path.to_string(), sha256.to_ascii_lowercase()))
+}
+
+fn required_write_targets(contracts: &[RequiredWriteContract]) -> Vec<String> {
+    contracts
+        .iter()
+        .map(|contract| contract.resolved.to_string_lossy().into_owned())
+        .collect()
+}
+
+fn required_write_expectations(contracts: &[RequiredWriteContract]) -> Vec<serde_json::Value> {
+    contracts
+        .iter()
+        .filter_map(|contract| {
+            contract.expected_sha256.as_ref().map(|sha256| {
+                serde_json::json!({
+                    "path": contract.resolved.to_string_lossy(),
+                    "sha256": sha256,
+                })
+            })
+        })
+        .collect()
+}
+
+fn required_write_system_instruction(contracts: &[RequiredWriteContract]) -> Option<String> {
+    (!contracts.is_empty()).then(|| {
+        let targets = serde_json::to_string(&required_write_targets(contracts))
+            .expect("required-write path list serializes");
+        let expectations = required_write_expectations(contracts);
+        let exact = if expectations.is_empty() {
+            String::new()
+        } else {
+            format!(
+                " Exact raw-byte SHA-256 expectations are host-verified for this JSON array: {}.",
+                serde_json::to_string(&expectations)
+                    .expect("required-write SHA-256 expectations serialize")
+            )
+        };
+        format!(
+            "\n\n---\nHost-enforced completion postcondition: before your final response, use the filesystem tools to make a real content change to every path in this JSON array: {targets}.{exact} The paths already have explicit write authority; this instruction grants no additional authority. A final response is not successful unless Kitsu verifies both the model-tool write and a final state different from process launch, plus every declared exact SHA-256 expectation."
+        )
+    })
+}
+
+fn emit_required_write_armed(
+    cli: &Cli,
+    contracts: &[RequiredWriteContract],
+) -> Result<(), CliError> {
+    if contracts.is_empty() {
+        return Ok(());
+    }
+    let targets = required_write_targets(contracts);
+    let expectations = required_write_expectations(contracts);
+    if cli.jsonl {
+        emit_jsonl(
+            "completion_postcondition",
+            serde_json::json!({
+                "phase": "armed",
+                "condition": "required_write",
+                "status": "pending",
+                "targets": targets,
+                "expectations": expectations,
+                "results": [],
+                "verification": "verified_model_fs_write_and_final_state_change",
+                "model_disclosed": true,
+                "write_authority_granted": false,
+            }),
+        )?;
+    } else {
+        eprintln!(
+            "~ completion postcondition armed: {} required model-written file(s)",
+            targets.len()
+        );
+    }
+    Ok(())
+}
+
+/// Return a bounded, host-owned repair instruction only when a model write is
+/// already journaled and its descriptor-pinned current bytes satisfy every
+/// ordinary mutation invariant except an exact SHA-256 expectation. Missing
+/// writes and unverifiable state remain the terminal postcondition's job; this
+/// gate must never broaden authority or turn a run-level contract into an
+/// eager per-turn failure.
+fn required_write_structured_repair(
+    contracts: &[RequiredWriteContract],
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+) -> Option<kitsu_core::StructuredFinalizationRepair> {
+    let mut targets = Vec::new();
+    for contract in contracts {
+        let Some(expected_sha256) = contract.expected_sha256.as_ref() else {
+            continue;
+        };
+        let Ok(Some((verification, Some(final_value)))) = journal
+            .verify_written_path_with_current_content(&contract.resolved, |current| {
+                current.map(required_write_fingerprint_bytes)
+            })
+        else {
+            continue;
+        };
+        let final_state_changed = match &contract.initial {
+            None => true,
+            Some(initial) => initial != &final_value,
+        };
+        if verification.net_content_changed
+            && verification.current_matches_latest_write
+            && final_state_changed
+            && final_value.sha256 != *expected_sha256
+        {
+            targets.push(kitsu_core::StructuredFinalizationRepairTarget {
+                path: contract.resolved.to_string_lossy().into_owned(),
+                expected_sha256: expected_sha256.clone(),
+                actual_sha256: final_value.sha256,
+            });
+        }
+    }
+    if targets.is_empty() {
+        return None;
+    }
+    targets.sort_by(|left, right| left.path.cmp(&right.path));
+    let disclosed_targets =
+        serde_json::to_string(&targets).expect("structured-finalization repair targets serialize");
+    Some(kitsu_core::StructuredFinalizationRepair {
+        cause: "required_write_sha256_mismatch".to_string(),
+        instruction: format!(
+            "Kitsu verified that the latest filesystem write does not yet match the required raw-byte SHA-256. Keep working with the available filesystem tools before answering. Correct these targets exactly: {disclosed_targets}. Do not give a final answer until every digest matches. This instruction grants no additional authority."
+        ),
+        targets,
+    })
+}
+
+fn evaluate_required_writes(
+    contracts: &[RequiredWriteContract],
+    perms: &Permissions,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+) -> RequiredWriteEvaluation {
+    if contracts.is_empty() {
+        return RequiredWriteEvaluation {
+            satisfied: true,
+            results: Vec::new(),
+            failure: None,
+        };
+    }
+    let mut results = Vec::with_capacity(contracts.len());
+    let mut failures = Vec::new();
+    for contract in contracts {
+        let journal_verification = journal
+            .verify_written_path_with_current_content(&contract.resolved, |current| {
+                current.map(required_write_fingerprint_bytes)
+            });
+        let (
+            journal_recorded,
+            journal_net_change,
+            current_matches,
+            journal_error,
+            final_value,
+            final_error,
+        ) = match journal_verification {
+            Ok(Some((verification, final_value))) => (
+                true,
+                verification.net_content_changed,
+                verification.current_matches_latest_write,
+                None,
+                final_value,
+                None,
+            ),
+            Ok(None) => match required_write_fingerprint(&contract.resolved, perms) {
+                Ok(value) => (false, false, false, None, value, None),
+                Err(error) => (false, false, false, None, None, Some(error)),
+            },
+            Err(error) => (false, false, false, Some(error.to_string()), None, None),
+        };
+        let final_state_changed = match (&contract.initial, &final_value) {
+            (None, Some(_)) => true,
+            (Some(initial), Some(final_value)) => initial != final_value,
+            _ => false,
+        };
+        let expected_sha256_matches = contract.expected_sha256.as_ref().map(|expected| {
+            final_value
+                .as_ref()
+                .is_some_and(|final_value| final_value.sha256 == *expected)
+        });
+        let satisfied = journal_recorded
+            && journal_net_change
+            && current_matches
+            && final_state_changed
+            && final_error.is_none()
+            && expected_sha256_matches != Some(false);
+        let reason = if satisfied {
+            None
+        } else if let Some(error) = journal_error.as_deref() {
+            Some(error.to_string())
+        } else if let Some(error) = final_error.as_deref() {
+            Some(error.to_string())
+        } else if !journal_recorded {
+            Some("no verified model filesystem write was recorded".to_string())
+        } else if !journal_net_change || !final_state_changed {
+            Some("final file contents do not differ from process launch".to_string())
+        } else if !current_matches {
+            Some("current file no longer matches the latest verified model write".to_string())
+        } else if expected_sha256_matches == Some(false) {
+            Some(format!(
+                "final raw-byte SHA-256 {} does not match required {}",
+                final_value
+                    .as_ref()
+                    .map_or("missing", |value| value.sha256.as_str()),
+                contract
+                    .expected_sha256
+                    .as_deref()
+                    .expect("mismatch requires an exact expectation")
+            ))
+        } else {
+            Some("required write could not be verified".to_string())
+        };
+        if let Some(reason) = reason.as_ref() {
+            failures.push(format!("{} ({reason})", contract.requested));
+        }
+        results.push(serde_json::json!({
+            "path": contract.resolved.to_string_lossy(),
+            "requested_path": contract.requested,
+            "satisfied": satisfied,
+            "journal_recorded": journal_recorded,
+            "journal_net_content_changed": journal_net_change,
+            "current_matches_latest_write": current_matches,
+            "final_state_changed": final_state_changed,
+            "initial_bytes": contract.initial.as_ref().map(|value| value.bytes),
+            "initial_sha256": contract.initial.as_ref().map(|value| value.sha256.as_str()),
+            "final_bytes": final_value.as_ref().map(|value| value.bytes),
+            "final_sha256": final_value.as_ref().map(|value| value.sha256.as_str()),
+            "expected_sha256": contract.expected_sha256.as_deref(),
+            "expected_sha256_matches": expected_sha256_matches,
+            "reason": reason,
+        }));
+    }
+    let satisfied = failures.is_empty();
+    let failure = (!satisfied).then(|| {
+        CliError::user(format!(
+            "completion postcondition failed: required write contract was not satisfied for {}",
+            failures.join(", ")
+        ))
+    });
+    RequiredWriteEvaluation {
+        satisfied,
+        results,
+        failure,
+    }
+}
+
+fn emit_required_write_evaluation(
+    cli: &Cli,
+    contracts: &[RequiredWriteContract],
+    evaluation: &RequiredWriteEvaluation,
+) -> Result<(), CliError> {
+    if contracts.is_empty() {
+        return Ok(());
+    }
+    if cli.jsonl {
+        let expectations = required_write_expectations(contracts);
+        emit_jsonl(
+            "completion_postcondition",
+            serde_json::json!({
+                "phase": "evaluated",
+                "condition": "required_write",
+                "status": if evaluation.satisfied { "satisfied" } else { "failed" },
+                "targets": required_write_targets(contracts),
+                "expectations": expectations,
+                "results": evaluation.results,
+                "verification": "verified_model_fs_write_and_final_state_change",
+                "model_disclosed": true,
+                "write_authority_granted": false,
+            }),
+        )?;
+    } else if evaluation.satisfied {
+        eprintln!(
+            "~ completion postcondition satisfied: {} required model-written file(s) verified",
+            contracts.len()
+        );
+    } else if let Some(error) = evaluation.failure.as_ref() {
+        eprintln!("~ {}", terminal_inline(&error.to_string()));
+    }
+    Ok(())
+}
+
+fn emit_required_write_error(cli: &Cli, error: &CliError) -> Result<(), CliError> {
+    if cli.jsonl {
+        emit_jsonl(
+            "error",
+            serde_json::json!({
+                "kind": "postcondition",
+                "condition": "required_write",
+                "message": error.to_string(),
+                "exit_code": error.exit_code(),
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn reject_host_file_command_authority(
+    path: &std::path::Path,
+    option: &str,
+    purpose: &str,
+    writable_roots: &[std::path::PathBuf],
+    readonly_runtime_roots: &[std::path::PathBuf],
+) -> Result<(), CliError> {
+    let parent = path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let name = path.file_name().ok_or_else(|| {
+        CliError::user(format!(
+            "{option} {purpose} '{}' has no filename",
+            path.display()
+        ))
+    })?;
+    let canonical_parent = std::fs::canonicalize(parent).map_err(|error| {
+        CliError::user(format!(
+            "cannot resolve {option} parent '{}': {error}",
+            parent.display()
+        ))
+    })?;
+    let canonical_target = canonical_parent.join(name);
+
+    for (roots, label) in [
+        (writable_roots, "writable command root"),
+        (readonly_runtime_roots, "read-only command runtime root"),
+    ] {
+        if let Some(root) = roots.iter().find(|root| canonical_target.starts_with(root)) {
+            return Err(CliError::user(format!(
+                "{option} {purpose} '{}' is visible inside {label} '{}'; choose a separate host-owned path outside command authority",
+                path.display(),
+                root.display()
+            )));
+        }
+    }
+
+    #[cfg(unix)]
+    if let Ok(metadata) = std::fs::symlink_metadata(&canonical_target) {
+        use std::os::unix::fs::MetadataExt as _;
+        if metadata.nlink() > 1 {
+            return Err(CliError::user(format!(
+                "{option} {purpose} '{}' has multiple hard links while command tools are enabled; choose a single-link host-owned file",
+                path.display()
+            )));
+        }
+    }
+    Ok(())
+}
+
+fn reject_host_output_command_authority(
+    cli: &Cli,
+    writable_roots: &[std::path::PathBuf],
+    readonly_runtime_roots: &[std::path::PathBuf],
+) -> Result<(), CliError> {
+    if let Some(destination) = cli.output_last_message.as_deref() {
+        reject_host_file_command_authority(
+            destination,
+            "--output-last-message",
+            "destination",
+            writable_roots,
+            readonly_runtime_roots,
+        )?;
+    }
+    if let Some(schema) = cli.output_schema.as_deref() {
+        reject_host_file_command_authority(
+            schema,
+            "--output-schema",
+            "file",
+            writable_roots,
+            readonly_runtime_roots,
+        )?;
+    }
+    Ok(())
+}
+
+fn write_output_last_message(cli: &Cli, turn_id: &str, text: &str) -> Result<(), CliError> {
+    let Some(destination) = cli.output_last_message.as_deref() else {
+        return Ok(());
+    };
+    if let Err(error) = session::atomic_write_output_file(destination, text.as_bytes()) {
+        let installed = error.installed;
+        return Err(CliError::user(format!(
+            "failed to write --output-last-message '{}': {error}{}",
+            destination.display(),
+            if installed {
+                "; the exact message was installed, but durability could not be confirmed"
+            } else {
+                "; the destination was left unchanged"
+            }
+        )));
+    }
+    if cli.jsonl {
+        emit_jsonl(
+            "output_last_message",
+            serde_json::json!({
+                "turn_id": turn_id,
+                "destination": destination
+                    .to_str()
+                    .expect("JSONL output destination validated as UTF-8"),
+                "bytes": text.len(),
+                "sha256": skills::content_sha256_hex(text.as_bytes()),
+                "atomic": true,
+                "assistant_committed": true,
+                "content_included": false,
+                "model_write_authority": false,
+            }),
+        )?;
+    } else {
+        eprintln!(
+            "~ saved last committed assistant message to {} ({} bytes, atomic)",
+            terminal_inline(&destination.display().to_string()),
+            text.len(),
+        );
+    }
+    Ok(())
+}
+
+fn emit_output_last_message_error(
+    cli: &Cli,
+    turn_id: &str,
+    error: &CliError,
+) -> Result<(), CliError> {
+    if cli.jsonl {
+        emit_jsonl(
+            "error",
+            serde_json::json!({
+                "turn_id": turn_id,
+                "kind": "output_last_message",
+                "message": error.to_string(),
+                "exit_code": error.exit_code(),
+            }),
+        )?;
+    }
     Ok(())
 }
 
@@ -189,6 +1032,7 @@ fn install_broken_pipe_guard() {
 }
 
 fn main() {
+    let _ = RUN_STARTED_AT.set(Instant::now());
     install_broken_pipe_guard();
     let jsonl_mode = jsonl_requested();
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
@@ -257,6 +1101,14 @@ fn main() {
             }
         }
     };
+    if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
+        let status = match code {
+            0 => kitsu_render::RunTimingStatus::Ok,
+            EXIT_CANCELLED => kitsu_render::RunTimingStatus::Cancelled,
+            _ => kitsu_render::RunTimingStatus::Error,
+        };
+        kitsu_render::emit_run_timing(run_elapsed(), status);
+    }
     std::process::exit(code);
 }
 
@@ -330,16 +1182,33 @@ fn run() -> Result<(), CliError> {
             _ => return Err(CliError::user(error.to_string())),
         },
     };
-    kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion);
+    kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion, cli.screen_reader);
+    validate_output_last_message_surface(&cli)?;
+    validate_output_schema_surface(&cli)?;
 
     let runtime = tokio::runtime::Runtime::new()
         .map_err(|e| CliError::user(format!("failed to start runtime: {e}")))?;
 
-    match &cli.command {
-        Command::Init { path, json } => run_init(&cli, path.as_deref(), *json),
-        Command::Doctor { online, json } => runtime.block_on(run_doctor(&cli, *online, *json)),
-        Command::Ask { prompt } => runtime.block_on(run_ask(&cli, prompt)),
-        Command::Review {
+    if let Some(prompt) = cli.print_prompt.as_deref() {
+        if cli.command.is_some() {
+            return Err(CliError::user(
+                "-p/--prompt is a top-level one-shot mode and cannot be combined with a subcommand; use `kitsu -p <PROMPT>` or the subcommand's own prompt argument",
+            ));
+        }
+        return runtime.block_on(run_ask(&cli, prompt));
+    }
+
+    match cli.command.as_ref() {
+        None => runtime.block_on(run_chat(&cli, ChatInvocation::default())),
+        Some(Command::Init { path, json }) => run_init(&cli, path.as_deref(), *json),
+        Some(Command::Doctor {
+            online,
+            inference,
+            json,
+        }) => runtime.block_on(run_doctor(&cli, *online, *inference, *json)),
+        Some(Command::Auth { json, command }) => runtime.block_on(run_auth(&cli, *json, command)),
+        Some(Command::Ask { prompt }) => runtime.block_on(run_ask(&cli, prompt)),
+        Some(Command::Review {
             path,
             staged,
             unstaged,
@@ -348,7 +1217,7 @@ fn run() -> Result<(), CliError> {
             instructions,
             resume,
             session,
-        } => {
+        }) => {
             let scope = if *staged {
                 ReviewScope::Staged
             } else if *unstaged {
@@ -373,18 +1242,21 @@ fn run() -> Result<(), CliError> {
                 *session,
             ))
         }
-        Command::Models { filter } => {
+        Some(Command::Models { filter }) => {
             runtime.block_on(run_models(&cli, filter.as_deref().unwrap_or("")))
         }
-        Command::Sessions { json, command } => {
+        Some(Command::Sessions { json, command }) => {
             runtime.block_on(run_sessions(&cli, *json, command.as_ref()))
         }
-        Command::Artifacts { json, command } => run_artifacts(&cli, *json, command.as_ref()),
-        Command::Chat {
+        Some(Command::Artifacts { json, command }) => run_artifacts(&cli, *json, command.as_ref()),
+        Some(Command::Chat {
             prompt,
+            no_tools,
             allow_paths,
             allow_write,
             allow_read_write,
+            require_writes,
+            require_write_sha256,
             enable_commands,
             command_roots,
             command_runtime_roots,
@@ -396,13 +1268,16 @@ fn run() -> Result<(), CliError> {
             no_session,
             name,
             allow_turn_errors,
-        } => runtime.block_on(run_chat(
+        }) => runtime.block_on(run_chat(
             &cli,
             ChatInvocation {
                 first_prompt: prompt.as_deref(),
+                no_tools: *no_tools,
                 allow_paths,
                 allow_write,
                 allow_read_write,
+                require_writes,
+                require_write_sha256,
                 enable_commands: *enable_commands,
                 command_roots,
                 command_runtime_roots,
@@ -420,11 +1295,15 @@ fn run() -> Result<(), CliError> {
     }
 }
 
+#[derive(Default)]
 struct ChatInvocation<'a> {
     first_prompt: Option<&'a str>,
+    no_tools: bool,
     allow_paths: &'a [String],
     allow_write: &'a [String],
     allow_read_write: &'a [String],
+    require_writes: &'a [String],
+    require_write_sha256: &'a [String],
     enable_commands: bool,
     command_roots: &'a [String],
     command_runtime_roots: &'a [String],
@@ -458,9 +1337,12 @@ async fn run_review(
         cli,
         ChatInvocation {
             first_prompt: None,
+            no_tools: false,
             allow_paths: &[],
             allow_write: &[],
             allow_read_write: &[],
+            require_writes: &[],
+            require_write_sha256: &[],
             enable_commands: false,
             command_roots: &[],
             command_runtime_roots: &[],
@@ -488,6 +1370,8 @@ async fn run_review(
 // currently routes through the same OpenAI-compatible transport — `openai`
 // here matches every other recipe, including this same Ollama gateway.
 const STARTER_CONFIG_BODY: &str = r#"default_gateway = "ollama"
+# Optional privacy default: create no automatic command/tool-output artifacts.
+# artifact_storage = false
 
 [gateways.ollama]
 flavor = "openai"
@@ -637,6 +1521,362 @@ fn run_init(cli: &Cli, requested: Option<&std::path::Path>, json: bool) -> Resul
         );
         println!("next: {}", terminal_inline(&next));
         Ok(())
+    }
+}
+
+fn trim_secret_line_ending(mut bytes: zeroize::Zeroizing<Vec<u8>>) -> zeroize::Zeroizing<Vec<u8>> {
+    if bytes.last() == Some(&b'\n') {
+        bytes.pop();
+        if bytes.last() == Some(&b'\r') {
+            bytes.pop();
+        }
+    }
+    bytes
+}
+
+fn read_secret_stdin() -> Result<zeroize::Zeroizing<Vec<u8>>, CliError> {
+    use std::io::Read as _;
+    let limit = credential_store::MAX_CREDENTIAL_BYTES.saturating_add(2);
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(limit.min(4096)));
+    std::io::stdin()
+        .lock()
+        .take(u64::try_from(limit).unwrap_or(u64::MAX))
+        .read_to_end(&mut bytes)
+        .map_err(|error| CliError::user(format!("cannot read managed credential: {error}")))?;
+    if bytes.len() >= limit {
+        return Err(CliError::user(
+            "managed credential exceeds the 16 KiB safety limit",
+        ));
+    }
+    Ok(trim_secret_line_ending(bytes))
+}
+
+#[cfg(unix)]
+struct TerminalEchoGuard {
+    fd: std::os::fd::RawFd,
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl Drop for TerminalEchoGuard {
+    fn drop(&mut self) {
+        unsafe {
+            libc::tcsetattr(self.fd, libc::TCSANOW, &self.original);
+        }
+    }
+}
+
+#[cfg(unix)]
+async fn read_secret_tty() -> Result<zeroize::Zeroizing<Vec<u8>>, CliError> {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::{AsRawFd as _, FromRawFd as _};
+
+    if unsafe { libc::isatty(libc::STDIN_FILENO) } != 1 {
+        return Err(CliError::user(
+            "auth login requires a terminal for hidden input; use --token-stdin for a secret-manager pipeline",
+        ));
+    }
+    let fd = unsafe { libc::dup(libc::STDIN_FILENO) };
+    if fd < 0 {
+        return Err(CliError::user(
+            "cannot duplicate terminal input; use --token-stdin instead",
+        ));
+    }
+    let file = unsafe { std::fs::File::from_raw_fd(fd) };
+    let flags = unsafe { libc::fcntl(file.as_raw_fd(), libc::F_GETFL) };
+    if flags < 0
+        || unsafe { libc::fcntl(file.as_raw_fd(), libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0
+    {
+        return Err(CliError::user(
+            "cannot prepare terminal input; use --token-stdin instead",
+        ));
+    }
+    let mut original = std::mem::MaybeUninit::<libc::termios>::uninit();
+    if unsafe { libc::tcgetattr(file.as_raw_fd(), original.as_mut_ptr()) } != 0 {
+        return Err(CliError::user(
+            "cannot prepare hidden terminal input; use --token-stdin instead",
+        ));
+    }
+    let original = unsafe { original.assume_init() };
+    let mut hidden = original;
+    hidden.c_lflag &= !libc::ECHO;
+    if unsafe { libc::tcsetattr(file.as_raw_fd(), libc::TCSAFLUSH, &hidden) } != 0 {
+        return Err(CliError::user(
+            "cannot disable terminal echo; use --token-stdin instead",
+        ));
+    }
+    let echo_guard = TerminalEchoGuard {
+        fd: file.as_raw_fd(),
+        original,
+    };
+    std::eprint!("credential: ");
+    std::io::stderr()
+        .flush()
+        .map_err(|error| CliError::user(format!("cannot write credential prompt: {error}")))?;
+
+    let async_file = tokio::io::unix::AsyncFd::new(file)
+        .map_err(|error| CliError::user(format!("cannot monitor terminal input: {error}")))?;
+    let read = async {
+        let limit = credential_store::MAX_CREDENTIAL_BYTES.saturating_add(2);
+        let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(limit.min(4096)));
+        loop {
+            let mut ready = async_file.readable().await.map_err(|error| {
+                CliError::user(format!("cannot wait for managed credential input: {error}"))
+            })?;
+            let mut chunk = [0_u8; 1024];
+            match ready.try_io(|inner| {
+                let mut file = inner.get_ref();
+                file.read(&mut chunk)
+            }) {
+                Ok(Ok(0)) => break,
+                Ok(Ok(read)) => {
+                    bytes.extend_from_slice(&chunk[..read]);
+                    if bytes.contains(&b'\n') {
+                        break;
+                    }
+                    if bytes.len() >= limit {
+                        return Err(CliError::user(
+                            "managed credential exceeds the 16 KiB safety limit",
+                        ));
+                    }
+                }
+                Ok(Err(error)) => {
+                    return Err(CliError::user(format!(
+                        "cannot read managed credential: {error}"
+                    )))
+                }
+                Err(_) => continue,
+            }
+        }
+        Ok(trim_secret_line_ending(bytes))
+    };
+    let result = tokio::select! {
+        result = read => result,
+        _ = tokio::signal::ctrl_c() => Err(CliError::cancelled("auth login cancelled; no credential was stored")),
+    };
+    drop(echo_guard);
+    std::eprintln!();
+    result
+}
+
+#[cfg(not(unix))]
+async fn read_secret_tty() -> Result<zeroize::Zeroizing<Vec<u8>>, CliError> {
+    Err(CliError::user(
+        "hidden terminal credential input is unavailable on this platform; use --token-stdin",
+    ))
+}
+
+fn environment_override_present(gateway: &Gateway) -> bool {
+    gateway.auth.method == "bearer-env"
+        && std::env::var_os(&gateway.auth.env).is_some_and(|value| !value.is_empty())
+}
+
+fn require_persistent_credential_home() -> Result<(), CliError> {
+    let Some(home) = std::env::var_os("HOME").filter(|home| !home.is_empty()) else {
+        return Err(CliError::user(
+            "auth login requires an absolute HOME so credentials are never persisted in temporary fallback state",
+        ));
+    };
+    if !std::path::Path::new(&home).is_absolute() {
+        return Err(CliError::user(
+            "auth login requires an absolute HOME so credentials are never persisted in temporary fallback state",
+        ));
+    }
+    Ok(())
+}
+
+fn managed_credential(
+    state_dir: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+) -> Result<Option<zeroize::Zeroizing<String>>, CliError> {
+    if gateway.auth.method != "bearer-env" {
+        return Ok(None);
+    }
+    credential_store::load(state_dir, gateway_name).map_err(CliError::user)
+}
+
+fn reject_credential_command_root(
+    root: &std::path::Path,
+    state_dir: &std::path::Path,
+    flag: &str,
+) -> Result<(), CliError> {
+    let state = std::fs::canonicalize(state_dir).unwrap_or_else(|_| state_dir.to_path_buf());
+    let credentials = credential_store::directory_path(&state);
+    if credentials.starts_with(root) || root.starts_with(&credentials) {
+        return Err(CliError::user(format!(
+            "{flag} '{}' intersects Kitsu's managed-credential namespace; use a narrower project/toolchain root",
+            terminal_inline(&root.display().to_string())
+        )));
+    }
+    Ok(())
+}
+
+fn auth_status_payload(
+    gateway_name: &str,
+    gateway: &Gateway,
+    managed: Option<zeroize::Zeroizing<String>>,
+) -> (serde_json::Value, bool) {
+    let environment_present = environment_override_present(gateway);
+    let managed_present = managed.is_some();
+    let effective_source = match gateway.auth.method.as_str() {
+        "none" => "none",
+        "static" => "static",
+        "bearer-env" if environment_present => "environment",
+        "bearer-env" if managed_present => "managed",
+        "bearer-env" => "missing",
+        _ => "unsupported",
+    };
+    let credential_present = match gateway.auth.method.as_str() {
+        "none" => false,
+        "static" => gateway
+            .auth
+            .token
+            .as_deref()
+            .is_some_and(|token| !token.is_empty()),
+        "bearer-env" => environment_present || managed_present,
+        _ => false,
+    };
+    let locally_usable =
+        build_auth(gateway, gateway_name, managed).is_ok_and(|auth| auth.header().is_ok());
+    (
+        serde_json::json!({
+            "gateway": gateway_name,
+            "method": gateway.auth.method,
+            "credential_present": credential_present,
+            "effective_source": effective_source,
+            "environment_override_present": environment_present,
+            "managed_credential_present": managed_present,
+            "locally_usable": locally_usable,
+            "remote_validity_checked": false,
+            "request_sent": false,
+        }),
+        locally_usable,
+    )
+}
+
+async fn run_auth(cli: &Cli, json: bool, command: &AuthCommand) -> Result<(), CliError> {
+    reject_jsonl_for_management(cli, "kitsu auth status --json")?;
+    let config_path = Config::resolve_path(cli.config.as_deref());
+    if !config_path.is_file() {
+        return Err(CliError::user(format!(
+            "config error: no readable config found at {}",
+            shorten_home(&config_path)
+        )));
+    }
+    let config =
+        Config::load(&config_path).map_err(|error| CliError::user(safe_config_error(&error)))?;
+    let (gateway_name, gateway) = config
+        .select_gateway(cli.gateway.as_deref())
+        .map_err(|error| CliError::user(error.to_string()))?;
+    gateway
+        .validate_auth()
+        .map_err(|error| CliError::user(error.to_string()))?;
+    let gateway_name = gateway_name.to_string();
+
+    match command {
+        AuthCommand::Login { token_stdin } => {
+            if gateway.auth.method != "bearer-env" {
+                return Err(CliError::user(format!(
+                    "auth login supports bearer-env gateways; '{}' uses {}",
+                    terminal_inline(&gateway_name),
+                    terminal_inline(&gateway.auth.method)
+                )));
+            }
+            require_persistent_credential_home()?;
+            let bytes = if *token_stdin {
+                read_secret_stdin()?
+            } else {
+                read_secret_tty().await?
+            };
+            let token = credential_store::decode_zeroizing(bytes).map_err(CliError::user)?;
+            let validator = EnvBearerAuth {
+                env: gateway.auth.env.clone(),
+                expires_env: gateway.auth.expires_env.clone(),
+                header: gateway.auth.header.clone(),
+                scheme: gateway.auth.scheme.clone(),
+                refresh_hint: None,
+                managed_token: None,
+            };
+            validator
+                .validate_managed_token(token.as_str())
+                .map_err(|_| CliError::user("managed credential is not a valid HTTP credential"))?;
+            let state_dir = runtime_state_dir(&config_path);
+            credential_store::store(&state_dir, &gateway_name, token.as_str())
+                .map_err(CliError::user)?;
+            let managed = managed_credential(&state_dir, &gateway_name, gateway)?;
+            let (mut report, _) = auth_status_payload(&gateway_name, gateway, managed);
+            report["stored"] = serde_json::Value::Bool(true);
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "managed credential stored for gateway {}; effective source: {}",
+                    terminal_inline(&gateway_name),
+                    report["effective_source"].as_str().unwrap_or("unknown")
+                );
+                println!(
+                    "remote validity was not checked; run `kitsu --gateway {} doctor --inference`",
+                    terminal_inline(&gateway_name)
+                );
+            }
+            Ok(())
+        }
+        AuthCommand::Status => {
+            let state_dir = runtime_state_dir_read_only(&config_path);
+            let managed = managed_credential(&state_dir, &gateway_name, gateway)?;
+            let (report, locally_usable) = auth_status_payload(&gateway_name, gateway, managed);
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "gateway {}: {} (source: {}; remote validity not checked)",
+                    terminal_inline(&gateway_name),
+                    if locally_usable {
+                        "credential locally usable"
+                    } else {
+                        "credential unavailable or malformed"
+                    },
+                    report["effective_source"].as_str().unwrap_or("unknown")
+                );
+            }
+            if locally_usable {
+                Ok(())
+            } else {
+                Err(CliError::user(
+                    "authentication is not locally usable; run `kitsu auth login` or set the configured environment variable",
+                ))
+            }
+        }
+        AuthCommand::Logout => {
+            if gateway.auth.method != "bearer-env" {
+                return Err(CliError::user(format!(
+                    "auth logout supports bearer-env gateways; '{}' uses {}",
+                    terminal_inline(&gateway_name),
+                    terminal_inline(&gateway.auth.method)
+                )));
+            }
+            let state_dir = runtime_state_dir_read_only(&config_path);
+            let removed =
+                credential_store::remove(&state_dir, &gateway_name).map_err(CliError::user)?;
+            let managed = managed_credential(&state_dir, &gateway_name, gateway)?;
+            let (mut report, _) = auth_status_payload(&gateway_name, gateway, managed);
+            report["removed"] = serde_json::Value::Bool(removed);
+            if json {
+                print_json(&report)?;
+            } else {
+                println!(
+                    "{} managed credential for gateway {}; effective source: {}",
+                    if removed { "removed" } else { "no" },
+                    terminal_inline(&gateway_name),
+                    report["effective_source"].as_str().unwrap_or("unknown")
+                );
+                if report["environment_override_present"] == true {
+                    println!("the configured environment credential remains effective");
+                }
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1046,9 +2286,12 @@ async fn run_sessions(
                     cli,
                     ChatInvocation {
                         first_prompt: None,
+                        no_tools: false,
                         allow_paths: &[],
                         allow_write: &[],
                         allow_read_write: &[],
+                        require_writes: &[],
+                        require_write_sha256: &[],
                         enable_commands: false,
                         command_roots: &[],
                         command_runtime_roots: &[],
@@ -1275,6 +2518,7 @@ fn safe_config_error(error: &ConfigError) -> String {
 #[derive(Clone, Copy)]
 enum ProviderOperation<'a> {
     Chat { model: &'a str },
+    InferenceProbe { model: &'a str },
     ModelCatalog,
 }
 
@@ -1282,6 +2526,7 @@ impl ProviderOperation<'_> {
     fn subject(self) -> &'static str {
         match self {
             Self::Chat { .. } => "chat request",
+            Self::InferenceProbe { .. } => "inference probe",
             Self::ModelCatalog => "model catalog request",
         }
     }
@@ -1392,6 +2637,12 @@ fn safe_provider_error_message(
         ProviderError::ResponseTooLarge { .. } => format!(
             "{subject} exceeded the provider response-size safety limit - reduce the requested output or catalog size and retry"
         ),
+        ProviderError::Unauthorized { status: 403, hint } => {
+            format!(
+                "{subject} was forbidden (HTTP 403) - confirm the credential has inference and gated-model access{}",
+                auth_refresh_hint_suffix(hint.as_deref())
+            )
+        }
         ProviderError::Unauthorized { status, hint } => {
             format!(
                 "{subject} authentication/access was rejected (HTTP {status}) - refresh the configured credential and confirm model access{}",
@@ -1405,7 +2656,7 @@ fn safe_provider_error_message(
             "{subject} was forbidden (HTTP 403) - confirm the credential has inference and gated-model access"
         ),
         ProviderError::Http { status: 404, .. } => match operation {
-            ProviderOperation::Chat { model } => format!(
+            ProviderOperation::Chat { model } | ProviderOperation::InferenceProbe { model } => format!(
                 "gateway rejected the chat route or model '{}' (HTTP 404) - verify the catalog with `kitsu models` or /models, run /model <valid-id>, and check the configured chat_path",
                 terminal_inline(model)
             ),
@@ -1445,17 +2696,33 @@ fn safe_provider_error_message(
                 terminal_inline(env)
             )
         }
+        ProviderError::Auth(kitsu_providers::AuthError::MalformedManaged) => {
+            "managed credential is malformed - replace it with `kitsu auth login`"
+                .to_string()
+        }
     }
 }
 
-/// Integration hook for human-mode provider telemetry. The runtime event log
-/// can call this beside its JSONL serializer; the result contains only bounded
-/// enums, numeric status/timing fields, and no provider-controlled text.
+/// Integration hook for human-mode runtime notices. The event log can call
+/// this beside its JSONL serializer; results contain only host-owned bounded
+/// facts, numeric status/timing fields, and no provider-controlled text.
 ///
 /// The success path stays silent: a first-attempt success is the normal case
 /// and narrating it is transport noise. Retries, failures, and a success that
 /// needed more than one attempt still report (JSONL mode keeps every event).
-fn format_provider_attempt_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
+fn format_runtime_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String> {
+    if let kitsu_core::AgentRuntimeEvent::StructuredFinalizationDeferred {
+        repair_round,
+        targets,
+        ..
+    } = event
+    {
+        return Some(format!(
+            "exact output mismatch; keeping tools available in repair round {repair_round} for {} target{}",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" }
+        ));
+    }
     let kitsu_core::AgentRuntimeEvent::ProviderAttempt {
         purpose,
         attempt,
@@ -1585,52 +2852,79 @@ fn print_doctor_human(report: &serde_json::Value) {
         doctor_text(report, "/runtime_state/status"),
     );
     let online_status = doctor_text(report, "/online/status");
-    let online_scope_note = if online_status == "reachable"
-        && report
+    let online_scope_note = match (
+        report
+            .pointer("/online/requested")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false),
+        report
+            .pointer("/online/scope")
+            .and_then(serde_json::Value::as_str),
+        report
+            .pointer("/online/status")
+            .and_then(serde_json::Value::as_str),
+        report
             .pointer("/online/chat_route_probed")
             .and_then(serde_json::Value::as_bool)
-            == Some(false)
-    {
-        // The probe validates the MODEL CATALOG route only. Claiming more
-        // told a user with an invalid credential "you're ready" (cycle-23
-        // audit): say exactly what was and was not checked.
-        let models = report
-            .pointer("/online/models")
-            .and_then(serde_json::Value::as_u64)
-            .unwrap_or(0);
-        format!(
-            "reachable ({models} models in catalog) — catalog route only; credentials and the chat route are NOT validated until a real turn"
-        )
-    } else {
-        online_status
+            .unwrap_or(false),
+    ) {
+        (true, Some("model_catalog_only"), _, false) => {
+            let models = report
+                .pointer("/online/models")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            format!(
+                "reachable ({models} models in catalog) — catalog route only; credentials and the chat route are NOT validated until a real turn"
+            )
+        }
+        (true, Some("chat_inference"), Some("reachable"), true) => {
+            format!("{online_status} — chat/inference accepted one minimal tool-free completion")
+        }
+        _ => online_status,
     };
     println!("[info] provider check: {online_scope_note}");
     println!(
-        "[info] tools: filesystem={}; commands={}",
+        "[info] tools: filesystem={} commands={}",
         doctor_text(report, "/tool_policy/filesystem"),
         doctor_text(report, "/tool_policy/commands"),
+    );
+    println!(
+        "[info] automatic artifacts: {} ({}) — oversized tool output {}",
+        doctor_text(report, "/artifact_policy/mode"),
+        doctor_text(report, "/artifact_policy/source"),
+        if report
+            .pointer("/artifact_policy/tool_result_offload")
+            .and_then(serde_json::Value::as_bool)
+            .unwrap_or(false)
+        {
+            "may be offloaded"
+        } else {
+            "is bounded inline"
+        },
     );
     let issues = report
         .pointer("/blocking_issues")
         .and_then(serde_json::Value::as_array)
         .map(Vec::as_slice)
         .unwrap_or(&[]);
-    if issues.is_empty() {
-        // Terminal state must name the next step (cycle-14 config audit #4):
-        // "healthy" without "now what" strands exactly the new user doctor
-        // exists to help.
-        let credential_caveat = if report
-            .pointer("/online/chat_route_probed")
-            .and_then(serde_json::Value::as_bool)
-            == Some(false)
-        {
-            " (config checks passed; the first real turn is what validates credentials)"
-        } else {
-            ""
-        };
+    if issues.is_empty()
+        && report
+            .pointer("/online/scope")
+            .and_then(serde_json::Value::as_str)
+            == Some("chat_inference")
+        && report
+            .pointer("/online/status")
+            .and_then(serde_json::Value::as_str)
+            == Some("reachable")
+    {
         println!(
-            "doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`){credential_caveat}"
+            "doctor: inference probe succeeded — the configured chat route accepted this model"
         );
+    } else if issues.is_empty() {
+        // Doctor never sends a chat completion: even an authenticated catalog
+        // success cannot prove inference permission. Name both the clean scope
+        // and the next verification step without claiming the user is ready.
+        println!("doctor: no blocking issues found — run `kitsu` to verify chat/inference access");
     } else {
         println!("doctor: {} blocking issue(s)", issues.len());
         for issue in issues {
@@ -1641,7 +2935,39 @@ fn print_doctor_human(report: &serde_json::Value) {
     }
 }
 
-async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError> {
+async fn minimal_inference_probe(
+    provider: &OpenAICompatProvider,
+    model: &str,
+) -> Result<(), ProviderError> {
+    use futures::StreamExt as _;
+
+    let request = ChatRequest {
+        model: model.to_string(),
+        messages: vec![ChatMessage::user("Reply OK.")],
+        tools: None,
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: Some(1),
+        response_format: None,
+    };
+    let mut response = provider.chat_stream(request).await?;
+    let mut finished = false;
+    while let Some(delta) = response.next().await {
+        if matches!(delta?, ChatDelta::Done(_)) {
+            finished = true;
+        }
+    }
+    if finished {
+        Ok(())
+    } else {
+        Err(ProviderError::InvalidResponse(
+            "inference probe ended without a terminal marker".to_string(),
+        ))
+    }
+}
+
+async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Result<(), CliError> {
     reject_jsonl_for_management(cli, "kitsu doctor --json")?;
     let config_path = Config::resolve_path(cli.config.as_deref());
     let config_exists = std::fs::symlink_metadata(&config_path).is_ok();
@@ -1665,6 +2991,7 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
         "method": "unavailable",
         "credential_present": null,
         "credential_required": null,
+        "recovery_hint": null,
         "status": "unavailable until config and gateway are valid",
     });
     let cache_path = context_window_cache_path(&state_dir);
@@ -1687,11 +3014,19 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
     } else {
         serde_json::json!({"enabled": true, "status": "no llms.txt, AGENTS.md, or CLAUDE.md found"})
     };
+    let provider_check_requested = online || inference;
+    let provider_check_scope = if inference {
+        "chat_inference"
+    } else {
+        "model_catalog_only"
+    };
     let mut online_report = serde_json::json!({
-        "requested": online,
-        "scope": "model_catalog_only",
+        "requested": provider_check_requested,
+        "scope": provider_check_scope,
         "chat_route_probed": false,
-        "status": if online { "not run" } else { "not requested (offline default)" },
+        "potentially_billable": inference,
+        "request_sent": false,
+        "status": if provider_check_requested { "not run" } else { "not requested (offline default)" },
     });
 
     let config = if !config_exists {
@@ -1757,21 +3092,42 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                         false
                     }
                 };
+                let managed_token = if auth_valid && gateway.auth.method == "bearer-env" {
+                    match managed_credential(&state_dir, gateway_name, gateway) {
+                        Ok(token) => token,
+                        Err(error) => {
+                            issues.push(error.to_string());
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let environment_present = environment_override_present(gateway);
+                let managed_present = managed_token.is_some();
                 let (credential_present, auth_status) = match gateway.auth.method.as_str() {
                     "none" => (None, "no credential required".to_string()),
                     "bearer-env" => {
-                        let present = std::env::var_os(&gateway.auth.env)
-                            .is_some_and(|value| !value.is_empty());
+                        let present = environment_present || managed_present;
                         if auth_valid && !present {
-                            issues
-                                .push(format!("auth variable {} is not present", gateway.auth.env));
+                            issues.push(format!(
+                                "no usable credential is available from {} or `kitsu auth login`{}",
+                                gateway.auth.env,
+                                auth_refresh_hint_suffix(gateway.auth.refresh_hint.as_deref())
+                            ));
                         }
                         (
                             Some(present),
                             format!(
-                                "bearer variable {} is {}",
-                                gateway.auth.env,
-                                if present { "present" } else { "missing" }
+                                "bearer credential is {} (source: {})",
+                                if present { "present" } else { "missing" },
+                                if environment_present {
+                                    "environment"
+                                } else if managed_present {
+                                    "managed"
+                                } else {
+                                    "missing"
+                                }
                             ),
                         )
                     }
@@ -1792,6 +3148,18 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                     }
                     other => (Some(false), format!("unsupported auth method {other}")),
                 };
+                let auth_locally_usable = auth_valid
+                    && build_auth(gateway, gateway_name, managed_token.clone())
+                        .is_ok_and(|auth| auth.header().is_ok());
+                if auth_valid && credential_present != Some(false) && !auth_locally_usable {
+                    issues.push(
+                        "the effective credential is present but malformed; replace the environment value or run `kitsu auth login`"
+                            .to_string(),
+                    );
+                }
+                let recovery_hint = (credential_present == Some(false))
+                    .then(|| safe_auth_refresh_hint(gateway.auth.refresh_hint.as_deref()))
+                    .flatten();
                 auth_report = serde_json::json!({
                     "method": gateway.auth.method,
                     "env": if gateway.auth.method == "bearer-env" {
@@ -1801,7 +3169,14 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                     },
                     "credential_present": credential_present,
                     "credential_required": gateway.auth.method != "none",
+                    "environment_override_present": environment_present,
+                    "managed_credential_present": managed_present,
+                    "effective_source": if gateway.auth.method == "bearer-env" {
+                        if environment_present { "environment" } else if managed_present { "managed" } else { "missing" }
+                    } else if gateway.auth.method == "static" { "static" } else { "none" },
+                    "recovery_hint": recovery_hint,
                     "valid": auth_valid,
+                    "locally_usable": auth_locally_usable,
                     "status": auth_status,
                 });
 
@@ -1828,17 +3203,96 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                     });
                 }
 
-                if online {
+                if inference {
+                    if !flavor_ok
+                        || !auth_valid
+                        || !auth_locally_usable
+                        || credential_present == Some(false)
+                        || model.is_none()
+                    {
+                        let issue = "inference provider check was requested but skipped: fix gateway, model, or auth diagnostics first".to_string();
+                        issues.push(issue.clone());
+                        online_report = serde_json::json!({
+                            "requested": true,
+                            "scope": "chat_inference",
+                            "chat_route_probed": false,
+                            "potentially_billable": true,
+                            "request_sent": false,
+                            "status": issue,
+                        });
+                    } else {
+                        let auth = build_auth(gateway, gateway_name, managed_token.clone())
+                            .map_err(|error| CliError::user(safe_config_error(&error)))?;
+                        let provider = OpenAICompatProvider::new(
+                            OpenAICompatConfig {
+                                base_url: gateway.base_url.clone(),
+                                chat_path: gateway.chat_path.clone(),
+                                models_path: gateway
+                                    .models_path
+                                    .clone()
+                                    .filter(|path| !path.is_empty()),
+                                retries: 0,
+                                timeout: Duration::from_secs(cli.timeout_secs),
+                            },
+                            auth,
+                        );
+                        let effective_model = model.as_deref().expect("validated above");
+                        match await_cancellable(minimal_inference_probe(&provider, effective_model))
+                            .await
+                        {
+                            Some(Ok(())) => {
+                                online_report = serde_json::json!({
+                                    "requested": true,
+                                    "scope": "chat_inference",
+                                    "chat_route_probed": true,
+                                    "potentially_billable": true,
+                                    "request_sent": true,
+                                    "status": "reachable",
+                                    "effective_model": effective_model,
+                                });
+                            }
+                            Some(Err(error)) => {
+                                let safe = safe_provider_error_message(
+                                    &error,
+                                    ProviderOperation::InferenceProbe {
+                                        model: effective_model,
+                                    },
+                                    Some(cli.timeout_secs),
+                                );
+                                issues.push(format!("inference provider check failed: {safe}"));
+                                online_report = serde_json::json!({
+                                    "requested": true,
+                                    "scope": "chat_inference",
+                                    "chat_route_probed": true,
+                                    "potentially_billable": true,
+                                    "request_sent": true,
+                                    "status": safe,
+                                    "effective_model": effective_model,
+                                });
+                            }
+                            None => {
+                                return Err(CliError::cancelled(
+                                    "doctor inference probe cancelled by Ctrl+C",
+                                ));
+                            }
+                        }
+                    }
+                } else if online {
                     let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
                     if models_path.is_none() {
                         let issue = "online provider check was requested but skipped: no models_path is configured for a safe read-only probe".to_string();
                         issues.push(issue.clone());
                         online_report = serde_json::json!({
                             "requested": true,
+                            "scope": "model_catalog_only",
+                            "chat_route_probed": false,
+                            "potentially_billable": false,
+                            "request_sent": false,
                             "status": issue,
                         });
                     } else if !flavor_ok
                         || !auth_valid
+                        || !auth_locally_usable
                         || credential_present == Some(false)
                         || model.is_none()
                     {
@@ -1846,10 +3300,14 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                         issues.push(issue.clone());
                         online_report = serde_json::json!({
                             "requested": true,
+                            "scope": "model_catalog_only",
+                            "chat_route_probed": false,
+                            "potentially_billable": false,
+                            "request_sent": false,
                             "status": issue,
                         });
                     } else {
-                        let auth = build_auth(gateway)
+                        let auth = build_auth(gateway, gateway_name, managed_token.clone())
                             .map_err(|error| CliError::user(safe_config_error(&error)))?;
                         let provider = OpenAICompatProvider::new(
                             OpenAICompatConfig {
@@ -1878,6 +3336,8 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                                     "requested": true,
                                     "scope": "model_catalog_only",
                                     "chat_route_probed": false,
+                                    "potentially_billable": false,
+                                    "request_sent": true,
                                     "status": "reachable",
                                     "models": models.len(),
                                     "effective_model": effective_model,
@@ -1889,6 +3349,10 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                                 issues.push(issue.clone());
                                 online_report = serde_json::json!({
                                     "requested": true,
+                                    "scope": "model_catalog_only",
+                                    "chat_route_probed": false,
+                                    "potentially_billable": false,
+                                    "request_sent": true,
                                     "status": issue,
                                 });
                             }
@@ -1902,6 +3366,10 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
                                 issues.push(format!("online provider check failed: {safe}"));
                                 online_report = serde_json::json!({
                                     "requested": true,
+                                    "scope": "model_catalog_only",
+                                    "chat_route_probed": false,
+                                    "potentially_billable": false,
+                                    "request_sent": true,
                                     "status": safe,
                                     "reason": reason,
                                 });
@@ -1928,6 +3396,24 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
     } else {
         "interactive chat prompts; automation is deny-by-default unless roots are granted"
     };
+    let (artifact_policy, artifact_policy_source) = if cli.no_artifacts {
+        (ArtifactStoragePolicy::InlineOnly, ArtifactPolicySource::Cli)
+    } else {
+        match config.as_ref().and_then(|config| config.artifact_storage) {
+            Some(false) => (
+                ArtifactStoragePolicy::InlineOnly,
+                ArtifactPolicySource::Config,
+            ),
+            Some(true) => (
+                ArtifactStoragePolicy::Automatic,
+                ArtifactPolicySource::Config,
+            ),
+            None => (
+                ArtifactStoragePolicy::Automatic,
+                ArtifactPolicySource::Default,
+            ),
+        }
+    };
     let report = serde_json::json!({
         "version": cli::LONG_VERSION,
         "read_only": true,
@@ -1951,6 +3437,11 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
             "commands": "disabled unless explicitly enabled; enabled commands require exact approval plus mandatory fail-closed OS containment",
             "scripted_tools": "not registered unless a filesystem capability or command policy is explicit",
         },
+        "artifact_policy": artifact_policy_receipt(
+            artifact_policy,
+            artifact_policy_source,
+            false,
+        ),
         "blocking_issues": issues,
     });
     if json {
@@ -1995,6 +3486,11 @@ struct ChatSetup {
     /// falls back to the mode default (interactive 8, scripted/piped 2);
     /// `--agent-spawn-cap` overrides.
     agent_spawn_cap: Option<u32>,
+    /// Effective run-level policy for Kitsu-created automatic output
+    /// artifacts. This never changes explicit session, credential, `-o`, or
+    /// model filesystem destinations.
+    artifact_policy: ArtifactStoragePolicy,
+    artifact_policy_source: ArtifactPolicySource,
     /// Resolved model context window in tokens, if known (design §3.2 order:
     /// `--context-window` → profile `context_window` → `/v1/models` → unset).
     context_window: Option<u64>,
@@ -2009,6 +3505,40 @@ struct ChatSetup {
     /// state; the conservative current-run budget remains unchanged.
     context_window_provenance: Arc<std::sync::Mutex<ContextWindowProvenance>>,
     context_window_refresh: ContextWindowRefreshConfig,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArtifactPolicySource {
+    Default,
+    Config,
+    Cli,
+}
+
+impl ArtifactPolicySource {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Default => "default",
+            Self::Config => "config",
+            Self::Cli => "cli",
+        }
+    }
+}
+
+fn artifact_policy_receipt(
+    policy: ArtifactStoragePolicy,
+    source: ArtifactPolicySource,
+    model_read_root_granted: bool,
+) -> serde_json::Value {
+    let automatic = policy == ArtifactStoragePolicy::Automatic;
+    serde_json::json!({
+        "mode": if automatic { "automatic" } else { "disabled" },
+        "source": source.as_str(),
+        "new_automatic_artifact_writes": automatic,
+        "command_output_persistence": automatic,
+        "tool_result_offload": automatic,
+        "existing_artifacts_unchanged": !automatic,
+        "model_artifact_read_root_granted": automatic && model_read_root_granted,
+    })
 }
 
 #[derive(Clone)]
@@ -2436,6 +3966,7 @@ fn build_agent_config(
     cli: &Cli,
     context_window: Option<u64>,
     offload_dir: Option<std::path::PathBuf>,
+    artifact_policy: ArtifactStoragePolicy,
 ) -> AgentConfig {
     let reasoning_effort = cli_reasoning_effort(cli);
     AgentConfig {
@@ -2447,11 +3978,21 @@ fn build_agent_config(
         // `/status` can disclose that it was defaulted, but every provider
         // request and manual compaction receives the same checked 8K budget.
         context_window: Some(context_window.unwrap_or(DEFAULT_CONTEXT_WINDOW)),
-        offload_dir,
+        offload_dir: (artifact_policy == ArtifactStoragePolicy::Automatic)
+            .then_some(offload_dir)
+            .flatten(),
+        artifact_policy,
         stream: !cli.no_stream,
         temperature: cli.temperature,
         reasoning_effort,
         max_tokens: cli.max_output_tokens,
+        response_format: active_output_schema().map(|schema| JsonSchemaFormat {
+            name: "kitsu_output".to_string(),
+            schema: schema.value.clone(),
+            strict: true,
+        }),
+        defer_response_format_until_final: false,
+        structured_finalization_gate: None,
         compaction: compaction_mode(cli),
         quiet: cli.jsonl,
         event_log: None,
@@ -2716,7 +4257,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "clear",
         args: "",
-        description: "clear conversation history",
+        description: "save current history and clear into a fresh session",
         details: "",
         group: CommandGroup::ContextHistory,
         alias_of: None,
@@ -3074,10 +4615,194 @@ fn slash_help(model: &str, styled: bool) -> String {
 /// future editor renderer that can preserve buffer geometry.
 struct ChatHelper {
     permissions: Arc<Permissions>,
+    /// Rich terminals get Unicode borders plus color. `NO_COLOR` keeps the
+    /// Rustyline editor but selects an unstyled ASCII palette; explicit
+    /// plain/screen-reader modes bypass Rustyline entirely.
+    rich_palette: bool,
+    /// Shared with `/model`, resume, and subagent dispatch so the persistent
+    /// composer footer reflects the model the next turn will actually use.
+    live_model_window: subagent::LiveModelWindow,
+    directory: String,
 }
 
-fn bracketed_paste_enabled(plain_mode: bool) -> bool {
-    !plain_mode
+const SLASH_PALETTE_ROWS: usize = 8;
+const COMPOSER_SURFACE_MAX_WIDTH: usize = 70;
+const COMPOSER_SURFACE_DEFAULT_INNER_WIDTH: usize = COMPOSER_SURFACE_MAX_WIDTH - 2;
+const SLASH_DESCRIPTION_MIN_INNER_WIDTH: usize = 40;
+
+#[cfg(unix)]
+fn current_terminal_columns() -> Option<usize> {
+    for descriptor in [libc::STDERR_FILENO, libc::STDOUT_FILENO, libc::STDIN_FILENO] {
+        let mut size = libc::winsize {
+            ws_row: 0,
+            ws_col: 0,
+            ws_xpixel: 0,
+            ws_ypixel: 0,
+        };
+        // SAFETY: `size` is initialized writable storage for TIOCGWINSZ and
+        // the standard descriptors remain owned by the process.
+        if unsafe { libc::ioctl(descriptor, libc::TIOCGWINSZ, &mut size) } == 0 && size.ws_col > 0 {
+            return Some(usize::from(size.ws_col));
+        }
+    }
+    None
+}
+
+#[cfg(not(unix))]
+fn current_terminal_columns() -> Option<usize> {
+    std::env::var("COLUMNS")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|columns| *columns > 0)
+}
+
+fn composer_surface_inner_width(columns: Option<usize>) -> usize {
+    columns.map_or(COMPOSER_SURFACE_DEFAULT_INNER_WIDTH, |columns| {
+        columns.min(COMPOSER_SURFACE_MAX_WIDTH).saturating_sub(2)
+    })
+}
+
+fn fit_palette_text(text: &str, width: usize) -> String {
+    fit_palette_text_with_padding(text, width, ' ')
+}
+
+fn fit_palette_text_with_padding(text: &str, width: usize, padding: char) -> String {
+    use unicode_width::UnicodeWidthChar as _;
+
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut fitted = String::new();
+    let mut used = 0_usize;
+    let mut truncated = false;
+    for character in text.chars() {
+        let character_width = character.width().unwrap_or(0);
+        if used.saturating_add(character_width) > width {
+            truncated = true;
+            break;
+        }
+        fitted.push(character);
+        used += character_width;
+    }
+    if truncated {
+        let ellipsis = '…';
+        let ellipsis_width = ellipsis.width().unwrap_or(1);
+        while used.saturating_add(ellipsis_width) > width {
+            let Some(character) = fitted.pop() else {
+                break;
+            };
+            used = used.saturating_sub(character.width().unwrap_or(0));
+        }
+        if used.saturating_add(ellipsis_width) <= width {
+            fitted.push(ellipsis);
+            used += ellipsis_width;
+        }
+    }
+    let padding_width = padding.width().unwrap_or(1).max(1);
+    while used.saturating_add(padding_width) <= width {
+        fitted.push(padding);
+        used += padding_width;
+    }
+    fitted
+}
+
+/// A bounded, editor-owned palette rendered as a multi-line Rustyline hint.
+/// Keeping it in the hint layout means every keystroke redraws/clears it with
+/// the input buffer instead of leaving stale rows in terminal scrollback.
+fn slash_palette(prefix: &str, rich: bool, inner_width: usize) -> String {
+    let matches = matching_slash_commands(prefix);
+    let top_label = " slash commands ";
+    let footer_label = " type to filter · Tab to complete ";
+    let (top_left, horizontal, top_right, vertical, separator_left, separator_right) = if rich {
+        ('╭', '─', '╮', '│', '├', '┤')
+    } else {
+        ('+', '-', '+', '|', '+', '+')
+    };
+
+    let mut palette = String::from("\n");
+    palette.push(top_left);
+    palette.push_str(&fit_palette_text_with_padding(
+        top_label,
+        inner_width,
+        horizontal,
+    ));
+    palette.push(top_right);
+    palette.push('\n');
+
+    if matches.is_empty() {
+        palette.push(vertical);
+        palette.push_str(&fit_palette_text(
+            " no matching command — /help lists everything",
+            inner_width,
+        ));
+        palette.push(vertical);
+        palette.push('\n');
+    } else {
+        for spec in matches.iter().take(SLASH_PALETTE_ROWS) {
+            let row = if inner_width >= SLASH_DESCRIPTION_MIN_INNER_WIDTH {
+                format!(" /{:<22} {}", spec.name, spec.description)
+            } else {
+                format!(" {}", spec.syntax())
+            };
+            palette.push(vertical);
+            palette.push_str(&fit_palette_text(&row, inner_width));
+            palette.push(vertical);
+            palette.push('\n');
+        }
+        if matches.len() > SLASH_PALETTE_ROWS {
+            let remaining = format!(
+                " … {} more — keep typing to narrow the list",
+                matches.len() - SLASH_PALETTE_ROWS
+            );
+            palette.push(vertical);
+            palette.push_str(&fit_palette_text(&remaining, inner_width));
+            palette.push(vertical);
+            palette.push('\n');
+        }
+    }
+
+    palette.push(separator_left);
+    palette.push_str(&fit_palette_text_with_padding(
+        footer_label,
+        inner_width,
+        horizontal,
+    ));
+    palette.push(separator_right);
+    palette
+}
+
+fn composer_status(model: &str, directory: &str, rich: bool, inner_width: usize) -> String {
+    let model = terminal_inline(model);
+    let directory = terminal_inline(directory);
+    let separator = if rich { " │ " } else { " | " };
+    let content = fit_palette_text(
+        &format!(" model {model}{separator}cwd {directory}"),
+        inner_width,
+    );
+    if rich {
+        format!("\n╰{content}╯")
+    } else {
+        format!("\n+{content}+")
+    }
+}
+
+struct SlashPaletteHint(String);
+
+impl rustyline::hint::Hint for SlashPaletteHint {
+    fn display(&self) -> &str {
+        &self.0
+    }
+
+    // The palette is informational. Right-arrow must never paste its borders
+    // and descriptions into the user's prompt; Tab owns completion.
+    fn completion(&self) -> Option<&str> {
+        None
+    }
+}
+
+fn bracketed_paste_enabled(assistive_input: bool) -> bool {
+    !assistive_input
 }
 
 enum ChatReadline {
@@ -3225,12 +4950,50 @@ impl rustyline::completion::Completer for ChatHelper {
     }
 }
 impl rustyline::hint::Hinter for ChatHelper {
-    type Hint = String;
+    type Hint = SlashPaletteHint;
+
+    fn hint(&self, line: &str, _pos: usize, _ctx: &rustyline::Context<'_>) -> Option<Self::Hint> {
+        let inner_width = composer_surface_inner_width(current_terminal_columns());
+        let mut deck = match line.strip_prefix('/') {
+            Some(typed) if !line.contains('\n') && !typed.chars().any(char::is_whitespace) => {
+                slash_palette(typed, self.rich_palette, inner_width)
+            }
+            _ => String::new(),
+        };
+        let model = self
+            .live_model_window
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .0
+            .clone();
+        deck.push_str(&composer_status(
+            &model,
+            &self.directory,
+            self.rich_palette,
+            inner_width,
+        ));
+        Some(SlashPaletteHint(deck))
+    }
 }
 impl rustyline::validate::Validator for ChatHelper {}
 impl rustyline::Helper for ChatHelper {}
 
-impl rustyline::highlight::Highlighter for ChatHelper {}
+impl rustyline::highlight::Highlighter for ChatHelper {
+    fn highlight_hint<'h>(&self, hint: &'h str) -> std::borrow::Cow<'h, str> {
+        if self.rich_palette {
+            // Bright cyan separates the transient command deck; the persistent
+            // model/directory footer is dimmer. Styling preserves the display
+            // width Rustyline calculated from the unstyled hint.
+            let styled = hint.rsplit_once('\n').map_or_else(
+                || format!("\x1b[2;36m{hint}\x1b[0m"),
+                |(deck, status)| format!("\x1b[1;96m{deck}\x1b[0m\n\x1b[2;36m{status}\x1b[0m"),
+            );
+            std::borrow::Cow::Owned(styled)
+        } else {
+            std::borrow::Cow::Borrowed(hint)
+        }
+    }
+}
 
 /// A provenance entry: a static context source, why it's loaded, its estimated
 /// token cost, and the governing policy — honest accounting (design §3).
@@ -3268,8 +5031,16 @@ struct SessionInfo {
     state_dir: std::path::PathBuf,
     endpoint: String,
     auth_status: String,
+    artifact_policy: ArtifactStoragePolicy,
+    artifact_policy_source: ArtifactPolicySource,
     project_context: RefCell<Option<std::path::PathBuf>>,
     offload_dir: Rc<RefCell<Option<std::path::PathBuf>>>,
+    model_can_read_artifacts: bool,
+    /// Split combined required-write + structured-output automation into
+    /// schema-free tool rounds followed by one schema-constrained final round.
+    defer_structured_finalization: bool,
+    /// Host-owned exact-output readiness gate paired with the deferred mode.
+    structured_finalization_gate: Option<kitsu_core::StructuredFinalizationGate>,
     session_id: Rc<RefCell<Option<String>>>,
     /// Per-turn subagent spawn budget shared with the spawn tools (G3).
     spawn_budget: Arc<kitsu_core::SpawnBudget>,
@@ -3323,8 +5094,20 @@ fn persist_session(
         project_context.as_deref(),
         messages,
     ) {
-        Ok(commit) => commit,
+        Ok(commit) => {
+            // Installation makes this id addressable even if the later
+            // private-identity observation reports an automation failure.
+            mark_jsonl_session_resumable(store.id());
+            commit
+        }
         Err(error) => {
+            if error.installed_commit().is_some() {
+                // The save API distinguishes a pre-install failure from a
+                // post-install durability/cleanup failure. In the latter case
+                // the exact snapshot is already present and resumable, even
+                // though the requested operation must still fail truthfully.
+                mark_jsonl_session_resumable(store.id());
+            }
             #[cfg(unix)]
             if let Some(commit) = error.installed_commit() {
                 if let Err(observation_error) = session
@@ -3389,6 +5172,169 @@ fn persist_started_session(
         return true;
     }
     persist_session(store, session, model, messages)
+}
+
+#[derive(Debug)]
+struct ClearSessionReceipt {
+    previous_session_id: Option<String>,
+    session_id: Option<String>,
+    removed_turns: usize,
+    removed_messages: usize,
+    history_preserved: bool,
+    retained_read_roots: usize,
+    retained_write_roots: usize,
+    artifact_warning: Option<String>,
+}
+
+impl ClearSessionReceipt {
+    fn snapshot_state(&self) -> &'static str {
+        if self.session_id.is_some() {
+            "pending_until_first_success"
+        } else {
+            "disabled"
+        }
+    }
+
+    fn payload(&self) -> serde_json::Value {
+        serde_json::json!({
+            "kind": "clear_session_boundary",
+            "previous_session_id": self.previous_session_id,
+            "session_id": self.session_id,
+            "removed_turns": self.removed_turns,
+            "removed_messages": self.removed_messages,
+            "history_preserved": self.history_preserved,
+            "previous_session_resumable": self.history_preserved,
+            "new_session_snapshot_state": self.snapshot_state(),
+            "runtime_grants_reset": true,
+            "invocation_read_roots_retained": self.retained_read_roots,
+            "invocation_write_roots_retained": self.retained_write_roots,
+            "artifact_warning": self.artifact_warning,
+        })
+    }
+
+    fn human_summary(&self) -> String {
+        match (
+            self.previous_session_id.as_deref(),
+            self.session_id.as_deref(),
+            self.history_preserved,
+        ) {
+            (Some(previous), Some(current), true) => format!(
+                "cleared context; previous session {} remains resumable ({} user turn(s), {} message(s) preserved); started {} (snapshot pending first successful turn; runtime grants reset)",
+                terminal_inline(previous),
+                self.removed_turns,
+                self.removed_messages,
+                terminal_inline(current),
+            ),
+            (_, Some(current), false) => format!(
+                "cleared context; no prior conversation needed saving; started {} (snapshot pending first successful turn; runtime grants reset)",
+                terminal_inline(current),
+            ),
+            _ => format!(
+                "cleared in-memory context (autosave disabled; {} user turn(s) and {} message(s) were not saved; runtime grants reset)",
+                self.removed_turns, self.removed_messages,
+            ),
+        }
+    }
+}
+
+/// Make `/clear` a recoverable session boundary. The only fallible durable
+/// operations happen before messages, identity mirrors, grants, agents, or
+/// artifacts are changed; a save or lease failure therefore leaves the active
+/// conversation usable under its original id.
+#[allow(clippy::too_many_arguments)]
+async fn clear_session_boundary(
+    session_store: &mut Option<session::SessionStore>,
+    session: &SessionInfo,
+    model: &str,
+    messages: &mut Vec<ChatMessage>,
+    state: &mut kitsu_core::AgentSessionState,
+    registry: &Arc<subagent::AgentRegistry>,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+    artifact_directories: &mut ArtifactDirectoryAllocator,
+    artifact_storage_enabled: bool,
+    stateless_artifact_base: &std::path::Path,
+) -> Result<ClearSessionReceipt, String> {
+    let running = registry.running();
+    if running > 0 {
+        return Err(format!(
+            "clear blocked while {running} background agent(s) are running; use /agents and wait for them to finish"
+        ));
+    }
+
+    let leading_system = messages
+        .first()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::System))
+        .cloned();
+    let removed_turns = messages
+        .iter()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::User))
+        .count();
+    let removed_messages = messages
+        .len()
+        .saturating_sub(usize::from(leading_system.is_some()));
+    let had_durable_content = messages
+        .iter()
+        .any(|message| !matches!(message.role, kitsu_providers::Role::System));
+    let previous_session_id = session.session_id.borrow().clone();
+    let durable = session_store.is_some();
+
+    if !persist_started_session(&*session_store, session, model, messages) {
+        return Err("clear cancelled because the current session could not be saved".to_string());
+    }
+    if let Some(store) = session_store.as_mut() {
+        store.reset().map_err(|error| {
+            format!("clear cancelled because a fresh autosave lease could not be created: {error}")
+        })?;
+        *session.session_id.borrow_mut() = Some(store.id().to_string());
+    }
+    let session_id = session.session_id.borrow().clone();
+    set_jsonl_session_receipt(
+        session_id.clone(),
+        if session_id.is_some() {
+            SessionSnapshotState::PendingUntilFirstSuccess
+        } else {
+            SessionSnapshotState::Disabled
+        },
+    );
+
+    report_write_checkpoints(journal.drain_and_take_reports().await);
+    *messages = leading_system.into_iter().collect();
+    *state = kitsu_core::AgentSessionState::default();
+    registry.reset();
+    journal.reset();
+    session.permissions.reset_runtime_grants();
+    reset_command_session(
+        session.command_policy.as_ref(),
+        &session.invocation_command_pregrants,
+    );
+    let artifact_warning = rotate_artifact_storage(
+        &session.permissions,
+        &session.offload_dir,
+        session.command_artifact_sink.as_ref(),
+        || {
+            artifact_directory_for_boundary(
+                artifact_directories,
+                artifact_storage_enabled,
+                session_store.as_ref(),
+                stateless_artifact_base,
+            )
+        },
+    )
+    .err();
+    // A fresh durable id is planned but deliberately has no empty snapshot;
+    // the next successful turn will publish it.
+    session.autosave_dirty.set(session_id.is_some());
+
+    Ok(ClearSessionReceipt {
+        previous_session_id,
+        session_id,
+        removed_turns,
+        removed_messages,
+        history_preserved: durable && had_durable_content,
+        retained_read_roots: session.permissions.base_read_roots().len(),
+        retained_write_roots: session.permissions.base_write_roots().len(),
+        artifact_warning,
+    })
 }
 
 fn activate_offload_dir(
@@ -3921,6 +5867,16 @@ fn evidence_disclosure_fields(
 fn evidence_disclosure_payload(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
     let mut fields = evidence_disclosure_fields(evidence);
     fields.insert("kind".to_string(), "review_disclosure".into());
+    serde_json::Value::Object(fields)
+}
+
+/// Process-scoped JSONL receipt for the top-level `kitsu review` surface.
+/// Unlike scripted `/review`, there is no command frame to carry a
+/// `command_result`, so the disclosure gets its own event between
+/// `run_started` and `turn_started`.
+fn top_level_review_disclosure_event(evidence: &workspace::ReviewEvidence) -> serde_json::Value {
+    let mut fields = evidence_disclosure_fields(evidence);
+    fields.insert("source".to_string(), "top_level_review".into());
     serde_json::Value::Object(fields)
 }
 
@@ -4551,9 +6507,18 @@ fn format_session_status(
             )
         })
         .unwrap_or_else(|| "none".to_string());
+    let artifacts = match session.artifact_policy {
+        ArtifactStoragePolicy::Automatic => {
+            format!("automatic ({})", session.artifact_policy_source.as_str())
+        }
+        ArtifactStoragePolicy::InlineOnly => format!(
+            "disabled ({}, bounded inline only; existing unchanged)",
+            session.artifact_policy_source.as_str()
+        ),
+    };
 
     format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
         crate::cli::LONG_VERSION,
         gateway,
         reasoning_effort_label(session.reasoning_effort.get()),
@@ -4672,6 +6637,11 @@ fn session_status_payload(
             "cwd_roots": session.command_roots.len(),
             "exact_grants": command_grants,
         },
+        "artifact_policy": artifact_policy_receipt(
+            session.artifact_policy,
+            session.artifact_policy_source,
+            session.model_can_read_artifacts,
+        ),
         "agents": {
             "total": progress.total,
             "running": progress.running,
@@ -4962,6 +6932,17 @@ fn format_permissions(perms: &Permissions, session: &SessionInfo) -> String {
     } else {
         out.push_str("disabled (enable explicitly with --enable-commands)");
     }
+    out.push_str("\n  artifacts    ");
+    match session.artifact_policy {
+        ArtifactStoragePolicy::Automatic => out.push_str(&format!(
+            "automatic ({})",
+            session.artifact_policy_source.as_str()
+        )),
+        ArtifactStoragePolicy::InlineOnly => out.push_str(&format!(
+            "disabled ({}, bounded inline only; no new automatic writes; existing artifacts unchanged)",
+            session.artifact_policy_source.as_str()
+        )),
+    }
     out
 }
 
@@ -5124,6 +7105,11 @@ fn permissions_payload(
             "ambient_authority_notice": session.command_mode.map(|_| kitsu_tools::CommandAmbientAuthority::CURRENT.notice()),
             "containment": containment,
         },
+        "artifact_policy": artifact_policy_receipt(
+            session.artifact_policy,
+            session.artifact_policy_source,
+            session.model_can_read_artifacts,
+        ),
     })
 }
 
@@ -5182,7 +7168,11 @@ fn render_context_command(
                 "tool results",
                 b.tool_results,
                 "admitted",
-                "tool outputs (offloaded -> pointers)",
+                if session.artifact_policy == ArtifactStoragePolicy::InlineOnly {
+                    "tool outputs (oversized results bounded inline; no automatic artifacts)"
+                } else {
+                    "tool outputs (offloaded -> pointers)"
+                },
             ),
         ])
         .collect();
@@ -5675,6 +7665,24 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         return Err(CliError::user(message));
     }
     let config = Config::load(&path).map_err(|error| CliError::user(safe_config_error(&error)))?;
+    let (artifact_policy, artifact_policy_source) = if cli.no_artifacts {
+        (ArtifactStoragePolicy::InlineOnly, ArtifactPolicySource::Cli)
+    } else {
+        match config.artifact_storage {
+            Some(false) => (
+                ArtifactStoragePolicy::InlineOnly,
+                ArtifactPolicySource::Config,
+            ),
+            Some(true) => (
+                ArtifactStoragePolicy::Automatic,
+                ArtifactPolicySource::Config,
+            ),
+            None => (
+                ArtifactStoragePolicy::Automatic,
+                ArtifactPolicySource::Default,
+            ),
+        }
+    };
     // Resolve the location now, but create it only when a command actually
     // needs durable state. In particular, provider-free/empty scripts should
     // continue to work in containers with a read-only HOME.
@@ -5690,15 +7698,18 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     let model = gateway
         .resolve_model(cli.model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
+    let managed_token = managed_credential(&state_dir, &gateway_name, gateway)?;
 
     let auth_status = match gateway.auth.method.as_str() {
         "none" => "none (no credential required)".to_string(),
         "static" => "static credential configured".to_string(),
         "bearer-env" => format!(
-            "bearer-env {} ({})",
+            "bearer-env {} (source: {})",
             gateway.auth.env,
-            if std::env::var_os(&gateway.auth.env).is_some_and(|value| !value.is_empty()) {
-                "present"
+            if environment_override_present(gateway) {
+                "environment"
+            } else if managed_token.is_some() {
+                "managed"
             } else {
                 "missing"
             }
@@ -5707,7 +7718,9 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     };
     let endpoint = redact_endpoint(&format!("{}{}", gateway.base_url, gateway.chat_path));
 
-    let auth = build_auth(gateway).map_err(|e| CliError::user(e.to_string()))?;
+    let auth = build_auth(gateway, &gateway_name, managed_token)
+        .map_err(|e| CliError::user(e.to_string()))?;
+    require_auth_ready(auth.as_ref(), ProviderOperation::Chat { model: &model })?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
     let context_window_refresh = ContextWindowRefreshConfig {
         cache_path: context_window_cache_path(&state_dir),
@@ -5840,6 +7853,8 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         model,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
+        artifact_policy,
+        artifact_policy_source,
         context_window,
         context_window_pinned,
         context_window_provenance,
@@ -5897,6 +7912,70 @@ fn empty_model_catalog_message(filter: &str) -> String {
     }
 }
 
+const HUMAN_MODEL_CATALOG_CAP: usize = 12;
+
+fn format_model_catalog_preview(
+    models: &[String],
+    filter: &str,
+    current_model: Option<&str>,
+    narrow_hint: &str,
+    switch_hint: &str,
+) -> String {
+    let filter = filter.trim();
+    let current_model = current_model
+        .map(str::trim)
+        .filter(|model| !model.is_empty());
+    let current_note = current_model
+        .map(|model| format!(" (current: {})", terminal_inline(model)))
+        .unwrap_or_default();
+    let mut output = if filter.is_empty() {
+        format!("~ {} model(s) available{current_note}:\n", models.len())
+    } else {
+        format!(
+            "~ {} model(s) matching '{}'{current_note}:\n",
+            models.len(),
+            terminal_inline(filter)
+        )
+    };
+
+    let mut displayed = Vec::with_capacity(HUMAN_MODEL_CATALOG_CAP.min(models.len()));
+    if let Some(current) = current_model {
+        if let Some(model) = models.iter().find(|model| model.as_str() == current) {
+            displayed.push(model.as_str());
+        }
+    }
+    let remaining = HUMAN_MODEL_CATALOG_CAP.saturating_sub(displayed.len());
+    displayed.extend(
+        models
+            .iter()
+            .map(String::as_str)
+            .filter(|model| Some(*model) != current_model)
+            .take(remaining),
+    );
+
+    for model in &displayed {
+        if Some(*model) == current_model {
+            output.push_str(&format!("  * {} (current)\n", terminal_inline(model)));
+        } else {
+            output.push_str(&format!("    {}\n", terminal_inline(model)));
+        }
+    }
+    if models.len() > displayed.len() {
+        output.push_str(&format!(
+            "    ... and {} more - narrow with {narrow_hint}\n",
+            models.len() - displayed.len(),
+        ));
+    }
+    if models.is_empty() {
+        output.push_str(&empty_model_catalog_message(filter));
+        output.push('\n');
+    } else {
+        output.push_str(switch_hint);
+        output.push('\n');
+    }
+    output
+}
+
 async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     let path = Config::resolve_path(cli.config.as_deref());
     if !path.exists() {
@@ -5912,7 +7991,14 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     gateway
         .validate_flavor()
         .map_err(|error| CliError::user(error.to_string()))?;
-    let auth = build_auth(gateway).map_err(|error| CliError::user(error.to_string()))?;
+    // Catalog discovery remains usable without a configured model. When one
+    // does resolve, human TTY output can orient the user by pinning it first.
+    let current_model = gateway.resolve_model(cli.model.as_deref()).ok();
+    let state_dir = runtime_state_dir_read_only(&path);
+    let managed_token = managed_credential(&state_dir, gateway_name, gateway)?;
+    let auth = build_auth(gateway, gateway_name, managed_token)
+        .map_err(|error| CliError::user(error.to_string()))?;
+    require_auth_ready(auth.as_ref(), ProviderOperation::ModelCatalog)?;
     let provider = OpenAICompatProvider::new(
         OpenAICompatConfig {
             base_url: gateway.base_url.clone(),
@@ -5955,6 +8041,17 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         emit_jsonl_summary("ok", 0, 0)?;
     } else if matched.is_empty() {
         eprintln!("{}", empty_model_catalog_message(filter));
+    } else if kitsu_render::is_tty() {
+        print!(
+            "{}",
+            format_model_catalog_preview(
+                &matched,
+                filter,
+                current_model.as_deref(),
+                "`kitsu models <substring>`",
+                "select with: kitsu --model <id> (or /model in chat)",
+            )
+        );
     } else {
         for model in matched {
             println!("{}", terminal_inline(&model));
@@ -5964,7 +8061,29 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
+    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let setup = build_setup(cli).await?;
+    if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
+        eprintln!(
+            "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
+        );
+    }
+    if let Some(destination) = cli.output_last_message.as_deref() {
+        let private_guard =
+            Permissions::for_roots(&[], &[]).map_err(|error| CliError::user(error.to_string()))?;
+        private_guard
+            .protect_read_path(&setup.config_path.to_string_lossy())
+            .map_err(|error| CliError::user(format!("cannot protect Kitsu config: {error}")))?;
+        private_guard
+            .protect_read_path(&setup.state_dir.to_string_lossy())
+            .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
+        if private_guard.is_within_protected_read_root(destination) {
+            return Err(CliError::user(format!(
+                "--output-last-message destination '{}' intersects Kitsu's protected config or state; choose a separate host-owned path",
+                destination.display()
+            )));
+        }
+    }
 
     let mut messages = Vec::new();
     // Preloaded skills (--skill) work even in the tool-less `ask` path: inject the
@@ -5990,7 +8109,13 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     }
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
-    let mut agent_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
+    let mut agent_cfg = build_agent_config(
+        setup.model.clone(),
+        cli,
+        setup.context_window,
+        None,
+        setup.artifact_policy,
+    );
     let partial_answer: PartialAnswerBuffer = Arc::default();
     let event_log =
         live_agent_event_log_capturing(cli.jsonl, "ask:1", Some(partial_answer.clone()));
@@ -6002,8 +8127,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 "mode": "ask",
                 "gateway": setup.gateway_name,
                 "model": setup.model,
+                "artifact_policy": artifact_policy_receipt(
+                    setup.artifact_policy,
+                    setup.artifact_policy_source,
+                    false,
+                ),
             }),
         )?;
+    }
+    emit_output_schema_receipt(cli)?;
+    if cli.jsonl {
         emit_jsonl(
             "turn_started",
             serde_json::json!({"turn_id": "ask:1", "input": prompt}),
@@ -6026,30 +8159,21 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     finish_agent_trace(cli, "ask:1", &event_log, assistant)?;
     warn_context_window_evidence(cli, Some("ask:1"), &mut state)?;
     match outcome {
-        TurnOutcome::Completed(Ok(_)) => {
-            if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
+        TurnOutcome::Completed(Ok(text)) => {
+            if let Some(failure) =
+                strict_turn_failure(&state.last_turn, cli.max_output_tokens, &text)
+            {
                 finish_assistant_disposition(
                     cli,
                     "ask:1",
                     AssistantDisposition::Discarded,
-                    Some(&issue),
+                    Some(&failure.issue),
                 )?;
-                let mapped = if kind == ScriptFailureKind::Provider {
-                    CliError::provider(format!("incomplete turn: {issue}"))
-                } else {
-                    CliError::user(issue.clone())
-                };
+                let mapped = strict_failure_cli_error(&failure);
                 if cli.jsonl {
                     emit_jsonl(
                         "error",
-                        serde_json::json!({
-                            "turn_id": "ask:1",
-                            "kind": kind.strict_jsonl_kind(),
-                            "message": mapped.to_string(),
-                            "tool_errors": state.last_turn.tool_errors,
-                            "policy_errors": state.last_turn.policy_errors,
-                            "exit_code": mapped.exit_code(),
-                        }),
+                        failure.jsonl_payload("ask:1", &mapped.to_string(), &state.last_turn),
                     )?;
                     emit_jsonl(
                         "turn_finished",
@@ -6063,13 +8187,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     emit_jsonl_summary_with_local_failures(
                         "error",
                         1,
-                        usize::from(kind == ScriptFailureKind::Provider),
-                        usize::from(kind == ScriptFailureKind::Tool),
-                        usize::from(kind == ScriptFailureKind::Policy),
+                        usize::from(failure.kind.is_provider_failure()),
+                        usize::from(failure.kind == ScriptFailureKind::OutputSchema),
+                        usize::from(failure.kind == ScriptFailureKind::Tool),
+                        usize::from(failure.kind == ScriptFailureKind::Policy),
+                        ToolErrorTotals::from_turn(&state.last_turn, false),
                     )?;
                 }
                 return Err(mapped);
             }
+            let recovered_tool_errors = ToolErrorTotals::from_turn(&state.last_turn, true);
             finish_assistant_disposition(cli, "ask:1", AssistantDisposition::Committed, None)?;
             if cli.jsonl {
                 emit_jsonl(
@@ -6081,7 +8208,24 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                         "policy_errors": state.last_turn.policy_errors,
                     }),
                 )?;
-                emit_jsonl_summary("ok", 0, 0)?;
+            }
+            if let Err(mapped) = write_output_last_message(cli, "ask:1", &text) {
+                emit_output_last_message_error(cli, "ask:1", &mapped)?;
+                if cli.jsonl {
+                    emit_jsonl_summary_with_local_failures(
+                        "error",
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        recovered_tool_errors,
+                    )?;
+                }
+                return Err(mapped);
+            }
+            if cli.jsonl {
+                emit_jsonl_summary_with_local_failures("ok", 0, 0, 0, 0, 0, recovered_tool_errors)?;
             }
             Ok(())
         }
@@ -6096,6 +8240,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     Some("the model turn failed before commit"),
                 )?;
             }
+            let cause = agent_error_jsonl_cause(&error);
             let mapped = map_agent_error(
                 error,
                 ProviderOperation::Chat {
@@ -6104,20 +8249,29 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 Some(cli.timeout_secs),
             );
             if cli.jsonl {
-                emit_jsonl(
-                    "error",
-                    serde_json::json!({
-                        "turn_id": "ask:1",
-                        "kind": mapped.jsonl_kind(),
-                        "message": mapped.to_string(),
-                        "exit_code": mapped.exit_code(),
-                    }),
-                )?;
+                let mut payload = serde_json::json!({
+                    "turn_id": "ask:1",
+                    "kind": mapped.jsonl_kind(),
+                    "message": mapped.to_string(),
+                    "exit_code": mapped.exit_code(),
+                });
+                if let Some(cause) = cause {
+                    payload["cause"] = serde_json::json!(cause);
+                }
+                emit_jsonl("error", payload)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "error"}),
                 )?;
-                emit_jsonl_summary("error", 1, usize::from(mapped.exit_code() == EXIT_PROVIDER))?;
+                emit_jsonl_summary_with_local_failures(
+                    "error",
+                    1,
+                    usize::from(mapped.exit_code() == EXIT_PROVIDER),
+                    0,
+                    0,
+                    0,
+                    ToolErrorTotals::from_turn(&state.last_turn, false),
+                )?;
             }
             Err(mapped)
         }
@@ -6143,7 +8297,15 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "cancelled"}),
                 )?;
-                emit_jsonl_summary("cancelled", 1, 0)?;
+                emit_jsonl_summary_with_local_failures(
+                    "cancelled",
+                    1,
+                    0,
+                    0,
+                    0,
+                    0,
+                    ToolErrorTotals::from_turn(&state.last_turn, false),
+                )?;
             }
             Err(mapped)
         }
@@ -6333,6 +8495,7 @@ fn chat_system_prompt(tool_names: &[String], environment: &PromptEnvironment) ->
 enum ScriptFailureKind {
     User,
     Provider,
+    OutputSchema,
     Tool,
     Policy,
     Cancelled,
@@ -6342,7 +8505,7 @@ enum ScriptFailureKind {
 impl ScriptFailureKind {
     fn exit_code(self) -> i32 {
         match self {
-            Self::Provider => EXIT_PROVIDER,
+            Self::Provider | Self::OutputSchema => EXIT_PROVIDER,
             Self::Cancelled => EXIT_CANCELLED,
             Self::User | Self::Tool | Self::Policy | Self::JsonlOutput => EXIT_USER,
         }
@@ -6351,12 +8514,73 @@ impl ScriptFailureKind {
     fn strict_jsonl_kind(self) -> &'static str {
         match self {
             Self::Provider => "incomplete_turn",
+            Self::OutputSchema => "output_schema",
             Self::Tool => "tool",
             Self::Policy => "policy",
             Self::User => "user",
             Self::Cancelled => "cancelled",
             Self::JsonlOutput => "jsonl_output",
         }
+    }
+
+    const fn is_provider_failure(self) -> bool {
+        matches!(self, Self::Provider | Self::OutputSchema)
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct OutputSchemaFailureDetails {
+    schema_sha256: String,
+    instance_path: String,
+    validation_keyword: &'static str,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct StrictTurnFailure {
+    kind: ScriptFailureKind,
+    issue: String,
+    output_schema: Option<OutputSchemaFailureDetails>,
+}
+
+impl StrictTurnFailure {
+    fn new(kind: ScriptFailureKind, issue: impl Into<String>) -> Self {
+        Self {
+            kind,
+            issue: issue.into(),
+            output_schema: None,
+        }
+    }
+
+    fn jsonl_payload(
+        &self,
+        turn_id: &str,
+        message: &str,
+        turn_status: &kitsu_core::AgentTurnStatus,
+    ) -> serde_json::Value {
+        let mut payload = serde_json::json!({
+            "turn_id": turn_id,
+            "kind": self.kind.strict_jsonl_kind(),
+            "message": message,
+            "tool_errors": turn_status.tool_errors,
+            "policy_errors": turn_status.policy_errors,
+            "exit_code": self.kind.exit_code(),
+        });
+        if let Some(details) = self.output_schema.as_ref() {
+            payload["schema_sha256"] = serde_json::json!(details.schema_sha256);
+            payload["instance_path"] = serde_json::json!(details.instance_path);
+            payload["validation_keyword"] = serde_json::json!(details.validation_keyword);
+        }
+        payload
+    }
+}
+
+fn strict_failure_cli_error(failure: &StrictTurnFailure) -> CliError {
+    match failure.kind {
+        ScriptFailureKind::Provider => {
+            CliError::provider(format!("incomplete turn: {}", failure.issue))
+        }
+        ScriptFailureKind::OutputSchema => CliError::provider(failure.issue.clone()),
+        _ => CliError::user(failure.issue.clone()),
     }
 }
 
@@ -6367,6 +8591,14 @@ fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
         | kitsu_core::AgentError::ContextWindowUnknown => ScriptFailureKind::User,
         _ => ScriptFailureKind::Provider,
     }
+}
+
+fn agent_error_jsonl_cause(error: &kitsu_core::AgentError) -> Option<&'static str> {
+    matches!(
+        error,
+        kitsu_core::AgentError::ToolCallDuringToolFreeFinalization
+    )
+    .then_some("tool_call_during_tool_free_finalization")
 }
 
 fn transcript_line(prefix: &str, text: &str) {
@@ -6485,7 +8717,7 @@ fn live_agent_event_log_capturing(
             // The process-long emitter retains a terminal write failure. The
             // turn boundary below converts it into the required nonzero exit.
             emit_runtime_event(&turn_id, event).is_ok()
-        } else if let Some(notice) = format_provider_attempt_notice(event) {
+        } else if let Some(notice) = format_runtime_notice(event) {
             // A mid-stream status must start on its own line, never fused onto
             // the last streamed stdout character.
             kitsu_render::finish_line();
@@ -6502,7 +8734,7 @@ fn live_command_event_log(jsonl: bool, line: usize, command: &str) -> kitsu_core
     kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
         if jsonl {
             emit_command_runtime_event(line, &command, event).is_ok()
-        } else if let Some(notice) = format_provider_attempt_notice(event) {
+        } else if let Some(notice) = format_runtime_notice(event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");
             true
@@ -6539,7 +8771,7 @@ fn finish_agent_trace(
         return emit_agent_trace(turn_id, log, assistant);
     }
     for event in log.take() {
-        if let Some(notice) = format_provider_attempt_notice(&event) {
+        if let Some(notice) = format_runtime_notice(&event) {
             kitsu_render::finish_line();
             eprintln!("~ {notice}");
         }
@@ -6677,7 +8909,7 @@ fn finish_assistant_disposition(
             kitsu_render::finish_line();
             if streamed {
                 eprintln!(
-                    "~ provisional assistant output was DISCARDED and was not committed{}",
+                    "~ assistant output above is provisional and was not committed{}",
                     reason
                         .map(|reason| format!(": {}", terminal_inline(reason)))
                         .unwrap_or_default()
@@ -6688,9 +8920,23 @@ fn finish_assistant_disposition(
     Ok(())
 }
 
+fn empty_final_response_issue(max_output_tokens: Option<u32>) -> String {
+    if let Some(current) = max_output_tokens {
+        let suggested = current.saturating_mul(2).max(current.saturating_add(1));
+        format!(
+            "model returned no final assistant text; retry with --max-output-tokens {suggested} or higher, or use a model that produces visible output"
+        )
+    } else {
+        "model returned no final assistant text; retry with an explicit larger --max-output-tokens <n>, revise the prompt, or use a different model"
+            .to_string()
+    }
+}
+
 fn strict_turn_failure(
     status: &kitsu_core::AgentTurnStatus,
-) -> Option<(ScriptFailureKind, String)> {
+    max_output_tokens: Option<u32>,
+    assistant_text: &str,
+) -> Option<StrictTurnFailure> {
     use kitsu_core::TurnCompletion;
     // Policy denials always fail the turn: local authority was refused, and a
     // later successful call does not un-refuse it. Plain tool errors fail the
@@ -6714,10 +8960,10 @@ fn strict_turn_failure(
                 status.tool_errors, status.policy_errors
             )
         };
-        return Some((kind, issue));
+        return Some(StrictTurnFailure::new(kind, issue));
     }
     if status.final_round_tool_errors > 0 {
-        return Some((
+        return Some(StrictTurnFailure::new(
             ScriptFailureKind::Tool,
             format!(
                 "{} tool call(s) failed during the turn ({} local policy denial(s))",
@@ -6726,15 +8972,44 @@ fn strict_turn_failure(
         ));
     }
     match status.completion {
-        TurnCompletion::LengthLimited => Some((
+        TurnCompletion::LengthLimited => {
+            let issue = if let Some(current) = max_output_tokens {
+                let suggested = current.saturating_mul(2).max(current.saturating_add(1));
+                format!(
+                    "model output hit --max-output-tokens {current}; retry with --max-output-tokens {suggested} or higher"
+                )
+            } else {
+                "model output hit the gateway's length limit; retry with an explicit larger --max-output-tokens <n>"
+                    .to_string()
+            };
+            Some(StrictTurnFailure::new(ScriptFailureKind::Provider, issue))
+        }
+        TurnCompletion::MaxRounds => Some(StrictTurnFailure::new(
             ScriptFailureKind::Provider,
-            "model output was truncated by its length limit".to_string(),
+            "agent exhausted the maximum tool rounds",
         )),
-        TurnCompletion::MaxRounds => Some((
-            ScriptFailureKind::Provider,
-            "agent exhausted the maximum tool rounds".to_string(),
-        )),
-        TurnCompletion::Complete => None,
+        TurnCompletion::Complete if assistant_text.trim().is_empty() => {
+            Some(StrictTurnFailure::new(
+                ScriptFailureKind::Provider,
+                empty_final_response_issue(max_output_tokens),
+            ))
+        }
+        TurnCompletion::Complete => active_output_schema().and_then(|schema| {
+            schema.validate_text(assistant_text).err().map(|error| {
+                StrictTurnFailure {
+                    issue: format!(
+                        "final assistant output failed --output-schema validation (sha256 {}): {error}",
+                        schema.sha256
+                    ),
+                    kind: ScriptFailureKind::OutputSchema,
+                    output_schema: Some(OutputSchemaFailureDetails {
+                        schema_sha256: schema.sha256.clone(),
+                        instance_path: error.instance_path,
+                        validation_keyword: error.validation_keyword,
+                    }),
+                }
+            })
+        }),
     }
 }
 
@@ -7488,8 +9763,34 @@ fn format_command_artifacts(
 fn handle_command_artifacts(
     sink: Option<&command_artifact::CommandArtifactSink>,
     cross_run: CrossRunArtifacts,
+    policy: ArtifactStoragePolicy,
+    policy_source: ArtifactPolicySource,
     arg: &str,
 ) -> Result<serde_json::Value, ()> {
+    if policy == ArtifactStoragePolicy::InlineOnly {
+        let action = arg.split_whitespace().next().unwrap_or("list");
+        if !matches!(action, "" | "list") || arg.split_whitespace().nth(1).is_some() {
+            eprintln!(
+                "automatic artifact storage is disabled; existing artifacts are unchanged — use `kitsu artifacts` for explicit host-only management"
+            );
+            return Err(());
+        }
+        eprintln!(
+            "command artifacts: automatic capture disabled ({}); bounded previews only; existing artifacts unchanged\n  other runs: {} generation(s), {} retained on disk — inspect with `kitsu artifacts list`",
+            policy_source.as_str(),
+            cross_run.generations,
+            artifacts::human_bytes(cross_run.bytes),
+        );
+        return Ok(serde_json::json!({
+            "kind": "command_artifacts",
+            "artifacts": [],
+            "cross_run": {
+                "generation_count": cross_run.generations,
+                "bytes": cross_run.bytes,
+            },
+            "artifact_policy": artifact_policy_receipt(policy, policy_source, false),
+        }));
+    }
     let Some(sink) = sink else {
         eprintln!("no artifacts — enable command tool to capture artifact generations");
         return Err(());
@@ -8113,8 +10414,15 @@ struct ScriptRunStatus {
     successes: usize,
     failures: usize,
     provider_failures: usize,
+    output_schema_failures: usize,
+    postcondition_failures: usize,
     tool_failures: usize,
     policy_failures: usize,
+    tool_error_totals: ToolErrorTotals,
+    /// Last assistant payload whose turn received a committed disposition.
+    /// Failed, cancelled, blank, length-limited, and committed-partial turns
+    /// never replace this candidate.
+    last_committed_assistant: Option<(String, String)>,
     /// True when the operation-specific JSONL error frame was successfully
     /// written before the body returned its primary error.
     primary_error_framed: bool,
@@ -8127,9 +10435,14 @@ impl ScriptRunStatus {
 
     fn record_turn_failure(&mut self, kind: ScriptFailureKind) {
         self.failures += 1;
-        self.provider_failures += usize::from(kind == ScriptFailureKind::Provider);
+        self.provider_failures += usize::from(kind.is_provider_failure());
+        self.output_schema_failures += usize::from(kind == ScriptFailureKind::OutputSchema);
         self.tool_failures += usize::from(kind == ScriptFailureKind::Tool);
         self.policy_failures += usize::from(kind == ScriptFailureKind::Policy);
+    }
+
+    fn record_turn_errors(&mut self, turn_status: &kitsu_core::AgentTurnStatus, recovered: bool) {
+        self.tool_error_totals.record_turn(turn_status, recovered);
     }
 }
 
@@ -8208,13 +10521,16 @@ fn emit_run_receipt(
 async fn finalize_scripted_run(
     registry: &Arc<subagent::AgentRegistry>,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
+    perms: &Permissions,
+    required_writes: &[RequiredWriteContract],
     session_id: Option<String>,
-    jsonl: bool,
+    cli: &Cli,
     allow_turn_errors: bool,
     agent_join_timeout: std::time::Duration,
     mut status: ScriptRunStatus,
     body_result: Result<(), CliError>,
 ) -> Result<(), CliError> {
+    let jsonl = cli.jsonl;
     let body_completed = body_result.is_ok();
     let mut primary_error = body_result.err();
     if let Some(error) = &primary_error {
@@ -8264,6 +10580,58 @@ async fn finalize_scripted_run(
             eprintln!(
                 "script retained {unseen_background_failures} failed background agent result(s); unacknowledged detached failures are not successful automation"
             );
+        }
+    }
+
+    let required_write_evaluation = evaluate_required_writes(required_writes, perms, journal);
+    let required_writes_satisfied = required_write_evaluation.satisfied;
+    if !required_writes.is_empty() {
+        if let Err(output_error) =
+            emit_required_write_evaluation(cli, required_writes, &required_write_evaluation)
+        {
+            finalization_output_error = Some(output_error);
+        }
+        if let Some(error) = required_write_evaluation.failure {
+            status.failures += 1;
+            status.postcondition_failures += 1;
+            let framed = emit_required_write_error(cli, &error);
+            if let Err(output_error) = framed.as_ref() {
+                finalization_output_error = Some(CliError::user(output_error.to_string()));
+            }
+            if primary_error.is_none() {
+                status.primary_error_framed = jsonl && framed.is_ok();
+                primary_error = Some(error);
+            } else if !jsonl {
+                eprintln!(
+                    "~ additional completion postcondition failure: {}",
+                    terminal_inline(&error.to_string())
+                );
+            }
+        }
+    }
+
+    if required_writes_satisfied {
+        if let Some((turn_id, text)) = status.last_committed_assistant.as_ref() {
+            if let Err(error) = write_output_last_message(cli, turn_id, text) {
+                if jsonl_output_failure().is_some() {
+                    finalization_output_error = Some(error);
+                } else {
+                    status.failures += 1;
+                    let framed = emit_output_last_message_error(cli, turn_id, &error);
+                    if let Err(output_error) = framed.as_ref() {
+                        finalization_output_error = Some(CliError::user(output_error.to_string()));
+                    }
+                    if primary_error.is_none() {
+                        status.primary_error_framed = jsonl && framed.is_ok();
+                        primary_error = Some(error);
+                    } else if !jsonl {
+                        eprintln!(
+                            "~ additional output failure: {}",
+                            terminal_inline(&error.to_string())
+                        );
+                    }
+                }
+            }
         }
     }
 
@@ -8350,12 +10718,15 @@ async fn finalize_scripted_run(
             } else {
                 "ok"
             };
-            if let Err(output_error) = emit_jsonl_summary_with_local_failures(
+            if let Err(output_error) = emit_jsonl_summary_with_postcondition_failures(
                 summary_status,
                 status.failures,
                 status.provider_failures,
+                status.output_schema_failures,
+                status.postcondition_failures,
                 status.tool_failures,
                 status.policy_failures,
+                status.tool_error_totals,
             ) {
                 finalization_output_error = Some(output_error);
             }
@@ -8381,14 +10752,17 @@ async fn run_scripted(
     path: &str,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
-    offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &Option<session::SessionStore>,
+    session_store: &mut Option<session::SessionStore>,
+    artifact_directories: &mut ArtifactDirectoryAllocator,
+    artifact_storage_enabled: bool,
+    stateless_artifact_base: &std::path::Path,
     allow_turn_errors: bool,
+    required_writes: &[RequiredWriteContract],
 ) -> Result<(), CliError> {
     let mut status = ScriptRunStatus::default();
     let result = run_scripted_body(
@@ -8400,13 +10774,15 @@ async fn run_scripted(
         path,
         perms,
         journal,
-        offload_dir,
         skillset,
         session,
         context_window,
         live_mw,
         registry,
         session_store,
+        artifact_directories,
+        artifact_storage_enabled,
+        stateless_artifact_base,
         &mut status,
     )
     .await;
@@ -8414,8 +10790,10 @@ async fn run_scripted(
     finalize_scripted_run(
         registry,
         journal,
+        perms,
+        required_writes,
         run_session_id,
-        cli.jsonl,
+        cli,
         allow_turn_errors,
         agent_join_timeout(cli),
         status,
@@ -8434,13 +10812,15 @@ async fn run_scripted_body(
     path: &str,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
-    offload_dir: &Option<std::path::PathBuf>,
     skillset: &skills::SkillSet,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &Option<session::SessionStore>,
+    session_store: &mut Option<session::SessionStore>,
+    artifact_directories: &mut ArtifactDirectoryAllocator,
+    artifact_storage_enabled: bool,
+    stateless_artifact_base: &std::path::Path,
     status: &mut ScriptRunStatus,
 ) -> Result<(), CliError> {
     let content = tokio::time::timeout(
@@ -8519,14 +10899,12 @@ async fn run_scripted_body(
                 cli,
                 &prompt.text,
                 &prompt.text,
-                offload_dir,
+                session,
                 &mut state,
                 context_window,
-                &session.reasoning_effort,
-                &session.spawn_budget,
-                &session.run_tallies,
                 &scripted_skill_names,
                 registry,
+                status,
                 &format!("{path}:{line_number}"),
             )
             .await;
@@ -8647,6 +11025,78 @@ async fn run_scripted_body(
                     finish_command("ok", None, EXIT_USER)?;
                     continue;
                 }
+                SlashResult::ClearSession => {
+                    let running = registry.running();
+                    if running > 0 {
+                        status.failures += 1;
+                        let message = format!(
+                            "clear blocked while {running} background agent(s) are running; use /agents and wait for them to finish"
+                        );
+                        finish_command("error", Some(&message), EXIT_USER)?;
+                        if !cli.jsonl {
+                            eprintln!(
+                                "{}:{line_number}: {}",
+                                terminal_inline(path),
+                                terminal_inline(&message)
+                            );
+                        }
+                        continue;
+                    }
+                    let background_results = registry.take_unobserved_terminal_results();
+                    emit_script_background_results(&background_results, cli.jsonl)?;
+                    match clear_session_boundary(
+                        session_store,
+                        session,
+                        model,
+                        messages,
+                        &mut state,
+                        registry,
+                        journal,
+                        artifact_directories,
+                        artifact_storage_enabled,
+                        stateless_artifact_base,
+                    )
+                    .await
+                    {
+                        Ok(receipt) => {
+                            if cli.jsonl {
+                                emit_jsonl(
+                                    "command_result",
+                                    serde_json::json!({
+                                        "line": line_number,
+                                        "command": trimmed,
+                                        "result": receipt.payload(),
+                                    }),
+                                )?;
+                            } else {
+                                eprintln!(
+                                    "{}",
+                                    kitsu_render::milestone_line(&receipt.human_summary())
+                                );
+                                if let Some(warning) = receipt.artifact_warning.as_deref() {
+                                    eprintln!(
+                                        "warning: private artifact storage disabled after clear: {warning}"
+                                    );
+                                }
+                            }
+                            status.record_success();
+                            last_failed = None;
+                            finish_command("ok", None, EXIT_USER)?;
+                        }
+                        Err(error) => {
+                            status.failures += 1;
+                            finish_command("error", Some(&error), EXIT_USER)?;
+                            if !cli.jsonl {
+                                eprintln!(
+                                    "{}:{line_number}: {}",
+                                    terminal_inline(path),
+                                    terminal_inline(&error)
+                                );
+                            }
+                        }
+                    }
+                    continue;
+                }
                 SlashResult::Cancelled => {
                     if cli.jsonl {
                         emit_jsonl(
@@ -8724,14 +11174,12 @@ async fn run_scripted_body(
                         cli,
                         &prompt.text,
                         trimmed,
-                        offload_dir,
+                        session,
                         &mut state,
                         context_window,
-                        &session.reasoning_effort,
-                        &session.spawn_budget,
-                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
+                        status,
                         &format!("{path}:{line_number}"),
                     )
                     .await;
@@ -8778,14 +11226,12 @@ async fn run_scripted_body(
                         cli,
                         &prompt.text,
                         "/retry",
-                        offload_dir,
+                        session,
                         &mut state,
                         context_window,
-                        &session.reasoning_effort,
-                        &session.spawn_budget,
-                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
+                        status,
                         &format!("{path}:{line_number}"),
                     )
                     .await;
@@ -8877,14 +11323,12 @@ async fn run_scripted_body(
             cli,
             &prompt.text,
             trimmed,
-            offload_dir,
+            session,
             &mut state,
             context_window,
-            &session.reasoning_effort,
-            &session.spawn_budget,
-            &session.run_tallies,
             &scripted_skill_names,
             registry,
+            status,
             &format!("{path}:{line_number}"),
         )
         .await;
@@ -8926,14 +11370,12 @@ async fn run_scripted_turn(
     cli: &Cli,
     input: &str,
     display_input: &str,
-    offload_dir: &Option<std::path::PathBuf>,
+    session: &SessionInfo,
     state: &mut kitsu_core::AgentSessionState,
     context_window: &Rc<Cell<Option<u64>>>,
-    reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
-    spawn_budget: &Arc<kitsu_core::SpawnBudget>,
-    run_tallies: &Arc<kitsu_core::RunTallies>,
     skill_names: &[String],
     registry: &Arc<subagent::AgentRegistry>,
+    run_status: &mut ScriptRunStatus,
     location: &str,
 ) -> Result<(), ScriptFailureKind> {
     transcript_line("user", display_input);
@@ -9012,20 +11454,37 @@ async fn run_scripted_turn(
         model.to_string(),
         cli,
         context_window.get(),
-        offload_dir.clone(),
+        session
+            .model_can_read_artifacts
+            .then(|| session.offload_dir.borrow().clone())
+            .flatten(),
+        session.artifact_policy,
     );
-    cfg.reasoning_effort = reasoning_effort.get();
-    cfg.spawn_budget = Some(spawn_budget.clone());
-    cfg.run_tallies = Some(run_tallies.clone());
+    cfg.reasoning_effort = session.reasoning_effort.get();
+    cfg.spawn_budget = Some(session.spawn_budget.clone());
+    cfg.run_tallies = Some(session.run_tallies.clone());
     cfg.skill_names = skill_names.to_vec();
+    cfg.defer_response_format_until_final = session.defer_structured_finalization;
+    cfg.structured_finalization_gate = session.structured_finalization_gate.clone();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
-    let outcome = journal
-        .scope_turn(
+    // One scripted turn gets one inference budget. A tool call must not reset
+    // `--timeout-secs` for the next provider round: without this outer bound a
+    // nominal 45-second automation turn can run for 45 seconds per round.
+    let outcome = match tokio::time::timeout(
+        Duration::from_secs(cli.timeout_secs),
+        journal.scope_turn(
             &journal_turn.token,
             run_turn_cancellable(&setup.provider, tools, messages, &cfg, state),
-        )
-        .await;
+        ),
+    )
+    .await
+    {
+        Ok(outcome) => outcome,
+        Err(_) => TurnOutcome::Completed(Err(kitsu_core::AgentError::Provider(
+            ProviderError::Timeout,
+        ))),
+    };
     // Keep this turn's verified reports: a failed turn's rollback needs them
     // to brief the next turn about file changes retained on disk (G1).
     let mut turn_reports = journal.drain_and_take_reports().await;
@@ -9043,26 +11502,22 @@ async fn run_scripted_turn(
     warn_context_window_evidence(cli, Some(location), state)
         .map_err(|_| ScriptFailureKind::JsonlOutput)?;
     match outcome {
-        TurnOutcome::Completed(Ok(_)) => {
-            if let Some((kind, issue)) = strict_turn_failure(&state.last_turn) {
+        TurnOutcome::Completed(Ok(text)) => {
+            if let Some(failure) =
+                strict_turn_failure(&state.last_turn, cli.max_output_tokens, &text)
+            {
+                run_status.record_turn_errors(&state.last_turn, false);
                 finish_assistant_disposition(
                     cli,
                     location,
                     AssistantDisposition::Discarded,
-                    Some(&issue),
+                    Some(&failure.issue),
                 )
                 .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 if cli.jsonl {
                     emit_jsonl(
                         "error",
-                        serde_json::json!({
-                            "turn_id": location,
-                            "kind": kind.strict_jsonl_kind(),
-                            "message": issue,
-                            "tool_errors": state.last_turn.tool_errors,
-                            "policy_errors": state.last_turn.policy_errors,
-                            "exit_code": kind.exit_code(),
-                        }),
+                        failure.jsonl_payload(location, &failure.issue, &state.last_turn),
                     )
                     .map_err(|_| ScriptFailureKind::JsonlOutput)?;
                     emit_jsonl(
@@ -9084,8 +11539,9 @@ async fn run_scripted_turn(
                 );
                 if !cli.jsonl {
                     eprintln!(
-                        "{}: strict scripted turn failed: {issue}",
-                        terminal_inline(location)
+                        "{}: strict scripted turn failed: {}",
+                        terminal_inline(location),
+                        failure.issue
                     );
                     eprintln!(
                         "kitsu-context-rollback: incomplete turn removed from conversation state"
@@ -9102,10 +11558,12 @@ async fn run_scripted_turn(
                     tools.is_registered("workspace_diff"),
                 )
                 .map_err(|_| ScriptFailureKind::JsonlOutput)?;
-                Err(kind)
+                Err(failure.kind)
             } else {
+                run_status.record_turn_errors(&state.last_turn, true);
                 finish_assistant_disposition(cli, location, AssistantDisposition::Committed, None)
                     .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+                run_status.last_committed_assistant = Some((location.to_string(), text.clone()));
                 if !cli.jsonl && state.last_turn.tool_errors > 0 {
                     eprintln!(
                         "~ {} earlier tool error(s) were recovered within the turn; final state committed",
@@ -9128,6 +11586,7 @@ async fn run_scripted_turn(
             }
         }
         TurnOutcome::Completed(Err(e)) => {
+            run_status.record_turn_errors(&state.last_turn, false);
             finish_assistant_disposition(
                 cli,
                 location,
@@ -9135,21 +11594,22 @@ async fn run_scripted_turn(
                 Some("the model turn failed before commit"),
             )
             .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+            let cause = agent_error_jsonl_cause(&e);
             let kind = script_failure_kind(&e);
             let error_message = chat_error_message(e, model, cli.timeout_secs);
             if cli.jsonl {
-                emit_jsonl(
-                    "error",
-                    serde_json::json!({
-                        "turn_id": location,
-                        "kind": if kind == ScriptFailureKind::Provider { "provider" } else { "user" },
-                        "message": error_message,
-                        "tool_errors": state.last_turn.tool_errors,
-                        "policy_errors": state.last_turn.policy_errors,
-                        "exit_code": if kind == ScriptFailureKind::Provider { EXIT_PROVIDER } else { EXIT_USER },
-                    }),
-                )
-                .map_err(|_| ScriptFailureKind::JsonlOutput)?;
+                let mut payload = serde_json::json!({
+                    "turn_id": location,
+                    "kind": if kind == ScriptFailureKind::Provider { "provider" } else { "user" },
+                    "message": error_message,
+                    "tool_errors": state.last_turn.tool_errors,
+                    "policy_errors": state.last_turn.policy_errors,
+                    "exit_code": if kind == ScriptFailureKind::Provider { EXIT_PROVIDER } else { EXIT_USER },
+                });
+                if let Some(cause) = cause {
+                    payload["cause"] = serde_json::json!(cause);
+                }
+                emit_jsonl("error", payload).map_err(|_| ScriptFailureKind::JsonlOutput)?;
                 emit_jsonl(
                     "turn_finished",
                     serde_json::json!({
@@ -9184,6 +11644,7 @@ async fn run_scripted_turn(
             Err(kind)
         }
         TurnOutcome::Cancelled => {
+            run_status.record_turn_errors(&state.last_turn, false);
             finish_assistant_disposition(
                 cli,
                 location,
@@ -10161,11 +12622,15 @@ async fn run_turn_steerable(
 }
 
 async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliError> {
+    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let ChatInvocation {
         first_prompt,
+        no_tools,
         allow_paths,
         allow_write,
         allow_read_write,
+        require_writes,
+        require_write_sha256,
         enable_commands,
         command_roots,
         command_runtime_roots,
@@ -10199,22 +12664,44 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         || !command_runtime_roots.is_empty()
         || !allow_commands.is_empty()
         || !command_env.is_empty();
+    let automatic_artifacts = setup.artifact_policy == ArtifactStoragePolicy::Automatic;
     if cli.jsonl && interactive {
         return Err(CliError::user(
             "--jsonl is an automation mode; use --script, pipe one prompt, or use `ask`"
                 .to_string(),
         ));
     }
-    if durable_session || command_requested {
+    if cli.output_last_message.is_some() && interactive {
+        return Err(CliError::user(
+            "--output-last-message is an automation mode; use --script, pipe one prompt, `ask`, or `review`"
+                .to_string(),
+        ));
+    }
+    let has_required_writes = !require_writes.is_empty() || !require_write_sha256.is_empty();
+    if has_required_writes && interactive {
+        return Err(CliError::user(
+            "--require-write and --require-write-sha256 are automation modes; use --script or pipe one prompt"
+                .to_string(),
+        ));
+    }
+    if has_required_writes && cli.output_schema.is_some() && cli.max_rounds < 2 {
+        return Err(CliError::user(
+            "--output-schema with a required-write contract needs --max-rounds 2 or higher: one bounded round is reserved for the tool-free structured final answer"
+                .to_string(),
+        ));
+    }
+    if durable_session || (command_requested && automatic_artifacts) {
         prepare_runtime_state_dir(&setup.state_dir).map_err(CliError::user)?;
         // The state dir is being prepared anyway, so reclaim the litter that is
         // provably worthless: empty, orphaned, and held by nobody. Non-empty
         // orphans are never deleted automatically — they may hold the only copy
         // of a command's output — but they stop being invisible.
-        let sweep = artifacts::sweep_empty_orphans(&setup.state_dir);
-        if let Some(notice) = sweep.notice() {
-            if !cli.jsonl {
-                eprintln!("{notice}");
+        if automatic_artifacts {
+            let sweep = artifacts::sweep_empty_orphans(&setup.state_dir);
+            if let Some(notice) = sweep.notice() {
+                if !cli.jsonl {
+                    eprintln!("{notice}");
+                }
             }
         }
     }
@@ -10322,6 +12809,46 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     perms
         .protect_write_path(&setup.state_dir.to_string_lossy())
         .map_err(|error| CliError::user(format!("cannot protect Kitsu state: {error}")))?;
+    if let Some(destination) = cli.output_last_message.as_deref() {
+        if perms.is_within_protected_read_root(destination) {
+            return Err(CliError::user(format!(
+                "--output-last-message destination '{}' intersects Kitsu's protected config or state; choose a separate host-owned path",
+                destination.display()
+            )));
+        }
+        // The host installs this file only after model/background work ends.
+        // Keep it absent from filesystem-tool authority even when its parent is
+        // an allowed write root or the global filesystem bypass is active.
+        perms
+            .protect_read_path(&destination.to_string_lossy())
+            .map_err(|error| {
+                CliError::user(format!(
+                    "cannot protect --output-last-message destination: {error}"
+                ))
+            })?;
+        perms
+            .protect_write_path(&destination.to_string_lossy())
+            .map_err(|error| {
+                CliError::user(format!(
+                    "cannot protect --output-last-message destination: {error}"
+                ))
+            })?;
+    }
+    if let Some(schema) = cli.output_schema.as_deref() {
+        // The host reads and validates the schema before constructing tools.
+        // The model receives only its provider-native value; broad filesystem
+        // roots must never turn the source file into model read/write authority.
+        perms
+            .protect_read_path(&schema.to_string_lossy())
+            .map_err(|error| {
+                CliError::user(format!("cannot protect --output-schema file: {error}"))
+            })?;
+        perms
+            .protect_write_path(&schema.to_string_lossy())
+            .map_err(|error| {
+                CliError::user(format!("cannot protect --output-schema file: {error}"))
+            })?;
+    }
 
     // In interactive chat the tools are always available (permissions gate access
     // at call time). Non-interactively, register a tool only when it can actually
@@ -10333,17 +12860,36 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // The unattended bypass exists so loop automation runs with no human;
     // unlike the filesystem-only bypass it therefore does register fs tools
     // in non-interactive runs (documented on the flag).
-    let can_read = !forced_one_shot
+    let can_read = !no_tools
+        && !forced_one_shot
         && (interactive
             || cli.dangerously_skip_permissions
             || !allow_paths.is_empty()
             || !allow_read_write.is_empty());
-    let can_write = interactive
-        || cli.dangerously_skip_permissions
-        || !allow_write.is_empty()
-        || !allow_read_write.is_empty();
+    let can_write = !no_tools
+        && (interactive
+            || cli.dangerously_skip_permissions
+            || !allow_write.is_empty()
+            || !allow_read_write.is_empty());
+    if has_required_writes && !can_write {
+        return Err(CliError::user(
+            "a required-write contract needs an enabled filesystem write tool and explicit --allow-write or --allow-read-write authority"
+                .to_string(),
+        ));
+    }
+    let required_write_contracts =
+        prepare_required_writes(require_writes, require_write_sha256, &perms).await?;
+    let defer_structured_finalization =
+        !required_write_contracts.is_empty() && active_output_schema().is_some();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
-    let command_artifact_sink = command_requested.then(|| {
+    let structured_finalization_gate = defer_structured_finalization.then(|| {
+        let contracts = required_write_contracts.clone();
+        let journal = write_journal.clone();
+        kitsu_core::StructuredFinalizationGate::new(move || {
+            required_write_structured_repair(&contracts, &journal)
+        })
+    });
+    let command_artifact_sink = (command_requested && automatic_artifacts).then(|| {
         let quota = command_artifact::CommandArtifactQuota::new(
             command_artifact::DEFAULT_COMMAND_ARTIFACT_COUNT,
             command_artifact::DEFAULT_COMMAND_ARTIFACT_TOTAL_BYTES,
@@ -10375,6 +12921,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         };
         let mut policy = kitsu_tools::CommandPolicy::new(&roots, command_mode)
             .map_err(|error| CliError::user(format!("invalid command policy: {error}")))?;
+        for root in policy.command_roots() {
+            reject_credential_command_root(&root, &setup.state_dir, "--command-root")?;
+        }
+        let mut readonly_runtime_roots = Vec::new();
         if !command_runtime_roots.is_empty() {
             // Toolchains outside /usr (rustup/cargo installs in particular)
             // are invisible to contained commands without an explicit
@@ -10389,6 +12939,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     })?;
             }
             for root in containment.readonly_runtime_roots() {
+                reject_credential_command_root(root, &setup.state_dir, "--command-runtime-root")?;
+                readonly_runtime_roots.push(root.clone());
                 eprintln!(
                     "~ command containment: read-only runtime root {} (contents readable by approved commands)",
                     terminal_inline(&root.display().to_string())
@@ -10396,6 +12948,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             }
             policy = policy.with_containment_config(containment);
         }
+        reject_host_output_command_authority(
+            cli,
+            &policy.command_roots(),
+            &readonly_runtime_roots,
+        )?;
         if interactive {
             policy = policy.with_prompter(Arc::new(CliCommandPrompter));
         }
@@ -10581,26 +13138,37 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // and every spawned subagent, feeding the end-of-run receipt.
     let run_tallies = Arc::new(kitsu_core::RunTallies::default());
 
-    // The main tool set: base tools + the spawn/agent tools, which delegate to
-    // subagents running the base `sub_tools` in their own isolated context.
+    // The main tool set: base tools plus, when spawning is enabled, the agent
+    // tools that delegate to `sub_tools` in their own isolated context. A zero
+    // cap removes the agent schemas entirely: advertising tools that can only
+    // return "budget exhausted" wastes context and makes /tools misleading.
     let mut tools = Registry::new();
-    register_base_tools(
-        &mut tools,
-        &perms,
-        &skillset,
-        can_read,
-        can_write,
-        &write_journal,
-        command_policy.as_ref(),
+    if !no_tools {
+        register_base_tools(
+            &mut tools,
+            &perms,
+            &skillset,
+            can_read,
+            can_write,
+            &write_journal,
+            command_policy.as_ref(),
+        );
+    }
+    let mut sub_cfg = build_agent_config(
+        setup.model.clone(),
+        cli,
+        setup.context_window,
+        None,
+        setup.artifact_policy,
     );
-    let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
                             // Foreground subagents run QUIET (cycle-15 audit #3 / cycle-27 double
                             // print): their inner narration corrupted the answer channel and their
                             // final text arrived twice — streamed by the child, then repeated by the
-                            // parent. The ◆ Agent(...) header and ◇ result receipt remain the
-                            // progress surface; the answer arrives once, through the parent.
+                            // parent. The ◆ Agent(...) header and ◇ result receipt remain the progress
+                            // surface; the answer arrives once, through the parent.
     sub_cfg.quiet = true;
+    sub_cfg.response_format = None;
     sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
     sub_cfg.run_tallies = Some(run_tallies.clone());
     let sub_system = if skillset.is_empty() {
@@ -10611,43 +13179,46 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             skillset.index("")
         )
     };
-    // Stage A: synchronous single delegation.
-    let (d, h) = subagent::spawn_agent_tool(
-        setup.provider.clone(),
-        sub_tools.clone(),
-        sub_cfg.clone(),
-        live_mw.clone(),
-        sub_system.clone(),
-        spawn_budget.clone(),
-    );
-    tools.register_with_descriptor(d, h);
-    // Stage B: fan several isolated subagents out in parallel.
-    let (d, h) = subagent::spawn_agents_tool(
-        setup.provider.clone(),
-        sub_tools.clone(),
-        sub_cfg.clone(),
-        live_mw.clone(),
-        sub_system.clone(),
-        spawn_budget.clone(),
-    );
-    tools.register_with_descriptor(d, h);
-    // Stage C: detached background subagent (runs quiet so it doesn't corrupt
-    // the prompt) + a tool to fetch its result by id.
-    let mut bg_cfg = sub_cfg;
-    bg_cfg.quiet = true;
-    let (d, h) = subagent::spawn_agent_bg_tool(
-        setup.provider.clone(),
-        sub_tools.clone(),
-        bg_cfg,
-        live_mw.clone(),
-        sub_system,
-        agent_registry.clone(),
-        subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
-        spawn_budget.clone(),
-    );
-    tools.register_with_descriptor(d, h);
-    let (d, h) = subagent::agent_result_tool(agent_registry.clone());
-    tools.register_with_descriptor(d, h);
+    if !no_tools && spawn_cap > 0 {
+        // Stage A: synchronous single delegation.
+        let (d, h) = subagent::spawn_agent_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
+            sub_cfg.clone(),
+            live_mw.clone(),
+            sub_system.clone(),
+            spawn_budget.clone(),
+        );
+        tools.register_with_descriptor(d, h);
+        // Stage B: fan several isolated subagents out in parallel.
+        let (d, h) = subagent::spawn_agents_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
+            sub_cfg.clone(),
+            live_mw.clone(),
+            sub_system.clone(),
+            spawn_budget.clone(),
+        );
+        tools.register_with_descriptor(d, h);
+        // Stage C: detached background subagent (runs quiet so it doesn't corrupt
+        // the prompt) + a tool to fetch its result by id.
+        let mut bg_cfg = sub_cfg;
+        bg_cfg.quiet = true;
+        let (d, h) = subagent::spawn_agent_bg_tool(
+            setup.provider.clone(),
+            sub_tools.clone(),
+            bg_cfg,
+            live_mw.clone(),
+            sub_system,
+            agent_registry.clone(),
+            subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
+            spawn_budget.clone(),
+        );
+        tools.register_with_descriptor(d, h);
+        let (d, h) = subagent::agent_result_tool(agent_registry.clone());
+        tools.register_with_descriptor(d, h);
+    }
+
     // The model-callable `workspace_diff` evidence tool: a bounded disclosure
     // of host-gathered diff bytes (like /review), never a model filesystem
     // read, so it is independent of can_read and grants no root. Main
@@ -10658,7 +13229,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // process (offload generations always land under the state dir, a session
     // sidecar beneath it, or the stateless temp base), so per-boundary
     // rotation cannot open an exclusion gap.
-    if setup.workspace_evidence && !cli.no_workspace_evidence && !forced_one_shot {
+    if !no_tools && setup.workspace_evidence && !cli.no_workspace_evidence && !forced_one_shot {
         let launch_dir = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
         let private_evidence_paths = vec![
             setup.config_path.clone(),
@@ -10682,9 +13253,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // A pointer is useful only when this registry also exposes fs_read_file.
     // In command-only automation, offloading would replace usable inline
     // command output with a path the model has no tool capable of reading.
-    let model_can_read_artifacts = can_resolve_offload_pointers(&tool_names);
-    let artifact_storage_enabled =
-        !tool_names.is_empty() && (model_can_read_artifacts || command_policy.is_some());
+    let model_can_read_artifacts = automatic_artifacts && can_resolve_offload_pointers(&tool_names);
+    let artifact_storage_enabled = automatic_artifacts
+        && !tool_names.is_empty()
+        && (model_can_read_artifacts || command_policy.is_some());
     let stateless_artifact_base = if command_policy.is_some() {
         setup.state_dir.join("artifacts")
     } else {
@@ -10692,29 +13264,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     };
     let mut artifact_directories = ArtifactDirectoryAllocator::default();
     let offload_state = Rc::new(RefCell::new(None));
-    if let Err(error) = rotate_artifact_storage(
-        &perms,
-        &offload_state,
-        command_artifact_sink.as_ref(),
-        || {
-            artifact_directory_for_boundary(
-                &mut artifact_directories,
-                artifact_storage_enabled,
-                session_store.as_ref(),
-                &stateless_artifact_base,
-            )
-        },
-    ) {
-        eprintln!("warning: private artifact storage disabled: {error}");
+    if artifact_storage_enabled {
+        if let Err(error) = rotate_artifact_storage(
+            &perms,
+            &offload_state,
+            command_artifact_sink.as_ref(),
+            || {
+                artifact_directory_for_boundary(
+                    &mut artifact_directories,
+                    artifact_storage_enabled,
+                    session_store.as_ref(),
+                    &stateless_artifact_base,
+                )
+            },
+        ) {
+            eprintln!("warning: private artifact storage disabled: {error}");
+        }
     }
-    let offload_dir = model_can_read_artifacts
-        .then(|| offload_state.borrow().clone())
-        .flatten();
-    let _offload_guard = if session_store.is_none() && command_policy.is_none() {
-        Some(OffloadDirGuard(stateless_artifact_base.clone()))
-    } else {
-        None
-    };
+    let _offload_guard =
+        if artifact_storage_enabled && session_store.is_none() && command_policy.is_none() {
+            Some(OffloadDirGuard(stateless_artifact_base.clone()))
+        } else {
+            None
+        };
 
     let mut model = setup.model.clone();
     // Shared with session UI state and updated in place by `/model`, so
@@ -10730,6 +13302,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let offload_state = offload_state.clone();
         let spawn_budget = spawn_budget.clone();
         let run_tallies = run_tallies.clone();
+        let structured_finalization_gate = structured_finalization_gate.clone();
         let skill_names: Vec<String> = skillset.names().into_iter().map(str::to_string).collect();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
@@ -10739,10 +13312,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 model_can_read_artifacts
                     .then(|| offload_state.borrow().clone())
                     .flatten(),
+                setup.artifact_policy,
             );
             config.reasoning_effort = reasoning_effort.get();
             config.skill_names = skill_names.clone();
             config.run_tallies = Some(run_tallies.clone());
+            config.defer_response_format_until_final = defer_structured_finalization;
+            config.structured_finalization_gate = structured_finalization_gate.clone();
             // Main-conversation turns carry the spawn budget so the
             // orchestrator resets it at each turn start (subagent configs
             // stay `None`).
@@ -10782,6 +13358,26 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         "core assistant instructions",
     ));
     let mut system = base;
+    if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !tool_names.is_empty() {
+        let contract = "\n\nAutomatic artifact storage is disabled for this run. Commands return bounded previews only; oversized tool results are irreversibly reduced to explicit head/tail previews. No new saved full-output path is created; historical artifact pointers may remain in resumed context, but no managed artifact read root is granted.";
+        system.push_str(contract);
+        provenance.push(CtxEntry::new(
+            "artifact-free policy",
+            estimate_str(contract),
+            "host-enforced",
+            "no automatic command or oversized tool-result files",
+        ));
+    }
+    if let Some(contract) = required_write_system_instruction(&required_write_contracts) {
+        let tokens = estimate_str(&contract);
+        system.push_str(&contract);
+        provenance.push(CtxEntry::new(
+            format!("required writes ({})", required_write_contracts.len()),
+            tokens,
+            "host-enforced",
+            "verified model filesystem writes plus final-state changes",
+        ));
+    }
     let mut project_context_source = None;
 
     // Project context (llms.txt / AGENTS.md), budget-gated (Stage 4).
@@ -10813,7 +13409,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
     }
     // Skill index (always-on): names + descriptions; bodies load on demand.
-    if !skillset.is_empty() {
+    if !no_tools && !skillset.is_empty() {
         let mut chunk = String::from(
             "\n\n---\nAvailable skills — call the `skill` tool with the name to load full \
              instructions when a task matches:\n",
@@ -10944,8 +13540,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         state_dir: setup.state_dir.clone(),
         endpoint: setup.endpoint.clone(),
         auth_status: setup.auth_status.clone(),
+        artifact_policy: setup.artifact_policy,
+        artifact_policy_source: setup.artifact_policy_source,
         project_context: RefCell::new(project_context_source),
         offload_dir: offload_state.clone(),
+        model_can_read_artifacts,
+        defer_structured_finalization,
+        structured_finalization_gate,
         session_id,
         spawn_budget: spawn_budget.clone(),
         run_tallies: run_tallies.clone(),
@@ -10976,12 +13577,23 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         max_tokens: cli.max_output_tokens,
         provenance: RefCell::new(provenance),
     };
-    // Mirror the planned/resumed durable session id for `final_summary`.
-    // Non-interactive runs cannot switch sessions mid-run (session commands
-    // require interactive chat), so a startup snapshot is authoritative here.
-    *JSONL_SESSION_ID
-        .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = session.session_id.borrow().clone();
+    // A fresh durable id is only a plan until the first snapshot is installed;
+    // a resumed id is already addressable. Scripted `/clear` can rotate this
+    // receipt back to pending at a recoverable boundary.
+    let initial_snapshot_state = if !durable_session {
+        SessionSnapshotState::Disabled
+    } else if resumed_existing {
+        SessionSnapshotState::Resumable
+    } else {
+        SessionSnapshotState::PendingUntilFirstSuccess
+    };
+    set_jsonl_session_receipt(session.session_id.borrow().clone(), initial_snapshot_state);
+
+    if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
+        eprintln!(
+            "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
+        );
+    }
 
     if cli.jsonl {
         emit_jsonl(
@@ -10999,18 +13611,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 "session_id": session.session_id.borrow().clone(),
                 "resumed": resumed_existing,
                 "durable_session": durable_session,
-                "session_snapshot_state": if !durable_session {
-                    "disabled"
-                } else if resumed_existing {
-                    "resumable"
-                } else {
-                    "pending_until_first_success"
-                },
+                "session_snapshot_state": initial_snapshot_state.as_str(),
                 "system_context_refreshed": resumed_context_refreshed,
                 "skill_context_changes": resumed_skill_changes,
+                "artifact_policy": artifact_policy_receipt(
+                    setup.artifact_policy,
+                    setup.artifact_policy_source,
+                    model_can_read_artifacts,
+                ),
             }),
         )?;
     }
+    emit_output_schema_receipt(cli)?;
+    emit_required_write_armed(cli, &required_write_contracts)?;
 
     if durable_session && !interactive {
         eprintln!(
@@ -11057,7 +13670,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 true,
             )));
         }
-        if !cli.jsonl {
+        if cli.jsonl {
+            emit_jsonl(
+                "review_disclosure",
+                top_level_review_disclosure_event(&evidence),
+            )?;
+        } else {
             eprintln!("~ verified {}", review_target_label(&evidence));
             eprintln!("{}", evidence_disclosure_line(&evidence, &model));
         }
@@ -11088,14 +13706,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             path,
             &perms,
             &write_journal,
-            &offload_dir,
             &skillset,
             &session,
             &context_window,
             &live_mw,
             &agent_registry,
-            &session_store,
+            &mut session_store,
+            &mut artifact_directories,
+            artifact_storage_enabled,
+            &stateless_artifact_base,
             allow_turn_errors,
+            &required_write_contracts,
         )
         .await;
     }
@@ -11279,8 +13900,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         };
         finish_agent_trace(cli, "piped:1", &event_log, assistant)?;
         warn_context_window_evidence(cli, Some("piped:1"), &mut session_state)?;
+        let unrecovered_tool_errors = ToolErrorTotals::from_turn(&session_state.last_turn, false);
         return match outcome {
-            TurnOutcome::Completed(Ok(_)) => {
+            TurnOutcome::Completed(Ok(text)) => {
                 // A piped turn that delegated work joins it the way `/quit
                 // wait` does. Only agents that outlive the join bound are
                 // cancelled, and only then is the run incomplete.
@@ -11334,11 +13956,21 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             "turn_finished",
                             serde_json::json!({"turn_id": "piped:1", "status": "error"}),
                         )?;
-                        emit_jsonl_summary("error", 1, 1)?;
+                        emit_jsonl_summary_with_local_failures(
+                            "error",
+                            1,
+                            1,
+                            0,
+                            0,
+                            0,
+                            unrecovered_tool_errors,
+                        )?;
                     }
                     return Err(mapped);
                 }
-                if let Some((kind, issue)) = strict_turn_failure(&session_state.last_turn) {
+                if let Some(failure) =
+                    strict_turn_failure(&session_state.last_turn, cli.max_output_tokens, &text)
+                {
                     // Cycle-30 (queued since the cycle-19 audit): a POLICY
                     // strict failure whose turn still completed a real final
                     // answer commits that answer as PARTIAL — the model was
@@ -11349,13 +13981,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     // unchanged. Provider-kind failures (incomplete turns)
                     // keep the full rollback: there is no real answer to
                     // keep.
-                    let commit_partial = kind == ScriptFailureKind::Policy;
+                    let commit_partial = failure.kind == ScriptFailureKind::Policy;
                     if commit_partial {
                         finish_assistant_disposition(
                             cli,
                             "piped:1",
                             AssistantDisposition::CommittedPartial,
-                            Some(&issue),
+                            Some(&failure.issue),
                         )?;
                         if let Err(persist_error) =
                             persist_session_required(&session_store, &session, &model, &messages)
@@ -11369,7 +14001,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         }
                         if !cli.jsonl {
                             eprintln!(
-                                "~ the answer above is COMMITTED AS PARTIAL: {issue}; the run still fails so automation notices"
+                                "~ the answer above is COMMITTED AS PARTIAL: {}; the run still fails so automation notices",
+                                failure.issue
                             );
                         }
                     } else {
@@ -11377,7 +14010,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             cli,
                             "piped:1",
                             AssistantDisposition::Discarded,
-                            Some(&issue),
+                            Some(&failure.issue),
                         )?;
                         let mut retained = turn_reports;
                         retained.extend(
@@ -11410,22 +14043,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             session.run_tallies.failed.load(Ordering::Acquire),
                         );
                     }
-                    let mapped = if kind == ScriptFailureKind::Provider {
-                        CliError::provider(format!("incomplete turn: {issue}"))
-                    } else {
-                        CliError::user(issue.clone())
-                    };
+                    let mapped = strict_failure_cli_error(&failure);
                     if cli.jsonl {
                         emit_jsonl(
                             "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": kind.strict_jsonl_kind(),
-                                "message": mapped.to_string(),
-                                "tool_errors": session_state.last_turn.tool_errors,
-                                "policy_errors": session_state.last_turn.policy_errors,
-                                "exit_code": mapped.exit_code(),
-                            }),
+                            failure.jsonl_payload(
+                                "piped:1",
+                                &mapped.to_string(),
+                                &session_state.last_turn,
+                            ),
                         )?;
                         emit_jsonl(
                             "turn_finished",
@@ -11439,13 +14065,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         emit_jsonl_summary_with_local_failures(
                             "error",
                             1,
-                            usize::from(kind == ScriptFailureKind::Provider),
-                            usize::from(kind == ScriptFailureKind::Tool),
-                            usize::from(kind == ScriptFailureKind::Policy),
+                            usize::from(failure.kind.is_provider_failure()),
+                            usize::from(failure.kind == ScriptFailureKind::OutputSchema),
+                            usize::from(failure.kind == ScriptFailureKind::Tool),
+                            usize::from(failure.kind == ScriptFailureKind::Policy),
+                            unrecovered_tool_errors,
                         )?;
                     }
                     return Err(mapped);
                 }
+                let recovered_tool_errors =
+                    ToolErrorTotals::from_turn(&session_state.last_turn, true);
                 if let Err(mapped) =
                     persist_session_required(&session_store, &session, &model, &messages)
                 {
@@ -11469,7 +14099,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             "turn_finished",
                             serde_json::json!({"turn_id": "piped:1", "status": "error"}),
                         )?;
-                        emit_jsonl_summary("error", 1, 0)?;
+                        emit_jsonl_summary_with_local_failures(
+                            "error",
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            recovered_tool_errors,
+                        )?;
                     }
                     return Err(mapped);
                 }
@@ -11485,6 +14123,55 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         session_state.last_turn.tool_errors
                     );
                 }
+                if cli.jsonl {
+                    emit_jsonl(
+                        "turn_finished",
+                        serde_json::json!({
+                            "turn_id": "piped:1",
+                            "status": "ok",
+                            "tool_errors": session_state.last_turn.tool_errors,
+                            "policy_errors": session_state.last_turn.policy_errors,
+                        }),
+                    )?;
+                }
+                let required_write_evaluation =
+                    evaluate_required_writes(&required_write_contracts, &perms, &write_journal);
+                emit_required_write_evaluation(
+                    cli,
+                    &required_write_contracts,
+                    &required_write_evaluation,
+                )?;
+                if let Some(mapped) = required_write_evaluation.failure {
+                    emit_required_write_error(cli, &mapped)?;
+                    if cli.jsonl {
+                        emit_jsonl_summary_with_postcondition_failures(
+                            "error",
+                            1,
+                            0,
+                            0,
+                            1,
+                            0,
+                            0,
+                            recovered_tool_errors,
+                        )?;
+                    }
+                    return Err(mapped);
+                }
+                if let Err(mapped) = write_output_last_message(cli, "piped:1", &text) {
+                    emit_output_last_message_error(cli, "piped:1", &mapped)?;
+                    if cli.jsonl {
+                        emit_jsonl_summary_with_local_failures(
+                            "error",
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            recovered_tool_errors,
+                        )?;
+                    }
+                    return Err(mapped);
+                }
                 if !cli.jsonl {
                     emit_run_receipt(
                         &write_journal,
@@ -11498,16 +14185,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     );
                 }
                 if cli.jsonl {
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "status": "ok",
-                            "tool_errors": session_state.last_turn.tool_errors,
-                            "policy_errors": session_state.last_turn.policy_errors,
-                        }),
+                    emit_jsonl_summary_with_local_failures(
+                        "ok",
+                        0,
+                        0,
+                        0,
+                        0,
+                        0,
+                        recovered_tool_errors,
                     )?;
-                    emit_jsonl_summary("ok", 0, 0)?;
                 }
                 Ok(())
             }
@@ -11538,29 +14224,35 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 }
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
+                let cause = agent_error_jsonl_cause(&error);
                 let mapped = map_agent_error(
                     error,
                     ProviderOperation::Chat { model: &model },
                     Some(cli.timeout_secs),
                 );
                 if cli.jsonl {
-                    emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "kind": mapped.jsonl_kind(),
-                            "message": mapped.to_string(),
-                            "exit_code": mapped.exit_code(),
-                        }),
-                    )?;
+                    let mut payload = serde_json::json!({
+                        "turn_id": "piped:1",
+                        "kind": mapped.jsonl_kind(),
+                        "message": mapped.to_string(),
+                        "exit_code": mapped.exit_code(),
+                    });
+                    if let Some(cause) = cause {
+                        payload["cause"] = serde_json::json!(cause);
+                    }
+                    emit_jsonl("error", payload)?;
                     emit_jsonl(
                         "turn_finished",
                         serde_json::json!({"turn_id": "piped:1", "status": "error"}),
                     )?;
-                    emit_jsonl_summary(
+                    emit_jsonl_summary_with_local_failures(
                         "error",
                         1,
                         usize::from(mapped.exit_code() == EXIT_PROVIDER),
+                        0,
+                        0,
+                        0,
+                        unrecovered_tool_errors,
                     )?;
                 }
                 Err(mapped)
@@ -11589,7 +14281,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         "turn_finished",
                         serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
                     )?;
-                    emit_jsonl_summary("cancelled", 1, 0)?;
+                    emit_jsonl_summary_with_local_failures(
+                        "cancelled",
+                        1,
+                        0,
+                        0,
+                        0,
+                        0,
+                        unrecovered_tool_errors,
+                    )?;
                 }
                 Err(mapped)
             }
@@ -11597,9 +14297,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
 
     // Interactive TTY loop. Bracketed paste keeps rich-mode multi-line input as
-    // one turn. Plain/accessibility modes must not make rustyline emit the
-    // bracketed-paste terminal control sequences they promise to suppress.
-    let assistive_input = kitsu_render::plain_mode();
+    // one turn. Literal plain/screen-reader input must not make Rustyline emit
+    // the bracketed-paste terminal control sequences those modes suppress.
+    // NO_COLOR only changes rendering and deliberately keeps the rich editor.
+    let assistive_input = kitsu_render::assistive_input_mode();
     let assistive_signal_task = assistive_input.then(|| {
         tokio::spawn(async {
             loop {
@@ -11620,6 +14321,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // Complete slash commands without changing the visible input-buffer width.
     rl.set_helper(Some(ChatHelper {
         permissions: perms.clone(),
+        rich_palette: !kitsu_render::plain_mode(),
+        live_model_window: live_mw.clone(),
+        directory: shorten_home(&session.directory),
     }));
     let foreground_typeahead_active = Arc::new(AtomicBool::new(false));
     let (deferred_notice_sender, deferred_notice_receiver) = std::sync::mpsc::channel::<String>();
@@ -11833,9 +14537,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             *live_mw.lock().expect("live model/window") = (model.clone(), context_window.get());
             match result {
                 SlashResult::Continue(_) => {
-                    if slash_name == "clear" {
-                        last_failed = None;
-                    }
                     if model != durable_model_before || messages != durable_messages_before {
                         persist_session(&session_store, &session, &model, &messages);
                     }
@@ -11867,6 +14568,43 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     };
                     eprintln!("~ retrying the last failed prompt");
                     submitted = prompt;
+                }
+                SlashResult::ClearSession => {
+                    let running = agent_registry.running();
+                    if running > 0 {
+                        eprintln!(
+                            "clear blocked while {running} background agent(s) are running; use /agents and wait for them to finish"
+                        );
+                        continue;
+                    }
+                    surface_unobserved_background_results(&agent_registry);
+                    while deferred_notice_receiver.try_recv().is_ok() {}
+                    match clear_session_boundary(
+                        &mut session_store,
+                        &session,
+                        &model,
+                        &mut messages,
+                        &mut session_state,
+                        &agent_registry,
+                        &write_journal,
+                        &mut artifact_directories,
+                        artifact_storage_enabled,
+                        &stateless_artifact_base,
+                    )
+                    .await
+                    {
+                        Ok(receipt) => {
+                            last_failed = None;
+                            eprintln!("{}", kitsu_render::milestone_line(&receipt.human_summary()));
+                            if let Some(warning) = receipt.artifact_warning.as_deref() {
+                                eprintln!(
+                                    "warning: private artifact storage disabled after clear: {warning}"
+                                );
+                            }
+                        }
+                        Err(error) => eprintln!("{error}"),
+                    }
+                    continue;
                 }
                 SlashResult::NewSession => {
                     if agent_registry.running() > 0 {
@@ -12283,13 +15021,42 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         warn_context_window_evidence(cli, None, &mut session_state)?;
         match turn_outcome {
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Ok(text))) => {
-                last_failed = None;
-                // The model can return an empty completion for vague inputs;
-                // say so instead of looking hung.
                 if text.trim().is_empty() {
-                    eprintln!("(the model returned an empty response - try rephrasing)");
+                    let issue = empty_final_response_issue(cli.max_output_tokens);
+                    finish_assistant_disposition(
+                        cli,
+                        "interactive",
+                        AssistantDisposition::Discarded,
+                        Some(&issue),
+                    )?;
+                    messages = messages_before;
+                    rollback_agent_state(&mut session_state, state_before);
+                    let mut retained = turn_reports;
+                    retained.extend(
+                        cancel_agents_and_report_writes(
+                            &agent_registry,
+                            agent_watermark,
+                            &write_journal,
+                        )
+                        .await,
+                    );
+                    last_failed = Some(retry_prompt);
+                    eprintln!(
+                        "~ {}; turn rolled back - /retry to try again",
+                        terminal_inline(&issue)
+                    );
+                    eprintln!("~ completed file changes, if any, remain on disk");
+                    note_rollback_retained_changes(
+                        cli,
+                        None,
+                        &mut messages,
+                        &retained,
+                        tools.is_registered("workspace_diff"),
+                    )?;
+                } else {
+                    last_failed = None;
+                    persist_session(&session_store, &session, &model, &messages);
                 }
-                persist_session(&session_store, &session, &model, &messages);
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(e))) => {
                 finish_assistant_disposition(
@@ -12509,6 +15276,7 @@ enum SlashResult {
     SubmitPrompt(SubmittedPrompt),
     QueueAction(QueueCommand),
     Retry,
+    ClearSession,
     NewSession,
     ResumeSession(String),
     ListSessions(String),
@@ -13198,6 +15966,7 @@ async fn handle_slash(
                 cli,
                 context_window.get(),
                 session.offload_dir.borrow().clone(),
+                session.artifact_policy,
             );
             cfg.reasoning_effort = session.reasoning_effort.get();
             cfg.event_log = runtime_log.cloned();
@@ -13478,7 +16247,7 @@ async fn handle_slash(
                 eprintln!("usage: {}", slash_syntax("doctor"));
                 return SlashResult::Error;
             }
-            return match run_doctor(cli, arg == "online", false).await {
+            return match run_doctor(cli, arg == "online", false, false).await {
                 Ok(()) => SlashResult::Continue(None),
                 Err(error) => {
                     eprintln!("{error}");
@@ -13651,6 +16420,8 @@ async fn handle_slash(
             return match handle_command_artifacts(
                 session.command_artifact_sink.as_ref(),
                 cross_run_artifacts(session),
+                session.artifact_policy,
+                session.artifact_policy_source,
                 arg,
             ) {
                 Ok(payload) => SlashResult::Continue(Some(payload)),
@@ -13750,7 +16521,8 @@ async fn handle_slash(
             }
         }
         "models" => {
-            let Some(result) = await_cancellable(list_models_and_print(provider, arg)).await else {
+            let Some(result) = await_cancellable(list_models_and_print(provider, arg, model)).await
+            else {
                 eprintln!("^C (model catalog request cancelled)");
                 return SlashResult::Cancelled;
             };
@@ -13926,23 +16698,10 @@ async fn handle_slash(
             }
         }
         "clear" => {
-            // Keep only a leading system message, if present.
-            let system = messages
-                .first()
-                .filter(|m| matches!(m.role, kitsu_providers::Role::System))
-                .cloned();
-            messages.clear();
-            if let Some(s) = system {
-                messages.push(s);
-            }
-            // The context-meter anchor describes token cost for the messages we
-            // just wiped, and the summarize circuit breaker belongs to that old
-            // conversation too — starting fresh means both must reset, not carry
-            // over and silently mis-budget (or permanently skip Summarize for) an
-            // unrelated new conversation.
-            state.meter.invalidate();
-            state.compact_failures = 0;
-            eprintln!("~ conversation cleared");
+            // Saving and rotating durable identity is owned by the driver, not
+            // this parser: mutating here would make the caller overwrite the
+            // only resumable copy under the same session id.
+            return SlashResult::ClearSession;
         }
         "model" => {
             if arg.is_empty() {
@@ -13954,7 +16713,8 @@ async fn handle_slash(
             } else if arg == "list" || arg.starts_with("list ") {
                 // Alias: `/model list [filter]` → same as `/models [filter]`.
                 let filter = arg.strip_prefix("list").unwrap_or("").trim();
-                let Some(result) = await_cancellable(list_models_and_print(provider, filter)).await
+                let Some(result) =
+                    await_cancellable(list_models_and_print(provider, filter, model)).await
                 else {
                     eprintln!("^C (model catalog request cancelled)");
                     return SlashResult::Cancelled;
@@ -14113,32 +16873,22 @@ fn extract_code_or_text(text: &str) -> String {
 async fn list_models_and_print(
     provider: &OpenAICompatProvider,
     filter: &str,
+    current_model: &str,
 ) -> Result<Option<Vec<String>>, ProviderError> {
     match provider.list_models().await {
         Ok(Some(models)) => {
             let filter = filter.trim();
             let matched = filter_model_catalog(models, filter);
-            let total = matched.len();
-            if filter.is_empty() {
-                eprintln!("~ {total} model(s) available:");
-            } else {
-                eprintln!("~ {total} model(s) matching '{}':", terminal_inline(filter));
-            }
-            const CAP: usize = 40;
-            for m in matched.iter().take(CAP) {
-                eprintln!("  {}", terminal_inline(m));
-            }
-            if total > CAP {
-                eprintln!(
-                    "  ... and {} more - narrow with `/models <substring>`",
-                    total - CAP
-                );
-            }
-            if total > 0 {
-                eprintln!("switch with: /model <id>");
-            } else {
-                eprintln!("{}", empty_model_catalog_message(filter));
-            }
+            eprint!(
+                "{}",
+                format_model_catalog_preview(
+                    &matched,
+                    filter,
+                    Some(current_model),
+                    "`/models <substring>`",
+                    "switch with: /model <id>",
+                )
+            );
             // A zero-match search is a successful catalog query, just like the
             // standalone `kitsu models <filter>` command. Only an unavailable
             // catalog returns false.
@@ -14285,7 +17035,10 @@ impl Prompter for CliPrompter {
         use std::io::Write;
         let _input_guard = ApprovalInputGuard::enter();
         // Disable bracketed paste (ESC[?2004l) for the raw read; rustyline
-        // re-enables it on the next prompt.
+        // re-enables it on the next prompt. Literal input never enables it.
+        if !kitsu_render::assistive_input_mode() {
+            eprint!("\x1b[?2004l");
+        }
         if kitsu_render::plain_mode() {
             eprint!(
                 "\npermission> kitsu wants to {} {}\n  [y] allow once   [a] always ({})   [n] deny\n> ",
@@ -14297,7 +17050,7 @@ impl Prompter for CliPrompter {
             // The approval moment carries visual weight: one shared header
             // design for file and command prompts (see CliCommandPrompter).
             eprint!(
-                "\x1b[?2004l\n{}\n{}\n> ",
+                "\n{}\n{}\n> ",
                 kitsu_render::approval_header(&format!(
                     "kitsu wants to {} {}",
                     req.action.verb(),
@@ -14324,7 +17077,7 @@ impl CommandPrompter for CliCommandPrompter {
     fn ask(&self, req: &CommandApprovalRequest) -> CommandDecision {
         use std::io::Write;
         let _input_guard = ApprovalInputGuard::enter();
-        if !kitsu_render::plain_mode() {
+        if !kitsu_render::assistive_input_mode() {
             eprint!("\x1b[?2004l");
         }
         let resolution = match req.executable.resolution {
@@ -14423,7 +17176,11 @@ fn shorten_home(p: &std::path::Path) -> String {
 }
 
 /// Build the appropriate AuthProvider from the profile's auth block.
-fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
+fn build_auth(
+    gateway: &Gateway,
+    gateway_name: &str,
+    managed_token: Option<zeroize::Zeroizing<String>>,
+) -> Result<Arc<dyn AuthProvider>, ConfigError> {
     gateway.validate_auth()?;
     let auth = &gateway.auth;
     let provider: Arc<dyn AuthProvider> = match auth.method.as_str() {
@@ -14436,15 +17193,27 @@ fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
                 scheme: auth.scheme.clone(),
             })
         }
-        "bearer-env" => Arc::new(EnvBearerAuth {
-            env: auth.env.clone(),
-            expires_env: auth.expires_env.clone(),
-            header: auth.header.clone(),
-            scheme: auth.scheme.clone(),
-            // Store only display-safe guidance in the runtime auth provider so
-            // every later Missing/Unauthorized error is safe by construction.
-            refresh_hint: safe_auth_refresh_hint(auth.refresh_hint.as_deref()),
-        }),
+        "bearer-env" => {
+            let login_hint = format!(
+                "run `kitsu --gateway {} auth login`",
+                terminal_inline(gateway_name)
+            );
+            let refresh_hint = safe_auth_refresh_hint(auth.refresh_hint.as_deref())
+                .filter(|hint| hint != &login_hint)
+                .map(|hint| format!("{login_hint}, or {hint}"))
+                .unwrap_or(login_hint);
+            Arc::new(EnvBearerAuth {
+                env: auth.env.clone(),
+                expires_env: auth.expires_env.clone(),
+                header: auth.header.clone(),
+                scheme: auth.scheme.clone(),
+                // Store only display-safe guidance in the runtime auth provider
+                // so every later Missing/Unauthorized error is safe by
+                // construction.
+                refresh_hint: Some(refresh_hint),
+                managed_token,
+            })
+        }
         other => {
             return Err(ConfigError::UnsupportedAuthMethod {
                 method: other.to_string(),
@@ -14452,6 +17221,20 @@ fn build_auth(gateway: &Gateway) -> Result<Arc<dyn AuthProvider>, ConfigError> {
         }
     };
     Ok(provider)
+}
+
+/// Validate local credential readiness before inference-capable commands build
+/// project context, register tools, emit run-start telemetry, or contact a
+/// gateway. This calls the same auth-provider path as the real request and
+/// immediately discards the sensitive header, keeping validation and recovery
+/// wording consistent without ever exposing the credential value.
+fn require_auth_ready(
+    auth: &dyn AuthProvider,
+    operation: ProviderOperation<'_>,
+) -> Result<(), CliError> {
+    auth.header()
+        .map(|_| ())
+        .map_err(|error| map_provider_error(ProviderError::Auth(error), operation, None))
 }
 
 /// Render an agent error for every chat mode through the same bounded provider
@@ -14472,6 +17255,10 @@ fn map_agent_error(
         kitsu_core::AgentError::Provider(error) => {
             map_provider_error(error, operation, timeout_secs)
         }
+        kitsu_core::AgentError::ToolCallDuringToolFreeFinalization => CliError::provider(
+            "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
+                .to_string(),
+        ),
         kitsu_core::AgentError::Loop(msg) => CliError::provider(format!("agent loop error: {msg}")),
         context_error @ (kitsu_core::AgentError::ContextOverflow { .. }
         | kitsu_core::AgentError::ContextWindowUnknown) => {
@@ -14502,6 +17289,12 @@ mod tests {
     fn chat_helper() -> ChatHelper {
         ChatHelper {
             permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+            rich_palette: true,
+            live_model_window: Arc::new(std::sync::Mutex::new((
+                "test-model".to_string(),
+                Some(8_000),
+            ))),
+            directory: "~/project".to_string(),
         }
     }
 
@@ -14768,7 +17561,7 @@ mod tests {
     }
 
     #[test]
-    fn the_jobs_deck_marks_each_state_with_its_own_glyph() {
+    fn the_jobs_deck_marks_each_state_for_the_active_terminal_mode() {
         let registry = subagent::AgentRegistry::default();
         let _running = registry.start("still working".to_string()).unwrap();
         let done = registry.start("finished cleanly".to_string()).unwrap();
@@ -14776,16 +17569,23 @@ mod tests {
         registry.finish(done, Ok("collected later".to_string()));
         registry.finish(failed, Err("provider request failed".to_string()));
 
-        // Non-TTY: glyphs, no escape bytes. (`--plain`'s ASCII markers are
-        // covered where the mode is an explicit argument, in kitsu-render, so
-        // this test never touches the process-wide plain flag.)
+        // A non-TTY never receives escape bytes. Ambient NO_COLOR is allowed to
+        // select the documented ASCII rendering; explicit glyph/plain mappings
+        // are covered by mode-pure kitsu-render tests.
         let styled = format_jobs(&registry);
         assert_no_debug_leak(&styled);
         assert!(!styled.contains('\u{1b}'), "{styled}");
-        assert!(styled.starts_with("◈ agent deck"), "{styled}");
-        assert!(styled.contains("◆ #"), "{styled}");
-        assert!(styled.contains("◈ #"), "{styled}");
-        assert!(styled.contains("◇ #"), "{styled}");
+        if kitsu_render::plain_mode() {
+            assert!(styled.starts_with("# agent deck"), "{styled}");
+            assert!(styled.contains("[run] #"), "{styled}");
+            assert!(styled.contains("[rdy] #"), "{styled}");
+            assert!(styled.contains("[err] #"), "{styled}");
+        } else {
+            assert!(styled.starts_with("◈ agent deck"), "{styled}");
+            assert!(styled.contains("◆ #"), "{styled}");
+            assert!(styled.contains("◈ #"), "{styled}");
+            assert!(styled.contains("◇ #"), "{styled}");
+        }
         assert!(styled.contains(&format!("/jobs show {done}")), "{styled}");
     }
 
@@ -14864,9 +17664,15 @@ mod tests {
     }
 
     #[test]
-    fn plain_mode_disables_rustyline_bracketed_paste_sequences() {
+    fn assistive_input_disables_rustyline_bracketed_paste_sequences() {
         assert!(bracketed_paste_enabled(false));
         assert!(!bracketed_paste_enabled(true));
+    }
+
+    #[test]
+    fn screen_reader_is_a_discoverable_global_cli_mode() {
+        let cli = Cli::try_parse_from(["kitsu", "--screen-reader", "ask", "hello"]).unwrap();
+        assert!(cli.screen_reader);
     }
 
     #[test]
@@ -14916,6 +17722,125 @@ mod tests {
 
         let (_, candidates) = helper.complete("/model qwen", 12, &context).unwrap();
         assert!(candidates.is_empty(), "arguments are not command names");
+    }
+
+    #[test]
+    fn slash_palette_opens_filters_and_never_becomes_insertable_text() {
+        use rustyline::hint::{Hint, Hinter};
+        let history = rustyline::history::DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+        let helper = chat_helper();
+
+        let all = helper.hint("/", 1, &context).expect("slash opens palette");
+        assert!(all.display().starts_with("\n╭ slash commands "));
+        assert!(all.display().contains("more — keep typing"));
+        assert!(all.display().contains("Tab to complete"));
+        assert!(all.display().contains("model test-model"));
+        assert!(all.display().contains("cwd ~/project"));
+        assert_eq!(
+            all.completion(),
+            None,
+            "right-arrow must not insert the deck"
+        );
+        let expected_width = composer_surface_inner_width(current_terminal_columns()) + 2;
+        assert!(
+            all.display()
+                .lines()
+                .filter(|line| !line.is_empty())
+                .all(|line| unicode_width::UnicodeWidthStr::width(line) == expected_width),
+            "palette rows must share one stable boundary width: {}",
+            all.display()
+        );
+
+        let filtered = helper
+            .hint("/mod", 4, &context)
+            .expect("prefix keeps palette open");
+        assert!(filtered.display().contains("/model"));
+        assert!(filtered.display().contains("/models"));
+        assert!(!filtered.display().contains("/status"));
+
+        let argument = helper
+            .hint("/model ", 7, &context)
+            .expect("status remains after command arguments begin");
+        assert!(!argument.display().contains("slash commands"));
+        assert!(argument.display().contains("model test-model"));
+
+        let ordinary = helper
+            .hint("ordinary prompt", 15, &context)
+            .expect("status is persistent");
+        assert!(!ordinary.display().contains("slash commands"));
+        assert!(ordinary.display().contains("model test-model"));
+        assert!(ordinary.display().contains("cwd ~/project"));
+
+        helper
+            .live_model_window
+            .lock()
+            .expect("live model/window")
+            .0 = "changed-model".to_string();
+        let changed = helper
+            .hint("", 0, &context)
+            .expect("status tracks live model changes");
+        assert!(changed.display().contains("model changed-model"));
+        assert!(!changed.display().contains("model test-model"));
+    }
+
+    #[test]
+    fn slash_palette_has_colored_unicode_and_no_color_ascii_variants() {
+        use rustyline::highlight::Highlighter;
+        let rich = slash_palette("mod", true, COMPOSER_SURFACE_DEFAULT_INNER_WIDTH);
+        assert!(rich.contains('╭') && rich.contains('┤'));
+        let helper = chat_helper();
+        let history = rustyline::history::DefaultHistory::new();
+        let context = rustyline::Context::new(&history);
+        let rich_with_status = rustyline::hint::Hinter::hint(&helper, "/mod", 4, &context)
+            .expect("rich palette and status")
+            .0;
+        assert!(rich_with_status.contains('╭') && rich_with_status.contains('╯'));
+        let highlighted = helper.highlight_hint(&rich_with_status).into_owned();
+        assert!(highlighted.contains("\x1b[1;96m"));
+        assert!(highlighted.contains("\x1b[2;36m"));
+        assert_eq!(
+            kitsu_render::sanitize_terminal_text(&highlighted),
+            rich_with_status
+        );
+
+        let plain = slash_palette("mod", false, COMPOSER_SURFACE_DEFAULT_INNER_WIDTH);
+        assert!(plain.contains("+ slash commands "));
+        assert!(!plain.contains('\u{1b}'));
+        assert!(!plain.contains('╭'));
+        assert!(plain.contains("/model"));
+    }
+
+    #[test]
+    fn composer_surfaces_fit_terminal_columns_and_unicode_cell_widths() {
+        use unicode_width::UnicodeWidthStr as _;
+
+        assert_eq!(composer_surface_inner_width(None), 68);
+        assert_eq!(composer_surface_inner_width(Some(50)), 48);
+        assert_eq!(composer_surface_inner_width(Some(200)), 68);
+
+        for columns in [32, 50, 70, 120] {
+            let inner_width = composer_surface_inner_width(Some(columns));
+            for rich in [true, false] {
+                let rendered = format!(
+                    "{}{}",
+                    slash_palette("", rich, inner_width),
+                    composer_status("模型-狐", "~/仕事/計画", rich, inner_width)
+                );
+                let expected_width = columns.min(COMPOSER_SURFACE_MAX_WIDTH);
+                assert!(
+                    rendered
+                        .lines()
+                        .filter(|line| !line.is_empty())
+                        .all(|line| line.width() == expected_width),
+                    "surface exceeded {columns} columns (rich={rich}):\n{rendered}"
+                );
+            }
+        }
+
+        let compact = slash_palette("mod", true, 30);
+        assert!(compact.contains(" /model <name>"));
+        assert!(!compact.contains("switch model while keeping history"));
     }
 
     #[test]
@@ -15616,7 +18541,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn workspace_diff_tool_disclosure_matches_review_disclosure_shape() {
+    async fn every_review_disclosure_surface_uses_the_same_auditable_shape() {
         let evidence = workspace::ReviewEvidence {
             target: "working_tree".to_string(),
             resolved_revision: None,
@@ -15625,8 +18550,9 @@ mod tests {
             diff: "diff --git a/x b/x\n".to_string(),
         };
         let review = evidence_disclosure_payload(&evidence);
+        let top_level = top_level_review_disclosure_event(&evidence);
         let tool = workspace_evidence_disclosure_event(&evidence);
-        // One auditable shape across both disclosure surfaces: identical
+        // One auditable shape across all disclosure surfaces: identical
         // fields except the discriminators.
         let review_fields: std::collections::BTreeSet<&str> = review
             .as_object()
@@ -15635,6 +18561,13 @@ mod tests {
             .map(String::as_str)
             .filter(|key| *key != "kind")
             .collect();
+        let top_level_fields: std::collections::BTreeSet<&str> = top_level
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .filter(|key| *key != "source")
+            .collect();
         let tool_fields: std::collections::BTreeSet<&str> = tool
             .as_object()
             .unwrap()
@@ -15642,7 +18575,9 @@ mod tests {
             .map(String::as_str)
             .filter(|key| *key != "source")
             .collect();
+        assert_eq!(review_fields, top_level_fields);
         assert_eq!(review_fields, tool_fields);
+        assert_eq!(top_level["source"], "top_level_review");
         assert_eq!(tool["source"], "workspace_diff");
         assert_eq!(tool["model_disclosed"], true);
         assert_eq!(tool["model_read_root_granted"], false);
@@ -15657,7 +18592,7 @@ mod tests {
             final_round_tool_errors: 0,
             ..Default::default()
         };
-        assert!(strict_turn_failure(&recovered).is_none());
+        assert!(strict_turn_failure(&recovered, None, "recovered answer").is_none());
 
         // Unrecovered: the final tool round still failed.
         let unrecovered = kitsu_core::AgentTurnStatus {
@@ -15665,9 +18600,10 @@ mod tests {
             final_round_tool_errors: 1,
             ..Default::default()
         };
-        let (kind, issue) = strict_turn_failure(&unrecovered).expect("must fail");
-        assert_eq!(kind, ScriptFailureKind::Tool);
-        assert!(issue.contains("1 tool call(s) failed"));
+        let failure =
+            strict_turn_failure(&unrecovered, None, "could not finish").expect("must fail");
+        assert_eq!(failure.kind, ScriptFailureKind::Tool);
+        assert!(failure.issue.contains("1 tool call(s) failed"));
 
         // A policy denial always fails, even when a later round succeeded.
         let denied = kitsu_core::AgentTurnStatus {
@@ -15676,9 +18612,54 @@ mod tests {
             final_round_tool_errors: 0,
             ..Default::default()
         };
-        let (kind, issue) = strict_turn_failure(&denied).expect("must fail");
-        assert_eq!(kind, ScriptFailureKind::Policy);
-        assert!(issue.contains("denied by local policy"));
+        let failure = strict_turn_failure(&denied, None, "unsupported answer").expect("must fail");
+        assert_eq!(failure.kind, ScriptFailureKind::Policy);
+        assert!(failure.issue.contains("denied by local policy"));
+
+        let length_limited = kitsu_core::AgentTurnStatus {
+            completion: kitsu_core::TurnCompletion::LengthLimited,
+            ..Default::default()
+        };
+        let failure = strict_turn_failure(&length_limited, Some(12), "partial")
+            .expect("length limit must fail");
+        assert_eq!(failure.kind, ScriptFailureKind::Provider);
+        assert!(failure.issue.contains("hit --max-output-tokens 12"));
+        assert!(failure.issue.contains("--max-output-tokens 24 or higher"));
+        let implicit =
+            strict_turn_failure(&length_limited, None, "partial").expect("gateway limit must fail");
+        assert!(implicit.issue.contains("gateway's length limit"));
+        assert!(implicit.issue.contains("--max-output-tokens <n>"));
+
+        let failure = strict_turn_failure(&kitsu_core::AgentTurnStatus::default(), None, " \n\t")
+            .expect("blank strict output must fail");
+        assert_eq!(failure.kind, ScriptFailureKind::Provider);
+        assert!(failure.issue.contains("no final assistant text"));
+    }
+
+    #[test]
+    fn tool_error_totals_separate_raw_errors_from_committed_recovery() {
+        let failed = kitsu_core::AgentTurnStatus {
+            tool_errors: 3,
+            policy_errors: 1,
+            ..Default::default()
+        };
+        let recovered = kitsu_core::AgentTurnStatus {
+            tool_errors: 2,
+            ..Default::default()
+        };
+        let mut totals = ToolErrorTotals::default();
+        totals.record_turn(&failed, false);
+        totals.record_turn(&recovered, true);
+
+        assert_eq!(
+            totals,
+            ToolErrorTotals {
+                tool_errors: 5,
+                policy_errors: 1,
+                recovered_tool_errors: 2,
+                recovered_policy_errors: 0,
+            }
+        );
     }
 
     #[test]
@@ -15775,7 +18756,13 @@ mod tests {
     #[test]
     fn unknown_cli_context_uses_the_documented_checked_default() {
         let cli = Cli::try_parse_from(["kitsu", "ask", "hello"]).unwrap();
-        let cfg = build_agent_config("model".to_string(), &cli, None, None);
+        let cfg = build_agent_config(
+            "model".to_string(),
+            &cli,
+            None,
+            None,
+            ArtifactStoragePolicy::Automatic,
+        );
         assert_eq!(cfg.context_window, Some(DEFAULT_CONTEXT_WINDOW));
     }
 
@@ -15962,6 +18949,24 @@ mod tests {
         assert!(
             expired_auth_warning("2026-01-01T00:00:00Z", Some(safe_hint)).contains("refresh-token")
         );
+
+        let hf_permission_hint = "create a fine-grained Hugging Face credential with 'Make calls to Inference Providers', then set HF_TOKEN";
+        assert_eq!(
+            safe_auth_refresh_hint(Some(hf_permission_hint)).as_deref(),
+            Some(hf_permission_hint)
+        );
+        let unauthorized = safe_provider_error_message(
+            &ProviderError::Unauthorized {
+                status: 401,
+                hint: Some(hf_permission_hint.to_string()),
+            },
+            ProviderOperation::Chat {
+                model: "safe-model",
+            },
+            Some(17),
+        );
+        assert!(unauthorized.contains("Make calls to Inference Providers"));
+        assert!(!unauthorized.contains("hf_"));
     }
 
     #[test]
@@ -15996,6 +19001,47 @@ mod tests {
             empty_model_catalog_message(" Missing "),
             "no models matched 'Missing' — retry without a filter to see the full catalog"
         );
+    }
+
+    #[test]
+    fn human_model_catalog_preview_pins_current_model_and_caps_rows() {
+        let models = (0..20)
+            .map(|index| format!("model-{index:02}"))
+            .collect::<Vec<_>>();
+        let preview = format_model_catalog_preview(
+            &models,
+            "",
+            Some("model-19"),
+            "`/models <substring>`",
+            "switch with: /model <id>",
+        );
+
+        assert!(preview.starts_with("~ 20 model(s) available (current: model-19):\n"));
+        let current = preview.find("  * model-19 (current)").unwrap();
+        let alphabetical_start = preview.find("    model-00").unwrap();
+        assert!(
+            current < alphabetical_start,
+            "current model was not pinned first"
+        );
+        assert_eq!(
+            preview
+                .lines()
+                .filter(|line| line.starts_with("  * model-") || line.starts_with("    model-"))
+                .count(),
+            HUMAN_MODEL_CATALOG_CAP
+        );
+        assert!(preview.contains("... and 8 more - narrow with `/models <substring>`"));
+        assert!(preview.ends_with("switch with: /model <id>\n"));
+
+        let filtered = format_model_catalog_preview(
+            &["alpha".to_string(), "beta".to_string()],
+            "alp",
+            Some("different-model"),
+            "filter again",
+            "switch",
+        );
+        assert!(filtered.contains("matching 'alp' (current: different-model)"));
+        assert!(!filtered.contains("(current)\n"));
     }
 
     #[test]
@@ -16246,7 +19292,7 @@ mod tests {
             retry_after_used: true,
             remaining_deadline_ms: 12_500,
         };
-        let notice = format_provider_attempt_notice(&event).unwrap();
+        let notice = format_runtime_notice(&event).unwrap();
         assert!(notice.contains("attempt 1/3"));
         assert!(notice.contains("rate limited; HTTP 429"));
         assert!(notice.contains("retry in 750ms (Retry-After)"));
@@ -16270,10 +19316,36 @@ mod tests {
         };
         // The normal case — one attempt, success — is transport noise and
         // must never narrate after a good turn.
-        assert_eq!(format_provider_attempt_notice(&success(1)), None);
+        assert_eq!(format_runtime_notice(&success(1)), None);
         // A success that needed retries closes the visible retry story.
-        let retried = format_provider_attempt_notice(&success(2)).unwrap();
+        let retried = format_runtime_notice(&success(2)).unwrap();
         assert!(retried.contains("attempt 2/3: success"));
+    }
+
+    #[test]
+    fn human_structured_repair_notice_is_content_free_and_actionable() {
+        let event = kitsu_core::AgentRuntimeEvent::StructuredFinalizationDeferred {
+            round: 2,
+            repair_round: 3,
+            finalization_round_reserved: true,
+            cause: "required_write_sha256_mismatch".to_string(),
+            targets: vec![kitsu_core::StructuredFinalizationRepairTarget {
+                path: "/private/work/result.json".to_string(),
+                expected_sha256: "a".repeat(64),
+                actual_sha256: "b".repeat(64),
+            }],
+            repair_instruction_disclosed: true,
+            write_authority_granted: false,
+        };
+
+        let notice = format_runtime_notice(&event).unwrap();
+        assert_eq!(
+            notice,
+            "exact output mismatch; keeping tools available in repair round 3 for 1 target"
+        );
+        assert!(!notice.contains("/private"));
+        assert!(!notice.contains(&"a".repeat(64)));
+        assert!(!notice.contains(&"b".repeat(64)));
     }
 
     #[test]
@@ -16879,6 +19951,42 @@ mod tests {
         assert_eq!(parsed.skill, vec!["review"]);
     }
 
+    #[test]
+    fn required_write_sha256_parser_splits_final_equals_and_normalizes_hex() {
+        let (path, sha256) =
+            parse_required_write_sha256(&format!("/tmp/output=part={}", "AB".repeat(32)))
+                .unwrap_or_else(|error| panic!("valid exact write expectation: {error}"));
+        assert_eq!(path, "/tmp/output=part");
+        assert_eq!(sha256, "ab".repeat(32));
+
+        for invalid in [
+            "missing-separator",
+            "=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "/tmp/output=abc",
+            "/tmp/output=gggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggggg",
+        ] {
+            assert!(
+                parse_required_write_sha256(invalid).is_err(),
+                "must reject {invalid:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn bare_cli_parses_as_implicit_chat() {
+        let parsed = Cli::try_parse_from(["kitsu"]).expect("bare kitsu must parse");
+        assert!(parsed.command.is_none());
+        assert!(parsed.print_prompt.is_none());
+    }
+
+    #[test]
+    fn top_level_prompt_flag_parses_without_a_subcommand() {
+        let parsed = Cli::try_parse_from(["kitsu", "-p", "explain this"])
+            .expect("top-level prompt mode must parse");
+        assert_eq!(parsed.print_prompt.as_deref(), Some("explain this"));
+        assert!(parsed.command.is_none());
+    }
+
     /// Regression: README documents "--resume implies --session", so passing
     /// both explicitly must be a harmless no-op confirmation, not a clap
     /// conflict error — in either argument order.
@@ -16887,9 +19995,9 @@ mod tests {
         let resume_then_session =
             Cli::try_parse_from(["kitsu", "chat", "--resume", "abc", "--session"])
                 .expect("--resume then --session must not conflict");
-        let Command::Chat {
+        let Some(Command::Chat {
             resume, session, ..
-        } = &resume_then_session.command
+        }) = &resume_then_session.command
         else {
             panic!("expected Command::Chat");
         };
@@ -16899,9 +20007,9 @@ mod tests {
         let session_then_resume =
             Cli::try_parse_from(["kitsu", "chat", "--session", "--resume", "abc"])
                 .expect("--session then --resume must not conflict");
-        let Command::Chat {
+        let Some(Command::Chat {
             resume, session, ..
-        } = &session_then_resume.command
+        }) = &session_then_resume.command
         else {
             panic!("expected Command::Chat");
         };

@@ -1,10 +1,12 @@
-//! Auth providers. Token is read from env at request time, never logged,
-//! never persisted (design §3). Expiry uses ANTHROPIC_TOKEN_EXPIRES only
-//! (env-var-only decision; no JWT decode, no base64 dep).
+//! Auth providers. Bearer tokens resolve from a non-empty environment value
+//! first, then an optional caller-loaded managed credential. Raw credentials
+//! are never logged. Expiry remains environment-only (no JWT decode or base64
+//! dependency).
 
 use crate::error::{AuthError, ExpiryStatus};
 use chrono::Utc;
 use reqwest::header::{HeaderName, HeaderValue};
+use zeroize::Zeroizing;
 
 #[cfg(test)]
 #[path = "auth_tests.rs"]
@@ -35,6 +37,9 @@ pub struct EnvBearerAuth {
     pub header: String,
     pub scheme: String,
     pub refresh_hint: Option<String>,
+    /// Optional config-scoped credential loaded by the CLI from its protected
+    /// store. A non-empty environment value always takes precedence.
+    pub managed_token: Option<Zeroizing<String>>,
 }
 
 impl EnvBearerAuth {
@@ -51,47 +56,76 @@ impl EnvBearerAuth {
             header: "Authorization".to_string(),
             scheme: "Bearer".to_string(),
             refresh_hint,
+            managed_token: None,
         }
+    }
+
+    fn header_for_token(
+        &self,
+        token: &str,
+        managed: bool,
+    ) -> Result<(HeaderName, HeaderValue), AuthError> {
+        let malformed = || {
+            if managed {
+                AuthError::MalformedManaged
+            } else {
+                AuthError::Malformed {
+                    env: self.env.clone(),
+                }
+            }
+        };
+        let name = HeaderName::from_bytes(self.header.to_lowercase().as_bytes())
+            .map_err(|_| malformed())?;
+
+        // Zero the intermediate combined header text after reqwest has copied
+        // it. The returned HeaderValue is itself marked sensitive.
+        let mut raw = Zeroizing::new(String::with_capacity(
+            self.scheme
+                .len()
+                .saturating_add(token.len())
+                .saturating_add(1),
+        ));
+        if !self.scheme.is_empty() {
+            raw.push_str(&self.scheme);
+            raw.push(' ');
+        }
+        raw.push_str(token);
+        let mut value = HeaderValue::from_str(raw.as_str()).map_err(|_| malformed())?;
+        value.set_sensitive(true);
+        Ok((name, value))
+    }
+
+    /// Validate a candidate managed credential through the exact header path
+    /// used for requests, without consulting or mutating process environment.
+    pub fn validate_managed_token(&self, token: &str) -> Result<(), AuthError> {
+        self.header_for_token(token, true).map(|_| ())
     }
 }
 
 impl AuthProvider for EnvBearerAuth {
     fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
-        // Read the token from env at request time. Missing or empty is an
-        // actionable error carrying the configured refresh hint.
-        let token = match std::env::var(&self.env) {
-            Ok(v) if !v.is_empty() => v,
-            _ => {
-                return Err(AuthError::Missing {
+        // A non-empty environment value is authoritative. Non-Unicode input is
+        // malformed and must not silently fall back to a managed credential.
+        let environment_token = match std::env::var_os(&self.env) {
+            Some(value) if value.is_empty() => None,
+            Some(value) => Some(Zeroizing::new(value.into_string().map_err(|_| {
+                AuthError::Malformed {
                     env: self.env.clone(),
-                    hint: self.refresh_hint.clone(),
-                })
-            }
+                }
+            })?)),
+            None => None,
         };
-
-        // Header name; reqwest stores names lowercase but accepts mixed case.
-        let name = HeaderName::from_bytes(self.header.to_lowercase().as_bytes()).map_err(|_| {
-            AuthError::Malformed {
-                env: self.env.clone(),
-            }
-        })?;
-
-        // Build the value: `scheme token`, trimming the leading space when the
-        // scheme is empty (raw token, e.g. x-api-key).
-        let raw = format!("{} {}", self.scheme, token);
-        let trimmed = if self.scheme.is_empty() {
-            raw.trim_start()
+        let (token, managed) = if let Some(token) = environment_token.as_ref() {
+            (token.as_str(), false)
+        } else if let Some(token) = self.managed_token.as_ref() {
+            (token.as_str(), true)
         } else {
-            raw.as_str()
+            return Err(AuthError::Missing {
+                env: self.env.clone(),
+                hint: self.refresh_hint.clone(),
+            });
         };
-
-        let mut value = HeaderValue::from_str(trimmed).map_err(|_| AuthError::Malformed {
-            env: self.env.clone(),
-        })?;
-        // Mark sensitive so reqwest/tracing never logs the token.
-        value.set_sensitive(true);
-
-        Ok(Some((name, value)))
+        self.header_for_token(token, managed).map(Some)
     }
 
     fn expiry_status(&self) -> ExpiryStatus {

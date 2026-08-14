@@ -24,6 +24,15 @@ no-tools turn. The top-level `kitsu review` command exposes every live Git scope
 for one-shot human or JSONL automation and supports additional user focus
 instructions plus opt-in saved-session continuity.
 
+Every review disclosure is auditable without granting the model a standing
+read capability. Human top-level review prints the bounded evidence byte count
+and the absence of a read root. JSONL top-level review instead emits exactly
+one `review_disclosure` after `run_started` and before `turn_started`, with
+`source: "top_level_review"`, target/revision metadata, truncation and byte
+counts, `model_disclosed: true`, and `model_read_root_granted: false`. The event
+does not repeat the diff body. Scripted `/review` retains the same field set in
+its command-scoped `review_disclosure` result.
+
 Live Git revisions are resolved as commits with `git rev-parse --verify
 --end-of-options`. The resulting hexadecimal object ID, rather than the
 user-entered revision, is passed to subsequent Git commands. Git is invoked

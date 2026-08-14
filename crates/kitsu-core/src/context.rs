@@ -61,10 +61,11 @@ impl ContextBreakdown {
 #[derive(Debug, Default, Clone)]
 pub struct ContextMeter {
     /// `(prompt_tokens, number of leading messages that request covered, whether
-    /// that request's `tools` field was present)`. The schema flag matters
-    /// because the final round of a turn withholds tools (forcing an answer),
-    /// so an anchor recorded there does NOT include schema overhead — a later
-    /// round that offers tools again must not assume it's already covered.
+    /// that request carried tool and/or response schema constraints)`. The flag
+    /// matters because a constraint-free request must not be treated as if it
+    /// already covered later schema overhead. Callers must invalidate the
+    /// anchor when one non-empty constraint set is replaced by a different one;
+    /// this compact flag intentionally does not fingerprint schema contents.
     anchor: Option<(u64, usize, bool)>,
 }
 
@@ -75,7 +76,8 @@ impl ContextMeter {
 
     /// Record the authoritative `prompt_tokens` from a response, for a request
     /// that sent `sent_len` leading messages and — per `had_schema` — did or
-    /// didn't include the tool schemas that round.
+    /// didn't include tool or response schemas that round. Replace one schema
+    /// set with another only after [`Self::invalidate`].
     pub fn record(&mut self, prompt_tokens: u64, sent_len: usize, had_schema: bool) {
         self.anchor = Some((prompt_tokens, sent_len, had_schema));
     }
@@ -113,11 +115,11 @@ impl ContextMeter {
     }
 
     /// True when the CURRENT anchor is valid for `messages` *and* the request
-    /// that produced it already included tool-schema tokens. Callers that need
+    /// that produced it already included request-schema tokens. Callers that need
     /// to add static overhead not reflected in a plain chars/token estimate
-    /// (tool schema tokens) should only skip doing so when this is `true` — an
-    /// anchor from a schema-less request (e.g. a turn's final round, which
-    /// withholds tools) does NOT cover that overhead, so it must still be added
+    /// (tool/response schema tokens) should only skip doing so when this is
+    /// `true` — an anchor from a schema-less request does NOT cover that
+    /// overhead, so it must still be added
     /// even though the meter is otherwise anchored.
     pub fn anchor_includes_schema(&self, messages: &[ChatMessage]) -> bool {
         matches!(self.anchor, Some((_, sent_len, had_schema)) if had_schema && sent_len <= messages.len())
