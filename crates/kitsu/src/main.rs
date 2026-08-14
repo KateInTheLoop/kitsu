@@ -3108,6 +3108,7 @@ async fn minimal_inference_probe(
         reasoning_effort: None,
         max_tokens: Some(1),
         response_format: None,
+        prompt_cache_key: None,
     };
     let mut response = provider.chat_stream(request).await?;
     let mut finished = false;
