@@ -9722,6 +9722,12 @@ fn run_live_typeahead(
             break;
         }
         if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            // A quiet tick after a bare ESC byte means the user pressed the
+            // Esc key itself (a real escape sequence arrives atomically):
+            // Esc clears the draft.
+            if editor.resolve_lone_escape() {
+                update_live_row(&editor);
+            }
             continue;
         }
 

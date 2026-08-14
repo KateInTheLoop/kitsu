@@ -10,8 +10,11 @@
 //! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W (delete word),
 //! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
 //! newline), Tab (requests inline-hint completion from the collector; the
-//! editor itself is hint-agnostic). A bracketed paste (`ESC[200~`…`ESC[201~`)
-//! stays one draft block:
+//! editor itself is hint-agnostic), and lone Esc (clears the draft — the
+//! collector resolves it on a quiet poll tick via
+//! [`TypeaheadEditor::resolve_lone_escape`], so real escape sequences,
+//! which arrive atomically, are unaffected). A bracketed paste
+//! (`ESC[200~`…`ESC[201~`) stays one draft block:
 //! its newlines insert literally instead of submitting. Unknown escape
 //! sequences are consumed and ignored so they never leak into the draft.
 
@@ -124,6 +127,27 @@ impl TypeaheadEditor {
         self.cursor = self.buffer.len();
         self.history_cursor = None;
         self.stash.clear();
+    }
+
+    /// Resolve a lone Esc keypress: when an `ESC` byte arrived with no
+    /// follow-up (the collector calls this on a poll tick with no input),
+    /// it was a real Esc key, not a sequence start — clear the whole draft
+    /// (and any history walk). Returns whether the visible draft changed.
+    /// Never fires mid-paste: a paste stalling between its `ESC` and the
+    /// rest of the terminator must not wipe the pasted draft.
+    pub fn resolve_lone_escape(&mut self) -> bool {
+        if self.pending != Pending::Escape || self.in_paste {
+            return false;
+        }
+        self.pending = Pending::None;
+        if self.buffer.is_empty() {
+            return false;
+        }
+        self.buffer.clear();
+        self.cursor = 0;
+        self.history_cursor = None;
+        self.stash.clear();
+        true
     }
 
     /// Drop all transient input state (paste mode, partial escape/UTF-8
@@ -623,6 +647,48 @@ mod tests {
         editor.feed(b"abc\x01"); // Ctrl+A home
         editor.feed(&[0x0b]); // Ctrl+K: kill to end
         assert_eq!(editor.buffer_string(), "");
+    }
+
+    #[test]
+    fn lone_escape_clears_the_draft_on_the_quiet_tick() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        editor.feed(b"half-typed junk");
+        editor.feed(b"\x1b");
+        assert!(editor.resolve_lone_escape());
+        assert_eq!(editor.buffer_string(), "");
+        assert_eq!(editor.cursor(), 0);
+        // Esc on an already-empty draft changes nothing.
+        editor.feed(b"\x1b");
+        assert!(!editor.resolve_lone_escape());
+        // Without a pending ESC the resolver is inert.
+        assert!(!editor.resolve_lone_escape());
+    }
+
+    #[test]
+    fn escape_sequences_and_pastes_are_immune_to_the_lone_escape_resolver() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"abc");
+        // Mid-sequence (ESC [ received, final byte pending): not a lone Esc.
+        editor.feed(b"\x1b[");
+        assert!(!editor.resolve_lone_escape());
+        editor.feed(b"D"); // completes ←
+        assert_eq!(editor.cursor(), 2);
+        // Mid-paste stall on a bare ESC must never wipe the pasted draft.
+        editor.feed(b"\x1b[200~pasted\x1b");
+        assert!(!editor.resolve_lone_escape());
+        editor.feed(b"[201~");
+        assert!(editor.buffer_string().contains("pasted"));
+    }
+
+    #[test]
+    fn escape_then_delayed_key_still_types_the_key() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"\x1b");
+        // Quiet tick resolves the ESC (empty draft: no change)...
+        assert!(!editor.resolve_lone_escape());
+        // ...and the late key arrives as itself, not as Alt+key.
+        editor.feed(b"x");
+        assert_eq!(editor.buffer_string(), "x");
     }
 
     #[test]
