@@ -9687,7 +9687,18 @@ fn run_live_typeahead(
     let mut raw = Some(raw);
     // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
     let mut quiet_ticks = 0u32;
+    let sync_queue_depth = |dispatcher: &TypeaheadDispatcher| {
+        live::live_queue_depth(
+            dispatcher
+                .queue
+                .lock()
+                .expect("prompt queue")
+                .status()
+                .queued,
+        );
+    };
     live::live_input_begin(prompt.clone());
+    sync_queue_depth(dispatcher);
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
@@ -9785,6 +9796,8 @@ fn run_live_typeahead(
                         continue;
                     }
                     dispatcher.dispatch(&line, &mut result);
+                    // Enqueues and /queue edits both move the pending count.
+                    sync_queue_depth(dispatcher);
                 }
                 typeahead_editor::EditorAction::Eof => {
                     result.eof = true;
@@ -9825,6 +9838,7 @@ fn run_live_typeahead(
                             ))
                             .write_line(&mut std::io::stderr());
                             editor.replace_buffer(&prompt);
+                            sync_queue_depth(dispatcher);
                         }
                         None => {
                             // Queue empty: plain history walk, as before.
