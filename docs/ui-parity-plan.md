@@ -398,9 +398,19 @@ as escalation); findings are re-verified before applying. Cycle log:
   (the +N-more row had NO width guard), the shrink-gap float (reachable
   via approval handoffs), and resize staleness — all fixed + pinned
   (cols-sweep test, byte-exact clear_region test). PTY 5/5.
-- Backlog (next cycles): multi-line draft wrap (region machinery now
-  exists); unit-test seam for the collector poll loop + injectable
-  writer for redraw_locked (review gap: branch selection untestable).
+- **Cycle 10 (2026-08-14, 616827c + follow-up d7af524)**: multi-line
+  drafts render as real lines — dim '│' context rows above the cursor
+  line, '⋮ +N earlier/below' markers, status row shows only the cursor's
+  logical line (cursor never leaves the bottom row, so every cycle-9
+  invariant holds unchanged). Fast path now compares the full upper-row
+  vector (last_upper), closing a latent same-count content-change gap.
+  Review: no code bugs; the below-marker now names the Enter-submits-all
+  semantics. With this, the original parity backlog from cycle 0 is
+  CLOSED — the mid-turn editor covers editing, history, search, recall,
+  pastes, completion, multi-line, and the full control-key vocabulary.
+- Backlog (next cycles): unit-test seam for the collector poll loop +
+  injectable writer for redraw_locked (testability debt); soft-wrap of
+  overlong single lines (nice-to-have; horizontal window suffices).
 
 ## Protocol
 
