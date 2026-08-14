@@ -11592,22 +11592,43 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // A prompt cannot be redrawn without cursor-control sequences. In
     // assistive mode, defer notices until the submitted line returns instead
     // of letting an asynchronous printer split partially typed input.
-    let agent_notification_task = (!assistive_input)
-        .then(|| rl.create_external_printer().ok())
-        .flatten()
-        .map(|mut printer| {
-            let mut changes = agent_registry.subscribe();
-            let notification_journal = write_journal.clone();
-            let typeahead_active = foreground_typeahead_active.clone();
-            let deferred = deferred_notice_sender.clone();
-            tokio::spawn(async move {
-                let mut previous = *changes.borrow_and_update();
-                while changes.changed().await.is_ok() {
-                    let current = *changes.borrow_and_update();
-                    if let Some(message) = background_agent_notice(previous, current) {
-                        let notice = kitsu_render::PromptSafeAsyncNotice::new(
-                            background_agent_notice_level(previous, current),
-                            message,
+    // DEFAULT: no rustyline ExternalPrinter. Registering one degrades the
+    // idle prompt's input processing to ~1 byte per event-loop wakeup on
+    // this rustyline (14 through 18, empirically bisected cycle 14 —
+    // burst input like pastes crawls; the fox's founding complaint). The
+    // printer-less fallback below prints agent notices between prompt
+    // cycles instead of live at idle; automation-first kitsu prefers
+    // sacred input latency. KITSU_LIVE_NOTICES=1 opts back into the
+    // printer for sessions that want live idle notices and accept the
+    // input cost.
+    let agent_notification_task = (!assistive_input
+        && std::env::var_os("KITSU_LIVE_NOTICES").is_some())
+    .then(|| rl.create_external_printer().ok())
+    .flatten()
+    .map(|mut printer| {
+        let mut changes = agent_registry.subscribe();
+        let notification_journal = write_journal.clone();
+        let typeahead_active = foreground_typeahead_active.clone();
+        let deferred = deferred_notice_sender.clone();
+        tokio::spawn(async move {
+            let mut previous = *changes.borrow_and_update();
+            while changes.changed().await.is_ok() {
+                let current = *changes.borrow_and_update();
+                if let Some(message) = background_agent_notice(previous, current) {
+                    let notice = kitsu_render::PromptSafeAsyncNotice::new(
+                        background_agent_notice_level(previous, current),
+                        message,
+                    );
+                    if typeahead_active.load(Ordering::Acquire)
+                        || notice.publish_with(|frame| printer.print(frame)).is_err()
+                    {
+                        let _ = deferred.send(notice.line());
+                    }
+                }
+                if current.terminal > previous.terminal {
+                    for report in notification_journal.drain_and_take_reports().await {
+                        let notice = kitsu_render::PromptSafeAsyncNotice::info(
+                            format_write_checkpoint(&report, undo_hint_actionable()),
                         );
                         if typeahead_active.load(Ordering::Acquire)
                             || notice.publish_with(|frame| printer.print(frame)).is_err()
@@ -11615,22 +11636,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             let _ = deferred.send(notice.line());
                         }
                     }
-                    if current.terminal > previous.terminal {
-                        for report in notification_journal.drain_and_take_reports().await {
-                            let notice = kitsu_render::PromptSafeAsyncNotice::info(
-                                format_write_checkpoint(&report, undo_hint_actionable()),
-                            );
-                            if typeahead_active.load(Ordering::Acquire)
-                                || notice.publish_with(|frame| printer.print(frame)).is_err()
-                            {
-                                let _ = deferred.send(notice.line());
-                            }
-                        }
-                    }
-                    previous = current;
                 }
-            })
-        });
+                previous = current;
+            }
+        })
+    });
     let agent_notifications_live = agent_notification_task.is_some();
     let history_path = setup.state_dir.join("history");
     if !no_session {
