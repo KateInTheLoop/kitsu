@@ -60,6 +60,10 @@ struct LiveRowState {
     /// Terminal width at the last paint; a change forces a full repaint so
     /// stack rows never linger at a stale width.
     last_cols: usize,
+    /// The upper (non-status) rows as last painted; content changes with an
+    /// unchanged row count (e.g. the cursor crossing logical lines) must
+    /// also force a full repaint.
+    last_upper: Vec<String>,
 }
 
 fn state() -> &'static Mutex<LiveRowState> {
@@ -195,8 +199,16 @@ fn compose_row(
     } else {
         avail
     };
-    let (visible, cursor_offset, windowed) =
-        fit_draft_window(&draft.buffer, draft.cursor, buffer_avail);
+    // Multi-line drafts show only the cursor's logical line here; earlier
+    // lines render as dim context rows above (compose_draft_context_rows).
+    let (line_start, line_end, cursor_in_line) = current_line_bounds(&draft.buffer, draft.cursor);
+    let line: String = draft
+        .buffer
+        .chars()
+        .skip(line_start)
+        .take(line_end - line_start)
+        .collect();
+    let (visible, cursor_offset, windowed) = fit_draft_window(&line, cursor_in_line, buffer_avail);
     let mut row = String::new();
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
@@ -255,6 +267,80 @@ fn compose_row(
         }
     }
     (row, Some(lead + prompt_width + cursor_offset + 1))
+}
+
+/// Char-index bounds of the logical line containing `cursor` (newline-split)
+/// plus the cursor's offset within it. Pure.
+fn current_line_bounds(buffer: &str, cursor: usize) -> (usize, usize, usize) {
+    let chars: Vec<char> = buffer.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let start = chars[..cursor]
+        .iter()
+        .rposition(|&ch| ch == '\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let end = chars[cursor..]
+        .iter()
+        .position(|&ch| ch == '\n')
+        .map(|i| cursor + i)
+        .unwrap_or(chars.len());
+    (start, end, cursor - start)
+}
+
+/// Dim context rows for a multi-line draft: up to two logical lines above
+/// the cursor's line (older lines collapse into a `⋮ +N earlier` marker)
+/// and a `⋮ +N below` marker when lines exist after the cursor's line.
+/// The cursor's own line renders on the status row itself. Pure.
+fn compose_draft_context_rows(buffer: &str, cursor: usize, cols: usize) -> Vec<String> {
+    if !buffer.contains('\n') {
+        return Vec::new();
+    }
+    let chars: Vec<char> = buffer.chars().collect();
+    let cursor = cursor.min(chars.len());
+    let lines: Vec<String> = buffer.split('\n').map(str::to_string).collect();
+    let cursor_line = chars[..cursor].iter().filter(|&&ch| ch == '\n').count();
+    let clamp = |plain: String| -> String {
+        if display_width(&plain) <= cols {
+            return plain;
+        }
+        let budget = cols.saturating_sub(1);
+        let mut used = 0usize;
+        let mut clipped: String = plain
+            .chars()
+            .take_while(|&ch| {
+                used += crate::char_display_width(ch);
+                used <= budget
+            })
+            .collect();
+        clipped.push('…');
+        clipped
+    };
+    let mut rows = Vec::new();
+    if cursor_line > 2 {
+        rows.push(format!(
+            "{}",
+            clamp(format!("  ⋮ +{} earlier line(s)", cursor_line - 2)).dimmed()
+        ));
+    }
+    for line in lines
+        .iter()
+        .take(cursor_line)
+        .skip(cursor_line.saturating_sub(2))
+    {
+        let text: String = crate::sanitize_terminal_text(line)
+            .chars()
+            .map(display_char)
+            .collect();
+        rows.push(format!("{}", clamp(format!("  │ {text}")).dimmed()));
+    }
+    let after = lines.len().saturating_sub(cursor_line + 1);
+    if after > 0 {
+        rows.push(format!(
+            "{}",
+            clamp(format!("  ⋮ +{after} line(s) below cursor")).dimmed()
+        ));
+    }
+    rows
 }
 
 /// Compose the dimmed queued-prompt stack rows shown above the status row:
@@ -347,20 +433,31 @@ fn redraw_locked(row_state: &mut LiveRowState) {
         row_state.last_cols = cols;
         row_state.region_dirty = true;
     }
-    // Stack rows render only alongside a draft, mirroring the queue tag.
-    let stack = if row_state.draft.is_some() {
+    // Upper rows: queue stack + multi-line draft context, both only
+    // alongside a draft.
+    let mut upper = if row_state.draft.is_some() {
         compose_stack_rows(&row_state.previews, row_state.queued, cols)
     } else {
         Vec::new()
     };
+    if let Some(draft) = &row_state.draft {
+        upper.extend(compose_draft_context_rows(
+            &draft.buffer,
+            draft.cursor,
+            cols,
+        ));
+    }
     let (status, cursor_col) = compose_row(
         row_state.spinner.as_deref(),
         row_state.draft.as_ref(),
         row_state.queued,
         cols,
     );
-    let wanted_rows = stack.len() + 1;
-    if row_state.drawn_rows == wanted_rows && !row_state.region_dirty {
+    let wanted_rows = upper.len() + 1;
+    if row_state.drawn_rows == wanted_rows
+        && !row_state.region_dirty
+        && upper == row_state.last_upper
+    {
         // Fast path (spinner ticks, keystrokes): only the bottom status row
         // changed; upper stack rows stay put — no flicker.
         let _ = write!(err, "\r\x1b[2K{status}");
@@ -376,12 +473,13 @@ fn redraw_locked(row_state: &mut LiveRowState) {
             let _ = write!(err, "{}", "\n".repeat(shrink));
         }
         let _ = write!(err, "\r");
-        for row in &stack {
+        for row in &upper {
             let _ = write!(err, "{row}\r\n");
         }
         let _ = write!(err, "{status}");
         row_state.drawn_rows = wanted_rows;
         row_state.region_dirty = false;
+        row_state.last_upper = upper;
     }
     if let Some(col) = cursor_col {
         let _ = write!(err, "\x1b[{col}G");
@@ -731,6 +829,64 @@ mod tests {
         );
         // Empty queue: no rows.
         assert!(compose_stack_rows(&[], 0, 80).is_empty());
+    }
+
+    #[test]
+    fn current_line_bounds_split_on_newlines() {
+        assert_eq!(current_line_bounds("abc", 2), (0, 3, 2));
+        // "ab\ncd\nef" — cursor on 'd' (index 4): line "cd" spans 3..5.
+        assert_eq!(current_line_bounds("ab\ncd\nef", 4), (3, 5, 1));
+        // Cursor exactly ON a newline belongs to the line it terminates.
+        assert_eq!(current_line_bounds("ab\ncd", 2), (0, 2, 2));
+        // Cursor at end of the last line.
+        assert_eq!(current_line_bounds("ab\ncd", 5), (3, 5, 2));
+    }
+
+    #[test]
+    fn multiline_draft_shows_cursor_line_with_context_rows_above() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "first line\nsecond line\nthird".to_string(),
+            cursor: 28, // end of "third"
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 0, 80);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            plain.contains("third"),
+            "status row shows cursor line: {plain}"
+        );
+        assert!(
+            !plain.contains("first"),
+            "earlier lines are context rows: {plain}"
+        );
+        // 7 prompt + 5 chars of "third" + 1.
+        assert_eq!(col, Some(13));
+
+        let rows = compose_draft_context_rows(&draft.buffer, draft.cursor, 80);
+        let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert_eq!(plain.len(), 2);
+        assert!(plain[0].contains("first line"));
+        assert!(plain[1].contains("second line"));
+    }
+
+    #[test]
+    fn context_rows_collapse_far_lines_into_markers() {
+        let buffer = "l1\nl2\nl3\nl4\nl5\nl6";
+        // Cursor in l5 (chars: l1\n=3 ... start of l5 = 12).
+        let rows = compose_draft_context_rows(buffer, 13, 80);
+        let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert!(plain[0].contains("+2 earlier line(s)"), "{plain:?}");
+        assert!(plain[1].contains("l3"));
+        assert!(plain[2].contains("l4"));
+        assert!(plain[3].contains("+1 line(s) below cursor"));
+        assert_eq!(plain.len(), 4);
+        // Single-line drafts produce no context rows.
+        assert!(compose_draft_context_rows("plain", 3, 80).is_empty());
+        // Narrow terminals clamp context rows too.
+        for row in compose_draft_context_rows(buffer, 13, 8) {
+            assert!(display_width(&sanitize_terminal_text(&row)) <= 8);
+        }
     }
 
     #[test]
