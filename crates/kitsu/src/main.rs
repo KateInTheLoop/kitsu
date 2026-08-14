@@ -2841,9 +2841,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "permissions",
-        args: "",
-        description: "show filesystem access policy",
-        details: "Full authority disclosure: read/write roots split by invocation vs runtime, protected kitsu-private paths, exact command grants (numbered, revocable), containment status, and the workspace-evidence tool's standing disclosure.",
+        args: "[protect <path>]",
+        description: "show access policy; protect paths for the session",
+        details: "Full authority disclosure: read/write roots split by invocation vs runtime, protected kitsu-private paths, exact command grants (numbered, revocable), containment status, and the workspace-evidence tool's standing disclosure. `/permissions protect <path>` marks a path Kitsu-private (read+write) for the rest of the session — a hard guard that survives every bypass, including --dangerously-skip-permissions, and cannot be revoked in-session.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -10030,7 +10030,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         store.set_name(Some(requested_name.to_string()));
         eprintln!("~ session name: {}", terminal_inline(requested_name));
     }
-    let mode = if cli.dangerously_allow_all_filesystem {
+    let mode = if cli.dangerously_skip_permissions || cli.dangerously_allow_all_filesystem {
         Mode::AutoAllow
     } else if cli.yes {
         Mode::Scoped
@@ -10039,6 +10039,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     } else {
         Mode::Deny
     };
+    if cli.dangerously_skip_permissions {
+        // The unattended bypass must never start silently: name exactly what
+        // is off and which guards remain, once, before any tool runs.
+        kitsu_render::PromptSafeAsyncNotice::warning(
+            "DANGEROUSLY SKIPPING PERMISSIONS: filesystem prompts bypassed for all \
+             non-protected paths; developer commands auto-approved inside their roots. \
+             Remaining guards: Kitsu config/state protection, command-root confinement \
+             + containment, and /permissions protect <path>",
+        )
+        .write_line(&mut std::io::stderr())
+        .ok();
+    }
     let mut read_roots: Vec<String> = allow_paths.to_vec();
     read_roots.extend(allow_read_write.iter().cloned());
     let mut write_roots: Vec<String> = allow_write.to_vec();
@@ -10077,9 +10089,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // flags are deliberately excluded: they change fallback policy but never
     // create capabilities. --allow-write is genuinely write-only; callers who
     // want edit/readback workflows opt into --allow-read-write explicitly.
+    // The unattended bypass exists so loop automation runs with no human;
+    // unlike the filesystem-only bypass it therefore does register fs tools
+    // in non-interactive runs (documented on the flag).
     let can_read = !forced_one_shot
-        && (interactive || !allow_paths.is_empty() || !allow_read_write.is_empty());
-    let can_write = interactive || !allow_write.is_empty() || !allow_read_write.is_empty();
+        && (interactive
+            || cli.dangerously_skip_permissions
+            || !allow_paths.is_empty()
+            || !allow_read_write.is_empty());
+    let can_write = interactive
+        || cli.dangerously_skip_permissions
+        || !allow_write.is_empty()
+        || !allow_read_write.is_empty();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
     let command_artifact_sink = command_requested.then(|| {
         let quota = command_artifact::CommandArtifactQuota::new(
@@ -10104,7 +10125,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         } else {
             command_roots.to_vec()
         };
-        let command_mode = if interactive {
+        let command_mode = if cli.dangerously_skip_permissions {
+            kitsu_tools::CommandMode::AutoAllow
+        } else if interactive {
             kitsu_tools::CommandMode::Ask
         } else {
             kitsu_tools::CommandMode::Deny
@@ -10693,6 +10716,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         command_mode: command_policy.as_ref().map(|policy| match policy.mode() {
             kitsu_tools::CommandMode::Ask => "ask",
             kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
+            kitsu_tools::CommandMode::AutoAllow => "DANGEROUS auto-allow (no prompts)",
         }),
         command_policy: command_policy.clone(),
         command_artifact_sink: command_artifact_sink.clone(),
@@ -12759,7 +12783,6 @@ async fn handle_slash(
                 | "compact"
                 | "cost"
                 | "new"
-                | "permissions"
                 | "profiles"
                 | "retry"
                 | "sessions"
@@ -12835,6 +12858,43 @@ async fn handle_slash(
             )));
         }
         "permissions" => {
+            let protect_request = match arg.trim() {
+                "protect" => Some(""),
+                trimmed => trimmed.strip_prefix("protect "),
+            };
+            if let Some(path) = protect_request {
+                let path = path.trim();
+                if path.is_empty() {
+                    eprintln!("usage: /permissions protect <path> (session-wide read+write guard; irrevocable in-session)");
+                    return SlashResult::Error;
+                }
+                // Order matters for atomicity of the message: attempt both
+                // protections; a failure on either leaves an honest error and
+                // whatever protection did land (protections only ever narrow
+                // authority, so a partial application is safe).
+                let read = perms.protect_read_path(path);
+                let write = perms.protect_write_path(path);
+                match (read, write) {
+                    (Ok(canon), Ok(_)) => {
+                        eprintln!(
+                            "~ protected for this session (read+write, survives all bypass flags): {}",
+                            shorten_home(&canon)
+                        );
+                        let text = format_permissions(perms, session);
+                        return SlashResult::Continue(Some(permissions_payload(
+                            perms, session, text,
+                        )));
+                    }
+                    (Err(error), _) | (_, Err(error)) => {
+                        eprintln!("cannot protect '{path}': {error}");
+                        return SlashResult::Error;
+                    }
+                }
+            }
+            if !arg.trim().is_empty() {
+                eprintln!("usage: {}", slash_syntax("permissions"));
+                return SlashResult::Error;
+            }
             let text = format_permissions(perms, session);
             if !cli.jsonl {
                 eprintln!("{text}");

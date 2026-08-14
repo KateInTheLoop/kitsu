@@ -15,7 +15,7 @@ Shipped in this pass: `/cost` and `/loop`.
 | `/cost` | `/cost` | ✅ NEW — cumulative session tokens across turns; kitsu meters tokens, not currency (gateway pricing varies; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire) |
 | `/status` | `/status` | ✅ parity+ (session, endpoint, window provenance, grants) |
 | `/model` | `/model` | ✅ parity (live window re-discovery on switch) |
-| `/permissions` | `/permissions` | ✅ parity+ (grants, protected paths, command containment) |
+| `/permissions` | `/permissions [protect <path>]` | ✅ parity+ (grants, protected paths, command containment; `protect` adds an irrevocable in-session guard that survives `--dangerously-skip-permissions`) |
 | `/resume` | `/resume <id\|name\|last\|auto>` | ✅ parity+ (names, cwd-scoped auto); interactive picker still queued |
 | `/rewind` | `/undo`, `/checkpoints` | ✅ parity (journal-verified checkpoints) |
 | `/export` | `/export` + `sessions export` | ✅ parity (markdown/JSON) |
