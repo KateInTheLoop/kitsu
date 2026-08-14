@@ -1403,7 +1403,8 @@ fn tool_activity_line(header: &str, styled: bool, plain: bool) -> String {
         None => format!(
             "{} {}",
             GLYPH_TOOL_CALL.truecolor(r, g, b),
-            header.truecolor(r, g, b).bold()
+            // Spec: whole header in accent — color only, no bold.
+            header.truecolor(r, g, b)
         ),
     }
 }
@@ -2430,8 +2431,14 @@ mod tests {
             sanitize_terminal_text(&styled),
             "◆ Read(crates/kitsu-render/src/lib.rs)"
         );
-        // No parenthesis: whole header accent-bold, round-trip intact.
+        // No parenthesis: whole header in accent (color only, NO bold per
+        // the item-12 spec), round-trip intact.
         let styled = tool_activity_line("workspace_diff", true, false);
+        assert!(
+            !styled.contains("\u{1b}[1m"),
+            "no bold without a verb split"
+        );
+        assert!(styled.contains("\u{1b}[38;2;"));
         assert_eq!(sanitize_terminal_text(&styled), "◆ workspace_diff");
         // Plain and non-TTY tiers are byte-identical to the historical forms.
         assert_eq!(tool_activity_line("Read(x)", false, true), "tool> Read(x)");
