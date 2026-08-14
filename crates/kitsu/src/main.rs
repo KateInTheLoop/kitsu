@@ -9653,6 +9653,10 @@ fn run_live_typeahead(
                 // the draft row is already hidden by the approval guard.
                 drop(guard);
                 live::live_input_end();
+                // The approval reader may consume the rest of an in-flight
+                // paste (terminator included); dropping transient input state
+                // prevents a latched paste mode from eating every later Enter.
+                editor.reset_pending_input();
             }
             std::thread::sleep(Duration::from_millis(25));
             continue;
