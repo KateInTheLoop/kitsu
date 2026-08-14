@@ -22,12 +22,23 @@ one turn's budget. To make Kimi a *contributor*, cycles now ramp:
 2. **Cycle 5 — usage/caching slice.** `crates/kitsu-providers/src` usage
    parsing only: propose surfacing `cached_tokens` + catalog/window
    caching, citing the actual parsing code.
+   **Attempt 1 FAILED 2026-08-14** (worktree commit d3d0ba5): all three
+   scoped reads clean, then completion tokens overshot the 14,000 cap
+   (14,322 spent, 100% invisible reasoning, zero visible output,
+   discarded). **Next tick RETRIES cycle 5** — the worktree log already
+   has a cycle-5 entry, so the supervisor must read the ramp status
+   here, not just count log entries. Retry changes: `--max-output-tokens
+   24000`; if that fails too, split the task (5a: locate the
+   cached_tokens drop only; 5b: ranked caching proposals only).
 3. **Cycle 6 — synthesis.** Re-read own cycle-4/5 reviews plus targeted
    orchestrator ranges; produce the full caching + context-window review
    the loop originally wanted, now grounded in two banked passes.
 
-Rules unchanged otherwise (timeout 300, output >= 12000, NO sub-agent
-spawns, write the file before polishing).
+Rules (updated after cycle-5 attempt 1): timeout 300; output budget
+scales with task shape — >= 14000 for one-file reviews, **>= 24000 for
+any multi-file or two-part analytical task** (reasoning spend grows with
+task complexity: 8.8K spent at cycle 2, 14.3K at cycle 5); NO sub-agent
+spawns; write the file before polishing.
 
 Started 2026-08-13 at user direction. Kimi-K3 (moonshotai/Kimi-K3 via the
 Hugging Face router, `--gateway huggingface`) is treated as an **extra
@@ -119,6 +130,12 @@ kitsu-core work as capacity allows):
   to window 8192; explicit `--context-window` was required).
 - [ ] Surface provider `cached_tokens` (HF router reports it in usage)
   in `kitsu-usage:` records and `/cost`, so caching wins are measurable.
+  **Grounded (cycle-5 supervisor, 2026-08-14):** `Usage` at
+  `crates/kitsu-providers/src/types.rs:136-144` carries only
+  prompt/completion/total, so serde silently drops
+  `prompt_tokens_details.cached_tokens` before any Rust code sees it;
+  both streaming (`openai_compat.rs:252-535` range) and non-streaming
+  (`openai_compat.rs:616-618`) paths decode into that type.
 - [ ] **Cycle 2:** wall-clock-cancelled turns print zero `kitsu-usage`/
   `kitsu-context` receipts even when real inference time was spent —
   a total cost blackout for timed-out turns. Surface partial usage (or
