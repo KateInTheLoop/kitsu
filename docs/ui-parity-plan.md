@@ -314,6 +314,25 @@ every new decoration must degrade, and sanitize-round-trip invariants
   finished agents show none; `cargo test -p kitsu` green (known PTY failure
   allowed).
 
+## Interactive-input parity loop (hourly, started 2026-08-13)
+
+A separate maintainer-driven loop works the live-input/editor UX thread
+(compare vs Claude Code → one fix → gates + PTY smoke → haiku commit
+review → follow-up). Budget policy: review agents run haiku (sonnet only
+as escalation); findings are re-verified before applying. Cycle log:
+
+- **Cycle 0 (2026-08-13, 6ca44a5)**: live input row during turns — raw-mode
+  editor (insert/arrows/Home/End/kills, ↑/↓ history with stash), shared
+  spinner+draft status row in `kitsu-render::live`, immediate `~ queued:`
+  receipts, draft carry into the next prompt, approval handoff.
+  PTY-verified against ollama; canonical/plain/assistive byte-identical.
+- **Cycle 1 (2026-08-13, 9c4ad74 + follow-up 18aee0a)**: bracketed paste is
+  one draft block (2004h/l scoped to the raw guard, ⏎/⇥ placeholders,
+  Alt+Enter manual newline); review findings fixed: approval-handoff
+  paste-state reset, escape sequences inert inside paste, C1-injection
+  dropped. Deferred cosmetic: multi-line entries split on rustyline
+  history-file reload next session.
+
 ## Protocol
 
 For implementation agents executing this queue:
