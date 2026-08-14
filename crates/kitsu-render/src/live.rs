@@ -47,8 +47,16 @@ struct LiveRowState {
     /// dimmed `[N queued]` tag so the pending stack stays visible after its
     /// receipt scrolls away.
     queued: usize,
-    /// Whether a row is currently painted on the terminal's bottom line.
-    drawn: bool,
+    /// Up to the first three queued prompts, rendered as dimmed stack rows
+    /// above the status row (the live region's upper rows).
+    previews: Vec<String>,
+    /// The stack rows changed and the next redraw must repaint the whole
+    /// region, not just the bottom status row.
+    region_dirty: bool,
+    /// How many physical rows the live region currently occupies on the
+    /// terminal (stack rows + status row); 0 when nothing is painted. The
+    /// cursor always rests on the bottom row while drawn.
+    drawn_rows: usize,
 }
 
 fn state() -> &'static Mutex<LiveRowState> {
@@ -246,31 +254,101 @@ fn compose_row(
     (row, Some(lead + prompt_width + cursor_offset + 1))
 }
 
+/// Compose the dimmed queued-prompt stack rows shown above the status row:
+/// up to three upcoming prompts in execution order, then a `+N more` row.
+/// Pure for unit testing. Rows are pre-truncated to `cols`.
+fn compose_stack_rows(previews: &[String], queued: usize, cols: usize) -> Vec<String> {
+    if queued == 0 || previews.is_empty() {
+        return Vec::new();
+    }
+    let mut rows = Vec::new();
+    for (index, preview) in previews.iter().take(3).enumerate() {
+        let label = if index == 0 { "next" } else { "then" };
+        let text = crate::sanitize_terminal_text(preview)
+            .chars()
+            .map(display_char)
+            .collect::<String>();
+        let prefix = format!("  ↳ {label}: ");
+        let budget = cols.saturating_sub(display_width(&prefix) + 1);
+        let mut used = 0usize;
+        let mut clipped: String = text
+            .chars()
+            .take_while(|&ch| {
+                used += crate::char_display_width(ch);
+                used <= budget
+            })
+            .collect();
+        if clipped.chars().count() < text.chars().count() {
+            clipped.push('…');
+        }
+        rows.push(format!("{}", format!("{prefix}{clipped}").dimmed()));
+    }
+    if queued > 3 {
+        rows.push(format!(
+            "{}",
+            format!("  ↳ +{} more queued", queued - 3).dimmed()
+        ));
+    }
+    rows
+}
+
+/// Erase the painted region: the cursor rests on the bottom row, so clear it
+/// and walk upward clearing each row, ending at the region's top, column 0.
+fn clear_region_locked(err: &mut impl Write, drawn_rows: usize) {
+    if drawn_rows == 0 {
+        return;
+    }
+    let _ = write!(err, "\r\x1b[2K");
+    for _ in 1..drawn_rows {
+        let _ = write!(err, "\x1b[1A\x1b[2K");
+    }
+}
+
 fn redraw_locked(row_state: &mut LiveRowState) {
     if !live_rows_supported() {
         return;
     }
     let mut err = io::stderr().lock();
     if row_state.spinner.is_none() && row_state.draft.is_none() {
-        if row_state.drawn {
-            let _ = write!(err, "\r\x1b[2K");
+        if row_state.drawn_rows > 0 {
+            clear_region_locked(&mut err, row_state.drawn_rows);
             let _ = err.flush();
-            row_state.drawn = false;
+            row_state.drawn_rows = 0;
         }
         return;
     }
-    let (row, cursor_col) = compose_row(
+    let cols = terminal_cols();
+    // Stack rows render only alongside a draft, mirroring the queue tag.
+    let stack = if row_state.draft.is_some() {
+        compose_stack_rows(&row_state.previews, row_state.queued, cols)
+    } else {
+        Vec::new()
+    };
+    let (status, cursor_col) = compose_row(
         row_state.spinner.as_deref(),
         row_state.draft.as_ref(),
         row_state.queued,
-        terminal_cols(),
+        cols,
     );
-    let _ = write!(err, "\r\x1b[2K{row}");
+    let wanted_rows = stack.len() + 1;
+    if row_state.drawn_rows == wanted_rows && !row_state.region_dirty {
+        // Fast path (spinner ticks, keystrokes): only the bottom status row
+        // changed; upper stack rows stay put — no flicker.
+        let _ = write!(err, "\r\x1b[2K{status}");
+    } else {
+        clear_region_locked(&mut err, row_state.drawn_rows);
+        let _ = write!(err, "\r");
+        for row in &stack {
+            let _ = write!(err, "{row}\r\n");
+        }
+        let _ = write!(err, "{status}");
+        row_state.drawn_rows = wanted_rows;
+        row_state.region_dirty = false;
+    }
     if let Some(col) = cursor_col {
         let _ = write!(err, "\x1b[{col}G");
     }
     let _ = err.flush();
-    row_state.drawn = true;
 }
 
 fn redraw() {
@@ -287,11 +365,11 @@ fn clear_row() {
     let mut row_state = state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    if row_state.drawn {
+    if row_state.drawn_rows > 0 {
         let mut err = io::stderr().lock();
-        let _ = write!(err, "\r\x1b[2K");
+        clear_region_locked(&mut err, row_state.drawn_rows);
         let _ = err.flush();
-        row_state.drawn = false;
+        row_state.drawn_rows = 0;
     }
 }
 
@@ -346,17 +424,20 @@ pub fn live_input_update(buffer: String, cursor: usize, hint: String, hint_reser
     redraw();
 }
 
-/// Update the pending-queue depth shown as a dimmed `[N queued]` tag on
-/// the live row (0 hides it). No-op redraw when nothing is drawn.
-pub fn live_queue_depth(queued: usize) {
+/// Update the pending-queue state: the depth (dimmed `[N queued]` tag on the
+/// status row; 0 hides it) and up to the first three queued prompts, shown as
+/// dimmed stack rows above the status row. No-op when nothing changed.
+pub fn live_queue_state(queued: usize, previews: Vec<String>) {
     {
         let mut row_state = state()
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        if row_state.queued == queued {
+        if row_state.queued == queued && row_state.previews == previews {
             return;
         }
         row_state.queued = queued;
+        row_state.previews = previews;
+        row_state.region_dirty = true;
     }
     redraw();
 }
@@ -577,6 +658,41 @@ mod tests {
         };
         let (row, _) = compose_row(None, Some(&unreserved), 0, 48);
         assert!(!sanitize_terminal_text(&row).contains("reverse-search"));
+    }
+
+    #[test]
+    fn stack_rows_list_upcoming_prompts_in_order_with_a_more_row() {
+        let previews = vec![
+            "first queued".to_string(),
+            "second queued".to_string(),
+            "third queued".to_string(),
+        ];
+        let rows = compose_stack_rows(&previews, 5, 80);
+        assert_eq!(rows.len(), 4);
+        let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert!(plain[0].contains("next: first queued"));
+        assert!(plain[1].contains("then: second queued"));
+        assert!(plain[2].contains("then: third queued"));
+        assert!(plain[3].contains("+2 more queued"));
+        for row in &rows {
+            assert!(row.contains("\u{1b}[2m"), "stack rows are dimmed: {row:?}");
+        }
+    }
+
+    #[test]
+    fn stack_rows_truncate_and_flatten_multiline_prompts() {
+        let previews = vec!["a multi\nline prompt that is quite long indeed".to_string()];
+        let rows = compose_stack_rows(&previews, 1, 24);
+        assert_eq!(rows.len(), 1);
+        let plain = sanitize_terminal_text(&rows[0]);
+        assert!(plain.ends_with('…'), "long preview truncates: {plain}");
+        assert!(display_width(&plain) <= 24);
+        assert!(
+            plain.contains('⏎'),
+            "newline renders as placeholder: {plain}"
+        );
+        // Empty queue: no rows.
+        assert!(compose_stack_rows(&[], 0, 80).is_empty());
     }
 
     #[test]

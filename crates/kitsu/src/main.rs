@@ -9698,14 +9698,11 @@ fn run_live_typeahead(
     // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
     let mut quiet_ticks = 0u32;
     let sync_queue_depth = |dispatcher: &TypeaheadDispatcher| {
-        live::live_queue_depth(
-            dispatcher
-                .queue
-                .lock()
-                .expect("prompt queue")
-                .status()
-                .queued,
-        );
+        let queue = dispatcher.queue.lock().expect("prompt queue");
+        let queued = queue.status().queued;
+        let previews: Vec<String> = queue.iter().take(3).map(str::to_string).collect();
+        drop(queue);
+        live::live_queue_state(queued, previews);
     };
     // Depth first, paint second: the row's first frame must reflect the
     // real queue, not the previous turn's persisted count (the main loop
