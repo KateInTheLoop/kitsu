@@ -231,4 +231,29 @@ kitsu-core work as capacity allows):
 
 ## Cycle log
 
-(appended by the supervisor each cycle, newest last)
+(appended by the supervisor each cycle, newest last; the per-cycle
+detail for cycles 1–7 also lives in this doc's copy on `dogfood/kimi-k3`)
+
+### Cycle 7 — 2026-08-14 — FIRST CODE CONTRIBUTION (grade A-)
+
+Kimi implemented its own cycle-6 P3 design: surface `cached_tokens`
+from `prompt_tokens_details` in `kitsu-providers` (`types.rs`, +32/-2 —
+`PromptTokensDetails` struct, `Usage.prompt_tokens_details`,
+`cached_tokens()` accessor, `is_empty()` widened, `add()` merges cached
+tokens). Committed as `eca129f` on `dogfood/kimi-k3`, pushed.
+
+- Single attempt, 58.7s wall, 5 tool calls, completion 2,150/24,000
+  (9% — lowest of the loop), zero truncation, zero debris events.
+- Gates: `cargo fmt --check` clean; `cargo test -p kitsu-providers`
+  58 passed / 0 failed. Fully additive; no struct-literal breakage.
+- Docked from A: no new unit test for the added logic, and redundant
+  double-`Option` nesting vs its own single-`Option` design.
+- Infra incident (not Kimi's fault): first `cargo test` filled the /tmp
+  tmpfs (worktree default `target/` ≈12G vs 5.7G mount) and briefly
+  broke Bash across sessions — hence the CARGO_TARGET_DIR rule above.
+
+**Verdict: the frontier recipe is validated for code work, not just
+review/analysis. Kimi is now a contributing agent.** Next cycles:
+continue P-backlog implementation (P1 `prompt_cache_key` or a unit test
+for the P3 diff are natural next tasks); consider requiring a test with
+every code diff as part of the task brief.
