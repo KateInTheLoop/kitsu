@@ -42,8 +42,9 @@ fn template_control_debris_in_tail(text: &str) -> bool {
 }
 use futures::StreamExt;
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
-    ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink, ReasoningEffort, Role, ToolCall,
+    ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat, Provider,
+    ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError, ProviderTelemetrySink,
+    ReasoningEffort, Role, ToolCall, ToolDescriptor,
 };
 use kitsu_tools::{
     scope_command_progress, CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
@@ -52,7 +53,12 @@ use kitsu_tools::{
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::Arc;
 use thiserror::Error;
+
+const STRUCTURED_FINALIZATION_NUDGE: &str = "The tool-action phase is complete. Tools are no \
+longer available. Produce only the final answer now, following the required structured output \
+format exactly.";
 
 #[cfg(test)]
 #[path = "orchestrator_tests.rs"]
@@ -123,6 +129,12 @@ pub struct AgentConfig {
     /// a tool result over the size cap is written here and replaced in context by
     /// a pointer + preview the model can re-read. Must be a model-readable path.
     pub offload_dir: Option<std::path::PathBuf>,
+    /// Whether Kitsu may create automatic tool/command output artifacts for
+    /// this run. `InlineOnly` never writes an offload file and instead keeps a
+    /// deterministic UTF-8-safe head/tail preview with explicit byte counts.
+    /// This is storage policy only: it does not change tool authority or
+    /// explicit model/host output destinations.
+    pub artifact_policy: ArtifactStoragePolicy,
     pub stream: bool,
     pub temperature: Option<f32>,
     /// Optional reasoning-effort hint forwarded to compatible gateways.
@@ -131,6 +143,21 @@ pub struct AgentConfig {
     /// (often small, e.g. 4096) default — which silently truncates long outputs
     /// like code reviews. Set this to lift the cap.
     pub max_tokens: Option<u32>,
+    /// Provider-native strict response shape for main automation turns. Child
+    /// agents and internal compaction requests deliberately leave this unset.
+    pub response_format: Option<JsonSchemaFormat>,
+    /// Keep provider-native response formatting off tool-capable action rounds
+    /// and reserve it for one tool-free finalization round. The CLI enables
+    /// this only when a required filesystem effect accompanies structured
+    /// output, so small models are not asked to act and format the terminal
+    /// answer in the same request.
+    pub defer_response_format_until_final: bool,
+    /// Host-owned readiness check consulted before a deferred structured
+    /// finalization. When it reports a repair, the loop keeps tools available
+    /// for one bounded action round and reserves a later tool-free finalizer.
+    /// The callback grants no authority and is never installed for child
+    /// agents or ordinary unstructured turns.
+    pub structured_finalization_gate: Option<StructuredFinalizationGate>,
     /// What to do when cheap trimming (offload + elide) isn't enough to fit the
     /// window (Stage 3). `Trim` drops the oldest whole exchanges; `Summarize`
     /// replaces them with an LLM-written summary (opt-in — quality is model-
@@ -160,6 +187,155 @@ pub struct AgentConfig {
     pub spawn_budget: Option<std::sync::Arc<SpawnBudget>>,
 }
 
+/// Run-level policy for Kitsu-created automatic output artifacts.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum ArtifactStoragePolicy {
+    /// Preserve normal private offload/full-command-output behavior when the
+    /// frontend installs a destination.
+    #[default]
+    Automatic,
+    /// Create no automatic artifact files; oversized results become bounded,
+    /// explicitly lossy inline previews.
+    InlineOnly,
+}
+
+/// What happened to the recoverable full output associated with one tool
+/// result. This is deliberately separate from tool success/failure.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ToolArtifactStatus {
+    /// The complete result already fit inline, so no artifact was useful.
+    NotNeeded,
+    /// A complete host-owned artifact was retained.
+    Retained,
+    /// Artifact creation was deliberately disabled by run policy.
+    SuppressedByPolicy,
+    /// Automatic storage was allowed but no recoverable artifact was created.
+    Unavailable,
+    /// The configured artifact sink reported a failure.
+    Failed,
+}
+
+/// A deterministic, UTF-8-safe inline representation of output that cannot be
+/// persisted as an automatic artifact. Raw byte counts deliberately exclude
+/// the host-authored omission marker.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BoundedInlineOutput {
+    pub content: String,
+    pub original_bytes: u64,
+    pub retained_bytes: u64,
+    pub omitted_bytes: u64,
+    pub truncated: bool,
+}
+
+/// Keep a bounded head and tail when automatic artifact persistence is
+/// disabled. This is public so frontends can apply the identical policy to
+/// background/subagent results before they enter a registry or provider
+/// context.
+pub fn bound_inline_output(content: String) -> BoundedInlineOutput {
+    let original_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
+    if content.len() <= OFFLOAD_CHAR_CAP {
+        return BoundedInlineOutput {
+            retained_bytes: original_bytes,
+            original_bytes,
+            omitted_bytes: 0,
+            truncated: false,
+            content,
+        };
+    }
+
+    // Reserve enough room for the deterministic marker itself so the returned
+    // representation also fits the cap. That makes this operation idempotent:
+    // a background result bounded before registry storage is not re-truncated
+    // when it later crosses another tool boundary.
+    const MARKER_RESERVE: usize = 256;
+    let raw_budget = OFFLOAD_CHAR_CAP.saturating_sub(MARKER_RESERVE);
+    let head_budget = raw_budget / 2;
+    let mut head_end = head_budget;
+    while head_end > 0 && !content.is_char_boundary(head_end) {
+        head_end -= 1;
+    }
+
+    let tail_budget = raw_budget.saturating_sub(head_end);
+    let mut tail_start = content.len().saturating_sub(tail_budget);
+    while tail_start < content.len() && !content.is_char_boundary(tail_start) {
+        tail_start += 1;
+    }
+    if tail_start < head_end {
+        tail_start = head_end;
+    }
+
+    let retained = head_end.saturating_add(content.len().saturating_sub(tail_start));
+    let retained_bytes = u64::try_from(retained).unwrap_or(u64::MAX);
+    let omitted_bytes = original_bytes.saturating_sub(retained_bytes);
+    let marker = format!(
+        "\n[... {omitted_bytes} bytes omitted by artifact-free policy; original \
+         {original_bytes} bytes, retained {retained_bytes} bytes ...]\n"
+    );
+    let mut bounded = String::with_capacity(retained.saturating_add(marker.len()));
+    bounded.push_str(&content[..head_end]);
+    bounded.push_str(&marker);
+    bounded.push_str(&content[tail_start..]);
+    debug_assert!(bounded.len() <= OFFLOAD_CHAR_CAP);
+
+    BoundedInlineOutput {
+        content: bounded,
+        original_bytes,
+        retained_bytes,
+        omitted_bytes,
+        truncated: true,
+    }
+}
+
+/// A content-bounded target disclosed when structured finalization is deferred
+/// so the model can repair a host-verified exact-output mismatch.
+#[derive(Debug, Clone, Serialize, PartialEq, Eq)]
+pub struct StructuredFinalizationRepairTarget {
+    pub path: String,
+    pub expected_sha256: String,
+    pub actual_sha256: String,
+}
+
+/// Host-owned repair instruction returned by a structured-finalization gate.
+/// `instruction` is request-local model context; the typed runtime event emits
+/// only the stable cause and bounded target facts.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StructuredFinalizationRepair {
+    pub cause: String,
+    pub instruction: String,
+    pub targets: Vec<StructuredFinalizationRepairTarget>,
+}
+
+/// Cloneable synchronous readiness callback for deferred finalization.
+#[derive(Clone)]
+pub struct StructuredFinalizationGate {
+    evaluate: Arc<dyn Fn() -> Option<StructuredFinalizationRepair> + Send + Sync>,
+}
+
+impl StructuredFinalizationGate {
+    pub fn new<F>(evaluate: F) -> Self
+    where
+        F: Fn() -> Option<StructuredFinalizationRepair> + Send + Sync + 'static,
+    {
+        Self {
+            evaluate: Arc::new(evaluate),
+        }
+    }
+
+    fn evaluate(&self) -> Option<StructuredFinalizationRepair> {
+        (self.evaluate)()
+    }
+}
+
+impl std::fmt::Debug for StructuredFinalizationGate {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter
+            .debug_struct("StructuredFinalizationGate")
+            .finish_non_exhaustive()
+    }
+}
+
 #[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderRequestPurpose {
@@ -175,6 +351,21 @@ pub enum AgentRuntimeEvent {
         purpose: ProviderRequestPurpose,
         message_count: usize,
         tools_offered: usize,
+        /// True when this logical request carries a provider-native strict
+        /// JSON Schema response format. This is metadata only; the schema
+        /// body remains out of the event stream.
+        structured_output: bool,
+    },
+    /// A host-verified exact-output mismatch kept the next bounded round in
+    /// tool-action mode instead of spending the reserved structured finalizer.
+    StructuredFinalizationDeferred {
+        round: u32,
+        repair_round: u32,
+        finalization_round_reserved: bool,
+        cause: String,
+        targets: Vec<StructuredFinalizationRepairTarget>,
+        repair_instruction_disclosed: bool,
+        write_authority_granted: bool,
     },
     /// One physical network send inside the preceding logical
     /// [`ProviderRequest`](Self::ProviderRequest). Retries produce additional
@@ -225,6 +416,18 @@ pub enum AgentRuntimeEvent {
         /// Generic tools retain a bounded raw output preview. Commands use
         /// `command` instead of embedding minified JSON here.
         output: String,
+        /// Exact raw bytes returned by the tool before inline reduction. For a
+        /// native command this is stdout + stderr, whose per-stream counters
+        /// remain authoritative in `command`.
+        output_bytes: u64,
+        /// Raw output bytes retained in the bounded inline representation.
+        /// Host-authored markers/pointers are not included in this count.
+        output_retained_bytes: u64,
+        /// True when raw output bytes were omitted from the inline result.
+        output_truncated: bool,
+        /// Whether full output was unnecessary, retained, deliberately
+        /// suppressed, unavailable, or failed independently of tool success.
+        artifact_status: ToolArtifactStatus,
         #[serde(skip_serializing_if = "Option::is_none")]
         command: Option<Box<CommandRuntimeResult>>,
     },
@@ -264,6 +467,7 @@ pub struct CommandRuntimeResult {
     pub stderr_tail: String,
     pub executable: CommandExecutableIdentity,
     pub ambient_authority: CommandAmbientAuthority,
+    pub artifact_status: ToolArtifactStatus,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub artifact: Option<CommandOutputArtifact>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -400,7 +604,48 @@ struct PendingToolEvent {
     name: String,
     command: Option<CommandRuntimeInvocation>,
     command_progress: Option<std::sync::Arc<std::sync::Mutex<Option<CommandOutput>>>>,
+    artifact_policy: ArtifactStoragePolicy,
     started: std::time::Instant,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ToolOutputRetention {
+    output_bytes: u64,
+    output_retained_bytes: u64,
+    output_truncated: bool,
+    artifact_status: ToolArtifactStatus,
+}
+
+struct PreparedToolOutput {
+    content: String,
+    retention: ToolOutputRetention,
+    artifact_path: Option<std::path::PathBuf>,
+}
+
+impl ToolOutputRetention {
+    fn complete(value: &str) -> Self {
+        let bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
+        Self {
+            output_bytes: bytes,
+            output_retained_bytes: bytes,
+            output_truncated: false,
+            artifact_status: ToolArtifactStatus::NotNeeded,
+        }
+    }
+
+    fn from_command(command: &CommandRuntimeResult) -> Self {
+        Self {
+            output_bytes: command.stdout_bytes.saturating_add(command.stderr_bytes),
+            output_retained_bytes: u64::try_from(
+                command
+                    .stdout_retained_bytes
+                    .saturating_add(command.stderr_retained_bytes),
+            )
+            .unwrap_or(u64::MAX),
+            output_truncated: command.stdout_truncated || command.stderr_truncated,
+            artifact_status: command.artifact_status,
+        }
+    }
 }
 
 impl ToolEventGuard {
@@ -410,6 +655,7 @@ impl ToolEventGuard {
         call_id: &str,
         name: &str,
         args: &str,
+        artifact_policy: ArtifactStoragePolicy,
     ) -> Self {
         let pending = log.map(|log| {
             let command = command_runtime_invocation(name, args);
@@ -434,6 +680,7 @@ impl ToolEventGuard {
                 name: name.to_string(),
                 command,
                 command_progress,
+                artifact_policy,
                 started: std::time::Instant::now(),
             }
         });
@@ -447,13 +694,17 @@ impl ToolEventGuard {
         }))
     }
 
-    fn finish(mut self, success: bool, output: &str) {
+    fn finish(mut self, success: bool, output: &str, retention: ToolOutputRetention) {
         if let Some(pending) = self.pending.take() {
             let command = pending
                 .command
                 .as_ref()
-                .and_then(|_| command_runtime_result(output))
+                .and_then(|_| command_runtime_result(output, pending.artifact_policy))
                 .map(Box::new);
+            let retention = command
+                .as_deref()
+                .map(ToolOutputRetention::from_command)
+                .unwrap_or(retention);
             pending.log.record(AgentRuntimeEvent::ToolFinished {
                 round: pending.round,
                 call_id: pending.call_id,
@@ -465,6 +716,10 @@ impl ToolEventGuard {
                 } else {
                     event_preview(output)
                 },
+                output_bytes: retention.output_bytes,
+                output_retained_bytes: retention.output_retained_bytes,
+                output_truncated: retention.output_truncated,
+                artifact_status: retention.artifact_status,
                 command,
             });
         }
@@ -478,31 +733,20 @@ impl Drop for ToolEventGuard {
                 .command_progress
                 .as_ref()
                 .and_then(|progress| progress.lock().expect("command progress").clone())
-                .map(command_runtime_result_from_output)
+                .map(|output| command_runtime_result_from_output(output, pending.artifact_policy))
                 .map(Box::new);
-            pending.log.record(AgentRuntimeEvent::ToolFinished {
-                round: pending.round,
-                call_id: pending.call_id,
-                name: pending.name,
-                success: false,
-                cancelled: true,
-                output: "[cancelled: tool execution interrupted]".to_string(),
-                command: observed_command.or_else(|| {
-                    pending
-                        .command
-                        .as_ref()
-                        .map(|invocation| {
-                            let executable_name =
-                                invocation.argv.first().cloned().unwrap_or_default();
-                            let executable_path = std::path::Path::new(&executable_name);
-                            let executable_resolution = if executable_path.is_absolute()
-                                || executable_path.components().count() > 1
-                            {
-                                CommandExecutableResolution::InvocationPath
-                            } else {
-                                CommandExecutableResolution::AmbientPath
-                            };
-                            CommandRuntimeResult {
+            let command = observed_command.or_else(|| {
+                pending.command.as_ref().map(|invocation| {
+                    let executable_name = invocation.argv.first().cloned().unwrap_or_default();
+                    let executable_path = std::path::Path::new(&executable_name);
+                    let executable_resolution = if executable_path.is_absolute()
+                        || executable_path.components().count() > 1
+                    {
+                        CommandExecutableResolution::InvocationPath
+                    } else {
+                        CommandExecutableResolution::AmbientPath
+                    };
+                    Box::new(CommandRuntimeResult {
                         termination: CommandTermination::Cancelled,
                         success: false,
                         exit_code: None,
@@ -529,17 +773,43 @@ impl Drop for ToolEventGuard {
                             pinned: false,
                         },
                         ambient_authority: CommandAmbientAuthority::CURRENT,
+                        artifact_status: if pending.artifact_policy
+                            == ArtifactStoragePolicy::InlineOnly
+                        {
+                            ToolArtifactStatus::SuppressedByPolicy
+                        } else {
+                            ToolArtifactStatus::Unavailable
+                        },
                         artifact: None,
-                        artifact_error: Some(
-                            "command cancelled before full-output artifact state was observed; \
-                             cleanup requirement is unverified and no cleanup is claimed"
-                                .to_string(),
-                        ),
+                        artifact_error: (pending.artifact_policy
+                            != ArtifactStoragePolicy::InlineOnly)
+                            .then(|| {
+                                "command cancelled before full-output artifact state was observed; \
+                                 cleanup requirement is unverified and no cleanup is claimed"
+                                    .to_string()
+                            }),
                         containment_hint: None,
-                    }
-                        })
-                        .map(Box::new)
-                }),
+                    })
+                })
+            });
+            let retention = command
+                .as_deref()
+                .map(ToolOutputRetention::from_command)
+                .unwrap_or_else(|| {
+                    ToolOutputRetention::complete("[cancelled: tool execution interrupted]")
+                });
+            pending.log.record(AgentRuntimeEvent::ToolFinished {
+                round: pending.round,
+                call_id: pending.call_id,
+                name: pending.name,
+                success: false,
+                cancelled: true,
+                output: "[cancelled: tool execution interrupted]".to_string(),
+                output_bytes: retention.output_bytes,
+                output_retained_bytes: retention.output_retained_bytes,
+                output_truncated: retention.output_truncated,
+                artifact_status: retention.artifact_status,
+                command,
             });
         }
     }
@@ -701,10 +971,14 @@ impl Default for AgentConfig {
             max_context_bytes: 128 * 1024,
             context_window: None,
             offload_dir: None,
+            artifact_policy: ArtifactStoragePolicy::Automatic,
             stream: true,
             temperature: None,
             reasoning_effort: None,
             max_tokens: None,
+            response_format: None,
+            defer_response_format_until_final: false,
+            structured_finalization_gate: None,
             compaction: CompactionMode::Trim,
             quiet: false,
             event_log: None,
@@ -719,6 +993,11 @@ impl Default for AgentConfig {
 pub enum AgentError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
+
+    #[error(
+        "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
+    )]
+    ToolCallDuringToolFreeFinalization,
 
     #[error("agent loop error: {0}")]
     Loop(String),
@@ -1018,6 +1297,13 @@ async fn run_agent_turn_inner<P>(
 where
     P: Provider,
 {
+    if cfg.defer_response_format_until_final && cfg.response_format.is_some() && cfg.max_rounds < 2
+    {
+        return Err(AgentError::Loop(
+            "deferred structured output needs at least two rounds (tool action plus finalization)"
+                .to_string(),
+        ));
+    }
     let AgentSessionState {
         meter,
         compact_failures,
@@ -1048,6 +1334,17 @@ where
     let mut consecutive_successes: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
     let mut force_final_next = false;
+    let mut force_structured_final_next = false;
+    // A deferred action response and the host-authored finalization nudge are
+    // request-local scaffolding, not a second user turn. Retain the provisional
+    // assistant long enough to build the final provider request, then remove
+    // both messages before appending the committed final assistant.
+    let mut structured_handoff_assistant: Option<ChatMessage> = None;
+    // An exact-output repair instruction is visible to one provider request,
+    // then removed before that request's real assistant/tool transcript is
+    // appended. Like the finalization handoff, it is host scaffolding rather
+    // than a durable user turn.
+    let mut structured_repair_nudge: Option<String> = None;
     const REPEAT_FAIL_LIMIT: u32 = 2;
     // Cycle-23 audit: the spawn cap's polite refusal was ignored 6x by a
     // hosted model. After this many refusals in one turn the spawn tools are
@@ -1056,11 +1353,6 @@ where
     const SPAWN_REFUSAL_LIMIT: u32 = 2;
     let mut spawn_cap_refusals: u32 = 0;
     let mut spawn_tools_withheld = false;
-
-    // The tool set is fixed for the whole turn (every round advertises the same
-    // descriptors), so serialize the schema once here rather than redoing it on
-    // every round inside enforce_context_budget.
-    let schema_json = serde_json::to_string(tools.descriptors()).unwrap_or_default();
 
     loop {
         round += 1;
@@ -1088,7 +1380,9 @@ where
         // 1 has no "earlier" round to nudge from, so only applies when >1.
         // Final round when: the round budget is exhausted, OR a tool call has
         // failed identically REPEAT_FAIL_LIMIT times (ISSUE-007 loop-breaker).
-        let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
+        let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1)
+            || force_final_next
+            || force_structured_final_next;
         let offered_tools = if is_final_round {
             None
         } else if spawn_tools_withheld {
@@ -1102,7 +1396,9 @@ where
             tool_descriptors(tools)
         };
         if is_final_round && tool_descriptors(tools).is_some() {
-            let nudge = if force_final_next {
+            let nudge = if force_structured_final_next {
+                STRUCTURED_FINALIZATION_NUDGE
+            } else if force_final_next {
                 "A tool call kept failing the same way. Stop retrying it — produce your \
                  complete final answer now using what you already have, or explain what \
                  you could not do."
@@ -1116,6 +1412,26 @@ where
         // Captured before `offered_tools` is moved into the request; drives the
         // text-protocol fallback below.
         let tools_were_offered = offered_tools.is_some();
+        let response_format = if cfg.defer_response_format_until_final && tools_were_offered {
+            None
+        } else {
+            cfg.response_format.clone()
+        };
+        if cfg.defer_response_format_until_final && !tools_were_offered && response_format.is_some()
+        {
+            // The preceding action request was metered with tool schemas, while
+            // this reserved final request carries a different response schema.
+            // A ContextMeter anchor only records whether constraints existed,
+            // not their identity or size, so retaining that anchor could make
+            // the final budget reuse the tool-schema cost and omit a larger
+            // response schema. Re-estimate this one constraint transition from
+            // the concrete messages and schema before crossing the provider
+            // boundary; the final usage report will establish a fresh anchor.
+            meter.invalidate();
+        }
+        let schema_json =
+            serialized_request_constraints(offered_tools.as_deref(), response_format.as_ref());
+        let request_constraints_present = tools_were_offered || response_format.is_some();
 
         // Budget only after every request-visible mutation (notably the final
         // round nudge above), and against the schema actually offered THIS
@@ -1126,7 +1442,7 @@ where
             messages,
             cfg,
             &schema_json,
-            tools_were_offered,
+            request_constraints_present,
             meter,
             turn_usage,
             compact_failures,
@@ -1136,6 +1452,33 @@ where
             false,
         )
         .await?;
+
+        // Context enforcement may compact earlier exchanges. Resolve the
+        // exact request-local suffix only after that mutation and before the
+        // request clone. The last-user preservation invariant keeps the host
+        // nudge present; the provisional assistant may already have been
+        // compacted away, in which case only the nudge needs removal.
+        let structured_finalization_ephemera = if force_structured_final_next {
+            let nudge_index = messages
+                .iter()
+                .rposition(|message| {
+                    message.role == Role::User && message.content == STRUCTURED_FINALIZATION_NUDGE
+                })
+                .ok_or_else(|| {
+                    AgentError::Loop(
+                        "structured-finalization context lost its host handoff".to_string(),
+                    )
+                })?;
+            let start = structured_handoff_assistant
+                .as_ref()
+                .filter(|provisional| {
+                    nudge_index > 0 && messages.get(nudge_index - 1) == Some(*provisional)
+                })
+                .map_or(nudge_index, |_| nudge_index - 1);
+            Some(start..nudge_index + 1)
+        } else {
+            None
+        };
 
         // Number of messages this request sends — the anchor point for the meter.
         let sent_len = messages.len();
@@ -1147,6 +1490,26 @@ where
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: cfg.max_tokens,
+            response_format,
+        };
+        let request_history_reshaped = if let Some(nudge) = structured_repair_nudge.take() {
+            let nudge_index = messages
+                .iter()
+                .rposition(|message| message.role == Role::User && message.content == nudge)
+                .ok_or_else(|| {
+                    AgentError::Loop(
+                        "structured-finalization repair context lost its host instruction"
+                            .to_string(),
+                    )
+                })?;
+            messages.remove(nudge_index);
+            // The concrete request includes a message that durable history no
+            // longer does. Do not let its usage report become a reusable prefix
+            // anchor for the cleaned transcript.
+            meter.invalidate();
+            true
+        } else {
+            false
         };
 
         // Keep the final check adjacent to the provider boundary. If a future
@@ -1164,6 +1527,7 @@ where
                 purpose: ProviderRequestPurpose::Inference,
                 message_count: req.messages.len(),
                 tools_offered: req.tools.as_ref().map_or(0, Vec::len),
+                structured_output: req.response_format.is_some(),
             });
         }
         abort_if_event_sink_failed(cfg)?;
@@ -1225,11 +1589,15 @@ where
                 ChatDelta::ToolCall(tc) => tool_calls.push(tc),
                 ChatDelta::Usage(u) => {
                     // Anchor the meter on this response's real prompt token
-                    // count. `tools_were_offered` records whether THIS request
-                    // included the schema, so a later round can tell whether the
-                    // anchor already accounts for it (see
+                    // count. `request_constraints_present` records whether THIS
+                    // request included tool and/or response schemas, so a later
+                    // round can tell whether the anchor already accounts for it (see
                     // ContextMeter::anchor_includes_schema).
-                    meter.record(u.prompt_tokens, sent_len, tools_were_offered);
+                    if request_history_reshaped {
+                        meter.invalidate();
+                    } else {
+                        meter.record(u.prompt_tokens, sent_len, request_constraints_present);
+                    }
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
                     // a usage report far below the sent estimate (and below
@@ -1266,6 +1634,10 @@ where
             }
         }
 
+        if cfg.defer_response_format_until_final && !tools_were_offered && !tool_calls.is_empty() {
+            return Err(AgentError::ToolCallDuringToolFreeFinalization);
+        }
+
         // Text-protocol fallback (ISSUE-001): some models — especially local ones
         // via Ollama — emit a tool call as plain-text JSON in `content` instead of
         // structured `tool_calls`. If tools were advertised this round and none
@@ -1296,12 +1668,26 @@ where
             }
         }
 
+        // A combined tool-action/strict-output request biases some smaller
+        // models toward a schema-valid placeholder instead of acting. In the
+        // deferred mode, a no-tool response from an action round is only a
+        // provisional handoff: retain it in model context, suppress it from
+        // committed output, and spend the next bounded round on a tool-free
+        // provider-native structured final answer.
+        let needs_structured_finalization = cfg.defer_response_format_until_final
+            && cfg.response_format.is_some()
+            && tools_were_offered
+            && tool_calls.is_empty()
+            && malformed_text_calls == 0
+            && skill_confusion.is_none()
+            && finish != FinishReason::Length;
+
         // ISSUE-002 / ISSUE-008: this round's text was buffered (tools were
         // offered). Print it now UNLESS it was a text-protocol tool call we
         // synthesized — that text IS the raw JSON, so suppress it. A model's real
         // reasoning before a STRUCTURED tool call, and terminal answers, print
         // normally (previously over-suppressed, hiding read/grep output).
-        if cfg.stream && tools_were_offered && !synthesized_call {
+        if cfg.stream && tools_were_offered && !synthesized_call && !needs_structured_finalization {
             if !cfg.quiet {
                 kitsu_render::print_message(&assistant_text);
             }
@@ -1320,6 +1706,37 @@ where
             }
         }
 
+        // Before consuming the tool-free structured finalizer, give a
+        // host-verified exact-output mismatch another bounded action round.
+        // Two rounds must remain: one for repair and one reserved finalizer.
+        // When the budget cannot accommodate both, preserve the existing
+        // fail-closed path and let terminal postcondition evaluation reject the
+        // mismatch after the final response.
+        if needs_structured_finalization && round.saturating_add(2) <= cfg.max_rounds {
+            if let Some(repair) = cfg
+                .structured_finalization_gate
+                .as_ref()
+                .and_then(StructuredFinalizationGate::evaluate)
+            {
+                if let Some(log) = &cfg.event_log {
+                    log.record(AgentRuntimeEvent::StructuredFinalizationDeferred {
+                        round,
+                        repair_round: round.saturating_add(1),
+                        finalization_round_reserved: true,
+                        cause: repair.cause,
+                        targets: repair.targets,
+                        repair_instruction_disclosed: true,
+                        write_authority_granted: false,
+                    });
+                }
+                abort_if_event_sink_failed(cfg)?;
+                structured_repair_nudge = Some(repair.instruction.clone());
+                messages.push(ChatMessage::user(repair.instruction));
+                meter.invalidate();
+                continue;
+            }
+        }
+
         // Record the assistant turn. When we synthesized a call from text, store
         // empty content so the raw tool-call JSON doesn't pollute the history.
         let assistant_content = if synthesized_call {
@@ -1327,6 +1744,14 @@ where
         } else {
             assistant_text.clone()
         };
+        if let Some(ephemera) = structured_finalization_ephemera {
+            messages.drain(ephemera);
+            structured_handoff_assistant = None;
+            // The latest usage anchor describes the provider request WITH the
+            // removed scaffolding. It is no longer a prefix of committed
+            // history, so the next turn must remeasure instead of reusing it.
+            meter.invalidate();
+        }
         last_assistant_text = assistant_content.clone();
         messages.push(ChatMessage::assistant(
             assistant_content,
@@ -1367,6 +1792,12 @@ where
                  {\"name\": \"<tool_name>\", \"arguments\": { ... }} with no surrounding prose."
                     .to_string(),
             ));
+            continue;
+        }
+
+        if needs_structured_finalization {
+            structured_handoff_assistant = messages.last().cloned();
+            force_structured_final_next = true;
             continue;
         }
 
@@ -1446,6 +1877,7 @@ where
                 &tc.call_id,
                 &tc.tool_name,
                 &tc.args,
+                cfg.artifact_policy,
             );
             abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
@@ -1544,25 +1976,23 @@ where
                     tallies.reads.fetch_add(1, Ordering::AcqRel);
                 }
             }
-            tool_event.finish(!is_err, &content);
-            abort_if_event_sink_failed(cfg)?;
-            // Offload a large successful result to disk (only under real
-            // context pressure), leaving a re-readable pointer, so one big
-            // result can't dominate a small window (Stage 2).
-            let (content, offloaded_to) = if is_err {
-                (content, None)
-            } else {
-                maybe_offload_for_tools(
-                    content,
-                    &tc.call_id,
-                    cfg.offload_dir.as_deref(),
-                    tools,
-                    messages,
-                    cfg,
-                )
-            };
+            // Commands already carry independently bounded stdout/stderr
+            // previews plus exact counters. Generic results are either
+            // pressure-offloaded under the default policy or irreversibly
+            // reduced to a deterministic head/tail preview in artifact-free
+            // mode.
+            let prepared = prepare_tool_output(
+                content,
+                &tc.call_id,
+                &tc.tool_name,
+                is_err,
+                cfg.offload_dir.as_deref(),
+                tools,
+                messages,
+                cfg,
+            );
             if let Some(mut summary) = summary {
-                if let Some(path) = &offloaded_to {
+                if let Some(path) = &prepared.artifact_path {
                     summary.push_str(&format!(
                         " → context got a {OFFLOAD_PREVIEW_CHARS}-char preview; full text at {} (model can fs_read_file it)",
                         path.display()
@@ -1574,7 +2004,9 @@ where
                     kitsu_render::tool_result(&summary);
                 }
             }
-            messages.push(ChatMessage::tool(tc.call_id.clone(), content));
+            tool_event.finish(!is_err, &prepared.content, prepared.retention);
+            abort_if_event_sink_failed(cfg)?;
+            messages.push(ChatMessage::tool(tc.call_id.clone(), prepared.content));
         }
         // continue to next round
     }
@@ -1786,12 +2218,29 @@ fn command_runtime_invocation(name: &str, args: &str) -> Option<CommandRuntimeIn
     })
 }
 
-fn command_runtime_result(output: &str) -> Option<CommandRuntimeResult> {
+fn command_runtime_result(
+    output: &str,
+    artifact_policy: ArtifactStoragePolicy,
+) -> Option<CommandRuntimeResult> {
     let output = serde_json::from_str::<CommandOutput>(output).ok()?;
-    Some(command_runtime_result_from_output(output))
+    Some(command_runtime_result_from_output(output, artifact_policy))
 }
 
-fn command_runtime_result_from_output(output: CommandOutput) -> CommandRuntimeResult {
+fn command_runtime_result_from_output(
+    output: CommandOutput,
+    artifact_policy: ArtifactStoragePolicy,
+) -> CommandRuntimeResult {
+    let artifact_status = if artifact_policy == ArtifactStoragePolicy::InlineOnly {
+        ToolArtifactStatus::SuppressedByPolicy
+    } else if output.artifact.is_some() {
+        ToolArtifactStatus::Retained
+    } else if output.artifact_error.is_some() {
+        ToolArtifactStatus::Failed
+    } else if output.stdout_truncated || output.stderr_truncated {
+        ToolArtifactStatus::Unavailable
+    } else {
+        ToolArtifactStatus::NotNeeded
+    };
     CommandRuntimeResult {
         termination: output.termination,
         success: output.success,
@@ -1810,6 +2259,7 @@ fn command_runtime_result_from_output(output: CommandOutput) -> CommandRuntimeRe
         stderr_tail: terminal_safe_tail(&output.stderr, 1024),
         executable: output.executable,
         ambient_authority: output.ambient_authority,
+        artifact_status,
         artifact: output.artifact,
         artifact_error: output.artifact_error,
         containment_hint: output.containment_hint,
@@ -2298,12 +2748,10 @@ fn ensure_chat_request_fits(
     cfg: &AgentConfig,
     meter: &ContextMeter,
 ) -> Result<RequestMeasurement, AgentError> {
-    let has_schema = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
-    let schema_json = req
-        .tools
-        .as_ref()
-        .map(|tools| serde_json::to_string(tools).unwrap_or_default())
-        .unwrap_or_default();
+    let has_schema =
+        req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) || req.response_format.is_some();
+    let schema_json =
+        serialized_request_constraints(req.tools.as_deref(), req.response_format.as_ref());
     check_measurement(request_measurement(
         &req.messages,
         cfg,
@@ -2312,6 +2760,36 @@ fn ensure_chat_request_fits(
         req.max_tokens,
         meter,
     ))
+}
+
+fn serialized_request_constraints(
+    tools: Option<&[ToolDescriptor]>,
+    response_format: Option<&JsonSchemaFormat>,
+) -> String {
+    let mut serialized = String::new();
+    if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
+        serialized.push_str(&serde_json::to_string(tools).unwrap_or_default());
+    }
+    if let Some(response_format) = response_format {
+        if !serialized.is_empty() {
+            serialized.push('\n');
+        }
+        // Budget the exact OpenAI-compatible wrapper, not merely the internal
+        // value: the provider adds both `type` and `json_schema` at the wire
+        // boundary and those bytes count against the same context window.
+        serialized.push_str(
+            &serde_json::to_string(&serde_json::json!({
+                "type": "json_schema",
+                "json_schema": {
+                    "name": &response_format.name,
+                    "strict": response_format.strict,
+                    "schema": &response_format.schema,
+                }
+            }))
+            .unwrap_or_default(),
+        );
+    }
+    serialized
 }
 
 /// Compact eligible old exchanges immediately, even when the conversation is
@@ -2332,8 +2810,11 @@ where
     if cfg.context_window.is_none() {
         return Err(AgentError::ContextWindowUnknown);
     }
-    let has_schema = !tools.descriptors().is_empty();
-    let schema_json = serde_json::to_string(tools.descriptors()).unwrap_or_default();
+    let has_schema = !tools.descriptors().is_empty() || cfg.response_format.is_some();
+    let schema_json = serialized_request_constraints(
+        (!tools.descriptors().is_empty()).then_some(tools.descriptors()),
+        cfg.response_format.as_ref(),
+    );
     let mut usage = kitsu_providers::Usage::default();
     enforce_context_budget_recording(
         provider,
@@ -2770,6 +3251,7 @@ fn bounded_summary_request(
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: Some(max_tokens),
+            response_format: None,
         },
         shortened,
     ))
@@ -2862,6 +3344,7 @@ where
                             purpose: ProviderRequestPurpose::Compaction,
                             message_count: req.messages.len(),
                             tools_offered: 0,
+                            structured_output: false,
                         });
                     }
                     abort_if_event_sink_failed(cfg)?;
@@ -3136,10 +3619,64 @@ fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) 
     used.saturating_add(added).saturating_mul(2) > effective
 }
 
+fn prepare_tool_output(
+    content: String,
+    call_id: &str,
+    tool_name: &str,
+    is_err: bool,
+    dir: Option<&std::path::Path>,
+    tools: &Registry,
+    messages: &[ChatMessage],
+    cfg: &AgentConfig,
+) -> PreparedToolOutput {
+    // Native command results are already bounded per stream and must remain
+    // valid JSON so the event layer can parse their authoritative counters.
+    if tool_name == "command_exec" {
+        let retention = ToolOutputRetention::complete(&content);
+        return PreparedToolOutput {
+            content,
+            retention,
+            artifact_path: None,
+        };
+    }
+
+    if cfg.artifact_policy == ArtifactStoragePolicy::InlineOnly {
+        let bounded = bound_inline_output(content);
+        let retention = ToolOutputRetention {
+            output_bytes: bounded.original_bytes,
+            output_retained_bytes: bounded.retained_bytes,
+            output_truncated: bounded.truncated,
+            artifact_status: if bounded.truncated {
+                ToolArtifactStatus::SuppressedByPolicy
+            } else {
+                ToolArtifactStatus::NotNeeded
+            },
+        };
+        return PreparedToolOutput {
+            content: bounded.content,
+            retention,
+            artifact_path: None,
+        };
+    }
+
+    // Preserve the existing default: errors remain inline, while successful
+    // oversized results may be offloaded if the model can recover the pointer.
+    if is_err {
+        let retention = ToolOutputRetention::complete(&content);
+        return PreparedToolOutput {
+            content,
+            retention,
+            artifact_path: None,
+        };
+    }
+    maybe_offload_for_tools_detailed(content, call_id, dir, tools, messages, cfg)
+}
+
 /// Offload only when the active model can actually recover the resulting
 /// pointer. A registered-but-unadvertised handler is insufficient: the model
 /// must receive an `fs_read_file` descriptor in this turn's tool catalog.
 /// Also requires genuine context pressure (see [`offload_pressure`]).
+#[cfg(test)]
 fn maybe_offload_for_tools(
     content: String,
     call_id: &str,
@@ -3148,15 +3685,32 @@ fn maybe_offload_for_tools(
     messages: &[ChatMessage],
     cfg: &AgentConfig,
 ) -> (String, Option<std::path::PathBuf>) {
+    let prepared = maybe_offload_for_tools_detailed(content, call_id, dir, tools, messages, cfg);
+    (prepared.content, prepared.artifact_path)
+}
+
+fn maybe_offload_for_tools_detailed(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+    tools: &Registry,
+    messages: &[ChatMessage],
+    cfg: &AgentConfig,
+) -> PreparedToolOutput {
     let can_read = tools.is_registered("fs_read_file")
         && tools
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_read_file");
     if !can_read || !offload_pressure(messages, &content, cfg) {
-        return (content, None);
+        let retention = ToolOutputRetention::complete(&content);
+        return PreparedToolOutput {
+            content,
+            retention,
+            artifact_path: None,
+        };
     }
-    maybe_offload(content, call_id, dir)
+    maybe_offload_detailed(content, call_id, dir)
 }
 
 /// If `content` exceeds the cap and an offload `dir` is set, allocate a unique
@@ -3164,17 +3718,38 @@ fn maybe_offload_for_tools(
 /// preview the model can re-read via `fs_read_file`. Returns the content
 /// unchanged when there is no dir, it's under the cap, or the write fails (the
 /// trimming cascade still bounds it). The offload dir must be model-readable.
+#[cfg(test)]
 fn maybe_offload(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
 ) -> (String, Option<std::path::PathBuf>) {
+    let prepared = maybe_offload_detailed(content, call_id, dir);
+    (prepared.content, prepared.artifact_path)
+}
+
+fn maybe_offload_detailed(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+) -> PreparedToolOutput {
     let Some(dir) = dir else {
-        return (content, None);
+        let retention = ToolOutputRetention::complete(&content);
+        return PreparedToolOutput {
+            content,
+            retention,
+            artifact_path: None,
+        };
     };
     if content.len() <= OFFLOAD_CHAR_CAP {
-        return (content, None);
+        let retention = ToolOutputRetention::complete(&content);
+        return PreparedToolOutput {
+            content,
+            retention,
+            artifact_path: None,
+        };
     }
+    let original_bytes = u64::try_from(content.len()).unwrap_or(u64::MAX);
     let safe_id: String = call_id
         .chars()
         .filter(|c| c.is_ascii_alphanumeric() || *c == '-' || *c == '_')
@@ -3187,16 +3762,34 @@ fn maybe_offload(
     let path = match kitsu_tools::builtins::fs::write_unique_private_text_file(dir, &name, &content)
     {
         Ok(path) => path,
-        Err(_) => return (content, None),
+        Err(_) => {
+            let mut retention = ToolOutputRetention::complete(&content);
+            retention.artifact_status = ToolArtifactStatus::Failed;
+            return PreparedToolOutput {
+                content,
+                retention,
+                artifact_path: None,
+            };
+        }
     };
     let preview: String = content.chars().take(OFFLOAD_PREVIEW_CHARS).collect();
-    let pointer = format!(
+    let preview_bytes = u64::try_from(preview.len()).unwrap_or(u64::MAX);
+    let rendered = format!(
         "{OFFLOAD_POINTER_PREFIX}{:.1} KB — full result saved to {}. Re-read it (or a line range) \
          with fs_read_file on that path.]\n\nPreview:\n{preview}…",
         content.len() as f64 / 1024.0,
         path.display(),
     );
-    (pointer, Some(path))
+    PreparedToolOutput {
+        content: rendered,
+        retention: ToolOutputRetention {
+            output_bytes: original_bytes,
+            output_retained_bytes: preview_bytes,
+            output_truncated: true,
+            artifact_status: ToolArtifactStatus::Retained,
+        },
+        artifact_path: Some(path),
+    }
 }
 
 /// How many recent user-delimited exchanges to always keep intact.

@@ -40,8 +40,18 @@ guarantees requires a new schema identifier.
   whether continuity was resumed, whether successful work is durable,
   `session_snapshot_state` (`disabled`, `pending_until_first_success`, or
   `resumable`), and whether current system context replaced saved context.
+- New ask/chat/review producers include `run_started.artifact_policy`. Its
+  `mode` is `automatic` or `disabled`; `source` is `default`, `config`, or
+  `cli`; and the remaining booleans state whether new automatic command/tool
+  files and a model-readable artifact root are active. In disabled mode,
+  `existing_artifacts_unchanged` is true. This receipt describes automatic
+  storage only, not sessions, credentials, `-o`, schemas, required writes, or
+  explicit model filesystem operations. Historical v1 records may omit it.
 - A turn begins with `turn_started` and ends with exactly one `turn_finished`.
 - `provider_request` represents one logical model request in an agent round.
+  New producers include `structured_output`; it is true only when that request
+  carried a provider-native strict JSON Schema response format. The schema body
+  is never duplicated in this event.
 - Provider requests, attempts, and usage carry `purpose: "inference"` for the
   answer-producing loop or `purpose: "compaction"` for a hidden summarizer
   call. A scripted manual `/compact` associates those records with its `line`
@@ -87,7 +97,11 @@ guarantees requires a new schema identifier.
   `resolved_window` (plus `turn_id` when turn-scoped). Kitsu never rewrites the
   resolved window from this evidence; `/context` reports it as provenance.
 - `tool_started` is followed by exactly one matching `tool_finished`, including
-  cancellation.
+  cancellation. New completions include exact `output_bytes`, raw
+  `output_retained_bytes`, `output_truncated`, and `artifact_status`
+  (`not_needed`, `retained`, `suppressed_by_policy`, `unavailable`, or
+  `failed`). Marker/pointer bytes are excluded from the raw retained count.
+  Artifact status is independent of tool success.
 - When the model calls the `workspace_diff` tool (registered in chat when the
   launch directory is a Git worktree; disabled by `--no-workspace-evidence` or
   the `workspace_evidence = false` config key), the call is framed as a normal
@@ -97,6 +111,84 @@ guarantees requires a new schema identifier.
   `source: "workspace_diff"`. It marks the moment bounded host-verified diff
   bytes entered the model prompt; `model_read_root_granted` is always `false`
   (see docs/workspace-diff-tool.md).
+- A top-level `kitsu review --jsonl` emits exactly one `review_disclosure`
+  after `run_started` and before the review's `turn_started`. It carries the
+  same bounded evidence metadata as scripted `/review`, plus
+  `source: "top_level_review"`; it never repeats the diff body and
+  `model_read_root_granted` is always `false`.
+- With `--output-schema`, one `output_schema` receipt appears after
+  `run_started` and before the first `turn_started`. It records the fixed
+  provider format/name, exact source byte count and SHA-256, successful bounded
+  schema preflight, mandatory local final-answer validation, and the facts that
+  neither schema content nor source path is included in the receipt and the
+  model has no filesystem authority over the source. A committed disposition
+  under this receipt proves the exact assistant text passed local validation.
+  Malformed JSON or a schema mismatch instead produces
+  `error.kind: "output_schema"`, a discarded disposition, exit `2`, and no
+  `output_last_message` installation. New producers also put the receipt's
+  `schema_sha256`, the JSON-Pointer-like `instance_path` (`$` is the root), and
+  the failing `validation_keyword` directly on that error event; v1 consumers
+  must tolerate their absence in historical streams.
+- With scripted or piped `chat --require-write PATH`, a
+  target that already exists must have both explicit read and write authority;
+  a write-only existing target is rejected before `run_started` or provider
+  contact, while a not-yet-created target may use write-only authority. A
+  `completion_postcondition` receipt with `phase: "armed"` appears after
+  `run_started` and before the first turn. It names the resolved target(s), the
+  journal-plus-final-state verification policy, and explicitly records that
+  the assertion granted no write authority. After turns and joined background
+  work finish, a second receipt with `phase: "evaluated"` reports per-path
+  verified-write, net-change, current-postimage, byte-count, and SHA-256 facts.
+  `status: "satisfied"` precedes any `output_last_message`; `status: "failed"`
+  is followed by `error.kind: "postcondition"`, exit `1`, no `-o` replacement,
+  and `final_summary.postcondition_failures: 1`. That additive counter is a
+  subset of `user_failures`; historical v1 summaries may omit it.
+  `--require-write-sha256 PATH=64HEX` implies this same mutation contract and
+  adds an exact raw-byte digest assertion without granting authority. New
+  producers expose normalized lowercase `{path, sha256}` rows in the optional
+  `expectations` array and optional per-result `expected_sha256` /
+  `expected_sha256_matches` fields; generic `--require-write` rows use `null`
+  match fields. The evaluated digest and latest-write match come from one
+  descriptor-pinned postimage. A digest mismatch still uses
+  `error.kind: "postcondition"`, exit `1`, and the same counter, preserves the
+  retained file effect, and emits no `output_last_message`. It is a run-level
+  finalization failure: an earlier committed durable transcript may remain
+  resumable even though `final_summary.status` is `error`.
+  When `--output-schema` is also active, action-round `provider_request` events
+  have tools and `structured_output: false`; the reserved finalization request
+  has no tools and `structured_output: true`. If an exact expectation is the
+  only failed invariant on an active descriptor-verified write and the budget
+  still fits one repair plus finalization, Kitsu emits
+  `structured_finalization_deferred` after that action response and before the
+  next `provider_request`. It carries `round`, `repair_round`, fixed
+  `cause: "required_write_sha256_mismatch"`, expected/actual digest targets,
+  `finalization_round_reserved: true`, and explicit disclosure/no-authority
+  booleans. The repair request keeps tools and omits the schema. With no such
+  capacity Kitsu proceeds to the reserved finalizer and the terminal
+  postcondition remains fail-closed.
+  A preceding provisional action response is neither emitted as `assistant` nor
+  committed. The provisional assistant, any host-authored repair instruction,
+  and Kitsu's finalization nudge exist only in their provider requests: none is
+  saved, restored, or counted as a durable user turn. The real action
+  tool-call/tool-result transcript and the committed final assistant remain in
+  history. Both phases share one existing deadline and max-round budget, and
+  `--max-rounds 1` is rejected before `run_started` because it cannot contain
+  action plus finalization.
+  If a model nevertheless returns a native tool call during the tool-free
+  finalization request, Kitsu executes none of those calls, discards the turn,
+  and exits `2`. The provider-class `error` includes the optional host-owned
+  `cause: "tool_call_during_tool_free_finalization"` and an explicit
+  no-execution message; this cause never contains provider-controlled text.
+- With `-o/--output-last-message`, a successful host-owned atomic installation
+  emits one `output_last_message` after the selected committed turn finishes
+  and before `final_summary`. It carries `turn_id`, the requested `destination`,
+  exact UTF-8 `bytes`, the lowercase `sha256` of those exact bytes, and constant `atomic: true`,
+  `assistant_committed: true`, and `content_included: false`; the assistant body
+  remains in the ordinary `assistant` event and is never duplicated.
+  `model_write_authority: false` makes explicit that this is a host-owned sink,
+  not a model filesystem grant. A script
+  selects its last fully committed turn. Discarded and `committed_partial`
+  payloads do not produce this receipt or replace the destination.
 - A detached job whose terminal result was not already consumed is emitted as a
   `background_result` before `final_summary`; successful detached work is never
   silently lost when a script exits. An unacknowledged failed job also makes
@@ -136,6 +228,8 @@ guarantees requires a new schema identifier.
   emits a `review_disclosure` result inside its own command frame, before the
   turn that carries the bytes, with `model_disclosed: true`,
   `model_read_root_granted: false`, and `evidence_bytes`.
+  Top-level `kitsu review` has no command frame, so its equivalent receipt is
+  the process-scoped `review_disclosure` event described above.
   The `jobs`/`steer` receipt additionally carries `restarts_thread` (always
   `true`) and `discarded_ms`: steering does not append to the running attempt,
   it drops it and restarts the worker on a fresh transcript, discarding that
@@ -168,13 +262,39 @@ and at least one turn or command succeeded, `error` for an unsuccessful run,
 and `cancelled` after interruption. `--allow-turn-errors` accepts partial
 success only: a script where every turn and command failed still ends with a
 run-level error and a nonzero exit.
-Its counters distinguish provider/incomplete-model failures, ordinary tool
-failures, local policy denials, user/command failures, and cancellations.
+A terminal assistant payload containing no non-whitespace text is an
+`incomplete_turn`: its provisional `assistant` event is closed by a
+`discarded` disposition, its conversation state is rolled back, and strict
+automation exits `2`. Empty content on an intermediate message that carries
+tool calls remains valid.
+Its counters distinguish provider/incomplete-model failures, structured-output
+validation failures, ordinary tool failures, local policy denials,
+user/command failures, and cancellations. `output_schema_failures` is the
+subset of `provider_failures` where transport completed but Kitsu rejected the
+terminal assistant bytes locally against `--output-schema`; this preserves the
+existing provider-failure classification while making the cause visible to a
+summary-only consumer.
+The `*_failures` counters count failed requested operations or turns and remain
+an exclusive outcome classification. `tool_errors` instead totals individual
+foreground tool-call errors across all attempted turns; `policy_errors` is the
+subset caused by local authority denials. `recovered_tool_errors` and
+`recovered_policy_errors` count those errors only when their turn ultimately
+received a committed assistant disposition. Accepting a failed turn with
+`--allow-turn-errors` does not make it recovered. Because policy denials are
+currently terminal, `recovered_policy_errors` is currently always zero. New
+producers emit all four tool-error counters and `output_schema_failures`; v1
+consumers must treat absent fields from older streams as zero.
 Local tool and policy failures exit 1; provider or incomplete-model failures
-exit 2. `final_summary.session_id` carries the run's durable session id (or
-`null` when nothing was persisted), so a consumer can learn where the
-conversation went from the one frame it already parses instead of scraping
-`run_started`.
+exit 2. `final_summary.session_snapshot_state` reports the terminal durability
+state: `disabled`, `pending_until_first_success`, or `resumable`.
+`final_summary.session_id` is non-null only in the `resumable` state, so every
+ID in the terminal receipt resolves to an installed snapshot. A failed, empty,
+or query-only fresh session therefore ends with a null ID and
+`pending_until_first_success`, while
+a failed turn in an already resumed session retains its resolvable ID. The
+planned fresh ID remains available in `run_started` for correlation without
+being misrepresented as durable. These fields are additive in v1; consumers of
+historical summaries must tolerate the absent state field.
 
 Events associated with a turn carry `turn_id`. Provider and tool runtime events
 also carry the one-based agent `round`. Provider operations initiated by a
@@ -191,7 +311,19 @@ separate serialized-file byte ceiling while stdout/stderr continue draining.
 `captured_bytes` is raw command data retained in the artifact,
 `artifact_bytes` is the exact completed on-disk JSONL size including framing and
 hex/JSON expansion, and `limit_bytes` bounds that serialized size. `truncated`
-discloses omitted output independently of the smaller inline preview.
+discloses omitted output independently of the smaller inline preview. The
+additive `command.artifact_status` uses the same vocabulary as the surrounding
+tool event. Under `--no-artifacts` / `artifact_storage = false`, it is
+`suppressed_by_policy`, no artifact or artifact-error path is emitted, and the
+bounded command result remains usable inline.
+
+For non-command results in disabled mode, output larger than 8 KiB is replaced
+before the next provider request by a deterministic UTF-8-safe head/tail value.
+Its host marker names original, retained, and omitted raw bytes; there is no
+recoverable path. This applies to tool errors and background-agent registry
+results as well as successes. Small complete values use `not_needed` rather
+than claiming suppression lost bytes. Existing sidecars and historical pointer
+messages are preserved but receive no managed artifact read root in that run.
 
 When a contained command exits nonzero and its bounded output matches a
 missing-module/missing-command shape (`No module named`, `command not found`,

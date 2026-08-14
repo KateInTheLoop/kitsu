@@ -9,6 +9,7 @@ use serde::Deserialize;
 
 /// Top-level config file shape.
 #[derive(Debug, Default, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct Config {
     #[serde(default)]
     pub default_gateway: Option<String>,
@@ -17,11 +18,18 @@ pub struct Config {
     /// `false` disables registration entirely, like `--no-workspace-evidence`.
     #[serde(default)]
     pub workspace_evidence: Option<bool>,
+    /// Permit Kitsu-created automatic command-output and oversized tool-result
+    /// artifacts. `false` is a one-way privacy default; a run may disable the
+    /// feature again with `--no-artifacts`, but no CLI flag silently overrides
+    /// a config-level disable.
+    #[serde(default)]
+    pub artifact_storage: Option<bool>,
     /// Per-turn cap on subagent spawns across `spawn_agent`, `spawn_agents`,
     /// and `spawn_agent_bg`. Spawns beyond the cap return a tool error the
     /// model sees. Unset: 8 in interactive chat, 2 in scripted/piped
     /// automation (small local models storm agents on trivial turns).
-    /// `--agent-spawn-cap` overrides; 0 disables spawning for the run.
+    /// `--agent-spawn-cap` overrides; 0 disables spawning for the run and
+    /// unregisters all multi-agent tools.
     #[serde(default)]
     pub agent_spawn_cap: Option<u32>,
     /// Default color theme for styled output (see `/theme` for the list).
@@ -207,7 +215,7 @@ impl std::fmt::Display for ConfigError {
             ),
             ConfigError::NoGateway => write!(
                 f,
-                "config error: no gateway selected — pass --gateway <name> or set default_gateway"
+                "config error: no gateway selected — pass --gateway <name>, set KITSU_GATEWAY, or set default_gateway"
             ),
             ConfigError::UnsupportedFlavor { flavor } => write!(
                 f,
@@ -226,7 +234,10 @@ impl std::fmt::Display for ConfigError {
                 "config error: static auth requires a non-empty token"
             ),
             ConfigError::ModelRequired => {
-                write!(f, "provider.model is required — set it with --model <name>")
+                write!(
+                    f,
+                    "provider.model is required — pass --model <name>, set KITSU_MODEL, or configure the gateway model"
+                )
             }
         }
     }
@@ -426,6 +437,17 @@ mod tests {
         assert!(display.contains("unknown field"), "{display}");
         assert!(display.contains("token_env"), "{display}");
         assert!(!display.contains(SECRET), "value leaked: {display}");
+    }
+
+    #[test]
+    fn artifact_storage_false_parses_and_misspelling_fails_closed() {
+        let parsed: Config = toml::from_str("artifact_storage = false\n").unwrap();
+        assert_eq!(parsed.artifact_storage, Some(false));
+
+        let error = toml::from_str::<Config>("artifact_stroage = false\n")
+            .expect_err("privacy-sensitive top-level typos must be rejected");
+        assert!(error.message().contains("unknown field"));
+        assert!(error.message().contains("artifact_stroage"));
     }
 
     #[test]

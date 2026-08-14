@@ -10,6 +10,7 @@ use crate::error::{AuthError, ExpiryStatus};
 use chrono::{Duration, Utc};
 use serial_test::serial;
 use std::env;
+use zeroize::Zeroizing;
 
 /// Scoped env guard: sets `key=value` (or removes it when `value` is None) for the
 /// lifetime of the guard, restoring the previous value on drop. Keeps the global
@@ -160,6 +161,42 @@ fn test_header_empty_env_is_missing_error() {
         matches!(err, AuthError::Missing { .. }),
         "empty token must map to AuthError::Missing, got {err:?}"
     );
+}
+
+#[test]
+#[serial]
+fn test_managed_token_is_used_only_when_environment_is_absent_or_empty() {
+    let _g = EnvGuard::unset(TEST_ENV);
+    let mut auth = auth_for_test();
+    auth.managed_token = Some(Zeroizing::new("managed-token".to_string()));
+    let (_, value) = auth.header().unwrap().unwrap();
+    assert_eq!(value.to_str().unwrap(), "Bearer managed-token");
+
+    env::set_var(TEST_ENV, "environment-token");
+    let (_, value) = auth.header().unwrap().unwrap();
+    assert_eq!(value.to_str().unwrap(), "Bearer environment-token");
+
+    env::set_var(TEST_ENV, "");
+    let (_, value) = auth.header().unwrap().unwrap();
+    assert_eq!(value.to_str().unwrap(), "Bearer managed-token");
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_non_unicode_environment_refuses_managed_fallback() {
+    use std::os::unix::ffi::OsStringExt;
+
+    let previous = env::var_os(TEST_ENV);
+    env::set_var(TEST_ENV, std::ffi::OsString::from_vec(vec![0xff]));
+    let mut auth = auth_for_test();
+    auth.managed_token = Some(Zeroizing::new("managed-token".to_string()));
+    let result = auth.header();
+    match previous {
+        Some(value) => env::set_var(TEST_ENV, value),
+        None => env::remove_var(TEST_ENV),
+    }
+    assert!(matches!(result, Err(AuthError::Malformed { .. })));
 }
 
 /// The refresh hint must surface in the Display of the Missing error (so the CLI

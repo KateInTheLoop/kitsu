@@ -123,6 +123,22 @@ struct WireRequest<'a> {
     reasoning_effort: Option<crate::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<WireResponseFormat<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: WireJsonSchema<'a>,
+}
+
+#[derive(Serialize)]
+struct WireJsonSchema<'a> {
+    name: &'a str,
+    strict: bool,
+    schema: &'a serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -236,6 +252,17 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         temperature: req.temperature,
         reasoning_effort: req.reasoning_effort,
         max_tokens: req.max_tokens,
+        response_format: req
+            .response_format
+            .as_ref()
+            .map(|format| WireResponseFormat {
+                kind: "json_schema",
+                json_schema: WireJsonSchema {
+                    name: &format.name,
+                    strict: format.strict,
+                    schema: &format.schema,
+                },
+            }),
     }
 }
 
