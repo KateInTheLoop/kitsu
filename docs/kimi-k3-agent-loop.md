@@ -1043,3 +1043,91 @@ faithful implementation of a prior self-authored design, a mergeable,
 test-green diff. The loop can extend this recipe to further P1/P2/P6/P7
 implementation cycles with confidence, provided each stays scoped to a
 small, named file set the way this one did.
+
+### Cycle 8 (2026-08-14)
+
+**CLOSE-THE-GAP: unit tests for Kimi's own P3 diff.** Cycle 7 was graded
+A- for shipping the `cached_tokens` feature with zero test coverage.
+This cycle handed that gap back to Kimi as a tightly scoped, write-first
+task: read `crates/kitsu-providers/src/types.rs` (its own cycle-7 output)
+and add a `#[cfg(test)] mod tests` block covering `cached_tokens()`
+(present/absent), the widened `is_empty()` cache-hit-only edge case, and
+`Usage::add()` merging cached tokens across two values. No other file in
+scope.
+
+**Run stats.**
+
+| | attempt 1 (no retry required) |
+|---|---|
+| wall time | 6.6s — the fastest turn of the whole loop by a wide margin (prior best-case single-edit turn was cycle 7's 58.7s) |
+| tool calls | 2 (`Read` types.rs whole, `Edit` types.rs) — zero list calls, zero `Agent` spawns, zero write conflicts, zero debris/re-prompt events |
+| `kitsu-usage` prompt/completion/total | 11,792 / 610 / 12,402 — **completion_tokens 610 against the 24,000 cap (2.5% utilization)**, the lowest completion spend of the whole loop to date (previous low was cycle 7's 9%), zero truncation warnings |
+| `kitsu-context` used/effective/window | 4,919 / 107,072 / 131,072 |
+| truncation warnings | 0 |
+| outcome | 1 file edited (`types.rs`, +53 lines, one new `mod tests` block, 4 tests), verified checkpoint diff printed in receipts, run summary "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1 change(s)), session not saved" |
+
+Kimi delivered exactly 4 tests (the brief asked for 3 behaviors; it
+split the "present and None/0 when absent" cached_tokens check into two
+tests, which is a reasonable and arguably cleaner decomposition):
+`cached_tokens_returns_nested_value` (asserts a non-trivial value, 42,
+round-trips through the accessor), `cached_tokens_zero_when_details_absent`
+(exercises the `None` path via `Usage::default()`), `is_empty_false_for_cache_hit_only_usage`
+(the exact edge case named in cycle 6/7 — zero prompt/completion/total
+but `cached_tokens=7` — asserting `is_empty()` returns `false`), and
+`add_merges_cached_tokens` (two `Usage` values with `cached_tokens`
+`Some(10)` and `Some(15)` merged via `Usage::add`, asserting the result
+is 25).
+
+**Grading the tests, not just that they pass:** all four are
+non-tautological — each would fail if the corresponding cycle-7 logic
+regressed. `cached_tokens_returns_nested_value` fails if the accessor
+stops reading the nested `Option`; `cached_tokens_zero_when_details_absent`
+fails if the accessor's `unwrap_or(0)` fallback were removed;
+`is_empty_false_for_cache_hit_only_usage` fails if `is_empty()` reverted
+to the old all-zero-only check (the exact regression this loop's
+backlog flagged as a risk); `add_merges_cached_tokens` fails if `add()`
+stopped summing `cached_tokens` across merges or reset the field to
+`None` incorrectly. Assertions were spot-checked line-by-line against
+the actual `types.rs` implementation (`cached_tokens()` at line 168,
+`is_empty()` at line 160, `add()` at line 175) and match exactly — no
+drift, no invented behavior.
+
+**Gates (supervisor-run in the worktree).**
+
+- `cargo fmt --all -- --check`: **clean**, no reformatting needed.
+- `cargo test -p kitsu-providers`: **62 passed, 0 failed, 0 ignored**
+  (plus 0 doc-tests) — the 58 pre-existing tests plus exactly the 4 new
+  ones, all green: `types::tests::cached_tokens_returns_nested_value`,
+  `types::tests::cached_tokens_zero_when_details_absent`,
+  `types::tests::is_empty_false_for_cache_hit_only_usage`,
+  `types::tests::add_merges_cached_tokens`.
+- `git diff` scope: `crates/kitsu-providers/src/types.rs` only, +53/-0
+  (pure addition, appended after the file's last existing item). No
+  other files touched.
+
+**Grade: A.** Closes the exact gap cycle 7 was docked for, with genuine
+(not tautological) test coverage, zero infrastructure incidents, first
+attempt, no retry, fastest and cheapest turn of the loop to date.
+
+**Weaknesses observed:** none new. This was the cleanest turn of the
+loop so far on every axis (wall time, completion-token spend, tool-call
+count) — likely because the scope was maximally narrow (one already-read
+file, a well-specified test list, no design decisions left open). This
+reinforces the standing finding: task narrowness predicts both cost and
+reliability for this model through kitsu, more than task type
+(review vs. implementation vs. test-writing) does.
+
+**Backlog status:** P3 is now **implemented and self-tested** end to
+end at the `kitsu-providers` layer. The still-open half of P3 — wiring
+`usage.cached_tokens()` through kitsu-core's per-turn aggregation and
+the `kitsu-usage:` record writer so the value reaches `/cost` and
+operator receipts — remains the natural next-cycle candidate, alongside
+the untouched P1 (`prompt_cache_key`), P6 (evidence-clamps-budget), and
+P7 (schema fingerprint) items.
+
+**Verdict:** the "hand the gap back to the model" pattern works well for
+closing review-flagged debt — a spoon-fed, single-file, single-purpose
+task produced the cheapest and fastest clean run of the loop. Future
+cycles should consider routinely pairing an implementation task with an
+immediate, separately scoped test-writing follow-up rather than asking
+for both in one turn.

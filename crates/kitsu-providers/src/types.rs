@@ -200,3 +200,56 @@ pub enum ChatDelta {
     /// Terminal marker for the stream.
     Done(FinishReason),
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cached_tokens_returns_nested_value() {
+        let usage = Usage {
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(42),
+            }),
+            ..Usage::default()
+        };
+        assert_eq!(usage.cached_tokens(), 42);
+    }
+
+    #[test]
+    fn cached_tokens_zero_when_details_absent() {
+        let usage = Usage::default();
+        assert_eq!(usage.cached_tokens(), 0);
+    }
+
+    #[test]
+    fn is_empty_false_for_cache_hit_only_usage() {
+        let usage = Usage {
+            prompt_tokens: 0,
+            completion_tokens: 0,
+            total_tokens: 0,
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(7),
+            }),
+        };
+        assert!(!usage.is_empty());
+    }
+
+    #[test]
+    fn add_merges_cached_tokens() {
+        let mut a = Usage {
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(10),
+            }),
+            ..Usage::default()
+        };
+        let b = Usage {
+            prompt_tokens_details: Some(PromptTokensDetails {
+                cached_tokens: Some(15),
+            }),
+            ..Usage::default()
+        };
+        a.add(b);
+        assert_eq!(a.cached_tokens(), 25);
+    }
+}
