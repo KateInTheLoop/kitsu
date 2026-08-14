@@ -793,6 +793,11 @@ asynchronous notices wait for the submitted line instead of splitting typed
 input. Pass `--reduced-motion` or set `KITSU_REDUCED_MOTION=1` to replace the
 animated wait indicator with a visible static status.
 
+Background-agent notices print between prompt cycles by default: rendering
+them live at an idle prompt requires a line-editor hook that measurably
+degrades burst-input processing (pastes), and kitsu prioritizes input
+latency. Set `KITSU_LIVE_NOTICES=1` to opt into live idle notices anyway.
+
 ---
 
 ## Context window

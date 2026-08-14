@@ -428,8 +428,18 @@ as escalation); findings are re-verified before applying. Cycle log:
   tool-call headers render the verb accent-bold and the detail dimmed
   (testable tool_activity_line, three-tier byte-identity + sanitize
   round-trip unit-tested per the item's acceptance).
-- **OPEN INVESTIGATION — intermittent idle-input crawl (found cycle
-  13).** In some windows, rustyline's idle prompt processes stdin at
+- **RESOLVED (cycle 14, 14755d7) — intermittent idle-input crawl.**
+  Root cause bisected with a 100%-discriminating env-gated experiment:
+  rustyline's ExternalPrinter (live idle agent notices) degrades idle
+  input to ~1 byte per event-loop wakeup; reproduces on rustyline 14,
+  17, AND 18 (upgrade tried, reverted). Fix: printer now opt-in via
+  KITSU_LIVE_NOTICES=1; the default rides the pre-existing printer-less
+  fallback (notices print between prompt cycles; checkpoint reports
+  drained via take_unreported_reports — review-verified complete).
+  Verified 3/3 instant burst echo by default, opt-in reproduces the
+  crawl, recall smoke green. Original record follows for history:
+  **(was: OPEN INVESTIGATION — intermittent idle-input crawl, found
+  cycle 13).** In some windows, rustyline's idle prompt processes stdin at
   ~1 byte per multi-second wakeup: '/help\\r' not consumed in 6s, typed
   chars echo one at a time (0/5 fast across repeated runs), while
   MINUTES earlier the same binary consumed a 48-char line instantly
@@ -446,6 +456,10 @@ as escalation); findings are re-verified before applying. Cycle log:
   rustyline event-loop wiring. This is the SAME symptom class as the
   loop's founding complaint ('cursor stuck') — highest-priority item
   when reproducible.
+- **Cycle 14 (2026-08-14, 14755d7 + docs follow-up)**: the idle-input
+  crawl SOLVED — see the resolved investigation entry above. The loop's
+  founding symptom class ('cursor stuck / input laggy') is now closed
+  at both ends: mid-turn (cycles 0-12) and idle (this cycle).
 - Backlog: soft-wrap of overlong single lines (nice-to-have); original
   queue items 10 (syntect), 11 (/diff header), 13 (agent deck rows)
   remain available for future ticks.
