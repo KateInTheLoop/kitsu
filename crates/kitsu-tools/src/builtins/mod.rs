@@ -26,6 +26,9 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::list_dir_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
+    let (d, h) = fs::read_csv_tool(policy.clone());
+    registry.register_with_descriptor(d, h);
+
     if rg_available() {
         let (d, h) = fs::grep_tool(policy);
         registry.register_with_descriptor(d, h);
@@ -86,6 +89,18 @@ mod tests {
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_edit_file"));
+    }
+
+    #[test]
+    fn fs_registration_advertises_csv_reader() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools(&mut registry, policy);
+        assert!(registry.is_registered("fs_read_csv"));
+        assert!(registry
+            .descriptors()
+            .iter()
+            .any(|d| d.name == "fs_read_csv"));
     }
 
     #[test]

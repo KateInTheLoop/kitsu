@@ -543,6 +543,358 @@ where
     Ok(capped)
 }
 
+// --- fs.read_csv ------------------------------------------------------------
+
+/// Default number of data rows returned in one `fs_read_csv` window when the
+/// caller does not specify `max_rows`. Small enough to stay well under the
+/// output cap on wide tables; the caller pages with `start_row`/`max_rows`.
+const CSV_DEFAULT_MAX_ROWS: usize = 50;
+/// Hard ceiling on a single window regardless of the requested `max_rows`, so
+/// one call can never blow the output budget on a huge table.
+const CSV_MAX_ROWS_CEILING: usize = 500;
+/// Per-column values sampled for type inference (bounds work on wide files).
+const CSV_TYPE_SAMPLE: usize = 200;
+
+#[derive(Deserialize)]
+struct ReadCsvArgs {
+    path: String,
+    /// 1-based first DATA row to show (the header is never a data row).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_row: Option<usize>,
+    /// Max data rows in this window (clamped to `CSV_MAX_ROWS_CEILING`).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_rows: Option<usize>,
+    /// Single-character field delimiter; defaults to ',' (accepts e.g. "\t").
+    #[serde(default)]
+    delimiter: Option<String>,
+    /// Treat the first row as data, not a header (default: header present).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    no_header: bool,
+}
+
+/// Accept `true`/`false`, `"true"`/`"false"` (any case), and `0`/`1` for
+/// boolean flags: small models routinely emit booleans as quoted strings, and
+/// a hard serde rejection burns a whole tool round with no repair hint — the
+/// same footgun `lenient_opt_usize` fixes for integers (found via a live
+/// llama3.2 fs_read_csv run passing `no_header: "false"`).
+fn lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Bool(bool),
+        Int(i64),
+        Text(String),
+    }
+    match Lenient::deserialize(deserializer)? {
+        Lenient::Bool(b) => Ok(b),
+        Lenient::Int(0) => Ok(false),
+        Lenient::Int(1) => Ok(true),
+        Lenient::Int(other) => Err(serde::de::Error::custom(format!(
+            "expected a boolean, got {other} — pass true or false"
+        ))),
+        Lenient::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Ok(true),
+            "false" | "no" | "0" | "" => Ok(false),
+            other => Err(serde::de::Error::custom(format!(
+                "expected a boolean, got '{other}' — pass true or false (quoted \"true\" is also accepted)"
+            ))),
+        },
+    }
+}
+
+/// A column's inferred value type across the sampled rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CsvType {
+    Empty,
+    Integer,
+    Float,
+    Bool,
+    String,
+}
+
+impl CsvType {
+    fn label(self) -> &'static str {
+        match self {
+            CsvType::Empty => "empty",
+            CsvType::Integer => "int",
+            CsvType::Float => "float",
+            CsvType::Bool => "bool",
+            CsvType::String => "string",
+        }
+    }
+
+    /// The type of a single cell value in isolation.
+    fn of_cell(value: &str) -> CsvType {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return CsvType::Empty;
+        }
+        if trimmed.parse::<i64>().is_ok() {
+            return CsvType::Integer;
+        }
+        if trimmed.parse::<f64>().is_ok() {
+            return CsvType::Float;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "true" || lower == "false" {
+            return CsvType::Bool;
+        }
+        CsvType::String
+    }
+
+    /// Fold a new cell type into the running column type. Integers widen to
+    /// floats; anything mixed or non-numeric collapses to string; `Empty`
+    /// cells never override a known type (nullable columns keep their type).
+    fn merge(self, cell: CsvType) -> CsvType {
+        match (self, cell) {
+            (a, CsvType::Empty) => a,
+            (CsvType::Empty, b) => b,
+            (a, b) if a == b => a,
+            (CsvType::Integer, CsvType::Float) | (CsvType::Float, CsvType::Integer) => {
+                CsvType::Float
+            }
+            _ => CsvType::String,
+        }
+    }
+}
+
+pub fn read_csv_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_csv".to_string(),
+        description: "Read a CSV/TSV file as structured data from an allowed path: reports column \
+                      headers, total data-row count, and an inferred type per column, then returns \
+                      a bounded window of rows. Page with start_row (1-based data row) and \
+                      max_rows. Set delimiter for TSV (\"\\t\") and no_header for headerless files. \
+                      Malformed rows (wrong field count) are disclosed, never silently dropped."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "CSV/TSV file path to read"},
+                "start_row": {"type": "integer", "description": "1-based first data row to show (optional, default 1)"},
+                "max_rows": {"type": "integer", "description": "Max data rows in this window (optional, default 50, max 500)"},
+                "delimiter": {"type": "string", "description": "Field delimiter, one character (optional, default ',', use \"\\t\" for TSV)"},
+                "no_header": {"type": "boolean", "description": "Treat the first row as data rather than a header (optional, default false)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_csv_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_csv_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadCsvArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let delimiter = match a.delimiter.as_deref() {
+        // An omitted or empty delimiter defaults to comma: small models pass
+        // `""` for optional string args constantly, and erroring on it burns a
+        // tool round (found via a live llama3.2 fs_read_csv run).
+        None | Some("") => b',',
+        Some("\\t") | Some("\t") => b'\t',
+        Some(text) => {
+            let mut bytes = text.bytes();
+            match (bytes.next(), bytes.next()) {
+                (Some(b), None) => b,
+                _ => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "delimiter must be a single character, got {text:?} (use \"\\t\" for TSV)"
+                    )))
+                }
+            }
+        }
+    };
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let max_bytes = policy.max_bytes();
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+
+    let start_row = a.start_row.unwrap_or(1).max(1);
+    let max_rows = a
+        .max_rows
+        .unwrap_or(CSV_DEFAULT_MAX_ROWS)
+        .min(CSV_MAX_ROWS_CEILING);
+    let rendered = render_csv(
+        &content.text,
+        delimiter,
+        a.no_header,
+        start_row,
+        max_rows,
+        content.truncated,
+    );
+    Ok(policy.cap_output(rendered))
+}
+
+/// Pure CSV formatter: parses `text` and produces the disclosure block. Kept
+/// free of IO so it is unit-testable in isolation.
+fn render_csv(
+    text: &str,
+    delimiter: u8,
+    no_header: bool,
+    start_row: usize,
+    max_rows: usize,
+    byte_truncated: bool,
+) -> String {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false) // we manage the header row ourselves
+        .flexible(true) // accept ragged rows so we can DISCLOSE them, not error
+        .from_reader(text.as_bytes());
+
+    let mut records = reader.records();
+    let headers: Vec<String> = if no_header {
+        Vec::new()
+    } else {
+        match records.next() {
+            Some(Ok(rec)) => rec.iter().map(|f| f.to_string()).collect(),
+            Some(Err(e)) => return format!("csv> parse error on header row: {e}"),
+            None => return "csv> empty file (no rows)".to_string(),
+        }
+    };
+
+    let expected_cols = headers.len();
+    let mut col_types: Vec<CsvType> = Vec::new();
+    let mut total_rows = 0usize;
+    let mut malformed: Vec<(usize, usize)> = Vec::new();
+    let mut window: Vec<Vec<String>> = Vec::new();
+    let end_row = start_row.saturating_add(max_rows);
+
+    for rec in records {
+        let rec = match rec {
+            Ok(rec) => rec,
+            Err(_) => continue,
+        };
+        // A trailing empty line parses as a zero-field record; ignore it.
+        if rec.is_empty() || (rec.len() == 1 && rec.get(0).map(str::is_empty).unwrap_or(false)) {
+            continue;
+        }
+        total_rows += 1;
+        let fields: Vec<String> = rec.iter().map(|f| f.to_string()).collect();
+
+        // Grow inferred columns if a header was absent or a row is wider.
+        if fields.len() > col_types.len() {
+            col_types.resize(fields.len(), CsvType::Empty);
+        }
+        if total_rows <= CSV_TYPE_SAMPLE {
+            for (idx, value) in fields.iter().enumerate() {
+                col_types[idx] = col_types[idx].merge(CsvType::of_cell(value));
+            }
+        }
+        if expected_cols > 0 && fields.len() != expected_cols {
+            malformed.push((total_rows, fields.len()));
+        }
+        if total_rows >= start_row && total_rows < end_row {
+            window.push(fields);
+        }
+    }
+
+    // With a header, its width is authoritative; a wider malformed row is an
+    // anomaly we disclose, not an extra column. Headerless files report the
+    // widest row seen.
+    let col_count = if headers.is_empty() {
+        col_types.len()
+    } else {
+        expected_cols
+    };
+    let mut out = String::new();
+    let kind = if delimiter == b'\t' { "TSV" } else { "CSV" };
+    out.push_str(&format!(
+        "csv> {kind}: {col_count} columns, {total_rows} data rows"
+    ));
+    if byte_truncated {
+        out.push_str(" (file exceeded the read byte cap — row count and window cover only the portion read; re-read with a smaller window is not needed, but totals are a lower bound)");
+    }
+    out.push('\n');
+
+    if !headers.is_empty() {
+        let cols: Vec<String> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let ty = col_types.get(i).copied().unwrap_or(CsvType::Empty);
+                format!("{h}:{}", ty.label())
+            })
+            .collect();
+        out.push_str(&format!("columns: {}\n", cols.join(", ")));
+    } else {
+        let cols: Vec<String> = col_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("col{}:{}", i + 1, ty.label()))
+            .collect();
+        out.push_str(&format!("columns (no header): {}\n", cols.join(", ")));
+    }
+
+    if total_rows == 0 {
+        out.push_str("(no data rows)\n");
+    } else if window.is_empty() {
+        out.push_str(&format!(
+            "(no rows in window: start_row {start_row} is past the {total_rows} data rows)\n"
+        ));
+    } else {
+        let last = start_row + window.len() - 1;
+        out.push_str(&format!("rows {start_row}-{last} of {total_rows}:\n"));
+        for (offset, fields) in window.iter().enumerate() {
+            let row_no = start_row + offset;
+            let cells: Vec<String> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let name = headers
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("col")
+                        .to_string();
+                    if headers.is_empty() {
+                        format!("{name}{}={v}", i + 1)
+                    } else {
+                        format!("{name}={v}")
+                    }
+                })
+                .collect();
+            out.push_str(&format!("{row_no} | {}\n", cells.join(" | ")));
+        }
+        if last < total_rows {
+            out.push_str(&format!(
+                "[showing {} of {total_rows} rows; pass start_row/max_rows for more]\n",
+                window.len()
+            ));
+        }
+    }
+
+    if !malformed.is_empty() {
+        let shown: Vec<String> = malformed
+            .iter()
+            .take(10)
+            .map(|(row, got)| format!("row {row} ({got} fields, expected {expected_cols})"))
+            .collect();
+        let more = if malformed.len() > 10 {
+            format!(" (+{} more)", malformed.len() - 10)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "[disclosure: {} row(s) with an unexpected field count: {}{}]\n",
+            malformed.len(),
+            shown.join(", "),
+            more
+        ));
+    }
+
+    out
+}
+
 /// Accept both `1` and `"1"` for optional line numbers: small models emit
 /// numeric strings constantly, and rejecting them burned a round per call
 /// with no repair hint (cycle-27 audit).
@@ -3306,6 +3658,100 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    #[test]
+    fn csv_reports_shape_types_and_bounded_window() {
+        let mut body = String::from("id,name,price,active\n");
+        for i in 1..=1000 {
+            body.push_str(&format!("{i},Item{i},{}.5,true\n", i % 7));
+        }
+        let out = render_csv(&body, b',', false, 1, 20, false);
+        assert!(out.contains("4 columns, 1000 data rows"), "shape: {out}");
+        assert!(
+            out.contains("id:int, name:string, price:float, active:bool"),
+            "types: {out}"
+        );
+        assert!(out.contains("rows 1-20 of 1000:"), "window header: {out}");
+        assert!(out.contains("[showing 20 of 1000 rows"), "more hint: {out}");
+        // Exactly 20 data rows rendered in the window.
+        let data_lines = out
+            .lines()
+            .filter(|l| l.starts_with("1 | ") || l.contains(" | id="))
+            .count();
+        assert!(data_lines >= 1);
+        assert_eq!(out.lines().filter(|l| l.contains(" | id=")).count(), 20);
+    }
+
+    #[test]
+    fn csv_paging_with_start_row() {
+        let body = "a,b\n1,2\n3,4\n5,6\n7,8\n";
+        let out = render_csv(body, b',', false, 3, 2, false);
+        assert!(out.contains("rows 3-4 of 4:"), "{out}");
+        assert!(out.contains("3 | a=5 | b=6"), "{out}");
+        assert!(out.contains("4 | a=7 | b=8"), "{out}");
+        assert!(
+            !out.contains("a=1"),
+            "row 1 should be outside the window: {out}"
+        );
+    }
+
+    #[test]
+    fn csv_discloses_malformed_rows_not_dropped() {
+        let body = "a,b,c\n1,2,3\n4,5\n6,7,8,9\n10,11,12\n";
+        let out = render_csv(body, b',', false, 1, 50, false);
+        // 4 data rows counted (none silently dropped).
+        assert!(out.contains("3 columns, 4 data rows"), "{out}");
+        assert!(
+            out.contains("2 row(s) with an unexpected field count"),
+            "disclosure missing: {out}"
+        );
+        assert!(out.contains("row 2 (2 fields, expected 3)"), "{out}");
+        assert!(out.contains("row 3 (4 fields, expected 3)"), "{out}");
+    }
+
+    #[test]
+    fn csv_tsv_and_no_header_and_nullable_types() {
+        // TSV, no header: columns get positional names; empty cells keep the
+        // column's inferred type (nullable int column stays int).
+        let body = "1\tx\n\ty\n3\tz\n";
+        let out = render_csv(body, b'\t', true, 1, 50, false);
+        assert!(out.contains("TSV: 2 columns, 3 data rows"), "{out}");
+        assert!(out.contains("col1:int, col2:string"), "nullable int: {out}");
+        assert!(out.contains("1 | col1=1 | col2=x"), "{out}");
+    }
+
+    #[test]
+    fn csv_no_header_accepts_stringy_booleans() {
+        // Small models emit `"false"`/`"true"` as strings (live llama3.2
+        // finding); all of these must parse rather than erroring the turn.
+        for raw in [
+            r#"{"path":"x","no_header":"false"}"#,
+            r#"{"path":"x","no_header":false}"#,
+            r#"{"path":"x","no_header":"true"}"#,
+            r#"{"path":"x","no_header":1}"#,
+            r#"{"path":"x"}"#,
+        ] {
+            let parsed: ReadCsvArgs = serde_json::from_str(raw).unwrap_or_else(|e| {
+                panic!("should parse {raw}: {e}");
+            });
+            let _ = parsed.no_header;
+        }
+        let t: ReadCsvArgs = serde_json::from_str(r#"{"path":"x","no_header":"true"}"#).unwrap();
+        assert!(t.no_header);
+        let f: ReadCsvArgs = serde_json::from_str(r#"{"path":"x","no_header":"false"}"#).unwrap();
+        assert!(!f.no_header);
+    }
+
+    #[test]
+    fn csv_start_row_past_end_is_disclosed() {
+        let body = "a,b\n1,2\n";
+        let out = render_csv(body, b',', false, 99, 10, false);
+        assert!(out.contains("no rows in window"), "{out}");
+        assert!(
+            out.contains("1 data rows") || out.contains("1 data row"),
+            "{out}"
+        );
+    }
+
     fn temp_with_file(name: &str, body: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
         let p = dir.path().join(name);
@@ -3436,6 +3882,51 @@ mod tests {
             .await;
         journal.drain_mutations().await;
         journal.finish_attributed_turn(&start.token).unwrap()
+    }
+
+    #[tokio::test]
+    async fn read_csv_end_to_end_honors_allowlist_and_delimiter() {
+        let (dir, root) = temp_with_file("data.tsv", "id\tname\n1\tAda\n2\tGrace\n");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("data.tsv");
+        let args =
+            serde_json::json!({"path": path.to_string_lossy(), "delimiter": "\\t"}).to_string();
+        let out = read_csv_run(&policy, &args).await.expect("csv ok");
+        assert!(out.contains("TSV: 2 columns, 2 data rows"), "{out}");
+        assert!(out.contains("id:int, name:string"), "{out}");
+        assert!(out.contains("1 | id=1 | name=Ada"), "{out}");
+
+        // Outside the allowlist → PolicyDenied (same guard as fs_read_file).
+        let other = tempfile::tempdir().expect("other");
+        let bad = other.path().join("x.csv");
+        std::fs::write(&bad, "a,b\n1,2\n").expect("write");
+        let bad_args = serde_json::json!({"path": bad.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_csv_run(&policy, &bad_args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A multi-character delimiter is a clear InvalidArgs, not a panic.
+        let two =
+            serde_json::json!({"path": path.to_string_lossy(), "delimiter": "ab"}).to_string();
+        assert!(matches!(
+            read_csv_run(&policy, &two).await,
+            Err(ToolError::InvalidArgs(_))
+        ));
+
+        // An empty delimiter degrades to the default comma (small-model
+        // habit), so a comma file parses instead of erroring.
+        let (dir2, root2) = temp_with_file("c.csv", "a,b\n1,2\n");
+        let policy2 = Permissions::for_roots(&[root2], &[]).expect("perms");
+        let empty = serde_json::json!({
+            "path": dir2.path().join("c.csv").to_string_lossy(),
+            "delimiter": ""
+        })
+        .to_string();
+        let out = read_csv_run(&policy2, &empty)
+            .await
+            .expect("empty delim ok");
+        assert!(out.contains("CSV: 2 columns, 1 data rows"), "{out}");
     }
 
     #[tokio::test]
