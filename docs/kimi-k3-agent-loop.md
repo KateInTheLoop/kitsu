@@ -322,3 +322,42 @@ kitsu-core test target. Author verified Kate on both.
 Backlog: P1 ✅, P3 ✅ (+tests). Next: P2 anchor content fingerprint or
 P6 evidence-clamps-budget. Both cron and supervisor briefs now carry
 `--agent-spawn-cap 0` + `--workspace` verification.
+
+### Cycle 10 — 2026-08-14 — P2 anchor content fingerprint (grade B)
+
+Kimi implemented P2 correctly: the anchor tuple grew a private `u64`
+`prefix_fingerprint()` — a `DefaultHasher` over role discriminant +
+content/tool-call **lengths only** (never message bytes — genuinely
+cheap as the spec required). `record()` now takes the sent `messages`
+slice; `estimate()`/`anchored()`/`anchor_includes_schema()` require the
+fingerprint to match before the fast path, else fall back to safe full
+recompute. No new `pub` surface. Committed `e3bc6d4` (Kate verified),
+pushed. `--agent-spawn-cap 0` held — zero spawn attempts.
+
+- kitsu-core 98 tests pass (95 + 3 new): unchanged prefix uses the
+  anchor; an in-place content edit that PRESERVES message count now
+  invalidates it (the exact P2 bug — supervisor confirmed the test fails
+  on the old length-only code); tail-append still uses the anchor.
+- **Docked to B — incomplete delivery (not a design fault).** Kimi's
+  algorithm and all three tests were correct *as authored in its final
+  answer*, but the turn hit the default **`--max-rounds 10`** — exhausted
+  by 11 sequential `Edit`s to one file — before writing the orchestrator
+  call-site fix, two test call-site fixes, and the 3 new tests. The
+  supervisor applied them verbatim from Kimi's own authored text.
+  Completion tokens were only 8,863/24,000 (37%): **round budget and
+  token budget are independent limits — token headroom is not round
+  headroom.** kitsu weakness recorded; fix applied below.
+- **Pre-existing defect uncovered (not cycle 10's):** a `Usage {..}`
+  literal in `kitsu/src/subagent.rs:1866` missing `prompt_tokens_details`
+  — the same cycle-7 drift class, this time in the `kitsu` crate's test
+  target, undetected until workspace-wide verification. Fixed in the same
+  commit.
+- **Flake noted:** `kitsu-tools …read_file_caps_input_before_allocating_the_whole_file`
+  failed once on the branch (confirmed pre-existing via stash, unrelated
+  to P2); it passes on the main branch's newer kitsu-tools. Likely
+  load/environment-sensitive; revisit if it recurs.
+
+**Fix applied to both cron and supervisor briefs:** gateway flags now
+include **`--max-rounds 30`** so a design-correct many-edit cycle is not
+throttled on edit count. Backlog: P1 ✅, P2 ✅, P3 ✅. Next: P6
+evidence-clamps-budget or P4 estimator overhead.
