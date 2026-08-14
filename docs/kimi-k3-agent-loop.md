@@ -1,5 +1,14 @@
 # Kimi-K3 worker loop — kitsu drives a hosted frontier model on real work
 
+> **LOOP PAUSED 2026-08-13 after cycle 3** — the HF router returned
+> `HTTP 402` (billing/quota) for the loop's token against
+> `moonshotai/Kimi-K3` before any inference on both attempts; retrying
+> blind reproduces the same sub-second failure. Resume by fixing HF
+> billing/credits (or supplying a fresh token) and re-arming the hourly
+> cron. Positive cycle-3 finding: kitsu classified the 402 terminal on
+> the FIRST internal attempt with an actionable message — no wasted
+> retries (contrast: cycle-1's 429 handling, still on the backlog).
+
 Started 2026-08-13 at user direction. Kimi-K3 (moonshotai/Kimi-K3 via the
 Hugging Face router, `--gateway huggingface`) is treated as an **extra
 agent that helps us out**: kitsu runs it on real improvement tasks against
