@@ -106,6 +106,10 @@ pub struct ChatRequest {
     /// ignore it when omitted.
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: Option<u32>,
+    /// Optional prompt-cache affinity hint (e.g. session id) sent as
+    /// `prompt_cache_key` so sharded gateway caches can pin the shared prefix.
+    /// Omitted from the wire body when `None`.
+    pub prompt_cache_key: Option<String>,
 }
 
 /// Common OpenAI-compatible reasoning-effort levels.

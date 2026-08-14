@@ -1106,6 +1106,7 @@ where
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: cfg.max_tokens,
+            prompt_cache_key: None,
         };
 
         // Keep the final check adjacent to the provider boundary. If a future
@@ -2707,6 +2708,7 @@ fn bounded_summary_request(
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: Some(max_tokens),
+            prompt_cache_key: None,
         },
         shortened,
     ))

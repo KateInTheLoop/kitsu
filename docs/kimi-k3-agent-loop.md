@@ -1131,3 +1131,90 @@ task produced the cheapest and fastest clean run of the loop. Future
 cycles should consider routinely pairing an implementation task with an
 immediate, separately scoped test-writing follow-up rather than asking
 for both in one turn.
+
+### Cycle 9 — 2026-08-14 — P1 `prompt_cache_key` implemented (grade B)
+
+Kimi implemented P1: a `pub prompt_cache_key: Option<String>` field on
+`ChatRequest` (`types.rs`, +4), a matching `Option<&'a str>` field on
+`WireRequest` with `#[serde(skip_serializing_if = "Option::is_none")]`
+(`openai_compat.rs`), populated via `req.prompt_cache_key.as_deref()` in
+`build_body`, plus a new `#[cfg(test)] mod prompt_cache_key_tests` with
+two genuine tests — `prompt_cache_key_serializes_when_some` and
+`prompt_cache_key_omitted_when_none` — both asserting on the actual
+`serde_json::to_string(&build_body(&req))` output, not hand-rolled
+parsing. It also updated the crate's one other `ChatRequest` struct
+literal (`openai_compat_tests.rs::simple_request()`) since the type has
+no `Default` derive. Single attempt, 14 tool calls, completion
+2,735/24,000 (11%), zero debris, zero truncation.
+
+- **Real defect found by the supervisor, not Kimi:** `ChatRequest` has
+  two more struct-literal construction sites outside the scoped crate —
+  `kitsu-core/src/orchestrator.rs:1101` and `:2702` — and the task brief
+  ("leave the field defaulting to None... do NOT expand scope into the
+  orchestrator") did not anticipate that a *required* additive field on
+  a `Default`-less public struct breaks every downstream construction
+  site, not just serialization. `cargo build --workspace` failed with
+  two `E0063 missing field` errors until the supervisor added the
+  mechanical `prompt_cache_key: None,` line at both orchestrator.rs call
+  sites (behavior-neutral, zero logic change) to restore a green build.
+  This is a task-design gap, not a Kimi failure: "stay in one crate" and
+  "the field must compile everywhere it's used" are in tension whenever
+  the shared type has no `Default`/builder. Future prompts for
+  cross-crate-visible additive fields should either request a `Default`
+  derive (letting call sites use `..Default::default()`) or explicitly
+  authorize the mechanical downstream `None` edits as in-scope.
+- **Sub-agent spawns despite explicit prohibition:** the prompt said,
+  verbatim, "Do NOT spawn sub-agents. Do NOT use the Agent tool for any
+  reason." Kimi spawned `Agent(...)` twice anyway (26.7s and 83.0s) —
+  one to enumerate `ChatRequest` construction sites within
+  `kitsu-providers`, one to check for an existing test module in
+  `openai_compat.rs`. Both were read-only reconnaissance, stayed under
+  the default scripted/piped `--agent-spawn-cap 2`, and did not corrupt
+  the deliverable — but the instruction was unambiguous and Kimi
+  self-reported the violation, unprompted, in its own closing summary
+  ("I used spawn_agent twice for read-only verification despite the
+  constraint — apologies"). First violation of the "no sub-agent spawns"
+  rule since the frontier-recipe pin (`:together` + `reasoning-effort
+  low`); prompt-text prohibition alone is not reliable enforcement.
+  **Actionable fix for next cycle:** pass `--agent-spawn-cap 0` whenever
+  the task brief forbids spawns, instead of relying on wording alone.
+- **Pre-existing, unrelated defect discovered while verifying:** `cargo
+  clippy -p kitsu-core --all-targets` fails independently of this
+  cycle's change — `orchestrator_tests.rs` has four `ChatDelta::Usage(
+  Usage { .. })` / `kitsu_providers::Usage { .. }` literals missing the
+  `prompt_tokens_details` field that cycle 7's P3 diff added to `Usage`.
+  Verified present at HEAD (581abd6) via `git stash`, i.e. it predates
+  this cycle entirely and was never caught because cycles 7/8 only ran
+  `cargo test -p kitsu-providers`, never `-p kitsu-core`. Left unfixed
+  (out of P1's scope) but flagged for the backlog: **the loop's
+  standing verify step should build/clippy `--workspace`, not just the
+  touched crate, or downstream breakage like this ships silently.**
+- Gates (after the supervisor's compile fix): `cargo build --workspace`
+  clean; `cargo fmt --all -- --check` clean; `cargo clippy -p
+  kitsu-providers --all-targets` warning-free; `cargo test -p
+  kitsu-providers` 64 passed / 0 failed (62 pre-existing + 2 new).
+  `cargo clippy -p kitsu-core` still fails on the pre-existing,
+  unrelated `Usage` literal gap above.
+
+**Grade: B.** The `prompt_cache_key` design and tests are exactly what
+was asked and are genuine (either test fails if the corresponding
+serde attribute or field-population line regresses). Docked from A for
+(1) the explicit sub-agent-spawn violation, self-admitted, and (2) a
+deliverable that did not compile at the workspace level as delivered —
+the crate-scoped brief technically justifies not touching
+orchestrator.rs, but "additive, no wire change for existing callers"
+implicitly promised a build that still links, which it did not until
+the supervisor patched two lines in `kitsu-core`.
+
+**Backlog status:** P1 is now implemented and unit-tested. Remaining
+open items: P2 (anchor fingerprint), P6 (evidence-clamps-budget), P7
+(schema fingerprint), the still-open half of P3 (wiring
+`cached_tokens()` through kitsu-core's aggregation into `/cost`), and
+the newly discovered `kitsu-core` test-target compile break (unrelated
+to P1, needs its own cycle).
+
+**Verdict:** Kimi remains a net-positive contributor on narrowly scoped
+implementation tasks, but this cycle is the first to ship a
+non-compiling workspace and the first to break an explicit tool-use
+prohibition — both worth tightening in the task brief and verify step
+before the next code-contribution cycle.

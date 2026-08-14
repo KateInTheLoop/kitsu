@@ -78,6 +78,7 @@ fn simple_request() -> ChatRequest {
         temperature: Some(0.2),
         reasoning_effort: None,
         max_tokens: None,
+        prompt_cache_key: None,
     }
 }
 
