@@ -15,7 +15,12 @@
 //! after two consecutive quiet ~50ms poll timeouts, so real escape
 //! sequences, which arrive atomically, are unaffected; a link slow enough
 //! to split a sequence across >100ms will misread it, the standard
-//! escape-time tradeoff every terminal editor makes). A bracketed paste
+//! escape-time tradeoff every terminal editor makes). Ctrl+R opens
+//! reverse-i-search over history: Ctrl+R cycles older matches, printable
+//! input extends the query, Backspace shrinks it, Enter accepts the match
+//! into the draft (without submitting), Ctrl+G cancels and restores the
+//! pre-search draft, and any other control key accepts then acts. A
+//! bracketed paste
 //! (`ESC[200~`…`ESC[201~`) stays one draft block:
 //! its newlines insert literally instead of submitting. Unknown escape
 //! sequences are consumed and ignored so they never leak into the draft.
@@ -57,6 +62,16 @@ enum Pending {
     Ss3,
 }
 
+/// Reverse-i-search state (Ctrl+R). The draft buffer shows the current
+/// match while searching; the pre-search draft is restored on cancel.
+struct SearchState {
+    query: Vec<char>,
+    saved_buffer: Vec<char>,
+    saved_cursor: usize,
+    /// History index of the current match (`None` while nothing matches).
+    match_index: Option<usize>,
+}
+
 pub struct TypeaheadEditor {
     buffer: Vec<char>,
     cursor: usize,
@@ -74,6 +89,8 @@ pub struct TypeaheadEditor {
     in_paste: bool,
     /// The previous pasted byte, for collapsing `\r\n` into one newline.
     last_paste_byte: u8,
+    /// Active Ctrl+R reverse search, if any.
+    search: Option<SearchState>,
     /// A RecallRequest was already emitted in the current `feed` batch.
     /// Without this gate, ↑↑ arriving in one read would emit twice and the
     /// collector's second queue-pop would overwrite (lose) the first
@@ -103,6 +120,7 @@ impl TypeaheadEditor {
             utf8: Vec::new(),
             in_paste: false,
             last_paste_byte: 0,
+            search: None,
             recall_emitted: false,
         }
     }
@@ -117,7 +135,11 @@ impl TypeaheadEditor {
     }
 
     /// Surrender the unsubmitted draft (for carrying into the next prompt).
-    pub fn take_draft(self) -> String {
+    /// An active search is cancelled first: the carried draft is the user's
+    /// real typing, never the transient match display.
+    pub fn take_draft(mut self) -> String {
+        let mut outcome = FeedOutcome::default();
+        self.search_exit(false, &mut outcome);
         self.buffer.into_iter().collect()
     }
 
@@ -129,6 +151,79 @@ impl TypeaheadEditor {
         self.cursor = self.buffer.len();
         self.history_cursor = None;
         self.stash.clear();
+    }
+
+    /// Status line for an active Ctrl+R search, rendered by the collector in
+    /// the row's hint slot (display-only): `⌕ reverse-search 'query'`, with a
+    /// `(no match)` marker when nothing in history contains the query.
+    pub fn search_status(&self) -> Option<String> {
+        self.search.as_ref().map(|search| {
+            let query: String = search.query.iter().collect();
+            if search.match_index.is_some() || search.query.is_empty() {
+                format!("  ⌕ reverse-search '{query}'")
+            } else {
+                format!("  ⌕ reverse-search '{query}' (no match)")
+            }
+        })
+    }
+
+    /// Enter search mode, or cycle to the next-older match when already in
+    /// it (Ctrl+R semantics).
+    fn search_enter_or_cycle(&mut self, outcome: &mut FeedOutcome) {
+        match &mut self.search {
+            None => {
+                self.search = Some(SearchState {
+                    query: Vec::new(),
+                    saved_buffer: std::mem::take(&mut self.buffer),
+                    saved_cursor: self.cursor,
+                    match_index: None,
+                });
+                self.cursor = 0;
+                self.history_cursor = None;
+                self.stash.clear();
+                outcome.changed = true;
+            }
+            Some(_) => self.search_refresh(true, outcome),
+        }
+    }
+
+    /// Re-run the search. `older` continues past the current match; otherwise
+    /// the search restarts from the newest entry (query changed).
+    fn search_refresh(&mut self, older: bool, outcome: &mut FeedOutcome) {
+        let Some(search) = &mut self.search else {
+            return;
+        };
+        let query: String = search.query.iter().collect();
+        let start = match (older, search.match_index) {
+            (true, Some(index)) => index,
+            _ => self.history.len(),
+        };
+        search.match_index = self.history[..start]
+            .iter()
+            .rposition(|entry| !query.is_empty() && entry.contains(&query));
+        // The draft shows the match; an unmatched query leaves the previous
+        // match visible only if cycling found nothing older (readline keeps
+        // the last match), else clears.
+        if let Some(index) = search.match_index {
+            self.buffer = self.history[index].chars().collect();
+        } else if !older {
+            self.buffer.clear();
+        }
+        self.cursor = self.buffer.len();
+        outcome.changed = true;
+    }
+
+    /// Leave search mode. `keep_match` keeps the matched text as the draft;
+    /// otherwise the pre-search draft and cursor are restored.
+    fn search_exit(&mut self, keep_match: bool, outcome: &mut FeedOutcome) {
+        let Some(search) = self.search.take() else {
+            return;
+        };
+        if !keep_match {
+            self.buffer = search.saved_buffer;
+            self.cursor = search.saved_cursor.min(self.buffer.len());
+        }
+        outcome.changed = true;
     }
 
     /// Resolve a lone Esc keypress: when an `ESC` byte arrived with no
@@ -158,6 +253,8 @@ impl TypeaheadEditor {
     /// a latched `in_paste` can never survive the handoff and eat every
     /// later Enter. The draft buffer and history are untouched.
     pub fn reset_pending_input(&mut self) {
+        let mut outcome = FeedOutcome::default();
+        self.search_exit(false, &mut outcome);
         self.in_paste = false;
         self.last_paste_byte = 0;
         self.pending = Pending::None;
@@ -235,7 +332,7 @@ impl TypeaheadEditor {
                     let taken = std::mem::take(&mut self.utf8);
                     if let Ok(text) = std::str::from_utf8(&taken) {
                         if let Some(ch) = text.chars().next() {
-                            self.insert_char(ch, outcome);
+                            self.input_char(ch, outcome);
                         }
                     }
                 }
@@ -272,6 +369,42 @@ impl TypeaheadEditor {
                         }
                     }
                 }
+            }
+            return;
+        }
+
+        // Reverse-i-search intercepts everything: Ctrl+R cycles, Ctrl+G
+        // cancels (restores the pre-search draft), Enter accepts the match
+        // into the draft WITHOUT submitting, Backspace edits the query,
+        // printable input extends it, and any other control key (arrows
+        // included, via ESC) accepts the match first and then acts normally.
+        if self.search.is_some() {
+            match byte {
+                0x12 => self.search_enter_or_cycle(outcome),
+                0x07 => self.search_exit(false, outcome),
+                b'\r' | b'\n' => self.search_exit(true, outcome),
+                0x7f | 0x08 => {
+                    if let Some(search) = &mut self.search {
+                        search.query.pop();
+                    }
+                    self.search_refresh(false, outcome);
+                }
+                0x1b => {
+                    self.search_exit(true, outcome);
+                    self.pending = Pending::Escape;
+                }
+                0x00..=0x1f => {
+                    self.search_exit(true, outcome);
+                    self.feed_byte(byte, outcome);
+                }
+                _ => match utf8_expected_len(byte) {
+                    1 => self.input_char(byte as char, outcome),
+                    0 => {}
+                    _ => {
+                        self.utf8.clear();
+                        self.utf8.push(byte);
+                    }
+                },
             }
             return;
         }
@@ -332,13 +465,14 @@ impl TypeaheadEditor {
                 }
             }
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
+            0x12 => self.search_enter_or_cycle(outcome),
             0x00..=0x1f => {
                 // Other control bytes are ignored: control characters must
                 // never enter the draft.
             }
             _ => {
                 match utf8_expected_len(byte) {
-                    1 => self.insert_char(byte as char, outcome),
+                    1 => self.input_char(byte as char, outcome),
                     // Stray continuation/invalid lead bytes never become
                     // C1 controls in the draft.
                     0 => {}
@@ -385,6 +519,19 @@ impl TypeaheadEditor {
                 _ => {}
             },
             _ => {}
+        }
+    }
+
+    /// Route one decoded character: into the search query while searching,
+    /// into the draft otherwise.
+    fn input_char(&mut self, ch: char, outcome: &mut FeedOutcome) {
+        if self.search.is_some() {
+            if let Some(search) = &mut self.search {
+                search.query.push(ch);
+            }
+            self.search_refresh(false, outcome);
+        } else {
+            self.insert_char(ch, outcome);
         }
     }
 
@@ -691,6 +838,98 @@ mod tests {
         // ...and the late key arrives as itself, not as Alt+key.
         editor.feed(b"x");
         assert_eq!(editor.buffer_string(), "x");
+    }
+
+    fn search_history() -> Vec<String> {
+        vec![
+            "cargo build".to_string(),
+            "fix the parser".to_string(),
+            "cargo test -p kitsu".to_string(),
+        ]
+    }
+
+    #[test]
+    fn ctrl_r_searches_cycles_and_accepts_without_submitting() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(b"draft in progress");
+        editor.feed(&[0x12]); // enter search: draft saved, row empty
+        assert_eq!(editor.buffer_string(), "");
+        assert!(editor
+            .search_status()
+            .unwrap()
+            .contains("reverse-search ''"));
+        let outcome = editor.feed(b"cargo");
+        assert!(outcome.actions.is_empty());
+        // Newest match first.
+        assert_eq!(editor.buffer_string(), "cargo test -p kitsu");
+        editor.feed(&[0x12]); // cycle older
+        assert_eq!(editor.buffer_string(), "cargo build");
+        // Enter accepts the match into the draft; it must NOT submit.
+        let outcome = editor.feed(b"\r");
+        assert!(outcome.actions.is_empty());
+        assert!(editor.search_status().is_none());
+        assert_eq!(editor.buffer_string(), "cargo build");
+        // The next Enter submits normally.
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["cargo build"]);
+    }
+
+    #[test]
+    fn ctrl_g_cancels_search_and_restores_the_draft() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(b"my draft");
+        editor.feed(&[0x12]);
+        editor.feed(b"parser");
+        assert_eq!(editor.buffer_string(), "fix the parser");
+        editor.feed(&[0x07]); // Ctrl+G
+        assert!(editor.search_status().is_none());
+        assert_eq!(editor.buffer_string(), "my draft");
+        assert_eq!(editor.cursor(), 8);
+    }
+
+    #[test]
+    fn search_backspace_edits_the_query_and_reports_no_match() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(&[0x12]);
+        editor.feed(b"parserZZ");
+        assert!(editor.search_status().unwrap().contains("(no match)"));
+        editor.feed(&[0x7f, 0x7f]); // drop ZZ
+        assert!(!editor.search_status().unwrap().contains("(no match)"));
+        assert_eq!(editor.buffer_string(), "fix the parser");
+    }
+
+    #[test]
+    fn other_control_keys_accept_the_match_then_act() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(&[0x12]);
+        editor.feed(b"build");
+        assert_eq!(editor.buffer_string(), "cargo build");
+        // Ctrl+A: accept then home.
+        editor.feed(&[0x01]);
+        assert!(editor.search_status().is_none());
+        assert_eq!(editor.buffer_string(), "cargo build");
+        assert_eq!(editor.cursor(), 0);
+    }
+
+    #[test]
+    fn take_draft_mid_search_carries_the_real_typing_not_the_match() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(b"real typing");
+        editor.feed(&[0x12]);
+        editor.feed(b"cargo");
+        assert_eq!(editor.buffer_string(), "cargo test -p kitsu");
+        assert_eq!(editor.take_draft(), "real typing");
+    }
+
+    #[test]
+    fn approval_handoff_cancels_search_and_restores_the_draft() {
+        let mut editor = TypeaheadEditor::new(search_history());
+        editor.feed(b"keep me");
+        editor.feed(&[0x12]);
+        editor.feed(b"cargo");
+        editor.reset_pending_input();
+        assert!(editor.search_status().is_none());
+        assert_eq!(editor.buffer_string(), "keep me");
     }
 
     #[test]

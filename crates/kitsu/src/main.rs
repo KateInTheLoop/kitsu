@@ -9623,12 +9623,16 @@ fn run_canonical_typeahead(
     result
 }
 
-/// Repaint the live row from editor state, with the inline slash hint.
+/// Repaint the live row from editor state. The hint slot carries the
+/// reverse-search status while Ctrl+R is active, the inline slash hint
+/// otherwise.
 #[cfg(unix)]
 fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
     let buffer = editor.buffer_string();
-    let hint = typeahead_slash_hint(&buffer);
-    kitsu_render::live::live_input_update(buffer, editor.cursor(), hint);
+    let search_status = editor.search_status();
+    let hint_reserved = search_status.is_some();
+    let hint = search_status.unwrap_or_else(|| typeahead_slash_hint(&buffer));
+    kitsu_render::live::live_input_update(buffer, editor.cursor(), hint, hint_reserved);
 }
 
 /// Commands that act on the RUNNING turn, in preference order. While a turn
