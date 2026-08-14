@@ -9623,6 +9623,32 @@ fn run_canonical_typeahead(
     result
 }
 
+/// Repaint the live row from editor state, with the inline slash hint.
+#[cfg(unix)]
+fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
+    let buffer = editor.buffer_string();
+    let hint = typeahead_slash_hint(&buffer);
+    kitsu_render::live::live_input_update(buffer, editor.cursor(), hint);
+}
+
+/// Inline completion hint for the live editor: the remainder of the first
+/// registry slash command matching the typed `/prefix` (empty when the
+/// buffer is not a bare slash prefix or nothing matches).
+fn typeahead_slash_hint(buffer: &str) -> String {
+    let Some(rest) = buffer.strip_prefix('/') else {
+        return String::new();
+    };
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return String::new();
+    }
+    matching_slash_commands(rest)
+        .iter()
+        .map(|spec| spec.name)
+        .find(|name| name.len() > rest.len())
+        .map(|name| name[rest.len()..].to_string())
+        .unwrap_or_default()
+}
+
 /// The live during-turn editor: raw stdin bytes feed the pure
 /// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
@@ -9647,7 +9673,7 @@ fn run_live_typeahead(
     let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
     let mut raw = Some(raw);
     live::live_input_begin(prompt.clone());
-    live::live_input_update(editor.buffer_string(), editor.cursor());
+    update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
             if let Some(guard) = raw.take() {
@@ -9668,7 +9694,7 @@ fn run_live_typeahead(
                 Some(guard) => {
                     raw = Some(guard);
                     live::live_input_begin(prompt.clone());
-                    live::live_input_update(editor.buffer_string(), editor.cursor());
+                    update_live_row(&editor);
                 }
                 None => break,
             }
@@ -9721,6 +9747,7 @@ fn run_live_typeahead(
             break;
         }
         let outcome = editor.feed(&buffer[..count as usize]);
+        let mut needs_redraw = outcome.changed;
         for action in outcome.actions {
             match action {
                 typeahead_editor::EditorAction::Submit(line) => {
@@ -9733,13 +9760,22 @@ fn run_live_typeahead(
                 typeahead_editor::EditorAction::Eof => {
                     result.eof = true;
                 }
+                typeahead_editor::EditorAction::CompleteRequest => {
+                    // Tab accepts the inline slash hint, if one is showing.
+                    let buffer = editor.buffer_string();
+                    let hint = typeahead_slash_hint(&buffer);
+                    if !hint.is_empty() {
+                        editor.replace_buffer(&format!("{buffer}{hint}"));
+                        needs_redraw = true;
+                    }
+                }
             }
         }
         if result.eof {
             break;
         }
-        if outcome.changed {
-            live::live_input_update(editor.buffer_string(), editor.cursor());
+        if needs_redraw {
+            update_live_row(&editor);
         }
     }
     live::live_input_end();

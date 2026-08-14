@@ -17,16 +17,21 @@ use std::io::{self, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Mutex, OnceLock};
 
+use owo_colors::OwoColorize;
+
 use crate::{display_width, sanitize_terminal_text};
 
 /// The user's in-progress input during a foreground turn. `buffer` is plain
 /// sanitized text (the editor never stores control bytes); `cursor` is a char
-/// index into `buffer`.
+/// index into `buffer`. `hint` is a display-only inline completion suffix
+/// (e.g. the rest of a slash-command name) rendered dimmed after the buffer
+/// when the cursor sits at the end; it is never part of the draft itself.
 #[derive(Clone, Debug, Default, Eq, PartialEq)]
 pub struct LiveDraft {
     pub prompt: String,
     pub buffer: String,
     pub cursor: usize,
+    pub hint: String,
 }
 
 #[derive(Default)]
@@ -164,6 +169,34 @@ fn compose_row(
     }
     row.push_str(&draft.prompt);
     row.push_str(&visible);
+    // The completion hint renders dimmed after the draft, but only when the
+    // draft fully fit unwindowed, the cursor sits at its end, and the hint
+    // has room — a hint must never displace the text it completes. The
+    // cursor column stays before the hint so typing continues over it.
+    let buffer_chars = draft.buffer.chars().count();
+    let buffer_width = display_width(&visible);
+    let unwindowed = !visible.contains('…') || draft.buffer.contains('…');
+    if !draft.hint.is_empty()
+        && draft.cursor == buffer_chars
+        && unwindowed
+        && cursor_offset == buffer_width
+    {
+        let space = avail.saturating_sub(buffer_width);
+        let hint: String = {
+            let mut used = 0usize;
+            draft
+                .hint
+                .chars()
+                .take_while(|&ch| {
+                    used += crate::char_display_width(ch);
+                    used <= space
+                })
+                .collect()
+        };
+        if !hint.is_empty() {
+            row.push_str(&format!("{}", hint.dimmed()));
+        }
+    }
     (row, Some(lead + prompt_width + cursor_offset + 1))
 }
 
@@ -245,13 +278,14 @@ pub fn live_input_begin(prompt: String) {
             prompt,
             buffer: String::new(),
             cursor: 0,
+            hint: String::new(),
         });
     }
     redraw();
 }
 
 /// Update the draft text and cursor (char index). No-op if no draft is live.
-pub fn live_input_update(buffer: String, cursor: usize) {
+pub fn live_input_update(buffer: String, cursor: usize, hint: String) {
     {
         let mut row_state = state()
             .lock()
@@ -261,6 +295,7 @@ pub fn live_input_update(buffer: String, cursor: usize) {
         };
         draft.cursor = cursor.min(buffer.chars().count());
         draft.buffer = buffer;
+        draft.hint = hint;
     }
     redraw();
 }
@@ -325,6 +360,7 @@ mod tests {
             prompt: "kitsu> ".to_string(),
             buffer: "abc".to_string(),
             cursor: 2,
+            ..LiveDraft::default()
         };
         let (row, col) = compose_row(None, Some(&draft), 80);
         assert_eq!(row, "kitsu> abc");
@@ -345,6 +381,7 @@ mod tests {
             prompt: "kitsu> ".to_string(),
             buffer: "hello".to_string(),
             cursor: 5,
+            ..LiveDraft::default()
         };
         let (row, col) = compose_row(Some("( .a. ) kitsu is thinking"), Some(&draft), 20);
         assert!(!row.contains("thinking"));
@@ -361,11 +398,52 @@ mod tests {
     }
 
     #[test]
+    fn hint_renders_dimmed_after_the_draft_without_moving_the_cursor() {
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: "/que".to_string(),
+            cursor: 4,
+            hint: "ue".to_string(),
+        };
+        let (row, col) = compose_row(None, Some(&draft), 80);
+        assert!(row.contains("\u{1b}[2m"), "hint must be dimmed: {row:?}");
+        assert!(sanitize_terminal_text(&row).contains("/queue"));
+        // Cursor sits right after the typed text, before the hint.
+        assert_eq!(col, Some(12));
+    }
+
+    #[test]
+    fn hint_is_suppressed_mid_buffer_and_when_it_has_no_room() {
+        let mid_cursor = LiveDraft {
+            prompt: "> ".to_string(),
+            buffer: "/que".to_string(),
+            cursor: 2,
+            hint: "ue".to_string(),
+        };
+        let (row, _) = compose_row(None, Some(&mid_cursor), 80);
+        assert!(!row.contains("\u{1b}[2m"), "no hint mid-buffer: {row:?}");
+
+        let no_room = LiveDraft {
+            prompt: "> ".to_string(),
+            buffer: "/status".to_string(),
+            cursor: 7,
+            hint: "extra".to_string(),
+        };
+        // avail = 10 - 2 - 1 = 7: the buffer exactly fills it.
+        let (row, _) = compose_row(None, Some(&no_room), 10);
+        assert!(
+            !row.contains("extra"),
+            "hint must never displace text: {row:?}"
+        );
+    }
+
+    #[test]
     fn styled_prompt_measures_by_visible_width() {
         let draft = LiveDraft {
             prompt: "\u{1b}[1mkitsu>\u{1b}[0m ".to_string(),
             buffer: String::new(),
             cursor: 0,
+            ..LiveDraft::default()
         };
         let (_, col) = compose_row(None, Some(&draft), 80);
         assert_eq!(col, Some(8));
