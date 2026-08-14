@@ -1,109 +1,184 @@
-# Kimi-K3 cycle 5 — run failed on output-budget truncation, no deliverable from the model
+# Cycle-5 review: usage parsing & caching (kitsu-providers)
 
-**Status: FAILED (kitsu/model interaction, not a transport failure — no retry
-taken).** Kimi-K3 read both named files completely and cleanly, then was
-truncated by `--max-output-tokens 14000` before writing anything. All
-provisional output was discarded per kitsu's turn-commit semantics.
-`reviews/kimi-cycle-5.md` (this file) is written by the supervisor, not the
-model. The cycle-5 usage/caching review of `crates/kitsu-providers/src`
-carries over, unattempted, to the next cycle 5 retry.
+Scope: `crates/kitsu-providers/src/types.rs` (172 lines) and
+`crates/kitsu-providers/src/openai_compat.rs` (1694 lines) only. Line numbers
+refer to those files as read.
 
-## What happened
+## (a) Where usage is parsed, what is dropped, and how to surface `cached_tokens`
 
-Single attempt (no retry — see "Why no retry" below):
+### Parse sites
 
-| | attempt 1 |
-|---|---|
-| wall time | 106.8s |
-| tool calls | 3 (`Read` types.rs whole; `Read` openai_compat.rs 1-850; `Read` openai_compat.rs 850-1694) — 0 list calls, 0 `Agent` spawns |
-| ranged-read behavior | both `openai_compat.rs` ranges returned full width instantly (`0ms` each) — the range-cap fix continues to hold under load |
-| visible model output | one line only: "I'll read the two files now — all three ranges in parallel." Nothing else was ever emitted before truncation. |
-| `kitsu-usage` prompt/completion/total | 19,620 / 14,322 / 33,942 |
-| `kitsu-context` used/effective/window | 17,007 / 117,072 / 131,072 |
-| truncation warnings | 1 — `response truncated: model hit its output length limit` |
-| outcome | `provisional assistant output was DISCARDED and was not committed: model output was truncated by its length limit`; run summary `0 turn(s) ok / 1 failed, 3 file(s) read, 0 file(s) written (0 change(s))`; process exit code 2 |
+The `usage` payload is deserialized directly into the shared `Usage` struct at
+exactly two wire types in `openai_compat.rs`:
 
-`completion_tokens` (14,322) came in *over* the nominal 14,000 cap (hidden
-reasoning plus scaffolding), yet produced zero characters of the requested
-review — the entire budget was consumed invisibly. This is a materially
-worse outcome than cycle 4's success on the *same* 14,000 cap: cycle 4 read
-one 378-line file and finished in 6,282 completion tokens with a full
-deliverable; cycle 5 asked for two files totaling 1,866 lines (types.rs 172
-+ openai_compat.rs 1,694) with a two-part analytical task (locate/diagnose a
-drop, then rank proposals), and burned more than double cycle 4's completion
-tokens on reasoning alone before hitting the wall.
+1. **Streaming**: `StreamChunk.usage` — `openai_compat.rs` ~lines 283–294:
+   ```rust
+   #[serde(default)]
+   usage: Option<Usage>,
+   ```
+   captured in `SseDecoder::process_line` (~lines 430–436):
+   ```rust
+   if let Some(u) = chunk.usage {
+       if !u.is_empty() {
+           self.usage = Some(u);
+       }
+   }
+   ```
+   and emitted in `SseDecoder::finalize` (~lines 488–491) as
+   `ChatDelta::Usage(usage)` immediately before `ChatDelta::Done`.
 
-## Why no retry
+2. **Non-streaming**: `CompletionResponse.usage` — ~lines 337–342, surfaced in
+   `parse_completion` (~lines 590–595) with the same `is_empty()` gate, again as
+   `ChatDelta::Usage` before `Done`.
 
-The loop's rules permit "one run + at most one retry **on transport
-failure**". This attempt reached the provider, read both files
-successfully, and was truncated by kitsu's own output-length enforcement —
-an HTTP-200-all-the-way execution outcome, not a connection/rate-limit/5xx
-transport failure (contrast cycle 1's `429` or cycle 3's `402`, both of
-which were transport-layer and did warrant the permitted retry). Retrying
-with an identical command would very likely reproduce the same truncation,
-since nothing about the failure was transient. No retry was taken; this
-cycle is recorded as a single-attempt failure.
+Both paths deserialize into `types.rs` `Usage` (~lines 129–140):
 
-## Grounded analysis of the standing task, done by the supervisor since the model did not reach it
+```rust
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct Usage {
+    #[serde(default)]
+    pub prompt_tokens: u64,
+    #[serde(default)]
+    pub completion_tokens: u64,
+    #[serde(default)]
+    pub total_tokens: u64,
+}
+```
 
-To keep this failure record useful despite no model deliverable, the
-supervisor verified where usage is parsed and what cycle 5 would have found,
-using the same two files the model was given:
+### What is dropped
 
-- **`crates/kitsu-providers/src/types.rs:136-144`** — `Usage` has exactly
-  three fields: `prompt_tokens`, `completion_tokens`, `total_tokens`, each
-  `#[serde(default)]`, `Deserialize`d directly from the gateway's JSON
-  `usage` object. There is no `deny_unknown_fields` attribute, so any extra
-  JSON key the gateway sends — including HF's `prompt_tokens_details.
-  cached_tokens` — is silently dropped by serde during deserialization; it
-  never reaches Rust code to be ignored, checked, or logged. `Usage::add`
-  (`types.rs:153-157`) sums only these three fields across multi-round
-  turns, so even a later fix that captured `cached_tokens` per-response
-  would additionally need `add()` extended or cached tokens would still be
-  lost on merge.
-- **`crates/kitsu-providers/src/openai_compat.rs`** — usage flows through
-  two paths: streaming (struct field `usage: Option<Usage>` at line 252/294
-  and again as `StreamState::usage` at line 373-374; populated at line
-  449-453 when a chunk carries it, most gateways send it only on the final
-  chunk; surfaced as `ChatDelta::Usage` at line 534-535) and non-streaming
-  (`resp.usage` surfaced as `ChatDelta::Usage` at line 616-618, gated on
-  `!usage.is_empty()`). Both paths deserialize straight into the same
-  `Usage` type from `types.rs`, so the drop described above applies
-  identically to streaming and non-streaming responses.
-- This confirms the standing backlog item ("surface provider `cached_tokens`
-  ... in `kitsu-usage:` records") is real and precisely located: the fix is
-  a new `Option<CachedTokenDetails>`-shaped field on `Usage`
-  (`types.rs:137-144`) fed by a `prompt_tokens_details` struct with its own
-  `#[serde(default)]` `cached_tokens: u64`, then threading it through
-  `Usage::add` and into whatever renders `kitsu-usage:` lines (not in either
-  file the model was scoped to — likely `kitsu-render` per cycle 3's
-  citation of `crates/kitsu-render/src/lib.rs`).
-- This run's own `kitsu-usage:` line (`{"prompt_tokens":19620,
-  "completion_tokens":14322,"total_tokens":33942}`) has no `cached_tokens`
-  key, consistent with (not new proof of) the drop above — this was a
-  fresh, single-turn session with no cache-eligible repeated prefix, so
-  absence here doesn't distinguish "dropped" from "never offered."
+Because `Usage` has no `prompt_tokens_details` field and serde ignores unknown
+fields by default, **everything else in the wire `usage` object is silently
+discarded**, including:
 
-The 2-4 further ranked caching proposals the task asked for (model catalog/
-window discovery caching, retry/telemetry observations grounded in the two
-files) were **not** produced by the supervisor — that synthesis belongs to
-the model's read of the full 1,694-line `openai_compat.rs`, most of which
-the supervisor did not re-read end-to-end for this failure record. They
-remain open for the next cycle-5 attempt.
+- `prompt_tokens_details.cached_tokens` (returned by the HF router, OpenAI,
+  DeepSeek, vLLM with prefix caching, etc.)
+- `completion_tokens_details.reasoning_tokens`
+- any gateway-specific cost fields.
 
-## Follow-up required before the next attempt
+The drop happens at the `serde_json::from_value(value)` calls in
+`process_line` (~line 415) and `parse_completion` (~line 566) — the nested
+object is parsed into `serde_json::Value` and then thrown away by the typed
+conversion.
 
-- Raise `--max-output-tokens` further (e.g. 20,000-24,000) for any task that
-  asks the model to read *and analyze two* non-trivial files, not just one —
-  cycle 4's 14,000 cap was sufficient for a single 378-line file with a
-  simpler ask; cycle 5's two-file, two-part analytical ask exhausted the
-  same cap on reasoning alone.
-- Consider splitting cycle 5 further: one attempt to just locate and
-  line-cite the `cached_tokens` drop (small, cycle-4-shaped), a second to
-  produce the ranked caching proposals — mirroring the ramp's own strategy
-  of narrowing scope until a turn reliably completes.
-- This is the first cycle where **completion_tokens exceeded the nominal
-  cap** (14,322 vs 14,000) rather than merely approaching it — worth noting
-  precisely for the open reasoning-headroom backlog item, since it shows
-  the overrun is not bounded by the cap being "close" to sufficient.
+A second, subtler drop: the `is_empty()` gates (`types.rs` ~lines 144–148;
+used at `openai_compat.rs` ~lines 432 and ~591) treat an all-zero triple as
+"not reported". A gateway that reports *only* `cached_tokens` (e.g. a full
+prefix-cache hit billed as 0 prompt tokens) is currently indistinguishable
+from silence and its usage chunk is discarded entirely.
+
+### Proposed edits (line-cited)
+
+1. **`types.rs`, after line ~140 — extend `Usage`:**
+
+   ```rust
+   /// Nested prompt-token breakdown reported by some gateways (OpenAI,
+   /// HF router, vLLM). Absent when the gateway does not report it.
+   #[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+   pub struct PromptTokensDetails {
+       #[serde(default)]
+       pub cached_tokens: u64,
+   }
+   ```
+   and add to `Usage`:
+   ```rust
+   #[serde(default)]
+   pub prompt_tokens_details: Option<PromptTokensDetails>,
+   ```
+   `Usage` stays `Copy` (the nested struct is `Copy`), so no call-site
+   ownership changes are needed.
+
+2. **`types.rs` `impl Usage` (~lines 142–161):**
+   - Add an accessor so downstream crates never touch the nested option:
+     ```rust
+     pub fn cached_tokens(&self) -> u64 {
+         self.prompt_tokens_details.map_or(0, |d| d.cached_tokens)
+     }
+     ```
+   - Extend `add()` (~lines 156–160) to sum the breakdown across multi-round
+     turns (this is the exact aggregation point kitsu-core uses per turn):
+     ```rust
+     pub fn add(&mut self, other: Usage) {
+         self.prompt_tokens += other.prompt_tokens;
+         self.completion_tokens += other.completion_tokens;
+         self.total_tokens += other.total_tokens;
+         let cached = self.cached_tokens() + other.cached_tokens();
+         self.prompt_tokens_details = Some(PromptTokensDetails { cached_tokens: cached });
+     }
+     ```
+     (Setting `Some` unconditionally is fine: a zero sum serializes as 0 and
+     preserves the existing "all-zero means unreported" convention.)
+   - Deliberately **do not** change `is_empty()` to include `cached_tokens`:
+     a cache-hit-only chunk would then mark usage as "reported" while
+     prompt/completion stay 0, breaking the documented contract at
+     ~lines 125–128. Instead, if cache-only chunks matter, gate on
+     `!u.is_empty() || u.cached_tokens() > 0` at the two capture sites
+     (`openai_compat.rs` ~lines 432 and ~591).
+
+3. **`openai_compat.rs`: no parse-site changes required.** `StreamChunk.usage`
+   (~line 291) and `CompletionResponse.usage` (~line 340) deserialize into
+   `Usage` directly, so the nested field flows through automatically once the
+   struct grows it. Only the optional `is_empty` gate tweak above touches this
+   file.
+
+4. **Into kitsu-usage records (interface note):** `ChatDelta::Usage(Usage)`
+   (`types.rs` ~line 168) already carries the full struct to the consumer, so
+   kitsu-core's per-turn aggregation (`Usage::add`) and the kitsu-usage record
+   writer need only read `usage.cached_tokens()` and store it as a new
+   `cached_tokens: u64` field. No provider-trait signature change is needed —
+   the type change is additive and backward-compatible on the wire
+   (`#[serde(default)]`).
+
+## (b) Further ranked caching proposals (grounded only in these two files)
+
+### 1. (Highest) Send a cache key / enable prefix-cache affinity on requests
+
+`WireRequest` (`openai_compat.rs` ~lines 107–126) sends exactly
+`model/messages/tools/stream/stream_options/temperature/reasoning_effort/
+max_tokens` — see `build_body` (~lines 250–262). There is no
+`prompt_cache_key` (OpenAI/HF-router supported) or any cache-affinity hint, so
+gateways that shard their prompt cache by an explicit key cannot be leveraged,
+and retries (`chat_stream_with_telemetry` retry loop, ~lines 1290–1500) and
+multi-round tool turns re-send the identical long prefix with no affinity
+signal. **Proposal:** add `pub prompt_cache_key: Option<String>` to
+`ChatRequest` (`types.rs` ~lines 89–102) and a matching
+`#[serde(skip_serializing_if = "Option::is_none")]` field on `WireRequest`,
+populated by the caller (e.g. session id). This directly increases the hit
+rate of the very `cached_tokens` metric proposed in (a). Value: high; cost:
+two additive fields.
+
+### 2. Make cache-hit-only usage chunks survive the `is_empty()` gate
+
+As noted in (a), `SseDecoder::process_line` (~lines 430–436) and
+`parse_completion` (~lines 590–595) drop usage where all three counters are
+zero. On gateways with aggressive prefix caching, a full-cache-hit completion
+can legitimately report `prompt_tokens: 0` with nonzero
+`prompt_tokens_details.cached_tokens`; today that signal vanishes. **Proposal:**
+after edit (a).1 lands, change both gates to
+`if !u.is_empty() || u.cached_tokens() > 0`. Value: medium-high (correctness
+of cache telemetry); cost: two one-line edits. Ranked below (1) because it
+only matters once (a) exists.
+
+### 3. Cache the *parsed* per-model context length, not just the raw catalog body
+
+`models_cache` (~lines 40–49, TTLs at ~lines 61–63) caches the raw catalog
+text, and `model_context_length` (~lines 1200–1250) re-parses the full JSON
+and re-runs the exact/loose-match scan on every call. The cache lock is even
+held across the fetch (~line 1160) to prevent stampedes, so the design already
+accepts a small critical section. **Proposal:** add a second
+`Mutex<HashMap<String, Option<u64>>>` (or store a parsed index in
+`ModelsCacheEntry`) keyed by model id, populated by `model_context_length`.
+Value: low-medium — these calls are advisory and rare (startup discovery,
+`/model`), which is why this ranks last; but it is a pure win with no wire
+behavior change, grounded entirely in the existing cache structure at
+~lines 1140–1195.
+
+### Non-proposals (considered and rejected as ungrounded)
+
+- Anthropic-style `cache_control` breakpoints on messages: `WireMessage`
+  (~lines 133–141) has no such field, but nothing in these two files shows any
+  gateway Kitsu targets consuming it — only the generic OpenAI-compatible
+  shape. Skipped per "skip anything you cannot ground".
+- Response-body memoization: contradicts the explicit streaming design
+  (`sse_step`, ~lines 1090–1145) and the bounded-body contract
+  (~lines 355–362). Not a caching win worth the correctness risk.
