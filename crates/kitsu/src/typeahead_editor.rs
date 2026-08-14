@@ -11,9 +11,11 @@
 //! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
 //! newline), Tab (requests inline-hint completion from the collector; the
 //! editor itself is hint-agnostic), and lone Esc (clears the draft — the
-//! collector resolves it on a quiet poll tick via
-//! [`TypeaheadEditor::resolve_lone_escape`], so real escape sequences,
-//! which arrive atomically, are unaffected). A bracketed paste
+//! collector resolves it via [`TypeaheadEditor::resolve_lone_escape`]
+//! after two consecutive quiet ~50ms poll timeouts, so real escape
+//! sequences, which arrive atomically, are unaffected; a link slow enough
+//! to split a sequence across >100ms will misread it, the standard
+//! escape-time tradeoff every terminal editor makes). A bracketed paste
 //! (`ESC[200~`…`ESC[201~`) stays one draft block:
 //! its newlines insert literally instead of submitting. Unknown escape
 //! sequences are consumed and ignored so they never leak into the draft.

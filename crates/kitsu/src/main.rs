@@ -9672,6 +9672,8 @@ fn run_live_typeahead(
     };
     let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
     let mut raw = Some(raw);
+    // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
+    let mut quiet_ticks = 0u32;
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
@@ -9721,15 +9723,23 @@ fn run_live_typeahead(
             }
             break;
         }
-        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-            // A quiet tick after a bare ESC byte means the user pressed the
-            // Esc key itself (a real escape sequence arrives atomically):
-            // Esc clears the draft.
-            if editor.resolve_lone_escape() {
+        if ready == 0 {
+            // Two consecutive true timeouts (~100ms) after a bare ESC byte
+            // mean the user pressed the Esc key itself — real escape
+            // sequences arrive atomically, and the double tick tolerates a
+            // slow link splitting ESC from its tail across reads. Error
+            // revents deliberately don't count as quiet: only a timeout is
+            // evidence that no bytes are inbound.
+            quiet_ticks += 1;
+            if quiet_ticks >= 2 && editor.resolve_lone_escape() {
                 update_live_row(&editor);
             }
             continue;
         }
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        quiet_ticks = 0;
 
         let mut buffer = [0u8; 1024];
         // SAFETY: reads into a stack buffer of the stated length from the
