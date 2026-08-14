@@ -298,7 +298,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   before `(`, dim after, and sanitizes back to `◆ Read(x)`; plain form still
   `tool> Read(x)`; workspace green.
 
-- [ ] **13. Agent deck: last-activity progress rows for running agents** (M)
+- [x] **13. Agent deck: last-activity progress rows for running agents** (M) — done 2026-08-14 (ce92b36, interactive loop cycle 16)
   Claude Code shows a progress tree for subagents; kitsu's `/jobs` deck rows
   are single lines. For each **Running** deck row, render one indented
   dimmed child row `  ↳ <last tool receipt or "no activity yet"> · <age>`
@@ -465,9 +465,14 @@ as escalation); findings are re-verified before applying. Cycle log:
   three tiers round-trip; live-verified in a scripted repo. SHIP-AS-IS
   review (4th clean): counting edges correct or acceptable-rare
   (diff-of-diff inflation, diff --cc undercount).
-- Backlog: soft-wrap of overlong single lines (nice-to-have); original
-  queue items 10 (syntect) and 13 (agent deck rows) remain available
-  for future ticks.
+- **Cycle 16 (2026-08-14, ce92b36)**: original-queue item 13 shipped —
+  running deck rows carry '↳ <activity> · <age> ago' children from a
+  new last_activity_at instant; stalled background agents visible at a
+  glance. SHIP-AS-IS review (5th clean): lock coverage, no JSONL age
+  leak, separator-injection safe.
+- Backlog: original-queue item 10 (syntect syntax highlighting — adds a
+  dependency, note build impact per its spec) and soft-wrap remain; the
+  interactive loop is otherwise complete.
 
 ## Protocol
 
