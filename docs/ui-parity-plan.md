@@ -483,6 +483,14 @@ as escalation); findings are re-verified before applying. Cycle log:
   SHIP-AS-IS review (7th clean). **EVERY RECORDED ITEM ACROSS BOTH
   QUEUES IS NOW COMPLETE.** Future ticks: pure maintenance — probe for
   new gaps, report no-gap when none, keep cost near zero.
+- **Cycle 19 (2026-08-14, b502f77)**: maintenance probe found the live
+  editor had no word-wise editing (Claude Code has the readline set).
+  Shipped: Alt+B/F + Ctrl/Alt+←/→ (CSI "1;5"/"1;3") word motion, Alt+D
+  + Ctrl+Delete (CSI "3;5~") delete-word-ahead, Alt+Backspace joining
+  Ctrl+W behind; word_end mirrors the word_start scan; meta bytes
+  inside a bracketed paste stay content (pasted "ESC b" inserts 'b').
+  PTY smoke 3/3; SHIP-AS-IS review (8th clean) traced paste guard,
+  search-mode ESC handoff, bounds, CSI param fallbacks, lone-Esc.
 
 ## Protocol
 
