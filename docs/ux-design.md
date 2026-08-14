@@ -60,7 +60,26 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
 - **Spinner**: fox kaomoji frames `( ･ᴥ･ )ﾉ`, `( ･ᴥ･ )～`, `( ･ᴥ･ ) ～`,
   `( ﾉᴥﾉ )～` in FOX, padded to one width; reduced-motion/plain: static
   `* kitsu is thinking`; non-TTY: `~ still waiting on the model (Ns)...`
-  heartbeat.
+  heartbeat. The animated frames render through the shared live status row
+  (below), never via bare `\r` writes.
+- **Live status row** (`kitsu-render::live`): during a foreground turn on a
+  styled interactive TTY, one rewritable stderr row at the transcript bottom
+  holds the spinner segment and a live type-ahead draft — `kitsu> <text>`
+  with a real terminal cursor. stdin drops to raw mode (`ICANON|ECHO` off,
+  `ISIG` kept so Ctrl+C still cancels) and bytes feed the pure
+  `TypeaheadEditor` keymap: printable insert, ←/→/Home/End, Backspace/Delete,
+  ↑/↓ history (seeded from the rustyline history, with a draft stash),
+  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Enter routes exactly like
+  canonical type-ahead (`/steer`, `/jobs`, `/queue`, `/quit cancel`
+  immediate; everything else queues) and prints an immediate teal
+  `~ queued: <text>` receipt. Transcript writers wrap output in
+  `with_live_row_suspended` (clear row → write line → repaint), an
+  over-wide draft windows around the cursor with `…`, a too-narrow terminal
+  drops the spinner segment first, and approval prompts hide the row and
+  restore canonical echo while they own stdin. An unsubmitted draft is
+  carried into the next live editor or pre-filled into the next idle prompt.
+  Non-TTY, `--plain`, and assistive sessions keep the canonical
+  line-collector loop with byte-identical output.
 - **Errors**: one weighted `! error: <message>` first line (EMBER, bold on a
   styled TTY) plus untinted hint lines; identical text with zero escape bytes
   elsewhere. Failed turns print no human stats line and no DISCARDED notice
