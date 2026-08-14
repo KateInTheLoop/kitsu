@@ -112,6 +112,27 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 
 ## Improvement backlog (fed by supervisor observations)
 
+Kimi-authored proposals from cycle 5 attempt 2 (banked 2026-08-14 at
+B+, commit 0751f0e on dogfood/kimi-k3; spot-checked — content accurate,
+line numbers drift 20-48 lines in one region of openai_compat.rs):
+
+- [ ] Surface `cached_tokens`: add a `PromptTokensDetails` field to
+  `Usage` (types.rs:136-144) with accessor, extend `Usage::add`, and
+  widen `is_empty()` — Kimi's design is backward-compatible and matches
+  the attempt-1 grounding.
+- [ ] `Usage::is_empty()` would discard a legitimate cache-hit-only
+  chunk (zero prompt/completion, nonzero cached_tokens) even after a
+  naive cached_tokens fix — Kimi-found edge case the human grounding
+  missed; fix together with the above.
+- [ ] Add `prompt_cache_key` to `WireRequest` (verified absent) so
+  providers that key prompt caches can be steered.
+- [ ] Cache parsed `model_context_length` across runs (window discovery
+  re-parses every start).
+- [ ] Tool-UX (cycle-5 supervisor): the Write tool's blind-overwrite
+  guard surprises models mid-turn ('requires expected_previous_content'
+  → an extra Read/Write round-trip); state the read-before-overwrite
+  precondition in the tool description up front.
+
 Kimi-authored proposals from cycle 4 (verified citations; triage into
 kitsu-core work as capacity allows):
 
