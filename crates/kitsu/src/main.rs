@@ -9445,7 +9445,7 @@ impl RawStdinGuard {
     fn engage() -> Option<Self> {
         // SAFETY: tcgetattr/tcsetattr write through a valid pointer to one
         // termios struct; stdin's fd is process-owned and stays open.
-        unsafe {
+        let original = unsafe {
             let mut modes: libc::termios = std::mem::zeroed();
             if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) != 0 {
                 return None;
@@ -9457,14 +9457,32 @@ impl RawStdinGuard {
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes) != 0 {
                 return None;
             }
-            Some(Self { original })
+            original
+        };
+        // Bracketed paste on: a mid-turn paste arrives as one `ESC[200~`
+        // delimited block instead of loose lines, so the editor can keep it
+        // as a single draft. Terminals without support ignore the sequence.
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"\x1b[?2004h");
+            let _ = err.flush();
         }
+        Some(Self { original })
     }
 }
 
 #[cfg(unix)]
 impl Drop for RawStdinGuard {
     fn drop(&mut self) {
+        // Bracketed paste off before handing stdin back: rustyline and the
+        // approval reader manage their own paste mode expectations.
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"\x1b[?2004l");
+            let _ = err.flush();
+        }
         // SAFETY: restores the termios snapshot captured in `engage`.
         unsafe {
             libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);

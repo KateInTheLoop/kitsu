@@ -69,10 +69,14 @@ Torii milestones mark the session passing a gate — compaction, `/new`,
   `ISIG` kept so Ctrl+C still cancels) and bytes feed the pure
   `TypeaheadEditor` keymap: printable insert, ←/→/Home/End, Backspace/Delete,
   ↑/↓ history (seeded from the rustyline history, with a draft stash),
-  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Enter routes exactly like
-  canonical type-ahead (`/steer`, `/jobs`, `/queue`, `/quit cancel`
-  immediate; everything else queues) and prints an immediate teal
-  `~ queued: <text>` receipt. Transcript writers wrap output in
+  Ctrl+U/K/W kills, Ctrl+D EOF on an empty draft. Raw mode enables
+  bracketed paste (`ESC[?2004h`, off again on release): a pasted block stays
+  ONE draft — its newlines insert literally (`\r\n` collapsed, tabs kept)
+  and render as `⏎`/`⇥` placeholders on the row — and Alt+Enter inserts a
+  manual newline; terminals without bracketed paste keep line-at-a-time
+  submission. Enter routes exactly like canonical type-ahead (`/steer`,
+  `/jobs`, `/queue`, `/quit cancel` immediate; everything else queues) and
+  prints an immediate teal `~ queued: <text>` receipt. Transcript writers wrap output in
   `with_live_row_suspended` (clear row → write line → repaint), an
   over-wide draft windows around the cursor with `…`, a too-narrow terminal
   drops the spinner segment first, and approval prompts hide the row and
