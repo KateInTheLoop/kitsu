@@ -208,7 +208,23 @@ fn compose_row(
         .skip(line_start)
         .take(line_end - line_start)
         .collect();
-    let (visible, cursor_offset, windowed) = fit_draft_window(&line, cursor_in_line, buffer_avail);
+    let line_mapped: String = line.chars().map(display_char).collect();
+    let (visible, cursor_offset, windowed) = if !draft.hint_reserved
+        && soft_wrap_active(
+            line.chars().count(),
+            cursor_in_line,
+            display_width(&line_mapped),
+            buffer_avail,
+        ) {
+        // Soft wrap: the bottom row carries only the final width segment
+        // (earlier segments are context rows); it fits by construction.
+        let segments = wrap_segments(&line, buffer_avail);
+        let last = segments.last().cloned().unwrap_or_default();
+        let offset = display_width(&last);
+        (last, offset, false)
+    } else {
+        fit_draft_window(&line, cursor_in_line, buffer_avail)
+    };
     let mut row = String::new();
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
@@ -269,6 +285,65 @@ fn compose_row(
     (row, Some(lead + prompt_width + cursor_offset + 1))
 }
 
+/// The columns available to the draft text on the status row, given the
+/// spinner segment, queue tag, and prompt — the SAME math compose_row uses,
+/// shared so soft-wrap segmentation agrees between the bottom row and the
+/// wrap context rows. Pure.
+fn draft_segment_width(
+    spinner: Option<&str>,
+    draft: &LiveDraft,
+    queued: usize,
+    cols: usize,
+) -> usize {
+    let spinner_width = spinner.map(|segment| display_width(&sanitize_terminal_text(segment)));
+    let queue_tag_width = if queued > 0 {
+        display_width(&format!("[{queued} queued] "))
+    } else {
+        0
+    };
+    let prompt_width = display_width(&sanitize_terminal_text(&draft.prompt)) + queue_tag_width;
+    let lead = match spinner_width {
+        Some(width) if width + 2 + prompt_width + 8 <= cols => width + 2,
+        _ => 0,
+    };
+    cols.saturating_sub(lead + prompt_width + 1)
+}
+
+/// Greedy display-width segmentation of one (display-mapped) logical line —
+/// the soft-wrap unit. Pure.
+fn wrap_segments(line: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut segments = Vec::new();
+    let mut current = String::new();
+    let mut used = 0usize;
+    for ch in line.chars().map(display_char) {
+        let w = crate::char_display_width(ch);
+        if used + w > width && !current.is_empty() {
+            segments.push(std::mem::take(&mut current));
+            used = 0;
+        }
+        current.push(ch);
+        used += w;
+    }
+    if !current.is_empty() || segments.is_empty() {
+        segments.push(current);
+    }
+    segments
+}
+
+/// Soft-wrap applies when the cursor rests at the END of a logical line too
+/// wide for the status row (the dominant typing case): earlier segments
+/// become context rows and the bottom row shows only the final segment.
+/// Mid-line cursors keep the horizontal window. Pure.
+fn soft_wrap_active(
+    line_chars: usize,
+    cursor_in_line: usize,
+    line_width: usize,
+    avail: usize,
+) -> bool {
+    avail >= 8 && cursor_in_line == line_chars && line_width > avail
+}
+
 /// Char-index bounds of the logical line containing `cursor` (newline-split)
 /// plus the cursor's offset within it. Pure.
 fn current_line_bounds(buffer: &str, cursor: usize) -> (usize, usize, usize) {
@@ -287,13 +362,90 @@ fn current_line_bounds(buffer: &str, cursor: usize) -> (usize, usize, usize) {
     (start, end, cursor - start)
 }
 
+/// Wrap context rows for one logical line (soft-wrap): when the cursor sits
+/// at the line's end and it overflows the status row, all but the final
+/// width segment render as dim '│' rows above (older segments collapse into
+/// a '⋮ +N earlier' marker). Pure.
+fn compose_wrap_rows_for_line(
+    line: &str,
+    cursor_in_line: usize,
+    cols: usize,
+    segment_width: usize,
+) -> Vec<String> {
+    let line_mapped: String = line.chars().map(display_char).collect();
+    if !soft_wrap_active(
+        line.chars().count(),
+        cursor_in_line,
+        display_width(&line_mapped),
+        segment_width,
+    ) {
+        return Vec::new();
+    }
+    let clamp = |plain: String| -> String {
+        if display_width(&plain) <= cols {
+            return plain;
+        }
+        let budget = cols.saturating_sub(1);
+        let mut used = 0usize;
+        let mut clipped: String = plain
+            .chars()
+            .take_while(|&ch| {
+                used += crate::char_display_width(ch);
+                used <= budget
+            })
+            .collect();
+        clipped.push('…');
+        clipped
+    };
+    let segments = wrap_segments(line, segment_width);
+    let earlier = segments.len().saturating_sub(1);
+    let mut rows = Vec::new();
+    if earlier > 2 {
+        rows.push(format!(
+            "{}",
+            clamp(format!("  ⋮ +{} earlier segment(s)", earlier - 2)).dimmed()
+        ));
+    }
+    for segment in segments
+        .iter()
+        .take(earlier)
+        .skip(earlier.saturating_sub(2))
+    {
+        rows.push(format!("{}", clamp(format!("  │ {segment}")).dimmed()));
+    }
+    rows
+}
+
+/// Single-line wrapper used by compose_draft_context_rows' early return.
+fn compose_wrap_rows(
+    buffer: &str,
+    cursor: usize,
+    cols: usize,
+    segment_width: usize,
+) -> Vec<String> {
+    compose_wrap_rows_for_line(
+        buffer,
+        cursor.min(buffer.chars().count()),
+        cols,
+        segment_width,
+    )
+}
+
 /// Dim context rows for a multi-line draft: up to two logical lines above
 /// the cursor's line (older lines collapse into a `⋮ +N earlier` marker)
 /// and a `⋮ +N below` marker when lines exist after the cursor's line.
 /// The cursor's own line renders on the status row itself. Pure.
-fn compose_draft_context_rows(buffer: &str, cursor: usize, cols: usize) -> Vec<String> {
+fn compose_draft_context_rows(
+    buffer: &str,
+    cursor: usize,
+    cols: usize,
+    // 0 disables soft-wrap rows (reserved-hint mode shrinks the bottom row,
+    // which would desync wrap boundaries between rows).
+    segment_width: usize,
+) -> Vec<String> {
     if !buffer.contains('\n') {
-        return Vec::new();
+        // Single-line drafts can still soft-wrap.
+        return compose_wrap_rows(buffer, cursor, cols, segment_width);
     }
     let chars: Vec<char> = buffer.chars().collect();
     let cursor = cursor.min(chars.len());
@@ -333,6 +485,18 @@ fn compose_draft_context_rows(buffer: &str, cursor: usize, cols: usize) -> Vec<S
             .collect();
         rows.push(format!("{}", clamp(format!("  │ {text}")).dimmed()));
     }
+    let (line_start, line_end, _) = current_line_bounds(buffer, cursor);
+    let cursor_line_text: String = buffer
+        .chars()
+        .skip(line_start)
+        .take(line_end - line_start)
+        .collect();
+    rows.extend(compose_wrap_rows_for_line(
+        &cursor_line_text,
+        cursor.min(buffer.chars().count()) - line_start,
+        cols,
+        segment_width,
+    ));
     let after = lines.len().saturating_sub(cursor_line + 1);
     if after > 0 {
         // Name the submit semantics: only the cursor line is visible on the
@@ -453,10 +617,16 @@ fn render_region(err: &mut impl Write, row_state: &mut LiveRowState, cols: usize
         Vec::new()
     };
     if let Some(draft) = &row_state.draft {
+        let segment_width = if draft.hint_reserved {
+            0
+        } else {
+            draft_segment_width(row_state.spinner.as_deref(), draft, row_state.queued, cols)
+        };
         upper.extend(compose_draft_context_rows(
             &draft.buffer,
             draft.cursor,
             cols,
+            segment_width,
         ));
     }
     let (status, cursor_col) = compose_row(
@@ -736,11 +906,13 @@ mod tests {
     fn hint_respects_windowing_even_when_the_buffer_contains_a_literal_ellipsis() {
         // Windowed + literal `…` in the buffer: the hint must stay hidden
         // (the pre-fix heuristic sniffed `…` out of the visible text and
-        // wrongly rendered a hint over trimmed content).
+        // wrongly rendered a hint over trimmed content). A MID-line cursor
+        // keeps the window; soft-wrap only engages at end-of-line, where a
+        // hint became legitimate (nothing on the row is hidden anymore).
         let trimmed = LiveDraft {
             prompt: "> ".to_string(),
             buffer: "/que…something-long-enough-to-trim".to_string(),
-            cursor: 34,
+            cursor: 10,
             hint: "ue".to_string(),
             hint_reserved: false,
         };
@@ -749,6 +921,14 @@ mod tests {
             !row.contains("\u{1b}[2m"),
             "no hint on a windowed draft: {row:?}"
         );
+        // End-of-line on the same overlong buffer soft-wraps: the tail
+        // segment fully fits, so the hint may render (new, intended).
+        let wrapped = LiveDraft {
+            cursor: 34,
+            ..trimmed.clone()
+        };
+        let (row, _) = compose_row(None, Some(&wrapped), 0, 16);
+        assert!(row.contains("\u{1b}[2m"), "hint on wrapped tail: {row:?}");
 
         // Unwindowed + literal `…`: the hint still renders.
         let fits = LiveDraft {
@@ -844,6 +1024,72 @@ mod tests {
     }
 
     #[test]
+    fn soft_wrap_segments_and_rows_agree_with_the_bottom_row() {
+        // 26 chars at width 10 → segments of 10/10/6.
+        let line = "abcdefghijklmnopqrstuvwxyz";
+        let segments = wrap_segments(line, 10);
+        assert_eq!(segments, vec!["abcdefghij", "klmnopqrst", "uvwxyz"]);
+        // Cursor at end of the overlong line, prompt "kitsu> " (7) at 18
+        // cols → avail = 10; bottom row shows the FINAL segment, cursor
+        // after it, and the two earlier segments render as wrap rows.
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: line.to_string(),
+            cursor: 26,
+            ..LiveDraft::default()
+        };
+        let (row, col) = compose_row(None, Some(&draft), 0, 18);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            plain.ends_with("uvwxyz"),
+            "bottom shows final segment: {plain}"
+        );
+        assert!(
+            !plain.contains('…'),
+            "soft wrap replaces the window: {plain}"
+        );
+        assert_eq!(col, Some(7 + 6 + 1));
+        let rows = compose_draft_context_rows(line, 26, 18, 10);
+        let plain_rows: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert_eq!(plain_rows.len(), 2, "{plain_rows:?}");
+        assert!(plain_rows[0].contains("abcdefghij"));
+        assert!(plain_rows[1].contains("klmnopqrst"));
+        // Many segments collapse older ones into a marker.
+        let long = "x".repeat(65);
+        let rows = compose_draft_context_rows(&long, 65, 80, 10);
+        let plain_rows: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
+        assert!(
+            plain_rows[0].contains("+4 earlier segment(s)"),
+            "{plain_rows:?}"
+        );
+        assert_eq!(plain_rows.len(), 3);
+    }
+
+    #[test]
+    fn soft_wrap_stays_off_mid_line_when_short_and_under_reserved_hints() {
+        let line = "abcdefghijklmnopqrstuvwxyz";
+        // Mid-line cursor keeps the horizontal window (no wrap rows).
+        assert!(compose_draft_context_rows(line, 12, 18, 10).is_empty());
+        let draft = LiveDraft {
+            prompt: "kitsu> ".to_string(),
+            buffer: line.to_string(),
+            cursor: 12,
+            ..LiveDraft::default()
+        };
+        let (row, _) = compose_row(None, Some(&draft), 0, 18);
+        assert!(
+            sanitize_terminal_text(&row).contains('…'),
+            "window still used"
+        );
+        // Short lines never wrap.
+        assert!(compose_draft_context_rows("short", 5, 18, 10).is_empty());
+        // segment_width 0 (reserved-hint mode) disables wrap rows.
+        assert!(compose_draft_context_rows(line, 26, 18, 0).is_empty());
+        // Tiny widths refuse to wrap (fall back to the window).
+        assert!(compose_draft_context_rows(line, 26, 18, 5).is_empty());
+    }
+
+    #[test]
     fn current_line_bounds_split_on_newlines() {
         assert_eq!(current_line_bounds("abc", 2), (0, 3, 2));
         // "ab\ncd\nef" — cursor on 'd' (index 4): line "cd" spans 3..5.
@@ -875,7 +1121,7 @@ mod tests {
         // 7 prompt + 5 chars of "third" + 1.
         assert_eq!(col, Some(13));
 
-        let rows = compose_draft_context_rows(&draft.buffer, draft.cursor, 80);
+        let rows = compose_draft_context_rows(&draft.buffer, draft.cursor, 80, 70);
         let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
         assert_eq!(plain.len(), 2);
         assert!(plain[0].contains("first line"));
@@ -886,7 +1132,7 @@ mod tests {
     fn context_rows_collapse_far_lines_into_markers() {
         let buffer = "l1\nl2\nl3\nl4\nl5\nl6";
         // Cursor in l5 (chars: l1\n=3 ... start of l5 = 12).
-        let rows = compose_draft_context_rows(buffer, 13, 80);
+        let rows = compose_draft_context_rows(buffer, 13, 80, 70);
         let plain: Vec<String> = rows.iter().map(|r| sanitize_terminal_text(r)).collect();
         assert!(plain[0].contains("+2 earlier line(s)"), "{plain:?}");
         assert!(plain[1].contains("l3"));
@@ -894,9 +1140,9 @@ mod tests {
         assert!(plain[3].contains("+1 line(s) below — Enter submits all"));
         assert_eq!(plain.len(), 4);
         // Single-line drafts produce no context rows.
-        assert!(compose_draft_context_rows("plain", 3, 80).is_empty());
+        assert!(compose_draft_context_rows("plain", 3, 80, 70).is_empty());
         // Narrow terminals clamp context rows too.
-        for row in compose_draft_context_rows(buffer, 13, 8) {
+        for row in compose_draft_context_rows(buffer, 13, 8, 6) {
             assert!(display_width(&sanitize_terminal_text(&row)) <= 8);
         }
     }
