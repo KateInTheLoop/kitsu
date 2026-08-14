@@ -217,6 +217,14 @@ guarantees requires a new schema identifier.
   not a model filesystem grant. A script
   selects its last fully committed turn. Discarded and `committed_partial`
   payloads do not produce this receipt or replace the destination.
+  When `-o` was requested but the run produced no fully committed assistant,
+  the destination remains exactly as it was (including remaining absent) and
+  `final_summary.output_last_message_state` is
+  `"preserved_no_committed_assistant"`. Human output says
+  `--output-last-message unchanged: no committed assistant message`. This
+  additive summary field is absent after a successful installation and when a
+  committed assistant exists but another typed finalization error prevents the
+  installation.
 - A detached job whose terminal result was not already consumed is emitted as a
   `background_result` before `final_summary`; successful detached work is never
   silently lost when a script exits. An unacknowledged failed job also makes
