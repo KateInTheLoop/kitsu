@@ -475,9 +475,14 @@ as escalation); findings are re-verified before applying. Cycle log:
   buffered and streamed paths (shared LineStyler), fancy-regex backend,
   SGR-only additions with the round-trip pinned. SHIP-AS-IS review
   (6th clean). **THE ORIGINAL IMPLEMENTATION QUEUE IS COMPLETE: 13/13.**
-- Backlog: soft-wrap of overlong single lines (nice-to-have) is the
-  only remaining optional item. The interactive loop is complete —
-  future ticks are pure maintenance unless new gaps surface.
+- **Cycle 18 (2026-08-14, 50b3374)**: soft-wrap shipped — the final
+  backlog item. Overlong lines wrap into dim '│' segment rows as you
+  type (end-of-line cursors; mid-line keeps the window; reserved-hint
+  mode gated off; shared draft_segment_width geometry). One principled
+  refinement: hints may render on a wrapped tail (nothing hidden).
+  SHIP-AS-IS review (7th clean). **EVERY RECORDED ITEM ACROSS BOTH
+  QUEUES IS NOW COMPLETE.** Future ticks: pure maintenance — probe for
+  new gaps, report no-gap when none, keep cost near zero.
 
 ## Protocol
 
