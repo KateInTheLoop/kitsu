@@ -197,7 +197,7 @@ fn stream_sanitizer() -> &'static Mutex<TerminalTextSanitizer> {
 /// bypasses this entirely, preserving byte-identical output. This is a deliberate tradeoff:
 /// styled TTY output becomes line-granular (stalled at line boundaries) instead of
 /// token-granular, but preserves the buffered-message styling semantics on the live path.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct StreamBuffer {
     buffer: String,
     styler: LineStyler,
@@ -497,9 +497,55 @@ fn find_pair(chars: &[char], from: usize, needle: &[char]) -> Option<usize> {
 ///
 /// The fence state machine is essential: styling must respect code fence boundaries
 /// across line boundaries. `reset()` ends the current turn and clears fence state.
-#[derive(Debug, Default)]
+#[derive(Default)]
 struct LineStyler {
     fence: Option<String>,
+    /// Stateful syntect highlighter for the current fence, when its language
+    /// is recognized (ui-parity item 10). Highlighting adds SGR only — the
+    /// sanitize round-trip always recovers the exact source text.
+    highlighter: Option<syntect::easy::HighlightLines<'static>>,
+}
+
+/// Shared syntect assets, loaded once. The fancy-regex backend keeps the
+/// build free of oniguruma.
+fn syntect_assets() -> &'static (syntect::parsing::SyntaxSet, syntect::highlighting::Theme) {
+    static ASSETS: OnceLock<(syntect::parsing::SyntaxSet, syntect::highlighting::Theme)> =
+        OnceLock::new();
+    ASSETS.get_or_init(|| {
+        let syntaxes = syntect::parsing::SyntaxSet::load_defaults_newlines();
+        let theme = syntect::highlighting::ThemeSet::load_defaults()
+            .themes
+            .remove("base16-ocean.dark")
+            .expect("bundled syntect theme");
+        (syntaxes, theme)
+    })
+}
+
+/// A fence language token mapped to a bundled syntax, if we recognize it.
+/// `diff`/`patch` keep the hand-rolled +/− styling; unknown tokens stay
+/// unhighlighted (current behavior).
+fn syntect_syntax_for(language: &str) -> Option<&'static syntect::parsing::SyntaxReference> {
+    let (syntaxes, _) = syntect_assets();
+    let token = match language {
+        "rust" | "rs" => "rs",
+        "python" | "py" => "py",
+        "javascript" | "js" => "js",
+        "typescript" | "ts" => "js",
+        "shell" | "sh" | "bash" | "zsh" => "sh",
+        "toml" => "toml",
+        "json" => "json",
+        "yaml" | "yml" => "yaml",
+        "c" => "c",
+        "cpp" | "c++" => "cpp",
+        "go" => "go",
+        "html" => "html",
+        "css" => "css",
+        "sql" => "sql",
+        "xml" => "xml",
+        "markdown" | "md" => "md",
+        _ => return None,
+    };
+    syntaxes.find_syntax_by_extension(token)
 }
 
 impl LineStyler {
@@ -511,10 +557,32 @@ impl LineStyler {
         if let Some(language) = line.trim().strip_prefix("```") {
             if self.fence.is_some() {
                 self.fence = None;
+                self.highlighter = None;
             } else {
-                self.fence = Some(language.trim().to_string());
+                let language = language.trim().to_string();
+                self.highlighter = syntect_syntax_for(&language).map(|syntax| {
+                    let (_, theme) = syntect_assets();
+                    syntect::easy::HighlightLines::new(syntax, theme)
+                });
+                self.fence = Some(language);
             }
             return format!("{}", line.dimmed());
+        }
+
+        // Recognized-language fence interior: truecolor syntax highlighting.
+        // Foreground SGR only (no backgrounds), so sanitize recovers the
+        // exact text and the row blends with any theme.
+        if self.fence.is_some() {
+            if let Some(highlighter) = &mut self.highlighter {
+                let (syntaxes, _) = syntect_assets();
+                if let Ok(ranges) = highlighter.highlight_line(line, syntaxes) {
+                    let mut styled = syntect::util::as_24_bit_terminal_escaped(&ranges, false);
+                    // syntect leaves the last SGR open; close it so fence
+                    // colors never bleed into following lines.
+                    styled.push_str("\x1b[0m");
+                    return styled;
+                }
+            }
         }
 
         let in_fence = self.fence.is_some();
@@ -540,6 +608,7 @@ impl LineStyler {
     /// Reset fence state for the next turn (e.g., at line completion).
     fn reset(&mut self) {
         self.fence = None;
+        self.highlighter = None;
     }
 }
 
@@ -2435,6 +2504,37 @@ mod tests {
         assert!(output.contains("system"));
         assert!(output.contains("keep"));
         assert!(output.contains("required"));
+    }
+
+    #[test]
+    fn rust_fences_highlight_with_syntect_and_round_trip_exactly() {
+        let source = "```rust\nfn main() { let x = \"hi\"; }\n```\n";
+        let styled = format_message(source, true);
+        // ≥2 distinct truecolor foregrounds inside the fence body.
+        let colors: std::collections::HashSet<&str> = styled
+            .match_indices("\u{1b}[38;2;")
+            .map(|(i, _)| &styled[i..styled[i..].find('m').map(|m| i + m + 1).unwrap()])
+            .collect();
+        assert!(
+            colors.len() >= 2,
+            "expected >=2 distinct colors, got {}: {styled:?}",
+            colors.len()
+        );
+        // Sanitize recovers the exact source; unstyled output is identical.
+        assert_eq!(sanitize_terminal_text(&styled), source);
+        assert_eq!(format_message(source, false), source);
+        // Unknown languages and diff fences keep prior behavior (no syntect
+        // truecolor beyond the existing +/- tints).
+        let diff = "```diff\n+added\n```\n";
+        let styled_diff = format_message(diff, true);
+        assert_eq!(sanitize_terminal_text(&styled_diff), diff);
+        let unknown = "```mystery\nplain text body\n```\n";
+        let styled_unknown = format_message(unknown, true);
+        assert!(
+            !styled_unknown.contains("\u{1b}[38;2;")
+                || sanitize_terminal_text(&styled_unknown) == unknown
+        );
+        assert_eq!(sanitize_terminal_text(&styled_unknown), unknown);
     }
 
     #[test]
