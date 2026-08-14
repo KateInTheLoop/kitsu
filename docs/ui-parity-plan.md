@@ -350,10 +350,17 @@ as escalation); findings are re-verified before applying. Cycle log:
   overwrote the first recall; fixed with a per-batch recall gate in the
   editor plus a still-empty-draft guard in the collector. PTY-verified
   against ollama.
+- **Cycle 4 (2026-08-13, 22e7722 + follow-up efd61f9)**: lone Esc clears
+  the mid-turn draft, resolved after two consecutive true poll timeouts
+  (~100ms escape-time; error revents never count as quiet — review
+  finding). Never fires mid-paste; delayed keys after Esc type as
+  themselves. PTY-verified with arrow-editing intact. Accepted gap
+  (recorded): the collector's quiet-tick gating has no unit test — only
+  the editor method and the PTY smoke cover it.
 - Backlog (next cycles): hint ranking should prefer mid-turn-actionable
-  commands (/steer, /jobs, /queue) over registry order; Esc-to-clear
-  draft; queued-message stack rendered under the status row; multi-line
-  draft wrap; Ctrl+R history search mid-turn.
+  commands (/steer, /jobs, /queue) over registry order; queued-message
+  stack rendered under the status row; multi-line draft wrap; Ctrl+R
+  history search mid-turn; unit-test seam for the collector poll loop.
 
 ## Protocol
 
