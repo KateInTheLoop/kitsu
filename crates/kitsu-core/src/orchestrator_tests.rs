@@ -235,6 +235,8 @@ fn tc(name: &str, call_id: &str, args: &str) -> ToolCall {
 fn cfg(max_rounds: u32) -> AgentConfig {
     AgentConfig {
         model: "example-model-v1".to_string(),
+        request_timeout_ms: None,
+        turn_deadline: None,
         max_rounds,
         max_context_bytes: 128 * 1024,
         context_window: None,
@@ -3871,7 +3873,7 @@ async fn structured_event_log_uses_native_command_fields_instead_of_json_blobs()
 
 #[tokio::test]
 async fn structured_event_log_separates_logical_requests_from_physical_attempts() {
-    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent, ProviderDeadlineScope};
     use kitsu_providers::{ChatMessage, ProviderAttemptOutcome};
 
     let provider = TelemetryProvider;
@@ -3880,20 +3882,28 @@ async fn structured_event_log_separates_logical_requests_from_physical_attempts(
     let mut c = cfg(1);
     c.quiet = true;
     c.event_log = Some(log.clone());
+    c.request_timeout_ms = Some(30_000);
+    c.turn_deadline = Some(tokio::time::Instant::now() + std::time::Duration::from_secs(60));
     let mut messages = vec![ChatMessage::user("work")];
 
     run_agent_turn(&provider, &tools, &mut messages, &c)
         .await
         .unwrap();
     let events = log.take();
-    assert_eq!(
-        events
-            .iter()
-            .filter(|event| matches!(event, AgentRuntimeEvent::ProviderRequest { .. }))
-            .count(),
-        1,
-        "retries must not duplicate the logical provider_request event"
-    );
+    let requests = events
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::ProviderRequest {
+                request_timeout_ms,
+                turn_remaining_ms,
+                ..
+            } => Some((*request_timeout_ms, *turn_remaining_ms)),
+            _ => None,
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 1, "retries must not duplicate the request");
+    assert_eq!(requests[0].0, Some(30_000));
+    assert!(requests[0].1.is_some_and(|remaining| remaining <= 60_000));
     let attempts: Vec<_> = events
         .iter()
         .filter_map(|event| match event {
@@ -3902,18 +3912,39 @@ async fn structured_event_log_separates_logical_requests_from_physical_attempts(
                 attempt,
                 outcome,
                 terminal,
+                deadline_scope,
+                remaining_deadline_ms,
+                turn_remaining_ms,
                 ..
-            } => Some((*round, *attempt, *outcome, *terminal)),
+            } => Some((
+                *round,
+                *attempt,
+                *outcome,
+                *terminal,
+                *deadline_scope,
+                *remaining_deadline_ms,
+                *turn_remaining_ms,
+            )),
             _ => None,
         })
         .collect();
-    assert_eq!(
-        attempts,
-        vec![
-            (1, 1, ProviderAttemptOutcome::RetryScheduled, false),
-            (1, 2, ProviderAttemptOutcome::ResponseAccepted, true),
-        ]
-    );
+    assert_eq!(attempts.len(), 2);
+    assert_eq!(attempts[0].0, 1);
+    assert_eq!(attempts[0].1, 1);
+    assert_eq!(attempts[0].2, ProviderAttemptOutcome::RetryScheduled);
+    assert!(!attempts[0].3);
+    assert_eq!(attempts[0].4, ProviderDeadlineScope::ProviderRequest);
+    assert_eq!(attempts[0].5, 10_000);
+    assert_eq!(attempts[1].0, 1);
+    assert_eq!(attempts[1].1, 2);
+    assert_eq!(attempts[1].2, ProviderAttemptOutcome::ResponseAccepted);
+    assert!(attempts[1].3);
+    assert_eq!(attempts[1].4, ProviderDeadlineScope::ProviderRequest);
+    assert_eq!(attempts[1].5, 9_700);
+    assert!(attempts
+        .iter()
+        .all(|attempt| attempt.6.is_some_and(|remaining| remaining <= 60_000)));
+    assert!(attempts[1].6 <= attempts[0].6);
 }
 
 #[tokio::test]

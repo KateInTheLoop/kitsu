@@ -116,6 +116,15 @@ impl SpawnBudget {
 #[derive(Debug, Clone)]
 pub struct AgentConfig {
     pub model: String,
+    /// Configured budget for each logical provider request. Frontends that
+    /// know the transport timeout disclose it on `provider_request`; embedded
+    /// providers may leave it unknown.
+    pub request_timeout_ms: Option<u64>,
+    /// Optional enclosing turn deadline enforced by the frontend. This is
+    /// deliberately distinct from the per-request transport timeout because a
+    /// multi-round turn must not appear to regain its whole budget on every
+    /// provider call.
+    pub turn_deadline: Option<tokio::time::Instant>,
     /// Hard backstop against infinite tool loops (design §5). Default 10.
     pub max_rounds: u32,
     /// Context byte budget; oldest tool results truncated first. Default 128 KiB.
@@ -344,6 +353,13 @@ pub enum ProviderRequestPurpose {
     ModelCatalog,
 }
 
+/// Scope of the countdown reported by a physical provider attempt.
+#[derive(Debug, Clone, Copy, Serialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderDeadlineScope {
+    ProviderRequest,
+}
+
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]
 #[serde(tag = "event", rename_all = "snake_case")]
 pub enum AgentRuntimeEvent {
@@ -356,6 +372,15 @@ pub enum AgentRuntimeEvent {
         /// JSON Schema response format. This is metadata only; the schema
         /// body remains out of the event stream.
         structured_output: bool,
+        /// Configured budget for this logical provider request. Historical or
+        /// embedded producers may omit it when the transport budget is not
+        /// known to the orchestrator.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        request_timeout_ms: Option<u64>,
+        /// Remaining budget for the enclosing turn, when the frontend enforces
+        /// one independently of the provider request timeout.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_remaining_ms: Option<u64>,
     },
     /// A host-verified exact-output mismatch kept the next bounded round in
     /// tool-action mode instead of spending the reserved structured finalizer.
@@ -382,7 +407,13 @@ pub enum AgentRuntimeEvent {
         terminal: bool,
         retry_delay_ms: Option<u64>,
         retry_after_used: bool,
+        /// `remaining_deadline_ms` is scoped to this provider request and may
+        /// reset when the agent starts another logical request.
+        deadline_scope: ProviderDeadlineScope,
         remaining_deadline_ms: u64,
+        /// Independently decreasing enclosing-turn budget, when present.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        turn_remaining_ms: Option<u64>,
     },
     /// Assistant text safe for immediate frontend display. Text is emitted as
     /// chunks when no tools were offered. Tool-capable rounds are buffered and
@@ -567,6 +598,7 @@ fn provider_telemetry_sink(
     log: Option<&AgentEventLog>,
     round: u32,
     purpose: ProviderRequestPurpose,
+    turn_deadline: Option<tokio::time::Instant>,
 ) -> Option<ProviderTelemetrySink> {
     log.map(|log| {
         let log = log.clone();
@@ -582,10 +614,23 @@ fn provider_telemetry_sink(
                 terminal: event.terminal,
                 retry_delay_ms: event.retry_delay_ms,
                 retry_after_used: event.retry_after_used,
+                deadline_scope: ProviderDeadlineScope::ProviderRequest,
                 remaining_deadline_ms: event.remaining_deadline_ms,
+                turn_remaining_ms: remaining_turn_millis(turn_deadline),
             });
             !log.abort_requested()
         })
+    })
+}
+
+fn remaining_turn_millis(deadline: Option<tokio::time::Instant>) -> Option<u64> {
+    deadline.map(|deadline| {
+        u64::try_from(
+            deadline
+                .saturating_duration_since(tokio::time::Instant::now())
+                .as_millis(),
+        )
+        .unwrap_or(u64::MAX)
     })
 }
 
@@ -968,6 +1013,8 @@ impl Default for AgentConfig {
     fn default() -> Self {
         Self {
             model: String::new(),
+            request_timeout_ms: None,
+            turn_deadline: None,
             max_rounds: 10,
             max_context_bytes: 128 * 1024,
             context_window: None,
@@ -1529,6 +1576,8 @@ where
                 message_count: req.messages.len(),
                 tools_offered: req.tools.as_ref().map_or(0, Vec::len),
                 structured_output: req.response_format.is_some(),
+                request_timeout_ms: cfg.request_timeout_ms,
+                turn_remaining_ms: remaining_turn_millis(cfg.turn_deadline),
             });
         }
         abort_if_event_sink_failed(cfg)?;
@@ -1549,6 +1598,7 @@ where
                     cfg.event_log.as_ref(),
                     round,
                     ProviderRequestPurpose::Inference,
+                    cfg.turn_deadline,
                 ),
             )
             .await;
@@ -3346,6 +3396,8 @@ where
                             message_count: req.messages.len(),
                             tools_offered: 0,
                             structured_output: false,
+                            request_timeout_ms: cfg.request_timeout_ms,
+                            turn_remaining_ms: remaining_turn_millis(cfg.turn_deadline),
                         });
                     }
                     abort_if_event_sink_failed(cfg)?;
@@ -3356,6 +3408,7 @@ where
                             cfg.event_log.as_ref(),
                             round,
                             ProviderRequestPurpose::Compaction,
+                            cfg.turn_deadline,
                         ),
                     )
                     .await;
