@@ -10,6 +10,8 @@
 //! Neither performs trimming — that is the cascade (Stage 2+). These are the
 //! measurement primitives the trimming and `/context` command build on.
 
+use std::hash::{Hash, Hasher};
+
 use kitsu_providers::{ChatMessage, Role};
 
 /// Rough chars-per-token for prose/code.
@@ -61,12 +63,35 @@ impl ContextBreakdown {
 #[derive(Debug, Default, Clone)]
 pub struct ContextMeter {
     /// `(prompt_tokens, number of leading messages that request covered, whether
-    /// that request carried tool and/or response schema constraints)`. The flag
-    /// matters because a constraint-free request must not be treated as if it
-    /// already covered later schema overhead. Callers must invalidate the
-    /// anchor when one non-empty constraint set is replaced by a different one;
-    /// this compact flag intentionally does not fingerprint schema contents.
-    anchor: Option<(u64, usize, bool)>,
+    /// that request carried tool and/or response schema constraints, fingerprint
+    /// of those leading messages)`. The constraint flag prevents a schema-free
+    /// request from covering later schema overhead; callers still invalidate
+    /// the anchor when one non-empty constraint set replaces another. The
+    /// fingerprint detects in-place edits inside the anchored prefix that keep
+    /// the message count unchanged.
+    anchor: Option<(u64, usize, bool, u64)>,
+}
+
+/// Cheap content-identity fingerprint over a message prefix: role discriminant
+/// plus LENGTHS of content, tool_call_id, and each tool call's fields — never
+/// the string bytes themselves, so it stays O(n) and near-free even for huge
+/// message bodies. A collision risk of 2^-64 is acceptable here: a false match
+/// only keeps an already-approximate estimate, while a false miss falls back
+/// to the safe full recompute.
+fn prefix_fingerprint(messages: &[ChatMessage]) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    for m in messages {
+        std::mem::discriminant(&m.role).hash(&mut h);
+        m.content.len().hash(&mut h);
+        m.tool_call_id.as_ref().map_or(0, String::len).hash(&mut h);
+        m.tool_calls.len().hash(&mut h);
+        for c in &m.tool_calls {
+            c.tool_name.len().hash(&mut h);
+            c.args.len().hash(&mut h);
+            c.call_id.len().hash(&mut h);
+        }
+    }
+    h.finish()
 }
 
 impl ContextMeter {
@@ -75,11 +100,18 @@ impl ContextMeter {
     }
 
     /// Record the authoritative `prompt_tokens` from a response, for a request
-    /// that sent `sent_len` leading messages and — per `had_schema` — did or
-    /// didn't include tool or response schemas that round. Replace one schema
-    /// set with another only after [`Self::invalidate`].
-    pub fn record(&mut self, prompt_tokens: u64, sent_len: usize, had_schema: bool) {
-        self.anchor = Some((prompt_tokens, sent_len, had_schema));
+    /// that sent exactly `messages` and — per `had_schema` — did or didn't
+    /// include tool or response schemas that round. Replace one non-empty
+    /// constraint set with another only after [`Self::invalidate`]. Also
+    /// fingerprint `messages` so later in-place prefix edits are not silently
+    /// trusted.
+    pub fn record(&mut self, prompt_tokens: u64, messages: &[ChatMessage], had_schema: bool) {
+        self.anchor = Some((
+            prompt_tokens,
+            messages.len(),
+            had_schema,
+            prefix_fingerprint(messages),
+        ));
     }
 
     /// Clear the anchor. `sent_len` is a plain message COUNT, not an identity —
@@ -96,12 +128,15 @@ impl ContextMeter {
 
     /// Estimated prompt tokens for the current `messages`: the last real-usage
     /// anchor plus a chars/token estimate of everything appended since — but only
-    /// if the anchored leading messages are still intact. If the history was
-    /// trimmed below the anchor (so the anchor no longer describes a prefix of
-    /// `messages`), fall back to a full estimate.
+    /// if the anchored leading messages are still intact (same count AND same
+    /// content fingerprint). If the history was trimmed below the anchor, or
+    /// edited in place inside the anchored prefix, fall back to a full estimate.
     pub fn estimate(&self, messages: &[ChatMessage]) -> u64 {
         match self.anchor {
-            Some((tokens, sent_len, _)) if sent_len <= messages.len() => {
+            Some((tokens, sent_len, _, fingerprint))
+                if sent_len <= messages.len()
+                    && prefix_fingerprint(&messages[..sent_len]) == fingerprint =>
+            {
                 tokens + messages[sent_len..].iter().map(message_tokens).sum::<u64>()
             }
             _ => messages.iter().map(message_tokens).sum(),
@@ -111,7 +146,9 @@ impl ContextMeter {
     /// True when [`Self::estimate`] would use the real-usage anchor (rather than
     /// a full chars/token re-tokenize) for `messages`.
     pub fn anchored(&self, messages: &[ChatMessage]) -> bool {
-        matches!(self.anchor, Some((_, sent_len, _)) if sent_len <= messages.len())
+        matches!(self.anchor, Some((_, sent_len, _, fingerprint))
+            if sent_len <= messages.len()
+                && prefix_fingerprint(&messages[..sent_len]) == fingerprint)
     }
 
     /// True when the CURRENT anchor is valid for `messages` *and* the request
@@ -122,7 +159,10 @@ impl ContextMeter {
     /// overhead, so it must still be added
     /// even though the meter is otherwise anchored.
     pub fn anchor_includes_schema(&self, messages: &[ChatMessage]) -> bool {
-        matches!(self.anchor, Some((_, sent_len, had_schema)) if had_schema && sent_len <= messages.len())
+        matches!(self.anchor, Some((_, sent_len, had_schema, fingerprint))
+            if had_schema
+                && sent_len <= messages.len()
+                && prefix_fingerprint(&messages[..sent_len]) == fingerprint)
     }
 
     /// Per-role breakdown (pure estimate; ignores the usage anchor so callers can
@@ -207,7 +247,7 @@ mod tests {
         let mut meter = ContextMeter::new();
         let mut msgs = vec![msg(Role::System, "x".repeat(40).as_str())];
         // Pretend the last request sent these 1 message(s) and cost 1000 tokens.
-        meter.record(1000, msgs.len(), false);
+        meter.record(1000, &msgs, false);
         // Append an 8-char user turn: +2 tokens estimated on top of the anchor.
         msgs.push(msg(Role::User, "abcdefgh"));
         assert_eq!(meter.estimate(&msgs), 1002);
@@ -217,7 +257,12 @@ mod tests {
     fn falls_back_to_full_estimate_when_trimmed_below_anchor() {
         let mut meter = ContextMeter::new();
         // Anchor claims 3 leading messages were sent...
-        meter.record(1000, 3, false);
+        let sent = vec![
+            msg(Role::System, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+        ];
+        meter.record(1000, &sent, false);
         // ...but history was trimmed to 1 message: anchor no longer describes a
         // prefix, so estimate ignores it and estimates the whole set.
         let msgs = vec![msg(Role::User, "abcd")];
@@ -287,10 +332,10 @@ mod tests {
     #[test]
     fn record_overwrites_the_previous_anchor() {
         let mut meter = ContextMeter::new();
-        meter.record(100, 1, false);
-        meter.record(200, 2, false);
-        // Two messages, anchor covers both, no tail -> exactly the latest anchor.
+        meter.record(100, &[msg(Role::System, "abcd")], false);
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(200, &msgs, false);
+        // Two messages, anchor covers both, no tail -> exactly the latest anchor.
         assert_eq!(meter.estimate(&msgs), 200);
     }
 
@@ -298,7 +343,7 @@ mod tests {
     fn anchor_only_when_no_new_messages() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, msgs.len(), false);
+        meter.record(500, &msgs, false);
         assert_eq!(meter.estimate(&msgs), 500);
     }
 
@@ -314,7 +359,14 @@ mod tests {
         let mut meter = ContextMeter::new();
         // Anchor claims a real API response covered 5 leading messages at a cost
         // of 1000 tokens.
-        meter.record(1000, 5, false);
+        let sent = vec![
+            msg(Role::System, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+            msg(Role::User, "abcd"),
+        ];
+        meter.record(1000, &sent, false);
         meter.invalidate();
 
         // The conversation was reshaped (e.g. dropped/summarized) and then grew
@@ -349,7 +401,7 @@ mod tests {
     fn anchor_includes_schema_is_false_when_recorded_without_tools() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, msgs.len(), false); // that request had NO tools field
+        meter.record(500, &msgs, false); // that request had NO tools field
         assert!(
             meter.anchored(&msgs),
             "sanity: anchor is structurally valid"
@@ -364,8 +416,84 @@ mod tests {
     fn anchor_includes_schema_is_true_when_recorded_with_tools() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, msgs.len(), true); // that request DID include tools
+        meter.record(500, &msgs, true); // that request DID include tools
         assert!(meter.anchor_includes_schema(&msgs));
+    }
+
+    /// (a) Guards the anchor fast path itself: an UNCHANGED prefix (same
+    /// messages, possibly with an appended tail) must still use the recorded
+    /// anchor, so the fingerprint check doesn't regress the normal append-only
+    /// flow into a full re-tokenize on every estimate.
+    #[test]
+    fn unchanged_prefix_still_uses_the_anchor() {
+        let mut meter = ContextMeter::new();
+        let mut msgs = vec![
+            msg(Role::System, "x".repeat(40).as_str()),
+            msg(Role::User, "abcd"),
+        ];
+        meter.record(1000, &msgs, false);
+        msgs.push(msg(Role::User, "abcdefgh")); // identical prefix + 8-char tail (+2)
+        assert!(meter.anchored(&msgs));
+        assert_eq!(meter.estimate(&msgs), 1002);
+    }
+
+    /// (b) THE bug from reviews/kimi-cycle-6.md P2: an in-place content edit
+    /// INSIDE the anchored prefix that preserves the message COUNT (rewritten
+    /// tool result, edited queued message) must invalidate the anchor. On the
+    /// old length-only code this silently returned `anchor + tail` for content
+    /// the anchor never measured (this test fails there: estimate == 1000 and
+    /// anchored() == true); with the fingerprint it must fall back to a full
+    /// recompute, and `anchored()` must agree.
+    #[test]
+    fn in_place_edit_inside_anchored_prefix_invalidates_the_anchor() {
+        let mut meter = ContextMeter::new();
+        let sent = vec![
+            msg(Role::System, "abcd"),
+            msg(Role::User, "short"),
+            msg(Role::User, "abcd"),
+        ];
+        meter.record(1000, &sent, false);
+
+        // SAME count (3), but message [1] was rewritten in place.
+        let edited = vec![
+            msg(Role::System, "abcd"),
+            msg(
+                Role::User,
+                "a much longer rewritten body the anchor never saw",
+            ),
+            msg(Role::User, "abcd"),
+        ];
+        assert_eq!(sent.len(), edited.len(), "the edit preserves the count");
+        assert!(
+            !meter.anchored(&edited),
+            "an in-place edit inside the anchored prefix must invalidate the anchor"
+        );
+        let full: u64 = edited.iter().map(message_tokens).sum();
+        assert_eq!(meter.estimate(&edited), full, "must be a full recompute");
+        assert_ne!(
+            meter.estimate(&edited),
+            1000,
+            "must not trust the stale anchor"
+        );
+    }
+
+    /// (c) Append-only growth must keep using the anchor: recording over N
+    /// messages and then appending NEW messages to the end (prefix untouched)
+    /// is the normal per-round flow and must stay on the cheap
+    /// `anchor + tail_estimate` path — no regression.
+    #[test]
+    fn appending_to_the_tail_still_uses_the_anchor() {
+        let mut meter = ContextMeter::new();
+        let mut msgs = vec![
+            msg(Role::System, "x".repeat(40).as_str()),
+            msg(Role::User, "abcd"),
+        ];
+        meter.record(800, &msgs, true);
+        msgs.push(msg(Role::Assistant, "abcdefgh")); // +2
+        msgs.push(msg(Role::Tool, "abcd")); // +1
+        assert!(meter.anchored(&msgs));
+        assert!(meter.anchor_includes_schema(&msgs));
+        assert_eq!(meter.estimate(&msgs), 803);
     }
 
     #[test]

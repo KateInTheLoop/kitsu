@@ -390,6 +390,7 @@ async fn structured_output_can_be_reserved_for_a_tool_free_finalization_round() 
                 prompt_tokens: 100,
                 completion_tokens: 5,
                 total_tokens: 105,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -526,6 +527,7 @@ async fn exact_output_gate_keeps_tools_available_for_one_bounded_repair() {
                 prompt_tokens: 120,
                 completion_tokens: 5,
                 total_tokens: 125,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -804,6 +806,7 @@ async fn deferred_finalization_remeasures_the_changed_response_schema() {
             prompt_tokens: 10,
             completion_tokens: 2,
             total_tokens: 12,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
@@ -3237,7 +3240,7 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
     // Real usage for exactly these messages was 300 tokens — comfortably under
     // the 400 target on its own (and already reflects that round's schema cost,
     // hence `had_schema: true`).
-    meter.record(300, sent_len, true);
+    meter.record(300, &msgs, true);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
@@ -3364,9 +3367,8 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
     // droppable, so drop_old_exchanges is a guaranteed no-op on `messages`.
     let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
     let mut meter = ContextMeter::new();
-    let sent_len = msgs.len();
     // A real anchor that's over target, forcing the compaction match to run.
-    meter.record(500, sent_len, true);
+    meter.record(500, &msgs, true);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
