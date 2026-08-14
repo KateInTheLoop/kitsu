@@ -257,7 +257,9 @@
             "purpose": { "enum": ["inference", "compaction", "model_catalog"] },
             "message_count": { "type": "integer", "minimum": 0 },
             "tools_offered": { "type": "integer", "minimum": 0 },
-            "structured_output": { "type": "boolean" }
+            "structured_output": { "type": "boolean" },
+            "request_timeout_ms": { "type": "integer", "minimum": 1 },
+            "turn_remaining_ms": { "type": "integer", "minimum": 0 }
           }
         }
       ]
@@ -364,7 +366,9 @@
             "terminal": { "type": "boolean" },
             "retry_delay_ms": { "type": ["integer", "null"], "minimum": 0 },
             "retry_after_used": { "type": "boolean" },
-            "remaining_deadline_ms": { "type": "integer", "minimum": 0 }
+            "deadline_scope": { "const": "provider_request" },
+            "remaining_deadline_ms": { "type": "integer", "minimum": 0 },
+            "turn_remaining_ms": { "type": "integer", "minimum": 0 }
           }
         }
       ]
