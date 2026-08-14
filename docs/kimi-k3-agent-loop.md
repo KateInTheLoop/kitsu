@@ -39,8 +39,12 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 - **Branch**: all Kimi-cycle work happens on `dogfood/kimi-k3` (worktree
   under `/tmp`, never in the main checkout, which stays on the UX branch).
 - **Gateway**: `--gateway huggingface --model moonshotai/Kimi-K3`,
-  `--context-window 131072`, generous `--max-output-tokens` (>= 4000;
-  it is a reasoning model — small budgets return empty answers).
+  `--context-window 131072`, `--timeout-secs 300` (cycle 2: the default
+  120s wall clock cancelled a healthy run), and generous
+  `--max-output-tokens` (>= 12000; it is a reasoning model — cycle 2
+  burned 8,852 completion tokens against a 6000 cap with zero visible
+  output). Tell the model NOT to spawn sub-agents (cycle 2: unprompted
+  `Agent(...)` spawns at 65-71s each sank both attempts).
 - **Token**: the supervisor receives `HF_TOKEN` via environment at spawn
   time. NEVER write the token into any file, commit, or log.
 - **Read scope**: grant kitsu read access only to the repo checkout
@@ -65,6 +69,23 @@ concrete, file-referenced proposals ranked by value; no vague advice.
   to window 8192; explicit `--context-window` was required).
 - [ ] Surface provider `cached_tokens` (HF router reports it in usage)
   in `kitsu-usage:` records and `/cost`, so caching wins are measurable.
+- [ ] **Cycle 2:** wall-clock-cancelled turns print zero `kitsu-usage`/
+  `kitsu-context` receipts even when real inference time was spent —
+  a total cost blackout for timed-out turns. Surface partial usage (or
+  an explicit "usage unknown: cancelled mid-flight" receipt) on
+  cancellation.
+- [ ] **Cycle 2:** model-driven sub-agent spawns are unbounded in cost
+  visibility mid-turn — nothing surfaces cumulative sub-agent spend to
+  the model (or the operator) while the turn runs; spawn-cap teeth only
+  count refusals, not seconds/tokens burned by granted spawns.
+- [ ] **Cycle 2:** reasoning models can exhaust `--max-output-tokens`
+  entirely on hidden reasoning (8,852 spent vs 6000 cap, zero visible
+  output, two truncation warnings). Add a reasoning-headroom warning or
+  an explicit hint in the truncation message naming the reasoning spend.
+- [ ] **Cycle 2:** offload-preview re-read thrash — the model re-read its
+  own offloaded output in shrinking ranges instead of recognizing it had
+  the content; the 500-char preview should disclose coverage ("preview
+  of N KiB; full content already returned to you as ...").
 
 ## Cycle log
 
