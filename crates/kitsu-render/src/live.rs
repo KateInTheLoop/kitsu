@@ -57,6 +57,9 @@ struct LiveRowState {
     /// terminal (stack rows + status row); 0 when nothing is painted. The
     /// cursor always rests on the bottom row while drawn.
     drawn_rows: usize,
+    /// Terminal width at the last paint; a change forces a full repaint so
+    /// stack rows never linger at a stale width.
+    last_cols: usize,
 }
 
 fn state() -> &'static Mutex<LiveRowState> {
@@ -261,6 +264,26 @@ fn compose_stack_rows(previews: &[String], queued: usize, cols: usize) -> Vec<St
     if queued == 0 || previews.is_empty() {
         return Vec::new();
     }
+    // Every emitted row is clamped to `cols` AFTER composition, prefix
+    // included: a stack row that wraps desyncs the region's row-count
+    // arithmetic from the screen (sonnet review, cycle 9). Clamping happens
+    // on the plain text, before styling, so the SGR wrapper stays intact.
+    let clamp = |plain: String| -> String {
+        if display_width(&plain) <= cols {
+            return plain;
+        }
+        let budget = cols.saturating_sub(1);
+        let mut used = 0usize;
+        let mut clipped: String = plain
+            .chars()
+            .take_while(|&ch| {
+                used += crate::char_display_width(ch);
+                used <= budget
+            })
+            .collect();
+        clipped.push('…');
+        clipped
+    };
     let mut rows = Vec::new();
     for (index, preview) in previews.iter().take(3).enumerate() {
         let label = if index == 0 { "next" } else { "then" };
@@ -281,12 +304,12 @@ fn compose_stack_rows(previews: &[String], queued: usize, cols: usize) -> Vec<St
         if clipped.chars().count() < text.chars().count() {
             clipped.push('…');
         }
-        rows.push(format!("{}", format!("{prefix}{clipped}").dimmed()));
+        rows.push(format!("{}", clamp(format!("{prefix}{clipped}")).dimmed()));
     }
     if queued > 3 {
         rows.push(format!(
             "{}",
-            format!("  ↳ +{} more queued", queued - 3).dimmed()
+            clamp(format!("  ↳ +{} more queued", queued - 3)).dimmed()
         ));
     }
     rows
@@ -318,6 +341,12 @@ fn redraw_locked(row_state: &mut LiveRowState) {
         return;
     }
     let cols = terminal_cols();
+    // A resize invalidates the painted stack rows (they hold the old
+    // width); force the full-repaint path (sonnet review, cycle 9).
+    if cols != row_state.last_cols {
+        row_state.last_cols = cols;
+        row_state.region_dirty = true;
+    }
     // Stack rows render only alongside a draft, mirroring the queue tag.
     let stack = if row_state.draft.is_some() {
         compose_stack_rows(&row_state.previews, row_state.queued, cols)
@@ -337,6 +366,15 @@ fn redraw_locked(row_state: &mut LiveRowState) {
         let _ = write!(err, "\r\x1b[2K{status}");
     } else {
         clear_region_locked(&mut err, row_state.drawn_rows);
+        // When the region SHRINKS, the cleared excess rows sit below the
+        // new region; step down through them first so the shorter region
+        // still hugs the bottom of the screen instead of floating above
+        // blank lines (sonnet review, cycle 9 — reachable via the approval
+        // handoff's draft hide). The blanks become scrollback whitespace.
+        let shrink = row_state.drawn_rows.saturating_sub(wanted_rows);
+        if shrink > 0 {
+            let _ = write!(err, "{}", "\n".repeat(shrink));
+        }
         let _ = write!(err, "\r");
         for row in &stack {
             let _ = write!(err, "{row}\r\n");
@@ -693,6 +731,40 @@ mod tests {
         );
         // Empty queue: no rows.
         assert!(compose_stack_rows(&[], 0, 80).is_empty());
+    }
+
+    #[test]
+    fn stack_rows_never_exceed_a_narrow_terminal() {
+        // Prefix (10 cols) wider than the terminal, and the '+N more' row
+        // (18+ cols) — both must clamp, never wrap (row-count desync).
+        let previews = vec![
+            "one".to_string(),
+            "two".to_string(),
+            "three".to_string(),
+            "four".to_string(),
+        ];
+        for cols in [4usize, 8, 10, 12, 17] {
+            let rows = compose_stack_rows(&previews, 9, cols);
+            for row in &rows {
+                let width = display_width(&sanitize_terminal_text(row));
+                assert!(
+                    width <= cols,
+                    "row wider than {cols} cols ({width}): {row:?}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn clear_region_walks_bottom_up_and_noops_on_zero() {
+        let mut out: Vec<u8> = Vec::new();
+        clear_region_locked(&mut out, 0);
+        assert!(out.is_empty());
+        clear_region_locked(&mut out, 1);
+        assert_eq!(out, b"\r\x1b[2K");
+        out.clear();
+        clear_region_locked(&mut out, 3);
+        assert_eq!(out, b"\r\x1b[2K\x1b[1A\x1b[2K\x1b[1A\x1b[2K");
     }
 
     #[test]
