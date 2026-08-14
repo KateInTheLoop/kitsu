@@ -107,14 +107,19 @@ fn merged_containment_environment(extra: &[(String, String)]) -> Vec<(String, St
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// How an invocation without an exact session grant is handled.
-///
-/// Unlike filesystem permissions, command policy has no auto-allow mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandMode {
     /// Ask the command-specific prompter. A missing prompter fails closed.
     Ask,
     /// Deny invocations that do not already have an exact grant.
     Deny,
+    /// DANGER: approve every invocation without prompting. Exists for
+    /// explicitly opted-in unattended automation
+    /// (`--dangerously-skip-permissions`). Only the *prompt* is skipped —
+    /// command-root cwd confinement, argv validation, executable
+    /// resolution, containment mounts, and secret-env filtering all still
+    /// apply.
+    AutoAllow,
 }
 
 /// The user's answer to a command-specific approval prompt.
@@ -1652,6 +1657,13 @@ impl CommandPolicy {
         }
 
         match self.mode {
+            // The dangerous bypass answers the approval question, nothing
+            // else: cwd/root confinement and executable resolution were
+            // already enforced above, and containment still wraps execution.
+            CommandMode::AutoAllow => Ok(AuthorizedCommand {
+                cwd: authorized_cwd,
+                executable,
+            }),
             CommandMode::Deny => {
                 if grant_match == GrantMatch::Invalidated {
                     Err(executable_changed(argv, &cwd))
@@ -3229,6 +3241,31 @@ mod tests {
         assert!(matches!(
             execute_command(&policy, invocation).await,
             Err(ToolError::PolicyDenied(message)) if message.contains("has not been approved")
+        ));
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn auto_allow_executes_inside_roots_without_any_prompter() {
+        let dir = tempfile::tempdir().unwrap();
+        // No prompter attached: AutoAllow must never consult one.
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::AutoAllow).unwrap();
+        let output = execute_command(&policy, args(&["/bin/echo", "auto-allowed"], dir.path()))
+            .await
+            .unwrap();
+        assert!(output.stdout.contains("auto-allowed"));
+    }
+
+    #[tokio::test]
+    async fn auto_allow_still_denies_cwd_outside_command_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::AutoAllow).unwrap();
+        // The dangerous bypass skips approval prompts only — root confinement
+        // is not negotiable.
+        assert!(matches!(
+            execute_command(&policy, args(&["definitely-not-run"], outside.path())).await,
+            Err(ToolError::PolicyDenied(message)) if message.contains("outside the approved command roots")
         ));
     }
 
