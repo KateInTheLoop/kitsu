@@ -9697,8 +9697,11 @@ fn run_live_typeahead(
                 .queued,
         );
     };
-    live::live_input_begin(prompt.clone());
+    // Depth first, paint second: the row's first frame must reflect the
+    // real queue, not the previous turn's persisted count (the main loop
+    // dequeues between turns, so the stored value can be stale here).
     sync_queue_depth(dispatcher);
+    live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
         if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
