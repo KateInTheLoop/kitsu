@@ -264,3 +264,25 @@ review/analysis. Kimi is now a contributing agent.** Next cycles:
 continue P-backlog implementation (P1 `prompt_cache_key` or a unit test
 for the P3 diff are natural next tasks); consider requiring a test with
 every code diff as part of the task brief.
+
+### Cycle 8 — 2026-08-14 — closes the cycle-7 gap (grade A)
+
+Kimi added the unit tests its cycle-7 P3 diff was docked for lacking:
+4 tests in `crates/kitsu-providers/src/types.rs` (+53/-0) —
+`cached_tokens_returns_nested_value`, `cached_tokens_zero_when_details_absent`,
+`is_empty_false_for_cache_hit_only_usage`, `add_merges_cached_tokens`.
+Committed as `333c835` on `dogfood/kimi-k3`, pushed.
+
+- Single attempt, **6.6s wall** (fastest of the loop), 2 tool calls,
+  completion **610/24,000 (2.5% — new low)**, zero debris.
+- Gates: `cargo fmt --check` clean; `cargo test -p kitsu-providers`
+  62 passed / 0 failed (58 pre-existing + 4 new). Tests are genuine —
+  each fails if the corresponding P3 behavior regresses; assertions
+  spot-checked against exact line numbers, no citation drift.
+- No new kitsu weaknesses. Reinforces the standing finding: task
+  narrowness (one known file + a fully-specified deliverable) predicts
+  cost and reliability more than task type does.
+
+**Kimi is now 3-for-3 on code/test work (cycles 7, 8) after the review
+ramp. The P3 contribution is complete and fully tested.** Next: P1
+`prompt_cache_key`, or another P1–P11 implementation slice.
