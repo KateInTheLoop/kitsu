@@ -6901,6 +6901,32 @@ fn agent_deck_state(
     }
 }
 
+/// The Running-row activity child line (ui-parity item 13): the most recent
+/// bounded activity label with its age, so a stalled agent shows at a
+/// glance. Terminal rows carry no child — their story is complete.
+fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: bool) -> String {
+    let arrow = if plain { "->" } else { "\u{21b3}" };
+    match activity {
+        None => format!("{arrow} no activity yet"),
+        Some(activity) => {
+            let age = ms_ago
+                .map(|ms| {
+                    format!(
+                        " \u{b7} {} ago",
+                        kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(ms))
+                    )
+                })
+                .unwrap_or_default();
+            let age = if plain {
+                age.replace('\u{b7}', "|")
+            } else {
+                age
+            };
+            format!("{arrow} {}{age}", terminal_inline(activity))
+        }
+    }
+}
+
 /// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
 /// `command_result` payload is built from, using the DTO's own status spellings
 /// — no `{:?}` reaches the terminal.
@@ -6990,6 +7016,14 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             ));
         }
         if matches!(agent.status, subagent::AgentProgressStatus::Running) {
+            output.push_str(&format!(
+                "\n      {}",
+                agent_activity_child_row(
+                    agent.telemetry.last_activity.as_deref(),
+                    agent.last_activity_ms_ago,
+                    kitsu_render::plain_mode(),
+                )
+            ));
             output.push_str("\n      partial response text withheld until the job is terminal");
         }
     }
@@ -14753,6 +14787,39 @@ mod tests {
         assert!(styled.contains("◈ #"), "{styled}");
         assert!(styled.contains("◇ #"), "{styled}");
         assert!(styled.contains(&format!("/jobs show {done}")), "{styled}");
+    }
+
+    #[test]
+    fn running_deck_rows_carry_an_activity_child_and_finished_rows_do_not() {
+        let registry = subagent::AgentRegistry::default();
+        let running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("collected".to_string()));
+
+        let deck = format_jobs(&registry);
+        // Exactly one running row → exactly one ↳ child line, with an age.
+        assert_eq!(deck.matches('↳').count(), 1, "{deck}");
+        assert!(deck.contains("↳ started · 0s ago"), "{deck}");
+        let _ = running;
+
+        // Formatter tiers: plain uses ASCII arrow and separator; no-activity
+        // and no-age cases degrade gracefully.
+        assert_eq!(
+            agent_activity_child_row(Some("started tool Read"), Some(4_200), false),
+            "↳ started tool Read · 4s ago"
+        );
+        assert_eq!(
+            agent_activity_child_row(Some("usage updated"), Some(65_000), true),
+            "-> usage updated | 1m05s ago"
+        );
+        assert_eq!(
+            agent_activity_child_row(Some("started"), None, false),
+            "↳ started"
+        );
+        assert_eq!(
+            agent_activity_child_row(None, Some(10), false),
+            "↳ no activity yet"
+        );
     }
 
     #[test]
