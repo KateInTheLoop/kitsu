@@ -362,6 +362,74 @@ fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Resul
     })
 }
 
+/// Read lines `[start, end]` (1-based, inclusive) with the byte cap applied
+/// to the *served range*, not the absolute file prefix. The pre-fix behavior
+/// read only the first `max_bytes` from byte 0 and then sliced the range out
+/// of that prefix, so any range starting past the cap returned almost
+/// nothing — on a ~128 KiB source file this burned 6-7 thrashing tool rounds
+/// per turn before the model gave up (kimi-k3 cycle-1 supervisor finding).
+/// Skipped prefix lines cost I/O only, never memory.
+fn read_capped_line_range(
+    file: std::fs::File,
+    max_bytes: usize,
+    start: usize,
+    end: usize,
+) -> std::io::Result<CappedText> {
+    use std::io::BufRead;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("read target is not a regular file"));
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut line_number = 0usize;
+    let mut text = String::new();
+    let mut truncated = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        line_number += 1;
+        if line_number < start {
+            continue;
+        }
+        if line_number > end {
+            break;
+        }
+        // Match the historical `.lines()` slicing: line terminators are
+        // stripped and served lines are joined with '\n'.
+        let stripped = line
+            .strip_suffix('\n')
+            .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+            .unwrap_or(&line);
+        let separator = usize::from(!text.is_empty());
+        if text.len() + separator + stripped.len() > max_bytes {
+            truncated = true;
+            if text.is_empty() {
+                // A single line larger than the whole budget: serve its
+                // prefix on a char boundary rather than nothing.
+                let mut cut = max_bytes;
+                while cut > 0 && !stripped.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.push_str(&stripped[..cut]);
+            }
+            break;
+        }
+        if separator == 1 {
+            text.push('\n');
+        }
+        text.push_str(stripped);
+    }
+    Ok(CappedText {
+        text,
+        truncated,
+        total_bytes: metadata.len(),
+    })
+}
+
 fn open_read_file(path: &Path) -> std::io::Result<std::fs::File> {
     #[cfg(unix)]
     {
@@ -442,35 +510,29 @@ where
     let file = open_read_file(authorization.path())
         .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
     authorization.validate_opened_file(&file, policy)?;
-    let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
-        .await
-        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
-        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
-
-    let served_bytes = content.text.len();
-    let sliced = match (a.start_line, a.end_line) {
-        (None, None) => content.text,
+    // Ranged reads stream to the requested lines and apply the byte cap to
+    // the range itself; only a full-file read caps from the file start.
+    let content = match (a.start_line, a.end_line) {
+        (None, None) => tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes)),
         (start, end) => {
-            let s = start.unwrap_or(1).max(1);
-            let e = end.unwrap_or(usize::MAX);
-            content
-                .text
-                .lines()
-                .enumerate()
-                .filter(|(i, _)| {
-                    let ln = i + 1;
-                    ln >= s && ln <= e
-                })
-                .map(|(_, l)| l)
-                .collect::<Vec<_>>()
-                .join("\n")
+            let start = start.unwrap_or(1).max(1);
+            let end = end.unwrap_or(usize::MAX);
+            tokio::task::spawn_blocking(move || read_capped_line_range(file, max_bytes, start, end))
         }
-    };
+    }
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+
+    // Disclose what the caller actually received (post-slice), not the
+    // pre-slice absolute read — the earlier figure misdescribed narrow
+    // ranges on large files (kimi-k3 cycle-1 supervisor finding).
+    let served_bytes = content.text.len();
     // The size disclosure is appended AFTER policy capping: cap_output trims
     // the tail, so an earlier append would be eaten and replaced by its
     // generic marker (the pre-fix behavior). The ~100-byte overflow past the
     // cap is deliberate — the disclosure is the point.
-    let mut capped = policy.cap_output(sliced);
+    let mut capped = policy.cap_output(content.text);
     if content.truncated {
         capped.push_str(&format!(
             "\n...[truncated: output exceeded byte cap — served {} KiB of {} KiB total; re-read a line range for the rest]",
@@ -3419,8 +3481,71 @@ mod tests {
 
         let output = read_file_run(&policy, &args).await.unwrap();
 
-        assert!(output.ends_with("...[truncated: output exceeded byte cap]"));
-        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 64);
+        // cap_output's generic marker is replaced by the served-of-total
+        // disclosure appended after capping (cycle 31).
+        assert!(
+            output.contains("...[truncated: output exceeded byte cap"),
+            "missing truncation marker: ...{}",
+            &output[output.len().saturating_sub(160)..]
+        );
+        assert!(output.ends_with("re-read a line range for the rest]"));
+        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 256);
+    }
+
+    /// The byte cap on a ranged read is range-relative: a range starting past
+    /// the file's first 64 KiB serves the requested lines in full instead of
+    /// the near-empty remainder of an absolute-prefix cap (kimi-k3 cycle-1).
+    #[tokio::test]
+    async fn read_file_range_past_the_byte_cap_serves_the_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // 4000 lines x ~30 bytes ≈ 120 KiB: line 3000 sits well past 64 KiB.
+        let body: String = (1..=4000)
+            .map(|n| format!("line-{n:05} {}\n", "x".repeat(18)))
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+        let policy =
+            Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[]).unwrap();
+        let args = serde_json::json!({
+            "path": path,
+            "start_line": 3000,
+            "end_line": 3004
+        })
+        .to_string();
+
+        let output = read_file_run(&policy, &args).await.unwrap();
+
+        assert!(output.starts_with("line-03000"), "got: {output}");
+        assert!(output.contains("line-03004"));
+        assert_eq!(output.lines().count(), 5);
+        assert!(
+            !output.contains("truncated"),
+            "range fits, no cap: {output}"
+        );
+    }
+
+    /// A ranged read wider than the byte budget is capped relative to the
+    /// range start and discloses the actually-served size.
+    #[tokio::test]
+    async fn read_file_wide_range_caps_relative_to_the_range_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let body: String = (1..=8000)
+            .map(|n| format!("line-{n:05} {}\n", "x".repeat(18)))
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+        let policy =
+            Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[]).unwrap();
+        let args = serde_json::json!({"path": path, "start_line": 3000}).to_string();
+
+        let output = read_file_run(&policy, &args).await.unwrap();
+
+        // Serving starts at the requested line, fills the budget, and the
+        // disclosure reports post-slice served bytes (~64 KiB), not the
+        // pre-slice absolute read.
+        assert!(output.starts_with("line-03000"), "got: {output}");
+        assert!(output.contains("served 63 KiB") || output.contains("served 64 KiB"));
+        assert!(output.ends_with("re-read a line range for the rest]"));
     }
 
     #[cfg(unix)]
