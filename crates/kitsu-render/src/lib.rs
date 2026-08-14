@@ -2,6 +2,7 @@
 //! Full UX (palette, code blocks, spinners) is later phases (design §8).
 
 pub mod jsonl;
+pub mod live;
 
 use std::io::{self, IsTerminal, Write};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -355,11 +356,21 @@ pub fn print_fragment(s: &str) {
             ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
             TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
         }
-        stream_buffer()
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .push(&sanitized);
-        let _ = io::stdout().flush();
+        let push_lines = || {
+            stream_buffer()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .push(&sanitized);
+            let _ = io::stdout().flush();
+        };
+        if sanitized.contains('\n') {
+            // Completed lines are about to hit stdout; lift the live status
+            // row so they land above it. Partial fragments only accumulate
+            // (no write), so they skip the clear/repaint cycle.
+            live::with_live_row_suspended(push_lines);
+        } else {
+            push_lines();
+        }
     } else {
         // Non-TTY or plain: use existing sanitizer path (byte-identical)
         let sanitized = stream_sanitizer()
@@ -386,9 +397,11 @@ pub fn print_message(s: &str) {
         ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
         TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
     }
-    let mut out = io::stdout();
-    let _ = out.write_all(rendered.as_bytes());
-    let _ = out.flush();
+    live::with_live_row_suspended(|| {
+        let mut out = io::stdout();
+        let _ = out.write_all(rendered.as_bytes());
+        let _ = out.flush();
+    });
 }
 
 /// Style inline markdown elements in a line: bold, inline code, and list markers.
@@ -1014,8 +1027,10 @@ impl PromptSafeAsyncNotice {
         styled: bool,
         plain: bool,
     ) -> io::Result<()> {
-        writeln!(destination, "{}", self.line_with_mode(styled, plain))?;
-        destination.flush()
+        live::with_live_row_suspended(|| {
+            writeln!(destination, "{}", self.line_with_mode(styled, plain))?;
+            destination.flush()
+        })
     }
 
     fn line_with_mode(&self, styled: bool, plain: bool) -> String {
@@ -1049,9 +1064,11 @@ impl PromptSafeAsyncNotice {
 /// following hint lines pass through untinted. `--plain`/non-TTY receive the
 /// same text with no ANSI.
 pub fn render_error(message: &str) {
-    for line in error_lines(message) {
-        eprintln!("{line}");
-    }
+    live::with_live_row_suspended(|| {
+        for line in error_lines(message) {
+            eprintln!("{line}");
+        }
+    });
 }
 
 /// The [`render_error`] payload as lines, for callers that own the printing
@@ -1266,16 +1283,16 @@ impl Spinner {
                     String::new()
                 };
 
-                // Clear to end of line: verbs and the elapsed suffix vary in
-                // length, and a shrinking line must not leave residue.
-                eprint!(
-                    "\r  {}{pad} {}{}{}\x1b[K",
+                // The frame renders through the shared live status row so the
+                // spinner and the type-ahead input draft coexist on one
+                // rewritable line (clearing and cursor placement live there).
+                live::set_spinner_segment(Some(format!(
+                    "  {}{pad} {}{}{}",
                     frame.truecolor(r, g, b),
                     format!("kitsu is {}", verb).dimmed(),
                     elapsed_suffix,
                     dots.dimmed()
-                );
-                let _ = io::stderr().flush();
+                )));
                 i += 1;
                 tokio::time::sleep(std::time::Duration::from_millis(160)).await;
             }
@@ -1297,8 +1314,9 @@ impl Spinner {
             h.abort();
         }
         if std::mem::take(&mut self.clear_line) {
-            eprint!("\r\x1b[2K");
-            let _ = io::stderr().flush();
+            // Dropping the segment repaints the live row, which erases the
+            // spinner while leaving any in-progress input draft visible.
+            live::set_spinner_segment(None);
         }
     }
 }
@@ -1326,25 +1344,27 @@ pub fn turn_wrote_assistant_output() -> bool {
 
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
-    // Flush any partial line from the streaming buffer UNSTYLED
-    // and reset its fence state.
-    stream_buffer()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .flush_unstyled();
+    live::with_live_row_suspended(|| {
+        // Flush any partial line from the streaming buffer UNSTYLED
+        // and reset its fence state.
+        stream_buffer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .flush_unstyled();
 
-    // Reset the non-TTY sanitizer state as well
-    stream_sanitizer()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .reset();
+        // Reset the non-TTY sanitizer state as well
+        stream_sanitizer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .reset();
 
-    if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
-        return;
-    }
-    let mut out = io::stdout();
-    let _ = out.write_all(b"\n");
-    let _ = out.flush();
+        if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
+            return;
+        }
+        let mut out = io::stdout();
+        let _ = out.write_all(b"\n");
+        let _ = out.flush();
+    });
 }
 
 /// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
@@ -1356,14 +1376,16 @@ pub fn tool_activity(header: &str) {
     } else {
         sanitize_terminal_inline(header)
     };
-    if stderr_is_tty() && !plain {
-        let (r, g, b) = theme().accent;
-        eprintln!("{} {header}", GLYPH_TOOL_CALL.truecolor(r, g, b));
-    } else if plain {
-        eprintln!("tool> {header}");
-    } else {
-        eprintln!("{GLYPH_TOOL_CALL} {header}");
-    }
+    live::with_live_row_suspended(|| {
+        if stderr_is_tty() && !plain {
+            let (r, g, b) = theme().accent;
+            eprintln!("{} {header}", GLYPH_TOOL_CALL.truecolor(r, g, b));
+        } else if plain {
+            eprintln!("tool> {header}");
+        } else {
+            eprintln!("{GLYPH_TOOL_CALL} {header}");
+        }
+    });
 }
 
 /// The result summary line under a tool call — e.g. `  ◇ 128 lines`. Dimmed on a
@@ -1386,18 +1408,20 @@ fn tool_result_with_weight(summary: &str, is_error: bool) {
         sanitize_terminal_inline(summary)
     };
     let line = format!("  {GLYPH_TOOL_RESULT} {summary}");
-    if stderr_is_tty() && !plain {
-        if is_error {
-            let (r, g, b) = theme().error;
-            eprintln!("{}", line.truecolor(r, g, b));
+    live::with_live_row_suspended(|| {
+        if stderr_is_tty() && !plain {
+            if is_error {
+                let (r, g, b) = theme().error;
+                eprintln!("{}", line.truecolor(r, g, b));
+            } else {
+                eprintln!("{}", line.dimmed());
+            }
+        } else if plain {
+            eprintln!("result> {summary}");
         } else {
-            eprintln!("{}", line.dimmed());
+            eprintln!("{line}");
         }
-    } else if plain {
-        eprintln!("result> {summary}");
-    } else {
-        eprintln!("{line}");
-    }
+    });
 }
 
 /// A section heading (e.g. one `/help` group). Bold when `styled`, verbatim
@@ -1506,7 +1530,9 @@ pub fn render_diff(diff: &str) {
 /// gate; at most one line per event, never in tool receipts. `--plain` renders
 /// the same text behind the ASCII `*` marker.
 pub fn milestone(message: &str) {
-    eprintln!("{}", milestone_line(message));
+    live::with_live_row_suspended(|| {
+        eprintln!("{}", milestone_line(message));
+    });
 }
 
 /// The [`milestone`] payload as a string, for callers that route output.

@@ -11,6 +11,7 @@ mod prompt_queue;
 mod session;
 mod skills;
 mod subagent;
+mod typeahead_editor;
 mod workspace;
 
 use std::cell::{Cell, RefCell};
@@ -3143,6 +3144,7 @@ fn read_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     prompt: &str,
     assistive: bool,
+    initial: &str,
 ) -> ChatReadline {
     if assistive {
         #[cfg(unix)]
@@ -3162,7 +3164,14 @@ fn read_chat_line(
             Err(error) => ChatReadline::Error(error.to_string()),
         };
     }
-    match editor.readline(prompt) {
+    // A draft carried over from the during-turn live editor pre-fills the
+    // prompt (cursor at the end) instead of being silently dropped.
+    let result = if initial.is_empty() {
+        editor.readline(prompt)
+    } else {
+        editor.readline_with_initial(prompt, (initial, ""))
+    };
+    match result {
         Ok(line) => ChatReadline::Line(line),
         Err(rustyline::error::ReadlineError::Eof) => ChatReadline::Eof,
         Err(rustyline::error::ReadlineError::Interrupted) => ChatReadline::Interrupted,
@@ -9281,6 +9290,186 @@ struct TypeaheadCaptureResult {
     captured: usize,
     outcomes: Vec<TypeaheadOutcome>,
     eof: bool,
+    /// Text the user was still composing on the live input row when the turn
+    /// ended. Carried into the next prompt so mid-turn typing is never lost.
+    pending_draft: String,
+    /// Whether the live raw-mode editor ran (its receipts print immediately,
+    /// so the post-turn bookkeeping summary is skipped).
+    live: bool,
+}
+
+/// Routing shared by both type-ahead loops: active-turn controls (`/steer`,
+/// `/jobs`, `/queue`, `/quit cancel`) execute immediately; everything else
+/// queues as a future prompt. Live (raw-mode) sessions narrate outcomes as
+/// they happen; canonical sessions defer them to the post-turn flush.
+#[cfg(unix)]
+struct TypeaheadDispatcher {
+    queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
+    steering: prompt_queue::SteeringChannel,
+    registry: Arc<subagent::AgentRegistry>,
+    runtime: tokio::runtime::Handle,
+    live: bool,
+}
+
+#[cfg(unix)]
+impl TypeaheadDispatcher {
+    fn deliver(&self, outcome: TypeaheadOutcome, result: &mut TypeaheadCaptureResult) {
+        if !self.live {
+            result.outcomes.push(outcome);
+            return;
+        }
+        kitsu_render::live::with_live_row_suspended(|| match &outcome {
+            TypeaheadOutcome::Notice(notice) => {
+                eprintln!("~ {}", kitsu_render::sanitize_terminal_text(notice));
+            }
+            TypeaheadOutcome::SteeringError(error) => {
+                eprintln!("steering refused: {}", terminal_inline(error));
+            }
+            TypeaheadOutcome::QueueError(error) => {
+                eprintln!("queue refused: {}", terminal_inline(error));
+            }
+        });
+    }
+
+    fn dispatch(&self, line: &str, result: &mut TypeaheadCaptureResult) {
+        if line == "/steer" || line.starts_with("/steer ") {
+            let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
+            if correction.is_empty() {
+                self.deliver(
+                    TypeaheadOutcome::SteeringError(
+                        "steering correction cannot be empty".to_string(),
+                    ),
+                    result,
+                );
+                return;
+            }
+            let Some(turn) = self.steering.active_turn() else {
+                self.deliver(
+                    TypeaheadOutcome::SteeringError(
+                        "steering arrived after the foreground turn ended; it was not queued as a new prompt"
+                            .to_string(),
+                    ),
+                    result,
+                );
+                return;
+            };
+            match self.steering.steer(turn, correction) {
+                Ok(_) => {
+                    if self.live {
+                        let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
+                            "steering the current turn: {correction}"
+                        ))
+                        .write_line(&mut std::io::stderr());
+                    }
+                }
+                Err(error) => self.deliver(
+                    TypeaheadOutcome::SteeringError(format!(
+                        "{error} ({}-character correction was not converted into a future prompt)",
+                        error.correction().text().chars().count()
+                    )),
+                    result,
+                ),
+            }
+            return;
+        }
+        if line == "/jobs" || line.starts_with("/jobs ") {
+            let argument = line.strip_prefix("/jobs").unwrap_or_default().trim();
+            match handle_active_jobs_command(&self.registry, &self.runtime, argument) {
+                Ok(message) => self.deliver(TypeaheadOutcome::Notice(message), result),
+                Err(error) => self.deliver(TypeaheadOutcome::QueueError(error), result),
+            }
+            return;
+        }
+        if line == "/quit cancel" || line == "/exit cancel" {
+            ACTIVE_QUIT_CANCEL.store(true, Ordering::Release);
+            self.deliver(
+                TypeaheadOutcome::Notice(
+                    "exit cancellation accepted; stopping the foreground turn and all background agents".to_string(),
+                ),
+                result,
+            );
+            return;
+        }
+        if line == "/queue" || line.starts_with("/queue ") {
+            let argument = line.strip_prefix("/queue").unwrap_or_default();
+            match parse_queue_command(argument).and_then(|command| {
+                execute_queue_command(&mut self.queue.lock().expect("prompt queue"), command)
+            }) {
+                Ok(message) => self.deliver(TypeaheadOutcome::Notice(message), result),
+                Err(error) => self.deliver(TypeaheadOutcome::QueueError(error), result),
+            }
+            return;
+        }
+        match self
+            .queue
+            .lock()
+            .expect("prompt queue")
+            .enqueue(line.to_string())
+        {
+            Ok(status) => {
+                result.captured += 1;
+                if self.live {
+                    // The draft row is ephemeral; a queue receipt keeps the
+                    // submitted text visible in the transcript.
+                    let message = if status.queued > 1 {
+                        format!("queued ({} waiting): {line}", status.queued)
+                    } else {
+                        format!("queued: {line}")
+                    };
+                    let _ = kitsu_render::PromptSafeAsyncNotice::info(message)
+                        .write_line(&mut std::io::stderr());
+                }
+            }
+            Err(error) => self.deliver(
+                TypeaheadOutcome::QueueError(format!(
+                    "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
+                    error.capacity(),
+                    error.prompt().chars().count(),
+                )),
+                result,
+            ),
+        }
+    }
+}
+
+/// Non-canonical stdin for the live type-ahead editor: byte-at-a-time reads
+/// with no kernel echo (the editor repaints the draft itself). `ISIG` is left
+/// on so Ctrl+C still cancels the foreground turn through the signal path.
+#[cfg(unix)]
+struct RawStdinGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawStdinGuard {
+    fn engage() -> Option<Self> {
+        // SAFETY: tcgetattr/tcsetattr write through a valid pointer to one
+        // termios struct; stdin's fd is process-owned and stays open.
+        unsafe {
+            let mut modes: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) != 0 {
+                return None;
+            }
+            let original = modes;
+            modes.c_lflag &= !(libc::ICANON | libc::ECHO);
+            modes.c_cc[libc::VMIN] = 1;
+            modes.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes) != 0 {
+                return None;
+            }
+            Some(Self { original })
+        }
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawStdinGuard {
+    fn drop(&mut self) {
+        // SAFETY: restores the termios snapshot captured in `engage`.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
 }
 
 /// Own complete lines submitted while a foreground turn is running. Rustyline
@@ -9295,137 +9484,44 @@ struct TypeaheadCollector {
 
 #[cfg(unix)]
 impl TypeaheadCollector {
+    /// `live_prompt`: when `Some`, stdin is a styled interactive TTY and the
+    /// collector runs the raw-mode live editor (visible draft, cursor, and
+    /// history on the shared status row). `None` keeps the canonical
+    /// line-at-a-time loop for scripted/plain/assistive sessions. `history`
+    /// seeds ↑/↓ recall; `initial_draft` restores typing carried across turns.
     fn start(
         queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         steering: prompt_queue::SteeringChannel,
         registry: Arc<subagent::AgentRegistry>,
+        live_prompt: Option<String>,
+        history: Vec<String>,
+        initial_draft: String,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let runtime = tokio::runtime::Handle::current();
         let handle = std::thread::spawn(move || {
-            let mut result = TypeaheadCaptureResult::default();
-            while !thread_stop.load(Ordering::Acquire) {
-                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                // Serialize ownership of canonical stdin with permission and
-                // command prompts. Holding this lock from poll through
-                // read_line closes the check-to-read race where one submitted
-                // line could otherwise become either type-ahead or approval.
-                let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                };
-                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
-                    continue;
-                }
-
-                let mut descriptor = libc::pollfd {
-                    fd: libc::STDIN_FILENO,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `descriptor` points to one initialized pollfd for the
-                // duration of the call, and stdin's process fd is not owned or
-                // closed by this collector.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
-                if ready < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-                    continue;
-                }
-
-                let mut line = String::new();
-                match std::io::stdin().read_line(&mut line) {
-                    Ok(0) => {
-                        result.eof = true;
-                        break;
-                    }
-                    Ok(_) => {
-                        let line = line.trim().to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if line == "/steer" || line.starts_with("/steer ") {
-                            let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
-                            if correction.is_empty() {
-                                result.outcomes.push(TypeaheadOutcome::SteeringError(
-                                    "steering correction cannot be empty".to_string(),
-                                ));
-                                continue;
-                            }
-                            let Some(turn) = steering.active_turn() else {
-                                result.outcomes.push(TypeaheadOutcome::SteeringError(
-                                    "steering arrived after the foreground turn ended; it was not queued as a new prompt"
-                                        .to_string(),
-                                ));
-                                continue;
-                            };
-                            match steering.steer(turn, correction) {
-                                Ok(_) => {}
-                                Err(error) => result.outcomes.push(TypeaheadOutcome::SteeringError(format!(
-                                    "{error} ({}-character correction was not converted into a future prompt)",
-                                    error.correction().text().chars().count()
-                                ))),
-                            }
-                            continue;
-                        }
-                        if line == "/jobs" || line.starts_with("/jobs ") {
-                            let argument = line.strip_prefix("/jobs").unwrap_or_default().trim();
-                            match handle_active_jobs_command(&registry, &runtime, argument) {
-                                Ok(message) => {
-                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
-                                }
-                                Err(error) => {
-                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
-                                }
-                            }
-                            continue;
-                        }
-                        if line == "/quit cancel" || line == "/exit cancel" {
-                            ACTIVE_QUIT_CANCEL.store(true, Ordering::Release);
-                            result.outcomes.push(TypeaheadOutcome::Notice(
-                                "exit cancellation accepted; stopping the foreground turn and all background agents".to_string(),
-                            ));
-                            continue;
-                        }
-                        if line == "/queue" || line.starts_with("/queue ") {
-                            let argument = line.strip_prefix("/queue").unwrap_or_default();
-                            match parse_queue_command(argument).and_then(|command| {
-                                execute_queue_command(
-                                    &mut queue.lock().expect("prompt queue"),
-                                    command,
-                                )
-                            }) {
-                                Ok(message) => {
-                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
-                                }
-                                Err(error) => {
-                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
-                                }
-                            }
-                            continue;
-                        }
-                        match queue.lock().expect("prompt queue").enqueue(line) {
-                            Ok(_) => result.captured += 1,
-                            Err(error) => result.outcomes.push(TypeaheadOutcome::QueueError(format!(
-                                "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
-                                error.capacity(),
-                                error.prompt().chars().count(),
-                            ))),
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+            let mut dispatcher = TypeaheadDispatcher {
+                queue,
+                steering,
+                registry,
+                runtime,
+                live: false,
+            };
+            if let Some(prompt) = live_prompt {
+                if let Some(raw) = RawStdinGuard::engage() {
+                    dispatcher.live = true;
+                    return run_live_typeahead(
+                        raw,
+                        &thread_stop,
+                        &dispatcher,
+                        prompt,
+                        history,
+                        initial_draft,
+                    );
                 }
             }
-            result
+            run_canonical_typeahead(&thread_stop, &dispatcher)
         });
         Self {
             stop,
@@ -9442,6 +9538,192 @@ impl TypeaheadCollector {
     }
 }
 
+/// The pre-live collector loop: canonical stdin, complete submitted lines
+/// only. Kept for sessions where the raw-mode editor must not run (piped
+/// stdin, `--plain`, assistive input, or a terminal that refuses raw mode).
+#[cfg(unix)]
+fn run_canonical_typeahead(
+    stop: &AtomicBool,
+    dispatcher: &TypeaheadDispatcher,
+) -> TypeaheadCaptureResult {
+    let mut result = TypeaheadCaptureResult::default();
+    while !stop.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        // Serialize ownership of canonical stdin with permission and
+        // command prompts. Holding this lock from poll through
+        // read_line closes the check-to-read race where one submitted
+        // line could otherwise become either type-ahead or approval.
+        let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points to one initialized pollfd for the
+        // duration of the call, and stdin's process fd is not owned or
+        // closed by this collector.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                result.eof = true;
+                break;
+            }
+            Ok(_) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                dispatcher.dispatch(&line, &mut result);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// The live during-turn editor: raw stdin bytes feed the pure
+/// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
+/// status row with a real cursor, ↑/↓ history, and editable text — while
+/// streamed output and tool receipts keep flowing above it. Approval prompts
+/// take stdin back by flipping `APPROVAL_INPUT_ACTIVE`: raw mode is released
+/// and the draft row hidden until the approval completes.
+#[cfg(unix)]
+fn run_live_typeahead(
+    raw: RawStdinGuard,
+    stop: &AtomicBool,
+    dispatcher: &TypeaheadDispatcher,
+    prompt: String,
+    history: Vec<String>,
+    initial_draft: String,
+) -> TypeaheadCaptureResult {
+    use kitsu_render::live;
+
+    let mut result = TypeaheadCaptureResult {
+        live: true,
+        ..TypeaheadCaptureResult::default()
+    };
+    let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
+    let mut raw = Some(raw);
+    live::live_input_begin(prompt.clone());
+    live::live_input_update(editor.buffer_string(), editor.cursor());
+    while !stop.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            if let Some(guard) = raw.take() {
+                // Canonical mode (with echo) back on for the approval reader;
+                // the draft row is already hidden by the approval guard.
+                drop(guard);
+                live::live_input_end();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => {
+                    raw = Some(guard);
+                    live::live_input_begin(prompt.clone());
+                    live::live_input_update(editor.buffer_string(), editor.cursor());
+                }
+                None => break,
+            }
+        }
+        let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd for the duration of the call; stdin
+        // stays process-owned.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+
+        let mut buffer = [0u8; 1024];
+        // SAFETY: reads into a stack buffer of the stated length from the
+        // process-owned stdin descriptor. VMIN=1 and a successful poll mean
+        // a zero return is end-of-input, not an empty raw read.
+        let count = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if count == 0 {
+            result.eof = true;
+            break;
+        }
+        let outcome = editor.feed(&buffer[..count as usize]);
+        for action in outcome.actions {
+            match action {
+                typeahead_editor::EditorAction::Submit(line) => {
+                    let line = line.trim().to_string();
+                    if line.is_empty() {
+                        continue;
+                    }
+                    dispatcher.dispatch(&line, &mut result);
+                }
+                typeahead_editor::EditorAction::Eof => {
+                    result.eof = true;
+                }
+            }
+        }
+        if result.eof {
+            break;
+        }
+        if outcome.changed {
+            live::live_input_update(editor.buffer_string(), editor.cursor());
+        }
+    }
+    live::live_input_end();
+    drop(raw);
+    result.pending_draft = editor.take_draft();
+    result
+}
+
 #[cfg(not(unix))]
 struct TypeaheadCollector;
 
@@ -9451,6 +9733,9 @@ impl TypeaheadCollector {
         _queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         _steering: prompt_queue::SteeringChannel,
         _registry: Arc<subagent::AgentRegistry>,
+        _live_prompt: Option<String>,
+        _history: Vec<String>,
+        _initial_draft: String,
     ) -> Self {
         Self
     }
@@ -11130,6 +11415,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // Fallback for terminals where Rustyline cannot create an external printer.
     let mut last_agent_snapshot = agent_registry.snapshot();
     let mut last_failed: Option<SubmittedPrompt> = None;
+    // Type-ahead the user was still composing when a turn ended; pre-filled
+    // into the next live editor or idle prompt so typing is never dropped.
+    let mut pending_draft = String::new();
     let no_tools = Registry::new();
 
     loop {
@@ -11182,7 +11470,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 .await;
                 break;
             }
-            (None, None) => match read_chat_line(&mut rl, &visible_prompt, assistive_input) {
+            (None, None) => match read_chat_line(
+                &mut rl,
+                &visible_prompt,
+                assistive_input,
+                &std::mem::take(&mut pending_draft),
+            ) {
                 ChatReadline::Line(line) => line,
                 ChatReadline::Eof => {
                     let running = agent_registry.running();
@@ -11615,10 +11908,20 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .begin_turn()
             .expect("interactive turns open steering sequentially");
         foreground_typeahead_active.store(true, Ordering::Release);
+        // A styled interactive session gets the live raw-mode editor (visible
+        // draft + history on the status row); scripted/plain/assistive
+        // sessions keep the canonical line collector.
+        let typeahead_live_prompt =
+            (!assistive_input && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled())
+                .then(kitsu_render::prompt_string);
+        let typeahead_history: Vec<String> = rl.history().iter().cloned().collect();
         let typeahead = TypeaheadCollector::start(
             prompt_queue.clone(),
             steering.clone(),
             agent_registry.clone(),
+            typeahead_live_prompt,
+            typeahead_history,
+            std::mem::take(&mut pending_draft),
         );
         let turn_outcome = write_journal
             .scope_turn(
@@ -11637,12 +11940,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .await;
         let captured = typeahead.finish();
         foreground_typeahead_active.store(false, Ordering::Release);
+        pending_draft = captured.pending_draft;
         while let Ok(notice) = deferred_notice_receiver.try_recv() {
             eprintln!("{notice}");
         }
-        if captured.captured > 0 {
+        if captured.captured > 0 && !captured.live {
             // Only narrate type-ahead that is still waiting: input that was
             // consumed immediately (e.g. an /exit) needs no bookkeeping line.
+            // The live editor already printed a per-prompt queue receipt.
             let status = prompt_queue.lock().expect("prompt queue").status();
             if status.queued > 0 {
                 eprintln!("~ captured type-ahead: {status}");
@@ -13552,6 +13857,10 @@ impl ApprovalInputGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_active = APPROVAL_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
+        // Take the live type-ahead draft row off the terminal before the
+        // approval prompt prints; the collector re-shows it (draft intact)
+        // once the approval releases stdin.
+        kitsu_render::live::live_input_end();
         Self {
             _owner: owner,
             previous_active,
