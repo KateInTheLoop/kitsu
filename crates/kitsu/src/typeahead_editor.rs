@@ -7,7 +7,9 @@
 //!
 //! Supported keys: printable UTF-8 insert, Enter (submit), Backspace, Delete,
 //! ←/→/Home/End (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash,
-//! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W (delete word),
+//! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W / Alt+Backspace
+//! (delete word behind), Alt+D / Ctrl+Delete (delete word ahead),
+//! Alt+B/F and Ctrl+←/→ (word motion),
 //! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
 //! newline), Tab (requests inline-hint completion from the collector; the
 //! editor itself is hint-agnostic), and lone Esc (clears the draft — the
@@ -298,6 +300,14 @@ impl TypeaheadEditor {
                     // Alt+Enter (ESC then CR/LF): insert a literal newline so
                     // multi-line prompts can be composed by hand.
                     b'\r' | b'\n' => self.insert_char('\n', outcome),
+                    // Readline meta keys: Alt+B/F word motion, Alt+D deletes
+                    // the word ahead, Alt+Backspace the word behind. Inside a
+                    // paste these bytes are content, not keys; the fallback
+                    // below re-feeds them into the paste path.
+                    b'b' if !self.in_paste => self.move_word_left(outcome),
+                    b'f' if !self.in_paste => self.move_word_right(outcome),
+                    b'd' if !self.in_paste => self.delete_word_right(outcome),
+                    0x7f | 0x08 if !self.in_paste => self.delete_word_left(outcome),
                     // A bare ESC followed by an ordinary key: drop the ESC
                     // and process the key normally.
                     _ => self.feed_byte(byte, outcome),
@@ -470,14 +480,7 @@ impl TypeaheadEditor {
                     outcome.changed = true;
                 }
             }
-            0x17 => {
-                let start = self.word_start();
-                if start < self.cursor {
-                    self.buffer.drain(start..self.cursor);
-                    self.cursor = start;
-                    outcome.changed = true;
-                }
-            }
+            0x17 => self.delete_word_left(outcome),
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x12 => self.search_enter_or_cycle(outcome),
             0x1a => outcome.actions.push(EditorAction::Suspend),
@@ -527,8 +530,15 @@ impl TypeaheadEditor {
         match final_byte {
             b'A' => self.history_prev(outcome),
             b'B' => self.history_next(outcome),
-            b'C' => self.move_right(outcome),
-            b'D' => self.move_left(outcome),
+            // Ctrl+→ / Alt+→ (modifier params 5/3) jump by words.
+            b'C' => match self.csi_params.as_slice() {
+                b"1;5" | b"1;3" => self.move_word_right(outcome),
+                _ => self.move_right(outcome),
+            },
+            b'D' => match self.csi_params.as_slice() {
+                b"1;5" | b"1;3" => self.move_word_left(outcome),
+                _ => self.move_left(outcome),
+            },
             b'H' => self.move_home(outcome),
             b'F' => self.move_end(outcome),
             b'~' => match self.csi_params.as_slice() {
@@ -539,6 +549,8 @@ impl TypeaheadEditor {
                         outcome.changed = true;
                     }
                 }
+                // Ctrl+Delete: delete the word ahead.
+                b"3;5" => self.delete_word_right(outcome),
                 b"4" | b"8" => self.move_end(outcome),
                 b"200" => {
                     self.in_paste = true;
@@ -607,6 +619,50 @@ impl TypeaheadEditor {
             index -= 1;
         }
         index
+    }
+
+    fn word_end(&self) -> usize {
+        let mut index = self.cursor;
+        while index < self.buffer.len() && self.buffer[index].is_whitespace() {
+            index += 1;
+        }
+        while index < self.buffer.len() && !self.buffer[index].is_whitespace() {
+            index += 1;
+        }
+        index
+    }
+
+    fn move_word_left(&mut self, outcome: &mut FeedOutcome) {
+        let start = self.word_start();
+        if start != self.cursor {
+            self.cursor = start;
+            outcome.changed = true;
+        }
+    }
+
+    fn move_word_right(&mut self, outcome: &mut FeedOutcome) {
+        let end = self.word_end();
+        if end != self.cursor {
+            self.cursor = end;
+            outcome.changed = true;
+        }
+    }
+
+    fn delete_word_left(&mut self, outcome: &mut FeedOutcome) {
+        let start = self.word_start();
+        if start < self.cursor {
+            self.buffer.drain(start..self.cursor);
+            self.cursor = start;
+            outcome.changed = true;
+        }
+    }
+
+    fn delete_word_right(&mut self, outcome: &mut FeedOutcome) {
+        let end = self.word_end();
+        if end > self.cursor {
+            self.buffer.drain(self.cursor..end);
+            outcome.changed = true;
+        }
     }
 
     fn history_prev(&mut self, outcome: &mut FeedOutcome) {
@@ -722,6 +778,37 @@ mod tests {
         assert_eq!(editor.cursor(), 0);
         editor.feed(b"\x1b[F");
         assert_eq!(editor.cursor(), 2);
+    }
+
+    #[test]
+    fn word_motions_jump_and_delete_by_words() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"run the tests");
+        editor.feed(b"\x1bb"); // Alt+B: start of "tests"
+        assert_eq!(editor.cursor(), 8);
+        editor.feed(b"\x1b[1;5D"); // Ctrl+Left: start of "the"
+        assert_eq!(editor.cursor(), 4);
+        editor.feed(b"\x1b[1;3C"); // Alt+Right: end of "the"
+        assert_eq!(editor.cursor(), 7);
+        editor.feed(b"\x1bf"); // Alt+F: end of "tests"
+        assert_eq!(editor.cursor(), 13);
+        editor.feed(b"\x1b\x7f"); // Alt+Backspace: drop "tests"
+        assert_eq!(editor.buffer_string(), "run the ");
+        editor.feed(b"\x1b[H\x1bd"); // Home, Alt+D: drop "run"
+        assert_eq!(editor.buffer_string(), " the ");
+        assert_eq!(editor.cursor(), 0);
+        editor.feed(b"\x1b[3;5~"); // Ctrl+Delete: drop " the"
+        assert_eq!(editor.buffer_string(), " ");
+    }
+
+    #[test]
+    fn word_motion_bytes_inside_a_paste_are_content_not_keys() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"\x1b[200~one \x1bbtwo\x1b[201~");
+        // The pasted ESC is dropped, its trailing 'b' lands as text and the
+        // cursor never jumps mid-paste.
+        assert_eq!(editor.buffer_string(), "one btwo");
+        assert_eq!(editor.cursor(), 8);
     }
 
     #[test]
