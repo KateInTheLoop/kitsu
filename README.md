@@ -309,6 +309,9 @@ If a selected Ollama profile points at a loopback URL but cannot be reached,
 Kitsu names local Ollama and suggests checking `ollama serve` or selecting a
 different gateway. Other connection failures keep the generic gateway remedy;
 neither form prints the configured URL or provider-controlled error detail.
+With `--jsonl`, the local case also emits the stable
+`diagnostic_code: "local_ollama_unreachable"` and bounded recovery-action
+enums, while generic failures omit those optional fields.
 
 ### vLLM (local / self-hosted)
 

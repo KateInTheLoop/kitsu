@@ -235,11 +235,68 @@ auth = {{ method = "none" }}
     assert!(message.contains("select another gateway"), "{message}");
     assert!(!message.contains(url_secret), "{message}");
     assert!(!message.contains("127.0.0.1"), "{message}");
+    assert_eq!(error["diagnostic_code"], "local_ollama_unreachable");
+    assert_eq!(
+        error["recovery_actions"],
+        serde_json::json!([
+            "start_ollama_serve",
+            "verify_ollama_serve",
+            "select_another_gateway",
+        ])
+    );
     assert_eq!(
         events.last().and_then(|event| event["type"].as_str()),
         Some("final_summary")
     );
     assert_eq!(events.last().unwrap()["provider_failures"], 1);
+
+    let script = home.path().join("unreachable-local-ollama.script");
+    fs::write(&script, "hello from a script\n").unwrap();
+    let scripted = base_cmd(home.path())
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--timeout-secs",
+            "1",
+            "chat",
+            "--no-session",
+            "--no-project-context",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run unreachable local Ollama script");
+    assert_eq!(scripted.status.code(), Some(2), "{scripted:?}");
+    assert!(scripted.stderr.is_empty(), "{scripted:?}");
+    let scripted_events = String::from_utf8(scripted.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let scripted_error = scripted_events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed scripted provider error");
+    assert_eq!(
+        scripted_error["diagnostic_code"],
+        "local_ollama_unreachable"
+    );
+    assert_eq!(
+        scripted_error["recovery_actions"],
+        error["recovery_actions"]
+    );
+    assert!(scripted_error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("`ollama serve`")));
+    assert!(!scripted_error.to_string().contains(url_secret));
+    assert_eq!(
+        scripted_events
+            .last()
+            .and_then(|event| event["type"].as_str()),
+        Some("final_summary")
+    );
+    assert_eq!(scripted_events.last().unwrap()["provider_failures"], 1);
 
     let doctor = base_cmd(home.path())
         .args(["--timeout-secs", "1", "doctor", "--online", "--json"])

@@ -37,7 +37,10 @@ provider's URL/body detail. When the selected profile is named or flavored
 `127.0.0.0/8` address, or `::1`), the bounded remedy identifies local Ollama,
 suggests starting or verifying `ollama serve`, and offers another gateway as an
 alternative. Non-loopback and non-Ollama profiles retain the generic gateway,
-network-access, availability, and `doctor --online` guidance.
+network-access, availability, and `doctor --online` guidance. In JSONL mode the
+same scoped failure adds `diagnostic_code: "local_ollama_unreachable"` and
+bounded recovery-action enums, so automation does not need to parse prose;
+generic connection failures omit those optional fields.
 
 For `bearer-env`, a non-empty configured environment value wins over the
 managed credential. A malformed/non-Unicode environment value fails closed and

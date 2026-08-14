@@ -695,6 +695,10 @@
         {
           "type": "object",
           "required": ["kind", "message", "exit_code"],
+          "dependentRequired": {
+            "diagnostic_code": ["recovery_actions"],
+            "recovery_actions": ["diagnostic_code"]
+          },
           "properties": {
             "type": { "const": "error" },
             "turn_id": { "type": "string" },
@@ -703,6 +707,21 @@
             "kind": { "type": "string" },
             "cause": {
               "enum": ["tool_call_during_tool_free_finalization"]
+            },
+            "diagnostic_code": {
+              "enum": ["local_ollama_unreachable"]
+            },
+            "recovery_actions": {
+              "type": "array",
+              "items": {
+                "enum": [
+                  "start_ollama_serve",
+                  "verify_ollama_serve",
+                  "select_another_gateway"
+                ]
+              },
+              "minItems": 1,
+              "uniqueItems": true
             },
             "message": { "type": "string" },
             "exit_code": { "type": "integer" },
