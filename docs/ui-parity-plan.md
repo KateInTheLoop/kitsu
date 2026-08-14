@@ -389,9 +389,18 @@ as escalation); findings are re-verified before applying. Cycle log:
   machinery. PTY-verified: first ^C clears while streaming continues,
   second cancels, session stays alive. Known caveat (pre-existing
   class): kill -9 mid-turn leaves the terminal raw — `reset` recovers.
-- Backlog (next cycles): queued-message full stack rendered under the
-  status row (multi-row live region); multi-line draft wrap; unit-test
-  seam for the collector poll loop.
+- **Cycle 9 (2026-08-14, 11d3326 + follow-up 7140c0a)**: the multi-row
+  live region — queued prompts render as dimmed '↳ next:/then:' stack
+  rows (+N more) above the input, execution order, flicker designed out
+  (spinner ticks repaint only the bottom row; full repaint only on
+  content change/suspension/row-count change). First sonnet-escalated
+  review (M diff): NEEDS-FIX verdict caught narrow-terminal row wrap
+  (the +N-more row had NO width guard), the shrink-gap float (reachable
+  via approval handoffs), and resize staleness — all fixed + pinned
+  (cols-sweep test, byte-exact clear_region test). PTY 5/5.
+- Backlog (next cycles): multi-line draft wrap (region machinery now
+  exists); unit-test seam for the collector poll loop + injectable
+  writer for redraw_locked (review gap: branch selection untestable).
 
 ## Protocol
 
