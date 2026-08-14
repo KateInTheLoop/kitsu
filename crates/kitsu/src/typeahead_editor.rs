@@ -40,6 +40,11 @@ pub enum EditorAction {
     /// prompt queue); if it declines, it calls
     /// [`TypeaheadEditor::history_prev_forced`] for the plain history walk.
     RecallRequest,
+    /// Ctrl+C on an EMPTY draft: the user wants the turn cancelled. (With a
+    /// non-empty draft Ctrl+C clears the draft instead; during a search it
+    /// aborts the search. Raw mode masks ISIG, so the collector re-raises
+    /// the real SIGINT for this action.)
+    Interrupt,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -381,7 +386,9 @@ impl TypeaheadEditor {
         if self.search.is_some() {
             match byte {
                 0x12 => self.search_enter_or_cycle(outcome),
-                0x07 => self.search_exit(false, outcome),
+                // Ctrl+G and Ctrl+C both abort the search, restoring the
+                // pre-search draft (readline behavior).
+                0x07 | 0x03 => self.search_exit(false, outcome),
                 b'\r' | b'\n' => self.search_exit(true, outcome),
                 0x7f | 0x08 => {
                     if let Some(search) = &mut self.search {
@@ -466,6 +473,19 @@ impl TypeaheadEditor {
             }
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x12 => self.search_enter_or_cycle(outcome),
+            0x03 => {
+                if self.buffer.is_empty() {
+                    outcome.actions.push(EditorAction::Interrupt);
+                } else {
+                    // First Ctrl+C abandons the draft; the next one (empty
+                    // draft) interrupts the turn.
+                    self.buffer.clear();
+                    self.cursor = 0;
+                    self.history_cursor = None;
+                    self.stash.clear();
+                    outcome.changed = true;
+                }
+            }
             0x00..=0x1f => {
                 // Other control bytes are ignored: control characters must
                 // never enter the draft.
@@ -650,9 +670,10 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 EditorAction::Submit(line) => Some(line.as_str()),
-                EditorAction::Eof | EditorAction::CompleteRequest | EditorAction::RecallRequest => {
-                    None
-                }
+                EditorAction::Eof
+                | EditorAction::CompleteRequest
+                | EditorAction::RecallRequest
+                | EditorAction::Interrupt => None,
             })
             .collect()
     }
@@ -771,6 +792,52 @@ mod tests {
         // ↓ restores the recalled prompt from the stash.
         editor.feed(b"\x1b[B");
         assert_eq!(editor.buffer_string(), "queued prompt");
+    }
+
+    #[test]
+    fn ctrl_c_clears_a_draft_then_interrupts_when_empty() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        editor.feed(b"half a thought");
+        let outcome = editor.feed(&[0x03]);
+        assert!(outcome.actions.is_empty(), "first Ctrl+C only clears");
+        assert_eq!(editor.buffer_string(), "");
+        assert_eq!(editor.cursor(), 0);
+        let outcome = editor.feed(&[0x03]);
+        assert_eq!(outcome.actions, vec![EditorAction::Interrupt]);
+    }
+
+    #[test]
+    fn ctrl_c_aborts_a_search_restoring_the_draft_without_interrupt() {
+        let mut editor = TypeaheadEditor::new(vec!["cargo build".to_string()]);
+        editor.feed(b"my draft");
+        editor.feed(&[0x12]);
+        editor.feed(b"cargo");
+        assert_eq!(editor.buffer_string(), "cargo build");
+        let outcome = editor.feed(&[0x03]);
+        assert!(outcome.actions.is_empty());
+        assert!(editor.search_status().is_none());
+        assert_eq!(editor.buffer_string(), "my draft");
+    }
+
+    #[test]
+    fn ctrl_c_during_a_history_walk_clears_and_ends_the_walk() {
+        let mut editor = TypeaheadEditor::new(vec!["old entry".to_string()]);
+        editor.feed(b"x");
+        editor.feed(b"\x1b[A"); // walk to "old entry"
+        assert_eq!(editor.buffer_string(), "old entry");
+        editor.feed(&[0x03]);
+        assert_eq!(editor.buffer_string(), "");
+        // ↓ must not resurrect the stash after the clear.
+        editor.feed(b"\x1b[B");
+        assert_eq!(editor.buffer_string(), "");
+    }
+
+    #[test]
+    fn ctrl_c_inside_a_paste_is_dropped_as_content_noise() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let outcome = editor.feed(b"\x1b[200~ab\x03cd\x1b[201~");
+        assert!(outcome.actions.is_empty());
+        assert_eq!(editor.buffer_string(), "abcd");
     }
 
     #[test]

@@ -9453,7 +9453,13 @@ impl RawStdinGuard {
                 return None;
             }
             let original = modes;
-            modes.c_lflag &= !(libc::ICANON | libc::ECHO);
+            // ISIG is cleared so Ctrl+C reaches the editor as a byte: with a
+            // non-empty draft it clears the draft (Claude-style), and only on
+            // an empty draft does the collector raise(SIGINT) itself — the
+            // exact signal the kernel would have sent, so turn cancellation
+            // is unchanged. Approval handoffs restore the original termios
+            // (ISIG on), so approval prompts keep kernel Ctrl+C.
+            modes.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
             modes.c_cc[libc::VMIN] = 1;
             modes.c_cc[libc::VTIME] = 0;
             if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes) != 0 {
@@ -9808,6 +9814,16 @@ fn run_live_typeahead(
                 }
                 typeahead_editor::EditorAction::Eof => {
                     result.eof = true;
+                }
+                typeahead_editor::EditorAction::Interrupt => {
+                    // Ctrl+C on an empty draft: reproduce the kernel's
+                    // SIGINT exactly (raw mode masked ISIG). The existing
+                    // signal path cancels the foreground turn; this
+                    // collector then winds down via the stop flag.
+                    // SAFETY: raising a handled signal in-process.
+                    unsafe {
+                        libc::raise(libc::SIGINT);
+                    }
                 }
                 typeahead_editor::EditorAction::CompleteRequest => {
                     // Tab accepts the inline slash hint, if one is showing.
