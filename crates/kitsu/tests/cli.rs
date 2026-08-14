@@ -5670,7 +5670,78 @@ async fn test_script_output_last_message_uses_the_last_committed_turn_once() {
         .unwrap();
     assert!(final_turn < receipt_index && receipt_index < events.len() - 1);
     assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(events
+        .last()
+        .unwrap()
+        .get("output_last_message_state")
+        .is_none());
     server.verify().await;
+}
+
+#[test]
+fn test_script_output_last_message_reports_preserved_without_committed_assistant() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("query-only-output.script");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+
+    let existing = home.path().join("existing-last-message.txt");
+    fs::write(&existing, "keep this host-owned value").unwrap();
+    let mut jsonl = base_cmd(home.path());
+    let output = jsonl
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--output-last-message",
+            &existing.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run query-only JSONL script");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&existing).unwrap(),
+        "keep this host-owned value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_no_committed_assistant"
+    );
+
+    let absent = home.path().join("absent-last-message.txt");
+    let mut human = base_cmd(home.path());
+    human
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--output-last-message",
+            &absent.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "~ --output-last-message unchanged: no committed assistant message",
+        ));
+    assert!(!absent.exists(), "a no-op must not create the destination");
 }
 
 #[tokio::test]
@@ -5747,6 +5818,7 @@ async fn test_script_output_last_message_keeps_earlier_commit_after_later_blank_
     assert_eq!(summary["status"], "partial");
     assert_eq!(summary["failures"], 1);
     assert_eq!(summary["provider_failures"], 1);
+    assert!(summary.get("output_last_message_state").is_none());
     server.verify().await;
 }
 
@@ -8520,6 +8592,10 @@ async fn test_scripted_empty_final_response_after_tool_activity_is_provider_fail
     assert_eq!(
         summary["session_snapshot_state"],
         "pending_until_first_success"
+    );
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_no_committed_assistant"
     );
     assert!(
         events
