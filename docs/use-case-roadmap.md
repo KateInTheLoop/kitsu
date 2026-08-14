@@ -230,5 +230,9 @@ args). A live llama3.2 gateway run was the load-bearing functional check
 missed (stringy `no_header:"false"` → `lenient_bool`; empty `delimiter:""`
 → default comma), both fixed and pinned. Verified end-to-end: the model
 called the tool and correctly reported `id:int, name:string, price:float,
-in_stock:bool` including a nullable price column. Haiku review pending.
+in_stock:bool` including a nullable price column. Haiku review:
+SHIP-AS-IS — all 9 negative cases traced concretely (nullable folding,
+malformed-row disclosure, 500-row ceiling, paging saturating arithmetic,
+delimiter validation, lenient_bool, truncation honesty, authorization
+path, panic-freedom), acceptance signal met, no findings.
 Next in lane 2: R2.2 PDF text extraction.
