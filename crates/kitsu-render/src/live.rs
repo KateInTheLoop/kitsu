@@ -32,6 +32,11 @@ pub struct LiveDraft {
     pub buffer: String,
     pub cursor: usize,
     pub hint: String,
+    /// Reserved hints (e.g. the reverse-search status) claim their columns
+    /// FIRST and the draft windows into the remainder — they must stay
+    /// visible even when the draft is trimmed. Unreserved hints (slash
+    /// completion) render only when the draft fully fits.
+    pub hint_reserved: bool,
 }
 
 #[derive(Default)]
@@ -172,7 +177,15 @@ fn compose_row(
     let lead = spinner.map(|(_, width)| width + 2).unwrap_or(0);
     // One column is reserved so an end-of-buffer cursor never wraps the row.
     let avail = cols.saturating_sub(lead + prompt_width + 1);
-    let (visible, cursor_offset, windowed) = fit_draft_window(&draft.buffer, draft.cursor, avail);
+    // A reserved hint claims its columns before the draft is windowed.
+    let hint_width = display_width(&draft.hint);
+    let buffer_avail = if draft.hint_reserved && !draft.hint.is_empty() {
+        avail.saturating_sub(hint_width)
+    } else {
+        avail
+    };
+    let (visible, cursor_offset, windowed) =
+        fit_draft_window(&draft.buffer, draft.cursor, buffer_avail);
     let mut row = String::new();
     if let Some((segment, _)) = spinner {
         row.push_str(segment);
@@ -189,6 +202,26 @@ fn compose_row(
     // cursor column stays before the hint so typing continues over it.
     let buffer_chars = draft.buffer.chars().count();
     let buffer_width = display_width(&visible);
+    if draft.hint_reserved && !draft.hint.is_empty() {
+        // Reserved hints always render (their space was carved out above),
+        // truncated only if the terminal cannot even hold them alone.
+        let space = avail.saturating_sub(buffer_width).max(1);
+        let hint: String = {
+            let mut used = 0usize;
+            draft
+                .hint
+                .chars()
+                .take_while(|&ch| {
+                    used += crate::char_display_width(ch);
+                    used <= space
+                })
+                .collect()
+        };
+        if !hint.is_empty() {
+            row.push_str(&format!("{}", hint.dimmed()));
+        }
+        return (row, Some(lead + prompt_width + cursor_offset + 1));
+    }
     if !draft.hint.is_empty()
         && draft.cursor == buffer_chars
         && !windowed
@@ -290,16 +323,14 @@ pub fn live_input_begin(prompt: String) {
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         row_state.draft = Some(LiveDraft {
             prompt,
-            buffer: String::new(),
-            cursor: 0,
-            hint: String::new(),
+            ..LiveDraft::default()
         });
     }
     redraw();
 }
 
 /// Update the draft text and cursor (char index). No-op if no draft is live.
-pub fn live_input_update(buffer: String, cursor: usize, hint: String) {
+pub fn live_input_update(buffer: String, cursor: usize, hint: String, hint_reserved: bool) {
     {
         let mut row_state = state()
             .lock()
@@ -310,6 +341,7 @@ pub fn live_input_update(buffer: String, cursor: usize, hint: String) {
         draft.cursor = cursor.min(buffer.chars().count());
         draft.buffer = buffer;
         draft.hint = hint;
+        draft.hint_reserved = hint_reserved;
     }
     redraw();
 }
@@ -435,6 +467,7 @@ mod tests {
             buffer: "/que".to_string(),
             cursor: 4,
             hint: "ue".to_string(),
+            hint_reserved: false,
         };
         let (row, col) = compose_row(None, Some(&draft), 0, 80);
         assert!(row.contains("\u{1b}[2m"), "hint must be dimmed: {row:?}");
@@ -450,6 +483,7 @@ mod tests {
             buffer: "/que".to_string(),
             cursor: 2,
             hint: "ue".to_string(),
+            hint_reserved: false,
         };
         let (row, _) = compose_row(None, Some(&mid_cursor), 0, 80);
         assert!(!row.contains("\u{1b}[2m"), "no hint mid-buffer: {row:?}");
@@ -459,6 +493,7 @@ mod tests {
             buffer: "/status".to_string(),
             cursor: 7,
             hint: "extra".to_string(),
+            hint_reserved: false,
         };
         // avail = 10 - 2 - 1 = 7: the buffer exactly fills it.
         let (row, _) = compose_row(None, Some(&no_room), 0, 10);
@@ -478,6 +513,7 @@ mod tests {
             buffer: "/que…something-long-enough-to-trim".to_string(),
             cursor: 34,
             hint: "ue".to_string(),
+            hint_reserved: false,
         };
         let (row, _) = compose_row(None, Some(&trimmed), 0, 16);
         assert!(
@@ -491,6 +527,7 @@ mod tests {
             buffer: "/que".to_string(),
             cursor: 4,
             hint: "ue".to_string(),
+            hint_reserved: false,
         };
         let (row, _) = compose_row(None, Some(&fits), 0, 80);
         assert!(row.contains("\u{1b}[2m"));
@@ -513,6 +550,33 @@ mod tests {
         let (row, col) = compose_row(None, Some(&draft), 0, 80);
         assert!(!sanitize_terminal_text(&row).contains("queued"));
         assert_eq!(col, Some(10));
+    }
+
+    #[test]
+    fn reserved_hint_survives_a_windowed_draft() {
+        // A reverse-search status must stay visible even when the match is
+        // long enough to window; the draft shrinks to make room.
+        let draft = LiveDraft {
+            prompt: "> ".to_string(),
+            buffer: "a very long matched history entry indeed".to_string(),
+            cursor: 40,
+            hint: "  ⌕ reverse-search 'match'".to_string(),
+            hint_reserved: true,
+        };
+        let (row, _) = compose_row(None, Some(&draft), 0, 48);
+        let plain = sanitize_terminal_text(&row);
+        assert!(
+            plain.contains("reverse-search 'match'"),
+            "status lost: {plain}"
+        );
+        assert!(plain.contains('…'), "draft should window: {plain}");
+        // Unreserved hints keep the old suppress-on-window behavior.
+        let unreserved = LiveDraft {
+            hint_reserved: false,
+            ..draft
+        };
+        let (row, _) = compose_row(None, Some(&unreserved), 0, 48);
+        assert!(!sanitize_terminal_text(&row).contains("reverse-search"));
     }
 
     #[test]
