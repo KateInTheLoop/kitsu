@@ -1513,10 +1513,37 @@ pub fn approval_detail(text: &str) -> String {
 
 /// Render a verified workspace diff to stderr. This output is generated from
 /// Git/filesystem state, not from assistant prose.
+/// Count the files and +/− lines of a unified diff (`diff --git`
+/// occurrences; +/− lines excluding the `+++`/`---` headers). Pure, for the
+/// `/diff` receipt header (ui-parity item 11).
+fn diff_summary(diff: &str) -> (usize, usize, usize) {
+    let mut files = 0usize;
+    let mut adds = 0usize;
+    let mut dels = 0usize;
+    for line in diff.lines() {
+        if line.starts_with("diff --git") {
+            files += 1;
+        } else if line.starts_with('+') && !line.starts_with("+++") {
+            adds += 1;
+        } else if line.starts_with('-') && !line.starts_with("---") {
+            dels += 1;
+        }
+    }
+    (files, adds, dels)
+}
+
 pub fn render_diff(diff: &str) {
     let diff = sanitize_terminal_text(diff);
     let line_count = diff.lines().count();
-    eprintln!("verified workspace diff ({line_count} line(s)):");
+    let (files, adds, dels) = diff_summary(&diff);
+    // The receipt form used elsewhere (deck_header): ◈ + highlight bold on a
+    // styled TTY, '#' prefix in plain — with per-file/+/− stats.
+    eprintln!(
+        "{}",
+        deck_header(&format!(
+            "verified workspace diff — {files} file(s), +{adds} -{dels} line(s)"
+        ))
+    );
     // Keep an interactive prompt usable after a repository-wide diff. Scripts
     // and redirected captures still receive the full bounded evidence; people
     // can narrow an interactive view with `/diff <path>`.
@@ -2408,6 +2435,24 @@ mod tests {
         assert!(output.contains("system"));
         assert!(output.contains("keep"));
         assert!(output.contains("required"));
+    }
+
+    #[test]
+    fn diff_summary_counts_files_and_signed_lines() {
+        let fixture = "diff --git a/x.rs b/x.rs\n--- a/x.rs\n+++ b/x.rs\n@@ -1,2 +1,3 @@\n+added one\n+added two\n-removed\n context\ndiff --git a/y.rs b/y.rs\n--- a/y.rs\n+++ b/y.rs\n@@ -1 +1 @@\n+swap in\n-swap out\n";
+        assert_eq!(super::diff_summary(fixture), (2, 3, 2));
+        // Header lines +++/--- are never counted; empty diff is all zeros.
+        assert_eq!(super::diff_summary(""), (0, 0, 0));
+        assert_eq!(super::diff_summary("+++ b/only\n--- a/only\n"), (0, 0, 0));
+        // The receipt header round-trips through every tier.
+        let summary = "verified workspace diff — 2 file(s), +3 -2 line(s)";
+        let styled = deck_header_with_mode(summary, true, false);
+        assert!(styled.contains("\u{1b}[1m"));
+        assert_eq!(sanitize_terminal_text(&styled), format!("◈ {summary}"));
+        assert_eq!(
+            deck_header_with_mode(summary, false, true),
+            "# verified workspace diff - 2 file(s), +3 -2 line(s)"
+        );
     }
 
     #[test]
