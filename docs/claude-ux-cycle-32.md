@@ -77,6 +77,9 @@ background results, cancellation, and the default artifact-retaining policy.
 ## Verification
 
 Formatting, published-schema parsing, staged and unstaged diff checks, all
-**781** workspace tests, and warning-denied Clippy pass. The resulting Cycle 33
-debug candidate is 154,331,912 bytes with SHA-256
+**781** workspace tests, and warning-denied Clippy pass. The fully verified
+pre-checkpoint debug image is 154,331,912 bytes with SHA-256
 `ec52af09c71f40f4aa66cd3e2484b264bd0ff56398ba5820b456630e0e976dd8`.
+The checkpoint commit changes the binary's embedded source provenance; Cycle 33
+records and gates that post-commit pin separately rather than rewriting this
+Cycle 32 evidence.
