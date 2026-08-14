@@ -9,7 +9,9 @@
 //! ←/→/Home/End (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash,
 //! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W (delete word),
 //! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
-//! newline). A bracketed paste (`ESC[200~`…`ESC[201~`) stays one draft block:
+//! newline), Tab (requests inline-hint completion from the collector; the
+//! editor itself is hint-agnostic). A bracketed paste (`ESC[200~`…`ESC[201~`)
+//! stays one draft block:
 //! its newlines insert literally instead of submitting. Unknown escape
 //! sequences are consumed and ignored so they never leak into the draft.
 
@@ -20,6 +22,9 @@ pub enum EditorAction {
     Submit(String),
     /// Ctrl+D on an empty draft: treat as end of input.
     Eof,
+    /// Tab outside a paste: the collector may accept an inline
+    /// completion hint (the editor itself knows nothing about hints).
+    CompleteRequest,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -98,6 +103,16 @@ impl TypeaheadEditor {
     /// Surrender the unsubmitted draft (for carrying into the next prompt).
     pub fn take_draft(self) -> String {
         self.buffer.into_iter().collect()
+    }
+
+    /// Replace the whole draft (cursor at the end) — used when the collector
+    /// accepts a completion hint. Ends any history walk; the stash is kept
+    /// draft-shaped no longer, so it is cleared.
+    pub fn replace_buffer(&mut self, text: &str) {
+        self.buffer = text.chars().collect();
+        self.cursor = self.buffer.len();
+        self.history_cursor = None;
+        self.stash.clear();
     }
 
     /// Drop all transient input state (paste mode, partial escape/UTF-8
@@ -278,10 +293,10 @@ impl TypeaheadEditor {
                     outcome.changed = true;
                 }
             }
+            0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x00..=0x1f => {
-                // Other control bytes (Tab included) are ignored: the
-                // during-turn editor has no completion surface, and control
-                // characters must never enter the draft.
+                // Other control bytes are ignored: control characters must
+                // never enter the draft.
             }
             _ => {
                 match utf8_expected_len(byte) {
@@ -433,7 +448,7 @@ mod tests {
             .iter()
             .filter_map(|action| match action {
                 EditorAction::Submit(line) => Some(line.as_str()),
-                EditorAction::Eof => None,
+                EditorAction::Eof | EditorAction::CompleteRequest => None,
             })
             .collect()
     }
@@ -536,10 +551,32 @@ mod tests {
     }
 
     #[test]
-    fn control_bytes_and_tab_are_ignored() {
+    fn control_bytes_are_ignored_and_tab_requests_completion() {
         let mut editor = TypeaheadEditor::new(Vec::new());
-        editor.feed(b"a\tb\x07c");
+        let outcome = editor.feed(b"a\tb\x07c");
         assert_eq!(editor.buffer_string(), "abc");
+        assert_eq!(outcome.actions, vec![EditorAction::CompleteRequest]);
+    }
+
+    #[test]
+    fn tab_inside_a_paste_inserts_a_literal_tab_not_a_completion() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let outcome = editor.feed(b"\x1b[200~a\tb\x1b[201~");
+        assert!(outcome.actions.is_empty());
+        assert_eq!(editor.buffer_string(), "a\tb");
+    }
+
+    #[test]
+    fn replace_buffer_sets_cursor_at_end_and_ends_history_walk() {
+        let mut editor = TypeaheadEditor::new(vec!["old".to_string()]);
+        editor.feed(b"dra");
+        editor.feed(b"\x1b[A"); // walk into history
+        editor.replace_buffer("/queue");
+        assert_eq!(editor.buffer_string(), "/queue");
+        assert_eq!(editor.cursor(), 6);
+        // ↓ after a replace must not resurrect the pre-walk stash.
+        editor.feed(b"\x1b[B");
+        assert_eq!(editor.buffer_string(), "/queue");
     }
 
     #[test]
