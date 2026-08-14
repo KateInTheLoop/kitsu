@@ -3783,3 +3783,29 @@ async fn test_healthy_usage_records_no_window_evidence() {
         .expect("turn should succeed");
     assert!(state.window_evidence.is_none());
 }
+
+#[test]
+fn template_control_debris_detector_fires_on_tails_not_quotes() {
+    use crate::orchestrator::template_control_debris_in_tail;
+    // The live failure shape: mangled trailing tool call with the file path.
+    let leaked = "analysis text...\n<|close|>argument<|sep|><|open|>argument key=\"path\"<|sep|>/tmp/x.md<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>";
+    assert!(template_control_debris_in_tail(leaked));
+    // A single stray token is not enough.
+    assert!(!template_control_debris_in_tail(
+        "ends with one token <|sep|>"
+    ));
+    // Tokens QUOTED early in a long answer (e.g. discussing chat templates)
+    // do not trip the tail-window detector.
+    let mut quoted =
+        String::from("Kimi uses tokens like <|close|> and <|sep|> in its chat template. ");
+    quoted.push_str(&"More analysis follows here. ".repeat(20));
+    assert!(!template_control_debris_in_tail(&quoted));
+    // Uppercase or long identifiers are not control tokens.
+    assert!(!template_control_debris_in_tail(
+        "x <|NOTATOKEN|> y <|this_is_a_much_too_long_identifier_name|> z"
+    ));
+    // Clean answers never trip.
+    assert!(!template_control_debris_in_tail(
+        "a perfectly normal answer."
+    ));
+}

@@ -3,6 +3,43 @@
 //! append results → repeat until the model stops or a cap is hit.
 
 use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
+
+/// Detect mangled chat-template control tokens (e.g. Kimi's `<|close|>`,
+/// `<|sep|>`) in the TAIL of a final answer — the residue a provider leaks
+/// when it fails to parse a model's native-format trailing tool call
+/// (observed live: the debris contained the Write call's file path). Only
+/// the last 300 chars are scanned, and two distinct control tokens are
+/// required, so answers that merely QUOTE such tokens earlier in prose or
+/// code fences do not trip it.
+fn template_control_debris_in_tail(text: &str) -> bool {
+    let tail_start = text.len().saturating_sub(300);
+    // Snap to a char boundary.
+    let mut start = tail_start;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    let mut distinct = std::collections::HashSet::new();
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'|' {
+            if let Some(end) = tail[i + 2..].find("|>") {
+                let token = &tail[i + 2..i + 2 + end];
+                if !token.is_empty()
+                    && token.len() <= 24
+                    && token.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')
+                {
+                    distinct.insert(token.to_string());
+                }
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    distinct.len() >= 2
+}
 use futures::StreamExt;
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
@@ -993,6 +1030,10 @@ where
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
+    // One bounded re-prompt per turn when provider-mangled chat-template
+    // debris is detected in a final answer (sibling of the malformed-JSON
+    // text-call recovery below).
+    let mut debris_retry_used = false;
 
     // ISSUE-007 loop-breaker: track consecutive identical tool-call failures so a
     // model that fixates on a failing call (e.g. a denied path) is forced to a
@@ -1332,7 +1373,29 @@ where
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
             match finish {
-                FinishReason::Stop => return Ok(assistant_text),
+                FinishReason::Stop => {
+                    if !debris_retry_used && template_control_debris_in_tail(&assistant_text) {
+                        // A provider failed to parse the model's native-format
+                        // trailing tool call and leaked its remains as text.
+                        // Don't accept the destroyed action silently: tell the
+                        // model and let it re-issue the call properly, once.
+                        debris_retry_used = true;
+                        turn_status.tool_errors += 1;
+                        if !cfg.quiet {
+                            kitsu_render::tool_result_error(
+                                "response tail contains chat-template control tokens — a trailing tool call was likely destroyed by the provider; asked the model to re-issue it",
+                            );
+                        }
+                        messages.push(ChatMessage::assistant(assistant_text.clone(), Vec::new()));
+                        messages.push(ChatMessage::user(
+                            "Your last message ended in raw chat-template control tokens (like <|...|>) — a tool call you attempted was NOT executed because the serving provider failed to parse it. Re-issue that action as a proper structured tool call now, without repeating the prose."
+                                .to_string(),
+                        ));
+                        assistant_text.clear();
+                        continue;
+                    }
+                    return Ok(assistant_text);
+                }
                 // Truncated by the model's output cap — surface it instead of
                 // letting a cut-off answer masquerade as a complete one.
                 FinishReason::Length => {
