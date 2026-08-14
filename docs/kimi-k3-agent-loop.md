@@ -1,13 +1,33 @@
 # Kimi-K3 worker loop — kitsu drives a hosted frontier model on real work
 
-> **LOOP PAUSED 2026-08-13 after cycle 3** — the HF router returned
-> `HTTP 402` (billing/quota) for the loop's token against
-> `moonshotai/Kimi-K3` before any inference on both attempts; retrying
-> blind reproduces the same sub-second failure. Resume by fixing HF
-> billing/credits (or supplying a fresh token) and re-arming the hourly
-> cron. Positive cycle-3 finding: kitsu classified the 402 terminal on
-> the FIRST internal attempt with an actionable message — no wasted
-> retries (contrast: cycle-1's 429 handling, still on the backlog).
+> **LOOP RE-ARMED 2026-08-14 with a pre-flight gate** (was paused after
+> cycle 3's `HTTP 402`). The router reports *monthly included credits
+> depleted* — this does not self-heal; it needs purchased HF credits or
+> a fresh token. Each hourly tick now runs a single cheap probe request
+> first: on 402 the tick ends silently (no agent spawned, no tokens
+> billed); on success the next ramp cycle launches immediately.
+> Cycle-3's positive finding stands: kitsu classifies the 402 terminal
+> on the FIRST attempt with an actionable message.
+
+## Success ramp (start here when credits return)
+
+Three failed cycles shared one root pattern: the task was too wide for
+one turn's budget. To make Kimi a *contributor*, cycles now ramp:
+
+1. **Cycle 4 — bank the first success.** ONE file only:
+   `crates/kitsu-core/src/context.rs` (378 lines, one read). Deliverable
+   `reviews/kimi-cycle-4.md`: ranked, line-cited proposals for that file
+   alone (estimate accuracy, budget policy, compaction breaker). No
+   other reads permitted. Target < 40K total tokens.
+2. **Cycle 5 — usage/caching slice.** `crates/kitsu-providers/src` usage
+   parsing only: propose surfacing `cached_tokens` + catalog/window
+   caching, citing the actual parsing code.
+3. **Cycle 6 — synthesis.** Re-read own cycle-4/5 reviews plus targeted
+   orchestrator ranges; produce the full caching + context-window review
+   the loop originally wanted, now grounded in two banked passes.
+
+Rules unchanged otherwise (timeout 300, output >= 12000, NO sub-agent
+spawns, write the file before polishing).
 
 Started 2026-08-13 at user direction. Kimi-K3 (moonshotai/Kimi-K3 via the
 Hugging Face router, `--gateway huggingface`) is treated as an **extra
