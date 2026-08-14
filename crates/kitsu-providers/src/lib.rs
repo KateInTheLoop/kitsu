@@ -48,6 +48,20 @@ pub trait Provider: Send + Sync {
     fn list_models(
         &self,
     ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send;
+
+    /// Fetch the model catalog while reporting each physical transport attempt.
+    ///
+    /// The default preserves compatibility for providers without catalog
+    /// instrumentation. Concrete adapters should emit no attempt when the
+    /// result is served from a local cache and one terminal event for every
+    /// physical HTTP send.
+    fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send {
+        let _ = telemetry;
+        self.list_models()
+    }
 }
 
 /// Share one provider across the main loop and spawned subagents: `Arc<P>` is a
@@ -73,5 +87,11 @@ impl<P: Provider> Provider for std::sync::Arc<P> {
         &self,
     ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send {
         (**self).list_models()
+    }
+    fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> impl std::future::Future<Output = Result<Option<Vec<String>>, ProviderError>> + Send {
+        (**self).list_models_with_telemetry(telemetry)
     }
 }

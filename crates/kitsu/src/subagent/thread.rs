@@ -774,6 +774,7 @@ fn purpose_label(purpose: ProviderRequestPurpose) -> &'static str {
     match purpose {
         ProviderRequestPurpose::Inference => "inference",
         ProviderRequestPurpose::Compaction => "compaction",
+        ProviderRequestPurpose::ModelCatalog => "model catalog",
     }
 }
 

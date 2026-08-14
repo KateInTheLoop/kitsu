@@ -57,10 +57,18 @@
         "command": { "type": "string" }
       }
     },
+    "model_catalog_identity": {
+      "type": "object",
+      "required": ["operation_id"],
+      "properties": {
+        "operation_id": { "type": "string", "pattern": "^models:[1-9][0-9]*$" }
+      }
+    },
     "provider_operation_identity": {
       "oneOf": [
         { "$ref": "#/$defs/turn_identity" },
-        { "$ref": "#/$defs/command_identity" }
+        { "$ref": "#/$defs/command_identity" },
+        { "$ref": "#/$defs/model_catalog_identity" }
       ]
     },
     "command_invocation": {
@@ -246,7 +254,7 @@
           "properties": {
             "type": { "const": "provider_request" },
             "round": { "type": "integer", "minimum": 1 },
-            "purpose": { "enum": ["inference", "compaction"] },
+            "purpose": { "enum": ["inference", "compaction", "model_catalog"] },
             "message_count": { "type": "integer", "minimum": 0 },
             "tools_offered": { "type": "integer", "minimum": 0 },
             "structured_output": { "type": "boolean" }
@@ -317,7 +325,7 @@
           "properties": {
             "type": { "const": "provider_attempt" },
             "round": { "type": "integer", "minimum": 1 },
-            "purpose": { "enum": ["inference", "compaction"] },
+            "purpose": { "enum": ["inference", "compaction", "model_catalog"] },
             "attempt": { "type": "integer", "minimum": 1 },
             "max_attempts": { "type": "integer", "minimum": 1 },
             "category": {

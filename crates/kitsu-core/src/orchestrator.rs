@@ -300,6 +300,7 @@ impl std::fmt::Debug for StructuredFinalizationGate {
 pub enum ProviderRequestPurpose {
     Inference,
     Compaction,
+    ModelCatalog,
 }
 
 #[derive(Debug, Clone, Serialize, PartialEq, Eq)]

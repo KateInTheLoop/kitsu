@@ -311,15 +311,53 @@ auth = {{ method = "none" }}
     assert!(!status.contains(url_secret), "{status}");
 
     let models = base_cmd(home.path())
-        .args(["--timeout-secs", "1", "models"])
+        .args(["--jsonl", "--timeout-secs", "1", "models"])
         .output()
         .expect("run unreachable local Ollama catalog");
     assert_eq!(models.status.code(), Some(2), "{models:?}");
-    assert!(models.stdout.is_empty(), "{models:?}");
-    let models_stderr = String::from_utf8(models.stderr).unwrap();
-    assert!(models_stderr.contains("local Ollama"), "{models_stderr}");
-    assert!(models_stderr.contains("`ollama serve`"), "{models_stderr}");
-    assert!(!models_stderr.contains(url_secret), "{models_stderr}");
+    assert!(models.stderr.is_empty(), "{models:?}");
+    let model_events = String::from_utf8(models.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "provider_request",
+            "provider_attempt",
+            "error",
+            "final_summary",
+        ]
+    );
+    assert_eq!(model_events[1]["operation_id"], "models:1");
+    assert_eq!(model_events[1]["purpose"], "model_catalog");
+    assert_eq!(model_events[1]["message_count"], 0);
+    assert_eq!(model_events[1]["tools_offered"], 0);
+    assert_eq!(model_events[1]["structured_output"], false);
+    assert_eq!(model_events[2]["operation_id"], "models:1");
+    assert_eq!(model_events[2]["purpose"], "model_catalog");
+    assert_eq!(model_events[2]["attempt"], 1);
+    assert_eq!(model_events[2]["max_attempts"], 1);
+    assert_eq!(model_events[2]["category"], "connection");
+    assert_eq!(model_events[2]["status"], serde_json::Value::Null);
+    assert_eq!(model_events[2]["outcome"], "transport_failed");
+    assert_eq!(model_events[2]["terminal"], true);
+    assert_eq!(
+        model_events[3]["diagnostic_code"],
+        "local_ollama_unreachable"
+    );
+    assert_eq!(
+        model_events[3]["recovery_actions"],
+        error["recovery_actions"]
+    );
+    assert!(!serde_json::to_string(&model_events)
+        .unwrap()
+        .contains(url_secret));
 }
 
 #[test]
@@ -6616,6 +6654,27 @@ auth = {{ method = "none" }}
             .expect("model_catalog event");
         assert_eq!(catalog["count"], 2);
         assert_eq!(catalog["models"], serde_json::json!(["model-a", "model-b"]));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "run_started",
+                "provider_request",
+                "provider_attempt",
+                "model_catalog",
+                "final_summary",
+            ]
+        );
+        assert_eq!(events[1]["operation_id"], "models:1");
+        assert_eq!(events[1]["purpose"], "model_catalog");
+        assert_eq!(events[2]["operation_id"], "models:1");
+        assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["category"], "success");
+        assert_eq!(events[2]["status"], 200);
+        assert_eq!(events[2]["outcome"], "body_completed");
+        assert_eq!(events[2]["terminal"], true);
     })
     .await
     .unwrap();
@@ -6713,6 +6772,29 @@ auth = {{ method = "none" }}
             .expect("typed error event");
         assert_eq!(error["kind"], "provider");
         assert_eq!(error["exit_code"], 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "run_started",
+                "provider_request",
+                "provider_attempt",
+                "error",
+                "final_summary",
+            ]
+        );
+        assert_eq!(events[1]["operation_id"], "models:1");
+        assert_eq!(events[1]["purpose"], "model_catalog");
+        assert_eq!(events[2]["operation_id"], "models:1");
+        assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["attempt"], 1);
+        assert_eq!(events[2]["max_attempts"], 1);
+        assert_eq!(events[2]["category"], "unavailable");
+        assert_eq!(events[2]["status"], 503);
+        assert_eq!(events[2]["outcome"], "rejected");
+        assert_eq!(events[2]["terminal"], true);
         assert_eq!(events.last().unwrap()["provider_failures"], 1);
     })
     .await
@@ -6781,13 +6863,23 @@ auth = {{ method = "none" }}
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(events.len(), 3, "events: {events:#?}");
+    assert_eq!(events.len(), 5, "events: {events:#?}");
     assert_eq!(events[0]["type"], "run_started");
-    assert_eq!(events[1]["kind"], "cancelled");
-    assert_eq!(events[1]["exit_code"], 130);
-    assert_eq!(events[2]["type"], "final_summary");
-    assert_eq!(events[2]["status"], "cancelled");
-    assert_eq!(events[2]["cancelled_failures"], 1);
+    assert_eq!(events[1]["type"], "provider_request");
+    assert_eq!(events[1]["operation_id"], "models:1");
+    assert_eq!(events[1]["purpose"], "model_catalog");
+    assert_eq!(events[2]["type"], "provider_attempt");
+    assert_eq!(events[2]["operation_id"], "models:1");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[2]["category"], "cancelled");
+    assert_eq!(events[2]["status"], serde_json::Value::Null);
+    assert_eq!(events[2]["outcome"], "cancelled");
+    assert_eq!(events[2]["terminal"], true);
+    assert_eq!(events[3]["kind"], "cancelled");
+    assert_eq!(events[3]["exit_code"], 130);
+    assert_eq!(events[4]["type"], "final_summary");
+    assert_eq!(events[4]["status"], "cancelled");
+    assert_eq!(events[4]["cancelled_failures"], 1);
 }
 
 // --- chat: piped-stdin one-shot ---------------------------------------------
@@ -11081,6 +11173,33 @@ auth = {{ method = "none" }}
     assert_eq!(error["kind"], "provider");
     assert_eq!(error["exit_code"], 2);
     assert!(error["message"].as_str().unwrap().contains("HTTP 503"));
+    let kinds = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "run_started",
+            "command_started",
+            "provider_request",
+            "provider_attempt",
+            "error",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[2]["line"], 1);
+    assert_eq!(events[2]["command"], "/models");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[2]["message_count"], 0);
+    assert_eq!(events[2]["tools_offered"], 0);
+    assert_eq!(events[3]["line"], 1);
+    assert_eq!(events[3]["command"], "/models");
+    assert_eq!(events[3]["purpose"], "model_catalog");
+    assert_eq!(events[3]["category"], "unavailable");
+    assert_eq!(events[3]["status"], 503);
+    assert_eq!(events[3]["outcome"], "rejected");
     let summary = events.last().unwrap();
     assert_eq!(summary["type"], "final_summary");
     assert_eq!(summary["provider_failures"], 1);
@@ -11219,13 +11338,24 @@ auth = {{ method = "none" }}
         [
             "run_started",
             "command_started",
+            "provider_request",
+            "provider_attempt",
             "error",
             "command_finished",
             "final_summary",
         ]
     );
-    assert_eq!(events[3]["status"], "cancelled");
-    assert_eq!(events[4]["status"], "cancelled");
+    assert_eq!(events[2]["line"], 1);
+    assert_eq!(events[2]["command"], "/models");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[3]["line"], 1);
+    assert_eq!(events[3]["command"], "/models");
+    assert_eq!(events[3]["purpose"], "model_catalog");
+    assert_eq!(events[3]["category"], "cancelled");
+    assert_eq!(events[3]["status"], serde_json::Value::Null);
+    assert_eq!(events[3]["outcome"], "cancelled");
+    assert_eq!(events[5]["status"], "cancelled");
+    assert_eq!(events[6]["status"], "cancelled");
 }
 
 /// `/context` prints the model, resolved window, and a per-category breakdown —

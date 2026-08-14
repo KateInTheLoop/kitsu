@@ -31,7 +31,8 @@ use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, 
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderError,
+    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
+    ProviderError, ProviderTelemetrySink,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -2888,6 +2889,7 @@ fn format_runtime_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String
     let purpose = match purpose {
         kitsu_core::ProviderRequestPurpose::Inference => "inference",
         kitsu_core::ProviderRequestPurpose::Compaction => "compaction",
+        kitsu_core::ProviderRequestPurpose::ModelCatalog => "model catalog",
     };
     Some(format!(
         "{purpose} provider attempt {attempt}/{max_attempts}: {category}{status}; {outcome}; terminal={terminal}{retry}; {remaining_deadline_ms}ms deadline remaining"
@@ -7833,6 +7835,32 @@ fn empty_model_catalog_message(filter: &str) -> String {
 }
 
 const HUMAN_MODEL_CATALOG_CAP: usize = 12;
+const MODEL_CATALOG_ROUND: u32 = 1;
+const TOP_LEVEL_MODEL_CATALOG_OPERATION_ID: &str = "models:1";
+
+fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Value {
+    serde_json::json!({
+        "round": MODEL_CATALOG_ROUND,
+        "purpose": "model_catalog",
+        "attempt": event.attempt,
+        "max_attempts": event.max_attempts,
+        "category": event.category,
+        "status": event.status,
+        "outcome": event.outcome,
+        "terminal": event.terminal,
+        "retry_delay_ms": event.retry_delay_ms,
+        "retry_after_used": event.retry_after_used,
+        "remaining_deadline_ms": event.remaining_deadline_ms,
+    })
+}
+
+fn top_level_model_catalog_telemetry() -> ProviderTelemetrySink {
+    ProviderTelemetrySink::with_fallible_observer(|event| {
+        let mut payload = model_catalog_attempt_payload(event);
+        payload["operation_id"] = serde_json::json!(TOP_LEVEL_MODEL_CATALOG_OPERATION_ID);
+        emit_jsonl("provider_attempt", payload).is_ok()
+    })
+}
 
 fn format_model_catalog_preview(
     models: &[String],
@@ -7936,8 +7964,20 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
             "run_started",
             serde_json::json!({"mode": "models", "gateway": gateway_name}),
         )?;
+        emit_jsonl(
+            "provider_request",
+            serde_json::json!({
+                "operation_id": TOP_LEVEL_MODEL_CATALOG_OPERATION_ID,
+                "round": MODEL_CATALOG_ROUND,
+                "purpose": "model_catalog",
+                "message_count": 0,
+                "tools_offered": 0,
+                "structured_output": false,
+            }),
+        )?;
     }
-    let result = await_cancellable(provider.list_models())
+    let telemetry = cli.jsonl.then(top_level_model_catalog_telemetry);
+    let result = await_cancellable(provider.list_models_with_telemetry(telemetry))
         .await
         .ok_or_else(|| CliError::cancelled("model catalog request cancelled by Ctrl+C"))?;
     let Some(models) = result.map_err(|error| {
@@ -10796,11 +10836,10 @@ async fn run_scripted_body(
             }
             let durable_model_before = model.clone();
             let durable_messages_before = messages.clone();
-            let command_runtime_log = rest
-                .split_whitespace()
-                .next()
-                .is_some_and(|name| name == "compact")
-                .then(|| live_command_event_log(cli.jsonl, line_number, trimmed));
+            let command_name = rest.split_whitespace().next().unwrap_or("");
+            let command_runtime_log = (command_name == "compact"
+                || (cli.jsonl && matches!(command_name, "models" | "model")))
+            .then(|| live_command_event_log(cli.jsonl, line_number, trimmed));
             let result = handle_slash(
                 rest,
                 messages,
@@ -15450,7 +15489,8 @@ async fn handle_slash(
             }
         }
         "models" => {
-            let Some(result) = await_cancellable(list_models_and_print(provider, arg, model)).await
+            let Some(result) =
+                await_cancellable(list_models_and_print(provider, arg, model, runtime_log)).await
             else {
                 eprintln!("^C (model catalog request cancelled)");
                 return SlashResult::Cancelled;
@@ -15647,7 +15687,8 @@ async fn handle_slash(
                 // Alias: `/model list [filter]` → same as `/models [filter]`.
                 let filter = arg.strip_prefix("list").unwrap_or("").trim();
                 let Some(result) =
-                    await_cancellable(list_models_and_print(provider, filter, model)).await
+                    await_cancellable(list_models_and_print(provider, filter, model, runtime_log))
+                        .await
                 else {
                     eprintln!("^C (model catalog request cancelled)");
                     return SlashResult::Cancelled;
@@ -15667,7 +15708,10 @@ async fn handle_slash(
                 };
             } else {
                 let previous_model = model.clone();
-                let Some(catalog) = await_cancellable(provider.list_models()).await else {
+                let Some(catalog) =
+                    await_cancellable(list_models_with_runtime_telemetry(provider, runtime_log))
+                        .await
+                else {
                     eprintln!("^C (model validation cancelled)");
                     return SlashResult::Cancelled;
                 };
@@ -15803,8 +15847,9 @@ async fn list_models_and_print(
     provider: &OpenAICompatProvider,
     filter: &str,
     current_model: &str,
+    runtime_log: Option<&kitsu_core::AgentEventLog>,
 ) -> Result<Option<Vec<String>>, ProviderError> {
-    match provider.list_models().await {
+    match list_models_with_runtime_telemetry(provider, runtime_log).await {
         Ok(Some(models)) => {
             let filter = filter.trim();
             let matched = filter_model_catalog(models, filter);
@@ -15829,6 +15874,53 @@ async fn list_models_and_print(
         }
         Err(error) => Err(error),
     }
+}
+
+fn runtime_model_catalog_telemetry(
+    runtime_log: Option<&kitsu_core::AgentEventLog>,
+) -> Option<ProviderTelemetrySink> {
+    runtime_log.map(|runtime_log| {
+        let runtime_log = runtime_log.clone();
+        ProviderTelemetrySink::with_fallible_observer(move |event| {
+            runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderAttempt {
+                round: MODEL_CATALOG_ROUND,
+                purpose: kitsu_core::ProviderRequestPurpose::ModelCatalog,
+                attempt: event.attempt,
+                max_attempts: event.max_attempts,
+                category: event.category,
+                status: event.status,
+                outcome: event.outcome,
+                terminal: event.terminal,
+                retry_delay_ms: event.retry_delay_ms,
+                retry_after_used: event.retry_after_used,
+                remaining_deadline_ms: event.remaining_deadline_ms,
+            });
+            !runtime_log.abort_requested()
+        })
+    })
+}
+
+async fn list_models_with_runtime_telemetry(
+    provider: &OpenAICompatProvider,
+    runtime_log: Option<&kitsu_core::AgentEventLog>,
+) -> Result<Option<Vec<String>>, ProviderError> {
+    if let Some(runtime_log) = runtime_log {
+        runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderRequest {
+            round: MODEL_CATALOG_ROUND,
+            purpose: kitsu_core::ProviderRequestPurpose::ModelCatalog,
+            message_count: 0,
+            tools_offered: 0,
+            structured_output: false,
+        });
+        if runtime_log.abort_requested() {
+            return Err(ProviderError::Connection(
+                "runtime event sink stopped the model catalog request".to_string(),
+            ));
+        }
+    }
+    provider
+        .list_models_with_telemetry(runtime_model_catalog_telemetry(runtime_log))
+        .await
 }
 
 fn report_slash_provider_error(
