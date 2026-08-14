@@ -102,6 +102,22 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 - **Never** run the Kimi loop and edit the same files from the main
   session simultaneously; the branches keep the work disjoint.
 
+> **RAMP COMPLETE — 2026-08-14, cycle 6 synthesis banked at grade A**
+> (commit 744b2da on dogfood/kimi-k3). Three consecutive deliverables:
+> cycle 4 (A), cycle 5 attempt 2 (B+), cycle 6 (A) — after three
+> consecutive pre-ramp failures. Cycle 6: 6 tool calls exactly as
+> scoped, 42.4K total tokens, completion spend 5,991/24,000 (25% — the
+> LOWEST of the ramp despite the largest input; synthesis-over-own-work
+> appears cheaper in hidden reasoning than cold-read analysis). Genuine
+> merge: 8 CARRIED + 3 NEW orchestrator-grounded proposals, citations
+> spot-checked (context.rs exact; orchestrator ≤15-line drift). The
+> loop's founding goal — the definitive caching + context-window
+> review — exists at reviews/kimi-cycle-6.md on the work branch.
+> **LOOP HOLDING**: ticks now pre-flight and stop with a one-line
+> status until the user picks the next act: (a) retire the loop,
+> (b) new ramp on a different focus area, or (c) implementation cycles
+> turning P1-P11 into code.
+
 > **FIRST BANKED DELIVERABLE — 2026-08-14, ramp cycle 4.** Credits
 > returned; the narrow-scope ramp worked exactly as designed: one Read,
 > one Write, 59s, 23,899 tokens (vs 187K-434K in the failed cycles),
@@ -111,6 +127,19 @@ concrete, file-referenced proposals ranked by value; no vague advice.
 > to cycle 5 (providers usage/caching slice).
 
 ## Improvement backlog (fed by supervisor observations)
+
+Kimi-authored NEW proposals from cycle 6 synthesis (grade A; also see
+the top-5 priority list in reviews/kimi-cycle-6.md — P1 prompt_cache_key,
+P2 anchor fingerprint, P3 cached_tokens, P6 evidence-clamps-budget,
+P4 estimator overhead):
+
+- [ ] P6: `ContextWindowEvidence`/`context_window_shortfall` diagnose
+  server-side truncation but never feed back into the session budget —
+  convert the shipped diagnosis into a budget clamp.
+- [ ] P7: `anchor_includes_schema` is a bare bool; mid-session tool-
+  registry changes fool the anchor — track a schema fingerprint.
+- [ ] P11: `ensure_chat_request_fits` re-serializes tool schemas on
+  every check — cache the serialized size.
 
 Kimi-authored proposals from cycle 5 attempt 2 (banked 2026-08-14 at
 B+, commit 0751f0e on dogfood/kimi-k3; spot-checked — content accurate,
