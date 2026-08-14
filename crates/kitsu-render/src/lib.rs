@@ -187,6 +187,62 @@ fn stream_sanitizer() -> &'static Mutex<TerminalTextSanitizer> {
     SANITIZER.get_or_init(|| Mutex::new(TerminalTextSanitizer::default()))
 }
 
+/// Stateful streaming buffer for styled output on TTY.
+/// Accumulates text into a line buffer; when a complete line is formed (ends with `\n`),
+/// styles it via LineStyler and writes it. Partial lines are buffered until completed
+/// or explicitly flushed (unstyled).
+///
+/// This buffer is ONLY used when stdout is a styled TTY. Non-TTY or plain-mode streaming
+/// bypasses this entirely, preserving byte-identical output. This is a deliberate tradeoff:
+/// styled TTY output becomes line-granular (stalled at line boundaries) instead of
+/// token-granular, but preserves the buffered-message styling semantics on the live path.
+#[derive(Debug, Default)]
+struct StreamBuffer {
+    buffer: String,
+    styler: LineStyler,
+}
+
+impl StreamBuffer {
+    /// Push text into the buffer, styling and writing complete lines to stdout.
+    /// Returns the total bytes written to stdout.
+    /// Partial lines (not ending with `\n`) are buffered and NOT written.
+    fn push(&mut self, s: &str) -> usize {
+        let mut written = 0;
+        self.buffer.push_str(s);
+
+        // Process complete lines (those ending with \n)
+        while let Some(newline_pos) = self.buffer.find('\n') {
+            let line = &self.buffer[..newline_pos];
+            let styled_line = self.styler.style_line(line);
+            let _ = io::stdout().write_all(styled_line.as_bytes());
+            written += styled_line.len();
+            let _ = io::stdout().write_all(b"\n");
+            written += 1;
+            self.buffer.drain(..=newline_pos);
+        }
+
+        written
+    }
+
+    /// Flush any remaining partial line UNSTYLED and reset fence state.
+    /// Called at turn boundaries (finish_line).
+    fn flush_unstyled(&mut self) -> usize {
+        let mut written = 0;
+        if !self.buffer.is_empty() {
+            let _ = io::stdout().write_all(self.buffer.as_bytes());
+            written = self.buffer.len();
+            self.buffer.clear();
+        }
+        self.styler.reset();
+        written
+    }
+}
+
+fn stream_buffer() -> &'static Mutex<StreamBuffer> {
+    static BUFFER: OnceLock<Mutex<StreamBuffer>> = OnceLock::new();
+    BUFFER.get_or_init(|| Mutex::new(StreamBuffer::default()))
+}
+
 /// Remove terminal control sequences and unsafe control characters from
 /// untrusted text while preserving printable Unicode, newlines, and tabs.
 ///
@@ -274,18 +330,50 @@ pub fn stdin_is_tty() -> bool {
 }
 
 /// Print a streamed text fragment immediately (no newline, flush).
+///
+/// On a styled TTY, text is accumulated into a line buffer and styled per-line
+/// via the streaming LineStyler. Complete lines are written immediately; partial
+/// lines are held until a newline arrives. This trades token-granular output for
+/// line-granular output, but enables the same markdown styling as the buffered
+/// `print_message` path.
+///
+/// On non-TTY or plain-mode output, text is sanitized and written immediately,
+/// maintaining byte-identical output to the current behavior.
 pub fn print_fragment(s: &str) {
-    let sanitized = stream_sanitizer()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
-        .push(s);
-    if !sanitized.is_empty() {
-        ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
-        TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
+    if stdout_style() {
+        // Styled TTY: SANITIZE FIRST (model output is untrusted — control
+        // sequences must never reach the terminal, styled path included),
+        // then line-buffer the sanitized text for styling. Output flags set
+        // when text enters the pipeline (old semantics), not only on line
+        // completion — a turn whose only output is a partial line must still
+        // count as having streamed output.
+        let sanitized = stream_sanitizer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(s);
+        if !sanitized.is_empty() {
+            ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+            TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
+        }
+        stream_buffer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(&sanitized);
+        let _ = io::stdout().flush();
+    } else {
+        // Non-TTY or plain: use existing sanitizer path (byte-identical)
+        let sanitized = stream_sanitizer()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(s);
+        if !sanitized.is_empty() {
+            ASSISTANT_OUTPUT_WRITTEN.store(true, Ordering::Release);
+            TURN_ASSISTANT_OUTPUT.store(true, Ordering::Release);
+        }
+        let mut out = io::stdout();
+        let _ = out.write_all(sanitized.as_bytes());
+        let _ = out.flush();
     }
-    let mut out = io::stdout();
-    let _ = out.write_all(sanitized.as_bytes());
-    let _ = out.flush();
 }
 
 /// Render a complete assistant message with lightweight terminal Markdown and
@@ -390,27 +478,36 @@ fn find_pair(chars: &[char], from: usize, needle: &[char]) -> Option<usize> {
     (from..=chars.len() - needle.len()).find(|&idx| chars[idx..idx + needle.len()] == *needle)
 }
 
-fn format_message(s: &str, styled: bool) -> String {
-    if !styled {
-        return s.to_string();
-    }
-    let mut out = String::with_capacity(s.len());
-    let mut fence: Option<String> = None;
-    for segment in s.split_inclusive('\n') {
-        let line = segment.trim_end_matches('\n');
-        let newline = if segment.ends_with('\n') { "\n" } else { "" };
+/// Stateful line styler for per-line markdown formatting.
+/// Tracks code fence state across multiple `style_line` calls,
+/// enabling streaming output with the same styling rules as buffered `format_message`.
+///
+/// The fence state machine is essential: styling must respect code fence boundaries
+/// across line boundaries. `reset()` ends the current turn and clears fence state.
+#[derive(Debug, Default)]
+struct LineStyler {
+    fence: Option<String>,
+}
+
+impl LineStyler {
+    /// Style a single line of markdown text according to fence state.
+    /// Updates fence state if the line contains fence markers.
+    /// Returns the styled line (without newline).
+    fn style_line(&mut self, line: &str) -> String {
+        // Check for fence marker
         if let Some(language) = line.trim().strip_prefix("```") {
-            if fence.is_some() {
-                fence = None;
+            if self.fence.is_some() {
+                self.fence = None;
             } else {
-                fence = Some(language.trim().to_string());
+                self.fence = Some(language.trim().to_string());
             }
-            out.push_str(&format!("{}", line.dimmed()));
-            out.push_str(newline);
-            continue;
+            return format!("{}", line.dimmed());
         }
-        let in_fence = fence.is_some();
-        let rendered = if fence.as_deref() == Some("diff") || fence.as_deref() == Some("patch") {
+
+        let in_fence = self.fence.is_some();
+
+        // Apply styling based on fence state
+        if self.fence.as_deref() == Some("diff") || self.fence.as_deref() == Some("patch") {
             if line.starts_with('+') && !line.starts_with("+++") {
                 format!("{}", line.green())
             } else if line.starts_with('-') && !line.starts_with("---") {
@@ -424,7 +521,25 @@ fn format_message(s: &str, styled: bool) -> String {
             format!("{}", line.bold())
         } else {
             style_inline_markdown(line, in_fence)
-        };
+        }
+    }
+
+    /// Reset fence state for the next turn (e.g., at line completion).
+    fn reset(&mut self) {
+        self.fence = None;
+    }
+}
+
+fn format_message(s: &str, styled: bool) -> String {
+    if !styled {
+        return s.to_string();
+    }
+    let mut styler = LineStyler::default();
+    let mut out = String::with_capacity(s.len());
+    for segment in s.split_inclusive('\n') {
+        let line = segment.trim_end_matches('\n');
+        let newline = if segment.ends_with('\n') { "\n" } else { "" };
+        let rendered = styler.style_line(line);
         out.push_str(&rendered);
         out.push_str(newline);
     }
@@ -1211,10 +1326,19 @@ pub fn turn_wrote_assistant_output() -> bool {
 
 /// Emit a trailing newline after a streamed turn so the next prompt is clean.
 pub fn finish_line() {
+    // Flush any partial line from the streaming buffer UNSTYLED
+    // and reset its fence state.
+    stream_buffer()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .flush_unstyled();
+
+    // Reset the non-TTY sanitizer state as well
     stream_sanitizer()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
         .reset();
+
     if !ASSISTANT_OUTPUT_WRITTEN.swap(false, Ordering::AcqRel) {
         return;
     }
@@ -1810,8 +1934,8 @@ mod tests {
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
         write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
-        DeckState, PromptSafeAsyncNotice, RenderMode, SpinnerMode, TerminalTextSanitizer, AMBER,
-        CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
+        DeckState, LineStyler, PromptSafeAsyncNotice, RenderMode, SpinnerMode, StreamBuffer,
+        TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -2014,6 +2138,136 @@ mod tests {
         // Test plain mode returns original text
         assert_eq!(format_message(bold_message, false), bold_message);
         assert_eq!(format_message(list_message, false), list_message);
+    }
+
+    #[test]
+    fn streaming_buffer_accumulates_and_styles_complete_lines() {
+        // Test the exact spec case: feeding "```di", "ff\n+add", "ed\n```\n"
+        // should yield the +added line in green SGR.
+        let mut buffer = StreamBuffer::default();
+
+        // Accumulate first fragment: "```di" (incomplete line, no newline)
+        buffer.push("```di");
+        assert!(
+            !buffer.buffer.is_empty(),
+            "incomplete line should be buffered"
+        );
+
+        // Continue with "ff\n" which completes the fence marker line
+        buffer.push("ff\n");
+        assert_eq!(buffer.buffer, "", "complete line should be flushed");
+
+        // Next: "+add" (incomplete diff line, no newline)
+        buffer.push("+add");
+        assert!(
+            !buffer.buffer.is_empty(),
+            "incomplete line should be buffered"
+        );
+
+        // Complete it with "ed\n"
+        buffer.push("ed\n");
+        assert_eq!(buffer.buffer, "", "complete diff line should be flushed");
+
+        // Finally: "```\n" (closing fence)
+        buffer.push("```\n");
+        assert_eq!(buffer.buffer, "", "fence marker should be flushed");
+    }
+
+    #[test]
+    fn streaming_buffer_flushes_unstyled() {
+        // Test that flush_unstyled outputs partial lines without styling
+        let mut buffer = StreamBuffer::default();
+
+        // Accumulate a partial line (no newline)
+        buffer.push("partial line");
+        assert!(!buffer.buffer.is_empty(), "should have buffered partial");
+
+        // Flush unstyled
+        buffer.flush_unstyled();
+        assert_eq!(buffer.buffer, "", "buffer should be empty after flush");
+        assert_eq!(buffer.styler.fence, None, "fence state should be reset");
+    }
+
+    #[test]
+    fn streaming_buffer_respects_fence_state_across_lines() {
+        // Test that fence state is maintained across multiple line_style calls
+        let mut buffer = StreamBuffer::default();
+
+        // Push a diff fence opening
+        buffer.push("```diff\n");
+        assert_eq!(buffer.styler.fence.as_deref(), Some("diff"));
+
+        // Push a diff line
+        buffer.push("+added line\n");
+        // The +added line should have been styled (green), and fence is still active
+
+        // Push another diff line
+        buffer.push("-removed line\n");
+        // The -removed line should have been styled (red), fence still active
+
+        // Close the fence
+        buffer.push("```\n");
+        assert_eq!(buffer.styler.fence, None, "fence should be closed");
+    }
+
+    #[test]
+    fn line_styler_tracks_fence_state() {
+        // Test that LineStyler correctly tracks fence state
+        let mut styler = LineStyler::default();
+        assert_eq!(styler.fence, None, "initial state: no fence");
+
+        // Open a diff fence
+        let line1 = styler.style_line("```diff");
+        assert_eq!(styler.fence.as_deref(), Some("diff"));
+        assert!(
+            line1.contains('\x1b'),
+            "fence marker should be dimmed (styled)"
+        );
+
+        // Style a diff line (+)
+        let line2 = styler.style_line("+added");
+        assert!(line2.contains('\x1b'), "+added should be green (styled)");
+        assert_eq!(styler.fence.as_deref(), Some("diff"));
+
+        // Style another diff line (-)
+        let line3 = styler.style_line("-removed");
+        assert!(line3.contains('\x1b'), "-removed should be red (styled)");
+        assert_eq!(styler.fence.as_deref(), Some("diff"));
+
+        // Close the fence
+        let line4 = styler.style_line("```");
+        assert!(line4.contains('\x1b'), "fence marker should be dimmed");
+        assert_eq!(styler.fence, None, "fence should be closed");
+
+        // Reset for next turn
+        styler.reset();
+        assert_eq!(styler.fence, None, "reset should clear fence");
+    }
+
+    #[test]
+    fn line_styler_preserves_styling_invariants() {
+        // Test that styled lines round-trip via sanitize
+        let mut styler = LineStyler::default();
+
+        // Test heading
+        let heading = "# Main Title";
+        let styled_heading = styler.style_line(heading);
+        assert_eq!(sanitize_terminal_text(&styled_heading), heading);
+
+        // Test bold
+        let bold = "This is **bold text** here";
+        let styled_bold = styler.style_line(bold);
+        assert_eq!(sanitize_terminal_text(&styled_bold), bold);
+
+        // Test inline code
+        let code = "Use `function()` like this";
+        let styled_code = styler.style_line(code);
+        assert_eq!(sanitize_terminal_text(&styled_code), code);
+
+        // Test list marker
+        let list = "- First item";
+        let styled_list = styler.style_line(list);
+        assert_eq!(sanitize_terminal_text(&styled_list), list);
     }
 
     #[test]

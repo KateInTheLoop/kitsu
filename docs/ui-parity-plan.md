@@ -239,7 +239,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   'hi'" /dev/null` from a deep cwd shows every banner row ending in `│`;
   render tests green.
 
-- [ ] **9. Styled streaming: line-buffered markdown on the live path** (M)
+- [x] **9. Styled streaming: line-buffered markdown on the live path** (M) (done 2026-08-13)
   The streamed path prints raw text; only buffered replies get styling
   (assessment: biggest parity gap). Give `kitsu-render` a stateful streaming
   renderer: `print_fragment` (`lib.rs:277`) accumulates into an internal
