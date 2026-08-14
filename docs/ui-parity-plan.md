@@ -372,9 +372,17 @@ as escalation); findings are re-verified before applying. Cycle log:
   cross-turn staleness — depth now syncs before the row's first paint.
   Deliberate scope cut: full stacked-rows rendering deferred (multi-row
   live region needs a renderer rewrite).
+- **Cycle 7 (2026-08-14, c3a64be)**: Ctrl+R reverse-i-search mid-turn —
+  readline semantics with accept-into-draft on Enter (never
+  auto-submits); Ctrl+G restores; take_draft/approval handoff carry the
+  real typing, not the match. Renderer gained reserved hints (search
+  status claims columns first, match windows into the remainder) after
+  the PTY smoke caught the suppress-on-window rule hiding the status for
+  long matches. SHIP-AS-IS review (second clean in a row; all 7
+  negative-case traces held).
 - Backlog (next cycles): queued-message full stack rendered under the
-  status row (multi-row live region); multi-line draft wrap; Ctrl+R
-  history search mid-turn; unit-test seam for the collector poll loop.
+  status row (multi-row live region); multi-line draft wrap; unit-test
+  seam for the collector poll loop.
 
 ## Protocol
 
