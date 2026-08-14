@@ -342,10 +342,18 @@ as escalation); findings are re-verified before applying. Cycle log:
   --no-fail-fast` — fail-fast at the known cli PTY failure was masking a
   stale kitsu-tools assertion since cycle 31 (fixed in f3d579c alongside
   the kimi-loop ranged-read cap fix).
+- **Cycle 3 (2026-08-13, 1e61df1 + follow-up fde3424)**: ↑ on an empty
+  draft recalls the newest queued prompt into the live editor (leaves the
+  queue, teal "(N still queued)" notice, resubmit re-enqueues); empty
+  queue falls through to plain history via history_prev_forced. Haiku
+  review caught real data loss — ↑↑ in one input batch double-popped and
+  overwrote the first recall; fixed with a per-batch recall gate in the
+  editor plus a still-empty-draft guard in the collector. PTY-verified
+  against ollama.
 - Backlog (next cycles): hint ranking should prefer mid-turn-actionable
   commands (/steer, /jobs, /queue) over registry order; Esc-to-clear
-  draft; queued-message stack visibility with ↑ recall of queued prompts;
-  multi-line draft wrap; Ctrl+R history search mid-turn.
+  draft; queued-message stack rendered under the status row; multi-line
+  draft wrap; Ctrl+R history search mid-turn.
 
 ## Protocol
 
