@@ -342,3 +342,80 @@ re-read of the model's own offloaded output isn't the default move
 (weakness 4); (e) pin `--timeout-secs 300` explicitly in this loop's
 standing task/rules doc so cycle 3 doesn't repeat attempt 1's
 easily-avoidable timeout.
+
+### Cycle 3 (2026-08-13)
+
+**Run stats.** Two attempts (one run + the one permitted retry, per the
+loop's cost bound), both rejected by the Hugging Face router before any
+inference began — a new failure mode, distinct from cycles 1 and 2, and
+external to kitsu.
+
+| | attempt 1 | attempt 2 (retry, after 60s cooldown) |
+|---|---|---|
+| wall time | <1s | <1s |
+| tool calls | 0 | 0 |
+| outcome | `HTTP 402` client error, `terminal=true`, on the *first* of 3 internal attempts | identical: `HTTP 402`, `terminal=true`, first attempt |
+| `kitsu-context` | `{"used":1908,"effective":117072,"window":131072}` (pre-flight estimate, printed) | identical |
+| `kitsu-usage` | none printed (no tokens billed — request never reached inference) | none printed |
+
+Both attempts used the run command specified by the authoritative rules
+doc (`--timeout-secs 300 --max-output-tokens 14000`), piping the same
+scoped, spawn-forbidding task prompt (whole-file read of `context.rs`,
+three fixed ranges for `orchestrator.rs`, directory-list-then-targeted-
+read for `kitsu-providers/src`). Combined tokens burned: effectively
+zero — the router rejected both requests before any prompt tokens were
+processed.
+
+**Deliverable grade: F (no deliverable), for a new, external reason.**
+`reviews/kimi-cycle-3.md` is a supervisor-authored failure record, not a
+model-authored caching/context-window review — the model never received
+the task prompt in either attempt. Unlike cycles 1 (ranged-read thrash
+then `429`) and 2 (wall-clock/output-budget exhaustion after real tool
+calls), cycle 3's failure happened at the HTTP layer before kitsu ever
+sent the request body: `client error; HTTP 402; request rejected;
+terminal=true` on the very first internal attempt. This is a Hugging
+Face account billing/quota condition for the `HF_TOKEN` used against
+`moonshotai/Kimi-K3`, not a kitsu code defect. The standing
+caching/context-window review carries over to cycle 4 unchanged, and
+should not be re-attempted until HF billing/quota is confirmed clear —
+retrying blind will reproduce this same sub-second failure.
+
+**Positive finding: 402 handling is correct and cheap.** kitsu classified
+the `402` as `terminal=true` on the first of its three internal retry
+slots and stopped immediately, rather than spending two more retries and
+their backoff delays (contrast cycle 1's `429` handling, which burned all
+3 attempts with near-zero effective backoff before discarding a turn with
+298s of timeout budget still unused). The surfaced error — `"chat request
+was rejected for billing or quota (HTTP 402) - check provider credits and
+billing settings"` — is produced at `crates/kitsu/src/main.rs:1402` and is
+immediately actionable; the supervisor did not need to inspect any code
+to diagnose the failure class. No new kitsu weakness is filed for the 402
+path itself.
+
+**Receipt behavior clarified (not a bug).** `kitsu-context:` printed
+(`used:1908`) on both attempts even though the call never reached the
+provider, while `kitsu-usage:` printed nothing on either attempt. Traced
+to `crates/kitsu-render/src/lib.rs:1770-1776`: `usage` and `context` are
+independent `Option`s passed to the turn-stats renderer, and
+`write_context_record` (a local, pre-flight estimate) fires whenever
+`context` is `Some` regardless of whether `usage` (which only exists
+after a provider response carries billed tokens) is `Some`. This cycle's
+zero `kitsu-usage` output is truthful — no tokens were ever billed — and
+should **not** be conflated with the cycle-2 backlog item below (turns
+that spent real inference time and *still* printed zero usage); that
+item remains open and unconfirmed either way by this cycle's evidence.
+
+**Weaknesses observed (ranked):** none new this cycle attributable to
+kitsu itself — the sole failure mode (HF billing/quota `402`) is external
+and kitsu's handling of it was fast, correctly classified as terminal,
+and clearly reported. All backlog items below carry over unchanged from
+cycle 2; none were confirmed or refuted by this cycle's evidence (the run
+never got far enough to exercise the ranged-read path, the sub-agent
+spawn path, the reasoning-headroom path, or the offload-preview path —
+zero tool calls were made in either attempt).
+
+**Improvements to schedule:** (a) before scheduling cycle 4, verify HF
+router billing/quota status for the loop's `HF_TOKEN` against
+`moonshotai/Kimi-K3` — this is an operational/account task, not a code
+change; (b) all cycle 1/2 backlog items (a-e above) remain open and
+untouched by this cycle; carry forward as-is.
