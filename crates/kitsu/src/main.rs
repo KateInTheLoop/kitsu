@@ -2521,6 +2521,58 @@ enum ProviderOperation<'a> {
     ModelCatalog,
 }
 
+/// Secret-free provider metadata used only to choose bounded recovery prose.
+/// The raw base URL never enters an error message: config may contain userinfo
+/// or query credentials, so reduce it to the one trusted fact the formatter
+/// needs while setup still owns the parsed gateway profile.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ProviderDiagnosticContext {
+    loopback_ollama: bool,
+}
+
+impl ProviderDiagnosticContext {
+    fn from_gateway(gateway_name: &str, gateway: &Gateway) -> Self {
+        let ollama_profile = gateway_name.eq_ignore_ascii_case("ollama")
+            || gateway.flavor.eq_ignore_ascii_case("ollama");
+        Self {
+            loopback_ollama: ollama_profile && base_url_has_loopback_host(&gateway.base_url),
+        }
+    }
+}
+
+/// Recognize only URL-shaped loopback endpoints. This deliberately does not
+/// resolve names or accept prefix matches such as `localhost.example.com`.
+fn base_url_has_loopback_host(base_url: &str) -> bool {
+    let Some((scheme, remainder)) = base_url.split_once("://") else {
+        return false;
+    };
+    if !matches!(scheme.to_ascii_lowercase().as_str(), "http" | "https") {
+        return false;
+    }
+    let authority = remainder
+        .split(['/', '?', '#'])
+        .next()
+        .unwrap_or_default()
+        .rsplit('@')
+        .next()
+        .unwrap_or_default();
+    let host = if let Some(bracketed) = authority.strip_prefix('[') {
+        let Some(end) = bracketed.find(']') else {
+            return false;
+        };
+        &bracketed[..end]
+    } else {
+        authority
+            .rsplit_once(':')
+            .filter(|(_, port)| !port.is_empty() && port.bytes().all(|byte| byte.is_ascii_digit()))
+            .map_or(authority, |(host, _)| host)
+    };
+    host.eq_ignore_ascii_case("localhost")
+        || host
+            .parse::<std::net::IpAddr>()
+            .is_ok_and(|address| address.is_loopback())
+}
+
 impl ProviderOperation<'_> {
     fn subject(self) -> &'static str {
         match self {
@@ -2615,9 +2667,13 @@ fn safe_provider_error_message(
     error: &ProviderError,
     operation: ProviderOperation<'_>,
     timeout_secs: Option<u64>,
+    diagnostics: ProviderDiagnosticContext,
 ) -> String {
     let subject = operation.subject();
     match error {
+        ProviderError::Connection(_) if diagnostics.loopback_ollama => format!(
+            "{subject} could not reach local Ollama at the configured loopback endpoint from this execution environment - start or verify `ollama serve`, or select another gateway"
+        ),
         ProviderError::Connection(_) => format!(
             "{subject} could not reach the gateway - check the selected gateway's base_url, network access, and provider availability; run `kitsu doctor --online`"
         ),
@@ -3058,6 +3114,8 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
     if let Some(config) = config.as_ref() {
         match config.select_gateway(cli.gateway.as_deref()) {
             Ok((gateway_name, gateway)) => {
+                let provider_diagnostics =
+                    ProviderDiagnosticContext::from_gateway(gateway_name, gateway);
                 let flavor_ok = match gateway.validate_flavor() {
                     Ok(()) => true,
                     Err(error) => {
@@ -3254,6 +3312,7 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                                         model: effective_model,
                                     },
                                     Some(cli.timeout_secs),
+                                    provider_diagnostics,
                                 );
                                 issues.push(format!("inference provider check failed: {safe}"));
                                 online_report = serde_json::json!({
@@ -3357,6 +3416,7 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                                     &error,
                                     ProviderOperation::ModelCatalog,
                                     Some(cli.timeout_secs),
+                                    provider_diagnostics,
                                 );
                                 let reason = bounded_model_catalog_reason(&error);
                                 issues.push(format!("online provider check failed: {safe}"));
@@ -3468,6 +3528,7 @@ struct ChatSetup {
     /// `/models` fail without honoring the user's requested wait budget.
     catalog_provider: Arc<OpenAICompatProvider>,
     gateway_name: String,
+    provider_diagnostics: ProviderDiagnosticContext,
     config_path: std::path::PathBuf,
     state_dir: std::path::PathBuf,
     endpoint: String,
@@ -4932,6 +4993,7 @@ impl CtxEntry {
 /// updates both request budgeting and `/status`/`/context` immediately.
 struct SessionInfo {
     gateway: String,
+    provider_diagnostics: ProviderDiagnosticContext,
     directory: std::path::PathBuf,
     config_path: std::path::PathBuf,
     state_dir: std::path::PathBuf,
@@ -7503,6 +7565,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         .select_gateway(cli.gateway.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
     let gateway_name = gateway_name.to_string();
+    let provider_diagnostics = ProviderDiagnosticContext::from_gateway(&gateway_name, gateway);
     gateway
         .validate_flavor()
         .map_err(|e| CliError::user(e.to_string()))?;
@@ -7653,6 +7716,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         provider,
         catalog_provider,
         gateway_name,
+        provider_diagnostics,
         config_path: path,
         state_dir,
         endpoint,
@@ -7795,6 +7859,7 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     let (gateway_name, gateway) = config
         .select_gateway(cli.gateway.as_deref())
         .map_err(|error| CliError::user(error.to_string()))?;
+    let provider_diagnostics = ProviderDiagnosticContext::from_gateway(gateway_name, gateway);
     gateway
         .validate_flavor()
         .map_err(|error| CliError::user(error.to_string()))?;
@@ -7827,10 +7892,11 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         .await
         .ok_or_else(|| CliError::cancelled("model catalog request cancelled by Ctrl+C"))?;
     let Some(models) = result.map_err(|error| {
-        map_provider_error(
+        map_provider_error_with_diagnostics(
             error,
             ProviderOperation::ModelCatalog,
             Some(cli.timeout_secs),
+            provider_diagnostics,
         )
     })?
     else {
@@ -8048,12 +8114,13 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 )?;
             }
             let cause = agent_error_jsonl_cause(&error);
-            let mapped = map_agent_error(
+            let mapped = map_agent_error_with_diagnostics(
                 error,
                 ProviderOperation::Chat {
                     model: &setup.model,
                 },
                 Some(cli.timeout_secs),
+                setup.provider_diagnostics,
             );
             if cli.jsonl {
                 let mut payload = serde_json::json!({
@@ -11332,7 +11399,12 @@ async fn run_scripted_turn(
             .map_err(|_| ScriptFailureKind::JsonlOutput)?;
             let cause = agent_error_jsonl_cause(&e);
             let kind = script_failure_kind(&e);
-            let error_message = chat_error_message(e, model, cli.timeout_secs);
+            let error_message = chat_error_message_with_diagnostics(
+                e,
+                model,
+                cli.timeout_secs,
+                session.provider_diagnostics,
+            );
             if cli.jsonl {
                 let mut payload = serde_json::json!({
                     "turn_id": location,
@@ -12702,6 +12774,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
 
     let session = SessionInfo {
         gateway: setup.gateway_name.clone(),
+        provider_diagnostics: setup.provider_diagnostics,
         directory,
         config_path: setup.config_path.clone(),
         state_dir: setup.state_dir.clone(),
@@ -13325,10 +13398,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
                     .await;
                 let cause = agent_error_jsonl_cause(&error);
-                let mapped = map_agent_error(
+                let mapped = map_agent_error_with_diagnostics(
                     error,
                     ProviderOperation::Chat { model: &model },
                     Some(cli.timeout_secs),
+                    setup.provider_diagnostics,
                 );
                 if cli.jsonl {
                     let mut payload = serde_json::json!({
@@ -14147,9 +14221,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     .await,
                 );
                 last_failed = Some(retry_prompt);
-                for line in
-                    kitsu_render::error_lines(&chat_error_message(e, &model, cli.timeout_secs))
-                {
+                for line in kitsu_render::error_lines(&chat_error_message_with_diagnostics(
+                    e,
+                    &model,
+                    cli.timeout_secs,
+                    session.provider_diagnostics,
+                )) {
                     eprintln!("{line}");
                 }
                 eprintln!(
@@ -14935,7 +15012,12 @@ async fn handle_slash(
                     let kind = script_failure_kind(&error);
                     *messages = messages_before;
                     rollback_agent_state(state, state_before);
-                    let message = chat_error_message(error, model, cli.timeout_secs);
+                    let message = chat_error_message_with_diagnostics(
+                        error,
+                        model,
+                        cli.timeout_secs,
+                        session.provider_diagnostics,
+                    );
                     eprintln!("cannot compact context (context restored): {message}");
                     return if kind == ScriptFailureKind::Provider {
                         SlashResult::ProviderFailure(message)
@@ -15335,7 +15417,11 @@ async fn handle_slash(
                 eprintln!("^C (model catalog request cancelled)");
                 return SlashResult::Cancelled;
             };
-            return match finish_slash_model_catalog(result, cli.timeout_secs) {
+            return match finish_slash_model_catalog(
+                result,
+                cli.timeout_secs,
+                session.provider_diagnostics,
+            ) {
                 Ok(models) => SlashResult::Continue(Some(serde_json::json!({
                     "kind": "model_catalog",
                     "filter": arg,
@@ -15528,7 +15614,11 @@ async fn handle_slash(
                     eprintln!("^C (model catalog request cancelled)");
                     return SlashResult::Cancelled;
                 };
-                return match finish_slash_model_catalog(result, cli.timeout_secs) {
+                return match finish_slash_model_catalog(
+                    result,
+                    cli.timeout_secs,
+                    session.provider_diagnostics,
+                ) {
                     Ok(models) => SlashResult::Continue(Some(serde_json::json!({
                         "kind": "model_catalog",
                         "filter": filter,
@@ -15562,6 +15652,7 @@ async fn handle_slash(
                             error,
                             ProviderOperation::ModelCatalog,
                             cli.timeout_secs,
+                            session.provider_diagnostics,
                         );
                     }
                 };
@@ -15707,9 +15798,10 @@ fn report_slash_provider_error(
     error: ProviderError,
     operation: ProviderOperation<'_>,
     timeout_secs: u64,
+    diagnostics: ProviderDiagnosticContext,
 ) -> SlashResult {
     let user_error = matches!(error, ProviderError::Auth(_));
-    let message = safe_provider_error_message(&error, operation, Some(timeout_secs));
+    let message = safe_provider_error_message(&error, operation, Some(timeout_secs), diagnostics);
     eprintln!("{}: {}", terminal_inline(prefix), message);
     if user_error {
         SlashResult::Error
@@ -15721,6 +15813,7 @@ fn report_slash_provider_error(
 fn finish_slash_model_catalog(
     result: Result<Option<Vec<String>>, ProviderError>,
     timeout_secs: u64,
+    diagnostics: ProviderDiagnosticContext,
 ) -> Result<Vec<String>, SlashResult> {
     match result {
         Ok(Some(models)) => Ok(models),
@@ -15730,6 +15823,7 @@ fn finish_slash_model_catalog(
             error,
             ProviderOperation::ModelCatalog,
             timeout_secs,
+            diagnostics,
         )),
     }
 }
@@ -16035,21 +16129,33 @@ fn require_auth_ready(
 
 /// Render an agent error for every chat mode through the same bounded provider
 /// diagnostic. This deliberately never renders provider body/URL text.
-fn chat_error_message(e: kitsu_core::AgentError, model: &str, timeout_secs: u64) -> String {
+fn chat_error_message_with_diagnostics(
+    e: kitsu_core::AgentError,
+    model: &str,
+    timeout_secs: u64,
+    diagnostics: ProviderDiagnosticContext,
+) -> String {
     kitsu_render::sanitize_terminal_text(
-        &map_agent_error(e, ProviderOperation::Chat { model }, Some(timeout_secs)).to_string(),
+        &map_agent_error_with_diagnostics(
+            e,
+            ProviderOperation::Chat { model },
+            Some(timeout_secs),
+            diagnostics,
+        )
+        .to_string(),
     )
 }
 
 /// Map an agent/provider error to the right exit code (design §6).
-fn map_agent_error(
+fn map_agent_error_with_diagnostics(
     e: kitsu_core::AgentError,
     operation: ProviderOperation<'_>,
     timeout_secs: Option<u64>,
+    diagnostics: ProviderDiagnosticContext,
 ) -> CliError {
     match e {
         kitsu_core::AgentError::Provider(error) => {
-            map_provider_error(error, operation, timeout_secs)
+            map_provider_error_with_diagnostics(error, operation, timeout_secs, diagnostics)
         }
         kitsu_core::AgentError::ToolCallDuringToolFreeFinalization => CliError::provider(
             "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
@@ -16068,8 +16174,22 @@ fn map_provider_error(
     operation: ProviderOperation<'_>,
     timeout_secs: Option<u64>,
 ) -> CliError {
+    map_provider_error_with_diagnostics(
+        error,
+        operation,
+        timeout_secs,
+        ProviderDiagnosticContext::default(),
+    )
+}
+
+fn map_provider_error_with_diagnostics(
+    error: ProviderError,
+    operation: ProviderOperation<'_>,
+    timeout_secs: Option<u64>,
+    diagnostics: ProviderDiagnosticContext,
+) -> CliError {
     let user_error = matches!(error, ProviderError::Auth(_));
-    let message = safe_provider_error_message(&error, operation, timeout_secs);
+    let message = safe_provider_error_message(&error, operation, timeout_secs, diagnostics);
     if user_error {
         CliError::user(message)
     } else {
@@ -17451,6 +17571,7 @@ mod tests {
                     model: "safe-model",
                 },
                 Some(17),
+                ProviderDiagnosticContext::default(),
             );
             for secret in secrets {
                 assert!(!message.contains(secret), "leaked {secret}: {message}");
@@ -17458,10 +17579,11 @@ mod tests {
             assert!(message.contains('-'), "diagnostic should include a remedy");
         }
 
-        let timeout = chat_error_message(
+        let timeout = chat_error_message_with_diagnostics(
             kitsu_core::AgentError::Provider(ProviderError::Timeout),
             "safe-model",
             17,
+            ProviderDiagnosticContext::default(),
         );
         assert!(timeout.contains("chat request timed out after 17s"));
         assert!(timeout.contains("--timeout-secs"));
@@ -17469,6 +17591,7 @@ mod tests {
             &ProviderError::Timeout,
             ProviderOperation::ModelCatalog,
             Some(17),
+            ProviderDiagnosticContext::default(),
         );
         assert!(catalog.contains("model catalog request timed out after 17s"));
 
@@ -17481,6 +17604,7 @@ mod tests {
                 model: "safe-model",
             },
             Some(17),
+            ProviderDiagnosticContext::default(),
         );
         assert!(missing.contains("$HF_TOKEN"));
         assert!(missing.contains("refresh-token"));
@@ -17498,11 +17622,74 @@ mod tests {
                 model: "bad\nmodel\u{1b}]0;owned\u{7}",
             },
             Some(17),
+            ProviderDiagnosticContext::default(),
         );
         assert!(bad_model.contains("HTTP 404"));
         assert!(!bad_model.contains("provider-body-secret"));
         assert!(!bad_model.contains('\n'));
         assert!(!bad_model.contains('\u{1b}'));
+    }
+
+    #[test]
+    fn loopback_ollama_connection_hint_is_scoped_and_secret_free() {
+        let gateway = |flavor: &str, base_url: &str| Gateway {
+            flavor: flavor.to_string(),
+            base_url: base_url.to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: Some("/v1/models".to_string()),
+            model: Some("test-model".to_string()),
+            context_window: Some(8_192),
+            auth: config::AuthConfig::default(),
+        };
+        let secret_url = "http://user:super-secret@127.0.0.7:11434?api_key=hidden";
+        let local = gateway("openai", secret_url);
+        let diagnostics = ProviderDiagnosticContext::from_gateway("ollama", &local);
+        assert!(diagnostics.loopback_ollama);
+        let message = safe_provider_error_message(
+            &ProviderError::Connection(format!("request failed for {secret_url}")),
+            ProviderOperation::Chat {
+                model: "test-model",
+            },
+            Some(17),
+            diagnostics,
+        );
+        assert!(message.contains("local Ollama"));
+        assert!(message.contains("configured loopback endpoint"));
+        assert!(message.contains("`ollama serve`"));
+        assert!(message.contains("select another gateway"));
+        assert!(!message.contains("super-secret"));
+        assert!(!message.contains("api_key"));
+        assert!(!message.contains("127.0.0.7"));
+
+        let flavored = gateway("ollama", "http://[::1]:11434");
+        assert!(ProviderDiagnosticContext::from_gateway("custom-local", &flavored).loopback_ollama);
+
+        for (name, flavor, base_url) in [
+            ("ollama", "openai", "https://gateway.example.test"),
+            ("example", "openai", "http://localhost:11434"),
+            ("ollama", "openai", "http://localhost.example.test:11434"),
+        ] {
+            let profile = gateway(flavor, base_url);
+            let diagnostics = ProviderDiagnosticContext::from_gateway(name, &profile);
+            assert!(!diagnostics.loopback_ollama, "{name} {base_url}");
+            let generic = safe_provider_error_message(
+                &ProviderError::Connection("provider-controlled detail".to_string()),
+                ProviderOperation::ModelCatalog,
+                Some(17),
+                diagnostics,
+            );
+            assert!(generic.contains("selected gateway's base_url"));
+            assert!(!generic.contains("ollama serve"));
+            assert!(!generic.contains("provider-controlled detail"));
+        }
+
+        for base_url in [
+            "http://localhost:11434",
+            "http://127.255.1.9:11434/v1",
+            "http://[::1]:11434",
+        ] {
+            assert!(base_url_has_loopback_host(base_url), "{base_url}");
+        }
     }
 
     /// The shipped huggingface profile's hint must SURVIVE the credential
@@ -17554,6 +17741,7 @@ mod tests {
                     model: "safe-model",
                 },
                 Some(17),
+                ProviderDiagnosticContext::default(),
             );
             let unauthorized = safe_provider_error_message(
                 &ProviderError::Unauthorized {
@@ -17562,6 +17750,7 @@ mod tests {
                 },
                 ProviderOperation::ModelCatalog,
                 Some(17),
+                ProviderDiagnosticContext::default(),
             );
             let expired = expired_auth_warning("2026-01-01T00:00:00Z", Some(hint));
             for rendered in [&missing, &unauthorized, &expired] {
@@ -17599,6 +17788,7 @@ mod tests {
                 model: "safe-model",
             },
             Some(17),
+            ProviderDiagnosticContext::default(),
         );
         assert!(unauthorized.contains("Make calls to Inference Providers"));
         assert!(!unauthorized.contains("hf_"));
@@ -17627,7 +17817,11 @@ mod tests {
             ]
         );
         assert!(filter_model_catalog(vec!["alpha".to_string()], "missing").is_empty());
-        let catalog = match finish_slash_model_catalog(Ok(Some(vec!["alpha".to_string()])), 17) {
+        let catalog = match finish_slash_model_catalog(
+            Ok(Some(vec!["alpha".to_string()])),
+            17,
+            ProviderDiagnosticContext::default(),
+        ) {
             Ok(catalog) => catalog,
             Err(_) => panic!("available catalog should succeed"),
         };

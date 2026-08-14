@@ -305,6 +305,11 @@ ollama serve && ollama pull llama3.2
 kitsu --gateway ollama ask "hi"
 ```
 
+If a selected Ollama profile points at a loopback URL but cannot be reached,
+Kitsu names local Ollama and suggests checking `ollama serve` or selecting a
+different gateway. Other connection failures keep the generic gateway remedy;
+neither form prints the configured URL or provider-controlled error detail.
+
 ### vLLM (local / self-hosted)
 
 ```toml
