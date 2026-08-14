@@ -101,6 +101,14 @@ concrete, file-referenced proposals ranked by value; no vague advice.
   backlog section below.
 - **Never** run the Kimi loop and edit the same files from the main
   session simultaneously; the branches keep the work disjoint.
+- **Worktree builds NEVER target the tmpfs** (cycle-7 incident: /tmp is
+  a 5.7G tmpfs, shared with a concurrent session's 4.9G build area, and
+  a fresh kitsu target dir needs ~12G — the build filled the tmpfs and
+  starved BOTH sessions' output capture). Any cargo command in the
+  worktree must set `CARGO_TARGET_DIR=/home/mmpg/.cache/kimi-worktree-target`.
+- Supervisors never spawn helper agents and never pause to await
+  notifications — every wait is a synchronous `sleep` in a Bash call
+  (two supervisors have stalled the loop this way).
 
 > **RAMP COMPLETE — 2026-08-14, cycle 6 synthesis banked at grade A**
 > (commit 744b2da on dogfood/kimi-k3). Three consecutive deliverables:
