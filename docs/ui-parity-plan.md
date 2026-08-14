@@ -415,9 +415,17 @@ as escalation); findings are re-verified before applying. Cycle log:
   Pure refactor, PTY 5/5 unchanged, SHIP-AS-IS review (probes confirmed
   the drawn_rows sentinel keeps the non-TTY gate airtight and degenerate
   cols never panic).
-- Backlog (next cycles): unit-test seam for the collector poll loop
-  (last testability item); soft-wrap of overlong single lines
-  (nice-to-have; horizontal window suffices).
+- **Cycle 12 (2026-08-14, 5d684e9 + follow-up f519624)**: action-
+  resolution seam — Submit dispatch, Tab-hint acceptance, ↑-recall
+  gating, and the ^C/^Z/^\\ signal mapping extracted into a pure
+  function with injected closures + returned ActionEffects; 5 unit
+  tests incl. last-signal-wins batching and the SIGTSTP pin the review
+  flagged. Two documented semantic refinements: signals raise
+  post-batch (last wins) and the recall notice now follows the draft
+  update. Recall + Ctrl+C PTY smokes unchanged. Testability debt: paid
+  in full.
+- Backlog: soft-wrap of overlong single lines (nice-to-have; horizontal
+  window suffices). The loop is otherwise in maintenance mode.
 
 ## Protocol
 
