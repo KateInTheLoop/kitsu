@@ -940,6 +940,134 @@ Two banked deliverables now exist (`reviews/kimi-cycle-4.md`,
 `reviews/kimi-cycle-5.md`); proceed to cycle 6 synthesis per the
 Success ramp.
 
+### Cycle 6 (2026-08-14)
+
+**THIRD BANKED DELIVERABLE — RAMP COMPLETE.** Pre-flight was not run
+separately this cycle (the prior tick's `HTTP 200` confirmation on
+cycle 5 attempt 2 stood); the run went straight to the synthesis task
+and succeeded on the **first attempt, no retry needed** — the cleanest
+run of the ramp so far.
+
+**Run stats.**
+
+| | attempt 1 (no retry required) |
+|---|---|
+| tool calls | 6 (`Read` kimi-cycle-4.md whole, `Read` kimi-cycle-5.md whole, `Read` context.rs whole, `Read` orchestrator.rs 700-900, `Read` orchestrator.rs 2100-2350, `Write` reviews/kimi-cycle-6.md) — zero extraneous reads, zero list calls, zero `Agent` spawns, zero write conflicts |
+| ranged-read behavior | both orchestrator.rs ranges (201 and 251 lines) returned full width in 0ms — range-cap fix holds under load again, fourth confirmation (cycles 2, 4, 5, now 6) |
+| `kitsu-usage` prompt/completion/total | 36,473 / 5,991 / 42,464 — **completion_tokens 5,991 against the 24,000 cap (25% utilization)**, well under, zero truncation warnings |
+| `kitsu-context` used/effective/window | 19,270 / 107,072 / 131,072 |
+| truncation warnings | 0 |
+| write conflicts | 0 — direct `created` on the first `Write` call, unlike cycle 5 attempt 2's failed-then-recovered overwrite (expected: cycle 6 targets a brand-new file, so the blind-overwrite guard never triggers) |
+| outcome | committed: `reviews/kimi-cycle-6.md`, 250 lines / 15,890 bytes, 11 ranked proposals + top-5 list |
+
+Total tokens (42,464) landed at roughly 21% of the cycle's 200K target —
+the most token-efficient cycle of the ramp per unit of deliverable
+content (250 lines / 15.9 KB, more than either source review alone).
+Wall time was not separately timed by the supervisor this cycle (no
+`time` wrapper was used); every individual tool-call receipt reported
+0-2ms, so the bulk of elapsed time was model generation, and the run
+completed comfortably inside the 300s `--timeout-secs` deadline with no
+harness-timeout risk (the harness's own Bash timeout was left at the
+tool default, which was sufficient — no repeat of cycle 5 attempt 2's
+120s-wrapper kill).
+
+**Deliverable grade: A (pass, strongest citation precision of the
+ramp).** `reviews/kimi-cycle-6.md` is a genuine synthesis, not a
+re-listing: 8 proposals CARRIED (5 from cycle 4: anchor fingerprint,
+gateway-usage sanity clamp, trim-buffer scaling, message-token
+overhead/bytes-vs-chars, reserve-vs-max_output mismatch; 3 from cycle
+5: `prompt_cache_key`, `cached_tokens` parsing + `is_empty()` edge
+case, model-context-length caching) plus 3 **NEW**, explicitly grounded
+in the orchestrator ranges just read: P6 (`ContextWindowEvidence` /
+`context_window_shortfall` diagnose truncation but never feed back into
+the session budget), P7 (`anchor_includes_schema` is a bare bool, so a
+mid-session tool-registry change fools it — the same count-vs-identity
+flaw as the carried P2, one level up), and P11 (`ensure_chat_request_fits`
+re-serializes tool schemas on every provider-boundary check). Every
+CARRIED/NEW label is present and correct; nothing is mislabeled.
+
+**Spot-check results.** All carried `context.rs` citations
+(`message_tokens` 35-43, `record` 79-81, `invalidate` 83-93, `estimate`
+100-107, `anchored` 111-113, `anchor_includes_schema` 122-124,
+`ContextBudget::new` 159-173, trim `buffer` line 166,
+`DEFAULT_CONTEXT_WINDOW` 20-22, `MIN_OUTPUT_RESERVE` 24-25,
+`estimate_str` 29-31) verified **exact** against the file read this
+cycle. All three NEW orchestrator citations verified against the actual
+700-900/2100-2350 ranges and found accurate to within single digits to
+~15 lines — materially tighter than cycle 5's 20-48 line drift in its
+dense 240-620 region: `AgentSessionState` (cited ~745-770, actual
+struct 756-777, doc comment from 746), `ContextWindowEvidence` (cited
+772-791, actual 779-796 — exact for the doc/struct span), `context_
+window_shortfall` (cited 793-820, actual fn 804-819, doc from 798 —
+contained), `request_measurement` (cited ~2165-2212, actual fn
+2172-2217 — tight), `ensure_chat_request_fits` doc line (cited ~2218-
+2233, actual fn 2233-2252, "last-line guard used at every provider
+boundary" comment quoted verbatim from line 2232). One quick
+cross-file spot-check also confirmed P1's premise (`prompt_cache_key`/
+`cache_control`, carried from cycle 5): zero grep hits across
+`kitsu-providers/src`, and `WireRequest` (openai_compat.rs 109-126) has
+no such field — accurate.
+
+**This completes the ramp's founding goal.** Three banked deliverables
+now exist on `dogfood/kimi-k3` — cycle 4 (A, single-file), cycle 5
+attempt 2 (B+, two-file usage/caching), cycle 6 (A, synthesis) — the
+exact three-stage arc the Success ramp was designed to prove: narrow
+scope to bank a first success, widen one notch with headroom lessons
+applied, then synthesize both into the review the loop originally
+wanted. The loop went from three straight F cycles (1-3, all external
+or infrastructure failures: ranged-read cap bug, unbounded sub-agent
+detour, HF 402 billing block) to three consecutive real deliverables
+once the task shape was disciplined to the model's demonstrated
+capability.
+
+**Weaknesses observed (ranked):** none new this cycle — it was the
+cleanest run of the ramp (no thrash, no truncation, no write conflict,
+no spawn, no cancellation).
+
+1. **Completion-token spend continues to track task complexity, not a
+   fixed floor, and this is now the fourth data point on that curve.**
+   Cycle 2 (single wide read + off-task detour): 8,852. Cycle 4
+   (one file, one read, one write): 6,282. Cycle 5 attempt 1 (two files,
+   two-part ask, no brevity instruction): 14,322 (overshot its 14,000
+   cap). Cycle 5 attempt 2 (same two-file, two-part ask, brevity
+   instruction added): 8,129. Cycle 6 (five reads across four files
+   including two prior reviews, one synthesis write, brevity
+   instruction present): 5,991 — the **lowest** completion spend of the
+   ramp despite reading the most material (2 review files + 1 whole
+   source file + 2 orchestrator ranges = ~1,043 lines of source input,
+   more than any prior cycle). This suggests synthesis-style tasks
+   (re-arranging and citing already-produced content, versus generating
+   novel analysis from a cold read) may be cheaper in hidden-reasoning
+   tokens than first-pass analytical tasks of similar or smaller input
+   size — worth testing directly in a future cycle if the loop
+   continues past the ramp, but not something to file as a kitsu defect
+   (it's a property of the task shape, not kitsu's handling of it).
+2. **Zero write conflicts this cycle, as expected** — cycle 5 attempt
+   2's backlog item (write tool's blind-overwrite guard costing a
+   round-trip) is about *overwriting an existing file*; cycle 6 wrote a
+   brand-new file, so the guard's precondition never applied. This
+   cycle neither confirms nor refutes that backlog item; it remains
+   open, unchanged.
+
+**Backlog status:** no items resolved or newly opened this cycle. The
+`cached_tokens` item (with its `is_empty()`-gate refinement) and the
+write-tool round-trip item both carry forward unchanged from cycle 5;
+neither was touched by code changes, only re-cited by the cycle-6
+synthesis.
+
+**Ramp verdict: RAMP COMPLETE.** All three stages of the Success ramp
+delivered a graded, citation-verified artifact (A, B+, A). The standing
+loop can now choose: (a) retire the ramp and treat future ticks as
+maintenance/backlog-triage cycles referencing `reviews/kimi-cycle-6.md`
+as the definitive review, (b) start a *new* ramp on a different focus
+area (e.g. the compaction/summarization cascade, or the tool-schema/
+sub-agent cost-visibility gaps cycle 2 surfaced), or (c) use a future
+cycle to actually implement one or more of P1-P11 against `kitsu-core`/
+`kitsu-providers` now that they're ranked and grounded. No further
+"cycle N+1" is implied by the ramp itself — the next tick should pick
+one of these three explicitly rather than defaulting to "cycle 7" with
+no stated task.
+
 ### Cycle 7 — 2026-08-14 — FIRST CODE CONTRIBUTION (grade A-)
 
 Kimi implemented its own cycle-6 P3 design: surface `cached_tokens`
