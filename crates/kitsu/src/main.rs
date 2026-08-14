@@ -9629,6 +9629,107 @@ fn run_canonical_typeahead(
     result
 }
 
+/// What one batch of editor actions asks the collector's I/O loop to do.
+/// Terminal writes, queue-depth syncs, notices, and signal raises are all
+/// returned as data so the resolution logic is unit-testable without a
+/// thread, raw stdin, or a live terminal (the collector-side counterpart of
+/// the renderer's render_region seam).
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ActionEffects {
+    /// The visible draft changed (keystrokes, hint acceptance, recall).
+    needs_redraw: bool,
+    /// A submission or recall may have moved the pending-queue depth.
+    queue_touched: bool,
+    /// A queued prompt was pulled into the draft; the caller prints the
+    /// notice with this remaining count.
+    recalled_remaining: Option<usize>,
+    /// Raise this signal after the batch (SIGINT keeps raw mode; job-control
+    /// and quit signals restore canonical termios first). Batching means the
+    /// LAST signal-producing action wins — e.g. ^C then ^\ in one read
+    /// quits rather than raising both, which matches what separate
+    /// keystrokes would leave the user with.
+    raise_signal: Option<i32>,
+}
+
+/// Resolve one feed batch's editor actions. `dispatch` routes a submitted
+/// line (active-turn controls or enqueue); `recall_pop` removes and returns
+/// the newest queued prompt plus the remaining count, if any.
+#[cfg(unix)]
+fn resolve_editor_actions(
+    editor: &mut typeahead_editor::TypeaheadEditor,
+    outcome: typeahead_editor::FeedOutcome,
+    result: &mut TypeaheadCaptureResult,
+    mut dispatch: impl FnMut(&str, &mut TypeaheadCaptureResult),
+    mut recall_pop: impl FnMut() -> Option<(String, usize)>,
+) -> ActionEffects {
+    let mut effects = ActionEffects {
+        needs_redraw: outcome.changed,
+        ..ActionEffects::default()
+    };
+    for action in outcome.actions {
+        match action {
+            typeahead_editor::EditorAction::Submit(line) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                dispatch(&line, result);
+                // Enqueues and /queue edits both move the pending count.
+                effects.queue_touched = true;
+            }
+            typeahead_editor::EditorAction::Eof => {
+                result.eof = true;
+            }
+            typeahead_editor::EditorAction::Interrupt => {
+                effects.raise_signal = Some(libc::SIGINT);
+            }
+            typeahead_editor::EditorAction::Suspend => {
+                effects.raise_signal = Some(libc::SIGTSTP);
+            }
+            typeahead_editor::EditorAction::Quit => {
+                effects.raise_signal = Some(libc::SIGQUIT);
+            }
+            typeahead_editor::EditorAction::CompleteRequest => {
+                // Tab accepts the inline slash hint, if one is showing.
+                let buffer = editor.buffer_string();
+                let hint = typeahead_slash_hint(&buffer);
+                if !hint.is_empty() {
+                    editor.replace_buffer(&format!("{buffer}{hint}"));
+                    effects.needs_redraw = true;
+                }
+            }
+            typeahead_editor::EditorAction::RecallRequest => {
+                // ↑ on an empty draft: pull the newest queued prompt back
+                // into the editor (it leaves the queue — the draft is now
+                // its only copy; submitting re-enqueues it at the back,
+                // which for the newest prompt is its original position).
+                // Recall applies only to a still-empty draft: if other
+                // bytes in the same batch already typed something, the
+                // request is dropped and the queue stays intact — a
+                // recall must never clobber text the user just typed.
+                if !editor.buffer_string().is_empty() {
+                    continue;
+                }
+                match recall_pop() {
+                    Some((prompt, remaining)) => {
+                        editor.replace_buffer(&prompt);
+                        effects.recalled_remaining = Some(remaining);
+                        effects.queue_touched = true;
+                    }
+                    None => {
+                        // Queue empty: plain history walk, as before.
+                        let mut forced = typeahead_editor::FeedOutcome::default();
+                        editor.history_prev_forced(&mut forced);
+                    }
+                }
+                effects.needs_redraw = true;
+            }
+        }
+    }
+    effects
+}
+
 /// Repaint the live row from editor state. The hint slot carries the
 /// reverse-search status while Ctrl+R is active, the inline slash hint
 /// otherwise.
@@ -9797,112 +9898,52 @@ fn run_live_typeahead(
             break;
         }
         let outcome = editor.feed(&buffer[..count as usize]);
-        let mut needs_redraw = outcome.changed;
-        for action in outcome.actions {
-            match action {
-                typeahead_editor::EditorAction::Submit(line) => {
-                    let line = line.trim().to_string();
-                    if line.is_empty() {
-                        continue;
-                    }
-                    dispatcher.dispatch(&line, &mut result);
-                    // Enqueues and /queue edits both move the pending count.
-                    sync_queue_depth(dispatcher);
+        let effects = resolve_editor_actions(
+            &mut editor,
+            outcome,
+            &mut result,
+            |line, result| dispatcher.dispatch(line, result),
+            || {
+                let mut queue = dispatcher.queue.lock().expect("prompt queue");
+                let queued = queue.status().queued;
+                queued
+                    .checked_sub(1)
+                    .and_then(|newest| queue.remove(newest))
+                    .map(|prompt| (prompt, queued - 1))
+            },
+        );
+        if effects.queue_touched {
+            sync_queue_depth(dispatcher);
+        }
+        if let Some(remaining) = effects.recalled_remaining {
+            let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
+                "recalled queued prompt for editing ({remaining} still queued)"
+            ))
+            .write_line(&mut std::io::stderr());
+        }
+        if let Some(signal) = effects.raise_signal {
+            // Job-control and quit signals need canonical termios back
+            // first (a suspended or dying process must not hold the
+            // terminal raw); SIGINT keeps raw mode — the turn cancels and
+            // this collector winds down via the stop flag, restoring
+            // termios on guard drop.
+            if signal != libc::SIGINT {
+                if let Some(guard) = raw.take() {
+                    drop(guard);
+                    live::live_input_end();
                 }
-                typeahead_editor::EditorAction::Eof => {
-                    result.eof = true;
-                }
-                typeahead_editor::EditorAction::Interrupt => {
-                    // Ctrl+C on an empty draft: reproduce the kernel's
-                    // SIGINT exactly (raw mode masked ISIG). The existing
-                    // signal path cancels the foreground turn; this
-                    // collector then winds down via the stop flag.
-                    // SAFETY: raising a handled signal in-process.
-                    unsafe {
-                        libc::raise(libc::SIGINT);
-                    }
-                }
-                typeahead_editor::EditorAction::Suspend => {
-                    // Ctrl+Z: canonical termios back first (a suspended
-                    // process must not hold the terminal raw), then the real
-                    // SIGTSTP. On fg/SIGCONT the loop's re-engage branch
-                    // restores raw mode and repaints — the approval-handoff
-                    // machinery, reused.
-                    if let Some(guard) = raw.take() {
-                        drop(guard);
-                        live::live_input_end();
-                    }
-                    // SAFETY: raising a default-disposition job-control
-                    // signal in-process.
-                    unsafe {
-                        libc::raise(libc::SIGTSTP);
-                    }
-                }
-                typeahead_editor::EditorAction::Quit => {
-                    // Ctrl+\: restore the terminal before the default
-                    // core-dump exit so the user's shell stays sane.
-                    if let Some(guard) = raw.take() {
-                        drop(guard);
-                        live::live_input_end();
-                    }
-                    // SAFETY: raising SIGQUIT in-process; default
-                    // disposition terminates.
-                    unsafe {
-                        libc::raise(libc::SIGQUIT);
-                    }
-                }
-                typeahead_editor::EditorAction::CompleteRequest => {
-                    // Tab accepts the inline slash hint, if one is showing.
-                    let buffer = editor.buffer_string();
-                    let hint = typeahead_slash_hint(&buffer);
-                    if !hint.is_empty() {
-                        editor.replace_buffer(&format!("{buffer}{hint}"));
-                        needs_redraw = true;
-                    }
-                }
-                typeahead_editor::EditorAction::RecallRequest => {
-                    // ↑ on an empty draft: pull the newest queued prompt back
-                    // into the editor (it leaves the queue — the draft is now
-                    // its only copy; submitting re-enqueues it at the back,
-                    // which for the newest prompt is its original position).
-                    // Recall applies only to a still-empty draft: if other
-                    // bytes in the same batch already typed something, the
-                    // request is dropped and the queue stays intact — a
-                    // recall must never clobber text the user just typed.
-                    if !editor.buffer_string().is_empty() {
-                        continue;
-                    }
-                    let recalled = {
-                        let mut queue = dispatcher.queue.lock().expect("prompt queue");
-                        let queued = queue.status().queued;
-                        queued
-                            .checked_sub(1)
-                            .and_then(|newest| queue.remove(newest))
-                            .map(|prompt| (prompt, queued - 1))
-                    };
-                    match recalled {
-                        Some((prompt, remaining)) => {
-                            let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
-                                "recalled queued prompt for editing ({remaining} still queued)"
-                            ))
-                            .write_line(&mut std::io::stderr());
-                            editor.replace_buffer(&prompt);
-                            sync_queue_depth(dispatcher);
-                        }
-                        None => {
-                            // Queue empty: plain history walk, as before.
-                            let mut forced = typeahead_editor::FeedOutcome::default();
-                            editor.history_prev_forced(&mut forced);
-                        }
-                    }
-                    needs_redraw = true;
-                }
+            }
+            // SAFETY: raising a handled or default-disposition signal
+            // in-process; for SIGTSTP the loop's re-engage branch restores
+            // raw mode and repaints after fg/SIGCONT.
+            unsafe {
+                libc::raise(signal);
             }
         }
         if result.eof {
             break;
         }
-        if needs_redraw {
+        if effects.needs_redraw {
             update_live_row(&editor);
         }
     }
@@ -14418,6 +14459,101 @@ mod tests {
         ChatHelper {
             permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
         }
+    }
+
+    #[cfg(unix)]
+    fn resolve(
+        editor: &mut typeahead_editor::TypeaheadEditor,
+        bytes: &[u8],
+        queue: &mut prompt_queue::PromptQueue,
+        dispatched: &mut Vec<String>,
+    ) -> (ActionEffects, TypeaheadCaptureResult) {
+        let outcome = editor.feed(bytes);
+        let mut result = TypeaheadCaptureResult::default();
+        let effects = resolve_editor_actions(
+            editor,
+            outcome,
+            &mut result,
+            |line, _| dispatched.push(line.to_string()),
+            || {
+                let queued = queue.status().queued;
+                queued
+                    .checked_sub(1)
+                    .and_then(|newest| queue.remove(newest))
+                    .map(|prompt| (prompt, queued - 1))
+            },
+        );
+        (effects, result)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_dispatches_trimmed_submissions_and_touches_the_queue() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        let (effects, result) = resolve(&mut editor, b"  hello  \r\r", &mut queue, &mut dispatched);
+        // Trimmed once, empty second Enter skipped entirely.
+        assert_eq!(dispatched, vec!["hello"]);
+        assert!(effects.queue_touched);
+        assert!(effects.needs_redraw);
+        assert!(!result.eof);
+        assert_eq!(effects.raise_signal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_recall_pops_newest_and_falls_back_to_history() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        queue.enqueue("older").unwrap();
+        queue.enqueue("newest").unwrap();
+        let mut dispatched = Vec::new();
+        let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "newest");
+        assert_eq!(effects.recalled_remaining, Some(1));
+        assert!(effects.queue_touched && effects.needs_redraw);
+        assert_eq!(queue.status().queued, 1);
+        // Empty queue: the same ↑ falls back to the plain history walk.
+        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "from history");
+        assert_eq!(effects.recalled_remaining, None);
+        assert!(!effects.queue_touched);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_maps_control_actions_to_signals_and_eof() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        // Ctrl+C on empty draft → SIGINT effect (raise happens in the caller).
+        let (effects, _) = resolve(&mut editor, &[0x03], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGINT));
+        // ^C then ^\ in one batch: the LAST signal wins.
+        let (effects, _) = resolve(&mut editor, &[0x03, 0x1c], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGQUIT));
+        // Ctrl+D on empty draft → EOF, no signal.
+        let (effects, result) = resolve(&mut editor, &[0x04], &mut queue, &mut dispatched);
+        assert!(result.eof);
+        assert_eq!(effects.raise_signal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_tab_accepts_the_slash_hint() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        let (effects, _) = resolve(&mut editor, b"/ste\t", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "/steer");
+        assert!(effects.needs_redraw);
+        // Tab with no matching hint leaves the draft alone.
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let (_, _) = resolve(&mut editor, b"/zzz\t", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "/zzz");
     }
 
     #[test]
