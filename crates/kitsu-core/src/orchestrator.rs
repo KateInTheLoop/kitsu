@@ -1531,9 +1531,6 @@ where
         } else {
             None
         };
-
-        // Number of messages this request sends — the anchor point for the meter.
-        let sent_len = messages.len();
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
@@ -1653,7 +1650,7 @@ where
                     if request_history_reshaped {
                         meter.invalidate();
                     } else {
-                        meter.record(u.prompt_tokens, sent_len, request_constraints_present);
+                        meter.record(u.prompt_tokens, messages, request_constraints_present);
                     }
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
