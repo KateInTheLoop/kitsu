@@ -286,3 +286,39 @@ Committed as `333c835` on `dogfood/kimi-k3`, pushed.
 **Kimi is now 3-for-3 on code/test work (cycles 7, 8) after the review
 ramp. The P3 contribution is complete and fully tested.** Next: P1
 `prompt_cache_key`, or another P1–P11 implementation slice.
+
+### Cycle 9 — 2026-08-14 — P1 prompt_cache_key (grade B)
+
+Kimi implemented P1 (prompt-cache affinity hint): `prompt_cache_key:
+Option<String>` on `ChatRequest`, threaded into `WireRequest` with
+`#[serde(skip_serializing_if = "Option::is_none")]`, `.as_deref()` in
+`build_body`, plus two genuine tests (`..serializes_when_some`,
+`..omitted_when_none`) asserting on the serialized body. Committed
+`f52c5d7`; a follow-up `0e895ae` (main-session cleanup) restored the
+kitsu-core test target. Author verified Kate on both.
+
+- Single attempt, 14 tool calls, completion 2,735/24,000 (11%), zero
+  debris/truncation. `kitsu-providers` 64 tests pass (62 + 2 new).
+- **Docked to B for two real problems:**
+  1. *Cross-crate compile break.* Adding a non-`Default` field to
+     `ChatRequest` broke two struct-literal sites in
+     `orchestrator.rs` (E0063). Crate-scoped `--allow-write` was
+     correct, but "additive" implicitly promises a linking workspace.
+     The supervisor added the mechanical `prompt_cache_key: None` at
+     both sites. **Lesson: adding a struct field ⇒ verify with `cargo
+     build/clippy --workspace`, never just the touched crate.**
+  2. *Sub-agent-spawn violation.* Kimi spawned `Agent(...)` twice
+     despite the explicit prohibition — the prompt-text ban alone did
+     not hold. **Lesson: enforce structurally with `--agent-spawn-cap
+     0` when a brief forbids spawns.**
+- **Pre-existing defect uncovered (not cycle 9's):** cycle 7's P3
+  `Usage` field left four `Usage { .. }` literals in
+  `orchestrator_tests.rs` missing `prompt_tokens_details` — the
+  kitsu-core *test target* had not compiled since cycle 7, masked by
+  crate-scoped verification through cycles 7–9. Fixed in `0e895ae`
+  (kitsu-core: 95 tests pass). This is why the two lessons above are
+  now standing rules.
+
+Backlog: P1 ✅, P3 ✅ (+tests). Next: P2 anchor content fingerprint or
+P6 evidence-clamps-budget. Both cron and supervisor briefs now carry
+`--agent-spawn-cap 0` + `--workspace` verification.
