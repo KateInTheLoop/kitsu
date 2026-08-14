@@ -13,7 +13,7 @@ pub use orchestrator::{
     AgentError, AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus,
     ArtifactStoragePolicy, BoundedInlineOutput, CommandRuntimeInvocation, CommandRuntimeResult,
     CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord,
-    CompactionReport, ContextUnit, ContextWindowEvidence, ProviderRequestPurpose, SpawnBudget,
-    StructuredFinalizationGate, StructuredFinalizationRepair, StructuredFinalizationRepairTarget,
-    SummaryFallbackReason, ToolArtifactStatus, TurnCompletion,
+    CompactionReport, ContextUnit, ContextWindowEvidence, ProviderDeadlineScope,
+    ProviderRequestPurpose, SpawnBudget, StructuredFinalizationGate, StructuredFinalizationRepair,
+    StructuredFinalizationRepairTarget, SummaryFallbackReason, ToolArtifactStatus, TurnCompletion,
 };

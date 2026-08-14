@@ -51,7 +51,12 @@ guarantees requires a new schema identifier.
 - `provider_request` represents one logical model request in an agent round.
   New producers include `structured_output`; it is true only when that request
   carried a provider-native strict JSON Schema response format. The schema body
-  is never duplicated in this event.
+  is never duplicated in this event. CLI producers also include
+  `request_timeout_ms`, the configured budget independently applied to each
+  logical provider request. When a scripted or piped turn has a separate
+  enclosing deadline, `turn_remaining_ms` samples that decreasing turn budget
+  immediately before the request. Historical or embedded producers may omit
+  these additive fields when the corresponding budget is unknown.
 - Provider requests and attempts carry `purpose: "inference"` for the
   answer-producing loop, `purpose: "compaction"` for a hidden summarizer, or
   `purpose: "model_catalog"` for an explicit catalog lookup. Usage records
@@ -68,7 +73,11 @@ guarantees requires a new schema identifier.
   are terminal. If that scheduled attempt is cancelled or loses the deadline
   during backoff, a statusless terminal event for its attempt number closes the
   earlier nonterminal disposition even though no HTTP send began. Retries never
-  add another `provider_request`.
+  add another `provider_request`. New producers include
+  `deadline_scope: "provider_request"`: `remaining_deadline_ms` belongs to the
+  current logical request and can reset on the next round. When an enclosing
+  scripted or piped deadline exists, `turn_remaining_ms` is sampled again at
+  the attempt disposition and never regains the per-request budget.
 - Model-catalog cache hits still have a logical `provider_request` but no
   `provider_attempt`, because no HTTP send occurred. An uncached catalog GET
   has `max_attempts: 1`; its bounded body read and catalog-shape validation are
@@ -363,9 +372,11 @@ was verified when the executor cannot prove it.
 ## Safe provider-attempt telemetry
 
 `provider_attempt` contains only a one-based attempt number, configured maximum,
-safe category, numeric HTTP status when available, retry timing, remaining
-deadline, and outcome. It never contains URLs, headers, tokens, request bodies,
-prompts, response bodies, or model text.
+safe category, numeric HTTP status when available, retry timing, explicitly
+scoped remaining deadlines, and outcome. `remaining_deadline_ms` is always the
+nested provider-request countdown; `turn_remaining_ms`, when present, is the
+independently enforced enclosing-turn countdown. It never contains URLs,
+headers, tokens, request bodies, prompts, response bodies, or model text.
 
 `terminal` means no later physical send will occur for that logical request.
 The OpenAI-compatible transport does not call header acceptance terminal

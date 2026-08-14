@@ -2839,6 +2839,7 @@ fn format_runtime_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String
         retry_delay_ms,
         retry_after_used,
         remaining_deadline_ms,
+        turn_remaining_ms,
         ..
     } = event
     else {
@@ -2891,8 +2892,11 @@ fn format_runtime_notice(event: &kitsu_core::AgentRuntimeEvent) -> Option<String
         kitsu_core::ProviderRequestPurpose::Compaction => "compaction",
         kitsu_core::ProviderRequestPurpose::ModelCatalog => "model catalog",
     };
+    let turn_remaining = turn_remaining_ms
+        .map(|remaining| format!("; {remaining}ms turn remaining"))
+        .unwrap_or_default();
     Some(format!(
-        "{purpose} provider attempt {attempt}/{max_attempts}: {category}{status}; {outcome}; terminal={terminal}{retry}; {remaining_deadline_ms}ms deadline remaining"
+        "{purpose} provider attempt {attempt}/{max_attempts}: {category}{status}; {outcome}; terminal={terminal}{retry}; {remaining_deadline_ms}ms provider-request deadline remaining{turn_remaining}"
     ))
 }
 
@@ -4077,6 +4081,8 @@ fn build_agent_config(
     let reasoning_effort = cli_reasoning_effort(cli);
     AgentConfig {
         model,
+        request_timeout_ms: Some(cli.timeout_secs.saturating_mul(1_000)),
+        turn_deadline: None,
         max_rounds: cli.max_rounds,
         max_context_bytes: 128 * 1024,
         // The CLI's documented conservative default is an enforcement value,
@@ -7850,6 +7856,7 @@ fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Val
         "terminal": event.terminal,
         "retry_delay_ms": event.retry_delay_ms,
         "retry_after_used": event.retry_after_used,
+        "deadline_scope": "provider_request",
         "remaining_deadline_ms": event.remaining_deadline_ms,
     })
 }
@@ -7973,6 +7980,7 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
                 "message_count": 0,
                 "tools_offered": 0,
                 "structured_output": false,
+                "request_timeout_ms": cli.timeout_secs.saturating_mul(1_000),
             }),
         )?;
     }
@@ -11358,8 +11366,12 @@ async fn run_scripted_turn(
     // One scripted turn gets one inference budget. A tool call must not reset
     // `--timeout-secs` for the next provider round: without this outer bound a
     // nominal 45-second automation turn can run for 45 seconds per round.
-    let outcome = match tokio::time::timeout(
-        Duration::from_secs(cli.timeout_secs),
+    let turn_deadline = tokio::time::Instant::now()
+        .checked_add(Duration::from_secs(cli.timeout_secs))
+        .ok_or(ScriptFailureKind::User)?;
+    cfg.turn_deadline = Some(turn_deadline);
+    let outcome = match tokio::time::timeout_at(
+        turn_deadline,
         journal.scope_turn(
             &journal_turn.token,
             run_turn_cancellable(&setup.provider, tools, messages, &cfg, state),
@@ -13178,6 +13190,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
         messages.push(ChatMessage::user(expanded_text));
         let mut cfg = base_cfg(model.clone(), cli);
+        cfg.turn_deadline = Some(one_shot_deadline);
         let partial_answer: PartialAnswerBuffer = Arc::default();
         let event_log =
             live_agent_event_log_capturing(cli.jsonl, "piped:1", Some(partial_answer.clone()));
@@ -15489,8 +15502,14 @@ async fn handle_slash(
             }
         }
         "models" => {
-            let Some(result) =
-                await_cancellable(list_models_and_print(provider, arg, model, runtime_log)).await
+            let Some(result) = await_cancellable(list_models_and_print(
+                provider,
+                arg,
+                model,
+                runtime_log,
+                cli.timeout_secs.saturating_mul(1_000),
+            ))
+            .await
             else {
                 eprintln!("^C (model catalog request cancelled)");
                 return SlashResult::Cancelled;
@@ -15686,9 +15705,14 @@ async fn handle_slash(
             } else if arg == "list" || arg.starts_with("list ") {
                 // Alias: `/model list [filter]` → same as `/models [filter]`.
                 let filter = arg.strip_prefix("list").unwrap_or("").trim();
-                let Some(result) =
-                    await_cancellable(list_models_and_print(provider, filter, model, runtime_log))
-                        .await
+                let Some(result) = await_cancellable(list_models_and_print(
+                    provider,
+                    filter,
+                    model,
+                    runtime_log,
+                    cli.timeout_secs.saturating_mul(1_000),
+                ))
+                .await
                 else {
                     eprintln!("^C (model catalog request cancelled)");
                     return SlashResult::Cancelled;
@@ -15708,9 +15732,12 @@ async fn handle_slash(
                 };
             } else {
                 let previous_model = model.clone();
-                let Some(catalog) =
-                    await_cancellable(list_models_with_runtime_telemetry(provider, runtime_log))
-                        .await
+                let Some(catalog) = await_cancellable(list_models_with_runtime_telemetry(
+                    provider,
+                    runtime_log,
+                    cli.timeout_secs.saturating_mul(1_000),
+                ))
+                .await
                 else {
                     eprintln!("^C (model validation cancelled)");
                     return SlashResult::Cancelled;
@@ -15848,8 +15875,9 @@ async fn list_models_and_print(
     filter: &str,
     current_model: &str,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
+    request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {
-    match list_models_with_runtime_telemetry(provider, runtime_log).await {
+    match list_models_with_runtime_telemetry(provider, runtime_log, request_timeout_ms).await {
         Ok(Some(models)) => {
             let filter = filter.trim();
             let matched = filter_model_catalog(models, filter);
@@ -15893,7 +15921,9 @@ fn runtime_model_catalog_telemetry(
                 terminal: event.terminal,
                 retry_delay_ms: event.retry_delay_ms,
                 retry_after_used: event.retry_after_used,
+                deadline_scope: kitsu_core::ProviderDeadlineScope::ProviderRequest,
                 remaining_deadline_ms: event.remaining_deadline_ms,
+                turn_remaining_ms: None,
             });
             !runtime_log.abort_requested()
         })
@@ -15903,6 +15933,7 @@ fn runtime_model_catalog_telemetry(
 async fn list_models_with_runtime_telemetry(
     provider: &OpenAICompatProvider,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
+    request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {
     if let Some(runtime_log) = runtime_log {
         runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderRequest {
@@ -15911,6 +15942,8 @@ async fn list_models_with_runtime_telemetry(
             message_count: 0,
             tools_offered: 0,
             structured_output: false,
+            request_timeout_ms: Some(request_timeout_ms),
+            turn_remaining_ms: None,
         });
         if runtime_log.abort_requested() {
             return Err(ProviderError::Connection(
@@ -18280,13 +18313,16 @@ mod tests {
             terminal: false,
             retry_delay_ms: Some(750),
             retry_after_used: true,
+            deadline_scope: kitsu_core::ProviderDeadlineScope::ProviderRequest,
             remaining_deadline_ms: 12_500,
+            turn_remaining_ms: Some(9_500),
         };
         let notice = format_runtime_notice(&event).unwrap();
         assert!(notice.contains("attempt 1/3"));
         assert!(notice.contains("rate limited; HTTP 429"));
         assert!(notice.contains("retry in 750ms (Retry-After)"));
-        assert!(notice.contains("12500ms deadline remaining"));
+        assert!(notice.contains("12500ms provider-request deadline remaining"));
+        assert!(notice.contains("9500ms turn remaining"));
     }
 
     #[test]
@@ -18302,7 +18338,9 @@ mod tests {
             terminal: true,
             retry_delay_ms: None,
             retry_after_used: false,
+            deadline_scope: kitsu_core::ProviderDeadlineScope::ProviderRequest,
             remaining_deadline_ms: 120_000,
+            turn_remaining_ms: None,
         };
         // The normal case — one attempt, success — is transport noise and
         // must never narrate after a good turn.

@@ -339,6 +339,11 @@ auth = {{ method = "none" }}
     assert_eq!(model_events[1]["message_count"], 0);
     assert_eq!(model_events[1]["tools_offered"], 0);
     assert_eq!(model_events[1]["structured_output"], false);
+    assert_eq!(model_events[1]["request_timeout_ms"], 1_000);
+    assert_eq!(
+        model_events[1]["turn_remaining_ms"],
+        serde_json::Value::Null
+    );
     assert_eq!(model_events[2]["operation_id"], "models:1");
     assert_eq!(model_events[2]["purpose"], "model_catalog");
     assert_eq!(model_events[2]["attempt"], 1);
@@ -347,6 +352,11 @@ auth = {{ method = "none" }}
     assert_eq!(model_events[2]["status"], serde_json::Value::Null);
     assert_eq!(model_events[2]["outcome"], "transport_failed");
     assert_eq!(model_events[2]["terminal"], true);
+    assert_eq!(model_events[2]["deadline_scope"], "provider_request");
+    assert_eq!(
+        model_events[2]["turn_remaining_ms"],
+        serde_json::Value::Null
+    );
     assert_eq!(
         model_events[3]["diagnostic_code"],
         "local_ollama_unreachable"
@@ -6669,8 +6679,12 @@ auth = {{ method = "none" }}
         );
         assert_eq!(events[1]["operation_id"], "models:1");
         assert_eq!(events[1]["purpose"], "model_catalog");
+        assert_eq!(events[1]["request_timeout_ms"], 120_000);
+        assert_eq!(events[1]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["operation_id"], "models:1");
         assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["deadline_scope"], "provider_request");
+        assert_eq!(events[2]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["category"], "success");
         assert_eq!(events[2]["status"], 200);
         assert_eq!(events[2]["outcome"], "body_completed");
@@ -7314,6 +7328,39 @@ async fn test_script_turn_timeout_is_shared_across_tool_rounds() {
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
+    let provider_requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_requests.len(), 2);
+    assert!(provider_requests
+        .iter()
+        .all(|event| event["request_timeout_ms"] == 1_000));
+    let turn_at_request = provider_requests
+        .iter()
+        .map(|event| event["turn_remaining_ms"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(turn_at_request[0] <= 1_000);
+    assert!(turn_at_request[1] < turn_at_request[0]);
+    let provider_attempts = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_attempts.len(), 2);
+    assert!(provider_attempts
+        .iter()
+        .all(|event| event["deadline_scope"] == "provider_request"));
+    assert!(provider_attempts
+        .iter()
+        .all(|event| event["turn_remaining_ms"].is_u64()));
+    let cancelled_attempt = provider_attempts.last().unwrap();
+    assert_eq!(cancelled_attempt["category"], "cancelled");
+    assert_eq!(cancelled_attempt["outcome"], "cancelled");
+    assert!(cancelled_attempt["turn_remaining_ms"].as_u64().unwrap() <= 100);
+    assert!(
+        cancelled_attempt["remaining_deadline_ms"].as_u64().unwrap()
+            > cancelled_attempt["turn_remaining_ms"].as_u64().unwrap()
+    );
     assert!(events.iter().any(|event| {
         event["type"] == "tool_finished"
             && event["name"] == "fs_read_file"

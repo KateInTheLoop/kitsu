@@ -2377,6 +2377,8 @@ mod tests {
                             message_count: 2,
                             tools_offered: 1,
                             structured_output: false,
+                            request_timeout_ms: None,
+                            turn_remaining_ms: None,
                         },
                     );
                     running_registry.record_progress_event(
