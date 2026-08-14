@@ -65,6 +65,31 @@ concrete, file-referenced proposals ranked by value; no vague advice.
   to window 8192; explicit `--context-window` was required).
 - [ ] Surface provider `cached_tokens` (HF router reports it in usage)
   in `kitsu-usage:` records and `/cost`, so caching wins are measurable.
+  **Grounded twice now (cycle-5 supervisor 2026-08-14, then cycle-5
+  attempt-2 Kimi-K3 2026-08-14):** both agree `Usage`
+  (`crates/kitsu-providers/src/types.rs:136-144`) has exactly
+  `prompt_tokens`/`completion_tokens`/`total_tokens` with no
+  `prompt_tokens_details` field, so serde silently drops
+  `cached_tokens` before any Rust code sees it, uniformly across the
+  streaming (`StreamChunk.usage`) and non-streaming
+  (`CompletionResponse.usage`) paths in `openai_compat.rs`, both of
+  which deserialize into the same `Usage` type. Kimi's attempt-2 review
+  (`reviews/kimi-cycle-5.md`) goes further than the attempt-1
+  supervisor grounding: it also flags that `Usage::is_empty()`
+  (`types.rs:148-150`) treats an all-zero triple as "not reported",
+  which would silently discard a legitimate cache-hit-only chunk
+  (`prompt_tokens: 0`, nonzero `cached_tokens`) even after a
+  `cached_tokens` field is added — a real edge case neither the
+  standing backlog item nor the attempt-1 grounding had identified.
+  Proposed fix (Kimi, cited `types.rs` ~129-168, `openai_compat.rs`
+  ~283-618, precise locations spot-checked by the supervisor and found
+  structurally correct but with line numbers frequently drifting
+  20-48 lines in the 240-620 range — see cycle-5 attempt-2 log entry):
+  add `Option<PromptTokensDetails { cached_tokens: u64 }>` to `Usage`,
+  a `cached_tokens()` accessor, extend `Usage::add` to sum it, and
+  widen the two capture-site gates to
+  `!u.is_empty() || u.cached_tokens() > 0`. Still unchecked — no code
+  change made yet.
 - [x] fixed on main (f3d579c) — ranged reads in the `fs_read_file` tool
   used to cap at 64 KiB measured from the *absolute start of the file*,
   not from the requested range's start line, so a range whose
@@ -602,3 +627,161 @@ the ranked caching proposals as a second) — mirroring the ramp's own
 strategy of narrowing scope until a turn reliably completes, applied one
 notch further given this cycle's evidence that two-file analytical tasks
 need materially more budget than cycle 4's single-file, single-ask task.
+
+### Cycle 5 — attempt 2 (2026-08-14)
+
+**SECOND BANKED DELIVERABLE.** Pre-flight passed (`HTTP 200`). Retry
+changes per the attempt-1 verdict: `--max-output-tokens` raised
+14,000 → 24,000, plus a brevity instruction added to the task prompt
+("Think briefly — a short plan then act; long deliberation wastes your
+output budget") on top of the existing sub-agent prohibition. Both
+changes together produced a clean, complete run.
+
+**Run stats.**
+
+| | attempt 2 (single run, no transport retry needed) |
+|---|---|
+| wall time | 71s (kitsu's own run; a first launch was killed at 120s by the *supervisor's own* shell-timeout wrapper, not by kitsu — see "Harness note" below) |
+| tool calls | 5 (`Read` types.rs whole, `Read` openai_compat.rs 1-850, `Read` openai_compat.rs 850-1694, `Write` reviews/kimi-cycle-5.md [failed: conflict], `Read` reviews/kimi-cycle-5.md, `Write` reviews/kimi-cycle-5.md [succeeded]) — 0 list calls, 0 `Agent` spawns, exactly the two files named and nothing else |
+| ranged-read behavior | both `openai_compat.rs` ranges returned full width in 0-1ms — range-cap fix holds under load again |
+| `kitsu-usage` prompt/completion/total | 84,961 / 8,129 / 93,090 — **completion_tokens 8,129 against the 24,000 cap (34% utilization, well under, zero truncation warnings)**; prompt_tokens are 4.3x attempt 1's 19,620, plausibly from the extra failed-write/read-back round-trip re-sending cumulative conversation history across one more round, though the exact mechanism wasn't traced |
+| `kitsu-context` used/effective/window | 25,445 / 107,072 / 131,072 |
+| truncation warnings | 0 |
+| outcome | committed: `reviews/kimi-cycle-5.md` overwritten, 184 lines / 8,330 bytes, full two-part review; run summary "1 turn(s) ok, 4 file(s) read, 1 file(s) written (1 change(s)), 1 failed tool call(s), session not saved" |
+
+Total tokens (93,090) landed just under the cycle's own "< 100K total
+tokens" target. The key ramp datum: raising the cap and adding the
+brevity instruction were not isolated from each other in this test
+(both changed at once), but the completion-token spend (8,129) stayed
+far under this cycle's 24,000 cap and nowhere near attempt 1's
+14,322/14,000 overshoot — modestly above cycle 4's single-file
+6,282, consistent with a two-file, two-part task costing somewhat more
+than a one-file task, but with none of the runaway-reasoning behavior
+attempt 1 showed. Suggests the combination of headroom + explicit
+brevity instruction is an effective mitigation for this task shape.
+
+**Harness note (not a kitsu weakness).** The first launch of this
+attempt was killed by the *supervisor's* own Bash-tool default 120s
+timeout, not by kitsu's `--timeout-secs 300` — kitsu had already
+completed 3 clean reads and one failed `Write` (see below) when
+terminated. The partially-written state was verified safe (the target
+review file was confirmed byte-identical to its pre-run content before
+the second, successful launch), and the second launch with a longer
+harness timeout completed normally. Filed here for the record, not as
+a kitsu backlog item, since the cause was external tooling, not kitsu.
+
+**Deliverable grade: B+ (strong pass, with a real citation-precision
+caveat).** `reviews/kimi-cycle-5.md` is a genuine Kimi-authored
+two-part review satisfying both halves of the task:
+
+- **(a) Drop location + fix.** Correctly identifies both parse sites
+  (`StreamChunk.usage` for streaming, `CompletionResponse.usage` for
+  non-streaming) deserializing into the shared 3-field `Usage`
+  (`types.rs`), correctly explains the serde silent-drop mechanism, and
+  additionally identifies a real edge case the attempt-1 supervisor
+  grounding missed: `Usage::is_empty()` would still discard a
+  cache-hit-only chunk (all-zero prompt/completion/total but nonzero
+  `cached_tokens`) even after a naive fix. The proposed edit (new
+  `PromptTokensDetails` struct + `Option` field + `cached_tokens()`
+  accessor + extended `Usage::add` + widened `is_empty` gates) is
+  concrete, additive/backward-compatible (`#[serde(default)]`), and
+  correctly notes `ChatDelta::Usage` already carries the struct through
+  with no trait-signature changes needed.
+- **(b) Ranked proposals.** 3 proposals (task allowed 2-4): (1) add
+  `prompt_cache_key` to `ChatRequest`/`WireRequest` — **verified true**,
+  `grep` for `prompt_cache_key`/`cache_control` across both files
+  returns zero hits, so the gap is real; (2) widen the `is_empty()`
+  gate — follows directly from (a); (3) cache parsed
+  `model_context_length` results alongside the raw catalog body —
+  grounded in the real `models_cache` mutex-held-across-fetch structure.
+  Explicitly rejects two ideas as ungrounded (`cache_control`
+  breakpoints, response memoization) rather than padding the list —
+  good discipline, matches the task's "skip anything you cannot
+  ground" instruction.
+- **Citation-precision spot-check (the reason this isn't an A).**
+  Every cited region was checked against the actual worktree file.
+  `types.rs` citations are accurate to within a few lines throughout
+  (e.g. `WireMessage` struct cited "~133-141", actual 133-141 — exact).
+  `openai_compat.rs` citations split into two bands: citations near the
+  file's start (`WireRequest` "~107-126" vs actual 109-126;
+  `WireMessage` exact) and in the 1070-1290 region (`sse_step`
+  "~1090-1145" vs actual 1077-1149, contained; `model_context_length`
+  "~1200-1250" vs actual 1271-on, in the right neighborhood) are close.
+  Citations in the 240-620 region drifted materially: `StreamChunk.usage`
+  cited "~283-294" (actual struct at 244-253 — the cited range instead
+  lands near `CompletionResponse`'s real location); the usage-capture
+  line in `process_line` cited "~430-436" (actual capture at 449-455);
+  `finalize`'s `ChatDelta::Usage` emission cited "~488-491" (actual
+  534-537); `CompletionResponse.usage` cited "~337-342" (actual struct
+  at 289-295); its surfacing in `parse_completion` cited "~590-595"
+  (actual 616-620). None of these are hallucinated — the *described
+  content* at each citation (field names, gate logic, struct shape) is
+  correct — but the *line numbers* are off by 20-48 lines for roughly
+  five of the ~14 distinct citations in this file, despite every
+  citation being hedged with "~" and despite the model having just read
+  both files with kitsu's own line-numbered `Read` output. Given the
+  task's explicit ask for "line-cited edits" and "cite lines you
+  actually read", this is a real quality gap, not a minor rounding
+  issue — an engineer following these citations directly would land on
+  the wrong code in about a third of cases in that file region.
+
+**Agreement vs. attempt-1 supervisor grounding.** Kimi's analysis
+agrees with the attempt-1 supervisor's grounding
+(`types.rs:136-144`, no `deny_unknown_fields`, uniform drop across
+both wire paths) on every substantive point, and extends it with one
+concrete new finding neither the standing backlog item nor attempt 1
+identified: the `is_empty()` gate would independently discard
+cache-hit-only usage chunks. No divergence or contradiction found.
+
+**Weaknesses observed (ranked):**
+
+1. **Citation line-number drift under real load, most concentrated in
+   one file region.** Repro: same command class as this cycle; ask a
+   reasoning model to line-cite specific structs/functions across a
+   ~1,700-line file it just read via two ranged `Read` calls (each with
+   kitsu's own line-numbered output) and independently verify the
+   citations. About a third of the citations in the file's 240-620 line
+   region drifted 20-48 lines from the true location, while citations
+   elsewhere in the same file (and in the smaller, 172-line companion
+   file) were accurate to within a few lines. This is a genuine model
+   behavior kitsu cannot fix directly, but it's worth tracking across
+   cycles as a data point on how much to trust unverified line
+   citations from this model at this file size — carries forward as a
+   new observation, not a kitsu code defect.
+2. **The write tool's blind-overwrite guard cost one extra round-trip.**
+   Repro: instruct the model to "overwrite" an existing file with
+   `Write` directly (as this cycle's prompt did); the first `Write`
+   attempt failed with `write conflict: replacing an existing file
+   requires expected_previous_content; read it first or use
+   fs_edit_file` (an `ExecError`, 1ms). The model recovered within the
+   same turn (`Read` then `Write` succeeded, "1 earlier tool error(s)
+   were recovered within the turn"), so the turn wasn't lost, but the
+   round-trip added a `Read` of the ~6.9KB existing file it didn't
+   otherwise need, growing prompt tokens. The tool's own description
+   apparently doesn't warn the model up front that overwriting a
+   file it hasn't read in *this* turn requires a prior `Read` — worth
+   considering whether the `Write` tool description could state this
+   precondition explicitly so a model that already intends to overwrite
+   doesn't have to discover it via a failed call.
+3. **Reasoning-headroom mitigation (cap + brevity instruction together)
+   worked for this task shape** — third data point on the open
+   backlog item, and the first cycle-5-scoped one that did *not*
+   overshoot: 8,129/24,000 (34%), vs. attempt 1's 14,322/14,000 (102%)
+   and cycle 2's 8,852/6,000 (147%). This is operational mitigation
+   (bigger cap + explicit prompt instruction), not a kitsu code change,
+   so the underlying backlog item (no separate reasoning-headroom
+   knob/warning in kitsu itself) remains open — but it's useful
+   evidence that prompt-level brevity instructions measurably help,
+   independent of raising the cap.
+
+**Backlog status:** `cached_tokens` item updated above with Kimi's
+additional `is_empty()`-gate finding (still unchecked — no code
+change made). No other backlog items resolved this cycle; the
+write-tool round-trip observation above is filed as a new,
+low-severity item.
+
+**Ramp verdict: ADVANCE to cycle 6.** The retry succeeded on the first
+attempt after the prescribed budget raise plus a brevity instruction.
+Two banked deliverables now exist (`reviews/kimi-cycle-4.md`,
+`reviews/kimi-cycle-5.md`); proceed to cycle 6 synthesis per the
+Success ramp.
