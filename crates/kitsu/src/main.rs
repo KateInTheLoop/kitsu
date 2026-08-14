@@ -9774,6 +9774,13 @@ fn run_live_typeahead(
                     // into the editor (it leaves the queue — the draft is now
                     // its only copy; submitting re-enqueues it at the back,
                     // which for the newest prompt is its original position).
+                    // Recall applies only to a still-empty draft: if other
+                    // bytes in the same batch already typed something, the
+                    // request is dropped and the queue stays intact — a
+                    // recall must never clobber text the user just typed.
+                    if !editor.buffer_string().is_empty() {
+                        continue;
+                    }
                     let recalled = {
                         let mut queue = dispatcher.queue.lock().expect("prompt queue");
                         let queued = queue.status().queued;
