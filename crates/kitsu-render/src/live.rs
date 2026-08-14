@@ -68,11 +68,22 @@ fn terminal_cols() -> usize {
     80
 }
 
+/// Control characters a draft may legitimately contain (multi-line pastes,
+/// Alt+Enter newlines, pasted tabs) render as visible placeholders so the
+/// row never breaks its single-physical-line invariant.
+fn display_char(ch: char) -> char {
+    match ch {
+        '\n' => '⏎',
+        '\t' => '⇥',
+        _ => ch,
+    }
+}
+
 /// Clamp `buffer` to `avail` display columns, keeping the cursor visible.
 /// Trimmed edges are marked with `…`. Returns the visible slice and the
 /// display width of the visible text left of the cursor.
 fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize) {
-    let chars: Vec<char> = buffer.chars().collect();
+    let chars: Vec<char> = buffer.chars().map(display_char).collect();
     let cursor = cursor.min(chars.len());
     let widths: Vec<usize> = chars
         .iter()
@@ -80,7 +91,7 @@ fn fit_draft_window(buffer: &str, cursor: usize, avail: usize) -> (String, usize
         .collect();
     let total: usize = widths.iter().sum();
     if total <= avail {
-        return (buffer.to_string(), widths[..cursor].iter().sum());
+        return (chars.iter().collect(), widths[..cursor].iter().sum());
     }
     if avail < 4 {
         // Too narrow for a meaningful window; show nothing but keep the
@@ -339,6 +350,14 @@ mod tests {
         assert!(!row.contains("thinking"));
         assert!(row.starts_with("kitsu> "));
         assert_eq!(col, Some(13));
+    }
+
+    #[test]
+    fn newlines_and_tabs_render_as_visible_placeholders() {
+        let (visible, offset) = fit_draft_window("one\ntwo\tend", 4, 40);
+        assert_eq!(visible, "one⏎two⇥end");
+        // Cursor sits just past the rendered ⏎.
+        assert_eq!(offset, 3 + display_width("⏎"));
     }
 
     #[test]

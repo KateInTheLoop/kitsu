@@ -8,7 +8,9 @@
 //! Supported keys: printable UTF-8 insert, Enter (submit), Backspace, Delete,
 //! ←/→/Home/End (also Ctrl+B/F/A/E), ↑/↓ history walk with a draft stash,
 //! Ctrl+U (kill to start), Ctrl+K (kill to end), Ctrl+W (delete word),
-//! Ctrl+D (EOF on an empty draft, delete otherwise). Unknown escape
+//! Ctrl+D (EOF on an empty draft, delete otherwise), Alt+Enter (literal
+//! newline). A bracketed paste (`ESC[200~`…`ESC[201~`) stays one draft block:
+//! its newlines insert literally instead of submitting. Unknown escape
 //! sequences are consumed and ignored so they never leak into the draft.
 
 /// A side effect the collector must perform after feeding bytes.
@@ -52,6 +54,11 @@ pub struct TypeaheadEditor {
     csi_params: Vec<u8>,
     /// Partial UTF-8 sequence awaiting continuation bytes.
     utf8: Vec<u8>,
+    /// Inside a bracketed paste (`ESC[200~` … `ESC[201~`): newlines insert
+    /// literally instead of submitting, so a paste stays one draft block.
+    in_paste: bool,
+    /// The previous pasted byte, for collapsing `\r\n` into one newline.
+    last_paste_byte: u8,
 }
 
 impl TypeaheadEditor {
@@ -74,6 +81,8 @@ impl TypeaheadEditor {
             pending: Pending::None,
             csi_params: Vec::new(),
             utf8: Vec::new(),
+            in_paste: false,
+            last_paste_byte: 0,
         }
     }
 
@@ -111,6 +120,9 @@ impl TypeaheadEditor {
                         self.csi_params.clear();
                     }
                     b'O' => self.pending = Pending::Ss3,
+                    // Alt+Enter (ESC then CR/LF): insert a literal newline so
+                    // multi-line prompts can be composed by hand.
+                    b'\r' | b'\n' => self.insert_char('\n', outcome),
                     // A bare ESC followed by an ordinary key: drop the ESC
                     // and process the key normally.
                     _ => self.feed_byte(byte, outcome),
@@ -160,6 +172,34 @@ impl TypeaheadEditor {
             }
             // Malformed sequence: discard it and process this byte fresh.
             self.utf8.clear();
+        }
+
+        // Bracketed paste: everything up to `ESC[201~` is content, one block.
+        // Newlines insert literally (`\r\n` collapsed to one), tabs are kept,
+        // other control bytes are dropped. ESC still parses normally so the
+        // paste terminator (and any stray sequences) never enter the draft.
+        if self.in_paste && byte != 0x1b {
+            let previous = std::mem::replace(&mut self.last_paste_byte, byte);
+            match byte {
+                b'\r' => self.insert_char('\n', outcome),
+                b'\n' => {
+                    if previous != b'\r' {
+                        self.insert_char('\n', outcome);
+                    }
+                }
+                b'\t' => self.insert_char('\t', outcome),
+                0x00..=0x1f | 0x7f => {}
+                _ => {
+                    let expected = utf8_expected_len(byte);
+                    if expected <= 1 {
+                        self.insert_char(byte as char, outcome);
+                    } else {
+                        self.utf8.clear();
+                        self.utf8.push(byte);
+                    }
+                }
+            }
+            return;
         }
 
         match byte {
@@ -251,8 +291,11 @@ impl TypeaheadEditor {
                     }
                 }
                 b"4" | b"8" => self.move_end(outcome),
-                // Bracketed-paste markers (200/201) and other tilde keys
-                // are ignored; pasted text itself arrives as ordinary bytes.
+                b"200" => {
+                    self.in_paste = true;
+                    self.last_paste_byte = 0;
+                }
+                b"201" => self.in_paste = false,
                 _ => {}
             },
             _ => {}
@@ -467,10 +510,56 @@ mod tests {
     }
 
     #[test]
-    fn paste_with_embedded_newline_submits_each_line() {
+    fn unbracketed_newlines_still_submit_each_line() {
+        // Terminals without bracketed paste send pasted text as plain bytes;
+        // line-at-a-time submission remains the honest interpretation there.
         let mut editor = TypeaheadEditor::new(Vec::new());
         let outcome = editor.feed(b"one\ntwo");
         assert_eq!(submit_actions(&outcome), vec!["one"]);
         assert_eq!(editor.buffer_string(), "two");
+    }
+
+    #[test]
+    fn bracketed_paste_stays_one_block_and_submits_once() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let outcome = editor.feed(b"\x1b[200~one\r\ntwo\nthree\x1b[201~");
+        assert!(outcome.actions.is_empty());
+        assert_eq!(editor.buffer_string(), "one\ntwo\nthree");
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["one\ntwo\nthree"]);
+    }
+
+    #[test]
+    fn bracketed_paste_keeps_tabs_and_drops_other_controls() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"\x1b[200~a\tb\x07c\x1b[201~");
+        assert_eq!(editor.buffer_string(), "a\tbc");
+    }
+
+    #[test]
+    fn paste_mode_ends_at_terminator_so_enter_submits_again() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"\x1b[200~block\x1b[201~ tail");
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["block tail"]);
+    }
+
+    #[test]
+    fn alt_enter_inserts_a_literal_newline() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"first\x1b\rsecond");
+        assert_eq!(editor.buffer_string(), "first\nsecond");
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["first\nsecond"]);
+    }
+
+    #[test]
+    fn utf8_inside_bracketed_paste_survives() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        let mut bytes = b"\x1b[200~f".to_vec();
+        bytes.extend("é".as_bytes());
+        bytes.extend(b"\nr\x1b[201~");
+        editor.feed(&bytes);
+        assert_eq!(editor.buffer_string(), "fé\nr");
     }
 }
