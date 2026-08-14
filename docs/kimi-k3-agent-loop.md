@@ -913,3 +913,133 @@ cycle to actually implement one or more of P1-P11 against `kitsu-core`/
 "cycle N+1" is implied by the ramp itself — the next tick should pick
 one of these three explicitly rather than defaulting to "cycle 7" with
 no stated task.
+
+### Cycle 7 (2026-08-14)
+
+**FIRST CODE CONTRIBUTION — BANKED.** Per the frontier root-cause recipe
+(`:together` pin, bounded 3-file scope, write-early mandate, no
+sub-agents), Kimi-K3 implemented P3 (surface `cached_tokens` through
+`Usage`) against its own cycle-5 design, with write access to
+`crates/kitsu-providers` for the first time (prior cycles were
+review/analysis-only, writing to `reviews/`).
+
+**Run stats.**
+
+| | attempt 1 (no retry required) |
+|---|---|
+| wall time | 58.7s |
+| tool calls | 5 (`Read` kimi-cycle-5.md, `Read` types.rs whole, `Read` openai_compat.rs 1-850, `Edit` types.rs, `Read` openai_compat.rs 850-1694) — zero list calls, zero `Agent` spawns, zero write conflicts, zero debris/re-prompt events |
+| `kitsu-usage` prompt/completion/total | 49,350 / 2,150 / 51,500 — **completion_tokens 2,150 against the 24,000 cap (9% utilization)**, the lowest completion spend of the whole loop to date, well under, zero truncation warnings |
+| `kitsu-context` used/effective/window | 20,448 / 107,072 / 131,072 |
+| truncation warnings | 0 |
+| outcome | 1 file edited (`types.rs`, +32/-2), verified checkpoint diff printed in receipts, run summary "1 turn(s) ok, 4 file(s) read, 1 file(s) written (1 change(s)), session not saved" |
+
+Notably efficient: Kimi read the second `openai_compat.rs` range *after*
+already applying the edit, explicitly to check for `Usage` struct-literal
+constructions that a new field could break, found none, and correctly
+concluded (stated in its closing explanation) that "the widened
+`is_empty()` automatically fixes both capture gates in `openai_compat.rs`
+… no edit needed there." This claim was independently verified by the
+supervisor and found accurate (see diff review below).
+
+**Gates (supervisor-run in the worktree).**
+
+- `cargo fmt --all -- --check`: **clean**, no reformatting needed.
+- `cargo test -p kitsu-providers`: **58 passed, 0 failed, 0 ignored**
+  (plus 0 doc-tests). All pre-existing tests, including
+  `test_parse_completion_surfaces_usage` and
+  `test_parse_completion_without_usage_emits_no_usage_delta`, passed
+  unchanged — confirms the change is behavior-preserving for every
+  previously-covered path.
+- `git diff --stat`: `crates/kitsu-providers/src/types.rs | 34
+  ++++++++++++++++++++++++++++++++--` — 1 file changed, 32
+  insertions(+), 2 deletions(-). No other files touched.
+
+**Diff review.** The change is exactly the design from
+`reviews/kimi-cycle-5.md` P3, self-contained to `types.rs`: a new
+`PromptTokensDetails { cached_tokens: Option<u64> }` struct
+(`#[derive(..., Default, Deserialize)]`, matches the house style of
+neighboring structs in the file), a new `Option<PromptTokensDetails>`
+field on `Usage` with `#[serde(default)]` (wire-additive, no breaking
+change), a `cached_tokens()` accessor, `is_empty()` widened to also
+require `cached_tokens() == 0`, and `add()` extended to sum the nested
+value across rounds. The supervisor confirmed by reading
+`openai_compat.rs` directly that both usage-capture gates
+(`SseDecoder::process_line` line ~452, `parse_completion` line ~617)
+call `u.is_empty()`/`usage.is_empty()` verbatim with no struct-literal
+construction of `Usage` anywhere in the file, so the widened method
+transparently fixes both sites — Kimi's own claim, verified, not just
+asserted. One small deviation from its own design: the design doc
+specified `cached_tokens: u64` on the nested struct (a single `Option`
+at the `Usage` level); the implementation instead double-nests
+(`Option<PromptTokensDetails>` wrapping `Option<u64>`), which is
+slightly more defensive but a little redundant — not a defect, since
+both layers default via serde and the accessor collapses them cleanly,
+but a human reviewer would likely simplify to match the original
+single-`Option` design. `add()` also goes beyond the design's
+"setting `Some` unconditionally is fine" note by setting `None` when
+the summed `cached_tokens` is 0, which is arguably cleaner (preserves
+the "all-zero/absent means unreported" convention one layer deeper) but
+is again a small unprompted deviation from the written design, not a
+bug.
+
+**Grade: A- (mergeable, first genuine code contribution of the loop).**
+Compiles clean, fmt clean, all 58 existing tests pass unmodified, the
+diff is minimal (32/-2, one file) and additive/backward-compatible
+end-to-end (verified, not just claimed), and it faithfully implements
+the model's own prior design with only minor, defensible deviations. Two
+things keep it from an A: (1) no new unit test was added exercising the
+new field — `cached_tokens()`, the widened `is_empty()`, or `add()`'s
+merge behavior — so the new logic itself is currently uncovered by the
+suite that just passed; the task prompt didn't explicitly ask for tests,
+but a fully mergeable PR would normally include at least one. (2) the
+double-`Option` nesting is a minor unforced complexity increase over its
+own design. Neither issue blocks a merge; both are one-line-scale
+follow-ups.
+
+**Infrastructure incident (not a Kimi or kitsu defect — filed as a
+process lesson).** The first verification attempt
+(`cargo test -p kitsu-providers`, default `target/` under the worktree)
+failed with `No space left on device` while compiling `reqwest`: `/tmp`
+here is a 5.7G tmpfs, and this worktree's own accumulated build
+artifacts plus the harness's per-session output-capture directory (also
+under `/tmp/claude-1000/...`) together exhausted it completely — severely
+enough that even trivial commands (`true`) failed with `ENOSPC` on the
+capture path itself, blocking the Bash tool entirely (in this session and
+in freshly spawned sub-agents) until space was freed. **Lesson for future
+cycles: never let `cargo test`/`cargo build` target a tmpfs-backed `/tmp`
+worktree's default `target/` dir.** Fix applied: removed the stale
+`target/` dir and re-ran with `CARGO_TARGET_DIR=/home/mmpg/.cache/
+kimi-worktree-target` (main disk, not tmpfs) for both `cargo fmt` and
+`cargo test`; both then ran cleanly with no space pressure. **Standing
+recipe update:** any future cycle that runs `cargo build`/`cargo test`/
+`cargo fmt` in this (or any `/tmp`-based) worktree must set
+`CARGO_TARGET_DIR` to a path on the main disk (e.g.
+`/home/mmpg/.cache/kimi-worktree-target`) rather than the worktree's
+default in-tree `target/`.
+
+**Weaknesses observed:** none new attributable to kitsu itself this
+cycle — the run that mattered (the kitsu-driven implementation turn) was
+the cleanest of the loop so far (lowest completion-token spend, zero
+truncation, zero write conflicts, zero debris/re-prompt events, first
+attempt, no retry). The only failure this cycle was the supervisor's own
+tmpfs/target-dir sizing mistake, addressed above, not a kitsu code
+defect.
+
+**Backlog status:** P3 (`cached_tokens` surfacing in `Usage`) is now
+**implemented and tested-green** at the `kitsu-providers` layer; the
+remaining half of the original backlog item — actually reading
+`usage.cached_tokens()` in kitsu-core's per-turn aggregation and the
+`kitsu-usage:` record writer so the value reaches `/cost` and operator
+receipts — is still open (out of this cycle's scoped file list) and is
+the natural next-cycle candidate. No other backlog items touched.
+
+**Verdict: recipe validated for code work.** The frontier recipe
+(`:together` pin, named-file bounded scope, write-early mandate, no
+sub-agents, brevity instruction) that was proven for open-ended
+review/analysis tasks in the frontier root-cause work now also holds for
+a real code-editing task with write access to source: one clean attempt,
+faithful implementation of a prior self-authored design, a mergeable,
+test-green diff. The loop can extend this recipe to further P1/P2/P6/P7
+implementation cycles with confidence, provided each stays scoped to a
+small, named file set the way this one did.
