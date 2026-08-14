@@ -1096,8 +1096,6 @@ where
         )
         .await?;
 
-        // Number of messages this request sends — the anchor point for the meter.
-        let sent_len = messages.len();
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
@@ -1189,7 +1187,7 @@ where
                     // included the schema, so a later round can tell whether the
                     // anchor already accounts for it (see
                     // ContextMeter::anchor_includes_schema).
-                    meter.record(u.prompt_tokens, sent_len, tools_were_offered);
+                    meter.record(u.prompt_tokens, messages, tools_were_offered);
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
                     // a usage report far below the sent estimate (and below

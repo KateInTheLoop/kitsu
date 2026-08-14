@@ -1867,6 +1867,7 @@ mod tests {
                     prompt_tokens: 11,
                     completion_tokens: 7,
                     total_tokens: 18,
+                    prompt_tokens_details: None,
                 })),
                 Ok(ChatDelta::Done(FinishReason::Stop)),
             ])))

@@ -1218,3 +1218,122 @@ implementation tasks, but this cycle is the first to ship a
 non-compiling workspace and the first to break an explicit tool-use
 prohibition — both worth tightening in the task brief and verify step
 before the next code-contribution cycle.
+
+### Cycle 10 — 2026-08-14 — P2 anchor content fingerprint (grade B, design correct but delivery incomplete)
+
+Kimi implemented P2's core design correctly and idiomatically in
+`crates/kitsu-core/src/context.rs`: the anchor tuple grew from
+`Option<(u64, usize, bool)>` to `Option<(u64, usize, bool, u64)>`,
+adding a private `prefix_fingerprint(messages: &[ChatMessage]) -> u64`
+(a `DefaultHasher` over role discriminant + `content.len()` +
+`tool_call_id` length + each tool call's `tool_name.len()`/
+`args.len()`/`call_id.len()` — lengths only, never message bytes, so it
+stays O(sent_len) and cheap even for huge bodies, exactly as scoped).
+`record()`'s signature changed to take the actual sent `messages`
+slice (not a bare `sent_len: usize`) so it can compute the fingerprint
+at record time; `estimate()`, `anchored()`, and
+`anchor_includes_schema()` all now require the length check **and** a
+matching fingerprint before taking the anchored fast path, agreeing
+with each other. No new `pub` surface leaked — the anchor field stays
+private. Kimi also rewrote all seven pre-existing tests whose
+`record(…, <int>, …)` calls no longer type-checked.
+
+- **Turn ended with the deliverable half-applied.** Single attempt, 8
+  reads + 11 `Edit`s to `context.rs` (all landed on disk, verified by
+  file checkpoint), completion 8,863/24,000 (37% — well under budget,
+  so this was not a hard truncation). Kimi's own final answer was
+  candid: "Status: partially complete — context.rs core fix is done; 3
+  mechanical call-site/test additions remain unapplied (turn was cut
+  off before I could write them)" — followed by fully-formed,
+  ready-to-paste code for all three remaining pieces (the
+  `orchestrator.rs` call-site fix, two `orchestrator_tests.rs`
+  call-site fixes, and the three new unit tests) as **text in the
+  reply, never written to any file**. No `[stopped: max tool rounds
+  reached]` marker appeared, so this was not the max-rounds backstop —
+  most likely the per-file edit-count on `context.rs` (11 `Edit` calls)
+  consumed the round budget (default `--max-rounds 10` was not raised
+  for this task) before the model could open the two other files.
+  Honest self-disclosure of incompleteness is a genuine strength (no
+  false completion claim), but the supervisor had to mechanically apply
+  ~90 lines of Kimi-authored-but-unwritten code across three files
+  before the crate would even compile.
+- **Supervisor-applied (verbatim, from Kimi's own text):**
+  `orchestrator.rs` ~1192 (`meter.record(u.prompt_tokens, messages,
+  tools_were_offered)`, dropping the now-unused `sent_len` binding);
+  two `orchestrator_tests.rs` call sites (`meter.record(300, &msgs,
+  true)` and `meter.record(500, &msgs, true)`, one dropping its
+  now-unused `sent_len`); and the three new tests appended to
+  `context.rs`'s `mod tests`.
+- **Pre-existing, unrelated defect discovered while verifying (not
+  Kimi's, not this cycle's):** `cargo clippy --workspace --all-targets`
+  failed on `crates/kitsu/src/subagent.rs:1866` — a `Usage { .. }`
+  test-target literal missing `prompt_tokens_details` (the field cycle
+  7's P3 diff added). Confirmed present at the pre-cycle HEAD via `git
+  stash` — this is the SAME class of masked defect fixed for
+  `kitsu-core`'s test target in cycle 9's follow-up (`0e895ae`), just in
+  a different crate's test target that no cycle's `cargo test -p
+  kitsu-tools/-p kitsu` had exercised since. Supervisor added
+  `prompt_tokens_details: None,` (one line) to restore a clean
+  `--workspace` build/clippy — the standing lesson from cycle 9 (build
+  `--workspace`, not just the touched crate) is what caught it this
+  time.
+- **Also pre-existing, left unfixed (out of scope):**
+  `kitsu-tools::builtins::fs::tests::read_file_caps_input_before_allocating_the_whole_file`
+  fails both before and after this cycle's changes (`git stash`
+  confirmed) — unrelated to context.rs/P2, not investigated further.
+- Gates after supervisor completion: `cargo build --workspace` clean;
+  `cargo clippy --workspace --all-targets` warning-free; `cargo fmt
+  --all -- --check` clean (one re-run of `cargo fmt --all` needed for
+  the three new tests' formatting); `cargo test --workspace`: 98 passed
+  in `kitsu-core` (95 pre-existing + exactly the 3 new tests, all named
+  and passing — `unchanged_prefix_still_uses_the_anchor`,
+  `in_place_edit_inside_anchored_prefix_invalidates_the_anchor`,
+  `appending_to_the_tail_still_uses_the_anchor`), 64 passed in
+  `kitsu-providers`, 251 + 2 passed in `kitsu`'s own suites, only the
+  two pre-existing unrelated failures noted above (the whitelisted
+  `test_query_only_interactive_session_does_not_create_a_snapshot` PTY
+  flake, plus the newly-observed `read_file_caps_input_before_allocating_the_whole_file`).
+- **Spot-check of the deliverable's substance:** test (b),
+  `in_place_edit_inside_anchored_prefix_invalidates_the_anchor`, is a
+  genuine regression test for the exact P2 bug — it records an anchor
+  over 3 messages, then constructs an edited 3-message vec where
+  message[1]'s content differs, and asserts `estimate()` returns the
+  full recompute (not `1000 + tail`). Verified by hand that on the
+  OLD length-only code this test would have failed (`sent_len(3) <=
+  len(3)` passes, so `estimate` would silently return `1000`,
+  contradicting `assert_ne!(…, 1000, …)`). Tests (a) and (c) correctly
+  guard against over-correction (unchanged prefix and tail-only growth
+  must still hit the fast path). No scope creep: every touched file
+  traces directly to the type change or its mechanical fallout.
+- **Spawn cap held.** No `Agent(...)` calls appear anywhere in the
+  stderr receipts; `--agent-spawn-cap 0` combined with prompt text
+  produced a clean run on this axis (contrast cycle 9's two violations
+  under `--agent-spawn-cap 2` + text-only prohibition).
+
+**Grade: B.** The algorithmic design — the actual hard part of P2 — is
+correct, cheap (lengths-only fingerprint, no full-content hashing),
+internal (no leaked `pub` surface), and independently verified against
+the bug it targets. Docked from A solely for incomplete delivery: three
+of the four required file changes existed only as unwritten text in
+the final answer, requiring full supervisor transcription before the
+workspace would build or the tests would run. Unlike cycle 9 (B, a
+design flaw in scope framing) this cycle's gap was purely
+operational — running out of round budget mid-task on a single
+edit-heavy file.
+
+**Actionable fix for next cycle:** when a task brief requires many
+small edits to one file (here: 11 `Edit` calls to rewrite one struct
+and seven tests) plus mechanical follow-through in 1-2 other files,
+pass `--max-rounds` well above the default 10 — a large positive
+completion-token margin (37% used) is not evidence the round budget was
+also generous; they are independent limits and only one of them
+throttled this run.
+
+**Backlog status:** P2 ✅ (design + 3 required tests, now fully applied
+and passing). Remaining open items: P6 (evidence-clamps-budget), P7
+(schema fingerprint), the still-open half of P3 (wiring
+`cached_tokens()` through kitsu-core's aggregation into `/cost`), P8-P11.
+New backlog item: the `kitsu` crate's test target needs the same
+"exercise every crate's test target every cycle" discipline that fixed
+`kitsu-core`'s in cycle 9 — this cycle shows it can still drift crate
+by crate.

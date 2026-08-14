@@ -2522,7 +2522,7 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
     // Real usage for exactly these messages was 300 tokens — comfortably under
     // the 400 target on its own (and already reflects that round's schema cost,
     // hence `had_schema: true`).
-    meter.record(300, sent_len, true);
+    meter.record(300, &msgs, true);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
@@ -2648,9 +2648,8 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
     // droppable, so drop_old_exchanges is a guaranteed no-op on `messages`.
     let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
     let mut meter = ContextMeter::new();
-    let sent_len = msgs.len();
     // A real anchor that's over target, forcing the compaction match to run.
-    meter.record(500, sent_len, true);
+    meter.record(500, &msgs, true);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
