@@ -357,10 +357,17 @@ as escalation); findings are re-verified before applying. Cycle log:
   themselves. PTY-verified with arrow-editing intact. Accepted gap
   (recorded): the collector's quiet-tick gating has no unit test — only
   the editor method and the PTY smoke cover it.
-- Backlog (next cycles): hint ranking should prefer mid-turn-actionable
-  commands (/steer, /jobs, /queue) over registry order; queued-message
-  stack rendered under the status row; multi-line draft wrap; Ctrl+R
-  history search mid-turn; unit-test seam for the collector poll loop.
+- **Cycle 5 (2026-08-14, 6d143b2)**: mid-turn hint ranks actionable-now
+  commands first (steer/queue/jobs/quit/exit) with registry fallback;
+  /s → steer, /st → steer. Registry-existence guard test protects the
+  priority list from renames. First SHIP-AS-IS review of the loop (zero
+  findings). Operational: /tmp tmpfs was 100% full with stale cycle-18/
+  parity build caches, failing up to 17 unrelated fs tests with
+  StorageFull — freed 5.1G; watch /tmp in future cycles (the kimi
+  worktree lives there too).
+- Backlog (next cycles): queued-message stack rendered under the status
+  row; multi-line draft wrap; Ctrl+R history search mid-turn; unit-test
+  seam for the collector poll loop.
 
 ## Protocol
 
