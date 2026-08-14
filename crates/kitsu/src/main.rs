@@ -1919,7 +1919,9 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
         }
     }
 
-    let filesystem_policy = if cli.dangerously_allow_all_filesystem {
+    let filesystem_policy = if cli.dangerously_skip_permissions {
+        "DANGER: unattended bypass — global non-protected filesystem access AND auto-approved commands inside their roots"
+    } else if cli.dangerously_allow_all_filesystem {
         "DANGER: global non-protected filesystem bypass when tools are enabled"
     } else if cli.yes {
         "non-prompting and confined to explicit/current roots when tools are enabled"
@@ -12885,7 +12887,22 @@ async fn handle_slash(
                             perms, session, text,
                         )));
                     }
-                    (Err(error), _) | (_, Err(error)) => {
+                    // Protections only ever narrow authority, so a half-landed
+                    // protection is safe — but it must be disclosed honestly,
+                    // not reported as if nothing changed.
+                    (Ok(_), Err(error)) => {
+                        eprintln!(
+                            "partial: READ protection applied, write protection failed for '{path}': {error}"
+                        );
+                        return SlashResult::Error;
+                    }
+                    (Err(error), Ok(_)) => {
+                        eprintln!(
+                            "partial: WRITE protection applied, read protection failed for '{path}': {error}"
+                        );
+                        return SlashResult::Error;
+                    }
+                    (Err(error), Err(_)) => {
                         eprintln!("cannot protect '{path}': {error}");
                         return SlashResult::Error;
                     }
