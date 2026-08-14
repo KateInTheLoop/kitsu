@@ -1368,24 +1368,44 @@ pub fn finish_line() {
 }
 
 /// Announce a tool call to **stderr** (meta, not assistant text) as a compact,
-/// friendly line — e.g. `◆ Read(deck1.md)`. Fox-orange marker on a TTY.
+/// friendly line — e.g. `◆ Read(deck1.md)`. Fox-orange marker on a TTY; the
+/// verb carries accent bold and the parenthesized detail is dimmed so the
+/// card reads at a glance (ui-parity item 12). Plain/non-TTY byte-identical.
 pub fn tool_activity(header: &str) {
-    let plain = plain_mode();
-    let header = if plain {
-        sanitize_plain_inline(header)
-    } else {
-        sanitize_terminal_inline(header)
-    };
+    let line = tool_activity_line(header, stderr_is_tty() && !plain_mode(), plain_mode());
     live::with_live_row_suspended(|| {
-        if stderr_is_tty() && !plain {
-            let (r, g, b) = theme().accent;
-            eprintln!("{} {header}", GLYPH_TOOL_CALL.truecolor(r, g, b));
-        } else if plain {
-            eprintln!("tool> {header}");
-        } else {
-            eprintln!("{GLYPH_TOOL_CALL} {header}");
-        }
+        eprintln!("{line}");
     });
+}
+
+/// The [`tool_activity`] payload as a string, per output tier. Styled rows
+/// keep the marker in accent, render the tool verb (text before the first
+/// `(`) accent-bold, and dim the argument text; markers/text are retained so
+/// `sanitize_terminal_text(styled)` equals the unstyled row. Headers without
+/// `(` render whole in accent.
+fn tool_activity_line(header: &str, styled: bool, plain: bool) -> String {
+    if plain {
+        return format!("tool> {}", sanitize_plain_inline(header));
+    }
+    let header = sanitize_terminal_inline(header);
+    if !styled {
+        return format!("{GLYPH_TOOL_CALL} {header}");
+    }
+    let (r, g, b) = theme().accent;
+    match header.split_once('(') {
+        Some((verb, rest)) => format!(
+            "{} {}{}{}",
+            GLYPH_TOOL_CALL.truecolor(r, g, b),
+            verb.truecolor(r, g, b).bold(),
+            "(".dimmed(),
+            rest.dimmed(),
+        ),
+        None => format!(
+            "{} {}",
+            GLYPH_TOOL_CALL.truecolor(r, g, b),
+            header.truecolor(r, g, b).bold()
+        ),
+    }
 }
 
 /// The result summary line under a tool call — e.g. `  ◇ 128 lines`. Dimmed on a
@@ -1959,9 +1979,10 @@ mod tests {
         fit_banner_value, format_message, grouped_count, human_turn_stats,
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
-        write_static_spinner, write_turn_stats, write_turn_stats_with_mode, AsyncNoticeLevel,
-        DeckState, LineStyler, PromptSafeAsyncNotice, RenderMode, SpinnerMode, StreamBuffer,
-        TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
+        tool_activity_line, write_static_spinner, write_turn_stats, write_turn_stats_with_mode,
+        AsyncNoticeLevel, DeckState, LineStyler, PromptSafeAsyncNotice, RenderMode, SpinnerMode,
+        StreamBuffer, TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES,
+        SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -2386,6 +2407,35 @@ mod tests {
         assert!(output.contains("system"));
         assert!(output.contains("keep"));
         assert!(output.contains("required"));
+    }
+
+    #[test]
+    fn tool_activity_verb_is_weighted_and_arguments_dim_across_tiers() {
+        // Styled: accent-bold verb before '(', dimmed detail after, and the
+        // sanitize round-trip returns the exact unstyled row.
+        let styled = tool_activity_line("Read(crates/kitsu-render/src/lib.rs)", true, false);
+        assert!(
+            styled.contains("\u{1b}[1m"),
+            "verb must be bold: {styled:?}"
+        );
+        assert!(
+            styled.contains("\u{1b}[2m"),
+            "detail must be dim: {styled:?}"
+        );
+        assert!(
+            styled.contains("\u{1b}[38;2;"),
+            "accent truecolor: {styled:?}"
+        );
+        assert_eq!(
+            sanitize_terminal_text(&styled),
+            "◆ Read(crates/kitsu-render/src/lib.rs)"
+        );
+        // No parenthesis: whole header accent-bold, round-trip intact.
+        let styled = tool_activity_line("workspace_diff", true, false);
+        assert_eq!(sanitize_terminal_text(&styled), "◆ workspace_diff");
+        // Plain and non-TTY tiers are byte-identical to the historical forms.
+        assert_eq!(tool_activity_line("Read(x)", false, true), "tool> Read(x)");
+        assert_eq!(tool_activity_line("Read(x)", false, false), "◆ Read(x)");
     }
 
     #[test]
