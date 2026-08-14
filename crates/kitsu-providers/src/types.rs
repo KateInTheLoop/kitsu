@@ -140,6 +140,14 @@ pub enum FinishReason {
     ToolCalls,
 }
 
+/// Nested prompt-token breakdown reported by some gateways (OpenAI, HF router,
+/// vLLM with prefix caching). Absent when the gateway does not report it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Deserialize)]
+pub struct PromptTokensDetails {
+    #[serde(default)]
+    pub cached_tokens: Option<u64>,
+}
+
 /// Token usage reported by the gateway for one completion. Anthropic (and most
 /// OpenAI-compat) responses carry this in a `usage` object; some gateways/models
 /// omit it, so every field defaults to 0 and callers should treat an all-zero
@@ -152,12 +160,26 @@ pub struct Usage {
     pub completion_tokens: u64,
     #[serde(default)]
     pub total_tokens: u64,
+    #[serde(default)]
+    pub prompt_tokens_details: Option<PromptTokensDetails>,
 }
 
 impl Usage {
-    /// True when the gateway reported nothing usable (all fields zero).
+    /// True when the gateway reported nothing usable (all counters zero and no
+    /// cache-hit signal). A cache-hit-only usage (zero prompt/completion but
+    /// nonzero `cached_tokens`) still counts as reported.
     pub fn is_empty(&self) -> bool {
-        self.prompt_tokens == 0 && self.completion_tokens == 0 && self.total_tokens == 0
+        self.prompt_tokens == 0
+            && self.completion_tokens == 0
+            && self.total_tokens == 0
+            && self.cached_tokens() == 0
+    }
+
+    /// Cached prompt tokens, if the gateway reported a prompt-token breakdown.
+    pub fn cached_tokens(&self) -> u64 {
+        self.prompt_tokens_details
+            .and_then(|d| d.cached_tokens)
+            .unwrap_or(0)
     }
 
     /// Merge another usage into this one (summed across multi-round turns).
@@ -165,6 +187,14 @@ impl Usage {
         self.prompt_tokens += other.prompt_tokens;
         self.completion_tokens += other.completion_tokens;
         self.total_tokens += other.total_tokens;
+        let cached = self.cached_tokens() + other.cached_tokens();
+        self.prompt_tokens_details = if cached > 0 {
+            Some(PromptTokensDetails {
+                cached_tokens: Some(cached),
+            })
+        } else {
+            None
+        };
     }
 }
 
