@@ -100,6 +100,19 @@ impl TypeaheadEditor {
         self.buffer.into_iter().collect()
     }
 
+    /// Drop all transient input state (paste mode, partial escape/UTF-8
+    /// sequences). Called when the editor loses stdin mid-stream — e.g. an
+    /// approval prompt takes over and may consume a paste's terminator — so
+    /// a latched `in_paste` can never survive the handoff and eat every
+    /// later Enter. The draft buffer and history are untouched.
+    pub fn reset_pending_input(&mut self) {
+        self.in_paste = false;
+        self.last_paste_byte = 0;
+        self.pending = Pending::None;
+        self.csi_params.clear();
+        self.utf8.clear();
+    }
+
     /// Feed raw stdin bytes; returns whether a redraw is needed and any
     /// submissions/EOF that completed.
     pub fn feed(&mut self, bytes: &[u8]) -> FeedOutcome {
@@ -142,6 +155,11 @@ impl TypeaheadEditor {
             }
             Pending::Ss3 => {
                 self.pending = Pending::None;
+                // Pasted content can carry SS3 sequences (e.g. a captured
+                // transcript); inside a paste they are data-noise, not keys.
+                if self.in_paste {
+                    return;
+                }
                 match byte {
                     b'A' => self.history_prev(outcome),
                     b'B' => self.history_next(outcome),
@@ -190,12 +208,15 @@ impl TypeaheadEditor {
                 b'\t' => self.insert_char('\t', outcome),
                 0x00..=0x1f | 0x7f => {}
                 _ => {
-                    let expected = utf8_expected_len(byte);
-                    if expected <= 1 {
-                        self.insert_char(byte as char, outcome);
-                    } else {
-                        self.utf8.clear();
-                        self.utf8.push(byte);
+                    match utf8_expected_len(byte) {
+                        1 => self.insert_char(byte as char, outcome),
+                        // Stray continuation/invalid lead bytes (0x80..):
+                        // dropping them keeps C1 controls out of the draft.
+                        0 => {}
+                        _ => {
+                            self.utf8.clear();
+                            self.utf8.push(byte);
+                        }
                     }
                 }
             }
@@ -263,18 +284,30 @@ impl TypeaheadEditor {
                 // characters must never enter the draft.
             }
             _ => {
-                let expected = utf8_expected_len(byte);
-                if expected <= 1 {
-                    self.insert_char(byte as char, outcome);
-                } else {
-                    self.utf8.clear();
-                    self.utf8.push(byte);
+                match utf8_expected_len(byte) {
+                    1 => self.insert_char(byte as char, outcome),
+                    // Stray continuation/invalid lead bytes never become
+                    // C1 controls in the draft.
+                    0 => {}
+                    _ => {
+                        self.utf8.clear();
+                        self.utf8.push(byte);
+                    }
                 }
             }
         }
     }
 
     fn dispatch_csi(&mut self, final_byte: u8, outcome: &mut FeedOutcome) {
+        // Inside a paste, escape sequences are content noise (a pasted script
+        // capture full of `ESC[A` must not walk history or move the cursor);
+        // only the paste terminator itself is honored.
+        if self.in_paste {
+            if final_byte == b'~' && self.csi_params.as_slice() == b"201" {
+                self.in_paste = false;
+            }
+            return;
+        }
         match final_byte {
             b'A' => self.history_prev(outcome),
             b'B' => self.history_next(outcome),
@@ -551,6 +584,40 @@ mod tests {
         assert_eq!(editor.buffer_string(), "first\nsecond");
         let outcome = editor.feed(b"\r");
         assert_eq!(submit_actions(&outcome), vec!["first\nsecond"]);
+    }
+
+    #[test]
+    fn navigation_sequences_inside_paste_are_inert_content_noise() {
+        let mut editor = TypeaheadEditor::new(vec!["old entry".to_string()]);
+        // A pasted transcript carrying cursor/history sequences must neither
+        // walk history nor move/delete; only the terminator is honored.
+        editor.feed(b"\x1b[200~line1\x1b[A\x1b[D\x1b[3~\x1bOHline2\x1b[201~");
+        assert_eq!(editor.buffer_string(), "line1line2");
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["line1line2"]);
+    }
+
+    #[test]
+    fn reset_pending_input_unlatches_paste_mode_and_keeps_the_draft() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"\x1b[200~stuck");
+        // Simulate an approval prompt consuming the rest of the paste,
+        // terminator included: the collector resets transient input state.
+        editor.reset_pending_input();
+        editor.feed(b" more");
+        let outcome = editor.feed(b"\r");
+        assert_eq!(submit_actions(&outcome), vec!["stuck more"]);
+    }
+
+    #[test]
+    fn stray_high_bytes_never_become_c1_controls_in_the_draft() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        // 0x85 (a bare continuation byte) would decode as U+0085 NEL; it must
+        // be dropped in both the paste path and the normal path.
+        editor.feed(b"\x1b[200~a\x85b\x1b[201~");
+        assert_eq!(editor.buffer_string(), "ab");
+        editor.feed(&[0x85, b'c']);
+        assert_eq!(editor.buffer_string(), "abc");
     }
 
     #[test]
