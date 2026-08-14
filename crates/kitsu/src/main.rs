@@ -14532,6 +14532,9 @@ mod tests {
         // Ctrl+C on empty draft → SIGINT effect (raise happens in the caller).
         let (effects, _) = resolve(&mut editor, &[0x03], &mut queue, &mut dispatched);
         assert_eq!(effects.raise_signal, Some(libc::SIGINT));
+        // Ctrl+Z → SIGTSTP (a swapped mapping must fail this).
+        let (effects, _) = resolve(&mut editor, &[0x1a], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGTSTP));
         // ^C then ^\ in one batch: the LAST signal wins.
         let (effects, _) = resolve(&mut editor, &[0x03, 0x1c], &mut queue, &mut dispatched);
         assert_eq!(effects.raise_signal, Some(libc::SIGQUIT));
