@@ -8,6 +8,13 @@
 > billed); on success the next ramp cycle launches immediately.
 > Cycle-3's positive finding stands: kitsu classifies the 402 terminal
 > on the FIRST attempt with an actionable message.
+>
+> **2026-08-14 post-cycle-7: the HF token was ROTATED** (401 on
+> `whoami-v2` — auth failure, not credit depletion; `/v1/models` is
+> public, so listings still succeed without auth). The pre-flight gate
+> treats 401 exactly like 402: end the tick silently. Both this loop
+> and the DeepSeek loop (`docs/deepseek-agent-loop.md`) resume
+> automatically once a fresh token is present in the environment.
 
 ## Success ramp (start here when credits return)
 
