@@ -74,11 +74,13 @@ richest greenfield lane.
 32 KiB/file. Zero document-format dependencies in any Cargo.toml.
 
 **Requirements (ranked):**
-- R2.1 **CSV/TSV as structured data**: a reader that parses delimited
-  files, reports column headers + row count + inferred types, and can
-  return a bounded row window rather than raw bytes. *Accept:* reading a
-  1000-row CSV discloses shape (cols, rows, dtypes) and returns a capped
-  preview; malformed rows disclosed, not silently dropped.
+- [x] (2026-08-14) R2.1 **CSV/TSV as structured data** — shipped as the
+  `fs_read_csv` builtin (commit 8566486): headers + total row count +
+  per-column inferred type (int/float/bool/string, nullable-aware),
+  bounded pageable window (start_row/max_rows, 500 ceiling), malformed
+  rows counted and disclosed, TSV + headerless support. Pure-Rust `csv`
+  crate. A live llama3.2 run hardened two small-model arg footguns
+  (stringy booleans, empty delimiter).
 - R2.2 **PDF text extraction**: extract selectable text (pure-Rust,
   e.g. `pdf-extract`/`lopdf`), page-ranged and capped like text reads,
   with a clear "N of M pages, text-layer only, no OCR" disclosure.
@@ -216,3 +218,17 @@ requirements are met, note it here and move down the sequence.
 ## Cycle log
 
 (appended each cycle, newest last)
+
+### Cycle 1 — 2026-08-14 — R2.1 CSV structured reading (document-review lane)
+
+Shipped `fs_read_csv` (commit 8566486). Document review's first
+capability: structured shape + type inference + bounded windowing +
+malformed-row disclosure, pure-Rust `csv` crate, same permission/byte-cap
+path as `fs_read_file`. 11 tests (formatter, e2e authorization, lenient
+args). A live llama3.2 gateway run was the load-bearing functional check
+— it caught two real small-model arg footguns that unit tests alone
+missed (stringy `no_header:"false"` → `lenient_bool`; empty `delimiter:""`
+→ default comma), both fixed and pinned. Verified end-to-end: the model
+called the tool and correctly reported `id:int, name:string, price:float,
+in_stock:bool` including a nullable price column. Haiku review pending.
+Next in lane 2: R2.2 PDF text extraction.
