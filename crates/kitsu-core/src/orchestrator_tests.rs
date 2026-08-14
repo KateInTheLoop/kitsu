@@ -193,6 +193,7 @@ impl Provider for SummaryTelemetryProvider {
                 prompt_tokens: 111,
                 completion_tokens: 22,
                 total_tokens: 133,
+                prompt_tokens_details: None,
             })),
             Ok(ChatDelta::Done(FinishReason::Stop)),
         ])))
@@ -3699,6 +3700,7 @@ async fn structured_event_log_frames_provider_usage_tools_and_completion() {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -4523,6 +4525,7 @@ async fn test_usage_shortfall_records_window_evidence() {
             prompt_tokens: 4096,
             completion_tokens: 3,
             total_tokens: 4099,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
@@ -4554,6 +4557,7 @@ async fn test_healthy_usage_records_no_window_evidence() {
             prompt_tokens: 5100,
             completion_tokens: 2,
             total_tokens: 5102,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
