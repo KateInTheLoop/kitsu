@@ -313,6 +313,24 @@ mod tests {
         assert!(defs["command_execution_result"].is_object());
         assert!(defs["command_result"]["allOf"].is_array());
         assert_eq!(
+            defs["model_catalog_identity"]["properties"]["operation_id"]["pattern"],
+            "^models:[1-9][0-9]*$"
+        );
+        assert!(
+            defs["provider_request"]["allOf"][2]["properties"]["purpose"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|purpose| purpose == "model_catalog")
+        );
+        assert!(
+            defs["provider_attempt"]["allOf"][2]["properties"]["purpose"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|purpose| purpose == "model_catalog")
+        );
+        assert_eq!(
             defs["review_disclosure"]["allOf"][1]["properties"]["source"]["const"],
             "top_level_review"
         );
