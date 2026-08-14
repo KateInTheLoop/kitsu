@@ -45,6 +45,11 @@ const EXIT_PROVIDER: i32 = 2;
 const EXIT_CANCELLED: i32 = 130;
 const JSONL_SCHEMA: &str = "kitsu.chat.v1";
 static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
+/// `-o` is a host-owned sink, so a run with no fully committed assistant must
+/// say that the destination was preserved instead of making automation infer
+/// a no-op from the absence of an installation receipt.
+static OUTPUT_LAST_MESSAGE_REQUESTED: AtomicBool = AtomicBool::new(false);
+static FULLY_COMMITTED_ASSISTANT_SEEN: AtomicBool = AtomicBool::new(false);
 /// Process-entry clock used by both human model-command receipts and JSONL's
 /// terminal summary. `Instant` avoids wall-clock jumps; conversion saturates
 /// for completeness even though a CLI process cannot realistically reach it.
@@ -268,29 +273,36 @@ fn emit_jsonl_summary_with_postcondition_failures(
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         (receipt.terminal_id(), receipt.snapshot_state.as_str())
     };
-    emit_jsonl(
-        "final_summary",
-        serde_json::json!({
-            "status": status,
-            "failures": failures,
-            "provider_failures": provider_failures,
-            "output_schema_failures": output_schema_failures,
-            "postcondition_failures": postcondition_failures,
-            "tool_failures": tool_failures,
-            "policy_failures": policy_failures,
-            "tool_errors": tool_error_totals.tool_errors,
-            "policy_errors": tool_error_totals.policy_errors,
-            "recovered_tool_errors": tool_error_totals.recovered_tool_errors,
-            "recovered_policy_errors": tool_error_totals.recovered_policy_errors,
-            "user_failures": user_failures,
-            "cancelled_failures": cancelled_failures,
-            "duration_ms": run_elapsed_ms(),
-            "session_id": session_id,
-            "session_snapshot_state": session_snapshot_state,
-        }),
-    )?;
+    let mut payload = serde_json::json!({
+        "status": status,
+        "failures": failures,
+        "provider_failures": provider_failures,
+        "output_schema_failures": output_schema_failures,
+        "postcondition_failures": postcondition_failures,
+        "tool_failures": tool_failures,
+        "policy_failures": policy_failures,
+        "tool_errors": tool_error_totals.tool_errors,
+        "policy_errors": tool_error_totals.policy_errors,
+        "recovered_tool_errors": tool_error_totals.recovered_tool_errors,
+        "recovered_policy_errors": tool_error_totals.recovered_policy_errors,
+        "user_failures": user_failures,
+        "cancelled_failures": cancelled_failures,
+        "duration_ms": run_elapsed_ms(),
+        "session_id": session_id,
+        "session_snapshot_state": session_snapshot_state,
+    });
+    if output_last_message_preserved_without_commit() {
+        payload["output_last_message_state"] =
+            serde_json::json!("preserved_no_committed_assistant");
+    }
+    emit_jsonl("final_summary", payload)?;
     JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
     Ok(())
+}
+
+fn output_last_message_preserved_without_commit() -> bool {
+    OUTPUT_LAST_MESSAGE_REQUESTED.load(Ordering::Acquire)
+        && !FULLY_COMMITTED_ASSISTANT_SEEN.load(Ordering::Acquire)
 }
 
 fn set_jsonl_session_receipt(planned_id: Option<String>, snapshot_state: SessionSnapshotState) {
@@ -1094,6 +1106,9 @@ fn main() {
             }
         }
     };
+    if !jsonl_mode && output_last_message_preserved_without_commit() {
+        std::eprintln!("~ --output-last-message unchanged: no committed assistant message");
+    }
     if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
         let status = match code {
             0 => kitsu_render::RunTimingStatus::Ok,
@@ -1199,6 +1214,7 @@ fn run() -> Result<(), CliError> {
     };
     kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion, cli.screen_reader);
     validate_output_last_message_surface(&cli)?;
+    OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
     validate_output_schema_surface(&cli)?;
 
     let runtime = tokio::runtime::Runtime::new()
@@ -8844,6 +8860,9 @@ fn finish_assistant_disposition(
     disposition: AssistantDisposition,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
+    if disposition == AssistantDisposition::Committed {
+        FULLY_COMMITTED_ASSISTANT_SEEN.store(true, Ordering::Release);
+    }
     if cli.jsonl {
         emit_jsonl(
             "assistant_disposition",

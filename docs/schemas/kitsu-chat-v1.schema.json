@@ -777,7 +777,8 @@
             "cancelled_failures": { "type": "integer", "minimum": 0 },
             "duration_ms": { "type": "integer", "minimum": 0 },
             "session_id": { "type": ["string", "null"] },
-            "session_snapshot_state": { "enum": ["disabled", "pending_until_first_success", "resumable"] }
+            "session_snapshot_state": { "enum": ["disabled", "pending_until_first_success", "resumable"] },
+            "output_last_message_state": { "const": "preserved_no_committed_assistant" }
           }
         }
       ]
