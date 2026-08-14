@@ -9825,6 +9825,35 @@ fn run_live_typeahead(
                         libc::raise(libc::SIGINT);
                     }
                 }
+                typeahead_editor::EditorAction::Suspend => {
+                    // Ctrl+Z: canonical termios back first (a suspended
+                    // process must not hold the terminal raw), then the real
+                    // SIGTSTP. On fg/SIGCONT the loop's re-engage branch
+                    // restores raw mode and repaints — the approval-handoff
+                    // machinery, reused.
+                    if let Some(guard) = raw.take() {
+                        drop(guard);
+                        live::live_input_end();
+                    }
+                    // SAFETY: raising a default-disposition job-control
+                    // signal in-process.
+                    unsafe {
+                        libc::raise(libc::SIGTSTP);
+                    }
+                }
+                typeahead_editor::EditorAction::Quit => {
+                    // Ctrl+\: restore the terminal before the default
+                    // core-dump exit so the user's shell stays sane.
+                    if let Some(guard) = raw.take() {
+                        drop(guard);
+                        live::live_input_end();
+                    }
+                    // SAFETY: raising SIGQUIT in-process; default
+                    // disposition terminates.
+                    unsafe {
+                        libc::raise(libc::SIGQUIT);
+                    }
+                }
                 typeahead_editor::EditorAction::CompleteRequest => {
                     // Tab accepts the inline slash hint, if one is showing.
                     let buffer = editor.buffer_string();
