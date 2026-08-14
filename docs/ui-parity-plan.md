@@ -257,7 +257,7 @@ every new decoration must degrade, and sanitize-round-trip invariants
   `sanitize_terminal_text` of the total output equals the input; existing
   streaming-sanitizer tests still pass; workspace green.
 
-- [ ] **10. Syntax-highlighted code blocks (syntect) on the buffered path** (M)
+- [x] **10. Syntax-highlighted code blocks (syntect) on the buffered path** (M) — done 2026-08-14 (64573e9, interactive loop cycle 17; lands on BOTH paths via the shared LineStyler)
   The standing backlog item since cycle 6. Add `syntect` (default features
   minus onig — use `fancy-regex` feature set to keep the build light) to
   `crates/kitsu-render/Cargo.toml`. In the fence branch of the line styler
@@ -470,9 +470,14 @@ as escalation); findings are re-verified before applying. Cycle log:
   new last_activity_at instant; stalled background agents visible at a
   glance. SHIP-AS-IS review (5th clean): lock coverage, no JSONL age
   leak, separator-injection safe.
-- Backlog: original-queue item 10 (syntect syntax highlighting — adds a
-  dependency, note build impact per its spec) and soft-wrap remain; the
-  interactive loop is otherwise complete.
+- **Cycle 17 (2026-08-14, 64573e9)**: original-queue item 10 shipped —
+  syntect truecolor highlighting for 16 fence languages on both the
+  buffered and streamed paths (shared LineStyler), fancy-regex backend,
+  SGR-only additions with the round-trip pinned. SHIP-AS-IS review
+  (6th clean). **THE ORIGINAL IMPLEMENTATION QUEUE IS COMPLETE: 13/13.**
+- Backlog: soft-wrap of overlong single lines (nice-to-have) is the
+  only remaining optional item. The interactive loop is complete —
+  future ticks are pure maintenance unless new gaps surface.
 
 ## Protocol
 
