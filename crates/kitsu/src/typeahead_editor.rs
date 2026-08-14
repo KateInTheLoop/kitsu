@@ -45,6 +45,13 @@ pub enum EditorAction {
     /// aborts the search. Raw mode masks ISIG, so the collector re-raises
     /// the real SIGINT for this action.)
     Interrupt,
+    /// Ctrl+Z: suspend kitsu. The collector restores canonical termios
+    /// FIRST, then raises the real SIGTSTP; on resume the raw guard
+    /// re-engages exactly like after an approval handoff.
+    Suspend,
+    /// Ctrl+\: quit with SIGQUIT. The collector restores canonical termios
+    /// first so the terminal is sane after the default core-dump exit.
+    Quit,
 }
 
 /// What one [`TypeaheadEditor::feed`] call produced.
@@ -473,6 +480,8 @@ impl TypeaheadEditor {
             }
             0x09 => outcome.actions.push(EditorAction::CompleteRequest),
             0x12 => self.search_enter_or_cycle(outcome),
+            0x1a => outcome.actions.push(EditorAction::Suspend),
+            0x1c => outcome.actions.push(EditorAction::Quit),
             0x03 => {
                 if self.buffer.is_empty() {
                     outcome.actions.push(EditorAction::Interrupt);
@@ -673,7 +682,9 @@ mod tests {
                 EditorAction::Eof
                 | EditorAction::CompleteRequest
                 | EditorAction::RecallRequest
-                | EditorAction::Interrupt => None,
+                | EditorAction::Interrupt
+                | EditorAction::Suspend
+                | EditorAction::Quit => None,
             })
             .collect()
     }
@@ -830,6 +841,18 @@ mod tests {
         // ↓ must not resurrect the stash after the clear.
         editor.feed(b"\x1b[B");
         assert_eq!(editor.buffer_string(), "");
+    }
+
+    #[test]
+    fn ctrl_z_and_ctrl_backslash_emit_job_control_actions() {
+        let mut editor = TypeaheadEditor::new(Vec::new());
+        editor.feed(b"draft stays");
+        let outcome = editor.feed(&[0x1a]);
+        assert_eq!(outcome.actions, vec![EditorAction::Suspend]);
+        // Suspension must not eat the draft.
+        assert_eq!(editor.buffer_string(), "draft stays");
+        let outcome = editor.feed(&[0x1c]);
+        assert_eq!(outcome.actions, vec![EditorAction::Quit]);
     }
 
     #[test]
