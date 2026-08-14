@@ -9631,9 +9631,15 @@ fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
     kitsu_render::live::live_input_update(buffer, editor.cursor(), hint);
 }
 
-/// Inline completion hint for the live editor: the remainder of the first
-/// registry slash command matching the typed `/prefix` (empty when the
-/// buffer is not a bare slash prefix or nothing matches).
+/// Commands that act on the RUNNING turn, in preference order. While a turn
+/// is live these outrank plain registry order in the inline hint: `/s`
+/// should suggest `steer` (usable now), not `save` (queued for later).
+const MID_TURN_HINT_PRIORITY: [&str; 5] = ["steer", "queue", "jobs", "quit", "exit"];
+
+/// Inline completion hint for the live editor: the remainder of the best
+/// registry slash command matching the typed `/prefix` — mid-turn-actionable
+/// commands first, then registry order (empty when the buffer is not a bare
+/// slash prefix or nothing matches).
 fn typeahead_slash_hint(buffer: &str) -> String {
     let Some(rest) = buffer.strip_prefix('/') else {
         return String::new();
@@ -9641,10 +9647,17 @@ fn typeahead_slash_hint(buffer: &str) -> String {
     if rest.is_empty() || rest.contains(char::is_whitespace) {
         return String::new();
     }
-    matching_slash_commands(rest)
+    let prioritized = MID_TURN_HINT_PRIORITY
         .iter()
-        .map(|spec| spec.name)
-        .find(|name| name.len() > rest.len())
+        .copied()
+        .find(|name| name.starts_with(rest) && name.len() > rest.len());
+    prioritized
+        .or_else(|| {
+            matching_slash_commands(rest)
+                .iter()
+                .map(|spec| spec.name)
+                .find(|name| name.len() > rest.len())
+        })
         .map(|name| name[rest.len()..].to_string())
         .unwrap_or_default()
 }
@@ -14341,6 +14354,34 @@ mod tests {
     fn chat_helper() -> ChatHelper {
         ChatHelper {
             permissions: Arc::new(Permissions::for_roots(&[], &[]).unwrap()),
+        }
+    }
+
+    #[test]
+    fn typeahead_slash_hint_prefers_mid_turn_actionable_commands() {
+        // While a turn runs, /s must suggest steer (usable now), not save
+        // (registry order), and /st must beat status.
+        assert_eq!(typeahead_slash_hint("/s"), "teer");
+        assert_eq!(typeahead_slash_hint("/st"), "eer");
+        assert_eq!(typeahead_slash_hint("/q"), "ueue");
+        assert_eq!(typeahead_slash_hint("/j"), "obs");
+        // Outside the priority set, registry order still decides.
+        assert_eq!(typeahead_slash_hint("/sa"), "ve");
+        // Exact names, non-slash text, arguments, and no-match: no hint.
+        assert_eq!(typeahead_slash_hint("/steer"), "");
+        assert_eq!(typeahead_slash_hint("steer"), "");
+        assert_eq!(typeahead_slash_hint("/queue add x"), "");
+        assert_eq!(typeahead_slash_hint("/zzz"), "");
+        assert_eq!(typeahead_slash_hint("/"), "");
+    }
+
+    #[test]
+    fn mid_turn_hint_priority_names_exist_in_the_registry() {
+        for name in MID_TURN_HINT_PRIORITY {
+            assert!(
+                SLASH_COMMANDS.iter().any(|spec| spec.name == name),
+                "priority hint '{name}' is not a registered command"
+            );
         }
     }
 
