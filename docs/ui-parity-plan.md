@@ -408,9 +408,16 @@ as escalation); findings are re-verified before applying. Cycle log:
   semantics. With this, the original parity backlog from cycle 0 is
   CLOSED — the mid-turn editor covers editing, history, search, recall,
   pastes, completion, multi-line, and the full control-key vocabulary.
-- Backlog (next cycles): unit-test seam for the collector poll loop +
-  injectable writer for redraw_locked (testability debt); soft-wrap of
-  overlong single lines (nice-to-have; horizontal window suffices).
+- **Cycle 11 (2026-08-14, bf12203)**: testability debt paid — the region
+  state machine (render_region) takes an injected writer + width; four
+  byte-level transition tests pin fast-path isolation, shrink stepping,
+  clear-to-silence, and the last_upper/resize full-repaint triggers.
+  Pure refactor, PTY 5/5 unchanged, SHIP-AS-IS review (probes confirmed
+  the drawn_rows sentinel keeps the non-TTY gate airtight and degenerate
+  cols never panic).
+- Backlog (next cycles): unit-test seam for the collector poll loop
+  (last testability item); soft-wrap of overlong single lines
+  (nice-to-have; horizontal window suffices).
 
 ## Protocol
 
