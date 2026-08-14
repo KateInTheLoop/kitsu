@@ -1543,6 +1543,7 @@ where
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: cfg.max_tokens,
             response_format,
+            prompt_cache_key: None,
         };
         let request_history_reshaped = if let Some(nudge) = structured_repair_nudge.take() {
             let nudge_index = messages
@@ -3307,6 +3308,7 @@ fn bounded_summary_request(
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: Some(max_tokens),
             response_format: None,
+            prompt_cache_key: None,
         },
         shortened,
     ))
