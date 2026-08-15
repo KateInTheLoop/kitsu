@@ -16124,6 +16124,7 @@ async fn handle_slash(
                     "name": spec.name,
                     "syntax": spec.syntax(),
                     "description": spec.description,
+                    "alias_of": spec.alias_of,
                 })).collect::<Vec<_>>(),
             })));
         }
