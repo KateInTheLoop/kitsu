@@ -255,6 +255,22 @@ requirements are met, note it here and move down the sequence.
 
 (appended each cycle, newest last)
 
+### Cycle 3 — 2026-08-14 — R2.5 type-aware dispatch (document-review lane core complete)
+
+Shipped `read_document` (commit 1d01628): magic-bytes-then-extension
+detection routing to fs_read_csv / fs_read_pdf / fs_read_file, with
+honest detect-and-decline for images and Office docs (no binary garbage)
+and a per-type disclosure line on every route. 7 tests (detection matrix
++ e2e routing CSV/text/PDF/PNG/xlsx + allowlist). Live-verified through
+ollama qwen2.5-coder across CSV/PDF/text — correct routing, honest
+CMap-failure disclosure on the PDF. Haiku review: SHIP-AS-IS — all 10
+edge cases traced (magic-before-extension precedence, delegates
+re-authorizing, WEBP `magic[8..12]` length guard, authorization before
+magic read, no double-prepend, no raw-bytes path for image/office),
+acceptance signal met, no findings. **Lane 2's sequenced core (R2.1,
+R2.2, R2.5) is complete.** Next: R2.4 xlsx (calamine) plugs a real
+extractor into the dispatcher, then R2.3 image; then lane 3 (sysadmin).
+
 ### Cycle 1 — 2026-08-14 — R2.1 CSV structured reading (document-review lane)
 
 Shipped `fs_read_csv` (commit 8566486). Document review's first
