@@ -73,17 +73,15 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   **Validated in production 2026-08-14:** GLM edited the 63 KiB
   `openai_compat.rs` directly across 4 in-place edits with zero
   journal-limit errors (was one addition from the old wall).
-- R1.7 **Line-number prefixes on ranged reads** (found by the DeepSeek
-  loop, cycle 4) — `fs_read_file`'s ranged read returns raw joined text
-  with no line numbers, so a model citing a range must self-count from
-  `start_line` and drifts ~1 line (esp. when the first line is blank).
-  Whole-file readers (count from 1) don't drift; ranged readers do — a
-  systematic citation-accuracy loss. *Accept:* ranged reads prefix each
-  line with its absolute number (cat -n style) so citations land exactly.
-  **Tradeoff to handle:** `fs_edit_file` matches `old_text` verbatim, so a
-  model may copy the number prefix into `old_text` and fail — either strip
-  prefixes on the edit path, scope the prefix to ranged reads only, or
-  document it. Evaluate before shipping.
+- [x] (2026-08-14) R1.7 **Line-number prefixes on ranged reads** — shipped
+  (commit 51fc5cf): `read_capped_line_range` prefixes each served line with
+  its absolute number + tab (`42\t<code>`), cap accounting included. The
+  tradeoff was handled by SCOPING the prefix to ranged reads only — a full
+  read (the edit-context path) stays verbatim, so `fs_edit_file` (which
+  matches against the full/raw read) is unaffected; the prefix is
+  documented as display-only. Live-verified: a model citing a ranged read
+  now reports the exact line. Directly fixes the ~1-line drift that hit
+  every ranged-read reviewer (DeepSeek).
 
 ## 2. Document reviewer (PDF / CSV / spreadsheets / images / docs) — *biggest gap*
 
@@ -160,14 +158,26 @@ templated runbooks, no fleet dispatch.
   values + unchanged count; `ignore_case` for sshd-style directives;
   duplicate keys disclosed. Both paths authorized. Live-verified diffing
   a default vs hardened sshd_config.
-- R3.3 **Structured command results**: `command_exec` results expose
-  exit code, timing, and truncation flags as fields the model can
-  branch on (partly present — confirm and formalize). *Accept:* a
-  non-zero exit is a first-class field, not just text.
+- [x] (2026-08-14) R3.3 **Structured command results** — VERIFIED
+  already fully implemented (no code needed). `command_exec` serializes
+  the whole `CommandOutput` struct to JSON (command.rs:3094): `exit_code`,
+  `success`, `signal`, `elapsed_ms`, `stdout_truncated`/`stderr_truncated`,
+  and capture-complete flags are all first-class fields. A non-zero exit
+  is a completed result (Ok), not an error — pinned by
+  `nonzero_exit_and_stream_bounds_are_truthful` (exit_code Some(7)) and
+  `registered_handler_returns_structured_json` (the model-facing JSON
+  exposes exit_code). The "confirm and formalize" was already done.
 - R3.4 **Runbook mode**: `--script` already runs ordered turns; document
   and test a sysadmin runbook pattern (ordered steps, stop-on-failure,
   JSONL receipt per step). *Accept:* a 3-step runbook halts on step 2's
-  failure with a clear JSONL trail.
+  failure with a clear JSONL trail. **DEFERRED from the capability loop:**
+  the `--script` runner lives in `kitsu/src/main.rs` (the large
+  interactive/scripted-chat loop, with `ScriptFailureKind` + JSONL
+  emission already present) — that surface is owned by the UI/main loop
+  and actively edited by a concurrent session, so runbook stop-on-failure
+  + per-step JSONL is best done there, not from a low-cost capability
+  tick. Groundwork exists (`ScriptFailureKind::exit_code`,
+  `strict_jsonl_kind`, per-turn `turn_finished`/`error` JSONL events).
 
 ## 4. Automation / unattended agent — *strong; close the loop*
 
@@ -297,6 +307,23 @@ requirements are met, note it here and move down the sequence.
 ## Cycle log
 
 (appended each cycle, newest last)
+
+### Cycle 7 — 2026-08-14 — R3.3 verified done + R1.7 shipped (line-number prefixes)
+
+R3.3 (structured command results) was found ALREADY fully implemented and
+tested — command_exec serializes the whole CommandOutput (exit_code,
+success, elapsed_ms, truncation flags) to JSON, non-zero-exit-is-Ok pinned
+by tests — so it was checked off with citations, no code. R3.4 (runbook
+mode) was DEFERRED: it needs surgery in main.rs's scripted-chat loop
+(owned by the UI/main loop, concurrently edited) — not a safe low-cost
+capability slice. Implementation budget went to **R1.7** (commit 51fc5cf):
+ranged reads now carry absolute line-number prefixes (`42\t<code>`),
+scoped to ranged reads only so fs_edit_file is unaffected. 4 tests
+(prefixed ranged reads + full-read-no-prefix); live-verified a model
+citing the exact line. This fixes the ~1-line citation drift that hit
+DeepSeek every review cycle — the dogfooding's own finding, now shipped.
+Haiku review pending (key check: fs_edit_file never sees the prefix).
+Next: R3.4 (for the UI/main loop) or lane 1/4 hardening.
 
 ### Cycle 6 — 2026-08-14 — R3.2 config drift audit (sysadmin lane)
 
