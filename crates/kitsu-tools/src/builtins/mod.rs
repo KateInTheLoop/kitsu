@@ -141,6 +141,47 @@ mod tests {
     }
 
     #[test]
+    fn read_registration_keeps_common_and_specialized_descriptors_unique() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools(&mut registry, policy);
+
+        let names = registry
+            .descriptors()
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect::<Vec<_>>();
+        let unique = names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "duplicate descriptors: {names:?}"
+        );
+
+        for name in [
+            "fs_read_file",
+            "fs_list_dir",
+            "fs_read_csv",
+            "fs_read_pdf",
+            "fs_read_xlsx",
+            "read_document",
+            "fs_scan_file",
+            "fs_diff_config",
+        ] {
+            assert!(unique.contains(name), "missing common read tool {name}");
+            assert!(registry.is_registered(name), "missing handler for {name}");
+        }
+        #[cfg(unix)]
+        assert!(unique.contains("repo_grep"));
+        assert!(!unique.contains("fs_write_file"));
+        assert!(!unique.contains("fs_edit_file"));
+        assert!(!unique.contains("command_exec"));
+    }
+
+    #[test]
     fn filesystem_auto_allow_never_enables_command_execution() {
         let filesystem =
             Arc::new(Permissions::new(&[], &[], crate::permissions::Mode::AutoAllow).unwrap());

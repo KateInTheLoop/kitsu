@@ -2673,6 +2673,93 @@ fn offload_pressure_requires_real_window_pressure() {
 }
 
 #[test]
+fn artifact_policy_and_context_pressure_select_one_retention_path() {
+    use crate::orchestrator::{prepare_tool_output, ArtifactStoragePolicy, ToolArtifactStatus};
+    use kitsu_providers::ToolDescriptor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let content = format!("HEAD{}TAIL", "x".repeat(20_000));
+    let messages = initial_messages();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "fs_read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    let mut roomy = cfg(10);
+    roomy.context_window = Some(131_072);
+    roomy.offload_dir = Some(dir.path().to_path_buf());
+    let inline = prepare_tool_output(
+        content.clone(),
+        "roomy",
+        "repo_grep",
+        false,
+        &tools,
+        &messages,
+        &roomy,
+    );
+    assert_eq!(inline.content, content);
+    assert_eq!(
+        inline.retention.artifact_status,
+        ToolArtifactStatus::NotNeeded
+    );
+    assert!(inline.artifact_path.is_none());
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 0);
+
+    let mut tight = cfg(10);
+    tight.context_window = Some(8_192);
+    tight.offload_dir = Some(dir.path().to_path_buf());
+    let retained = prepare_tool_output(
+        content.clone(),
+        "tight",
+        "repo_grep",
+        false,
+        &tools,
+        &messages,
+        &tight,
+    );
+    assert_eq!(
+        retained.retention.artifact_status,
+        ToolArtifactStatus::Retained
+    );
+    assert!(retained.content.contains("full result saved to"));
+    assert!(retained
+        .artifact_path
+        .as_ref()
+        .is_some_and(|path| path.is_file()));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+    tight.artifact_policy = ArtifactStoragePolicy::InlineOnly;
+    let suppressed = prepare_tool_output(
+        content,
+        "suppressed",
+        "repo_grep",
+        false,
+        &tools,
+        &messages,
+        &tight,
+    );
+    assert_eq!(
+        suppressed.retention.artifact_status,
+        ToolArtifactStatus::SuppressedByPolicy
+    );
+    assert!(suppressed.retention.output_truncated);
+    assert!(suppressed
+        .content
+        .contains("bytes omitted by artifact-free policy"));
+    assert!(suppressed.artifact_path.is_none());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "artifact-free retention must not create a second file"
+    );
+}
+
+#[test]
 fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
     use crate::orchestrator::maybe_offload_for_tools;
     use kitsu_providers::ToolDescriptor;

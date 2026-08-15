@@ -11225,7 +11225,7 @@ async fn test_no_artifacts_resume_keeps_historical_pointer_but_grants_no_artifac
     let input = work.path().join("historical-large.txt");
     fs::write(
         &input,
-        format!("HISTORICAL_HEAD{}HISTORICAL_TAIL", "h".repeat(12_000)),
+        format!("HISTORICAL_HEAD{}HISTORICAL_TAIL", "h".repeat(20_000)),
     )
     .unwrap();
     let read_args = serde_json::json!({"path": input}).to_string();

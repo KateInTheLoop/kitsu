@@ -2042,7 +2042,6 @@ where
                 &tc.call_id,
                 &tc.tool_name,
                 is_err,
-                cfg.offload_dir.as_deref(),
                 tools,
                 messages,
                 cfg,
@@ -3684,7 +3683,6 @@ fn prepare_tool_output(
     call_id: &str,
     tool_name: &str,
     is_err: bool,
-    dir: Option<&std::path::Path>,
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
@@ -3729,7 +3727,14 @@ fn prepare_tool_output(
             artifact_path: None,
         };
     }
-    maybe_offload_for_tools_detailed(content, call_id, dir, tools, messages, cfg)
+    maybe_offload_for_tools_detailed(
+        content,
+        call_id,
+        cfg.offload_dir.as_deref(),
+        tools,
+        messages,
+        cfg,
+    )
 }
 
 /// Offload only when the active model can actually recover the resulting
