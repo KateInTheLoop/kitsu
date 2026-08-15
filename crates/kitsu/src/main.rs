@@ -11338,6 +11338,18 @@ async fn run_scripted_body(
                     }
                     continue;
                 }
+                SlashResult::UserFailure(message) => {
+                    status.failures += 1;
+                    finish_command("error", Some(&message), EXIT_USER)?;
+                    if !cli.jsonl {
+                        eprintln!(
+                            "{}:{line_number}: {}",
+                            terminal_inline(path),
+                            terminal_inline(&message)
+                        );
+                    }
+                    continue;
+                }
                 SlashResult::ProviderFailure(detail) => {
                     status.failures += 1;
                     status.provider_failures += 1;
@@ -14752,6 +14764,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     continue;
                 }
+                SlashResult::UserFailure(message) => {
+                    eprintln!("{}", terminal_inline(&message));
+                    continue;
+                }
                 SlashResult::Error | SlashResult::ProviderFailure(_) => continue,
                 SlashResult::Cancelled => continue,
                 SlashResult::Quit => {
@@ -15484,6 +15500,9 @@ enum SlashResult {
     Continue(Option<serde_json::Value>),
     Quit,
     Error,
+    /// A host-authored, terminal-safe user error that automation should retain
+    /// instead of replacing with the generic scripted-command fallback.
+    UserFailure(String),
     ProviderFailure(String),
     Cancelled,
     SubmitPrompt(SubmittedPrompt),
@@ -17073,12 +17092,12 @@ async fn handle_slash(
         }
         other => {
             let display = terminal_inline(other);
-            if let Some(suggestion) = closest_slash_command(other) {
-                eprintln!("unknown command: /{display} - did you mean /{suggestion}?");
+            let message = if let Some(suggestion) = closest_slash_command(other) {
+                format!("unknown command: /{display} - did you mean /{suggestion}?")
             } else {
-                eprintln!("unknown command: /{display} (try /help)");
-            }
-            return SlashResult::Error;
+                format!("unknown command: /{display} (try /help)")
+            };
+            return SlashResult::UserFailure(message);
         }
     }
     SlashResult::Continue(None)
