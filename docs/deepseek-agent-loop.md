@@ -1,12 +1,16 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 3 shipped (grade A-) after cycles 2 and its
-> retry produced no deliverable (4 of 4 shipless).** DeepSeek is
-> 2-for-6 on kitsu invocations. Cycle 3 shrunk the review scope to a
-> single ~60-line function and the over-reading vanished — 1 read, then
-> write, vs. 15–28 reads at larger scope — but n=1; see the Cycle 3
-> entry for the scope-sizing-vs-discipline verdict and caveats. See the
-> Cycle log below.
+> **LIVE 2026-08-14: cycle 5 was DeepSeek's first IMPLEMENTATION cycle
+> (grade C+, partial).** The tiny-scope discipline that held for 2
+> review cycles (3, 4 — both A-) did NOT transfer to an
+> implementation-plus-test task: DeepSeek made ~36 read/scan calls
+> against a 2-read cap, timed out before writing its test, and the turn
+> was discarded — but its file-edit checkpoints persisted anyway, and
+> the code change itself (proposal #1 from its own cycle-4 review) was
+> correct and shipped after the supervisor trimmed two out-of-scope
+> touches. See the Cycle 5 entry for the full account, including proof
+> that the test DeepSeek was asked to write is not constructible with
+> today's types. See the Cycle log below.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -621,3 +625,127 @@ share the 1 MiB write cap), so a fresh binary build can edit
 `orchestrator.rs` directly — but DeepSeek's first code-writing cycle
 should still prefer a small, self-contained function (or a small file)
 over a large one, consistent with the scope-size lesson above.
+
+### Cycle 5 — 2026-08-14 — first IMPLEMENTATION cycle, partial (grade C+)
+
+Task: implement DeepSeek's own strongest cycle-4 proposal on
+`ensure_chat_request_fits` (proposal #1 — `serde_json::to_string(tools)
+.unwrap_or_default()` silently turns a serialization failure into an
+empty `schema_json`, so `request_measurement` undercounts the request
+while the real, unmeasured tools schema still ships to the provider)
+plus a unit test that fails without the fix. Proposals #2/#3 were
+derivative style nits and #4 was a doc-comment wording fix, so #1 was
+the clear pick. The supervisor pre-corrected DeepSeek's own proposal
+snippet, which called a nonexistent `AgentError::internal(...)`; the
+prompt told DeepSeek to use the real `AgentError::Loop(String)` variant
+instead.
+
+**Journal-cap fix VALIDATED on a third model.** DeepSeek edited
+`orchestrator.rs` (129 KiB) directly with no journal-limit error — 2
+file-edit checkpoints landed (`orchestrator.rs` and, transiently,
+`orchestrator_tests.rs`) even though the turn's final chat message was
+later discarded. **New operational finding: checkpoint writes persist
+to disk independent of whether the turn's own message commits** — "the
+turn was discarded" does NOT mean "nothing changed"; a supervisor must
+always check `git status`/`git diff` after a failed/timed-out turn, not
+just the transcript.
+
+**Read discipline did not transfer from review to implementation.**
+Prompted with the same "at most 2 reads" cap that produced 1-read
+successes in cycles 3 and 4, DeepSeek made **~36 tool calls before its
+first edit** (16 `Read`, 18 `fs_scan_file`, 2 `List`, across
+`orchestrator.rs`, `orchestrator_tests.rs`, `kitsu-providers/src/types.rs`,
+and `lib.rs`) — chasing type definitions (`ChatRequest`, `ToolDescriptor`,
+`AgentError`) it needed to write a compiling test. This refines, not
+contradicts, the cycle-3/4 finding: **tiny scope disciplines
+READ-ONLY review, but an implementation-plus-test task legitimately
+needs cross-file type knowledge that a single-function read range
+can't supply, and DeepSeek does not ration those follow-on reads even
+under an explicit numeric cap.** No spawn was attempted (cap 1
+unexercised — 0 `spawn_agent` calls in the transcript). The turn then
+hit the 300s timeout mid-test-writing and was discarded; no usage was
+billed (consistent with prior discarded-turn cycles).
+
+**Scope crept beyond the target function, corrected by the
+supervisor.** DeepSeek's checkpoint edits (a) fixed
+`ensure_chat_request_fits` exactly as specified — correct, and (b)
+bumped its visibility from private to `pub(crate)` and added an unused
+import to `orchestrator_tests.rs`, apparently in preparation for a test
+it never got to write. Both were unnecessary: `orchestrator_tests` is
+declared via `#[path] mod orchestrator_tests;` **inside**
+`orchestrator.rs`, making it a descendant module that already sees
+`orchestrator`'s private items under Rust's ordinary visibility rules.
+The supervisor reverted both, leaving a minimal diff scoped to exactly
+the target function's body — matching the letter of "editing ONLY
+`ensure_chat_request_fits`."
+
+**The mandated unit test turned out to be unconstructible, not just
+undelivered.** DeepSeek's own proposal (and the cycle brief) suggested
+reproducing the serialization failure with a NaN/Infinite float inside
+the tools schema. The supervisor verified experimentally (standalone
+`serde_json` probe) that this is impossible through any safe public
+API: `serde_json::Number::from_f64(f64::NAN)` and `::from_f64(f64::INFINITY)`
+both return `None`, and parsing an overflow-exponent literal like
+`"1e400"` is a hard parse error (`"number out of range"`), not a
+lenient `Infinity` value. Since `ToolDescriptor::parameters` is a
+`serde_json::Value` and `Value` cannot hold a non-finite number by
+construction, **there is no legitimate input that makes
+`serde_json::to_string(&Vec<ToolDescriptor>)` fail today** — the bug
+proposal #1 fixes is real defensive correctness (never silently swallow
+a `Result` you could propagate) but is currently unreachable dead code,
+and no genuine "fails without the fix, passes with it" test exists for
+it without changing `ToolDescriptor`'s type (out of scope). The
+supervisor did not fabricate a hollow test and left the deliverable
+without one, docking the grade accordingly rather than inflating it
+with a test that would prove nothing.
+
+**Verification (workspace-wide, after the supervisor's trim):**
+`cargo build --workspace` clean (first attempt hit a spurious
+`CommandMode::AutoAllow` non-exhaustive-match error from stale
+incremental artifacts — `CARGO_TARGET_DIR` is intentionally shared
+between the main-checkout driver rebuild and the worktree build per
+spec, and this run shows that sharing can corrupt incremental state
+across two different workspace roots with identically-named crates;
+`cargo clean -p kitsu -p kitsu-tools -p kitsu-core -p kitsu-render`
+resolved it cleanly on rebuild — a process note, not a kitsu bug).
+`cargo clippy --workspace --all-targets` warning-free. `cargo test
+--workspace --no-fail-fast`: every suite green except the known PTY
+flake `test_query_only_interactive_session_does_not_create_a_snapshot`.
+`cargo fmt --all -- --check` clean, no reformatting needed.
+
+**Grade: C+ (partial).** The implemented fix is correct, minimal,
+exactly matches the selected proposal, and compiles/tests/lints clean
+workspace-wide — a real, if small, first code contribution. Docked
+substantially because (a) DeepSeek never delivered the mandated test
+(turn timed out mid-write), (b) the supervisor had to trim two
+out-of-scope touches (visibility bump, unused import) before the diff
+was acceptable, and (c) the supervisor, not DeepSeek, discovered that
+the requested test strategy doesn't actually work — a finding that
+should have been caught in review, not in verification.
+
+**kitsu weaknesses filed (backlog):**
+- W7: no technical read/tool-call cap exists yet (R4.10, filed cycle 2)
+  — this cycle is further evidence it's needed for implementation
+  tasks specifically, where prose "read at most N" caps that hold for
+  review tasks stop working once the model needs supporting type
+  definitions.
+- W8: a discarded/timed-out turn still leaves file-edit checkpoints on
+  disk with no summary of what changed printed to the user/supervisor
+  — kitsu should surface a clear "N files were modified by this
+  discarded turn" notice distinct from the per-checkpoint diff lines
+  already shown, so a caller doesn't have to know to run `git status`
+  themselves.
+
+**Ramp status:** DeepSeek is now 3-for-8 review/implementation attempts
+(review lane 3-for-3 once scope is single-function-tight: cycles 1 B,
+3 A-, 4 A-; implementation lane 0-for-1 clean, 1-for-1 partial: cycle 5
+C+ landed a correct fix but no test). The journal-cap fix is confirmed
+working end-to-end for DeepSeek specifically (third model validated,
+after Kimi and GLM). Next implementation cycle should (a) keep the
+target function tiny and self-contained as here, (b) additionally scope
+the test requirement to something DEMONSTRABLY constructible before
+the cycle starts — the supervisor should verify a failing-test
+reproduction is achievable BEFORE briefing DeepSeek, not after — and
+(c) consider a longer `--timeout-secs` for implementation-plus-test
+turns, since this one needed real exploration budget that a review-only
+turn doesn't.

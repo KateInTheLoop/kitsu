@@ -2018,11 +2018,11 @@ fn ensure_chat_request_fits(
     meter: &ContextMeter,
 ) -> Result<RequestMeasurement, AgentError> {
     let has_schema = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
-    let schema_json = req
-        .tools
-        .as_ref()
-        .map(|tools| serde_json::to_string(tools).unwrap_or_default())
-        .unwrap_or_default();
+    let schema_json = match &req.tools {
+        Some(tools) => serde_json::to_string(tools)
+            .map_err(|e| AgentError::Loop(format!("failed to serialise tools schema: {e}")))?,
+        None => String::new(),
+    };
     check_measurement(request_measurement(
         &req.messages,
         cfg,
