@@ -1828,3 +1828,79 @@ async fn test_model_context_length_unknown_model_stays_none_through_memo() {
     assert_eq!(provider.model_context_length("unknown-model").await, None);
     assert_eq!(provider.model_context_length("unknown-model").await, None);
 }
+
+/// P3 — `build_body` must fast-fail when a tool's `parameters` is not a JSON
+/// object. A non-object schema would otherwise be serialized verbatim and
+/// fail opaquely downstream at the gateway. This test could not compile against
+/// the old infallible signature (`build_body` returned `WireRequest`, not a
+/// `Result`), so it genuinely proves the behavior change.
+#[test]
+fn test_build_body_rejects_non_object_parameters() {
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "bad_tool".to_string(),
+        description: "a tool with a string-typed parameters field".to_string(),
+        parameters: serde_json::json!("not an object"),
+    }]);
+
+    let err = super::build_body(&req).expect_err("non-object parameters must error");
+    // Actionable message names the tool and states the constraint.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tool bad_tool: parameters must be a JSON Schema object"),
+        "unexpected error message: {msg}"
+    );
+
+    // A numeric `parameters` is also a non-object and must be rejected.
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "num_tool".to_string(),
+        description: "a tool with a numeric parameters field".to_string(),
+        parameters: serde_json::json!(42),
+    }]);
+    let err = super::build_body(&req).expect_err("numeric parameters must error");
+    assert!(
+        err.to_string()
+            .contains("tool num_tool: parameters must be a JSON Schema object"),
+        "unexpected error message for numeric parameters: {}",
+        err
+    );
+}
+
+/// P3, requirement (b): a tool with a valid JSON object `parameters` still
+/// builds successfully — no regression for well-formed descriptors.
+#[test]
+fn test_build_body_accepts_valid_object_parameters() {
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "good_tool".to_string(),
+        description: "a tool with a proper schema".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }]);
+
+    let body = super::build_body(&req).expect("valid object parameters should build");
+    assert!(
+        body.tools.is_some(),
+        "tools should be present on the wire request"
+    );
+}
+
+/// P3, requirement (c): a request with no tools still builds successfully.
+#[test]
+fn test_build_body_ok_with_no_tools() {
+    // `simple_request()` already has `tools: None`.
+    let req = simple_request();
+    let body = super::build_body(&req).expect("no-tools request should build");
+    assert!(
+        body.tools.is_none(),
+        "tools should be absent on the wire request"
+    );
+
+    // An empty tools vec is likewise fine (vacuously no malformed schemas).
+    let mut req = simple_request();
+    req.tools = Some(vec![]);
+    let body = super::build_body(&req).expect("empty-tools request should build");
+    assert!(
+        body.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true),
+        "empty tools should serialize to an empty vec (or be absent)"
+    );
+}
