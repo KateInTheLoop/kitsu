@@ -259,6 +259,23 @@ requirements are met, note it here and move down the sequence.
 
 (appended each cycle, newest last)
 
+### Cycle 4 — 2026-08-14 — R2.4 xlsx extraction (lane 2 effectively complete)
+
+Shipped `fs_read_xlsx` (commit 63a139a) via pure-Rust `calamine`: sheet
+names + a bounded cell window (sheet by name/0-based index, start_row/
+max_rows, 500 ceiling, empty cells blank), wired into `read_document`'s
+XLSX branch as real extraction. 32 MiB guard, same allowlist. Tests use
+an embedded real .xlsx fixture (include_bytes!, no writer dep); the
+read_document routing test now extracts xlsx and still declines docx.
+Live-verified through ollama qwen2.5-coder both directly and via
+dispatch. Haiku review: SHIP-AS-IS — all 10 edge cases traced including
+the security property (authorize before any file op; the canonical
+authorized path — not the raw user arg — flows through to calamine, no
+TOCTOU), acceptance signal met, no findings. **Lane 2 now covers CSV,
+PDF, xlsx extraction + type-aware dispatch — the common document types.
+Remaining: R2.3 image metadata (opportunistic) and optional docx text.
+Next: lane 3 (system administration), R3.1 log scanning.**
+
 ### Cycle 3 — 2026-08-14 — R2.5 type-aware dispatch (document-review lane core complete)
 
 Shipped `read_document` (commit 1d01628): magic-bytes-then-extension
