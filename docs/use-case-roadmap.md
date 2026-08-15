@@ -348,9 +348,23 @@ no dependency-vulnerability integration.
   SHIP-AS-IS. Note: this is the summary half; a fuller flow could also
   RUN `cargo audit` via the guarded command_exec, but the roadmap's
   acceptance ("given cargo audit JSON") is met by the summary tool.
-- R5.2 **Secret-in-diff guard**: flag apparent credentials in a diff
-  before commit (reuses the existing credential-filter machinery).
-  *Accept:* a diff containing an API-key-shaped string is flagged.
+- [x] (2026-08-15) R5.2 **Secret-in-diff guard** — shipped as the
+  `scan_secrets` builtin (commit 535475c): flags lines that appear to
+  hold a credential — known token prefixes (hf_/sk-/ghp_/AKIA/AIza/…),
+  URL user:pass@host, secret assignments (api_key=/password:/token=/…),
+  and Bearer tokens — reporting each flagged line number + kind with the
+  line REDACTED (never echoing the raw secret). Point it at a saved
+  `git diff`. Detection mirrors the binary's credential filter
+  (`sanitize_and_redact_text`) exactly, incl. the ≥8-body-char guard that
+  spares `hf_model`-style identifiers; kept as a self-contained copy
+  because kitsu-tools can't depend on the binary (a future refactor could
+  share a module). Streams (256 MiB budget, bounded memory), advisory
+  (never blocks). Bearer redaction runs FIRST to close a real leak
+  (`Authorization: Bearer <tok>` — the `authorization:` assignment rule
+  would otherwise eat "Bearer" and expose the token), pinned by a
+  regression test. Dep-free. Haiku (security-focused) review: SHIP-AS-IS,
+  no-leak invariant verified (bearer-first, UTF-8-safe, source-faithful,
+  tests assert secret ABSENCE). **Lane 5 complete.**
 
 ## 6. Scientific / data document review (incl. biology) — *described, deprioritized*
 
@@ -509,6 +523,32 @@ lane-6 scientific-doc review (largely covered by lane 2 already). Next
 tick should pick R5.2 if the credential machinery is reusable as a tool,
 else flag that the loop needs a run-layer mandate coordinated with the
 other sessions.
+
+### Cycle 14 — 2026-08-15 — R5.2 scan_secrets (completes lane 5)
+
+Shipped `scan_secrets` (commit 535475c): an advisory credential guard for
+diffs/files — flags known token prefixes, url user:pass, secret
+assignments, and bearer tokens, emitting each flagged line REDACTED
+(never the raw secret). Detection ports the binary's credential filter
+verbatim (kitsu-tools can't depend on the binary). Development found and
+fixed a REAL leak: on `Authorization: Bearer <tok>` the `authorization:`
+assignment rule ate the word "Bearer" and left the token exposed, so
+bearer redaction now runs FIRST — pinned by a regression test asserting
+the token's ABSENCE. Streams (256 MiB budget), dep-free. Security-focused
+haiku review: SHIP-AS-IS — no-leak invariant verified (bearer-first,
+UTF-8-safe on adversarial input, source-faithful, tests assert secret
+absence not just marker presence). **Lane 5 (security tooling) complete:
+R5.1 audit_summary + R5.2 scan_secrets.**
+
+**Capability-loop runway note:** with lanes 2, 3 (bar UI-owned R3.4), and
+5 complete and lane 1 down to UI-owned items, the loop has now exhausted
+the cleanly SELF-CONTAINED kitsu-tools slices. Everything left is
+run-layer (lane 4: R4.3/R4.4/R4.6/R4.10-12 in main.rs/orchestrator —
+concurrently-edited by the UI/main loop and touched by the model-worker
+loops) or lane-6 scientific docs (already covered by lane 2). The loop
+needs a repointed mandate — a coordinated lane-4 assignment or a gen-2
+role — rather than more standalone fs tools. Flagged for the gen-2
+strategy decision.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
