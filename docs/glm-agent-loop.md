@@ -171,3 +171,34 @@ transport-killed first attempt doesn't count against the model). **Grade
 A debut — GLM has reached Kimi-cycle-4 review level.** Next cycle: a
 second review OR begin the implementation ramp (a fresh P-item Kimi
 hasn't taken — P7/P10/P11), applying the same recipe.
+
+### Cycle 2 — 2026-08-14 — second review confirms consistency (grade A) → GRADUATES
+
+Fresh file — the provider usage/caching path in `openai_compat.rs`.
+Success on `:together` attempt 1 (3 ticks healthy now — cycle 1's
+transport failure was a one-off). `reviews/glm-cycle-2.md`: 4 ranked,
+line-cited proposals (cached_tokens surfacing, context-length-cache
+efficiency, tool-schema fast-fail, empty-choice guard). Commit `3870a9c`
+(Kate verified), pushed. cap-1 unexercised.
+
+- **Citation accuracy: 5/5 EXACT — zero drift, holding cycle 1's perfect
+  record two cycles running.** No substantively-wrong proposals; one
+  claim about a `ProviderError` variant was correctly HEDGED rather than
+  guessed (the variant does exist — good caution).
+- Read discipline held: 5 ranged reads of the target + 2 disclosed
+  grounding reads of `types.rs` (7 total, one over the ~5 guidance but
+  transparently reasoned, not silent overreach).
+- **Third instance of GLM independently converging on real, unclaimed
+  issues:** two of its four proposals (cached_tokens, context-length
+  caching) duplicate still-open items in Kimi's backlog — found from
+  scratch.
+
+**GLM is 2-for-2 at grade A with a perfect citation record. It has
+matched Kimi's review quality. GRADUATING to the implementation ramp.**
+Cycle 3 = GLM's first CODE cycle: implement **P10** (cache the parsed
+per-model context length instead of re-parsing the catalog JSON per
+call) in `openai_compat.rs` — which is exactly the context-length-cache
+efficiency fix GLM proposed in this very cycle (implementing its own
+finding, as Kimi did with P3). Widen `--allow-write` to `kitsu-providers`
+for that cycle; apply the full write-first recipe + workspace-wide
+verification.
