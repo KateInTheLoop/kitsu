@@ -1811,10 +1811,14 @@ async fn test_model_context_length_none_when_field_absent() {
     assert_eq!(provider.model_context_length("my-model").await, None);
 }
 
-/// A lone entry is used even if its id doesn't match exactly.
+/// Regression: a lone catalog entry that matches neither exactly nor loosely
+/// must NOT bind a window. Before the fix, the sole-entry fallback accepted
+/// `entries[0]` whatever its id, silently budgeting against the wrong window
+/// (here a "whatever" query against a "served-model" entry returned
+/// `Some(16384)` instead of `None`).
 #[tokio::test]
 #[serial]
-async fn test_model_context_length_lone_entry_fallback() {
+async fn test_model_context_length_lone_nonmatching_entry_is_none() {
     let server = MockServer::start().await;
     let _g = EnvGuard::set(TEST_ENV, "test-token");
     Mock::given(method("GET"))
@@ -1826,7 +1830,52 @@ async fn test_model_context_length_lone_entry_fallback() {
         .mount(&server)
         .await;
     let provider = provider_with_models(server.uri());
-    assert_eq!(provider.model_context_length("whatever").await, Some(16384));
+    // "whatever" is neither an exact id nor a delimiter-bounded loose match of
+    // "served-model": a sole entry must not be accepted as a fallback.
+    assert_eq!(provider.model_context_length("whatever").await, None);
+}
+
+/// A lone entry that DOES match — exactly or loosely — still resolves to its
+/// own context length. (Guards against over-correcting the lone-entry fix into
+/// rejecting every single-entry catalog.)
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_lone_matching_entry_resolves() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"served-model","context_length":16384}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // Exact id match on the sole entry.
+    assert_eq!(
+        provider.model_context_length("served-model").await,
+        Some(16384)
+    );
+    // A short alias that loosely (delimiter-bounded) matches the sole entry.
+    assert_eq!(provider.model_context_length("served").await, Some(16384));
+}
+
+/// An exact match among multiple entries still resolves (unchanged behavior).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_exact_match_among_many() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"alpha","context_length":4096},{"id":"beta","context_length":32768},{"id":"gamma","context_length":128000}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("beta").await, Some(32768));
 }
 
 /// No models_path configured → no request, None (never errors).
