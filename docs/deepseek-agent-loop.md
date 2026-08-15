@@ -346,3 +346,35 @@ swallowing `serde_json::to_string` failures appears in multiple
 orchestrator.rs functions (fixed in `ensure_chat_request_fits` cycle 5;
 flagged again around `compact_context`). Worth a Kimi sweep to find and
 guard all instances.
+### Cycle 7 — 2026-08-14 — BEST CYCLE (grade A): R1.7 + hedging fixes both landed
+
+Reviewed `summarize_or_fallback` (2545-2661). Process perfect for the 4th
+clean cycle: 1 ranged read → 1 write, no over-read, no spawn, exit 0 (no
+discard this time). kitsu-usage 17,152 / 4,922 / 22,074. Commit `05f4fa7`
+(Kate verified), pushed.
+
+- **R1.7 VALIDATED FOR DEEPSEEK — the loop closes.** All citations
+  letter-perfect on BOTH quoted text AND line-number labels — the FIRST
+  cycle with ZERO label drift. The absolute line-number prefixes shipped
+  in R1.7 (from DeepSeek's OWN cycle-4 finding) eliminated the ~1-line
+  self-count error that drifted every prior ranged-read cycle. A clean
+  find→fix→validate arc across the loops.
+- **Hedging fix landed too.** DeepSeek hedged ONLY genuinely out-of-range
+  dependencies (a SummaryFallbackReason/CompactionOutcome variant, the
+  value of MAX_COMPACT_FAILURES, caller behavior) and did NOT hedge
+  in-range facts — **no unhedged wrong claims**, a clean reversal of
+  cycle 6's failure mode. The cron hedging instruction worked.
+- All 3 proposals substantively correct (verified): (1 high) the
+  `Complete { usage, .. }` arm @2627 labels an empty completion
+  `ProviderFailure`, conflating "errored" with "succeeded but empty";
+  (2 med) zero-drop path leaves `progress.outcome` stale; (3 low)
+  circuit-breaker records `CircuitBreaker` even when the request was also
+  oversized.
+
+**Ramp verdict UPGRADED:** DeepSeek is now a STRONG tiny-scope reviewer —
+process rock-solid (4 clean cycles), citations perfect (R1.7), hedging
+correct. Both diagnosed weaknesses are fixed. Grades: B, A-, A-, B+, A.
+It remains review-only until R4.10 (implementation type-chasing unchanged),
+but as a reviewer it now matches GLM's discipline. (Minor: `--prompt`
+isn't a flag on `kitsu chat` — prompt is positional; same CLI-friction
+family as R4.7.)
