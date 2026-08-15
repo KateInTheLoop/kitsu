@@ -530,3 +530,44 @@ verified), pushed. Single attempt, 7 tool calls, completion 2,769/24,000
 **Backlog: P1-P8 ✅. Kimi is 9-for-9 on code work (cycles 7-15).** Next:
 P9 (budget-reserve/max_output consistency, context.rs+orchestrator.rs),
 P11 (schema re-serialization cache, synergizes with P7), or a fresh item.
+
+### Cycle 16 — 2026-08-14 — P9 budget/max_output consistency (grade A)
+
+Kimi fixed the disagreement between the reply reserve and the max_output
+actually SENT. `context.rs`: `ContextBudget` grew `pub reserve` +
+`clamped_max_output()`, plus a free `clamp_max_tokens_to_reserve(Option<u32>,
+&ContextBudget)` that clamps a caller's max_tokens DOWN to the reserve
+(already-fitting values untouched, None→None). `orchestrator.rs` (~1112,
+edited directly): rewrites max_tokens through the clamp before the
+`ChatRequest` is built, so the number the provider is told and the number
+the budget measured are now the same. Commit `99c850e` (Kate verified),
+pushed. First attempt, cap-1 held, zero spawns.
+
+- Test (a) proves window=8192/max_output=Some(8192) → reserve 4096, rewrite
+  8192→4096, effective == 8192−4096; (b) already-fitting value unchanged +
+  a smaller value never inflated; (c) None stays None. kitsu-core 119/119,
+  purely additive. **Grade A.**
+
+**kitsu weaknesses (two, both real):**
+1. **Confirms R4.12 from a SECOND loop this hour** (GLM W5 was the first):
+   an early self-recovered `PolicyDenied` (read a directory instead of a
+   file, twice at the start) poisoned the WHOLE turn — the CLI discarded
+   the correct clean final answer (`provisional assistant output was
+   DISCARDED`) even though every later action incl. the summary succeeded;
+   the edits survived only via the retained-checkpoint mechanism. The
+   supervisor notes the cycle-30 "policy-denied turns commit their truthful
+   answer as partial" fix (07b7b59) does NOT cover this self-recovered-
+   early-failure shape. **Two independent models hit R4.12 in one hour —
+   promote it.**
+2. **NEW (→ roadmap R1.8): debris-detector false positive on Edit.** The
+   template-debris scanner fired 3× on `Edit(orchestrator.rs)` with
+   "content contains a raw model chat-template control marker" — a false
+   positive: the file's OWN debris-detector code contains literal
+   `<|im_start|>` etc. marker strings AS DATA, so editing near that region
+   trips the scanner on pre-existing file content, not injected garbage.
+   Editing any file that contains template markers as data hits this.
+
+**Backlog: P1-P9 ✅. Kimi is 10-for-10 on code work (cycles 7-16).** Next:
+P11 (schema re-serialization cache — synergizes with Kimi's own P7), or
+the unwrap_or_default() serialization-swallow sweep (4 sites in
+orchestrator.rs, DeepSeek-flagged; defensive), or a fresh item.

@@ -73,6 +73,18 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   **Validated in production 2026-08-14:** GLM edited the 63 KiB
   `openai_compat.rs` directly across 4 in-place edits with zero
   journal-limit errors (was one addition from the old wall).
+- R1.8 **Debris-detector false positive on Edit content** (found by the
+  Kimi loop, cycle 16): the template-control-debris scanner (added
+  cycle 30 to catch raw `<|...|>` markers leaking from a provider) also
+  fires on `fs_edit_file`/`fs_write_file` content that legitimately
+  CONTAINS such marker strings as data — e.g. editing kitsu's own
+  debris-detector code, or any file with template markers as string
+  literals — producing a spurious "content contains a raw model
+  chat-template control marker" warning 3× in Kimi cycle 16. *Accept:* the
+  debris scanner distinguishes markers in MODEL-GENERATED tail output
+  (its real target) from marker strings in file content the model is
+  intentionally writing/editing; editing a file that contains `<|...|>`
+  literals raises no false debris warning.
 - [x] (2026-08-14) R1.7 **Line-number prefixes on ranged reads** — shipped
   (commit 51fc5cf): `read_capped_line_range` prefixes each served line with
   its absolute number + tab (`42\t<code>`), cap accounting included. The
@@ -238,7 +250,8 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   discarded" notice (stderr + machine record), listing the paths, so the
   operator/next-run knows the workspace changed.
 - R4.12 **Don't classify a RECOVERED-tool-error turn as a failure**
-  (found by the GLM loop, W5): a turn that hit a tool error (e.g. a
+  (found by the GLM loop W5 AND the Kimi loop cycle 16 in the SAME hour —
+  two independent models, promote): a turn that hit a tool error (e.g. a
   PolicyDenied misfire) or a self-corrected edit conflict, then RECOVERED
   and produced a complete committed deliverable, is still marked
   `DISCARDED` / `session not saved` / exit 1 because ANY tool/policy error
