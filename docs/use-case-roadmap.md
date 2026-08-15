@@ -99,12 +99,14 @@ richest greenfield lane.
   extraction (both are zip+XML; pure-Rust `calamine` covers xlsx).
   *Accept:* a `.docx` yields its paragraph text; an `.xlsx` yields
   sheet names + a bounded cell window.
-- R2.5 **Type-aware dispatch**: `fs_read_file` (or a sibling
-  `read_document` tool) detects type by extension+magic bytes and routes
-  to the right extractor, always disclosing which path was taken and its
-  limits. *Accept:* one entry point handles `.txt/.csv/.pdf/.png/.xlsx`
-  with a per-type disclosure line; unknown types fall back to the
-  UTF-8-with-truncation behavior unchanged.
+- [x] (2026-08-14) R2.5 **Type-aware dispatch** — shipped as the
+  `read_document` tool (commit 1d01628): detects type by magic bytes
+  then extension, routes `.csv/.tsv`→fs_read_csv, `.pdf`/%PDF→fs_read_pdf,
+  plain/unknown→UTF-8 text read (fallback preserved), and detects+discloses
+  images (PNG/JPEG/GIF/WEBP) and Office (xlsx/docx/pptx) with an honest
+  "no extractor yet" decline instead of binary garbage. Per-type disclosure
+  line on every route; delegates reuse the same allowlist guard. Image and
+  xlsx *extraction* (R2.3/R2.4) plug into this dispatcher next.
 
 ## 3. System administration helper — *primitives exist, no orchestration*
 
@@ -190,6 +192,16 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   response surfaces a message naming the failing stage (e.g. "usage
   chunk", "tool_call arguments JSON", "empty choices") and a bounded
   snippet of the offending body, without leaking secrets.
+- R4.10 **Technical read/tool-call cap per turn** (surfaced by the
+  DeepSeek loop, W6): kitsu has a spawn-count cap (`--agent-spawn-cap`)
+  but no analogous cap on reads or total tool calls per turn. A model
+  that compulsively over-reads (DeepSeek: 15-28 reads, never writing,
+  until the 300s timeout discards the whole turn) cannot be reined in by
+  prose alone — a prose read-cap is 0-for-3 against it. *Accept:* a
+  `--max-tool-calls-per-turn` (or `--max-reads-per-turn`) lever that,
+  when exceeded, returns a tool error nudging the model to act on what it
+  has, the same way the spawn cap does. Would also bound cost on
+  runaway turns.
 
 ## 5. Security tooling — *described, deprioritized*
 
@@ -224,8 +236,10 @@ no dependency-vulnerability integration.
 
 Priority order the loop follows (revisit as lanes close):
 
-1. **Document review** (lane 2) — biggest capability gap, clear wins;
-   start with R2.1 CSV, then R2.2 PDF, then R2.5 type-aware dispatch.
+1. **Document review** (lane 2) — R2.1 CSV ✅, R2.2 PDF ✅, R2.5 dispatch
+   ✅ (the sequenced core is done). Remaining lane-2 items now plug real
+   extractors into the `read_document` dispatcher: R2.4 xlsx (calamine,
+   pure-Rust) next, then R2.3 image metadata.
 2. **System administration** (lane 3) — R3.1 log scanning first.
 3. **Code analysis hardening** (lane 1) — R1.3 symbol nav, R1.4 grouped
    edit receipts.
