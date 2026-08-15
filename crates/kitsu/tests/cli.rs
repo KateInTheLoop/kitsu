@@ -5740,7 +5740,11 @@ fn test_script_output_last_message_reports_preserved_without_committed_assistant
         .success()
         .stderr(predicate::str::contains(
             "~ --output-last-message unchanged: no committed assistant message",
-        ));
+        ))
+        .stderr(predicate::str::contains(
+            "~ run summary: 1 successful operation,",
+        ))
+        .stderr(predicate::str::contains("turn(s) ok").not());
     assert!(!absent.exists(), "a no-op must not create the destination");
 }
 
