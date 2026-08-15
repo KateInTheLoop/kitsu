@@ -15257,10 +15257,9 @@ async fn handle_slash(
                     })));
                 }
                 None => {
-                    eprintln!(
+                    return SlashResult::UserFailure(format!(
                         "checkpoint #{id} is not available; run /checkpoints to list recoverable checkpoints"
-                    );
-                    return SlashResult::Error;
+                    ));
                 }
             }
         }
