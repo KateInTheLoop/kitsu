@@ -324,6 +324,10 @@ fn create_unique_private_artifact_with_sequence(
 struct CappedText {
     text: String,
     truncated: bool,
+    /// Total on-disk size in bytes (cheap via metadata) so a capped read can
+    /// disclose how much was NOT served (cycle-19/29 audits: a model read
+    /// 1731 of 15682 lines and said DONE with nothing marking the gap).
+    total_bytes: u64,
 }
 
 fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Result<CappedText> {
@@ -351,7 +355,89 @@ fn read_capped_text(mut file: std::fs::File, max_bytes: usize) -> std::io::Resul
             return Err(std::io::Error::new(std::io::ErrorKind::InvalidData, error));
         }
     };
-    Ok(CappedText { text, truncated })
+    Ok(CappedText {
+        text,
+        truncated,
+        total_bytes: metadata.len(),
+    })
+}
+
+/// Read lines `[start, end]` (1-based, inclusive) with the byte cap applied
+/// to the *served range*, not the absolute file prefix. The pre-fix behavior
+/// read only the first `max_bytes` from byte 0 and then sliced the range out
+/// of that prefix, so any range starting past the cap returned almost
+/// nothing — on a ~128 KiB source file this burned 6-7 thrashing tool rounds
+/// per turn before the model gave up (kimi-k3 cycle-1 supervisor finding).
+/// Skipped prefix lines cost I/O only, never memory.
+fn read_capped_line_range(
+    file: std::fs::File,
+    max_bytes: usize,
+    start: usize,
+    end: usize,
+) -> std::io::Result<CappedText> {
+    use std::io::BufRead;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("read target is not a regular file"));
+    }
+    let mut reader = std::io::BufReader::new(file);
+    let mut line = String::new();
+    let mut line_number = 0usize;
+    let mut text = String::new();
+    let mut truncated = false;
+    loop {
+        line.clear();
+        if reader.read_line(&mut line)? == 0 {
+            break;
+        }
+        line_number += 1;
+        if line_number < start {
+            continue;
+        }
+        if line_number > end {
+            break;
+        }
+        // Match the historical `.lines()` slicing: line terminators are
+        // stripped and served lines are joined with '\n'.
+        let stripped = line
+            .strip_suffix('\n')
+            .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
+            .unwrap_or(&line);
+        // Prefix each served line with its ABSOLUTE line number + a tab, so a
+        // model citing a ranged read counts from the file's real numbering
+        // instead of self-counting from `start` (which drifts ~1 line,
+        // especially on a blank first line — the R1.7 fix). The prefix is
+        // display-only: fs_edit_file matches raw file text, so `old_text`
+        // must NOT include it (documented in the tool description).
+        let prefix = format!("{line_number}\t");
+        let separator = usize::from(!text.is_empty());
+        if text.len() + separator + prefix.len() + stripped.len() > max_bytes {
+            truncated = true;
+            if text.is_empty() {
+                // A single line larger than the whole budget: serve the line
+                // number prefix and the content prefix on a char boundary.
+                text.push_str(&prefix);
+                let budget = max_bytes.saturating_sub(prefix.len());
+                let mut cut = budget.min(stripped.len());
+                while cut > 0 && !stripped.is_char_boundary(cut) {
+                    cut -= 1;
+                }
+                text.push_str(&stripped[..cut]);
+            }
+            break;
+        }
+        if separator == 1 {
+            text.push('\n');
+        }
+        text.push_str(&prefix);
+        text.push_str(stripped);
+    }
+    Ok(CappedText {
+        text,
+        truncated,
+        total_bytes: metadata.len(),
+    })
 }
 
 fn open_read_file(path: &Path) -> std::io::Result<std::fs::File> {
@@ -385,9 +471,9 @@ where
 struct ReadFileArgs {
     path: String,
     /// Optional 1-based inclusive line range [start, end].
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     start_line: Option<usize>,
-    #[serde(default)]
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
     end_line: Option<usize>,
 }
 
@@ -395,7 +481,11 @@ pub fn read_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_read_file".to_string(),
         description: "Read a UTF-8 text file from an allowed path. Optionally restrict to a \
-                      1-based inclusive line range with start_line/end_line."
+                      1-based inclusive line range with start_line/end_line. A ranged read \
+                      prefixes each line with its absolute line number and a tab (e.g. \
+                      \"42\\t<code>\") so you can cite exact line numbers; this prefix is \
+                      display-only — do NOT include it in fs_edit_file old_text. A full read \
+                      (no range) is returned verbatim with no prefixes."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -434,34 +524,1326 @@ where
     let file = open_read_file(authorization.path())
         .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
     authorization.validate_opened_file(&file, policy)?;
+    // Ranged reads stream to the requested lines and apply the byte cap to
+    // the range itself; only a full-file read caps from the file start.
+    let content = match (a.start_line, a.end_line) {
+        (None, None) => tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes)),
+        (start, end) => {
+            let start = start.unwrap_or(1).max(1);
+            let end = end.unwrap_or(usize::MAX);
+            tokio::task::spawn_blocking(move || read_capped_line_range(file, max_bytes, start, end))
+        }
+    }
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+
+    // Disclose what the caller actually received (post-slice), not the
+    // pre-slice absolute read — the earlier figure misdescribed narrow
+    // ranges on large files (kimi-k3 cycle-1 supervisor finding).
+    let served_bytes = content.text.len();
+    // The size disclosure is appended AFTER policy capping: cap_output trims
+    // the tail, so an earlier append would be eaten and replaced by its
+    // generic marker (the pre-fix behavior). The ~100-byte overflow past the
+    // cap is deliberate — the disclosure is the point.
+    let mut capped = policy.cap_output(content.text);
+    if content.truncated {
+        capped.push_str(&format!(
+            "\n...[truncated: output exceeded byte cap — served {} KiB of {} KiB total; re-read a line range for the rest]",
+            served_bytes / 1024,
+            content.total_bytes / 1024,
+        ));
+    }
+    Ok(capped)
+}
+
+// --- fs.read_csv ------------------------------------------------------------
+
+/// Default number of data rows returned in one `fs_read_csv` window when the
+/// caller does not specify `max_rows`. Small enough to stay well under the
+/// output cap on wide tables; the caller pages with `start_row`/`max_rows`.
+const CSV_DEFAULT_MAX_ROWS: usize = 50;
+/// Hard ceiling on a single window regardless of the requested `max_rows`, so
+/// one call can never blow the output budget on a huge table.
+const CSV_MAX_ROWS_CEILING: usize = 500;
+/// Per-column values sampled for type inference (bounds work on wide files).
+const CSV_TYPE_SAMPLE: usize = 200;
+
+#[derive(Deserialize)]
+struct ReadCsvArgs {
+    path: String,
+    /// 1-based first DATA row to show (the header is never a data row).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_row: Option<usize>,
+    /// Max data rows in this window (clamped to `CSV_MAX_ROWS_CEILING`).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_rows: Option<usize>,
+    /// Single-character field delimiter; defaults to ',' (accepts e.g. "\t").
+    #[serde(default)]
+    delimiter: Option<String>,
+    /// Treat the first row as data, not a header (default: header present).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    no_header: bool,
+}
+
+/// Accept `true`/`false`, `"true"`/`"false"` (any case), and `0`/`1` for
+/// boolean flags: small models routinely emit booleans as quoted strings, and
+/// a hard serde rejection burns a whole tool round with no repair hint — the
+/// same footgun `lenient_opt_usize` fixes for integers (found via a live
+/// llama3.2 fs_read_csv run passing `no_header: "false"`).
+fn lenient_bool<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Bool(bool),
+        Int(i64),
+        Text(String),
+    }
+    match Lenient::deserialize(deserializer)? {
+        Lenient::Bool(b) => Ok(b),
+        Lenient::Int(0) => Ok(false),
+        Lenient::Int(1) => Ok(true),
+        Lenient::Int(other) => Err(serde::de::Error::custom(format!(
+            "expected a boolean, got {other} — pass true or false"
+        ))),
+        Lenient::Text(text) => match text.trim().to_ascii_lowercase().as_str() {
+            "true" | "yes" | "1" => Ok(true),
+            "false" | "no" | "0" | "" => Ok(false),
+            other => Err(serde::de::Error::custom(format!(
+                "expected a boolean, got '{other}' — pass true or false (quoted \"true\" is also accepted)"
+            ))),
+        },
+    }
+}
+
+/// A column's inferred value type across the sampled rows.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum CsvType {
+    Empty,
+    Integer,
+    Float,
+    Bool,
+    String,
+}
+
+impl CsvType {
+    fn label(self) -> &'static str {
+        match self {
+            CsvType::Empty => "empty",
+            CsvType::Integer => "int",
+            CsvType::Float => "float",
+            CsvType::Bool => "bool",
+            CsvType::String => "string",
+        }
+    }
+
+    /// The type of a single cell value in isolation.
+    fn of_cell(value: &str) -> CsvType {
+        let trimmed = value.trim();
+        if trimmed.is_empty() {
+            return CsvType::Empty;
+        }
+        if trimmed.parse::<i64>().is_ok() {
+            return CsvType::Integer;
+        }
+        if trimmed.parse::<f64>().is_ok() {
+            return CsvType::Float;
+        }
+        let lower = trimmed.to_ascii_lowercase();
+        if lower == "true" || lower == "false" {
+            return CsvType::Bool;
+        }
+        CsvType::String
+    }
+
+    /// Fold a new cell type into the running column type. Integers widen to
+    /// floats; anything mixed or non-numeric collapses to string; `Empty`
+    /// cells never override a known type (nullable columns keep their type).
+    fn merge(self, cell: CsvType) -> CsvType {
+        match (self, cell) {
+            (a, CsvType::Empty) => a,
+            (CsvType::Empty, b) => b,
+            (a, b) if a == b => a,
+            (CsvType::Integer, CsvType::Float) | (CsvType::Float, CsvType::Integer) => {
+                CsvType::Float
+            }
+            _ => CsvType::String,
+        }
+    }
+}
+
+pub fn read_csv_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_csv".to_string(),
+        description: "Read a CSV/TSV file as structured data from an allowed path: reports column \
+                      headers, total data-row count, and an inferred type per column, then returns \
+                      a bounded window of rows. Page with start_row (1-based data row) and \
+                      max_rows. Set delimiter for TSV (\"\\t\") and no_header for headerless files. \
+                      Malformed rows (wrong field count) are disclosed, never silently dropped."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "CSV/TSV file path to read"},
+                "start_row": {"type": "integer", "description": "1-based first data row to show (optional, default 1)"},
+                "max_rows": {"type": "integer", "description": "Max data rows in this window (optional, default 50, max 500)"},
+                "delimiter": {"type": "string", "description": "Field delimiter, one character (optional, default ',', use \"\\t\" for TSV)"},
+                "no_header": {"type": "boolean", "description": "Treat the first row as data rather than a header (optional, default false)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_csv_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_csv_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadCsvArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let delimiter = match a.delimiter.as_deref() {
+        // An omitted or empty delimiter defaults to comma: small models pass
+        // `""` for optional string args constantly, and erroring on it burns a
+        // tool round (found via a live llama3.2 fs_read_csv run).
+        None | Some("") => b',',
+        Some("\\t") | Some("\t") => b'\t',
+        Some(text) => {
+            let mut bytes = text.bytes();
+            match (bytes.next(), bytes.next()) {
+                (Some(b), None) => b,
+                _ => {
+                    return Err(ToolError::InvalidArgs(format!(
+                        "delimiter must be a single character, got {text:?} (use \"\\t\" for TSV)"
+                    )))
+                }
+            }
+        }
+    };
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let max_bytes = policy.max_bytes();
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
     let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
 
-    let sliced = match (a.start_line, a.end_line) {
-        (None, None) => content.text,
-        (start, end) => {
-            let s = start.unwrap_or(1).max(1);
-            let e = end.unwrap_or(usize::MAX);
-            content
-                .text
-                .lines()
-                .enumerate()
-                .filter(|(i, _)| {
-                    let ln = i + 1;
-                    ln >= s && ln <= e
-                })
-                .map(|(_, l)| l)
-                .collect::<Vec<_>>()
-                .join("\n")
+    let start_row = a.start_row.unwrap_or(1).max(1);
+    let max_rows = a
+        .max_rows
+        .unwrap_or(CSV_DEFAULT_MAX_ROWS)
+        .min(CSV_MAX_ROWS_CEILING);
+    let rendered = render_csv(
+        &content.text,
+        delimiter,
+        a.no_header,
+        start_row,
+        max_rows,
+        content.truncated,
+    );
+    Ok(policy.cap_output(rendered))
+}
+
+/// Pure CSV formatter: parses `text` and produces the disclosure block. Kept
+/// free of IO so it is unit-testable in isolation.
+fn render_csv(
+    text: &str,
+    delimiter: u8,
+    no_header: bool,
+    start_row: usize,
+    max_rows: usize,
+    byte_truncated: bool,
+) -> String {
+    let mut reader = csv::ReaderBuilder::new()
+        .delimiter(delimiter)
+        .has_headers(false) // we manage the header row ourselves
+        .flexible(true) // accept ragged rows so we can DISCLOSE them, not error
+        .from_reader(text.as_bytes());
+
+    let mut records = reader.records();
+    let headers: Vec<String> = if no_header {
+        Vec::new()
+    } else {
+        match records.next() {
+            Some(Ok(rec)) => rec.iter().map(|f| f.to_string()).collect(),
+            Some(Err(e)) => return format!("csv> parse error on header row: {e}"),
+            None => return "csv> empty file (no rows)".to_string(),
         }
     };
-    let mut sliced = sliced;
-    if content.truncated {
-        sliced.push_str("\n...[truncated: output exceeded byte cap]");
+
+    let expected_cols = headers.len();
+    let mut col_types: Vec<CsvType> = Vec::new();
+    let mut total_rows = 0usize;
+    let mut malformed: Vec<(usize, usize)> = Vec::new();
+    let mut window: Vec<Vec<String>> = Vec::new();
+    let end_row = start_row.saturating_add(max_rows);
+
+    for rec in records {
+        let rec = match rec {
+            Ok(rec) => rec,
+            Err(_) => continue,
+        };
+        // A trailing empty line parses as a zero-field record; ignore it.
+        if rec.is_empty() || (rec.len() == 1 && rec.get(0).map(str::is_empty).unwrap_or(false)) {
+            continue;
+        }
+        total_rows += 1;
+        let fields: Vec<String> = rec.iter().map(|f| f.to_string()).collect();
+
+        // Grow inferred columns if a header was absent or a row is wider.
+        if fields.len() > col_types.len() {
+            col_types.resize(fields.len(), CsvType::Empty);
+        }
+        if total_rows <= CSV_TYPE_SAMPLE {
+            for (idx, value) in fields.iter().enumerate() {
+                col_types[idx] = col_types[idx].merge(CsvType::of_cell(value));
+            }
+        }
+        if expected_cols > 0 && fields.len() != expected_cols {
+            malformed.push((total_rows, fields.len()));
+        }
+        if total_rows >= start_row && total_rows < end_row {
+            window.push(fields);
+        }
     }
-    Ok(policy.cap_output(sliced))
+
+    // With a header, its width is authoritative; a wider malformed row is an
+    // anomaly we disclose, not an extra column. Headerless files report the
+    // widest row seen.
+    let col_count = if headers.is_empty() {
+        col_types.len()
+    } else {
+        expected_cols
+    };
+    let mut out = String::new();
+    let kind = if delimiter == b'\t' { "TSV" } else { "CSV" };
+    out.push_str(&format!(
+        "csv> {kind}: {col_count} columns, {total_rows} data rows"
+    ));
+    if byte_truncated {
+        out.push_str(" (file exceeded the read byte cap — row count and window cover only the portion read; re-read with a smaller window is not needed, but totals are a lower bound)");
+    }
+    out.push('\n');
+
+    if !headers.is_empty() {
+        let cols: Vec<String> = headers
+            .iter()
+            .enumerate()
+            .map(|(i, h)| {
+                let ty = col_types.get(i).copied().unwrap_or(CsvType::Empty);
+                format!("{h}:{}", ty.label())
+            })
+            .collect();
+        out.push_str(&format!("columns: {}\n", cols.join(", ")));
+    } else {
+        let cols: Vec<String> = col_types
+            .iter()
+            .enumerate()
+            .map(|(i, ty)| format!("col{}:{}", i + 1, ty.label()))
+            .collect();
+        out.push_str(&format!("columns (no header): {}\n", cols.join(", ")));
+    }
+
+    if total_rows == 0 {
+        out.push_str("(no data rows)\n");
+    } else if window.is_empty() {
+        out.push_str(&format!(
+            "(no rows in window: start_row {start_row} is past the {total_rows} data rows)\n"
+        ));
+    } else {
+        let last = start_row + window.len() - 1;
+        out.push_str(&format!("rows {start_row}-{last} of {total_rows}:\n"));
+        for (offset, fields) in window.iter().enumerate() {
+            let row_no = start_row + offset;
+            let cells: Vec<String> = fields
+                .iter()
+                .enumerate()
+                .map(|(i, v)| {
+                    let name = headers
+                        .get(i)
+                        .map(String::as_str)
+                        .unwrap_or("col")
+                        .to_string();
+                    if headers.is_empty() {
+                        format!("{name}{}={v}", i + 1)
+                    } else {
+                        format!("{name}={v}")
+                    }
+                })
+                .collect();
+            out.push_str(&format!("{row_no} | {}\n", cells.join(" | ")));
+        }
+        if last < total_rows {
+            out.push_str(&format!(
+                "[showing {} of {total_rows} rows; pass start_row/max_rows for more]\n",
+                window.len()
+            ));
+        }
+    }
+
+    if !malformed.is_empty() {
+        let shown: Vec<String> = malformed
+            .iter()
+            .take(10)
+            .map(|(row, got)| format!("row {row} ({got} fields, expected {expected_cols})"))
+            .collect();
+        let more = if malformed.len() > 10 {
+            format!(" (+{} more)", malformed.len() - 10)
+        } else {
+            String::new()
+        };
+        out.push_str(&format!(
+            "[disclosure: {} row(s) with an unexpected field count: {}{}]\n",
+            malformed.len(),
+            shown.join(", "),
+            more
+        ));
+    }
+
+    out
+}
+
+/// Accept both `1` and `"1"` for optional line numbers: small models emit
+/// numeric strings constantly, and rejecting them burned a round per call
+/// with no repair hint (cycle-27 audit).
+fn lenient_opt_usize<'de, D>(deserializer: D) -> Result<Option<usize>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    #[derive(Deserialize)]
+    #[serde(untagged)]
+    enum Lenient {
+        Number(usize),
+        Text(String),
+    }
+    match Option::<Lenient>::deserialize(deserializer)? {
+        None => Ok(None),
+        Some(Lenient::Number(value)) => Ok(Some(value)),
+        Some(Lenient::Text(text)) => text.trim().parse::<usize>().map(Some).map_err(|_| {
+            serde::de::Error::custom(format!(
+                "expected a line number, got '{text}' — pass an integer like 12 (quoted \"12\" is also accepted)"
+            ))
+        }),
+    }
+}
+
+// --- fs.read_pdf ------------------------------------------------------------
+
+/// Default number of pages returned in one `fs_read_pdf` window.
+const PDF_DEFAULT_MAX_PAGES: usize = 10;
+/// Hard ceiling on pages per call so one call cannot blow the output budget.
+const PDF_MAX_PAGES_CEILING: usize = 50;
+/// Refuse to parse a PDF larger than this (lopdf loads the whole file; this
+/// bounds memory). Generous for text documents, well below OOM territory.
+const PDF_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadPdfArgs {
+    path: String,
+    /// 1-based first page to extract (optional, default 1).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_page: Option<usize>,
+    /// Max pages in this window (clamped to `PDF_MAX_PAGES_CEILING`).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_pages: Option<usize>,
+}
+
+pub fn read_pdf_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_pdf".to_string(),
+        description: "Extract the text layer of a PDF from an allowed path, page by page. Reports \
+                      total page count and returns a bounded page window (start_page/max_pages). \
+                      Text-layer only — no OCR; a scanned/image-only page is disclosed as having \
+                      no extractable text rather than returning garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PDF file path to read"},
+                "start_page": {"type": "integer", "description": "1-based first page (optional, default 1)"},
+                "max_pages": {"type": "integer", "description": "Max pages in this window (optional, default 10, max 50)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_pdf_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_pdf_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadPdfArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > PDF_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "PDF is {} MiB, over the {} MiB read limit — extract the pages you need with an external tool first",
+            metadata.len() / (1024 * 1024),
+            PDF_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let start_page = a.start_page.unwrap_or(1).max(1);
+    let max_pages = a
+        .max_pages
+        .unwrap_or(PDF_DEFAULT_MAX_PAGES)
+        .min(PDF_MAX_PAGES_CEILING);
+
+    let rendered = tokio::task::spawn_blocking(move || extract_pdf(&path, start_page, max_pages))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("pdf parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Load `path` with lopdf and render the disclosure block for the requested
+/// page window. Blocking (CPU-bound parse); callers run it off the reactor.
+fn extract_pdf(path: &Path, start_page: usize, max_pages: usize) -> Result<String, String> {
+    let doc = lopdf::Document::load(path).map_err(|e| e.to_string())?;
+    let pages = doc.get_pages(); // BTreeMap<u32, ObjectId>, 1-based page numbers
+    let total_pages = pages.len();
+    let mut extracted: Vec<(u32, Result<String, String>)> = Vec::new();
+    let end_page = start_page.saturating_add(max_pages);
+    for &page_no in pages.keys() {
+        let idx = page_no as usize;
+        if idx < start_page || idx >= end_page {
+            continue;
+        }
+        let text = doc
+            .extract_text(&[page_no])
+            .map_err(|e| e.to_string())
+            .map(|t| t.trim().to_string());
+        extracted.push((page_no, text));
+    }
+    Ok(render_pdf(&extracted, total_pages, start_page))
+}
+
+/// Pure formatter: turn per-page extraction results into the disclosure block.
+/// Kept IO-free so it is unit-testable without a real PDF.
+fn render_pdf(
+    extracted: &[(u32, Result<String, String>)],
+    total_pages: usize,
+    start_page: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "pdf> {total_pages} page(s), text-layer only (no OCR)\n"
+    ));
+    if total_pages == 0 {
+        out.push_str("(no pages found — the file may not be a valid PDF)\n");
+        return out;
+    }
+    if extracted.is_empty() {
+        out.push_str(&format!(
+            "(no pages in window: start_page {start_page} is past the {total_pages} page(s))\n"
+        ));
+        return out;
+    }
+    let first = extracted.first().map(|(n, _)| *n).unwrap_or(0);
+    let last = extracted.last().map(|(n, _)| *n).unwrap_or(0);
+    out.push_str(&format!("pages {first}-{last} of {total_pages}:\n"));
+    let mut image_only = 0usize;
+    for (page_no, result) in extracted {
+        out.push_str(&format!("\n--- page {page_no} ---\n"));
+        match result {
+            Ok(text) if !text.is_empty() => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            Ok(_) => {
+                image_only += 1;
+                out.push_str("(no extractable text on this page — likely a scanned/image-only page; OCR is not applied)\n");
+            }
+            Err(e) => {
+                out.push_str(&format!("(text extraction failed for this page: {e})\n"));
+            }
+        }
+    }
+    if (last as usize) < total_pages {
+        out.push_str(&format!(
+            "\n[showing pages {first}-{last} of {total_pages}; pass start_page/max_pages for more]\n"
+        ));
+    }
+    if image_only > 0 {
+        out.push_str(&format!(
+            "[disclosure: {image_only} page(s) in this window had no text layer]\n"
+        ));
+    }
+    out
+}
+
+// --- fs.read_xlsx -----------------------------------------------------------
+
+const XLSX_DEFAULT_MAX_ROWS: usize = 50;
+const XLSX_MAX_ROWS_CEILING: usize = 500;
+/// Refuse to parse a spreadsheet larger than this (calamine decompresses the
+/// whole workbook; this bounds memory). Generous for real spreadsheets.
+const XLSX_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadXlsxArgs {
+    path: String,
+    /// Sheet to read: a name, or a 0-based index as a string; default first.
+    #[serde(default)]
+    sheet: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_row: Option<usize>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_rows: Option<usize>,
+}
+
+pub fn read_xlsx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_xlsx".to_string(),
+        description:
+            "Read a spreadsheet (.xlsx/.xls/.ods) from an allowed path: lists sheet names, \
+                      then returns a bounded cell window of one sheet (sheet by name or 0-based \
+                      index; default the first). Page with start_row/max_rows. Empty cells render \
+                      blank; cell types are preserved as text."
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Spreadsheet file path"},
+                "sheet": {"type": "string", "description": "Sheet name, or a 0-based index as a string (optional, default first sheet)"},
+                "start_row": {"type": "integer", "description": "1-based first row to show (optional, default 1)"},
+                "max_rows": {"type": "integer", "description": "Max rows in this window (optional, default 50, max 500)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_xlsx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_xlsx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadXlsxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > XLSX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "spreadsheet is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            XLSX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let sheet = a.sheet.clone();
+    let start_row = a.start_row.unwrap_or(1).max(1);
+    let max_rows = a
+        .max_rows
+        .unwrap_or(XLSX_DEFAULT_MAX_ROWS)
+        .min(XLSX_MAX_ROWS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || {
+        extract_xlsx(&path, sheet.as_deref(), start_row, max_rows)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("spreadsheet parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Load `path` with calamine and render the sheet list + a bounded cell window.
+/// Blocking (decompresses the workbook); callers run it off the reactor.
+fn extract_xlsx(
+    path: &Path,
+    sheet: Option<&str>,
+    start_row: usize,
+    max_rows: usize,
+) -> Result<String, String> {
+    use calamine::{open_workbook_auto, Reader};
+
+    let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
+    let names = workbook.sheet_names().to_vec();
+    if names.is_empty() {
+        return Ok("xlsx> no sheets found (the file may not be a valid spreadsheet)".to_string());
+    }
+    // Resolve the requested sheet: exact name, else a 0-based index string,
+    // else the first sheet.
+    let chosen = match sheet {
+        None => names[0].clone(),
+        Some(s) if names.iter().any(|n| n == s) => s.to_string(),
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(idx) if idx < names.len() => names[idx].clone(),
+            _ => {
+                return Ok(format!(
+                    "xlsx> {} sheet(s): {}\n(sheet {:?} not found — pass an existing name or a 0-based index)",
+                    names.len(),
+                    names.join(", "),
+                    s
+                ))
+            }
+        },
+    };
+    let range = workbook
+        .worksheet_range(&chosen)
+        .map_err(|e| e.to_string())?;
+    let (total_rows, total_cols) = range.get_size();
+
+    let mut out = format!(
+        "xlsx> {} sheet(s): {}\nsheet '{}': {} rows x {} cols\n",
+        names.len(),
+        names.join(", "),
+        chosen,
+        total_rows,
+        total_cols
+    );
+    if total_rows == 0 {
+        out.push_str("(sheet is empty)\n");
+        return Ok(out);
+    }
+    let end_row = start_row.saturating_add(max_rows);
+    let mut shown = 0usize;
+    for (idx, row) in range.rows().enumerate() {
+        let row_no = idx + 1; // 1-based
+        if row_no < start_row || row_no >= end_row {
+            continue;
+        }
+        if shown == 0 {
+            let last = (start_row + max_rows - 1).min(total_rows);
+            out.push_str(&format!("rows {start_row}-{last} of {total_rows}:\n"));
+        }
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| {
+                if matches!(c, calamine::Data::Empty) {
+                    String::new()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        out.push_str(&format!("{row_no} | {}\n", cells.join(" | ")));
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str(&format!(
+            "(no rows in window: start_row {start_row} is past the {total_rows} rows)\n"
+        ));
+    } else if start_row + shown - 1 < total_rows {
+        out.push_str(&format!(
+            "[showing {shown} of {total_rows} rows; pass start_row/max_rows for more]\n"
+        ));
+    }
+    Ok(out)
+}
+
+// --- fs.read_document (type-aware dispatch) ---------------------------------
+
+#[derive(Deserialize)]
+struct ReadDocumentArgs {
+    path: String,
+}
+
+/// The document class `read_document` detected, and how it will be handled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DocType {
+    /// Delegated to `fs_read_csv`.
+    Csv,
+    /// Delegated to `fs_read_pdf`.
+    Pdf,
+    /// Delegated to the plain UTF-8 text read (`fs_read_file`).
+    Text,
+    /// Recognized image; no text to extract from a text tool.
+    Image(&'static str),
+    /// Zip-based Office document (xlsx/docx/pptx); no extractor yet.
+    Office(&'static str),
+}
+
+/// Detect the document class from magic bytes first (authoritative for binary
+/// formats), then fall back to the file extension (needed for CSV/TSV, which
+/// have no magic number). Unknown → `Text`, so the UTF-8-with-truncation
+/// behavior is preserved for anything unrecognized.
+fn detect_doc_type(path: &Path, magic: &[u8]) -> DocType {
+    // Magic numbers for binary formats we recognize.
+    if magic.starts_with(b"%PDF-") {
+        return DocType::Pdf;
+    }
+    if magic.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return DocType::Image("PNG");
+    }
+    if magic.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return DocType::Image("JPEG");
+    }
+    if magic.starts_with(b"GIF87a") || magic.starts_with(b"GIF89a") {
+        return DocType::Image("GIF");
+    }
+    // RIFF....WEBP
+    if magic.len() >= 12 && magic.starts_with(b"RIFF") && &magic[8..12] == b"WEBP" {
+        return DocType::Image("WEBP");
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    // Zip container: distinguish Office formats by extension.
+    if magic.starts_with(&[b'P', b'K', 0x03, 0x04]) {
+        return match ext.as_deref() {
+            Some("xlsx") => DocType::Office("XLSX"),
+            Some("docx") => DocType::Office("DOCX"),
+            Some("pptx") => DocType::Office("PPTX"),
+            _ => DocType::Office("ZIP-based"),
+        };
+    }
+    match ext.as_deref() {
+        Some("csv") | Some("tsv") => DocType::Csv,
+        Some("pdf") => DocType::Pdf, // extensionless-magic already handled above
+        // Extension-only image hints (e.g. a truncated header) still classify.
+        Some("png") => DocType::Image("PNG"),
+        Some("jpg") | Some("jpeg") => DocType::Image("JPEG"),
+        Some("gif") => DocType::Image("GIF"),
+        Some("webp") => DocType::Image("WEBP"),
+        Some("xlsx") => DocType::Office("XLSX"),
+        Some("docx") => DocType::Office("DOCX"),
+        Some("pptx") => DocType::Office("PPTX"),
+        _ => DocType::Text,
+    }
+}
+
+pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "read_document".to_string(),
+        description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
+                      to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
+                      → text. Always discloses the detected type and which reader ran. Images and \
+                      Office (xlsx/docx) files are detected and disclosed but not yet text-extracted \
+                      (use a dedicated tool or convert first). Unknown types fall back to a UTF-8 \
+                      text read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to read (any supported type)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_document_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadDocumentArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    // Authorize + sniff the first bytes for magic-number detection. This uses
+    // the same guard the delegated readers use, so no path escapes it.
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let mut magic = [0u8; 16];
+    let n = {
+        use std::io::Read as _;
+        let mut f = &file;
+        f.read(&mut magic).unwrap_or(0)
+    };
+    let doc_type = detect_doc_type(authorization.path(), &magic[..n]);
+
+    // Re-serialize just the path for the delegate readers (they re-authorize
+    // the same path — cheap and keeps a single guard implementation).
+    let path_args = serde_json::json!({ "path": a.path }).to_string();
+    let (label, body) = match doc_type {
+        DocType::Csv => (
+            "CSV/TSV → fs_read_csv",
+            read_csv_run(policy, &path_args).await?,
+        ),
+        DocType::Pdf => ("PDF → fs_read_pdf", read_pdf_run(policy, &path_args).await?),
+        DocType::Text => (
+            "text → fs_read_file",
+            read_file_run(policy, &path_args).await?,
+        ),
+        DocType::Image(fmt) => (
+            "image (no text extraction)",
+            format!(
+                "detected {fmt} image. This is a text-oriented reader — image content is not \
+                 extracted here; a vision-capable model/gateway is required to interpret the \
+                 picture."
+            ),
+        ),
+        DocType::Office("XLSX") => (
+            "XLSX → fs_read_xlsx",
+            read_xlsx_run(policy, &path_args).await?,
+        ),
+        DocType::Office(fmt) => (
+            "office (no extractor yet)",
+            format!(
+                "detected {fmt} (zip-based Office document). kitsu has no structured extractor \
+                 for this type yet — convert it to CSV/text first, or use a dedicated tool. Not \
+                 read as raw bytes to avoid emitting binary garbage."
+            ),
+        ),
+    };
+    let disclosure = format!("read_document> {}: {label}\n", a.path);
+    // The delegate readers already cap their own output; the disclosure line
+    // is a small fixed prefix, so no additional cap is needed here.
+    Ok(format!("{disclosure}{body}"))
+}
+
+// --- fs.scan_file (bounded log tail / grep) ---------------------------------
+
+const SCAN_DEFAULT_TAIL_LINES: usize = 200;
+const SCAN_MAX_TAIL_LINES: usize = 2000;
+const SCAN_DEFAULT_MAX_MATCHES: usize = 200;
+const SCAN_MAX_MATCHES_CEILING: usize = 2000;
+/// Forward grep stops after scanning this many bytes (disclosed if hit), so a
+/// pathological file can never make one call run unbounded.
+const SCAN_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// Bytes read from the end for tail mode — bounds memory regardless of file
+/// size (a true seek-to-end tail, not a full-file scan).
+const SCAN_TAIL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+/// Per-line display cap so one very long line cannot blow the output budget.
+const SCAN_LINE_DISPLAY_CAP: usize = 2000;
+
+#[derive(Deserialize)]
+struct ScanFileArgs {
+    path: String,
+    /// If present, grep mode: return lines containing this literal substring.
+    /// Absent → tail mode (last N lines).
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    ignore_case: bool,
+    /// Tail-mode window (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    tail_lines: Option<usize>,
+    /// Grep-mode match cap (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_matches: Option<usize>,
+}
+
+pub fn scan_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_scan_file".to_string(),
+        description: "Scan a large file (e.g. a log) without loading it whole. With a pattern: \
+                      streams the file and returns matching lines (with line numbers), disclosing \
+                      how many of the total matches are shown and how much was scanned. Without a \
+                      pattern: returns the LAST tail_lines lines (a true seek-to-end tail). \
+                      Memory stays bounded regardless of file size — use this instead of \
+                      fs_read_file (which only sees the first bytes) for logs."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to scan"},
+                "pattern": {"type": "string", "description": "Literal substring to grep for (optional; omit for tail mode)"},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive match (optional, default false)"},
+                "tail_lines": {"type": "integer", "description": "Tail mode: last N lines (optional, default 200, max 2000)"},
+                "max_matches": {"type": "integer", "description": "Grep mode: max matched lines shown (optional, default 200, max 2000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { scan_file_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn scan_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ScanFileArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || scan_file_blocking(file, &display, &a))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("scan failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn truncate_line(line: &str) -> String {
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    if trimmed.chars().count() > SCAN_LINE_DISPLAY_CAP {
+        let cut: String = trimmed.chars().take(SCAN_LINE_DISPLAY_CAP).collect();
+        format!("{cut}…[line truncated]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn scan_file_blocking(
+    file: std::fs::File,
+    display: &str,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("scan target is not a regular file"));
+    }
+    let total_bytes = metadata.len();
+    match args.pattern.as_deref() {
+        Some(pattern) if !pattern.is_empty() => {
+            scan_grep(file, display, total_bytes, pattern, args)
+        }
+        _ => scan_tail(file, display, total_bytes, args),
+    }
+}
+
+fn scan_grep(
+    file: std::fs::File,
+    display: &str,
+    total_bytes: u64,
+    pattern: &str,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    use std::io::BufRead;
+
+    let cap = args
+        .max_matches
+        .unwrap_or(SCAN_DEFAULT_MAX_MATCHES)
+        .min(SCAN_MAX_MATCHES_CEILING);
+    let needle = if args.ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    // Bound total bytes scanned so a huge file cannot run unbounded.
+    let mut reader = std::io::BufReader::new(Read::take(file, SCAN_MAX_SCAN_BYTES + 1));
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut total_matches = 0usize;
+    let mut bytes_read = 0u64;
+    let mut shown: Vec<(usize, String)> = Vec::new();
+    let mut scan_truncated = false;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > SCAN_MAX_SCAN_BYTES {
+            scan_truncated = true;
+            break;
+        }
+        line_no += 1;
+        let hay = if args.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.clone()
+        };
+        if hay.contains(&needle) {
+            total_matches += 1;
+            if shown.len() < cap {
+                shown.push((line_no, truncate_line(&line)));
+            }
+        }
+    }
+
+    let case = if args.ignore_case {
+        " (case-insensitive)"
+    } else {
+        ""
+    };
+    let scanned_note = if scan_truncated {
+        format!(
+            " — stopped after scanning {} MiB of {} MiB (refine or split the file)",
+            SCAN_MAX_SCAN_BYTES / (1024 * 1024),
+            total_bytes / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "scan> {display}: grep {pattern:?}{case} — {total_matches} match(es) in {line_no} lines scanned{scanned_note}\n"
+    );
+    if shown.is_empty() {
+        out.push_str("(no matching lines)\n");
+    } else {
+        for (no, text) in &shown {
+            out.push_str(&format!("{no}: {text}\n"));
+        }
+        if total_matches > shown.len() {
+            out.push_str(&format!(
+                "[showing {} of {} matches; narrow the pattern or raise max_matches for more]\n",
+                shown.len(),
+                total_matches
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn scan_tail(
+    mut file: std::fs::File,
+    display: &str,
+    total_bytes: u64,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let want = args
+        .tail_lines
+        .unwrap_or(SCAN_DEFAULT_TAIL_LINES)
+        .clamp(1, SCAN_MAX_TAIL_LINES);
+    // Read only the trailing window — bounds memory for any file size.
+    let window = total_bytes.min(SCAN_TAIL_WINDOW_BYTES);
+    let start = total_bytes - window;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(window as usize);
+    Read::by_ref(&mut file).take(window).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    // If we did not start at the file head, the first (partial) line is
+    // incomplete — drop it so we only show whole lines.
+    let mut lines: Vec<&str> = text.lines().collect();
+    let window_clipped = start > 0;
+    if window_clipped && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let total_in_window = lines.len();
+    let tail: Vec<&str> = lines
+        .iter()
+        .skip(total_in_window.saturating_sub(want))
+        .copied()
+        .collect();
+
+    let mut out = format!(
+        "scan> {display}: tail — last {} line(s) of a {} byte file",
+        tail.len(),
+        total_bytes
+    );
+    if window_clipped {
+        out.push_str(&format!(
+            " (read the final {} KiB; earlier lines not shown)",
+            window / 1024
+        ));
+    }
+    out.push('\n');
+    if tail.is_empty() {
+        out.push_str("(no complete lines in the tail window)\n");
+    } else {
+        for line in &tail {
+            out.push_str(&truncate_line(line));
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
+// --- fs.diff_config (config drift audit) ------------------------------------
+
+#[derive(Deserialize)]
+struct DiffConfigArgs {
+    /// The current config to audit.
+    path: String,
+    /// The reference/baseline config to compare against.
+    reference: String,
+    /// Compare keys case-insensitively (e.g. sshd_config directives).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    ignore_case: bool,
+}
+
+/// One parsed config: keys in first-seen order, a lookup keyed by the
+/// (optionally case-folded) directive, and a count of duplicate keys seen.
+struct ParsedConfig {
+    order: Vec<String>,
+    /// normalized key -> (display key, last value)
+    entries: std::collections::HashMap<String, (String, String)>,
+    duplicates: usize,
+}
+
+/// Parse a line-oriented config: `#`/`;` comments and blank lines skipped;
+/// each entry split on the first `=`, `:`, or whitespace run. Last value wins
+/// for a repeated key (with a duplicate count disclosed).
+fn parse_config(text: &str, ignore_case: bool) -> ParsedConfig {
+    let mut order = Vec::new();
+    let mut entries: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut duplicates = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        // Split on the first '=', ':', or whitespace.
+        let delim = line
+            .char_indices()
+            .find(|&(_, c)| c == '=' || c == ':' || c.is_whitespace())
+            .map(|(i, _)| i);
+        let (key_raw, value) = match delim {
+            Some(i) => {
+                let key = line[..i].trim();
+                // Drop leading '='/':' delimiter chars (so `k=v`, `k==v`, and
+                // `k = v` all yield the same value), then trim whitespace.
+                let rest = line[i..].trim_start_matches(['=', ':']);
+                (key, rest.trim())
+            }
+            None => (line, ""),
+        };
+        if key_raw.is_empty() {
+            continue;
+        }
+        let norm = if ignore_case {
+            key_raw.to_lowercase()
+        } else {
+            key_raw.to_string()
+        };
+        if entries.contains_key(&norm) {
+            duplicates += 1;
+        } else {
+            order.push(norm.clone());
+        }
+        entries.insert(norm, (key_raw.to_string(), value.to_string()));
+    }
+    ParsedConfig {
+        order,
+        entries,
+        duplicates,
+    }
+}
+
+/// Render the drift between a `reference` (baseline) and `current` config.
+fn render_config_diff(
+    current: &ParsedConfig,
+    reference: &ParsedConfig,
+    path: &str,
+    reference_path: &str,
+) -> String {
+    let mut added: Vec<(&str, &str)> = Vec::new(); // in current, not reference
+    let mut changed: Vec<(&str, &str, &str)> = Vec::new(); // key, ref value, cur value
+    let mut removed: Vec<(&str, &str)> = Vec::new(); // in reference, not current
+    let mut unchanged = 0usize;
+
+    for norm in &current.order {
+        let (disp, cur_val) = &current.entries[norm];
+        match reference.entries.get(norm) {
+            None => added.push((disp.as_str(), cur_val.as_str())),
+            Some((_, ref_val)) if ref_val != cur_val => {
+                changed.push((disp.as_str(), ref_val.as_str(), cur_val.as_str()))
+            }
+            Some(_) => unchanged += 1,
+        }
+    }
+    for norm in &reference.order {
+        if !current.entries.contains_key(norm) {
+            let (disp, ref_val) = &reference.entries[norm];
+            removed.push((disp.as_str(), ref_val.as_str()));
+        }
+    }
+
+    let mut out = format!(
+        "config-diff> {path} vs {reference_path}: {} added, {} removed, {} changed, {} unchanged\n",
+        added.len(),
+        removed.len(),
+        changed.len(),
+        unchanged
+    );
+    if added.is_empty() && removed.is_empty() && changed.is_empty() {
+        out.push_str("(no drift — configs are equivalent)\n");
+    }
+    if !changed.is_empty() {
+        out.push_str("[changed — reference → current]\n");
+        for (k, r, c) in &changed {
+            out.push_str(&format!("~ {k}: {r:?} → {c:?}\n"));
+        }
+    }
+    if !added.is_empty() {
+        out.push_str("[added — set in current, absent from reference]\n");
+        for (k, v) in &added {
+            out.push_str(&format!("+ {k} = {v:?}\n"));
+        }
+    }
+    if !removed.is_empty() {
+        out.push_str("[removed — in reference, absent from current]\n");
+        for (k, v) in &removed {
+            out.push_str(&format!("- {k} = {v:?}\n"));
+        }
+    }
+    let dup = current.duplicates + reference.duplicates;
+    if dup > 0 {
+        out.push_str(&format!(
+            "[note: {dup} duplicate key line(s) seen; last value per key was used]\n"
+        ));
+    }
+    out
+}
+
+pub fn diff_config_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_diff_config".to_string(),
+        description: "Compare a line-oriented config file against a reference/baseline and report \
+                      drift: keys added, removed, or changed, plus an unchanged count. Parses \
+                      `key value`, `key=value`, and `key: value` styles; skips # and ; comments. \
+                      Set ignore_case for case-insensitive directives (e.g. sshd_config)."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Current config file to audit"},
+                "reference": {"type": "string", "description": "Reference/baseline config to compare against"},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive key comparison (optional, default false)"}
+            },
+            "required": ["path", "reference"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { diff_config_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn diff_config_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: DiffConfigArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let current_text = read_config_text(policy, &a.path).await?;
+    let reference_text = read_config_text(policy, &a.reference).await?;
+    let ignore_case = a.ignore_case;
+    let path = a.path.clone();
+    let reference = a.reference.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let cur = parse_config(&current_text, ignore_case);
+        let refc = parse_config(&reference_text, ignore_case);
+        render_config_diff(&cur, &refc, &path, &reference)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Authorize and read one config file (bounded by the read cap — configs are
+/// small; the same guard as fs_read_file).
+async fn read_config_text(policy: &Permissions, path: &str) -> Result<String, ToolError> {
+    let authorization = policy.authorize_read_file(Path::new(path)).await?;
+    let max_bytes = policy.max_bytes();
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(content.text)
 }
 
 // --- fs.list_dir ------------------------------------------------------------
@@ -2900,6 +4282,32 @@ const CHAT_TEMPLATE_TOKENS: &[&str] = &[
     "[/INST]",
 ];
 
+/// A chat-template token is leaked protocol debris only when it appears
+/// OUTSIDE a string literal — a raw completion leaks it bare (`<|im_start|>assistant`
+/// at line start), whereas legitimate source that lists these tokens as data
+/// always quotes them (`"<|im_start|>"`). Treating a token as debris only when
+/// it is NOT immediately preceded by a quote removes the false positive on any
+/// file that mentions the markers as strings — e.g. kitsu's own token table or
+/// debris-detector code (a real kimi-cycle-16 false positive: editing near the
+/// `CHAT_TEMPLATE_TOKENS` list tripped the old naive `contains` check).
+fn has_unquoted_chat_template_marker(content: &str) -> bool {
+    for tok in CHAT_TEMPLATE_TOKENS {
+        let mut from = 0;
+        while let Some(rel) = content[from..].find(tok) {
+            let idx = from + rel;
+            let preceded_by_quote = content[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == '"' || c == '\'');
+            if !preceded_by_quote {
+                return true;
+            }
+            from = idx + tok.len();
+        }
+    }
+    false
+}
+
 /// Best-effort detection of obviously-broken generated content: a model's raw
 /// protocol tokens leaking into the file, or a would-be multi-line file whose
 /// newlines never got un-escaped (literal `\n` two-char sequences instead of
@@ -2908,7 +4316,7 @@ const CHAT_TEMPLATE_TOKENS: &[&str] = &[
 /// silently corrupted file (a real dogfooding finding: a Python file written
 /// with literal `\n` was a guaranteed SyntaxError, reported as a clean write).
 fn content_quality_warning(content: &str) -> Option<&'static str> {
-    if CHAT_TEMPLATE_TOKENS.iter().any(|tok| content.contains(tok)) {
+    if has_unquoted_chat_template_marker(content) {
         return Some(
             "content contains a raw model chat-template control marker — \
              the model likely emitted protocol text instead of real file content",
@@ -2946,7 +4354,10 @@ async fn write_file_run_with_journal(
     let written = target.clone();
     let blocking_journal = journal.cloned();
     let tracked_mutation = journal.map(WriteJournal::begin_mutation);
-    let max_bytes = policy.max_bytes();
+    // The journal pre-image is part of a WRITE, so bound it by the write cap
+    // (1 MiB), not the 64 KiB read cap — otherwise any file over the read cap
+    // is uneditable (orchestrator.rs at 129 KiB could never be written).
+    let max_bytes = policy.max_write_bytes();
     let outcome =
         tokio::task::spawn_blocking(move || -> std::io::Result<(&'static str, Option<usize>)> {
             let (_mutation_lease, attribution) = match tracked_mutation {
@@ -3109,7 +4520,11 @@ async fn edit_file_run_with_journal(
     }
     let display = target.display().to_string();
     let read_target = target.clone();
-    let max_bytes = policy.max_bytes();
+    // fs_edit_file reads the whole existing file to apply the replacement and
+    // snapshot the pre-image; both are part of a write, so bound by the write
+    // cap (1 MiB), not the 64 KiB read cap — a large source file must remain
+    // editable even though a bare read of it would be capped.
+    let max_bytes = policy.max_write_bytes();
     let (mutation_target, original, original_snapshot) = tokio::task::spawn_blocking(move || {
         let mutation_target = MutationTarget::pin(&read_target)?;
         read_existing_text(mutation_target, max_bytes)
@@ -3202,6 +4617,635 @@ async fn edit_file_run_with_journal(
 mod tests {
     use super::*;
     use std::io::Write;
+
+    /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
+    /// LibreOffice, embedded so the xlsx tests need no writer dependency.
+    const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+
+    #[test]
+    fn config_diff_reports_added_removed_changed_on_sshd_shaped_files() {
+        // sshd_config-shaped: `Key value`, # comments, case-insensitive keys.
+        let reference = "\
+# baseline sshd_config
+Port 22
+PermitRootLogin no
+PasswordAuthentication yes
+X11Forwarding no
+";
+        let current = "\
+# hardened
+Port 2222
+permitrootlogin no
+PasswordAuthentication no
+UseDNS no
+";
+        let refc = parse_config(reference, true);
+        let cur = parse_config(current, true);
+        let out = render_config_diff(&cur, &refc, "current", "baseline");
+        assert!(
+            out.contains("1 added, 1 removed, 2 changed, 1 unchanged"),
+            "summary: {out}"
+        );
+        // Port changed 22 → 2222.
+        assert!(out.contains("~ Port: \"22\" → \"2222\""), "{out}");
+        // PasswordAuthentication changed yes → no.
+        assert!(out.contains("PasswordAuthentication"), "{out}");
+        // UseDNS added in current; X11Forwarding removed from current.
+        assert!(out.contains("+ UseDNS = \"no\""), "added: {out}");
+        assert!(out.contains("- X11Forwarding = \"no\""), "removed: {out}");
+        // permitrootlogin (case-differing) matched PermitRootLogin → unchanged
+        // (both "no"), NOT reported as changed.
+        assert!(
+            !out.contains("PermitRootLogin: "),
+            "case-insensitive match: {out}"
+        );
+    }
+
+    #[test]
+    fn config_diff_handles_equal_configs_and_multiple_delimiters() {
+        // key=value and key: value styles both parse; identical → no drift.
+        let a = "host=localhost\nport: 8080\ndebug true\n";
+        let b = "port: 8080\nhost=localhost\ndebug true\n";
+        let out = render_config_diff(&parse_config(a, false), &parse_config(b, false), "a", "b");
+        assert!(
+            out.contains("0 added, 0 removed, 0 changed, 3 unchanged"),
+            "{out}"
+        );
+        assert!(out.contains("no drift"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn diff_config_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let cur = dir.path().join("app.conf");
+        let refr = dir.path().join("app.conf.default");
+        std::fs::write(&cur, "timeout=30\nretries=5\n").unwrap();
+        std::fs::write(&refr, "timeout=10\nretries=5\n").unwrap();
+        let out = diff_config_run(
+            &policy,
+            &serde_json::json!({"path": cur.to_string_lossy(), "reference": refr.to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("diff ok");
+        assert!(
+            out.contains("0 added, 0 removed, 1 changed, 1 unchanged"),
+            "{out}"
+        );
+        assert!(out.contains("~ timeout: \"10\" → \"30\""), "{out}");
+
+        // Either path outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.conf");
+        std::fs::write(&bad, "a=b\n").unwrap();
+        assert!(matches!(
+            diff_config_run(
+                &policy,
+                &serde_json::json!({"path": cur.to_string_lossy(), "reference": bad.to_string_lossy()})
+                    .to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn scan_file_grep_returns_matches_with_served_of_total_disclosure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.log");
+        // 1000 lines; every 100th is an ERROR (10 total matches).
+        let mut body = String::new();
+        for i in 1..=1000 {
+            if i % 100 == 0 {
+                body.push_str(&format!("line {i}: ERROR disk full\n"));
+            } else {
+                body.push_str(&format!("line {i}: info ok\n"));
+            }
+        }
+        std::fs::write(&path, &body).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Grep with a cap below the match count → served-of-total disclosure.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "ERROR", "max_matches": 3})
+                .to_string(),
+        )
+        .await
+        .expect("grep ok");
+        assert!(out.contains("10 match(es) in 1000 lines scanned"), "{out}");
+        assert!(
+            out.contains("100: line 100: ERROR"),
+            "line-numbered match: {out}"
+        );
+        assert!(
+            out.contains("[showing 3 of 10 matches"),
+            "cap disclosure: {out}"
+        );
+
+        // Case-insensitive matches lowercase too.
+        std::fs::write(&path, "Warn: A\nwarn: b\nWARN: c\ninfo\n").unwrap();
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "warn", "ignore_case": true})
+                .to_string(),
+        )
+        .await
+        .expect("ci ok");
+        assert!(out.contains("3 match(es)"), "case-insensitive: {out}");
+
+        // No match discloses zero, not an error.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "zzz"}).to_string(),
+        )
+        .await
+        .expect("nomatch ok");
+        assert!(
+            out.contains("0 match(es)") && out.contains("no matching lines"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_file_tail_returns_the_last_lines_via_seek() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.log");
+        let mut body = String::new();
+        for i in 1..=5000 {
+            body.push_str(&format!("row {i}\n"));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Default tail (no pattern) returns the LAST lines, not the first.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "tail_lines": 3}).to_string(),
+        )
+        .await
+        .expect("tail ok");
+        assert!(out.contains("tail — last 3 line(s)"), "{out}");
+        assert!(out.contains("row 5000"), "last line present: {out}");
+        assert!(out.contains("row 4998"), "{out}");
+        assert!(!out.contains("row 1\n"), "must not include the head: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.log");
+        std::fs::write(&bad, "secret\n").unwrap();
+        assert!(matches!(
+            scan_file_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[tokio::test]
+    async fn read_xlsx_lists_sheets_and_returns_a_bounded_cell_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("book.xlsx");
+        std::fs::write(&path, SAMPLE_XLSX).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Default: first sheet, header + 3 data rows, 3 columns.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("xlsx ok");
+        assert!(out.contains("sheet(s):"), "sheet list: {out}");
+        assert!(out.contains("cols"), "dims: {out}");
+        assert!(
+            out.contains("Ada") && out.contains("Grace") && out.contains("Alan"),
+            "{out}"
+        );
+        assert!(out.contains("95"), "cell value: {out}");
+
+        // Sheet selection by 0-based index string resolves to the first sheet.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "sheet": "0"}).to_string(),
+        )
+        .await
+        .expect("xlsx idx ok");
+        assert!(out.contains("Ada"), "{out}");
+
+        // A non-existent sheet is disclosed, not a panic.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "sheet": "Nope"}).to_string(),
+        )
+        .await
+        .expect("xlsx bad-sheet ok");
+        assert!(out.contains("not found"), "{out}");
+
+        // Paging: start_row past the end discloses an empty window.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "start_row": 999}).to_string(),
+        )
+        .await
+        .expect("xlsx page ok");
+        assert!(out.contains("no rows in window"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.xlsx");
+        std::fs::write(&bad, SAMPLE_XLSX).unwrap();
+        assert!(matches!(
+            read_xlsx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A non-spreadsheet surfaces a parse error, not a panic.
+        let notxlsx = dir.path().join("plain.xlsx");
+        std::fs::write(&notxlsx, b"not a spreadsheet").unwrap();
+        assert!(matches!(
+            read_xlsx_run(
+                &policy,
+                &serde_json::json!({"path": notxlsx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+    }
+
+    #[test]
+    fn csv_reports_shape_types_and_bounded_window() {
+        let mut body = String::from("id,name,price,active\n");
+        for i in 1..=1000 {
+            body.push_str(&format!("{i},Item{i},{}.5,true\n", i % 7));
+        }
+        let out = render_csv(&body, b',', false, 1, 20, false);
+        assert!(out.contains("4 columns, 1000 data rows"), "shape: {out}");
+        assert!(
+            out.contains("id:int, name:string, price:float, active:bool"),
+            "types: {out}"
+        );
+        assert!(out.contains("rows 1-20 of 1000:"), "window header: {out}");
+        assert!(out.contains("[showing 20 of 1000 rows"), "more hint: {out}");
+        // Exactly 20 data rows rendered in the window.
+        let data_lines = out
+            .lines()
+            .filter(|l| l.starts_with("1 | ") || l.contains(" | id="))
+            .count();
+        assert!(data_lines >= 1);
+        assert_eq!(out.lines().filter(|l| l.contains(" | id=")).count(), 20);
+    }
+
+    #[test]
+    fn csv_paging_with_start_row() {
+        let body = "a,b\n1,2\n3,4\n5,6\n7,8\n";
+        let out = render_csv(body, b',', false, 3, 2, false);
+        assert!(out.contains("rows 3-4 of 4:"), "{out}");
+        assert!(out.contains("3 | a=5 | b=6"), "{out}");
+        assert!(out.contains("4 | a=7 | b=8"), "{out}");
+        assert!(
+            !out.contains("a=1"),
+            "row 1 should be outside the window: {out}"
+        );
+    }
+
+    #[test]
+    fn csv_discloses_malformed_rows_not_dropped() {
+        let body = "a,b,c\n1,2,3\n4,5\n6,7,8,9\n10,11,12\n";
+        let out = render_csv(body, b',', false, 1, 50, false);
+        // 4 data rows counted (none silently dropped).
+        assert!(out.contains("3 columns, 4 data rows"), "{out}");
+        assert!(
+            out.contains("2 row(s) with an unexpected field count"),
+            "disclosure missing: {out}"
+        );
+        assert!(out.contains("row 2 (2 fields, expected 3)"), "{out}");
+        assert!(out.contains("row 3 (4 fields, expected 3)"), "{out}");
+    }
+
+    #[test]
+    fn csv_tsv_and_no_header_and_nullable_types() {
+        // TSV, no header: columns get positional names; empty cells keep the
+        // column's inferred type (nullable int column stays int).
+        let body = "1\tx\n\ty\n3\tz\n";
+        let out = render_csv(body, b'\t', true, 1, 50, false);
+        assert!(out.contains("TSV: 2 columns, 3 data rows"), "{out}");
+        assert!(out.contains("col1:int, col2:string"), "nullable int: {out}");
+        assert!(out.contains("1 | col1=1 | col2=x"), "{out}");
+    }
+
+    /// Build an in-memory PDF: each entry is `Some(text)` for a text page or
+    /// `None` for an image-only page (no text operators).
+    fn build_pdf(pages_text: &[Option<&str>]) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", "Font");
+            d.set("Subtype", "Type1");
+            d.set("BaseFont", "Courier");
+            d
+        });
+        let resources_id = doc.add_object({
+            let mut fonts = Dictionary::new();
+            fonts.set("F1", font_id);
+            let mut res = Dictionary::new();
+            res.set("Font", fonts);
+            res
+        });
+        let mut kids: Vec<Object> = Vec::new();
+        for text in pages_text {
+            let ops = match text {
+                Some(t) => vec![
+                    Operation::new("BT", vec![]),
+                    Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                    Operation::new("Td", vec![72.into(), 720.into()]),
+                    Operation::new("Tj", vec![Object::string_literal(*t)]),
+                    Operation::new("ET", vec![]),
+                ],
+                None => vec![], // no text operators → image-only page
+            };
+            let content = Content { operations: ops };
+            let content_id =
+                doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+            let mut page = Dictionary::new();
+            page.set("Type", "Page");
+            page.set("Parent", pages_id);
+            page.set("Contents", content_id);
+            kids.push(doc.add_object(page).into());
+        }
+        let count = kids.len() as i64;
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", kids);
+        pages.set("Count", count);
+        pages.set("Resources", resources_id);
+        pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("save pdf");
+        buf
+    }
+
+    #[test]
+    fn doc_type_detection_prefers_magic_then_extension() {
+        use std::path::Path;
+        // Magic wins for binary formats.
+        assert_eq!(
+            detect_doc_type(Path::new("x.dat"), b"%PDF-1.7"),
+            DocType::Pdf
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("photo.bin"), &[0x89, b'P', b'N', b'G', 0, 0]),
+            DocType::Image("PNG")
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("j"), &[0xFF, 0xD8, 0xFF, 0xE0]),
+            DocType::Image("JPEG")
+        );
+        // Zip magic + extension distinguishes Office formats.
+        assert_eq!(
+            detect_doc_type(Path::new("book.xlsx"), &[b'P', b'K', 0x03, 0x04]),
+            DocType::Office("XLSX")
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("memo.docx"), &[b'P', b'K', 0x03, 0x04]),
+            DocType::Office("DOCX")
+        );
+        // Extension carries CSV/TSV (no magic number).
+        assert_eq!(
+            detect_doc_type(Path::new("data.csv"), b"a,b\n"),
+            DocType::Csv
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("data.tsv"), b"a\tb\n"),
+            DocType::Csv
+        );
+        // Unknown/plain → Text (UTF-8 fallback preserved).
+        assert_eq!(
+            detect_doc_type(Path::new("notes.md"), b"# hello"),
+            DocType::Text
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("noext"), b"just words"),
+            DocType::Text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_document_routes_csv_pdf_text_and_discloses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+
+        // CSV → structured table.
+        let csv = dir.path().join("t.csv");
+        std::fs::write(&csv, "id,name\n1,Ada\n2,Grace\n").unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": csv.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("csv route");
+        assert!(out.contains("read_document>"), "disclosure: {out}");
+        assert!(out.contains("CSV/TSV → fs_read_csv"), "{out}");
+        assert!(out.contains("2 data rows"), "delegated body: {out}");
+
+        // Plain text → text read.
+        let txt = dir.path().join("notes.md");
+        std::fs::write(&txt, "line one\nline two\n").unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": txt.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("text route");
+        assert!(out.contains("text → fs_read_file"), "{out}");
+        assert!(out.contains("line one"), "{out}");
+
+        // PDF → text-layer extraction (build a real 1-page PDF).
+        let pdf = dir.path().join("doc.pdf");
+        std::fs::write(&pdf, build_pdf(&[Some("routed via read_document")])).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": pdf.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("pdf route");
+        assert!(out.contains("PDF → fs_read_pdf"), "{out}");
+        assert!(out.contains("routed via read_document"), "extracted: {out}");
+
+        // PNG magic → detected image, no extraction, no garbage.
+        let png = dir.path().join("pic.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": png.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("png route");
+        assert!(out.contains("detected PNG image"), "{out}");
+        assert!(out.contains("not extracted"), "{out}");
+
+        // xlsx (zip magic + extension) → routed to the real extractor.
+        let xlsx = dir.path().join("book.xlsx");
+        std::fs::write(&xlsx, SAMPLE_XLSX).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": xlsx.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("xlsx route");
+        assert!(out.contains("XLSX → fs_read_xlsx"), "{out}");
+        assert!(out.contains("Ada"), "extracted cell: {out}");
+
+        // docx (zip magic + extension, no extractor) → detected, declined.
+        let docx = dir.path().join("memo.docx");
+        std::fs::write(&docx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": docx.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("docx route");
+        assert!(out.contains("detected DOCX"), "{out}");
+        assert!(out.contains("no structured extractor"), "{out}");
+
+        // Outside the allowlist → PolicyDenied before any routing.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.csv");
+        std::fs::write(&bad, "a,b\n1,2\n").unwrap();
+        assert!(matches!(
+            read_document_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn pdf_render_formats_pages_and_discloses_image_only() {
+        let extracted = vec![
+            (1u32, Ok("Hello from page one".to_string())),
+            (2u32, Ok(String::new())), // image-only
+            (3u32, Ok("Third page text".to_string())),
+        ];
+        let out = render_pdf(&extracted, 5, 1);
+        assert!(out.contains("5 page(s), text-layer only (no OCR)"), "{out}");
+        assert!(out.contains("pages 1-3 of 5:"), "{out}");
+        assert!(out.contains("--- page 1 ---"), "{out}");
+        assert!(out.contains("Hello from page one"), "{out}");
+        assert!(
+            out.contains("no extractable text on this page"),
+            "image-only disclosure: {out}"
+        );
+        assert!(
+            out.contains("1 page(s) in this window had no text layer"),
+            "{out}"
+        );
+        assert!(out.contains("[showing pages 1-3 of 5"), "more hint: {out}");
+    }
+
+    #[test]
+    fn pdf_render_empty_and_past_end() {
+        assert!(render_pdf(&[], 0, 1).contains("may not be a valid PDF"));
+        assert!(render_pdf(&[], 4, 99).contains("no pages in window"));
+    }
+
+    #[tokio::test]
+    async fn read_pdf_end_to_end_extracts_text_and_flags_scanned_page() {
+        // Page 1 has text, page 2 is image-only (no text operators).
+        let bytes = build_pdf(&[Some("Kitsune runs on foxfire"), None]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, &bytes).expect("write pdf");
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+        let args = serde_json::json!({"path": path.to_string_lossy()}).to_string();
+        let out = read_pdf_run(&policy, &args).await.expect("pdf read ok");
+        assert!(out.contains("2 page(s), text-layer only (no OCR)"), "{out}");
+        assert!(
+            out.contains("Kitsune runs on foxfire"),
+            "extracted text: {out}"
+        );
+        assert!(
+            out.contains("no extractable text on this page"),
+            "scanned-page disclosure: {out}"
+        );
+
+        // Outside the allowlist → PolicyDenied, same guard as fs_read_file.
+        let other = tempfile::tempdir().expect("other");
+        let bad = other.path().join("x.pdf");
+        std::fs::write(&bad, &bytes).expect("write");
+        let bad_args = serde_json::json!({"path": bad.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_pdf_run(&policy, &bad_args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A non-PDF file surfaces a parse error, not a panic or garbage.
+        let notpdf = dir.path().join("plain.pdf");
+        std::fs::write(&notpdf, b"this is not a pdf at all").expect("write");
+        let np_args = serde_json::json!({"path": notpdf.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_pdf_run(&policy, &np_args).await,
+            Err(ToolError::ExecError(_))
+        ));
+    }
+
+    #[test]
+    fn csv_no_header_accepts_stringy_booleans() {
+        // Small models emit `"false"`/`"true"` as strings (live llama3.2
+        // finding); all of these must parse rather than erroring the turn.
+        for raw in [
+            r#"{"path":"x","no_header":"false"}"#,
+            r#"{"path":"x","no_header":false}"#,
+            r#"{"path":"x","no_header":"true"}"#,
+            r#"{"path":"x","no_header":1}"#,
+            r#"{"path":"x"}"#,
+        ] {
+            let parsed: ReadCsvArgs = serde_json::from_str(raw).unwrap_or_else(|e| {
+                panic!("should parse {raw}: {e}");
+            });
+            let _ = parsed.no_header;
+        }
+        let t: ReadCsvArgs = serde_json::from_str(r#"{"path":"x","no_header":"true"}"#).unwrap();
+        assert!(t.no_header);
+        let f: ReadCsvArgs = serde_json::from_str(r#"{"path":"x","no_header":"false"}"#).unwrap();
+        assert!(!f.no_header);
+    }
+
+    #[test]
+    fn csv_start_row_past_end_is_disclosed() {
+        let body = "a,b\n1,2\n";
+        let out = render_csv(body, b',', false, 99, 10, false);
+        assert!(out.contains("no rows in window"), "{out}");
+        assert!(
+            out.contains("1 data rows") || out.contains("1 data row"),
+            "{out}"
+        );
+    }
 
     fn temp_with_file(name: &str, body: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3336,6 +5380,51 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn read_csv_end_to_end_honors_allowlist_and_delimiter() {
+        let (dir, root) = temp_with_file("data.tsv", "id\tname\n1\tAda\n2\tGrace\n");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("data.tsv");
+        let args =
+            serde_json::json!({"path": path.to_string_lossy(), "delimiter": "\\t"}).to_string();
+        let out = read_csv_run(&policy, &args).await.expect("csv ok");
+        assert!(out.contains("TSV: 2 columns, 2 data rows"), "{out}");
+        assert!(out.contains("id:int, name:string"), "{out}");
+        assert!(out.contains("1 | id=1 | name=Ada"), "{out}");
+
+        // Outside the allowlist → PolicyDenied (same guard as fs_read_file).
+        let other = tempfile::tempdir().expect("other");
+        let bad = other.path().join("x.csv");
+        std::fs::write(&bad, "a,b\n1,2\n").expect("write");
+        let bad_args = serde_json::json!({"path": bad.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_csv_run(&policy, &bad_args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A multi-character delimiter is a clear InvalidArgs, not a panic.
+        let two =
+            serde_json::json!({"path": path.to_string_lossy(), "delimiter": "ab"}).to_string();
+        assert!(matches!(
+            read_csv_run(&policy, &two).await,
+            Err(ToolError::InvalidArgs(_))
+        ));
+
+        // An empty delimiter degrades to the default comma (small-model
+        // habit), so a comma file parses instead of erroring.
+        let (dir2, root2) = temp_with_file("c.csv", "a,b\n1,2\n");
+        let policy2 = Permissions::for_roots(&[root2], &[]).expect("perms");
+        let empty = serde_json::json!({
+            "path": dir2.path().join("c.csv").to_string_lossy(),
+            "delimiter": ""
+        })
+        .to_string();
+        let out = read_csv_run(&policy2, &empty)
+            .await
+            .expect("empty delim ok");
+        assert!(out.contains("CSV: 2 columns, 1 data rows"), "{out}");
+    }
+
+    #[tokio::test]
     async fn read_file_reads_allowed_and_rejects_outside() {
         let (dir, root) = temp_with_file("a.txt", "line1\nline2\nline3\n");
         let policy = Permissions::for_roots(&[root], &[]).expect("perms");
@@ -3364,7 +5453,21 @@ mod tests {
             serde_json::json!({"path": path.to_string_lossy(), "start_line": 2, "end_line": 3})
                 .to_string();
         let out = read_file_run(&policy, &args).await.expect("read ok");
-        assert_eq!(out, "l2\nl3");
+        // Ranged reads are line-number prefixed (R1.7) so citations are exact.
+        assert_eq!(out, "2\tl2\n3\tl3");
+    }
+
+    #[tokio::test]
+    async fn full_read_has_no_line_prefixes() {
+        // A full read (no range) is verbatim — prefixes are ranged-only, so
+        // the edit-context path is unchanged.
+        let (dir, root) = temp_with_file("a.txt", "l1\nl2\nl3\n");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("a.txt");
+        let args = serde_json::json!({"path": path.to_string_lossy()}).to_string();
+        let out = read_file_run(&policy, &args).await.expect("read ok");
+        assert_eq!(out, "l1\nl2\nl3\n");
+        assert!(!out.contains('\t'), "no line-number prefix on a full read");
     }
 
     #[tokio::test]
@@ -3378,8 +5481,71 @@ mod tests {
 
         let output = read_file_run(&policy, &args).await.unwrap();
 
-        assert!(output.ends_with("...[truncated: output exceeded byte cap]"));
-        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 64);
+        // cap_output's generic marker is replaced by the served-of-total
+        // disclosure appended after capping (cycle 31).
+        assert!(
+            output.contains("...[truncated: output exceeded byte cap"),
+            "missing truncation marker: ...{}",
+            &output[output.len().saturating_sub(160)..]
+        );
+        assert!(output.ends_with("re-read a line range for the rest]"));
+        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 256);
+    }
+
+    /// The byte cap on a ranged read is range-relative: a range starting past
+    /// the file's first 64 KiB serves the requested lines in full instead of
+    /// the near-empty remainder of an absolute-prefix cap (kimi-k3 cycle-1).
+    #[tokio::test]
+    async fn read_file_range_past_the_byte_cap_serves_the_requested_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        // 4000 lines x ~30 bytes ≈ 120 KiB: line 3000 sits well past 64 KiB.
+        let body: String = (1..=4000)
+            .map(|n| format!("line-{n:05} {}\n", "x".repeat(18)))
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+        let policy =
+            Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[]).unwrap();
+        let args = serde_json::json!({
+            "path": path,
+            "start_line": 3000,
+            "end_line": 3004
+        })
+        .to_string();
+
+        let output = read_file_run(&policy, &args).await.unwrap();
+
+        assert!(output.starts_with("3000\tline-03000"), "got: {output}");
+        assert!(output.contains("3004\tline-03004"));
+        assert_eq!(output.lines().count(), 5);
+        assert!(
+            !output.contains("truncated"),
+            "range fits, no cap: {output}"
+        );
+    }
+
+    /// A ranged read wider than the byte budget is capped relative to the
+    /// range start and discloses the actually-served size.
+    #[tokio::test]
+    async fn read_file_wide_range_caps_relative_to_the_range_start() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("big.txt");
+        let body: String = (1..=8000)
+            .map(|n| format!("line-{n:05} {}\n", "x".repeat(18)))
+            .collect();
+        std::fs::write(&path, &body).unwrap();
+        let policy =
+            Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[]).unwrap();
+        let args = serde_json::json!({"path": path, "start_line": 3000}).to_string();
+
+        let output = read_file_run(&policy, &args).await.unwrap();
+
+        // Serving starts at the requested line, fills the budget, and the
+        // disclosure reports post-slice served bytes (~64 KiB), not the
+        // pre-slice absolute read.
+        assert!(output.starts_with("3000\tline-03000"), "got: {output}");
+        assert!(output.contains("served 63 KiB") || output.contains("served 64 KiB"));
+        assert!(output.ends_with("re-read a line range for the rest]"));
     }
 
     #[cfg(unix)]
@@ -3820,14 +5986,69 @@ mod tests {
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
     }
 
+    #[tokio::test]
+    async fn write_tool_warning_is_quote_aware_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy = Permissions::for_roots(&[], &[root]).expect("perms");
+
+        // A source file that lists the markers as QUOTED data → no warning
+        // (R1.8: the write succeeds cleanly, warning is null).
+        let ok_path = dir.path().join("tokens.rs");
+        let ok_args = serde_json::json!({
+            "path": ok_path.to_string_lossy(),
+            "content": "const T: &[&str] = &[\"<|im_start|>\", \"<|im_end|>\"];\n"
+        })
+        .to_string();
+        let out = write_file_run(&policy, &ok_args).await.expect("write ok");
+        assert!(
+            out.contains("\"warning\":null"),
+            "quoted table must not warn: {out}"
+        );
+
+        // A file whose content is a BARE leaked marker → warning fires.
+        let bad_path = dir.path().join("leaked.txt");
+        let bad_args = serde_json::json!({
+            "path": bad_path.to_string_lossy(),
+            "content": "<|im_start|>assistant\nsome leaked protocol text\n"
+        })
+        .to_string();
+        let out = write_file_run(&policy, &bad_args).await.expect("write ok");
+        assert!(
+            out.contains("chat-template control marker"),
+            "bare marker must still warn: {out}"
+        );
+    }
+
     #[test]
     fn content_quality_warning_flags_chat_template_tokens() {
+        // A BARE marker (raw leaked completion) is flagged.
         let warning = content_quality_warning("<|im_start|>system\nhi")
             .expect("chat-template marker should be flagged");
         assert!(CHAT_TEMPLATE_TOKENS
             .iter()
             .all(|token| !warning.contains(token)));
         assert!(content_quality_warning("normal code, no tokens here").is_none());
+    }
+
+    #[test]
+    fn content_quality_warning_ignores_quoted_marker_strings_in_source() {
+        // R1.8: a file that lists the markers AS DATA (quoted string literals)
+        // must NOT be flagged — this is the false positive Kimi hit editing the
+        // debris-detector's own token table.
+        let token_table = "const CHAT_TEMPLATE_TOKENS: &[&str] = &[\n    \
+                           \"<|im_start|>\",\n    \"<|im_end|>\",\n    \"[INST]\",\n];\n";
+        assert!(
+            content_quality_warning(token_table).is_none(),
+            "quoted marker literals in source must not warn"
+        );
+        // Single-quoted also counts as quoted.
+        assert!(content_quality_warning("let c = '\u{0}'; let m = \"<|eot_id|>\";").is_none());
+        // But a bare marker mixed into otherwise-quoted content still warns.
+        assert!(
+            content_quality_warning("\"<|im_start|>\" then bare <|im_end|> here").is_some(),
+            "a bare (unquoted) marker is still leaked debris"
+        );
     }
 
     #[test]
@@ -3959,6 +6180,53 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "alpha\nBETA\ngamma\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_and_write_handle_files_larger_than_the_read_cap() {
+        // Regression: the journal pre-image used the 64 KiB READ cap, so any
+        // file above it (e.g. orchestrator.rs at 129 KiB) was uneditable. The
+        // write cap (1 MiB) is the correct bound. Build a ~200 KiB file — well
+        // over the read cap, under the write cap — and edit + rewrite it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+        // The 200 KiB fixture straddles the caps: over the 64 KiB read cap,
+        // under the 1 MiB write cap (DEFAULT_MAX_BYTES .. DEFAULT_MAX_WRITE_BYTES).
+        let target = dir.path().join("big.rs");
+        let mut body = "x".repeat(200 * 1024);
+        body.push_str("\nOLD_MARKER\n");
+        std::fs::write(&target, &body).unwrap();
+
+        // fs_edit_file on a file over the read cap now succeeds.
+        let args = serde_json::json!({
+            "path": target,
+            "old_text": "OLD_MARKER",
+            "new_text": "NEW_MARKER"
+        })
+        .to_string();
+        let result: serde_json::Value =
+            serde_json::from_str(&edit_file_run(&policy, &args).await.unwrap()).unwrap();
+        assert_eq!(result["change"], "updated", "edit result: {result}");
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("NEW_MARKER"));
+
+        // fs_write_file creating a fresh file larger than the read cap
+        // succeeds (the write cap governs, not the read cap).
+        let fresh = dir.path().join("fresh_big.rs");
+        let content = "y".repeat(150 * 1024);
+        let wargs = serde_json::json!({ "path": fresh, "content": content }).to_string();
+        let wout = write_file_run(&policy, &wargs)
+            .await
+            .expect("write over-cap ok");
+        assert!(
+            wout.contains("created") || wout.contains("\"change\""),
+            "{wout}"
+        );
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap().len(), 150 * 1024);
     }
 
     #[tokio::test]

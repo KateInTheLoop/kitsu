@@ -7,6 +7,8 @@ license.workspace = true
 
 [dependencies]
 owo-colors = { workspace = true }
+libc = "0.2"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
 serde = { workspace = true }
 serde_json = { workspace = true }
 tokio = { workspace = true }

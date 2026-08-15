@@ -239,6 +239,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         quiet: false,
         event_log: None,
         skill_names: Vec::new(),
+        run_tallies: None,
         spawn_budget: None,
     }
 }
@@ -989,6 +990,77 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     );
 }
 
+/// Cycle-27: identical SUCCESSFUL calls stop re-executing past the limit;
+/// the model gets a reminder result instead.
+#[tokio::test]
+async fn identical_successful_repeats_short_circuit_after_limit() {
+    let call = |id: &str| {
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "echo".to_string(),
+                args: r#"{"x":1}"#.to_string(),
+                call_id: id.to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ]
+    };
+    let provider = MockProvider::new(vec![
+        call("c1"),
+        call("c2"),
+        call("c3"),
+        call("c4"),
+        call("c5"),
+        vec![
+            ChatDelta::Text("stopped".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let ran = Arc::new(AtomicUsize::new(0));
+    let ran2 = ran.clone();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "echo".to_string(),
+            description: "echo".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(move |_args: String| {
+            let ran = ran2.clone();
+            Box::pin(async move {
+                ran.fetch_add(1, Ordering::SeqCst);
+                Ok::<String, ToolError>("{}".to_string())
+            })
+        }),
+    );
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
+        .await
+        .unwrap();
+    assert!(out.contains("stopped"));
+    assert_eq!(
+        ran.load(Ordering::SeqCst),
+        3,
+        "calls 4 and 5 must be short-circuited after 3 identical successes"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last().unwrap().iter().any(|m| {
+            m.role == kitsu_providers::Role::Tool && m.content.contains("identical call repeated")
+        }),
+        "the reminder result reaches the model"
+    );
+}
+
+/// Receipt durations: milliseconds under a second, one-decimal seconds after.
+#[test]
+fn format_tool_elapsed_formats_ms_and_seconds() {
+    use crate::orchestrator::format_tool_elapsed;
+    use std::time::Duration;
+    assert_eq!(format_tool_elapsed(Duration::from_millis(34)), "34ms");
+    assert_eq!(format_tool_elapsed(Duration::from_millis(999)), "999ms");
+    assert_eq!(format_tool_elapsed(Duration::from_millis(2100)), "2.1s");
+    assert_eq!(format_tool_elapsed(Duration::from_secs(61)), "61.0s");
+}
+
 /// Invalid escapes inside string literals are dropped; valid ones survive.
 #[test]
 fn relax_json_escapes_repairs_only_invalid_escapes() {
@@ -1110,6 +1182,133 @@ async fn test_text_protocol_skill_confusion_feeds_back_instead_of_answering() {
     );
 }
 
+/// Shared run tallies count reads, failures, and denials — including from
+/// any config that carries the same Arc (subagents share it).
+#[tokio::test]
+async fn run_tallies_count_reads_failures_and_denials() {
+    use crate::orchestrator::RunTallies;
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "denied_tool".to_string(),
+                args: "{}".to_string(),
+                call_id: "c1".to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "denied_tool".to_string(),
+            description: "always denied".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(|_args: String| {
+            Box::pin(async move {
+                Err::<String, ToolError>(ToolError::PolicyDenied("nope".to_string()))
+            })
+        }),
+    );
+    let tallies = std::sync::Arc::new(RunTallies::default());
+    let mut config = cfg(10);
+    config.run_tallies = Some(tallies.clone());
+
+    let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &config).await;
+
+    use std::sync::atomic::Ordering;
+    assert_eq!(tallies.failed.load(Ordering::Acquire), 1);
+    assert_eq!(tallies.denied.load(Ordering::Acquire), 1);
+    assert_eq!(tallies.reads.load(Ordering::Acquire), 0);
+}
+
+/// Cycle-23 audit: after SPAWN_REFUSAL_LIMIT cap refusals the spawn tools
+/// are withheld for the rest of the turn — later rounds advertise fewer
+/// tools, and the model gets an explicit withdrawal notice.
+#[tokio::test]
+async fn spawn_cap_refusals_withhold_spawn_tools_for_the_turn() {
+    use crate::orchestrator::{AgentEventLog, AgentRuntimeEvent};
+    // Distinct args per attempt: a real storm varies its tasks, which is
+    // exactly why the identical-signature loop-breaker never catches it.
+    let spam = |id: &str, task: &str| {
+        vec![
+            ChatDelta::ToolCall(ToolCall {
+                tool_name: "spawn_agent".to_string(),
+                args: format!(r#"{{"task":"{task}"}}"#),
+                call_id: id.to_string(),
+            }),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ]
+    };
+    let provider = MockProvider::new(vec![
+        spam("s1", "first"),
+        spam("s2", "second"),
+        vec![
+            ChatDelta::Text("done inline".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "spawn_agent".to_string(),
+            description: "spawn".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        Box::new(|_args: String| {
+            Box::pin(async move {
+                Err::<String, ToolError>(ToolError::ExecError(
+                    "agent spawn cap reached: this turn already started 0 of 0 allowed subagents."
+                        .to_string(),
+                ))
+            })
+        }),
+    );
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "other_tool".to_string(),
+            description: "still available".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+    let log = AgentEventLog::default();
+    let mut config = cfg(10);
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+
+    let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &config)
+        .await
+        .expect("turn completes inline after withdrawal");
+    assert!(out.contains("done inline"));
+
+    let offered: Vec<usize> = log
+        .take()
+        .iter()
+        .filter_map(|event| match event {
+            AgentRuntimeEvent::ProviderRequest { tools_offered, .. } => Some(*tools_offered),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        offered,
+        vec![2, 2, 1],
+        "third round must advertise only the non-spawn tool: {offered:?}"
+    );
+    let seen = provider.seen_messages.lock().unwrap();
+    assert!(
+        seen.last()
+            .unwrap()
+            .iter()
+            .any(|m| { m.role == kitsu_providers::Role::User && m.content.contains("WITHDRAWN") }),
+        "the model gets the withdrawal notice"
+    );
+}
+
 // --- ISSUE-007: loop-breaker on repeated identical failures -----------------
 
 /// A provider that ALWAYS emits the same failing tool call while tools are
@@ -1196,7 +1395,15 @@ async fn test_loop_breaker_on_repeated_failure() {
 fn tool_activity_formatting() {
     use crate::orchestrator::{format_tool_header, format_tool_result, short_path};
 
-    assert_eq!(short_path("/x/y/deck1.md"), "…/y/deck1.md");
+    // Three-segment paths preserve crate identity (cycle-15 G5).
+    assert_eq!(short_path("/x/y/deck1.md"), "/x/y/deck1.md");
+    // Paths with 4+ segments show the last three with a leading `…`.
+    assert_eq!(short_path("/a/b/c/d/e.rs"), "…/c/d/e.rs");
+    assert_eq!(
+        short_path("crates/kitsu-render/src/lib.rs"),
+        "…/kitsu-render/src/lib.rs"
+    );
+    // Two-segment paths stay exact (relative or absolute).
     assert_eq!(short_path("a/b"), "a/b");
     assert_eq!(short_path("deck.md"), "deck.md");
     // Short absolute paths keep their leading slash: `/etc/hostname` must not
@@ -1206,7 +1413,7 @@ fn tool_activity_formatting() {
 
     assert_eq!(
         format_tool_header("fs_read_file", r#"{"path":"/x/y/deck1.md"}"#),
-        "Read(…/y/deck1.md)"
+        "Read(/x/y/deck1.md)"
     );
     assert_eq!(
         format_tool_header("fs_write_file", r#"{"path":"out/fb.py","content":"x"}"#),
@@ -1243,6 +1450,7 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "spawn_agent_bg",
+            "{}",
             "Started background agent #1. It runs detached.",
             false
         ),
@@ -1250,12 +1458,18 @@ fn tool_activity_formatting() {
     );
 
     assert_eq!(
-        format_tool_result("fs_write_file", r#"{"written":"x","bytes":42}"#, false),
+        format_tool_result(
+            "fs_write_file",
+            "{}",
+            r#"{"written":"x","bytes":42}"#,
+            false
+        ),
         "written · 42 bytes"
     );
     assert_eq!(
         format_tool_result(
             "fs_write_file",
+            "{}",
             r#"{"written":"x","bytes":42,"change":"unchanged"}"#,
             false
         ),
@@ -1266,6 +1480,7 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "fs_write_file",
+            "{}",
             r#"{"written":"x","bytes":42,"change":"created","warning":"looks corrupted"}"#,
             false
         ),
@@ -1278,23 +1493,48 @@ fn tool_activity_formatting() {
     assert_eq!(
         format_tool_result(
             "fs_edit_file",
+            "{}",
             r#"{"edited":"x","bytes":10,"change":"updated"}"#,
             false
         ),
         "updated · 10 bytes"
     );
     assert_eq!(
-        format_tool_result("repo_grep", "l1\nl2\nl3", false),
+        format_tool_result("repo_grep", "{}", "l1\nl2\nl3", false),
         "3 matches"
     );
     assert_eq!(
-        format_tool_result("repo_grep", "(no matches)", false),
+        format_tool_result("repo_grep", "{}", "(no matches)", false),
         "no matches"
     );
-    assert_eq!(format_tool_result("fs_read_file", "a\nb", false), "2 lines");
+    assert_eq!(
+        format_tool_result("fs_read_file", "{}", "a\nb", false),
+        "2 lines"
+    );
+    // A ranged read discloses its slice (cycle-16: silent 4-line reads of a
+    // 1905-line file were invisible starvation).
     assert_eq!(
         format_tool_result(
             "fs_read_file",
+            r#"{"path":"x.rs","start_line":1,"end_line":4}"#,
+            "a\nb\nc\nd",
+            false
+        ),
+        "4 lines (ranged read 1-4)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_read_file",
+            r#"{"path":"x.rs","start_line":100}"#,
+            "a\nb",
+            false
+        ),
+        "2 lines (ranged read 100-end)"
+    );
+    assert_eq!(
+        format_tool_result(
+            "fs_read_file",
+            "{}",
             r#"{"error":"PolicyDenied","detail":"nope"}"#,
             true
         ),
@@ -1341,7 +1581,8 @@ fn tool_activity_formatting() {
             "artifact": {"reference": "session:command-1"},
             "artifact_error": null
     });
-    let command_result = format_tool_result("command_exec", &command_output.to_string(), false);
+    let command_result =
+        format_tool_result("command_exec", "{}", &command_output.to_string(), false);
     assert!(command_result.contains("exit 7 | 42 ms"));
     assert!(command_result.contains("stdout 4/9 B truncated"));
     assert!(command_result.contains("89"));
@@ -1356,6 +1597,7 @@ fn tool_activity_formatting() {
         serde_json::json!("no full-output artifact was created; no cleanup was required");
     let cancelled_result = format_tool_result(
         "command_exec",
+        "{}",
         &cancelled_without_artifact.to_string(),
         false,
     );
@@ -1367,7 +1609,7 @@ fn tool_activity_formatting() {
     signaled["exit_code"] = serde_json::Value::Null;
     signaled["signal"] = serde_json::json!(15);
     assert!(
-        format_tool_result("command_exec", &signaled.to_string(), false)
+        format_tool_result("command_exec", "{}", &signaled.to_string(), false)
             .starts_with("signal 15 | 42 ms")
     );
 
@@ -1376,7 +1618,7 @@ fn tool_activity_formatting() {
     timed_out["exit_code"] = serde_json::Value::Null;
     timed_out["signal"] = serde_json::json!(9);
     assert!(
-        format_tool_result("command_exec", &timed_out.to_string(), false)
+        format_tool_result("command_exec", "{}", &timed_out.to_string(), false)
             .starts_with("timeout (signal 9) | 42 ms")
     );
 
@@ -1394,6 +1636,7 @@ fn tool_activity_formatting() {
 
     let sanitized_warning = format_tool_result(
         "fs_write_file",
+        "{}",
         r#"{"bytes":1,"warning":"raw <|im_start|> marker"}"#,
         false,
     );
@@ -1450,7 +1693,7 @@ fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
         "artifact_error": null,
         "containment_hint": "output matches 'No module named' — try --command-env / --command-root"
     });
-    let receipt = format_tool_result("command_exec", &output.to_string(), false);
+    let receipt = format_tool_result("command_exec", "{}", &output.to_string(), false);
     assert!(
         receipt.contains(&format!("full output={long_reference:?}")),
         "artifact path must appear complete and unelided: {receipt}"
@@ -1711,8 +1954,9 @@ fn maybe_offload_writes_large_result_and_returns_pointer() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(20_000);
-    let out = maybe_offload(big.clone(), "call-1", Some(dir.path()));
+    let (out, offloaded_to) = maybe_offload(big.clone(), "call-1", Some(dir.path()));
     assert!(out.contains("saved to"), "returns a pointer");
+    assert!(offloaded_to.is_some(), "reports the artifact path");
     assert!(
         out.contains("fs_read_file"),
         "tells the model how to re-read"
@@ -1738,8 +1982,8 @@ fn maybe_offload_never_clobbers_an_earlier_result_for_the_same_call() {
     let first = "a".repeat(20_000);
     let second = "b".repeat(20_000);
 
-    let first_pointer = maybe_offload(first.clone(), "same-call", Some(dir.path()));
-    let second_pointer = maybe_offload(second.clone(), "same-call", Some(dir.path()));
+    let (first_pointer, _) = maybe_offload(first.clone(), "same-call", Some(dir.path()));
+    let (second_pointer, _) = maybe_offload(second.clone(), "same-call", Some(dir.path()));
 
     assert_ne!(first_pointer, second_pointer);
     let mut contents = std::fs::read_dir(dir.path())
@@ -1755,14 +1999,49 @@ fn maybe_offload_keeps_small_results_inline() {
     use crate::orchestrator::maybe_offload;
     let dir = tempfile::tempdir().unwrap();
     let small = "hello".to_string();
-    assert_eq!(maybe_offload(small.clone(), "c", Some(dir.path())), small);
+    assert_eq!(
+        maybe_offload(small.clone(), "c", Some(dir.path())),
+        (small, None)
+    );
 }
 
 #[test]
 fn maybe_offload_is_noop_without_a_dir() {
     use crate::orchestrator::maybe_offload;
     let big = "x".repeat(20_000);
-    assert_eq!(maybe_offload(big.clone(), "c", None), big);
+    assert_eq!(maybe_offload(big.clone(), "c", None), (big, None));
+}
+
+/// The cycle-15 headline regression: with a huge window and a nearly empty
+/// conversation, a big successful result must STAY INLINE — swapping it for
+/// a 500-char preview starves the model for no reason. Pressure returns once
+/// the estimated prompt would pass half the effective budget.
+#[test]
+fn offload_pressure_requires_real_window_pressure() {
+    use crate::orchestrator::offload_pressure;
+    let messages = initial_messages();
+    let big = "x".repeat(20_000); // ~5k estimated tokens
+
+    let mut roomy = cfg(10);
+    roomy.context_window = Some(131_072);
+    assert!(
+        !offload_pressure(&messages, &big, &roomy),
+        "1.5k used + 5k added in a 131k window is not pressure"
+    );
+
+    let mut tight = cfg(10);
+    tight.context_window = Some(8_192);
+    assert!(
+        offload_pressure(&messages, &big, &tight),
+        "the same result in an 8k window is pressure"
+    );
+
+    let mut unknown = cfg(10);
+    unknown.context_window = None;
+    assert!(
+        offload_pressure(&messages, &big, &unknown),
+        "unknown window keeps the conservative old behavior"
+    );
 }
 
 #[test]
@@ -1782,8 +2061,18 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         ok_handler("{}"),
     );
 
-    let inline = maybe_offload_for_tools(big.clone(), "command", Some(dir.path()), &tools);
-    assert_eq!(inline, big);
+    let mut tight = cfg(10);
+    tight.context_window = Some(8_192);
+    let msgs = initial_messages();
+    let inline = maybe_offload_for_tools(
+        big.clone(),
+        "command",
+        Some(dir.path()),
+        &tools,
+        &msgs,
+        &tight,
+    );
+    assert_eq!(inline, (big.clone(), None));
     assert!(
         std::fs::read_dir(dir.path()).unwrap().next().is_none(),
         "a command-only model cannot recover an fs_read_file pointer"
@@ -1797,9 +2086,11 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
-    let pointer = maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools);
+    let (pointer, offloaded_to) =
+        maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools, &msgs, &tight);
     assert!(pointer.contains("full result saved to"));
     assert!(pointer.contains("fs_read_file"));
+    assert!(offloaded_to.is_some());
 }
 
 // --- summarizing compaction (Stage 3) ---------------------------------------
@@ -2056,7 +2347,7 @@ fn trim_tool_results_preserves_offload_pointer_but_drops_preview() {
 
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(20_000);
-    let pointer = maybe_offload(big, "call-1", Some(dir.path()));
+    let (pointer, _) = maybe_offload(big, "call-1", Some(dir.path()));
     assert!(
         pointer.contains("saved to"),
         "sanity: got an offload pointer"
@@ -3491,4 +3782,30 @@ async fn test_healthy_usage_records_no_window_evidence() {
         .await
         .expect("turn should succeed");
     assert!(state.window_evidence.is_none());
+}
+
+#[test]
+fn template_control_debris_detector_fires_on_tails_not_quotes() {
+    use crate::orchestrator::template_control_debris_in_tail;
+    // The live failure shape: mangled trailing tool call with the file path.
+    let leaked = "analysis text...\n<|close|>argument<|sep|><|open|>argument key=\"path\"<|sep|>/tmp/x.md<|close|>argument<|sep|><|close|>call<|sep|><|close|>tools<|sep|>";
+    assert!(template_control_debris_in_tail(leaked));
+    // A single stray token is not enough.
+    assert!(!template_control_debris_in_tail(
+        "ends with one token <|sep|>"
+    ));
+    // Tokens QUOTED early in a long answer (e.g. discussing chat templates)
+    // do not trip the tail-window detector.
+    let mut quoted =
+        String::from("Kimi uses tokens like <|close|> and <|sep|> in its chat template. ");
+    quoted.push_str(&"More analysis follows here. ".repeat(20));
+    assert!(!template_control_debris_in_tail(&quoted));
+    // Uppercase or long identifiers are not control tokens.
+    assert!(!template_control_debris_in_tail(
+        "x <|NOTATOKEN|> y <|this_is_a_much_too_long_identifier_name|> z"
+    ));
+    // Clean answers never trip.
+    assert!(!template_control_debris_in_tail(
+        "a perfectly normal answer."
+    ));
 }

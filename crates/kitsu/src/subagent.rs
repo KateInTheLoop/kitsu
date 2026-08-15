@@ -119,6 +119,9 @@ pub struct AgentTelemetry {
     pub tool_count: u64,
     pub write_count: u64,
     pub last_activity: Option<String>,
+    /// When the last activity was recorded — the deck renders its age so a
+    /// stalled running agent is visible at a glance (ui-parity item 13).
+    pub last_activity_at: Option<Instant>,
     pub recent_activity: Vec<String>,
     pub failure_class: Option<AgentFailureClass>,
 }
@@ -172,6 +175,7 @@ impl AgentTelemetry {
         Self {
             model: thread::safe_inline_label(&model, 256),
             last_activity: Some("started".to_string()),
+            last_activity_at: Some(Instant::now()),
             recent_activity: vec!["started".to_string()],
             ..Self::default()
         }
@@ -179,6 +183,7 @@ impl AgentTelemetry {
 
     fn record_activity(&mut self, activity: String) {
         self.last_activity = Some(activity.clone());
+        self.last_activity_at = Some(Instant::now());
         if self.recent_activity.len() == RECENT_ACTIVITY_LIMIT {
             self.recent_activity.remove(0);
         }
@@ -247,6 +252,8 @@ pub struct AgentProgress {
     pub status: AgentProgressStatus,
     pub elapsed_ms: u64,
     pub result_bytes: Option<usize>,
+    /// Milliseconds since the agent's last recorded activity (running rows).
+    pub last_activity_ms_ago: Option<u64>,
     pub telemetry: AgentTelemetry,
 }
 
@@ -1138,6 +1145,10 @@ fn agent_progress(id: u64, record: &AgentRecord) -> AgentProgress {
         status,
         elapsed_ms: elapsed_millis(record.started_at, record.finished_at),
         result_bytes,
+        last_activity_ms_ago: record
+            .telemetry
+            .last_activity_at
+            .map(|at| at.elapsed().as_millis() as u64),
         telemetry: record.telemetry.clone(),
     }
 }

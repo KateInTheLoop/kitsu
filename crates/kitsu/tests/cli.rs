@@ -6545,6 +6545,80 @@ fn test_permissions_payload_reports_cwd_source() {
     );
 }
 
+/// --dangerously-skip-permissions is the unattended umbrella: filesystem
+/// bypass plus command auto-approval, disclosed loudly at startup and in
+/// /permissions — and `/permissions protect <path>` layers an in-session
+/// guard the bypass cannot cross.
+#[test]
+#[serial]
+fn test_dangerously_skip_permissions_discloses_and_protect_guards() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let proj = TempDir::new().expect("command root");
+    let guarded = proj.path().join("secrets");
+    fs::create_dir(&guarded).unwrap();
+    let script = home.path().join("skip.txt");
+    fs::write(
+        &script,
+        format!(
+            "/permissions protect {}\n/permissions\n/quit\n",
+            guarded.display()
+        ),
+    )
+    .unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(proj.path())
+        .args([
+            "--jsonl",
+            "--dangerously-skip-permissions",
+            "chat",
+            "--command-root",
+            &proj.path().to_string_lossy(),
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("skip-permissions script");
+    assert!(output.status.success());
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("DANGEROUSLY SKIPPING PERMISSIONS"),
+        "startup warning missing: {stderr}"
+    );
+    let permissions = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .rfind(|event| event["result"]["kind"] == "permissions")
+        .expect("permissions payload");
+    assert_eq!(
+        permissions["result"]["commands"]["mode"],
+        "DANGEROUS auto-allow (no prompts)"
+    );
+    assert_eq!(
+        permissions["result"]["mode"],
+        "DANGER: global filesystem bypass"
+    );
+    assert_eq!(permissions["result"]["dangerous_global_bypass"], true);
+    let protected_writes = permissions["result"]["filesystem"]["protected_write_roots"]
+        .as_array()
+        .expect("protected_write_roots");
+    assert!(
+        protected_writes
+            .iter()
+            .any(|path| path.as_str().is_some_and(|path| path.ends_with("secrets"))),
+        "protected path missing from payload: {protected_writes:?}"
+    );
+    let text = permissions["result"]["text"].as_str().expect("text");
+    assert!(
+        text.contains("secrets"),
+        "protected path missing from disclosure: {text}"
+    );
+}
+
 /// When the legacy form is unsatisfiable because the launch directory sits
 /// outside the roots, the startup error names the object syntax that fixes it.
 #[test]

@@ -3,6 +3,43 @@
 //! append results → repeat until the model stops or a cap is hit.
 
 use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
+
+/// Detect mangled chat-template control tokens (e.g. Kimi's `<|close|>`,
+/// `<|sep|>`) in the TAIL of a final answer — the residue a provider leaks
+/// when it fails to parse a model's native-format trailing tool call
+/// (observed live: the debris contained the Write call's file path). Only
+/// the last 300 chars are scanned, and two distinct control tokens are
+/// required, so answers that merely QUOTE such tokens earlier in prose or
+/// code fences do not trip it.
+fn template_control_debris_in_tail(text: &str) -> bool {
+    let tail_start = text.len().saturating_sub(300);
+    // Snap to a char boundary.
+    let mut start = tail_start;
+    while start < text.len() && !text.is_char_boundary(start) {
+        start += 1;
+    }
+    let tail = &text[start..];
+    let mut distinct = std::collections::HashSet::new();
+    let bytes = tail.as_bytes();
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        if bytes[i] == b'<' && bytes[i + 1] == b'|' {
+            if let Some(end) = tail[i + 2..].find("|>") {
+                let token = &tail[i + 2..i + 2 + end];
+                if !token.is_empty()
+                    && token.len() <= 24
+                    && token.chars().all(|ch| ch.is_ascii_lowercase() || ch == '_')
+                {
+                    distinct.insert(token.to_string());
+                }
+                i += 2 + end + 2;
+                continue;
+            }
+        }
+        i += 1;
+    }
+    distinct.len() >= 2
+}
 use futures::StreamExt;
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
@@ -112,6 +149,10 @@ pub struct AgentConfig {
     /// a skill invoked as a fake tool (`{"name": "code-review"}`) apart from
     /// arbitrary JSON in a real answer. Empty when no skills are loaded.
     pub skill_names: Vec<String>,
+    /// Shared run-wide tallies (reads/denied/failed). Unlike per-state
+    /// fields, this Arc spans the MAIN conversation and every subagent, so
+    /// end-of-run receipts count delegated work (cycle-17 #1, cycle-19 #5).
+    pub run_tallies: Option<std::sync::Arc<RunTallies>>,
     /// Per-turn subagent spawn budget (config `agent_spawn_cap`). Set only on
     /// the MAIN conversation's config; the orchestrator resets it when a turn
     /// starts. Subagent configs must leave this `None` so nested turns never
@@ -668,6 +709,7 @@ impl Default for AgentConfig {
             quiet: false,
             event_log: None,
             skill_names: Vec::new(),
+            run_tallies: None,
             spawn_budget: None,
         }
     }
@@ -761,6 +803,14 @@ pub struct AgentSessionState {
     /// backend telemetry, not conversation state: callers that roll a failed
     /// turn back should preserve it.
     pub window_evidence: Option<ContextWindowEvidence>,
+    /// Successful `fs_read_file` calls across the whole run. Rendered in the
+    /// end-of-run receipt so "wrote a summary of files it never opened"
+    /// (cycle-16 M1) is visible at a glance.
+    pub run_reads: u64,
+    /// Cumulative provider usage across the run, for `/cost`.
+    pub run_usage: kitsu_providers::Usage,
+    /// Completed model turns across the run, for `/cost`.
+    pub run_turns: u32,
 }
 
 /// Evidence, gathered from a provider `usage` report, that the server accepted
@@ -872,6 +922,7 @@ pub async fn run_agent_turn_with_state<P>(
 where
     P: Provider,
 {
+    let turn_start = std::time::Instant::now();
     let mut turn_usage = kitsu_providers::Usage::default();
     state.last_turn = AgentTurnStatus::default();
     if let Some(budget) = &cfg.spawn_budget {
@@ -883,6 +934,33 @@ where
         kitsu_render::begin_turn_output();
     }
     let result = run_agent_turn_inner(provider, tools, messages, cfg, &mut turn_usage, state).await;
+    let elapsed = turn_start.elapsed();
+    state.run_usage.prompt_tokens += turn_usage.prompt_tokens;
+    state.run_usage.completion_tokens += turn_usage.completion_tokens;
+    state.run_usage.total_tokens += turn_usage.total_tokens;
+    state.run_turns += 1;
+    if let Some(tallies) = &cfg.run_tallies {
+        tallies
+            .prompt_tokens
+            .fetch_add(turn_usage.prompt_tokens, Ordering::AcqRel);
+        tallies
+            .completion_tokens
+            .fetch_add(turn_usage.completion_tokens, Ordering::AcqRel);
+        tallies
+            .total_tokens
+            .fetch_add(turn_usage.total_tokens, Ordering::AcqRel);
+        tallies.turns.fetch_add(1, Ordering::AcqRel);
+        if !turn_usage.is_empty() {
+            let mut per_model = tallies
+                .per_model
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            let bin = per_model.entry(cfg.model.clone()).or_insert((0, 0, 0));
+            bin.0 += turn_usage.prompt_tokens;
+            bin.1 += turn_usage.completion_tokens;
+            bin.2 += turn_usage.total_tokens;
+        }
+    }
     if let Some(log) = &cfg.event_log {
         let completion = match state.last_turn.completion {
             TurnCompletion::Complete => "complete",
@@ -917,11 +995,11 @@ where
             (state.meter.estimate(messages), budget.effective, window)
         });
         if result.is_ok() {
-            kitsu_render::emit_turn_stats(usage, context);
+            kitsu_render::emit_turn_stats(usage, context, Some(elapsed));
         } else {
             // A failed turn gets no human stats line — the error notice owns
             // that moment — but redirected runs keep the machine records.
-            kitsu_render::emit_failed_turn_stats(usage, context);
+            kitsu_render::emit_failed_turn_stats(usage, context, Some(elapsed));
         }
     }
     result
@@ -946,17 +1024,38 @@ where
         compaction_ledger,
         last_turn: turn_status,
         window_evidence,
+        run_reads,
+        run_usage: _,
+        run_turns: _,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
+    // One bounded re-prompt per turn when provider-mangled chat-template
+    // debris is detected in a final answer (sibling of the malformed-JSON
+    // text-call recovery below).
+    let mut debris_retry_used = false;
 
     // ISSUE-007 loop-breaker: track consecutive identical tool-call failures so a
     // model that fixates on a failing call (e.g. a denied path) is forced to a
     // final answer instead of burning every round. Signature = tool_name + args.
     let mut consecutive_failures: std::collections::HashMap<String, u32> =
         std::collections::HashMap::new();
+    // Cycle-27 audit: nine byte-identical SUCCESSFUL workspace_diff calls
+    // cost 6.7x tokens — the failure breaker never sees successful repeats.
+    // After this many identical successes, further identical calls are
+    // answered with a short reminder instead of re-executing.
+    const REPEAT_SUCCESS_LIMIT: u32 = 3;
+    let mut consecutive_successes: std::collections::HashMap<String, u32> =
+        std::collections::HashMap::new();
     let mut force_final_next = false;
     const REPEAT_FAIL_LIMIT: u32 = 2;
+    // Cycle-23 audit: the spawn cap's polite refusal was ignored 6x by a
+    // hosted model. After this many refusals in one turn the spawn tools are
+    // WITHHELD for the turn's remainder (ISSUE-007 pattern applied to
+    // spawning) — the model keeps its other tools and must work inline.
+    const SPAWN_REFUSAL_LIMIT: u32 = 2;
+    let mut spawn_cap_refusals: u32 = 0;
+    let mut spawn_tools_withheld = false;
 
     // The tool set is fixed for the whole turn (every round advertises the same
     // descriptors), so serialize the schema once here rather than redoing it on
@@ -992,6 +1091,13 @@ where
         let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1) || force_final_next;
         let offered_tools = if is_final_round {
             None
+        } else if spawn_tools_withheld {
+            tool_descriptors(tools).map(|descriptors| {
+                descriptors
+                    .into_iter()
+                    .filter(|descriptor| !descriptor.name.starts_with("spawn_agent"))
+                    .collect::<Vec<_>>()
+            })
         } else {
             tool_descriptors(tools)
         };
@@ -1267,7 +1373,29 @@ where
         if tool_calls.is_empty() {
             // (1) terminal: model stopped with no tool calls.
             match finish {
-                FinishReason::Stop => return Ok(assistant_text),
+                FinishReason::Stop => {
+                    if !debris_retry_used && template_control_debris_in_tail(&assistant_text) {
+                        // A provider failed to parse the model's native-format
+                        // trailing tool call and leaked its remains as text.
+                        // Don't accept the destroyed action silently: tell the
+                        // model and let it re-issue the call properly, once.
+                        debris_retry_used = true;
+                        turn_status.tool_errors += 1;
+                        if !cfg.quiet {
+                            kitsu_render::tool_result_error(
+                                "response tail contains chat-template control tokens — a trailing tool call was likely destroyed by the provider; asked the model to re-issue it",
+                            );
+                        }
+                        messages.push(ChatMessage::assistant(assistant_text.clone(), Vec::new()));
+                        messages.push(ChatMessage::user(
+                            "Your last message ended in raw chat-template control tokens (like <|...|>) — a tool call you attempted was NOT executed because the serving provider failed to parse it. Re-issue that action as a proper structured tool call now, without repeating the prose."
+                                .to_string(),
+                        ));
+                        assistant_text.clear();
+                        continue;
+                    }
+                    return Ok(assistant_text);
+                }
                 // Truncated by the model's output cap — surface it instead of
                 // letting a cut-off answer masquerade as a complete one.
                 FinishReason::Length => {
@@ -1321,15 +1449,29 @@ where
             );
             abort_if_event_sink_failed(cfg)?;
             let sig = format!("{}\u{0}{}", tc.tool_name, tc.args);
-            let tool_result = match tool_event.command_progress_sink() {
-                Some(sink) => {
-                    scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone())).await
+            let call_started = std::time::Instant::now();
+            let repeat_count = consecutive_successes.get(&sig).copied().unwrap_or(0);
+            let tool_result = if repeat_count >= REPEAT_SUCCESS_LIMIT {
+                // Identical successful call repeated past the limit: answer
+                // with a reminder instead of re-running (and re-paying for)
+                // the same result.
+                Ok(format!(
+                    "[identical call repeated: this exact {} call already succeeded {repeat_count} time(s) this turn and its result is above — use it, or change the arguments]",
+                    tc.tool_name
+                ))
+            } else {
+                match tool_event.command_progress_sink() {
+                    Some(sink) => {
+                        scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone()))
+                            .await
+                    }
+                    None => tools.run(&tc.tool_name, tc.args.clone()).await,
                 }
-                None => tools.run(&tc.tool_name, tc.args.clone()).await,
             };
             let (content, is_err) = match tool_result {
                 Ok(out) => {
                     consecutive_failures.remove(&sig); // a success resets the streak
+                    *consecutive_successes.entry(sig.clone()).or_insert(0) += 1;
                     (out, false)
                 }
                 Err(e) => {
@@ -1346,6 +1488,28 @@ where
                         turn_status.final_round_tool_errors.saturating_add(1);
                     if matches!(e, kitsu_tools::ToolError::PolicyDenied(_)) {
                         turn_status.policy_errors = turn_status.policy_errors.saturating_add(1);
+                        if let Some(tallies) = &cfg.run_tallies {
+                            tallies.denied.fetch_add(1, Ordering::AcqRel);
+                        }
+                    }
+                    if tc.tool_name.starts_with("spawn_agent")
+                        && e.to_string().contains("agent spawn cap reached")
+                    {
+                        spawn_cap_refusals = spawn_cap_refusals.saturating_add(1);
+                        if spawn_cap_refusals >= SPAWN_REFUSAL_LIMIT && !spawn_tools_withheld {
+                            spawn_tools_withheld = true;
+                            if !cfg.quiet {
+                                kitsu_render::tool_result_error(
+                                    "spawn cap refusals ignored — spawn tools withheld for the rest of this turn; the model keeps its other tools",
+                                );
+                            }
+                            messages.push(ChatMessage::user(
+                                "The agent spawn cap was reached and further spawn attempts were refused. \
+                                 Spawn tools are now WITHDRAWN for the rest of this turn: do the remaining \
+                                 work yourself with your other tools, then give your final answer."
+                                    .to_string(),
+                            ));
+                        }
                     }
                     (
                         serde_json::json!({ "error": e.kind(), "detail": e.to_string() })
@@ -1354,23 +1518,62 @@ where
                     )
                 }
             };
-            if !cfg.quiet {
-                let summary = format_tool_result(&tc.tool_name, &content, is_err);
+            // Describe the result BEFORE any offload substitution, but print
+            // AFTER the decision so the receipt can disclose the swap — a
+            // `◇ 1828 lines` line over a 500-char preview is a lie the user
+            // has no way to detect (cycle-15 headline).
+            let summary = (!cfg.quiet).then(|| {
+                let mut summary = format_tool_result(&tc.tool_name, &tc.args, &content, is_err);
+                // UI-parity item 3: every receipt carries its duration, except
+                // command_exec whose result already reports its own elapsed.
+                if tc.tool_name != "command_exec" {
+                    summary.push_str(&format!(
+                        " · {}",
+                        format_tool_elapsed(call_started.elapsed())
+                    ));
+                }
+                summary
+            });
+            if !is_err && tc.tool_name == "fs_read_file" {
+                *run_reads += 1;
+            }
+            if let Some(tallies) = &cfg.run_tallies {
+                if is_err {
+                    tallies.failed.fetch_add(1, Ordering::AcqRel);
+                } else if tc.tool_name == "fs_read_file" {
+                    tallies.reads.fetch_add(1, Ordering::AcqRel);
+                }
+            }
+            tool_event.finish(!is_err, &content);
+            abort_if_event_sink_failed(cfg)?;
+            // Offload a large successful result to disk (only under real
+            // context pressure), leaving a re-readable pointer, so one big
+            // result can't dominate a small window (Stage 2).
+            let (content, offloaded_to) = if is_err {
+                (content, None)
+            } else {
+                maybe_offload_for_tools(
+                    content,
+                    &tc.call_id,
+                    cfg.offload_dir.as_deref(),
+                    tools,
+                    messages,
+                    cfg,
+                )
+            };
+            if let Some(mut summary) = summary {
+                if let Some(path) = &offloaded_to {
+                    summary.push_str(&format!(
+                        " → context got a {OFFLOAD_PREVIEW_CHARS}-char preview; full text at {} (model can fs_read_file it)",
+                        path.display()
+                    ));
+                }
                 if is_err {
                     kitsu_render::tool_result_error(&summary);
                 } else {
                     kitsu_render::tool_result(&summary);
                 }
             }
-            tool_event.finish(!is_err, &content);
-            abort_if_event_sink_failed(cfg)?;
-            // Offload a large successful result to disk, leaving a re-readable
-            // pointer, so one big result can't dominate a small window (Stage 2).
-            let content = if is_err {
-                content
-            } else {
-                maybe_offload_for_tools(content, &tc.call_id, cfg.offload_dir.as_deref(), tools)
-            };
             messages.push(ChatMessage::tool(tc.call_id.clone(), content));
         }
         // continue to next round
@@ -1727,18 +1930,37 @@ fn format_tool_header(name: &str, args: &str) -> String {
 
 /// Result summary shown under a tool call — bytes for writes, matches for grep,
 /// lines otherwise; the error kind on failure.
-fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
+/// Compact duration for tool receipts: `34ms` under a second, `2.1s` beyond.
+fn format_tool_elapsed(elapsed: std::time::Duration) -> String {
+    if elapsed.as_secs() == 0
+        && elapsed.subsec_millis() < 1000
+        && elapsed < std::time::Duration::from_secs(1)
+    {
+        format!("{}ms", elapsed.as_millis())
+    } else {
+        format!("{:.1}s", elapsed.as_secs_f64())
+    }
+}
+
+fn format_tool_result(name: &str, args: &str, content: &str, is_err: bool) -> String {
     if is_err {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(content) {
             if let Some(kind) = v.get("error").and_then(|x| x.as_str()) {
-                let detail = v
+                // Keep the WHOLE detail (newlines flattened) up to a bound,
+                // with an explicit ellipsis — the old first-line/180-char cut
+                // silently ate the remedy clauses kitsu itself appends
+                // (cycle-19 audit #3).
+                let raw = v
                     .get("detail")
                     .and_then(|value| value.as_str())
                     .unwrap_or("")
-                    .lines()
-                    .next()
-                    .unwrap_or("");
-                let detail: String = detail.chars().take(180).collect();
+                    .split_whitespace()
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                let mut detail: String = raw.chars().take(360).collect();
+                if raw.chars().count() > 360 {
+                    detail.push('…');
+                }
                 return if detail.is_empty() {
                     format!("error: {kind}")
                 } else {
@@ -1785,6 +2007,56 @@ fn format_tool_result(name: &str, content: &str, is_err: bool) -> String {
         // one-sentence status whose first line IS the summary.
         "spawn_agent_bg" | "agent_result" => {
             bounded_human_value(content.lines().next().unwrap_or_default(), 180)
+        }
+        // A directory listing's unit is entries, not lines (cycle-15 audit).
+        "fs_list_dir" => {
+            let n = content.lines().count();
+            format!("{n} entr{}", if n == 1 { "y" } else { "ies" })
+        }
+        // A ranged read must SAY it was ranged (cycle-16 audit: a model
+        // reading lines 1-4 of a 1905-line file under a small window is
+        // silent starvation unless the receipt discloses the slice).
+        "fs_read_file" => {
+            let truncated = content
+                .lines()
+                .any(|line| line.starts_with("...[truncated"));
+            let n = content
+                .lines()
+                .filter(|line| !line.starts_with("...[truncated"))
+                .count();
+            let range = serde_json::from_str::<serde_json::Value>(args)
+                .ok()
+                .and_then(|value| {
+                    let start = value.get("start_line").and_then(|v| v.as_u64());
+                    let end = value.get("end_line").and_then(|v| v.as_u64());
+                    match (start, end) {
+                        (None, None) => None,
+                        (start, end) => Some(format!(
+                            " (ranged read {}-{})",
+                            start.map_or("start".to_string(), |v| v.to_string()),
+                            end.map_or("end".to_string(), |v| v.to_string()),
+                        )),
+                    }
+                })
+                .unwrap_or_default();
+            let capped = if truncated {
+                // Quote the served-of-total detail from the marker so the
+                // human sees the gap size without opening the raw result.
+                content
+                    .lines()
+                    .find(|line| line.starts_with("...[truncated"))
+                    .and_then(|line| line.split(" — ").nth(1))
+                    .map(|detail| {
+                        format!(
+                            ", capped: {}",
+                            detail.split(';').next().unwrap_or(detail).trim()
+                        )
+                    })
+                    .unwrap_or_else(|| ", capped at the byte limit".to_string())
+            } else {
+                String::new()
+            };
+            format!("{n} line{}{range}{capped}", if n == 1 { "" } else { "s" })
         }
         _ => {
             let n = content.lines().count();
@@ -1897,8 +2169,9 @@ fn safe_warning_summary(warning: &str) -> String {
     bounded_human_value(&safe, 180)
 }
 
-/// Compact a path to at most its last two segments (with a leading `…` when more
-/// were dropped), so activity lines stay short.
+/// Compact a path to at most its last three segments (with a leading `…` when more
+/// were dropped), so activity lines stay short while preserving crate identity.
+/// Cycle-15 G5 finding: distinguish `kitsu-render/src/lib.rs` from `kitsu-core/src/lib.rs`.
 fn short_path(p: &str) -> String {
     let parts: Vec<&str> = p
         .trim_end_matches('/')
@@ -1909,13 +2182,21 @@ fn short_path(p: &str) -> String {
         [] => p.to_string(),
         [one] if p.starts_with('/') => format!("/{one}"),
         [one] => (*one).to_string(),
-        [.., a, b] => {
+        [a, b] => {
             let tail = format!("{a}/{b}");
-            if parts.len() > 2 {
-                format!("…/{tail}")
-            } else if p.starts_with('/') {
+            if p.starts_with('/') {
                 // Keep short absolute paths exact: `/etc/hostname` must not
                 // display as the relative-looking `etc/hostname`.
+                format!("/{tail}")
+            } else {
+                tail
+            }
+        }
+        [.., a, b, c] => {
+            let tail = format!("{a}/{b}/{c}");
+            if parts.len() > 3 {
+                format!("…/{tail}")
+            } else if p.starts_with('/') {
                 format!("/{tail}")
             } else {
                 tail
@@ -2817,22 +3098,63 @@ const OFFLOAD_POINTER_PREFIX: &str = "[tool output ";
 /// How much of an offloaded result to keep inline as a preview.
 const OFFLOAD_PREVIEW_CHARS: usize = 500;
 
+/// Run-wide tallies shared across the MAIN conversation and every spawned
+/// subagent (one Arc, like the spawn budget), so end-of-run receipts count
+/// delegated work too: successful reads, denied tool calls, failed tool
+/// calls (denied is a subset of failed).
+#[derive(Debug, Default)]
+pub struct RunTallies {
+    pub reads: std::sync::atomic::AtomicU64,
+    pub denied: std::sync::atomic::AtomicU64,
+    pub failed: std::sync::atomic::AtomicU64,
+    /// Billed usage across the run — accumulated at turn end regardless of
+    /// later rollback (cycle-23: a rolled-back turn erased ~9.8k billed
+    /// tokens from /cost), and shared with subagent configs so delegated
+    /// spend counts too.
+    pub prompt_tokens: std::sync::atomic::AtomicU64,
+    pub completion_tokens: std::sync::atomic::AtomicU64,
+    pub total_tokens: std::sync::atomic::AtomicU64,
+    pub turns: std::sync::atomic::AtomicU64,
+    /// Per-model spend bins: `/model` mid-session must not blur attribution
+    /// (cycle-25 audit). Key = model id; value = (prompt, completion, total).
+    pub per_model: std::sync::Mutex<std::collections::BTreeMap<String, (u64, u64, u64)>>,
+}
+
+/// True when swapping this inline result for a preview is actually needed:
+/// keeping it inline would push the estimated prompt past half the effective
+/// budget. Below that, headroom is comfortable — and replacing full evidence
+/// with a 500-char preview only starves the model (cycle-15 headline: a
+/// 131k-window turn lost a 1828-line read at 1.5k tokens used, then answered
+/// honestly from the preview and was blamed for fabricating).
+fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) -> bool {
+    let Some(window) = cfg.context_window else {
+        return true; // unknown window: keep the old conservative behavior
+    };
+    let effective = ContextBudget::new(window, cfg.max_tokens).effective;
+    let used: u64 = messages.iter().map(message_tokens).sum();
+    let added = estimate_str(content);
+    used.saturating_add(added).saturating_mul(2) > effective
+}
+
 /// Offload only when the active model can actually recover the resulting
 /// pointer. A registered-but-unadvertised handler is insufficient: the model
 /// must receive an `fs_read_file` descriptor in this turn's tool catalog.
+/// Also requires genuine context pressure (see [`offload_pressure`]).
 fn maybe_offload_for_tools(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
     tools: &Registry,
-) -> String {
+    messages: &[ChatMessage],
+    cfg: &AgentConfig,
+) -> (String, Option<std::path::PathBuf>) {
     let can_read = tools.is_registered("fs_read_file")
         && tools
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_read_file");
-    if !can_read {
-        return content;
+    if !can_read || !offload_pressure(messages, &content, cfg) {
+        return (content, None);
     }
     maybe_offload(content, call_id, dir)
 }
@@ -2842,12 +3164,16 @@ fn maybe_offload_for_tools(
 /// preview the model can re-read via `fs_read_file`. Returns the content
 /// unchanged when there is no dir, it's under the cap, or the write fails (the
 /// trimming cascade still bounds it). The offload dir must be model-readable.
-fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) -> String {
+fn maybe_offload(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+) -> (String, Option<std::path::PathBuf>) {
     let Some(dir) = dir else {
-        return content;
+        return (content, None);
     };
     if content.len() <= OFFLOAD_CHAR_CAP {
-        return content;
+        return (content, None);
     }
     let safe_id: String = call_id
         .chars()
@@ -2861,15 +3187,16 @@ fn maybe_offload(content: String, call_id: &str, dir: Option<&std::path::Path>) 
     let path = match kitsu_tools::builtins::fs::write_unique_private_text_file(dir, &name, &content)
     {
         Ok(path) => path,
-        Err(_) => return content,
+        Err(_) => return (content, None),
     };
     let preview: String = content.chars().take(OFFLOAD_PREVIEW_CHARS).collect();
-    format!(
+    let pointer = format!(
         "{OFFLOAD_POINTER_PREFIX}{:.1} KB — full result saved to {}. Re-read it (or a line range) \
          with fs_read_file on that path.]\n\nPreview:\n{preview}…",
         content.len() as f64 / 1024.0,
         path.display(),
-    )
+    );
+    (pointer, Some(path))
 }
 
 /// How many recent user-delimited exchanges to always keep intact.
