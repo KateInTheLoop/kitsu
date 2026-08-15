@@ -237,7 +237,18 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   write/edit tool surfaces a "N file(s) were modified before the turn was
   discarded" notice (stderr + machine record), listing the paths, so the
   operator/next-run knows the workspace changed.
-- R4.9 **Disclosing response-parse errors** (surfaced by the GLM loop):
+- R4.12 **Don't classify a RECOVERED-tool-error turn as a failure**
+  (found by the GLM loop, W5): a turn that hit a tool error (e.g. a
+  PolicyDenied misfire) or a self-corrected edit conflict, then RECOVERED
+  and produced a complete committed deliverable, is still marked
+  `DISCARDED` / `session not saved` / exit 1 because ANY tool/policy error
+  in the turn trips the failure classification. This wrongly signals
+  failure — a literal retry-on-failure would burn a run discarding a GOOD
+  result — and (with R4.11) leaves the files on disk under a "discarded"
+  banner. *Accept:* a turn that ends with a committed assistant answer is
+  NOT classified a failure merely because it recovered from an earlier
+  tool/policy error mid-turn; the errors are still reported (counts/JSONL)
+  but the turn's disposition reflects the committed outcome.
   `invalid response; HTTP 200; body failed` does not say which parse
   step or chunk failed, so a transport/format failure can't be
   root-caused from the receipt alone. *Accept:* a malformed provider
