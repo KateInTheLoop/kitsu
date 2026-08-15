@@ -162,6 +162,45 @@ fn test_header_empty_env_is_missing_error() {
     );
 }
 
+/// A token carrying surrounding whitespace must be trimmed before being placed
+/// into the Authorization header, so a stray trailing space/tab cannot produce
+/// a `Bearer <token>` value the gateway rejects with 401. Asserts the EXACT
+/// header-value bytes end at the token, with no trailing whitespace.
+#[test]
+#[serial]
+fn test_header_trims_surrounding_whitespace_from_token() {
+    let _g = EnvGuard::set(TEST_ENV, "token123\t");
+    let auth = auth_for_test();
+
+    let (_name, value) = auth
+        .header()
+        .expect("header() should succeed when token has trailing whitespace")
+        .expect("bearer auth should produce a header");
+
+    assert_eq!(
+        value.as_bytes(),
+        b"Bearer token123",
+        "trailing whitespace must be trimmed from the token value"
+    );
+}
+
+/// An all-whitespace env value (only spaces/tabs) must still be treated as
+/// missing rather than producing a header with an empty token.
+#[test]
+#[serial]
+fn test_header_whitespace_only_env_is_missing_error() {
+    let _g = EnvGuard::set(TEST_ENV, " \t");
+    let auth = auth_for_test();
+
+    let err = auth
+        .header()
+        .expect_err("header() should fail when env is all whitespace");
+    assert!(
+        matches!(err, AuthError::Missing { .. }),
+        "an all-whitespace token must map to AuthError::Missing, got {err:?}"
+    );
+}
+
 /// The refresh hint must surface in the Display of the Missing error (so the CLI
 /// can print an actionable message), and the token value must never appear.
 #[test]

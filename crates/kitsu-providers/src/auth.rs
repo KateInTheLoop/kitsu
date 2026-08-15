@@ -57,10 +57,12 @@ impl EnvBearerAuth {
 
 impl AuthProvider for EnvBearerAuth {
     fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
-        // Read the token from env at request time. Missing or empty is an
-        // actionable error carrying the configured refresh hint.
+        // Read the token from env at request time. Missing or empty (after
+        // trimming surrounding whitespace) is an actionable error carrying the
+        // configured refresh hint. A non-empty token is trimmed so a stray
+        // trailing space/tab cannot produce a header the gateway rejects.
         let token = match std::env::var(&self.env) {
-            Ok(v) if !v.is_empty() => v,
+            Ok(v) if !v.trim().is_empty() => v.trim().to_string(),
             _ => {
                 return Err(AuthError::Missing {
                     env: self.env.clone(),

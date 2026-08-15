@@ -1126,3 +1126,118 @@ reviews, 4 code) with a demonstrated pattern of tight scope discipline,
 accurate citations, and now a first (minor) hedging-discipline lapse to
 watch in future review cycles — otherwise no change to its top-tier
 standing.
+
+### Cycle 9 — 2026-08-15 — token whitespace trimmed (own cycle-8 finding, grade A)
+
+Implemented GLM's own cycle-8 finding 3 in `EnvBearerAuth::header()`
+(`crates/kitsu-providers/src/auth.rs`): the env token was used verbatim
+with only an `is_empty` guard, so a token with a trailing space/tab
+passed the guard and produced a header the gateway would reject —
+indistinguishable from a wrong token. Finding 1 (`NotUnicode`→`Missing`)
+was skipped as already implemented cross-model by the Kimi loop; finding
+2 (`Malformed` misattribution) was skipped as low-reachability (needs a
+risky enum ripple into a concurrently-edited crate); finding 4
+(zeroize) was skipped as low priority — finding 3 was the correct,
+highest-reachability, single-function pick, chosen by the supervisor
+ahead of the run. Driver rebuilt fresh from main immediately before the
+run. Success on `:together` attempt 1 — no transport failure, no retry,
+no provider fallback, no spawn attempted (cap 1 unexercised).
+
+**The fix, exactly as specified, single arm, no ripple:** the match arm
+`Ok(v) if !v.is_empty() => v` became `Ok(v) if !v.trim().is_empty() =>
+v.trim().to_string()`, with the `_ => Missing` arm and every surrounding
+line untouched. No signature change, no new enum variant, no refactor —
+the diff is 3 changed lines plus an updated comment in `auth.rs`, plus
+two new tests in `auth_tests.rs`. Confirmed against the pre-run read of
+the arm on disk that GLM mirrored the real code exactly (matched the
+supervisor's own line-59 grep verbatim).
+
+**Read/tool discipline: 4 file reads** (a 1–100 ranged read of
+`auth.rs` covering `header()`, a full read of `auth_tests.rs` for the
+`EnvGuard`/`#[serial]` style, a small post-edit ranged re-read of
+`auth.rs` 58–73 to confirm the edit landed, and a 140–210 ranged
+re-read of `auth_tests.rs` to confirm test placement), plus two
+lightweight non-`Read` lookups (`find_symbol`, `read_manifest` to
+confirm `serial_test` is already a dev-dependency before relying on
+`#[serial]`). Within the ~5-read guidance. Wrote early — the `auth.rs`
+edit landed right after the two required reads, before any of the
+verification reads. `kitsu-usage: {"prompt_tokens":61344,
+"completion_tokens":3956,"total_tokens":65300}`. `kitsu-context:
+{"used":10502,"effective":107072,"window":131072}`. Run summary: "1
+turn(s) ok, 4 file(s) read, 2 file(s) written (2 change(s)), session
+not saved" — clean exit, no PolicyDenied, no discard.
+
+**Two new `#[serial]` tests, mirroring the existing `EnvGuard` style,
+each independently verified fail-without-impl by the supervisor** (not
+just by GLM's own in-session reasoning): `test_header_trims_surrounding_
+whitespace_from_token` (env `"token123\t"`, asserts the exact
+`HeaderValue` bytes `b"Bearer token123"` with no trailing tab) and
+`test_header_whitespace_only_env_is_missing_error` (env `" \t"`, asserts
+`AuthError::Missing`). Supervisor stashed only `auth.rs` (kept the new
+tests), ran them against the unfixed arm, and both failed as required —
+`test_header_trims_surrounding_whitespace_from_token` on an
+`assert_eq!` byte mismatch (untrimmed bytes end in `0x09`) and
+`test_header_whitespace_only_env_is_missing_error` on `expect_err`
+panicking because `header()` unexpectedly returned `Ok(Some(...))`.
+Stash-popped and reran: both pass, 6/6 in the `header()` test group,
+75/75 in `kitsu-providers` overall (73 + 2 new).
+
+**One genuine (if minor) flaw: GLM's live chain-of-thought mispredicted
+its own tests' failure mode.** In-session, GLM reasoned that
+`HeaderValue::from_str` would reject the raw tab byte and return
+`Err(AuthError::Malformed)` for both untrimmed cases. That is
+factually wrong — SP and TAB are valid bytes inside an HTTP header
+*value* (only the header *name* and control/non-ASCII bytes are
+restricted) — and it directly contradicts cycle 8's own review finding
+3, which correctly stated this exact fact about the same dependency.
+The supervisor's independent fail-without-impl run confirms the actual
+failure mode is different from GLM's stated prediction (an `Ok` value
+with untrimmed bytes, not an `Err(Malformed)`) — but the tests
+themselves are still genuinely discriminating (fail on old code, pass
+on new) and the end deliverable is unaffected. Worth flagging because
+it is the second cycle in a row (after cycle 8's unhedged-claim slip)
+where GLM's stated reasoning about `HeaderValue`/dependency internals
+didn't hold up to independent scrutiny, even though neither slip
+changed the correctness of the shipped artifact.
+
+**Workspace-wide verification:** `cargo build --workspace` clean;
+`cargo clippy --workspace --all-targets` clean, zero warnings; `cargo
+test -p kitsu-providers` 75/75; `cargo test --workspace` — only the one
+known PTY flake (`test_query_only_interactive_session_does_not_create_a_
+snapshot`, `crates/kitsu/tests/cli.rs`) red, unrelated to this diff, no
+new env-test race introduced (the new tests are correctly `#[serial]`
+and did not need supervisor intervention); `cargo fmt --all -- --check`
+passed clean, no reformatting needed.
+
+**Grade: A.** All required criteria hold: the token is trimmed, an
+all-whitespace value still reports `Missing`, the change is genuinely
+single-function with no signature/enum/refactor creep, and the tests
+are real — independently verified fail-without-impl by the supervisor,
+not just asserted by GLM. The one process flaw (mispredicting the
+tests' own failure mode against a dependency whose real behavior cycle
+8 had already correctly documented) is a repeat of the same class of
+lapse as cycle 8's unhedged claim, so this is graded A on substance
+with the same "not flawless on process" caveat carried forward.
+
+**GLM is now 4-for-4 A on reviews and 5-for-5 on code (B→A→A→A→A) — the
+fifth cycle in a row (4, 6, 7, 9, counting this one) with an
+independently-verified fail-without-impl test suite, and the third
+cycle implementing its own graded-A review finding end-to-end cleanly
+on the first attempt.** No new kitsu weaknesses filed (W1–W5 from prior
+cycles still open, none re-triggered — no recovered tool error, no
+discard, no PolicyDenied). Two cycles in a row now show a live-reasoning
+slip about unread/misremembered dependency internals (`HeaderValue`
+byte-permissiveness) without affecting the shipped artifact — worth
+watching as a pattern rather than acting on yet. Open candidates for
+future cycles: cycle-8 finding 2 (`Malformed` misattribution, still
+skipped pending the concurrently-edited-crate risk clearing), cycle-5
+findings 5/6, P8/P11; on the review side, `StaticAuth`/`NoAuth`
+`header()` impls, `expiry_status()`, and the retry/backoff and
+model-discovery paths remain unreviewed.
+
+**Ramp status:** GLM holds a perfect grade record across 9 cycles (4
+reviews, 5 code). Top-tier standing unchanged; the two-cycle pattern of
+live-reasoning slips about dependency internals (cycle 8's unhedged
+claim, cycle 9's mispredicted test-failure mode) is noted for the next
+review cycle to watch, not yet a downgrade since neither slip has
+touched a shipped artifact's correctness.
