@@ -1347,3 +1347,124 @@ internals hedging concern flagged after cycles 8/9 is now resolved
 rather than escalating — this cycle explicitly hedged the structurally
 identical claim it would have been natural to assert outright. No
 downgrade; the watch item is closed pending any recurrence.
+
+### Cycle 11 — 2026-08-15 — implements its own cycle-10 finding 1 (grade A) — the lone-entry mis-budget is closed
+
+Implemented GLM's own cycle-10 review proposal 1 (highest-ranked,
+supervisor-verified correct ahead of the run) in
+`context_length_from_catalog` (`crates/kitsu-providers/src/openai_compat.rs`,
+~1348–1385). **The bug:** the `_` arm of the exact/loose match —
+`_ => (entries.len() == 1).then(|| &entries[0])?` — accepted the sole
+catalog entry whenever the loose-match iterator yielded 0 or ≥2 hits,
+with zero regard for whether that lone entry's id had anything to do
+with the requested model. A gateway returning exactly one catalog
+entry queried for an unrelated model name silently inherited that
+entry's context length — a wrong-window mis-budget, and a strictly
+*worse* outcome than the ambiguous-multi-match case the same function
+explicitly rejects one branch earlier. Driver rebuilt fresh from main
+immediately before the run. Success on `:together` attempt 1 — no
+transport failure, no retry, no provider fallback, no spawn attempted
+(cap 1 unexercised).
+
+**The fix, exactly as specified, single function, no ripple:** the `_`
+arm became `_ => return None`, deleting the id-blind lone-entry
+acceptance outright. The `(Some(only), None) => only` arm immediately
+above — which already accepts a lone entry that *does* exact- or
+loosely-match — is untouched, so the legitimate single-model-server
+case still resolves. No signature change, no touch to the exact/loose
+logic. GLM also updated both the function's doc comment and the
+inline comment that stated "fall back to a lone entry, whatever its
+id," replacing them with an explicit statement that there is no
+lone-entry fallback and why. Diff: `openai_compat.rs` 11 lines changed
+(2 comment blocks + the one-line fix); `openai_compat_tests.rs` +52
+lines (one repurposed test, two new).
+
+**Read discipline: 10 `Read` calls** (function body, `loosely_matches`
+helper, two `fs_scan_file`/`find_symbol` probes that found no
+`#[test]` in-file, a directory `List`, then discovery that tests live
+in `openai_compat_tests.rs`, followed by targeted reads of that file's
+existing catalog-test style and the lone-entry test specifically),
+plus 7 lightweight non-`Read` lookups (`find_symbol`, `fs_scan_file`,
+`List`) and 3 `Edit` calls. This is double the ~5-read guidance in
+raw `Read` count, but the overage is explained rather than sloppy:
+this crate keeps its test module in a sibling file rather than an
+inline `#[cfg(test)]` block, so GLM spent several calls discovering
+*where* the tests lived before it could read them, then read twice
+more to precisely mirror an existing test's structure before editing
+it. Wrote early relative to that discovery cost — the impl edit
+landed as soon as the two core function reads were done, before any
+test-file exploration. `kitsu-usage:
+{"prompt_tokens":195418,"completion_tokens":16542,"total_tokens":211960}`.
+`kitsu-context: {"used":21590,"effective":107072,"window":131072}`.
+Run summary: "1 turn(s) ok, 10 file(s) read, 2 file(s) written (2
+change(s)), session not saved" — clean exit, no PolicyDenied, no
+discard.
+
+**Three tests, one repurposed from the bug-encoding original, all
+independently verified by the supervisor:**
+1. `test_model_context_length_lone_nonmatching_entry_is_none` —
+   repurposed from the old `test_model_context_length_lone_entry_fallback`
+   (which had asserted the buggy `Some(16384)`); now asserts `None` for
+   a single `"served-model"` entry queried as `"whatever"`.
+2. `test_model_context_length_lone_matching_entry_resolves` — new;
+   confirms a lone entry that *does* exact- or loosely-match (queried
+   as `"served-model"` and as `"served"`) still resolves to
+   `Some(16384)`, guarding against over-correcting into rejecting every
+   single-entry catalog.
+3. `test_model_context_length_exact_match_among_many` — new; confirms
+   an exact match among three entries is unaffected by the change.
+
+GLM could not run `cargo test` itself (no shell/test-execution tool in
+its toolset) and said so explicitly, instead tracing the pre-edit
+control flow by hand to predict the fail-before/pass-after transition
+for test 1 — a materially honest substitute for execution, not an
+unhedged claim. **The supervisor independently ran the proof this
+cycle's own mandate required:** stashed only `openai_compat.rs` (kept
+the tests), ran test 1 against the unfixed `_` arm — it failed exactly
+as GLM predicted (`assertion left == right failed: left: Some(16384),
+right: None`) — then restored the fix and reran: passed. All three new/
+repurposed tests, plus the full 62-test `openai_compat_tests` module,
+pass on the fixed tree (`cargo test -p kitsu-providers openai_compat_tests`
+→ 62 passed, 0 failed, 15 filtered).
+
+**Workspace-wide verification:** `cargo build --workspace` clean;
+`cargo clippy --workspace --all-targets` clean, zero warnings; `cargo
+test --workspace` — only the one known PTY flake
+(`test_query_only_interactive_session_does_not_create_a_snapshot`,
+`crates/kitsu/tests/cli.rs`) red, and the supervisor independently
+confirmed it is pre-existing and unrelated to this diff by stashing
+both changed files and rerunning the same test in isolation — identical
+failure with or without the fix. `cargo fmt --all -- --check` found one
+formatting diff in the new test block (multi-line `assert_eq!`
+wrapping); ran `cargo fmt --all` to normalize it, noted here as the fix
+rather than silently absorbed.
+
+**Grade: A.** All required criteria hold: a lone non-matching entry now
+returns `None`, a lone matching entry still resolves, exact/loose
+multi-entry behavior is untouched, the change is genuinely
+single-function with no signature/logic creep beyond the one arm, the
+stale comment was updated rather than left inconsistent, and the tests
+are real — independently verified fail-without-impl by the supervisor,
+not just asserted by GLM. The only mild process note is the doubled
+read count, fully explained by the tests-in-a-sibling-file layout
+rather than any scope drift or re-reading of already-seen content.
+
+**GLM is now 5-for-5 A on reviews and 6-for-6 on code (11-for-11
+overall) — the fourth cycle in a row (7, 9, 10-review, 11) with either
+an independently-verified fail-without-impl test suite or (for
+cycle 10) a citation spot-check catching zero errors, and the fourth
+cycle implementing its own graded-A review finding end-to-end cleanly
+on the first attempt (after cycles 6, 7, 9).** No new kitsu weaknesses
+filed (W1–W5 from prior cycles still open, none re-triggered — no
+recovered tool error, no discard, no PolicyDenied; the one gap, GLM
+having no test-execution tool, is a known toolset limitation already
+priced into the supervisor's independent-verification step, not a new
+finding). Open candidates for future cycles: cycle-10 findings 2
+(`as_u64` float/string silent drop), 3, 4; cycle-8 finding 2, cycle-5
+findings 5/6, P8/P11 remain open; on the review side,
+`StaticAuth`/`NoAuth` `header()` impls, `expiry_status()`,
+`validate_models_catalog`, and the retry/backoff paths remain
+unreviewed.
+
+**Ramp status:** GLM holds a perfect grade record across 11 cycles (5
+reviews, 6 code). Top-tier standing unchanged.

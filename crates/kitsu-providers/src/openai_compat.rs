@@ -1341,7 +1341,9 @@ impl OpenAICompatProvider {
 
 /// Pure parse: extract a model's advisory context length from a catalog JSON
 /// body. Prefers an exact id match, then a unique loose match (ambiguous loose
-/// matches give up rather than binding to the wrong window), then a lone entry.
+/// matches give up rather than binding to the wrong window). There is no lone
+/// entry fallback: a sole entry that matches neither exactly nor loosely must
+/// not bind a window, since it would silently budget against the wrong one.
 /// Checks `max_model_len`, `context_length`, `context_window`,
 /// `max_context_length`, and `max_input_tokens` in that order. Returns `None`
 /// on any parse error or when no usable field is present.
@@ -1351,8 +1353,9 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
     // Prefer an exact id match; then a loose match, but ONLY if it's unique —
     // an ambiguous loose match (e.g. "gpt-4" loosely matching both
     // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
-    // to the wrong entry silently budgets against the wrong window. Finally
-    // fall back to a lone entry, whatever its id.
+    // to the wrong entry silently budgets against the wrong window. There is
+    // NO lone-entry fallback: a sole entry that matches neither exactly nor
+    // loosely would silently budget against the wrong window.
     let exact = entries
         .iter()
         .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
@@ -1366,7 +1369,7 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
         });
         match (loose.next(), loose.next()) {
             (Some(only), None) => only,
-            _ => (entries.len() == 1).then(|| &entries[0])?,
+            _ => return None,
         }
     };
     for key in [
