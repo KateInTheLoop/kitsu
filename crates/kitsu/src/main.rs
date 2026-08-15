@@ -4653,9 +4653,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "sessions",
-        args: "",
-        description: "list locally saved conversations",
-        details: "",
+        args: "[filter]",
+        description: "list saved conversations by id, name, or preview",
+        details: "An optional case-insensitive filter matches the session id, name, or transcript preview.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -16065,7 +16065,6 @@ async fn handle_slash(
                 | "new"
                 | "profiles"
                 | "retry"
-                | "sessions"
                 | "status"
                 | "tools"
         )
@@ -19619,14 +19618,14 @@ mod tests {
     }
 
     /// Cycle-9 session search, thickened: matching is case-insensitive over
-    /// both id and preview, non-matching filters produce the guided empty
+    /// id, name, and preview, non-matching filters produce the guided empty
     /// state naming the filter, and the current-session marker survives
     /// filtering.
     #[test]
-    fn session_filtering_matches_id_and_preview_case_insensitively() {
+    fn session_filtering_matches_id_name_and_preview_case_insensitively() {
         let summaries = vec![
             session::SessionSummary {
-                name: None,
+                name: Some("Parser-Plan".to_string()),
                 id: "s-alpha-1".to_string(),
                 updated_at: "now".to_string(),
                 model: "m".to_string(),
@@ -19655,6 +19654,10 @@ mod tests {
         let by_preview = filter_sessions(&summaries, "parser");
         assert_eq!(by_preview.len(), 1);
         assert_eq!(by_preview[0].id, "s-alpha-1");
+        // Case-insensitive name match.
+        let by_name = filter_sessions(&summaries, "PARSER-plan");
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].id, "s-alpha-1");
         // Whitespace-only filters behave like no filter.
         assert_eq!(filter_sessions(&summaries, "   ").len(), 2);
 

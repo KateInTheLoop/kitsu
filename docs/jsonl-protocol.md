@@ -252,6 +252,11 @@ guarantees requires a new schema identifier.
   stderr. Status, permissions, and session inventory retain a compatibility
   `text` field alongside typed fields. Job mutations report both whether state
   changed and the resulting bounded registry/thread snapshot.
+  `/sessions [filter]` matches session IDs, names, and previews
+  case-insensitively. Its session-inventory result reports the total `count`,
+  `filtered_count`, `current_session_id`, and matching `sessions`; a guided
+  miss is still a successful provider-free query and is never saved into the
+  conversation transcript.
   Failed commands instead emit a typed `error` before `command_finished`.
   Unknown slash commands retain Kitsu's host-authored recovery in `message`:
   either the bounded closest-command suggestion or `(try /help)`. The message
