@@ -81,11 +81,16 @@ richest greenfield lane.
   rows counted and disclosed, TSV + headerless support. Pure-Rust `csv`
   crate. A live llama3.2 run hardened two small-model arg footguns
   (stringy booleans, empty delimiter).
-- R2.2 **PDF text extraction**: extract selectable text (pure-Rust,
-  e.g. `pdf-extract`/`lopdf`), page-ranged and capped like text reads,
-  with a clear "N of M pages, text-layer only, no OCR" disclosure.
-  *Accept:* a text-layer PDF yields its text with page markers; a
-  scanned/image-only PDF says so instead of returning garbage.
+- [x] (2026-08-14) R2.2 **PDF text extraction** — shipped as the
+  `fs_read_pdf` builtin (commit 68dccc2): per-page text-layer extraction
+  via pure-Rust `lopdf`, total page count, bounded page window
+  (start_page/max_pages, 50 ceiling), "text-layer only (no OCR)"
+  disclosure. Image-only pages flagged as no-text-layer; a page whose
+  text can't be decoded discloses the specific extraction failure
+  (honest, not garbage). 32 MiB file guard; same allowlist path. Known
+  limitation: lopdf 0.34 fails ToUnicode CMap on some real-world PDFs
+  (e.g. LibreOffice output) — degrades to an honest per-page disclosure;
+  a richer extractor can follow if this bites.
 - R2.3 **Image handling**: for a vision-capable gateway, pass images
   through; otherwise report dimensions/format/EXIF and decline to
   hallucinate content. *Accept:* `.png`/`.jpg` reads route to the vision
@@ -168,6 +173,16 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   `kitsu --allow-path/--allow-write/--agent-spawn-cap …` fails because
   those are `chat` subcommand flags, with no hint pointing there. *Accept:*
   the error names the flag and suggests it belongs under `chat`.
+- R4.8 **`--agent-spawn-cap 0` must not crash the turn** (real bug,
+  DeepSeek cycle 2): when the cap is 0 and the model attempts a spawn,
+  kitsu denies it and withholds the spawn tools mid-turn, after which the
+  next provider request is rejected `HTTP 400` (a request-shape break
+  from mutating the tool list mid-conversation). `cap 0` should mean the
+  spawn tools are never advertised in the first place, so there is
+  nothing to withhold. *Accept:* a run with `--agent-spawn-cap 0` never
+  advertises spawn_agent* tools; a model that would otherwise spawn
+  simply doesn't see them, and no mid-turn tool-list mutation or HTTP 400
+  occurs. (Affects both HF worker loops.)
 
 ## 5. Security tooling — *described, deprioritized*
 
@@ -236,3 +251,17 @@ malformed-row disclosure, 500-row ceiling, paging saturating arithmetic,
 delimiter validation, lenient_bool, truncation honesty, authorization
 path, panic-freedom), acceptance signal met, no findings.
 Next in lane 2: R2.2 PDF text extraction.
+
+### Cycle 2 — 2026-08-14 — R2.2 PDF text extraction (document-review lane)
+
+Shipped `fs_read_pdf` (commit 68dccc2): per-page text-layer extraction
+via pure-Rust `lopdf`, page count, bounded window, image-only + decode
+-failure disclosure, 32 MiB guard, same permission path. 6 tests
+including an e2e that builds a real 2-page PDF with lopdf. The live
+gateway run (ollama qwen2.5-coder) confirmed the tool is registered,
+invoked, policy-enforced, and parses page count correctly — and
+usefully exposed that lopdf 0.34 can't decode some LibreOffice PDFs'
+ToUnicode CMap, which the tool discloses honestly per page rather than
+emitting garbage (the acceptance signal's intent). Haiku review pending.
+Next in lane 2: R2.3 image handling, then R2.4 docx/xlsx, then R2.5
+type-aware dispatch — after which lane 2's core is complete.
