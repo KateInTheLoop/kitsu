@@ -537,3 +537,87 @@ this one.
 deliverable since cycle 1. Next cycle: replicate at the same tiny scope
 (a different ~60-line function, e.g. `ensure_chat_request_fits` alone)
 before widening scope, to confirm this wasn't a one-off.
+
+### Cycle 4 — 2026-08-14 — REPLICATED tiny-scope success (grade A-)
+
+**n=2 confirms the lever: scope size, not model discipline, was cycle
+2's problem.** Target was `ensure_chat_request_fits`, but the supervisor
+briefing's line range (2015-2077, "~62 lines," "next fn
+`enforce_context_budget` @2078") was wrong against the actual worktree
+file: the real function is only **lines 2015-2034 (20 lines)** — lines
+2035-2077 are `compact_context`, an unrelated `pub async fn`, and
+`enforce_context_budget` is further down still. The supervisor corrected
+the assigned range to **2013-2034** (doc comment through closing brace,
+22 physical lines) before running DeepSeek, to keep the single-function
+scope intent intact rather than following a stale range into a second
+function. Commit `<pending>` records this cycle.
+
+- **Read count: exactly 1 source read** (`orchestrator.rs`, ranged
+  2013-2034), matching cycle 3 precisely. It then wrote
+  `reviews/deepseek-cycle-4.md` on the first attempt, read that file back
+  once (self-check, not source), and made one `Edit` to tighten prose —
+  zero additional source reads, zero re-reads of the target file. No
+  spawn attempted; `--agent-spawn-cap 1` unexercised again. kitsu-usage
+  27,081 / 4,684 / 31,765 — comparable to cycle 3's footprint.
+- **Deliverable grade A-.** 4 ranked, severity-tagged proposals: (1) 🔴
+  `serde_json::to_string(tools).unwrap_or_default()` silently drops the
+  tools schema from the measurement on a serialization error, so the
+  provider still gets the real (unmeasured) schema — a real, if
+  narrow-trigger, silent-failure smell; (2) 🟡 `has_schema` and
+  `schema_json` can disagree (`Some(vec![])` → `has_schema=false` but
+  `schema_json="[]"`, a non-empty string) — verified true against the
+  code; (3) 🟢 the nested `.map().unwrap_or_default()` chain conflates
+  two distinct fallback cases, a fair readability critique; (4) 🔵 the
+  "last-line guard" doc comment doesn't match the function's actual
+  behavior (it's a pure delegator to
+  `check_measurement(request_measurement(...))`), correctly scoped to
+  not claim knowledge of functions it didn't read. **No proposal was
+  substantively wrong this cycle** — a clean improvement over cycle 3,
+  whose top-ranked proposal hypothesized a non-existent bug.
+- **Citation spot-check: quoted TEXT letter-perfect on every citation**
+  (all four code blocks match the source byte-for-byte, including
+  indentation), but **line-number LABELS drifted by ~1 line on every
+  citation** — the doc comment cited as "line 2013" (actual 2014),
+  `has_schema` cited as "line 2019" (actual 2020), and the 5-line
+  `schema_json` chain labeled "lines 2021–2024" (actual 2021-2025, one
+  line short). kitsu's `fs_read_file` ranged read returns raw text with
+  **no line-number prefixes** (confirmed in
+  `crates/kitsu-tools/src/builtins/fs.rs`'s `read_capped_line_range` —
+  it streams and joins stripped lines with no numbering), so the model
+  must count lines itself from the requested `start_line`; it undercounted
+  by one throughout, plausibly because the assigned range's first line
+  (2013) was blank and got miscounted as the first content line. This is
+  a real but minor regression from cycle 3's fully accurate line labels —
+  docked half a grade, same as cycle 3 but for a different reason (there:
+  one wrong bug claim; here: systematic off-by-one citation labels with
+  otherwise-perfect text and substance).
+- Minor, non-citation nit: proposal 1's suggested fix code calls
+  `AgentError::internal(...)`, a constructor not verified to exist on the
+  enum (out of the model's read scope by design — `AgentError` lives
+  elsewhere in the file). Doesn't affect the finding's validity, only the
+  literal patch snippet.
+
+**Verdict: REPLICATED, n=2.** Both tiny-scope cycles (3 and 4) hit
+exactly 1 source read + 1 successful write-first-attempt, zero
+over-reading, zero spawn incidents, and A- grades — on two different
+functions, with two different specific flaws (wrong-bug-claim vs.
+citation-label drift) rather than a repeat of the same weakness. Scope
+size is confirmed as the dominant lever for DeepSeek viability on kitsu.
+
+**New candidate weakness (not yet filed to roadmap):** `fs_read_file`
+ranged reads return no line-number prefixes, forcing every model to
+self-count from `start_line`; both DeepSeek cycles that produced
+line-cited output (1 and 4) show number drift while text drift is now
+zero. A cheap fix — prefixing each served line with its absolute file
+line number (`cat -n`-style) on ranged reads only — would likely remove
+this whole class of citation error for every model, not just DeepSeek.
+
+**Ramp status:** DeepSeek is 3-for-7 on kitsu invocations (cycle 1 B,
+cycle 2 ×2 + retry ×2 shipless, cycle 3 A-, cycle 4 A-), and 3-for-3
+once scope is single-function-tight. Per the plan, cycle 5 should try a
+tiny single-function **implementation** task. The journal-cap bug that
+made `orchestrator.rs` uneditable was fixed on `main` (edit/write now
+share the 1 MiB write cap), so a fresh binary build can edit
+`orchestrator.rs` directly — but DeepSeek's first code-writing cycle
+should still prefer a small, self-contained function (or a small file)
+over a large one, consistent with the scope-size lesson above.
