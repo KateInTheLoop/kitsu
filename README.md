@@ -1154,8 +1154,10 @@ always: false
   **stderr**, so stdout stays clean for piping and scripts remain compatible.
 - **Model-run timing** ends inference-capable commands with elapsed time. A
   terminal gets a compact secondary row; redirected stderr gets stable
-  `kitsu-timing: {"duration_ms":...,"status":"..."}` JSON. Provider-free
-  management commands do not gain an unrelated timing footer.
+  `kitsu-timing: {"duration_ms":...,"status":"..."}` JSON. Status is `ok`,
+  `partial`, `error`, or `cancelled`; `partial` identifies a script accepted by
+  `--allow-turn-errors` after both successful and failed operations.
+  Provider-free management commands do not gain an unrelated timing footer.
 - **Exit codes:** `0` success (including accepted partial scripts with
   `--allow-turn-errors`), `1` CLI/input/config/missing-auth or other user-policy
   failure (including local tool failures and policy denials), `2`

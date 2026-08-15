@@ -1804,6 +1804,7 @@ fn format_turn_duration(elapsed: std::time::Duration) -> String {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum RunTimingStatus {
     Ok,
+    Partial,
     Error,
     Cancelled,
 }
@@ -1812,6 +1813,7 @@ impl RunTimingStatus {
     fn record_label(self) -> &'static str {
         match self {
             Self::Ok => "ok",
+            Self::Partial => "partial",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
         }
@@ -1820,6 +1822,7 @@ impl RunTimingStatus {
     fn human_phrase(self) -> &'static str {
         match self {
             Self::Ok => "completed in",
+            Self::Partial => "partially completed in",
             Self::Error => "failed after",
             Self::Cancelled => "cancelled after",
         }
@@ -2549,6 +2552,20 @@ mod tests {
             "  -> completed in 1.2 s\n"
         );
 
+        let mut partial_terminal = Vec::new();
+        write_run_timing_with_mode(
+            &mut partial_terminal,
+            true,
+            true,
+            elapsed,
+            RunTimingStatus::Partial,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(partial_terminal).unwrap(),
+            "  -> partially completed in 1.2 s\n"
+        );
+
         let mut styled = Vec::new();
         write_run_timing_with_mode(
             &mut styled,
@@ -2577,6 +2594,20 @@ mod tests {
         assert_eq!(
             String::from_utf8(redirected).unwrap(),
             "kitsu-timing: {\"duration_ms\":1250,\"status\":\"error\"}\n"
+        );
+
+        let mut partial_redirected = Vec::new();
+        write_run_timing_with_mode(
+            &mut partial_redirected,
+            false,
+            false,
+            elapsed,
+            RunTimingStatus::Partial,
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(partial_redirected).unwrap(),
+            "kitsu-timing: {\"duration_ms\":1250,\"status\":\"partial\"}\n"
         );
     }
 

@@ -571,8 +571,10 @@ does not reset the timer before the follow-up provider request.
 Without JSONL, stdout contains assistant text only. Human metadata is on stderr.
 Inference-capable commands end with elapsed time: terminals receive a compact
 secondary status row, while redirected runs receive
-`kitsu-timing: {"duration_ms":...,"status":"..."}`. Redirected turns retain the
-existing stable `kitsu-usage:` and `kitsu-context:` records. Provider-free
+`kitsu-timing: {"duration_ms":...,"status":"..."}`. The status is `ok`,
+`partial`, `error`, or `cancelled`; accepted partial scripts use `partial` even
+though `--allow-turn-errors` preserves exit code `0`. Redirected turns retain
+the existing stable `kitsu-usage:` and `kitsu-context:` records. Provider-free
 management commands remain free of the timing receipt.
 
 | Exit | Meaning |

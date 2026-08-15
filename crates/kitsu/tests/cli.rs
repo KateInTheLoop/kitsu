@@ -8225,7 +8225,9 @@ async fn test_script_allow_turn_errors_preserves_zero_exit() {
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("still works"))
-            .stderr(predicate::str::contains("script summary: 1 failure"));
+            .stderr(predicate::str::contains("script summary: 1 failure\n"))
+            .stderr(predicate::str::contains("failure(s)").not())
+            .stderr(predicate::str::contains("\"status\":\"partial\""));
     })
     .await
     .expect("join");
