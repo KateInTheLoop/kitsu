@@ -1710,3 +1710,126 @@ DIFFERENT cross-model finding — DeepSeek cycle-7 proposal 3
 GLM-adjacent finding — and when scoping it, the supervisor should
 pre-verify reachability of the described branch before handing Kimi the
 brief, to avoid repeating this cycle's test-repair overhead.
+
+### Cycle 20 (2026-08-15) — cross-model #3: GLM cycle-8 finding 1, `AuthError::Malformed` for non-UTF-8 env vars (grade A — clean single-attempt, first Kimi work in kitsu-providers)
+
+Kimi's 3rd cross-model implementation, and its **first in
+`kitsu-providers`** (every prior cross-model cycle — 18, 19 — was in
+`kitsu-core`): GLM reviewed `EnvBearerAuth::header()`
+(`crates/kitsu-providers/src/auth.rs`) in its cycle-8 review and found
+that the `_` catch-all arm of `match std::env::var(&self.env)` collapsed
+`Err(VarError::NotPresent)`, `Err(VarError::NotUnicode(_))`, and
+`Ok("")` into the same `AuthError::Missing` ("is not set"), which is
+false for the `NotUnicode` case — the variable IS set, just holding
+non-UTF-8 bytes, so the operator is told to "set" something that
+already exists, hiding the real (encoding) fix. Fix (verified minimal
+by the supervisor before handing off): route `NotUnicode` to the
+already-existing `AuthError::Malformed { env }` variant (Display: "auth
+error: token in ${env} is malformed" — accurate, no new variant, no
+`main.rs` exhaustive-match change needed since `Malformed` was already
+handled there).
+
+**Run stats.** Single attempt, exit 0, no retry, no spawn attempted
+(`--agent-spawn-cap 1` never exercised). Tool-call shape: 3 `Read`
+(`auth.rs` ranged 55-96, `error.rs` ranged 62-72, `auth_tests.rs`
+whole) + 2 `Edit` (`auth.rs`, `auth_tests.rs`) = **5 tool calls total**
+— the smallest cross-model cycle so far (18: 38, 19: 14, 20: 5), and
+well inside the "~5 reads" budget the brief allowed. `kitsu-usage`:
+26,220 / 1,598 / 27,818 (completion 7% of the 24,000 cap, zero
+truncation). `kitsu-context`: used 8,160 / effective 107,072 / window
+131,072. No debris-warning false positive this cycle (R1.8 did not
+reproduce — the edit sites don't touch any template-marker test
+fixture).
+
+**Harness note (process gap, not a Kimi or kitsu-code weakness).** The
+literal EXECUTION brief specified `kitsu ask ... --allow-path ...
+--allow-write ...`. Both flags no longer exist on `ask` in the current
+build, and — more importantly — `kitsu ask` registers **no filesystem
+tools at all**: `run_ask` builds an empty `Registry` and never calls
+`register_base_tools` (that call exists only in `run_chat`); `ask` is a
+deliberately tool-free, single-turn path (`kitsu-tools/src/lib.rs:82-83`,
+"the descriptor-free `ask` path"). A first attempt with `kitsu ask
+--yes "<prompt>"` confirmed this empirically: it returned in one round
+with a trivial reply, `kitsu-usage: 395/197/592`, zero tool-call
+receipts, and zero file changes — the model was never offered a way to
+read or write anything. `--allow-path`/`--allow-write`/
+`--allow-read-write` are `kitsu chat`-only flags; `chat` also supports a
+single piped/non-TTY turn (`[PROMPT]` positional + `< /dev/null`
+stdin), so the corrected invocation was `kitsu chat --gateway
+huggingface --model moonshotai/Kimi-K3:together --context-window 131072
+--timeout-secs 300 --max-output-tokens 24000 --reasoning-effort low
+--max-rounds 30 --agent-spawn-cap 1 --allow-path /tmp/kimi-k3-cycle1
+--allow-read-write /tmp/kimi-k3-cycle1/crates/kitsu-providers --yes
+"<prompt>" < /dev/null`, which ran cleanly on the first try. Filed here
+for the record so future cycles' EXECUTION templates say `chat`, not
+`ask`, when the task requires file reads/writes — not filed as a new
+kitsu backlog item since `ask` being tool-free is by design, not a bug.
+
+**Deliverable: exactly the prescribed minimal fix, verified on disk.**
+`git diff` matches the brief precisely:
+
+```rust
+let token = match std::env::var(&self.env) {
+    Ok(v) if !v.is_empty() => v,
+    Err(std::env::VarError::NotUnicode(_)) => {
+        return Err(AuthError::Malformed { env: self.env.clone() })
+    }
+    _ => { /* Missing, unchanged */ }
+};
+```
+
+No new enum variant, no signature change, no refactor — `NotPresent`
+and empty-string both still fall through the `_` arm to `Missing`
+unchanged. Diff: `auth.rs` +5/-0, `auth_tests.rs` +44/-0.
+
+**2 genuine new tests**, both `#[serial]` and mirroring the file's
+existing `EnvGuard`/serialization style:
+`test_header_non_utf8_env_is_malformed_not_missing` (`#[cfg(unix)]`,
+sets the test env var to `[0xFF, 0xFE]` via `OsStr::from_bytes`,
+restores it manually since `EnvGuard` is `String`-based and can't hold
+non-UTF-8, then asserts both `matches!(err, Malformed { .. })` and
+`!matches!(err, Missing { .. })`) and
+`test_header_absent_env_still_missing` (confirms the untouched path
+still reports `Missing`). Full `kitsu-providers` auth suite: 15/15
+passing, including both new tests.
+
+**Independently confirmed fail-without-fix (supervisor-verified, not
+taken on Kimi's word).** `git stash push -- auth.rs` (keeping the new
+tests), reran `cargo test -p kitsu-providers
+test_header_non_utf8_env_is_malformed_not_missing`: **failed** exactly
+as expected —
+`non-UTF-8 token must map to AuthError::Malformed, got Missing { env:
+"KITSU_TEST_AUTH_TOKEN", hint: Some("run \`refresh-token\` to refresh
+the gateway JWT") }`. Restored the fix (`git stash pop`) and reran —
+green again. The new test is genuine, not a tautology.
+
+**Verification (all clean).** `cargo build --workspace`: clean. `cargo
+clippy --workspace --all-targets`: zero warnings (the `Ok(v) if
+!v.is_empty()` guard leaves the match non-exhaustive without a trailing
+`_`, which the code already had and Kimi didn't touch — no new
+non-exhaustive-match lint). `cargo fmt --all -- --check`: clean, no
+reformat needed. `cargo test --workspace`: 122 passed / 1 failed — only
+the pre-known PTY flake `test_query_only_interactive_session_does_not_
+create_a_snapshot` (cycles 10-19, environment/PTY "did not exit" panic,
+unrelated to this diff); `cargo test -p kitsu-providers`: 66/66 passed
+including the 2 new tests, no env-test race observed (the new
+non-UTF-8 test is `#[serial]` and restores the prior env value/absence
+exactly like `EnvGuard`, so it doesn't interfere with neighboring
+`#[serial]` tests).
+
+**Grade A.** Correct (NotUnicode → Malformed, NotPresent/empty →
+Missing, verified by spot-check and by the independent
+fails-without-the-fix rerun), single-function + zero-ripple (no new
+variant, no signature/refactor, `main.rs:1444`'s existing `Malformed`
+arm needed no change), genuinely small (5 tool calls — the smallest
+cross-model cycle yet), and a genuine, non-tautological test. Kimi is
+now 13-for-14 on code work (cycles 7-20) and 3-for-3 on cross-model
+implementations (18: DeepSeek→Kimi in kitsu-core, needed a
+main-branch-collision repair; 19: DeepSeek→Kimi in kitsu-core, needed a
+reachability-driven test repair; 20: GLM→Kimi, **first clean cross-model
+cycle needing zero supervisor repair**). No new kitsu weaknesses this
+cycle beyond the process-only harness note above. Next: continue
+cross-model work — DeepSeek cycle-7 proposal 3 (circuit-breaker-vs-
+RequestTooLarge diagnostic precedence, still open) or GLM's remaining
+cycle-8 findings, whichever the supervisor can verify as reachable and
+minimal before handing off.
