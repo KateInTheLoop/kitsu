@@ -1258,6 +1258,82 @@ fn extract_xlsx(
     Ok(out)
 }
 
+// --- fs.read_image (metadata only) ------------------------------------------
+
+/// Bytes read from an image for header/metadata parsing. Every format keeps
+/// its dimensions in the leading bytes, so this bounds memory regardless of
+/// the image's on-disk size.
+const IMAGE_HEADER_BYTES: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+struct ReadImageArgs {
+    path: String,
+}
+
+pub fn read_image_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_image".to_string(),
+        description: "Report an image's format and pixel dimensions (PNG/JPEG/GIF/WEBP/BMP and \
+                      more) from its header — metadata only. This is a TEXT tool: it does NOT \
+                      interpret the picture's content; understanding what an image depicts \
+                      requires a vision-capable model/gateway. Use it to confirm a file is a \
+                      valid image and learn its size without hallucinating its contents."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Image file path"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_image_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_image_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadImageArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let mut header = Vec::new();
+        Read::take(file, IMAGE_HEADER_BYTES)
+            .read_to_end(&mut header)
+            .map_err(|e| format!("read failed: {e}"))?;
+        Ok::<_, String>(render_image_metadata(&display, &header))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(ToolError::ExecError)?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Pure formatter: derive format + dimensions from an image header. IO-free so
+/// it is unit-testable from a byte slice.
+fn render_image_metadata(path: &str, header: &[u8]) -> String {
+    let fmt = imagesize::image_type(header)
+        .map(|t| format!("{t:?}"))
+        .unwrap_or_else(|_| "unrecognized".to_string());
+    match imagesize::blob_size(header) {
+        Ok(sz) => format!(
+            "image> {path}: {fmt}, {}x{} px (metadata only — this text tool does not interpret \
+             image content; a vision-capable model is required to see what it depicts)\n",
+            sz.width, sz.height
+        ),
+        Err(_) => format!(
+            "image> {path}: detected {fmt} but could not read dimensions from the header \
+             (truncated or unsupported variant); not an interpretable image for a text tool\n"
+        ),
+    }
+}
+
 // --- fs.read_document (type-aware dispatch) ---------------------------------
 
 #[derive(Deserialize)]
@@ -1385,13 +1461,9 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
             "text → fs_read_file",
             read_file_run(policy, &path_args).await?,
         ),
-        DocType::Image(fmt) => (
-            "image (no text extraction)",
-            format!(
-                "detected {fmt} image. This is a text-oriented reader — image content is not \
-                 extracted here; a vision-capable model/gateway is required to interpret the \
-                 picture."
-            ),
+        DocType::Image(_) => (
+            "image → fs_read_image (metadata)",
+            read_image_run(policy, &path_args).await?,
         ),
         DocType::Office("XLSX") => (
             "XLSX → fs_read_xlsx",
@@ -5270,6 +5342,63 @@ mod tests {
     /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
     /// LibreOffice, embedded so the xlsx tests need no writer dependency.
     const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+    /// A real 120x80 8-bit RGB PNG, generated once and embedded.
+    const SAMPLE_PNG: &[u8] = include_bytes!("testdata/sample.png");
+
+    #[test]
+    fn image_metadata_reports_format_and_dimensions() {
+        let out = render_image_metadata("pic.png", SAMPLE_PNG);
+        assert!(out.contains("Png"), "format: {out}");
+        assert!(out.contains("120x80 px"), "dimensions: {out}");
+        assert!(out.contains("metadata only"), "disclosure: {out}");
+        // A non-image header does not panic and discloses it can't read dims.
+        let out = render_image_metadata("x.png", b"this is not an image");
+        assert!(
+            out.contains("could not read dimensions") || out.contains("unrecognized"),
+            "non-image: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_end_to_end_and_via_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, SAMPLE_PNG).unwrap();
+
+        // Direct fs_read_image.
+        let out = read_image_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("image ok");
+        assert!(out.contains("Png") && out.contains("120x80 px"), "{out}");
+
+        // read_document routes an image to fs_read_image (real metadata now).
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("image → fs_read_image"), "route label: {out}");
+        assert!(out.contains("120x80 px"), "dispatch metadata: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.png");
+        std::fs::write(&bad, SAMPLE_PNG).unwrap();
+        assert!(matches!(
+            read_image_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
 
     #[test]
     fn config_diff_reports_added_removed_changed_on_sshd_shaped_files() {
@@ -5743,17 +5872,18 @@ UseDNS no
         assert!(out.contains("PDF → fs_read_pdf"), "{out}");
         assert!(out.contains("routed via read_document"), "extracted: {out}");
 
-        // PNG magic → detected image, no extraction, no garbage.
+        // PNG → routed to fs_read_image for real metadata (format + dims), no
+        // garbage. Use a real PNG so dimensions come through.
         let png = dir.path().join("pic.png");
-        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        std::fs::write(&png, SAMPLE_PNG).unwrap();
         let out = read_document_run(
             &policy,
             &serde_json::json!({"path": png.to_string_lossy()}).to_string(),
         )
         .await
         .expect("png route");
-        assert!(out.contains("detected PNG image"), "{out}");
-        assert!(out.contains("not extracted"), "{out}");
+        assert!(out.contains("image → fs_read_image"), "{out}");
+        assert!(out.contains("120x80 px"), "{out}");
 
         // xlsx (zip magic + extension) → routed to the real extractor.
         let xlsx = dir.path().join("book.xlsx");
