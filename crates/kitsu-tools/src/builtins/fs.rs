@@ -4282,6 +4282,32 @@ const CHAT_TEMPLATE_TOKENS: &[&str] = &[
     "[/INST]",
 ];
 
+/// A chat-template token is leaked protocol debris only when it appears
+/// OUTSIDE a string literal — a raw completion leaks it bare (`<|im_start|>assistant`
+/// at line start), whereas legitimate source that lists these tokens as data
+/// always quotes them (`"<|im_start|>"`). Treating a token as debris only when
+/// it is NOT immediately preceded by a quote removes the false positive on any
+/// file that mentions the markers as strings — e.g. kitsu's own token table or
+/// debris-detector code (a real kimi-cycle-16 false positive: editing near the
+/// `CHAT_TEMPLATE_TOKENS` list tripped the old naive `contains` check).
+fn has_unquoted_chat_template_marker(content: &str) -> bool {
+    for tok in CHAT_TEMPLATE_TOKENS {
+        let mut from = 0;
+        while let Some(rel) = content[from..].find(tok) {
+            let idx = from + rel;
+            let preceded_by_quote = content[..idx]
+                .chars()
+                .next_back()
+                .is_some_and(|c| c == '"' || c == '\'');
+            if !preceded_by_quote {
+                return true;
+            }
+            from = idx + tok.len();
+        }
+    }
+    false
+}
+
 /// Best-effort detection of obviously-broken generated content: a model's raw
 /// protocol tokens leaking into the file, or a would-be multi-line file whose
 /// newlines never got un-escaped (literal `\n` two-char sequences instead of
@@ -4290,7 +4316,7 @@ const CHAT_TEMPLATE_TOKENS: &[&str] = &[
 /// silently corrupted file (a real dogfooding finding: a Python file written
 /// with literal `\n` was a guaranteed SyntaxError, reported as a clean write).
 fn content_quality_warning(content: &str) -> Option<&'static str> {
-    if CHAT_TEMPLATE_TOKENS.iter().any(|tok| content.contains(tok)) {
+    if has_unquoted_chat_template_marker(content) {
         return Some(
             "content contains a raw model chat-template control marker — \
              the model likely emitted protocol text instead of real file content",
@@ -5960,14 +5986,69 @@ UseDNS no
         assert_eq!(std::fs::read_to_string(&target).unwrap(), "fn main() {}\n");
     }
 
+    #[tokio::test]
+    async fn write_tool_warning_is_quote_aware_end_to_end() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy = Permissions::for_roots(&[], &[root]).expect("perms");
+
+        // A source file that lists the markers as QUOTED data → no warning
+        // (R1.8: the write succeeds cleanly, warning is null).
+        let ok_path = dir.path().join("tokens.rs");
+        let ok_args = serde_json::json!({
+            "path": ok_path.to_string_lossy(),
+            "content": "const T: &[&str] = &[\"<|im_start|>\", \"<|im_end|>\"];\n"
+        })
+        .to_string();
+        let out = write_file_run(&policy, &ok_args).await.expect("write ok");
+        assert!(
+            out.contains("\"warning\":null"),
+            "quoted table must not warn: {out}"
+        );
+
+        // A file whose content is a BARE leaked marker → warning fires.
+        let bad_path = dir.path().join("leaked.txt");
+        let bad_args = serde_json::json!({
+            "path": bad_path.to_string_lossy(),
+            "content": "<|im_start|>assistant\nsome leaked protocol text\n"
+        })
+        .to_string();
+        let out = write_file_run(&policy, &bad_args).await.expect("write ok");
+        assert!(
+            out.contains("chat-template control marker"),
+            "bare marker must still warn: {out}"
+        );
+    }
+
     #[test]
     fn content_quality_warning_flags_chat_template_tokens() {
+        // A BARE marker (raw leaked completion) is flagged.
         let warning = content_quality_warning("<|im_start|>system\nhi")
             .expect("chat-template marker should be flagged");
         assert!(CHAT_TEMPLATE_TOKENS
             .iter()
             .all(|token| !warning.contains(token)));
         assert!(content_quality_warning("normal code, no tokens here").is_none());
+    }
+
+    #[test]
+    fn content_quality_warning_ignores_quoted_marker_strings_in_source() {
+        // R1.8: a file that lists the markers AS DATA (quoted string literals)
+        // must NOT be flagged — this is the false positive Kimi hit editing the
+        // debris-detector's own token table.
+        let token_table = "const CHAT_TEMPLATE_TOKENS: &[&str] = &[\n    \
+                           \"<|im_start|>\",\n    \"<|im_end|>\",\n    \"[INST]\",\n];\n";
+        assert!(
+            content_quality_warning(token_table).is_none(),
+            "quoted marker literals in source must not warn"
+        );
+        // Single-quoted also counts as quoted.
+        assert!(content_quality_warning("let c = '\u{0}'; let m = \"<|eot_id|>\";").is_none());
+        // But a bare marker mixed into otherwise-quoted content still warns.
+        assert!(
+            content_quality_warning("\"<|im_start|>\" then bare <|im_end|> here").is_some(),
+            "a bare (unquoted) marker is still leaked debris"
+        );
     }
 
     #[test]
