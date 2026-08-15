@@ -336,9 +336,18 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
 no dependency-vulnerability integration.
 
 **Requirements (low priority):**
-- R5.1 **Dependency advisory read**: summarize a lockfile against a
-  local advisory source (e.g. `cargo audit` output) when the user runs
-  it. *Accept:* given `cargo audit` JSON, produce a ranked risk summary.
+- [x] (2026-08-15) R5.1 **Dependency advisory read** — shipped as the
+  `audit_summary` builtin (commit 41783be): parses a `cargo audit --json`
+  report into a ranked risk view — vulnerabilities first (advisory id,
+  package + version, title, patched-version fix or "no patched release",
+  CVE aliases), then advisory warnings (unmaintained/yanked/unsound)
+  grouped by kind; bounded (100/section, max 1000) with truthful elision,
+  clean-report + malformed-JSON disclosed honestly. Dep-free (serde_json);
+  read-only, same allowlist guard. Unambiguously defensive (summarize your
+  OWN lockfile's advisories from a report you generate). Haiku review:
+  SHIP-AS-IS. Note: this is the summary half; a fuller flow could also
+  RUN `cargo audit` via the guarded command_exec, but the roadmap's
+  acceptance ("given cargo audit JSON") is met by the summary tool.
 - R5.2 **Secret-in-diff guard**: flag apparent credentials in a diff
   before commit (reuses the existing credential-filter machinery).
   *Accept:* a diff containing an API-key-shaped string is flagged.
@@ -474,6 +483,32 @@ only, genuine real-zip tests), no findings. **Lane 2 is now fully
 complete for common document types.** Next capability cycle: lane 4
 (automation trust) needs a self-contained angle, or opportunistic
 lane-5 R5.1 (cargo-audit summary — dep-free, tool-shaped).
+
+### Cycle 13 — 2026-08-15 — R5.1 audit_summary (opens lane 5, dep-free)
+
+Shipped `audit_summary` (commit 41783be): a `cargo audit --json` report
+parsed into a ranked risk view (vulnerabilities-with-fixes first, then
+warnings by kind), dep-free (serde_json), read-only, allowlist-guarded,
+honest on clean/malformed input. Picked as the clean SELF-CONTAINED slice
+because the document-review lane is complete and every remaining
+lane-1/3/4 item now lives in the concurrently-edited run layer
+(main.rs/orchestrator) — collision territory for the capability loop.
+Unambiguously defensive per the lane-5 scope note (analyze your OWN
+lockfile). 3 tests (ranked render, clean/no-patch/malformed honesty,
+e2e + allowlist). Haiku review: SHIP-AS-IS — 8 areas traced (Option-
+chain parse safety, truthful elision counts from real totals, missing-
+field fallbacks, sandbox, additive/dep-free), no findings.
+
+**Standing-loop status:** the capability loop has now drained every
+cleanly self-contained kitsu-tools slice across lanes 1-3 + lane-5 R5.1.
+What remains is either (a) run-layer work (R4.3/R4.4/R4.6/R4.10-12 in
+main.rs/orchestrator — belongs to the UI/main loop or a coordinated
+automation cycle), or (b) lane-5 R5.2 (secret-in-diff guard — reuses the
+credential-filter machinery, whose home needs locating first), or (c)
+lane-6 scientific-doc review (largely covered by lane 2 already). Next
+tick should pick R5.2 if the credential machinery is reusable as a tool,
+else flag that the loop needs a run-layer mandate coordinated with the
+other sessions.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
