@@ -1072,6 +1072,171 @@ fn render_pdf(
     out
 }
 
+// --- fs.read_xlsx -----------------------------------------------------------
+
+const XLSX_DEFAULT_MAX_ROWS: usize = 50;
+const XLSX_MAX_ROWS_CEILING: usize = 500;
+/// Refuse to parse a spreadsheet larger than this (calamine decompresses the
+/// whole workbook; this bounds memory). Generous for real spreadsheets.
+const XLSX_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadXlsxArgs {
+    path: String,
+    /// Sheet to read: a name, or a 0-based index as a string; default first.
+    #[serde(default)]
+    sheet: Option<String>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_row: Option<usize>,
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_rows: Option<usize>,
+}
+
+pub fn read_xlsx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_xlsx".to_string(),
+        description:
+            "Read a spreadsheet (.xlsx/.xls/.ods) from an allowed path: lists sheet names, \
+                      then returns a bounded cell window of one sheet (sheet by name or 0-based \
+                      index; default the first). Page with start_row/max_rows. Empty cells render \
+                      blank; cell types are preserved as text."
+                .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Spreadsheet file path"},
+                "sheet": {"type": "string", "description": "Sheet name, or a 0-based index as a string (optional, default first sheet)"},
+                "start_row": {"type": "integer", "description": "1-based first row to show (optional, default 1)"},
+                "max_rows": {"type": "integer", "description": "Max rows in this window (optional, default 50, max 500)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_xlsx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_xlsx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadXlsxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > XLSX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "spreadsheet is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            XLSX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let sheet = a.sheet.clone();
+    let start_row = a.start_row.unwrap_or(1).max(1);
+    let max_rows = a
+        .max_rows
+        .unwrap_or(XLSX_DEFAULT_MAX_ROWS)
+        .min(XLSX_MAX_ROWS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || {
+        extract_xlsx(&path, sheet.as_deref(), start_row, max_rows)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("spreadsheet parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Load `path` with calamine and render the sheet list + a bounded cell window.
+/// Blocking (decompresses the workbook); callers run it off the reactor.
+fn extract_xlsx(
+    path: &Path,
+    sheet: Option<&str>,
+    start_row: usize,
+    max_rows: usize,
+) -> Result<String, String> {
+    use calamine::{open_workbook_auto, Reader};
+
+    let mut workbook = open_workbook_auto(path).map_err(|e| e.to_string())?;
+    let names = workbook.sheet_names().to_vec();
+    if names.is_empty() {
+        return Ok("xlsx> no sheets found (the file may not be a valid spreadsheet)".to_string());
+    }
+    // Resolve the requested sheet: exact name, else a 0-based index string,
+    // else the first sheet.
+    let chosen = match sheet {
+        None => names[0].clone(),
+        Some(s) if names.iter().any(|n| n == s) => s.to_string(),
+        Some(s) => match s.trim().parse::<usize>() {
+            Ok(idx) if idx < names.len() => names[idx].clone(),
+            _ => {
+                return Ok(format!(
+                    "xlsx> {} sheet(s): {}\n(sheet {:?} not found — pass an existing name or a 0-based index)",
+                    names.len(),
+                    names.join(", "),
+                    s
+                ))
+            }
+        },
+    };
+    let range = workbook
+        .worksheet_range(&chosen)
+        .map_err(|e| e.to_string())?;
+    let (total_rows, total_cols) = range.get_size();
+
+    let mut out = format!(
+        "xlsx> {} sheet(s): {}\nsheet '{}': {} rows x {} cols\n",
+        names.len(),
+        names.join(", "),
+        chosen,
+        total_rows,
+        total_cols
+    );
+    if total_rows == 0 {
+        out.push_str("(sheet is empty)\n");
+        return Ok(out);
+    }
+    let end_row = start_row.saturating_add(max_rows);
+    let mut shown = 0usize;
+    for (idx, row) in range.rows().enumerate() {
+        let row_no = idx + 1; // 1-based
+        if row_no < start_row || row_no >= end_row {
+            continue;
+        }
+        if shown == 0 {
+            let last = (start_row + max_rows - 1).min(total_rows);
+            out.push_str(&format!("rows {start_row}-{last} of {total_rows}:\n"));
+        }
+        let cells: Vec<String> = row
+            .iter()
+            .map(|c| {
+                if matches!(c, calamine::Data::Empty) {
+                    String::new()
+                } else {
+                    c.to_string()
+                }
+            })
+            .collect();
+        out.push_str(&format!("{row_no} | {}\n", cells.join(" | ")));
+        shown += 1;
+    }
+    if shown == 0 {
+        out.push_str(&format!(
+            "(no rows in window: start_row {start_row} is past the {total_rows} rows)\n"
+        ));
+    } else if start_row + shown - 1 < total_rows {
+        out.push_str(&format!(
+            "[showing {shown} of {total_rows} rows; pass start_row/max_rows for more]\n"
+        ));
+    }
+    Ok(out)
+}
+
 // --- fs.read_document (type-aware dispatch) ---------------------------------
 
 #[derive(Deserialize)]
@@ -1206,6 +1371,10 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
                  extracted here; a vision-capable model/gateway is required to interpret the \
                  picture."
             ),
+        ),
+        DocType::Office("XLSX") => (
+            "XLSX → fs_read_xlsx",
+            read_xlsx_run(policy, &path_args).await?,
         ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
@@ -3961,6 +4130,86 @@ mod tests {
     use super::*;
     use std::io::Write;
 
+    /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
+    /// LibreOffice, embedded so the xlsx tests need no writer dependency.
+    const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+
+    #[tokio::test]
+    async fn read_xlsx_lists_sheets_and_returns_a_bounded_cell_window() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("book.xlsx");
+        std::fs::write(&path, SAMPLE_XLSX).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Default: first sheet, header + 3 data rows, 3 columns.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("xlsx ok");
+        assert!(out.contains("sheet(s):"), "sheet list: {out}");
+        assert!(out.contains("cols"), "dims: {out}");
+        assert!(
+            out.contains("Ada") && out.contains("Grace") && out.contains("Alan"),
+            "{out}"
+        );
+        assert!(out.contains("95"), "cell value: {out}");
+
+        // Sheet selection by 0-based index string resolves to the first sheet.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "sheet": "0"}).to_string(),
+        )
+        .await
+        .expect("xlsx idx ok");
+        assert!(out.contains("Ada"), "{out}");
+
+        // A non-existent sheet is disclosed, not a panic.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "sheet": "Nope"}).to_string(),
+        )
+        .await
+        .expect("xlsx bad-sheet ok");
+        assert!(out.contains("not found"), "{out}");
+
+        // Paging: start_row past the end discloses an empty window.
+        let out = read_xlsx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "start_row": 999}).to_string(),
+        )
+        .await
+        .expect("xlsx page ok");
+        assert!(out.contains("no rows in window"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.xlsx");
+        std::fs::write(&bad, SAMPLE_XLSX).unwrap();
+        assert!(matches!(
+            read_xlsx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A non-spreadsheet surfaces a parse error, not a panic.
+        let notxlsx = dir.path().join("plain.xlsx");
+        std::fs::write(&notxlsx, b"not a spreadsheet").unwrap();
+        assert!(matches!(
+            read_xlsx_run(
+                &policy,
+                &serde_json::json!({"path": notxlsx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+    }
+
     #[test]
     fn csv_reports_shape_types_and_bounded_window() {
         let mut body = String::from("id,name,price,active\n");
@@ -4183,16 +4432,28 @@ mod tests {
         assert!(out.contains("detected PNG image"), "{out}");
         assert!(out.contains("not extracted"), "{out}");
 
-        // xlsx (zip magic + extension) → detected office, declined honestly.
+        // xlsx (zip magic + extension) → routed to the real extractor.
         let xlsx = dir.path().join("book.xlsx");
-        std::fs::write(&xlsx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        std::fs::write(&xlsx, SAMPLE_XLSX).unwrap();
         let out = read_document_run(
             &policy,
             &serde_json::json!({"path": xlsx.to_string_lossy()}).to_string(),
         )
         .await
         .expect("xlsx route");
-        assert!(out.contains("detected XLSX"), "{out}");
+        assert!(out.contains("XLSX → fs_read_xlsx"), "{out}");
+        assert!(out.contains("Ada"), "extracted cell: {out}");
+
+        // docx (zip magic + extension, no extractor) → detected, declined.
+        let docx = dir.path().join("memo.docx");
+        std::fs::write(&docx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": docx.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("docx route");
+        assert!(out.contains("detected DOCX"), "{out}");
         assert!(out.contains("no structured extractor"), "{out}");
 
         // Outside the allowlist → PolicyDenied before any routing.
