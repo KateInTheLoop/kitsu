@@ -3381,14 +3381,38 @@ struct OutlineArgs {
     max_items: Option<usize>,
 }
 
-/// True when a structural keyword is immediately followed by an identifier
-/// (a definition, not a use). Comment lines are filtered by the caller.
+/// Visibility/qualifier tokens that may precede a definition keyword (incl. the
+/// `pub(crate)` / `pub(super)` tokens). Requiring the keyword to sit at the
+/// statement START — after only these — keeps a keyword INSIDE a string or a
+/// call (`describe("fn fake", …)`, `let s = "fn x"`) from being flagged.
+const OUTLINE_MODIFIERS: &[&str] = &[
+    "pub",
+    "async",
+    "unsafe",
+    "extern",
+    "default",
+    "public",
+    "private",
+    "protected",
+    "export",
+    "final",
+    "abstract",
+    "crate",
+    "super",
+    "self",
+    "in",
+];
+
+/// True when a structural keyword is at the statement start (after only
+/// modifiers) AND followed by an identifier — a real definition, not a use.
+/// Comment lines are filtered by the caller.
 fn line_defines(line: &str) -> bool {
     let tokens = identifier_tokens(line);
-    tokens
-        .iter()
-        .enumerate()
-        .any(|(i, tok)| OUTLINE_KEYWORDS.contains(tok) && tokens.get(i + 1).is_some())
+    tokens.iter().enumerate().any(|(i, tok)| {
+        OUTLINE_KEYWORDS.contains(tok)
+            && tokens.get(i + 1).is_some()
+            && tokens[..i].iter().all(|t| OUTLINE_MODIFIERS.contains(t))
+    })
 }
 
 /// Skip obvious comment lines to cut false positives (`// fn foo does …`).
@@ -7607,6 +7631,24 @@ fn helper(x: u32) -> u32 { x + MAX as u32 }
     fn outline_no_defs_is_honest() {
         let out = render_outline("x.txt", "just some prose\nno code here\n", 500, false);
         assert!(out.contains("(no top-level definitions detected)"), "{out}");
+    }
+
+    #[test]
+    fn outline_rejects_keywords_in_strings_and_calls() {
+        // A keyword mid-line (inside a string or a call argument) is NOT a
+        // definition; only a keyword at the statement start (after modifiers) is.
+        let src = "fn real_definition() {}\n\
+                   describe(\"fn fake\", || {});\n\
+                   let code = \"fn also_fake\";\n\
+                   pub(crate) fn visible_helper() {}\n";
+        let out = render_outline("t.rs", src, 500, false);
+        assert!(out.contains("2 definition(s)"), "{out}");
+        assert!(out.contains("fn real_definition"), "{out}");
+        assert!(
+            out.contains("fn visible_helper"),
+            "pub(crate) missed: {out}"
+        );
+        assert!(!out.contains("fake"), "string/call keyword leaked: {out}");
     }
 
     #[tokio::test]
