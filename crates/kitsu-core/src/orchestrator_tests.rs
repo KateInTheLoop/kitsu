@@ -4843,3 +4843,128 @@ fn test_cached_schema_estimate_correctness_matches_fresh_estimate() {
     assert_eq!(second, estimate_str(&schema_json));
     assert_eq!(first, second);
 }
+
+/// Build a conversation with a system prefix plus `exchanges` user/assistant
+/// exchanges (more than KEEP_RECENT_EXCHANGES so a compaction span exists).
+fn compaction_conversation(exchanges: usize) -> Vec<kitsu_providers::ChatMessage> {
+    let mut msgs = vec![kitsu_providers::ChatMessage::system("you are a test bot")];
+    for i in 0..exchanges {
+        msgs.push(kitsu_providers::ChatMessage::user(format!(
+            "question {i}: please do some work"
+        )));
+        msgs.push(kitsu_providers::ChatMessage::assistant(
+            format!("answer {i}: work done"),
+            vec![],
+        ));
+    }
+    msgs
+}
+
+/// An EMPTY (whitespace-only) but cleanly terminated (`Done(Stop)`) summary
+/// completion must fall back with SummaryFallbackReason::EmptyCompletion, NOT
+/// ProviderFailure: the provider succeeded; it simply returned no usable text.
+#[tokio::test]
+async fn summarize_or_fallback_empty_completion_uses_empty_completion_reason() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("   \n\t ".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(4);
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        64_000,
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on an empty completion");
+
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::EmptyCompletion),
+        "an empty-but-terminated completion is not a provider failure"
+    );
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the fallback must still trim the old exchanges"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content == crate::orchestrator::TRIM_MARKER),
+        "the trim fallback must leave its marker in the rebuilt history"
+    );
+}
+
+/// A genuine provider FAILURE (stream error) must still fall back with
+/// SummaryFallbackReason::ProviderFailure — the new EmptyCompletion variant
+/// must not swallow real failures.
+#[tokio::test]
+async fn summarize_or_fallback_provider_failure_still_uses_provider_failure_reason() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = FallibleMockProvider::new(vec![Err(ProviderError::Connection(
+        "stream interrupted".to_string(),
+    ))]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(4);
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        64_000,
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on a provider failure");
+
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::ProviderFailure),
+        "a real provider failure must keep the ProviderFailure reason"
+    );
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the fallback must still trim the old exchanges"
+    );
+}
