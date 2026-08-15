@@ -183,6 +183,13 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   advertises spawn_agent* tools; a model that would otherwise spawn
   simply doesn't see them, and no mid-turn tool-list mutation or HTTP 400
   occurs. (Affects both HF worker loops.)
+- R4.9 **Disclosing response-parse errors** (surfaced by the GLM loop):
+  `invalid response; HTTP 200; body failed` does not say which parse
+  step or chunk failed, so a transport/format failure can't be
+  root-caused from the receipt alone. *Accept:* a malformed provider
+  response surfaces a message naming the failing stage (e.g. "usage
+  chunk", "tool_call arguments JSON", "empty choices") and a bounded
+  snippet of the offending body, without leaking secrets.
 
 ## 5. Security tooling — *described, deprioritized*
 

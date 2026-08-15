@@ -93,3 +93,43 @@ flight) — GLM should take fresh items.
 ## Cycle log
 
 (appended by the supervisor each cycle, newest last)
+
+### Cycle 1 — 2026-08-14 — GLM debut FAILED (transient provider transport; grade F)
+
+Probes all green: reasoning under `message.reasoning` / `delta.reasoning`;
+`reasoning_effort low` gives a modest ~10-30% reasoning shrink (143-184
+vs 199 tokens — not the dramatic drop the spec's spot-check saw, logged
+as a discrepancy) and a tight `max_tokens` still burns the whole budget
+on reasoning (recipe warning confirmed real); forced tool call intact
+from `:together`; `cached_tokens` present (0 on short prompts).
+
+**Phase B produced no deliverable — provider transport, not GLM.** Build
+clean. Attempt 1: GLM read the file, then `:together` returned **HTTP 503
+three times** → kitsu gave up (turn correctly discarded). 60s cooldown,
+one retry: read again, then **HTTP 200 with an unparseable body**
+(`invalid response; HTTP 200; body failed`). Retry budget exhausted, no
+third attempt. GLM never advanced past its first read in either attempt —
+citation spot-check N/A. This is a **different failure class** than
+Kimi's tool-call corruption or DeepSeek's over-reading: pure `:together`
+backend instability (two failure modes in ~2 min). No spawn attempted
+(cap 1 unexercised).
+
+**Provider re-check (post-cycle, curl only):** all four candidate
+providers now answer 3/3 with tool calls intact — `together`,
+`fireworks-ai`, `novita`, `zai-org`. So the cycle-1 failure was a
+**transient blip**, not a persistent `:together` problem. **Decision:
+keep the `:together` pin** (proven recipe provider, healthy now); if
+cycle 2 ALSO fails on transport, switch the pin to `fireworks-ai`.
+
+**kitsu weaknesses filed:**
+- W1 (→ roadmap R4.9): `invalid response; HTTP 200; body failed` does
+  not disclose WHICH parse step/chunk failed — this cycle couldn't
+  confirm root cause because the error is opaque. A disclosing parse
+  error would have.
+- W2: fail-closed discard on transport error means attempt-1's real
+  progress (a full read, ~625 completion tokens) buys nothing on the
+  same-turn retry — no partial-turn caching across retries.
+
+**Ramp status:** 0 banked for GLM after cycle 1 (Kimi many, DeepSeek 1@B).
+Cycle 2 retries Phase B on the same file; if `:together` flakes again,
+switch to `fireworks-ai`.
