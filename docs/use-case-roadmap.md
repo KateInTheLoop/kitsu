@@ -296,9 +296,13 @@ configs and reports added/removed/changed keys + unchanged count,
 handling `key value`/`key=value`/`key: value`, comments, case-insensitive
 directives, and duplicates. Both paths authorized; parse off-reactor.
 5 test scenarios incl. the sshd_config case-insensitive match; live-
-verified on default-vs-hardened sshd_config (correct drift). Haiku review
-pending (flagged the delimiter-parsing edge cases and indexing safety).
-Next in lane 3: R3.3 structured command results, R3.4 runbook mode.
+verified on default-vs-hardened sshd_config (correct drift). Haiku review:
+SHIP-AS-IS — all 10 edge cases traced (set-op correctness, value-contains-
+delimiter, case-insensitivity, dup handling, both-paths-authorized,
+byte-boundary/indexing safety, debug-format escaping); one very-low
+comment/behavior mismatch on the double-delimiter case, fixed in a
+follow-up (ae9f2ab). Next in lane 3: R3.3 structured command results,
+R3.4 runbook mode.
 
 ### Cycle 5 — 2026-08-14 — R3.1 log scan/tail (opens the sysadmin lane)
 
