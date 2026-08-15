@@ -2356,3 +2356,109 @@ fn test_build_body_ok_with_no_tools() {
         "empty tools should serialize to an empty vec (or be absent)"
     );
 }
+
+/// Rebase guard: tool-schema validation is a request-boundary invariant, not
+/// merely a property of the private body builder. It must win before auth and
+/// before any network attempt so malformed tools fail deterministically.
+#[tokio::test]
+#[serial]
+async fn test_invalid_tool_schema_fails_before_authentication_or_network() {
+    let _g = EnvGuard::set(TEST_ENV, "");
+    let provider = provider_for("http://127.0.0.1:9".to_string());
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "bad_tool".to_string(),
+        description: "invalid scalar schema".to_string(),
+        parameters: serde_json::json!(42),
+    }]);
+
+    let error = match provider.chat_stream(req).await {
+        Ok(_) => panic!("malformed tool schema must fail before request dispatch"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            ProviderError::InvalidResponse(ref message)
+                if message == "tool bad_tool: parameters must be a JSON Schema object"
+        ),
+        "schema validation must precede the missing-auth path; got {error:?}"
+    );
+}
+
+/// Rebase guard: gateways use both response modes interchangeably, so a
+/// top-level `error: null` must preserve the same semantic text and terminal
+/// reason in streaming and non-streaming parsing.
+#[test]
+fn test_null_error_semantics_match_across_response_modes() {
+    use super::{parse_completion, SseDecoder};
+
+    let nonstream = parse_completion(
+        r#"{
+            "error": null,
+            "choices": [{"message": {"content": "same"}, "finish_reason": "stop"}]
+        }"#,
+    )
+    .expect("non-streaming error:null response must parse");
+
+    let mut stream_text = Vec::new();
+    let mut decoder = SseDecoder::default();
+    decoder
+        .process_line(
+            r#"data: {"error":null,"choices":[{"index":0,"delta":{"content":"same"},"finish_reason":"stop"}]}"#,
+            &mut stream_text,
+        )
+        .expect("streaming error:null response must parse");
+    let stream_terminal = decoder
+        .finalize()
+        .expect("streaming error:null response must finalize");
+
+    assert!(matches!(
+        nonstream.as_slice(),
+        [ChatDelta::Text(text), ChatDelta::Done(FinishReason::Stop)] if text == "same"
+    ));
+    assert!(matches!(
+        stream_text.as_slice(),
+        [ChatDelta::Text(text)] if text == "same"
+    ));
+    assert!(matches!(
+        stream_terminal.as_slice(),
+        [ChatDelta::Done(FinishReason::Stop)]
+    ));
+}
+
+/// Rebase guard: an identical catalog refresh must carry the complete memo,
+/// including cached misses. Retaining only successful lengths would silently
+/// reparse unknown models after every refresh and weaken the cache contract.
+#[tokio::test]
+async fn test_same_catalog_refresh_preserves_positive_and_negative_memo_entries() {
+    let server = MockServer::start().await;
+    let catalog = r#"{"data":[{"id":"known","context_length":8192}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("known").await, Some(8192));
+    assert_eq!(provider.model_context_length("missing").await, None);
+
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after lookups");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+    provider
+        .get_models_response()
+        .await
+        .expect("identical catalog refresh succeeds");
+
+    let cache = provider.models_cache.lock().await;
+    let entry = cache.as_ref().expect("catalog remains cached");
+    let memo = entry.context_lengths.lock().unwrap();
+    assert_eq!(memo.len(), 2);
+    assert_eq!(memo.get("known"), Some(&Some(8192)));
+    assert_eq!(memo.get("missing"), Some(&None));
+}
