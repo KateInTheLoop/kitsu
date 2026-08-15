@@ -306,3 +306,38 @@ was produced.
 **GLM is 3-for-3 A on reviews, 2-for-2 on code — a fully proven
 contributor.** Next code cycle: implement cycle-5 finding 1 (the
 error:null false positive) with the proven test-rigor discipline.
+
+### Cycle 6 — 2026-08-14 — SSE error:null fix (grade A) — its own finding, with judgment
+
+Implemented GLM's own cycle-5 finding 1 in openai_compat.rs: the SSE
+parser rejected ANY record with an `error` field via `.is_some()`, so
+`{"error": null}` (which healthy gateways emit) was a false positive AND
+a real mid-stream error's detail was discarded behind a fixed string.
+Fix: ignore a null error, surface the gateway's `error.message` otherwise
+(`provider error in SSE stream: {detail}`). All 3 criteria hold: null
+ignored, detail surfaced, real error still rejected. Also advances
+roadmap R4.9. Commit `59bc117` (Kate verified), pushed. cap-1 held, no
+spawn, first attempt.
+
+- **Tests-fail-without-impl VERIFIED** (supervisor stashed only the impl,
+  kept the tests): (a) `"error": null` + valid data parses — FAILS on old
+  code; (b) `{"error":{"message":"rate limited"}}` → Err containing "rate
+  limited" — FAILS on old code (old fixed string); (c) no-error regression
+  guard. Test rigor holding cycle-over-cycle.
+- **Judgment, not just a diff:** a PRE-EXISTING test asserted the OLD
+  "don't surface provider error text" behavior and went red. GLM/supervisor
+  did NOT blindly flip it — verified this wasn't crossing a
+  secret-redaction boundary (token/credential redaction is a SEPARATE,
+  untouched, still-passing guard: `test_token_never_in_error_display`),
+  confirmed the codebase already discloses response-body text for
+  diagnostics, then updated the stale assertion to the new intended
+  behavior (confirmed it too fails against the unfixed impl). Documented
+  the reasoning as a lesson.
+- 6 reads (1 over guidance, a disclosed post-edit verify), 2 edits.
+  kitsu-usage 70,673 / 2,320 / 72,993. kitsu-providers 70/70.
+
+**GLM is 3-for-3 A on reviews AND 3-for-3 on code (B→A→A). A top-tier
+contributor — implements its own findings with genuine tests and
+security-aware judgment.** Next: alternate — a fresh review of a new area
+then implement, or take a fresh backlog item (avoid Kimi's in-flight
+P11).
