@@ -218,6 +218,15 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   advertises spawn_agent* tools; a model that would otherwise spawn
   simply doesn't see them, and no mid-turn tool-list mutation or HTTP 400
   occurs. (Affects both HF worker loops.)
+- R4.11 **Discarded turns must disclose files were modified** (found by
+  the DeepSeek loop, W8): when a turn is discarded (e.g. on a
+  `--timeout-secs` cancellation) after tool calls already wrote to disk,
+  the transcript says "discarded" but the file edits persisted —
+  "discarded" wrongly implies rollback. An unattended run can silently
+  leave half-applied changes. *Accept:* a discarded turn that ran any
+  write/edit tool surfaces a "N file(s) were modified before the turn was
+  discarded" notice (stderr + machine record), listing the paths, so the
+  operator/next-run knows the workspace changed.
 - R4.9 **Disclosing response-parse errors** (surfaced by the GLM loop):
   `invalid response; HTTP 200; body failed` does not say which parse
   step or chunk failed, so a transport/format failure can't be
