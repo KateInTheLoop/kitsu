@@ -4,7 +4,7 @@
 
 use crate::context::{
     clamp_max_tokens_to_reserve, clamp_window_for_shortfall, estimate_str, message_tokens,
-    ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
+    schema_fingerprint, ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
 };
 use futures::StreamExt;
 use kitsu_providers::{
@@ -777,6 +777,14 @@ pub struct AgentSessionState {
     pub run_usage: kitsu_providers::Usage,
     /// Completed model turns across the run, for `/cost`.
     pub run_turns: u32,
+    /// P11: cached (fingerprint, schema_json, token estimate) for the tool
+    /// schema. The preflight at every provider boundary used to re-run
+    /// `estimate_str` over the full serialized schema every round even though
+    /// the tool registry almost never changes within a session. Keyed by the
+    /// P7 [`schema_fingerprint`] of the serialized schema: a matching
+    /// fingerprint reuses the cached estimate, a mismatch recomputes and
+    /// overwrites. Session-scoped so no cross-session staleness is possible.
+    pub schema_cache: Option<(u64, String, u64)>,
 }
 
 /// Evidence, gathered from a provider `usage` report, that the server accepted
@@ -1005,6 +1013,7 @@ where
         run_reads,
         run_usage: _,
         run_turns: _,
+        schema_cache,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
@@ -1143,7 +1152,8 @@ where
         // edit adds another message or tool mutation between compaction and
         // request construction, this check fails locally instead of leaking an
         // oversized request to the gateway.
-        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter, *window_evidence)?;
+        let sent_measurement =
+            ensure_chat_request_fits(&req, cfg, meter, *window_evidence, schema_cache)?;
         // Token-denominated estimate of the request being sent, kept so the
         // usage report below can be cross-checked against what left the door.
         let sent_estimate_tokens =
@@ -2197,13 +2207,12 @@ struct RequestMeasurement {
     unit: ContextUnit,
 }
 
-fn structural_request_tokens(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
-    messages.iter().map(message_tokens).sum::<u64>()
-        + if has_schema {
-            estimate_str(schema_json)
-        } else {
-            0
-        }
+/// Structural token total for a request shape. `schema_tokens` is the
+/// precomputed estimate for the (fixed-per-call) tool schema — P11 threads one
+/// computed/cached value through instead of re-running `estimate_str` on every
+/// invocation (some callers, e.g. `fit_summary_rebuild`, call this in a loop).
+fn structural_request_tokens(messages: &[ChatMessage], schema_tokens: u64) -> u64 {
+    messages.iter().map(message_tokens).sum::<u64>() + schema_tokens
 }
 
 fn structural_request_bytes(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
@@ -2231,21 +2240,23 @@ fn effective_budget_window(window: u64, window_evidence: Option<ContextWindowEvi
     }
 }
 
+// P11 added `schema_tokens` (the cached/fresh estimate) alongside the
+// pre-existing `schema_json`/`has_schema`, which are still needed here for
+// the anchor fingerprint check and the byte-mode fallback — matches the
+// `#[allow(clippy::too_many_arguments)]` precedent already used by the other
+// measurement-plumbing functions in this module.
+#[allow(clippy::too_many_arguments)]
 fn request_measurement(
     messages: &[ChatMessage],
     cfg: &AgentConfig,
     schema_json: &str,
     has_schema: bool,
+    schema_tokens: u64,
     max_tokens: Option<u32>,
     meter: &ContextMeter,
     window_evidence: Option<ContextWindowEvidence>,
 ) -> RequestMeasurement {
     if let Some(window) = cfg.context_window {
-        let schema_tokens = if has_schema {
-            estimate_str(schema_json)
-        } else {
-            0
-        };
         // A valid real-usage anchor is stronger than a cold chars/token pass.
         // Add schemas only if that exact anchored request did not already carry
         // them. Any mutation of covered messages invalidates the anchor first.
@@ -2297,11 +2308,20 @@ fn check_measurement(measurement: RequestMeasurement) -> Result<RequestMeasureme
 }
 
 /// The last-line guard used at every provider boundary in this module.
+///
+/// P11: the schema token estimate is cached per session, keyed by the P7
+/// [`schema_fingerprint`] of the serialized schema. A cache hit reuses the
+/// stored `schema_json` and estimate without re-running `estimate_str`; a miss
+/// (first preflight or a changed tool registry) recomputes and overwrites the
+/// cache. Serialization of `req.tools` still happens here — it is required to
+/// fingerprint the CURRENT request's schema — but the chars/token pass over it
+/// does not.
 fn ensure_chat_request_fits(
     req: &ChatRequest,
     cfg: &AgentConfig,
     meter: &ContextMeter,
     window_evidence: Option<ContextWindowEvidence>,
+    schema_cache: &mut Option<(u64, String, u64)>,
 ) -> Result<RequestMeasurement, AgentError> {
     let has_schema = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let schema_json = req
@@ -2309,15 +2329,37 @@ fn ensure_chat_request_fits(
         .as_ref()
         .map(|tools| serde_json::to_string(tools).unwrap_or_default())
         .unwrap_or_default();
+    let schema_tokens = if has_schema {
+        cached_schema_estimate(schema_cache, &schema_json)
+    } else {
+        0
+    };
     check_measurement(request_measurement(
         &req.messages,
         cfg,
         &schema_json,
         has_schema,
+        schema_tokens,
         req.max_tokens,
         meter,
         window_evidence,
     ))
+}
+
+/// P11 helper: return the cached token estimate for `schema_json` when the
+/// session cache's fingerprint matches, otherwise compute `estimate_str` fresh
+/// and overwrite the cache with the new (fingerprint, schema_json, estimate)
+/// triple. Reuses the P7 [`schema_fingerprint`] — no new hashing scheme.
+fn cached_schema_estimate(cache: &mut Option<(u64, String, u64)>, schema_json: &str) -> u64 {
+    let fingerprint = schema_fingerprint(schema_json);
+    if let Some((cached_fp, _, cached_estimate)) = cache.as_ref() {
+        if *cached_fp == fingerprint {
+            return *cached_estimate;
+        }
+    }
+    let estimate = estimate_str(schema_json);
+    *cache = Some((fingerprint, schema_json.to_string(), estimate));
+    estimate
 }
 
 /// Compact eligible old exchanges immediately, even when the conversation is
@@ -2339,7 +2381,19 @@ where
         return Err(AgentError::ContextWindowUnknown);
     }
     let has_schema = !tools.descriptors().is_empty();
-    let schema_json = serde_json::to_string(tools.descriptors()).unwrap_or_default();
+    // P11: reuse the session schema cache so a `/compact` right after normal
+    // rounds does not re-run estimate_str over an unchanged schema.
+    let schema_json = if has_schema {
+        let serialized = serde_json::to_string(tools.descriptors()).unwrap_or_default();
+        match state.schema_cache.as_ref() {
+            Some((fp, cached_json, _)) if *fp == schema_fingerprint(&serialized) => {
+                cached_json.clone()
+            }
+            _ => serialized,
+        }
+    } else {
+        String::new()
+    };
     let mut usage = kitsu_providers::Usage::default();
     enforce_context_budget_recording(
         provider,
@@ -2427,13 +2481,23 @@ async fn enforce_context_budget_recording<P>(
 where
     P: Provider,
 {
-    let token_before = structural_request_tokens(messages, schema_json, has_schema);
+    // P11: the schema is fixed for this whole call, so its token estimate is
+    // computed once here and threaded into every request_measurement /
+    // structural_request_tokens call below instead of being re-derived from
+    // schema_json on each pass.
+    let schema_tokens = if has_schema {
+        estimate_str(schema_json)
+    } else {
+        0
+    };
+    let token_before = structural_request_tokens(messages, schema_tokens);
     let messages_before = messages.len();
     let initial = request_measurement(
         messages,
         cfg,
         schema_json,
         has_schema,
+        schema_tokens,
         cfg.max_tokens,
         meter,
         window_evidence,
@@ -2492,6 +2556,7 @@ where
             cfg,
             schema_json,
             has_schema,
+            schema_tokens,
             cfg.max_tokens,
             meter,
             window_evidence,
@@ -2502,7 +2567,7 @@ where
             reason,
             &progress,
             token_before,
-            structural_request_tokens(messages, schema_json, has_schema),
+            structural_request_tokens(messages, schema_tokens),
             messages_before,
             messages.len(),
         );
@@ -2511,7 +2576,7 @@ where
             changed: record.is_some(),
             target_tokens: 0,
             tokens_before: token_before,
-            tokens_after: structural_request_tokens(messages, schema_json, has_schema),
+            tokens_after: structural_request_tokens(messages, schema_tokens),
             record,
             usage: *turn_usage,
         });
@@ -2544,7 +2609,7 @@ where
             progress.outcome = Some(CompactionOutcome::ToolResultsElided);
             // Once covered content changes, use one consistent cold estimate for
             // all subsequent stages and the final adjacent preflight.
-            running = structural_request_tokens(messages, schema_json, has_schema);
+            running = structural_request_tokens(messages, schema_tokens);
         }
     }
 
@@ -2566,7 +2631,7 @@ where
                     }
                     meter.invalidate();
                     removed_total = removed_total.saturating_add(removed);
-                    current = structural_request_tokens(messages, schema_json, has_schema);
+                    current = structural_request_tokens(messages, schema_tokens);
                     if force || current <= target {
                         break;
                     }
@@ -2581,8 +2646,7 @@ where
                     provider,
                     messages,
                     cfg,
-                    schema_json,
-                    has_schema,
+                    schema_tokens,
                     target,
                     compact_failures,
                     turn_usage,
@@ -2596,7 +2660,7 @@ where
         }
     }
 
-    let token_after = structural_request_tokens(messages, schema_json, has_schema);
+    let token_after = structural_request_tokens(messages, schema_tokens);
     let record = record_progress(
         ledger,
         cfg,
@@ -2612,6 +2676,7 @@ where
         cfg,
         schema_json,
         has_schema,
+        schema_tokens,
         cfg.max_tokens,
         meter,
         window_evidence,
@@ -2830,8 +2895,7 @@ fn fit_summary_rebuild(
     messages: &[ChatMessage],
     span: CompactionSpan,
     summary: &str,
-    schema_json: &str,
-    has_schema: bool,
+    schema_tokens: u64,
     target: u64,
 ) -> Option<(Vec<ChatMessage>, bool)> {
     let mut cap = summary.len();
@@ -2841,7 +2905,7 @@ fn fit_summary_rebuild(
             return None;
         }
         let rebuilt = rebuilt_with_summary(messages, span, bounded.trim());
-        let used = structural_request_tokens(&rebuilt, schema_json, has_schema);
+        let used = structural_request_tokens(&rebuilt, schema_tokens);
         if used <= target {
             return Some((rebuilt, bounded.len() < summary.len()));
         }
@@ -2865,8 +2929,7 @@ async fn summarize_or_fallback<P>(
     provider: &P,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
-    schema_json: &str,
-    has_schema: bool,
+    schema_tokens: u64,
     target: u64,
     failures: &mut u32,
     turn_usage: &mut kitsu_providers::Usage,
@@ -2896,7 +2959,11 @@ where
                 // This is a provider request in its own right. Check the concrete
                 // bounded request immediately before crossing the boundary.
                 let cold_meter = ContextMeter::new();
-                if ensure_chat_request_fits(&req, cfg, &cold_meter, window_evidence).is_err() {
+                // The bounded summary request carries no tools, so the P11
+                // schema cache is irrelevant here — pass a fresh empty slot.
+                if ensure_chat_request_fits(&req, cfg, &cold_meter, window_evidence, &mut None)
+                    .is_err()
+                {
                     Some(SummaryFallbackReason::RequestTooLarge)
                 } else {
                     if let Some(log) = &cfg.event_log {
@@ -2930,8 +2997,7 @@ where
                                 messages,
                                 span,
                                 text.trim(),
-                                schema_json,
-                                has_schema,
+                                schema_tokens,
                                 target,
                             ) {
                                 *messages = rebuilt;
@@ -2972,7 +3038,7 @@ where
     // eligible old exchange, preserve the leading system/marker plus the two
     // recent exchanges, then let the common final preflight either accept that
     // smallest safe history or return ContextOverflow for protected context.
-    let current = structural_request_tokens(messages, schema_json, has_schema);
+    let current = structural_request_tokens(messages, schema_tokens);
     let removed = drop_old_exchanges_detailed(messages, current, target, message_tokens, true);
     if removed > 0 {
         meter.invalidate();
