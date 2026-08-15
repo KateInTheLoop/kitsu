@@ -1636,6 +1636,201 @@ fn scan_tail(
     Ok(out)
 }
 
+// --- fs.diff_config (config drift audit) ------------------------------------
+
+#[derive(Deserialize)]
+struct DiffConfigArgs {
+    /// The current config to audit.
+    path: String,
+    /// The reference/baseline config to compare against.
+    reference: String,
+    /// Compare keys case-insensitively (e.g. sshd_config directives).
+    #[serde(default, deserialize_with = "lenient_bool")]
+    ignore_case: bool,
+}
+
+/// One parsed config: keys in first-seen order, a lookup keyed by the
+/// (optionally case-folded) directive, and a count of duplicate keys seen.
+struct ParsedConfig {
+    order: Vec<String>,
+    /// normalized key -> (display key, last value)
+    entries: std::collections::HashMap<String, (String, String)>,
+    duplicates: usize,
+}
+
+/// Parse a line-oriented config: `#`/`;` comments and blank lines skipped;
+/// each entry split on the first `=`, `:`, or whitespace run. Last value wins
+/// for a repeated key (with a duplicate count disclosed).
+fn parse_config(text: &str, ignore_case: bool) -> ParsedConfig {
+    let mut order = Vec::new();
+    let mut entries: std::collections::HashMap<String, (String, String)> =
+        std::collections::HashMap::new();
+    let mut duplicates = 0usize;
+    for raw in text.lines() {
+        let line = raw.trim();
+        if line.is_empty() || line.starts_with('#') || line.starts_with(';') {
+            continue;
+        }
+        // Split on the first '=', ':', or whitespace.
+        let delim = line
+            .char_indices()
+            .find(|&(_, c)| c == '=' || c == ':' || c.is_whitespace())
+            .map(|(i, _)| i);
+        let (key_raw, value) = match delim {
+            Some(i) => {
+                let key = line[..i].trim();
+                // Skip the single delimiter char, then trim the rest.
+                let rest = line[i..].trim_start_matches(['=', ':']);
+                (key, rest.trim())
+            }
+            None => (line, ""),
+        };
+        if key_raw.is_empty() {
+            continue;
+        }
+        let norm = if ignore_case {
+            key_raw.to_lowercase()
+        } else {
+            key_raw.to_string()
+        };
+        if entries.contains_key(&norm) {
+            duplicates += 1;
+        } else {
+            order.push(norm.clone());
+        }
+        entries.insert(norm, (key_raw.to_string(), value.to_string()));
+    }
+    ParsedConfig {
+        order,
+        entries,
+        duplicates,
+    }
+}
+
+/// Render the drift between a `reference` (baseline) and `current` config.
+fn render_config_diff(
+    current: &ParsedConfig,
+    reference: &ParsedConfig,
+    path: &str,
+    reference_path: &str,
+) -> String {
+    let mut added: Vec<(&str, &str)> = Vec::new(); // in current, not reference
+    let mut changed: Vec<(&str, &str, &str)> = Vec::new(); // key, ref value, cur value
+    let mut removed: Vec<(&str, &str)> = Vec::new(); // in reference, not current
+    let mut unchanged = 0usize;
+
+    for norm in &current.order {
+        let (disp, cur_val) = &current.entries[norm];
+        match reference.entries.get(norm) {
+            None => added.push((disp.as_str(), cur_val.as_str())),
+            Some((_, ref_val)) if ref_val != cur_val => {
+                changed.push((disp.as_str(), ref_val.as_str(), cur_val.as_str()))
+            }
+            Some(_) => unchanged += 1,
+        }
+    }
+    for norm in &reference.order {
+        if !current.entries.contains_key(norm) {
+            let (disp, ref_val) = &reference.entries[norm];
+            removed.push((disp.as_str(), ref_val.as_str()));
+        }
+    }
+
+    let mut out = format!(
+        "config-diff> {path} vs {reference_path}: {} added, {} removed, {} changed, {} unchanged\n",
+        added.len(),
+        removed.len(),
+        changed.len(),
+        unchanged
+    );
+    if added.is_empty() && removed.is_empty() && changed.is_empty() {
+        out.push_str("(no drift — configs are equivalent)\n");
+    }
+    if !changed.is_empty() {
+        out.push_str("[changed — reference → current]\n");
+        for (k, r, c) in &changed {
+            out.push_str(&format!("~ {k}: {r:?} → {c:?}\n"));
+        }
+    }
+    if !added.is_empty() {
+        out.push_str("[added — set in current, absent from reference]\n");
+        for (k, v) in &added {
+            out.push_str(&format!("+ {k} = {v:?}\n"));
+        }
+    }
+    if !removed.is_empty() {
+        out.push_str("[removed — in reference, absent from current]\n");
+        for (k, v) in &removed {
+            out.push_str(&format!("- {k} = {v:?}\n"));
+        }
+    }
+    let dup = current.duplicates + reference.duplicates;
+    if dup > 0 {
+        out.push_str(&format!(
+            "[note: {dup} duplicate key line(s) seen; last value per key was used]\n"
+        ));
+    }
+    out
+}
+
+pub fn diff_config_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_diff_config".to_string(),
+        description: "Compare a line-oriented config file against a reference/baseline and report \
+                      drift: keys added, removed, or changed, plus an unchanged count. Parses \
+                      `key value`, `key=value`, and `key: value` styles; skips # and ; comments. \
+                      Set ignore_case for case-insensitive directives (e.g. sshd_config)."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Current config file to audit"},
+                "reference": {"type": "string", "description": "Reference/baseline config to compare against"},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive key comparison (optional, default false)"}
+            },
+            "required": ["path", "reference"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { diff_config_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn diff_config_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: DiffConfigArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let current_text = read_config_text(policy, &a.path).await?;
+    let reference_text = read_config_text(policy, &a.reference).await?;
+    let ignore_case = a.ignore_case;
+    let path = a.path.clone();
+    let reference = a.reference.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let cur = parse_config(&current_text, ignore_case);
+        let refc = parse_config(&reference_text, ignore_case);
+        render_config_diff(&cur, &refc, &path, &reference)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Authorize and read one config file (bounded by the read cap — configs are
+/// small; the same guard as fs_read_file).
+async fn read_config_text(policy: &Permissions, path: &str) -> Result<String, ToolError> {
+    let authorization = policy.authorize_read_file(Path::new(path)).await?;
+    let max_bytes = policy.max_bytes();
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let content = tokio::task::spawn_blocking(move || read_capped_text(file, max_bytes))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(content.text)
+}
+
 // --- fs.list_dir ------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -4385,6 +4580,95 @@ mod tests {
     /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
     /// LibreOffice, embedded so the xlsx tests need no writer dependency.
     const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+
+    #[test]
+    fn config_diff_reports_added_removed_changed_on_sshd_shaped_files() {
+        // sshd_config-shaped: `Key value`, # comments, case-insensitive keys.
+        let reference = "\
+# baseline sshd_config
+Port 22
+PermitRootLogin no
+PasswordAuthentication yes
+X11Forwarding no
+";
+        let current = "\
+# hardened
+Port 2222
+permitrootlogin no
+PasswordAuthentication no
+UseDNS no
+";
+        let refc = parse_config(reference, true);
+        let cur = parse_config(current, true);
+        let out = render_config_diff(&cur, &refc, "current", "baseline");
+        assert!(
+            out.contains("1 added, 1 removed, 2 changed, 1 unchanged"),
+            "summary: {out}"
+        );
+        // Port changed 22 → 2222.
+        assert!(out.contains("~ Port: \"22\" → \"2222\""), "{out}");
+        // PasswordAuthentication changed yes → no.
+        assert!(out.contains("PasswordAuthentication"), "{out}");
+        // UseDNS added in current; X11Forwarding removed from current.
+        assert!(out.contains("+ UseDNS = \"no\""), "added: {out}");
+        assert!(out.contains("- X11Forwarding = \"no\""), "removed: {out}");
+        // permitrootlogin (case-differing) matched PermitRootLogin → unchanged
+        // (both "no"), NOT reported as changed.
+        assert!(
+            !out.contains("PermitRootLogin: "),
+            "case-insensitive match: {out}"
+        );
+    }
+
+    #[test]
+    fn config_diff_handles_equal_configs_and_multiple_delimiters() {
+        // key=value and key: value styles both parse; identical → no drift.
+        let a = "host=localhost\nport: 8080\ndebug true\n";
+        let b = "port: 8080\nhost=localhost\ndebug true\n";
+        let out = render_config_diff(&parse_config(a, false), &parse_config(b, false), "a", "b");
+        assert!(
+            out.contains("0 added, 0 removed, 0 changed, 3 unchanged"),
+            "{out}"
+        );
+        assert!(out.contains("no drift"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn diff_config_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let cur = dir.path().join("app.conf");
+        let refr = dir.path().join("app.conf.default");
+        std::fs::write(&cur, "timeout=30\nretries=5\n").unwrap();
+        std::fs::write(&refr, "timeout=10\nretries=5\n").unwrap();
+        let out = diff_config_run(
+            &policy,
+            &serde_json::json!({"path": cur.to_string_lossy(), "reference": refr.to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("diff ok");
+        assert!(
+            out.contains("0 added, 0 removed, 1 changed, 1 unchanged"),
+            "{out}"
+        );
+        assert!(out.contains("~ timeout: \"10\" → \"30\""), "{out}");
+
+        // Either path outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.conf");
+        std::fs::write(&bad, "a=b\n").unwrap();
+        assert!(matches!(
+            diff_config_run(
+                &policy,
+                &serde_json::json!({"path": cur.to_string_lossy(), "reference": bad.to_string_lossy()})
+                    .to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
 
     #[tokio::test]
     async fn scan_file_grep_returns_matches_with_served_of_total_disclosure() {
