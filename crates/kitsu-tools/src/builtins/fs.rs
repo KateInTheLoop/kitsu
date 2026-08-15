@@ -1679,7 +1679,8 @@ fn parse_config(text: &str, ignore_case: bool) -> ParsedConfig {
         let (key_raw, value) = match delim {
             Some(i) => {
                 let key = line[..i].trim();
-                // Skip the single delimiter char, then trim the rest.
+                // Drop leading '='/':' delimiter chars (so `k=v`, `k==v`, and
+                // `k = v` all yield the same value), then trim whitespace.
                 let rest = line[i..].trim_start_matches(['=', ':']);
                 (key, rest.trim())
             }
