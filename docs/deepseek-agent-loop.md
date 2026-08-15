@@ -270,3 +270,45 @@ single-function change with `--allow-write` on the crate. The journal-cap
 bug that blocked orchestrator.rs edits is FIXED on main (edit/write now
 use the 1 MiB write cap), so a fresh binary can edit it — but keep
 DeepSeek's first code target small and self-contained regardless.
+
+### Cycle 5 — 2026-08-14 — first code cycle, PARTIAL (grade C+)
+
+Implemented its own cycle-4 proposal #1: `ensure_chat_request_fits`'s
+`serde_json::to_string(tools).unwrap_or_default()` silently turns a
+serialization failure into an empty `schema_json` (the request undercounts
+while the real schema still ships). **The code fix is correct and
+minimal** (propagates via `AgentError::Loop` — DeepSeek's cycle-4
+proposal had invented a non-existent `AgentError::internal`, corrected in
+the brief). Committed `162a969` (Kate verified), pushed. THIRD production
+validation of the journal-cap fix: DeepSeek edited orchestrator.rs
+(129 KiB) directly, no journal-limit error.
+
+- **Grade C+, and the reason is the important finding: implementation
+  breaks DeepSeek's scope discipline.** Its tiny-scope wins (cycles 3-4)
+  were REVIEWS — no type-chasing. Implementation forced it to chase
+  `ChatRequest`/`ToolDescriptor`/`AgentError` definitions across 4 files:
+  **~36 tool calls (16 Read, 18 fs_scan_file, 2 List) vs the "at most 2
+  reads" cap**, then the 300s timeout. The over-reading returns the moment
+  it can't stay inside one already-understood function.
+- The mandated test never shipped — and the supervisor verified the test
+  strategy is **unconstructible**: `serde_json` can't fail to serialize a
+  `ToolDescriptor` today (params is a Value that can't hold non-finite
+  floats), so no legitimate input triggers the guarded path. No hollow
+  test fabricated (good rigor); the fix is defensive against a
+  currently-impossible failure.
+- Also over-reached the diff (bumped fn to `pub(crate)`, added an unused
+  import) — reverted by the supervisor to keep scope tight.
+
+**New weaknesses:** W7 — no technical read cap hurts IMPLEMENTATION
+specifically (reinforces roadmap R4.10); W8 (→ roadmap R4.11) — a turn
+DISCARDED on timeout still leaves its file edits on disk ("discarded"
+implies rollback but files changed) — kitsu should surface a "files were
+modified" notice on a discarded turn.
+
+**Ramp verdict:** DeepSeek is a reliable TINY-SCOPE REVIEWER (3-for-3 at
+A-/B on single-function reviews) but NOT yet a reliable implementer —
+implementation's inherent type-chasing reignites its over-reading, which
+only a technical read cap (R4.10) will contain. **Role decision: keep
+DeepSeek on tiny-scope REVIEWS (its proven contribution mode) until R4.10
+lands; revisit implementation after.** Cycle 6 = a tiny-scope review of a
+fresh single function.
