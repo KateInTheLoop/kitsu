@@ -172,8 +172,13 @@ richest greenfield lane.
   `<w:br/>`→newline, entity/char-ref decoding, empty paragraphs skipped;
   32 MiB file guard + 64 MiB decompressed zip-bomb cap + paragraph
   pagination; wired into `read_document`'s DOCX branch (real extraction
-  now). So lane 2 covers CSV/PDF/XLSX/DOCX + image metadata + dispatch —
-  the common document types. pptx remains detect-and-disclose.
+  now). **`.pptx` slide text also DONE** (2026-08-15, commit 3b10ece):
+  `fs_read_pptx` extracts slide text via the shared `parse_ooxml_paragraphs`
+  (`<a:t>`/`<a:p>`), enumerating `ppt/slides/slideN.xml` in NUMERIC order,
+  grouped per slide, wired into `read_document`'s PPTX branch. So lane 2
+  covers CSV/PDF/XLSX/DOCX/PPTX + image metadata + dispatch — every common
+  document type, the full Office triad. Only unknown zip-based Office
+  types remain detect-and-disclose.
 - [x] (2026-08-14) R2.5 **Type-aware dispatch** — shipped as the
   `read_document` tool (commit 1d01628): detects type by magic bytes
   then extension, routes `.csv/.tsv`→fs_read_csv, `.pdf`/%PDF→fs_read_pdf,
@@ -549,6 +554,35 @@ loops) or lane-6 scientific docs (already covered by lane 2). The loop
 needs a repointed mandate — a coordinated lane-4 assignment or a gen-2
 role — rather than more standalone fs tools. Flagged for the gen-2
 strategy decision.
+
+### Cycle 15 — 2026-08-15 — fs_read_pptx (completes the Office triad, lane 2)
+
+Shipped `fs_read_pptx` (commit 3b10ece): PowerPoint slide-text extraction,
+the last common Office type. Enumerates `ppt/slides/slideN.xml`, sorts
+NUMERICALLY (lexical would put slide10 before slide2), extracts `<a:t>`
+runs into `<a:p>` paragraphs grouped per slide, wired into `read_document`
+(PPTX now extracts). The docx parser was generalized into a shared
+`parse_ooxml_paragraphs(text_tag, para_tag, tab_tag, break_tags)` — docx
+now calls it with the w:-tags, pptx with the a:-tags; docx behavior
+unchanged (tests pass untouched). No new crates (zip + quick-xml already
+deps). Bounded (32 MiB file / 64 MiB per-slide + total zip-bomb budget /
+paragraph pagination). Functional check: e2e builds a real 3-slide .pptx
+added OUT OF ORDER and pins numeric slide ordering (1<2<10) through
+read_pptx_run + the read_document dispatch, plus zip-without-slides honest
+error and allowlist denial. Haiku review: SHIP-AS-IS — 9 areas traced
+(refactor safety, numeric ordering incl. layout/master/notes exclusion,
+panic/zip-bomb bounds, honest degradation, dispatch ordering, additive),
+two explicitly-non-blocking extreme-edge notes (2× budget overshoot worst
+case, still bounded; slides.len() vs read on the byte-capped path, already
+disclosed) — not applied (gold-plating a non-defect). **Lane 2 now covers
+every common document type — CSV/PDF/XLSX/DOCX/PPTX + image + dispatch.**
+
+**Runway:** the capability loop has now completed lanes 2 (fully), 3
+(bar UI-owned R3.4), and 5, and drained the self-contained kitsu-tools
+slices. Remaining roadmap work is run-layer (lane 4 in main.rs/
+orchestrator, concurrently-edited) or already-covered lane 6. The loop
+needs a repointed/gen-2 mandate — flagged repeatedly; the next self-
+contained tick would have to invent non-roadmap tool hardening.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
