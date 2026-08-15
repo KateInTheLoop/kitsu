@@ -17,8 +17,8 @@ pub fn register_command_tool(registry: &mut Registry, policy: Arc<command::Comma
 }
 
 /// Register the read fs tools against `registry`, bound to `permissions`.
-/// `repo_grep` is registered only when `rg` is on PATH; otherwise it is simply
-/// not advertised (design Gap 7).
+/// Content search is implemented in-process on Unix, so its availability does
+/// not depend on a developer tool being present on the model runner's PATH.
 pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_file_tool(policy.clone());
     registry.register_with_descriptor(d, h);
@@ -44,6 +44,13 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::diff_config_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
+    #[cfg(unix)]
+    {
+        let (d, h) = fs::grep_tool(policy);
+        registry.register_with_descriptor(d, h);
+    }
+
+    #[cfg(not(unix))]
     if rg_available() {
         let (d, h) = fs::grep_tool(policy);
         registry.register_with_descriptor(d, h);
@@ -76,15 +83,17 @@ pub fn register_write_tools_with_journal(
     registry.register_with_descriptor(d, h);
 }
 
-/// Is ripgrep (`rg`) available on PATH?
+/// Non-Unix builds retain the fixed-argv ripgrep backend and advertise it only
+/// when the dependency is actually usable. Unix builds never execute this
+/// discovery path because their search is native and always registered.
+#[cfg(not(unix))]
 fn rg_available() -> bool {
     std::process::Command::new("rg")
         .arg("--version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
         .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
+        .is_ok_and(|status| status.success())
 }
 
 #[cfg(test)]
@@ -132,6 +141,47 @@ mod tests {
     }
 
     #[test]
+    fn read_registration_keeps_common_and_specialized_descriptors_unique() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools(&mut registry, policy);
+
+        let names = registry
+            .descriptors()
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect::<Vec<_>>();
+        let unique = names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(
+            names.len(),
+            unique.len(),
+            "duplicate descriptors: {names:?}"
+        );
+
+        for name in [
+            "fs_read_file",
+            "fs_list_dir",
+            "fs_read_csv",
+            "fs_read_pdf",
+            "fs_read_xlsx",
+            "read_document",
+            "fs_scan_file",
+            "fs_diff_config",
+        ] {
+            assert!(unique.contains(name), "missing common read tool {name}");
+            assert!(registry.is_registered(name), "missing handler for {name}");
+        }
+        #[cfg(unix)]
+        assert!(unique.contains("repo_grep"));
+        assert!(!unique.contains("fs_write_file"));
+        assert!(!unique.contains("fs_edit_file"));
+        assert!(!unique.contains("command_exec"));
+    }
+
+    #[test]
     fn filesystem_auto_allow_never_enables_command_execution() {
         let filesystem =
             Arc::new(Permissions::new(&[], &[], crate::permissions::Mode::AutoAllow).unwrap());
@@ -140,6 +190,34 @@ mod tests {
         register_fs_tools(&mut registry, filesystem);
 
         assert!(!registry.is_registered("command_exec"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn filesystem_registration_always_advertises_bounded_content_search() {
+        let filesystem = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+
+        register_fs_tools(&mut registry, filesystem);
+
+        assert!(registry.is_registered("repo_grep"));
+        let descriptor = registry
+            .descriptors()
+            .iter()
+            .find(|descriptor| descriptor.name == "repo_grep")
+            .unwrap();
+        assert_eq!(
+            descriptor.parameters["properties"]["max_count"]["maximum"],
+            1_000
+        );
+        assert_eq!(
+            descriptor.parameters["properties"]["pattern"]["maxLength"],
+            4_096
+        );
+        assert_eq!(
+            descriptor.parameters["properties"]["literal"]["type"],
+            "boolean"
+        );
     }
 
     #[test]

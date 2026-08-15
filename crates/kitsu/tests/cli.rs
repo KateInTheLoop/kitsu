@@ -48,11 +48,38 @@ auth         = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_e
 fn base_cmd(home: &Path) -> Command {
     let mut cmd = Command::cargo_bin("kitsu").expect("kitsu binary should build");
     cmd.env("HOME", home);
+    // Selection-variable behavior is opt-in per test; ambient developer shell
+    // defaults must not silently redirect the mock gateway or model.
+    cmd.env_remove("KITSU_GATEWAY");
+    cmd.env_remove("KITSU_MODEL");
     // Ensure no ambient expiry interferes.
     cmd.env_remove("ANTHROPIC_TOKEN_EXPIRES");
     // Don't auto-load the repo's own llms.txt into test system prompts.
     cmd.env("KITSU_NO_PROJECT_CONTEXT", "1");
     cmd
+}
+
+#[test]
+#[serial]
+fn test_output_last_message_rejects_management_commands_without_touching_destination() {
+    let home = TempDir::new().unwrap();
+    let destination = home.path().join("last-message.txt");
+    fs::write(&destination, "preserve").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    cmd.args([
+        "--output-last-message",
+        &destination.to_string_lossy(),
+        "sessions",
+    ]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains(
+            "--output-last-message is supported only by non-interactive",
+        ));
+    assert_eq!(fs::read_to_string(destination).unwrap(), "preserve");
 }
 
 // --- missing token ----------------------------------------------------------
@@ -65,15 +92,966 @@ fn base_cmd(home: &Path) -> Command {
 fn test_ask_missing_token() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), "https://gateway.invalid");
+    let destination = home.path().join("last-message.txt");
+    fs::write(&destination, "previous committed answer").unwrap();
 
     let mut cmd = base_cmd(home.path());
     cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
-    cmd.args(["ask", "--gateway", "example", "hi"]);
+    cmd.args([
+        "--output-last-message",
+        &destination.to_string_lossy(),
+        "ask",
+        "--gateway",
+        "example",
+        "hi",
+    ]);
 
     cmd.assert()
         .failure()
         .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("refresh-token"))
+        .stderr(predicate::str::contains("kitsu-context").not())
+        .stderr(predicate::str::contains("provider attempt").not())
+        .stderr(predicate::str::contains("kitsu is thinking").not());
+    assert_eq!(
+        fs::read_to_string(destination).unwrap(),
+        "previous committed answer"
+    );
+}
+
+/// The offline doctor and inference preflight must share one bounded recovery
+/// path. Doctor may disclose the configured env-var name and safe prose, but
+/// never a value; model startup must fail before unrelated setup telemetry.
+#[test]
+#[serial]
+fn test_missing_auth_preflight_and_doctor_share_safe_recovery_guidance() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "https://gateway.invalid");
+
+    let mut doctor = base_cmd(home.path());
+    doctor.env_remove("ANTHROPIC_AUTH_TOKEN");
+    let output = doctor
+        .args(["doctor", "--gateway", "example", "--json"])
+        .output()
+        .expect("run doctor");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).expect("doctor JSON");
+    assert_eq!(report["auth"]["credential_present"], false);
+    assert_eq!(
+        report["auth"]["recovery_hint"],
+        "run `refresh-token` to refresh the gateway JWT"
+    );
+    assert!(report["blocking_issues"]
+        .as_array()
+        .expect("blocking issues")
+        .iter()
+        .any(|issue| issue
+            .as_str()
+            .is_some_and(|issue| issue.contains("refresh-token"))));
+
+    let mut inference = base_cmd(home.path());
+    inference.env_remove("ANTHROPIC_AUTH_TOKEN");
+    let output = inference
+        .args(["doctor", "--gateway", "example", "--inference", "--json"])
+        .output()
+        .expect("run inference doctor without auth");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["online"]["scope"], "chat_inference");
+    assert_eq!(report["online"]["chat_route_probed"], false);
+    assert_eq!(report["online"]["request_sent"], false);
+    assert_eq!(report["online"]["potentially_billable"], true);
+    assert!(report["online"]["status"]
+        .as_str()
+        .is_some_and(|status| status.contains("requested but skipped")));
+
+    let mut models = base_cmd(home.path());
+    models.env_remove("ANTHROPIC_AUTH_TOKEN");
+    models
+        .args(["models", "--gateway", "example"])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout("")
         .stderr(predicate::str::contains("refresh-token"));
+}
+
+#[test]
+#[serial]
+fn test_loopback_ollama_connection_failure_has_scoped_secret_free_recovery() {
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create ~/.kitsu");
+    let url_secret = "kitsu-url-secret-633";
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "ollama"
+[gateways.ollama]
+flavor = "openai"
+base_url = "http://user:{url_secret}@127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "local-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#
+        ),
+    )
+    .expect("write config.toml");
+
+    let output = base_cmd(home.path())
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--timeout-secs",
+            "1",
+            "ask",
+            "hello",
+        ])
+        .output()
+        .expect("run unreachable local Ollama ask");
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed provider error");
+    assert_eq!(error["kind"], "provider");
+    assert_eq!(error["exit_code"], 2);
+    let message = error["message"].as_str().expect("error message");
+    assert!(message.contains("local Ollama"), "{message}");
+    assert!(
+        message.contains("configured loopback endpoint"),
+        "{message}"
+    );
+    assert!(message.contains("`ollama serve`"), "{message}");
+    assert!(message.contains("select another gateway"), "{message}");
+    assert!(!message.contains(url_secret), "{message}");
+    assert!(!message.contains("127.0.0.1"), "{message}");
+    assert_eq!(error["diagnostic_code"], "local_ollama_unreachable");
+    assert_eq!(
+        error["recovery_actions"],
+        serde_json::json!([
+            "start_ollama_serve",
+            "verify_ollama_serve",
+            "select_another_gateway",
+        ])
+    );
+    assert_eq!(
+        events.last().and_then(|event| event["type"].as_str()),
+        Some("final_summary")
+    );
+    assert_eq!(events.last().unwrap()["provider_failures"], 1);
+
+    let script = home.path().join("unreachable-local-ollama.script");
+    fs::write(&script, "hello from a script\n").unwrap();
+    let scripted = base_cmd(home.path())
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--timeout-secs",
+            "1",
+            "chat",
+            "--no-session",
+            "--no-project-context",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run unreachable local Ollama script");
+    assert_eq!(scripted.status.code(), Some(2), "{scripted:?}");
+    assert!(scripted.stderr.is_empty(), "{scripted:?}");
+    let scripted_events = String::from_utf8(scripted.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let scripted_error = scripted_events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed scripted provider error");
+    assert_eq!(
+        scripted_error["diagnostic_code"],
+        "local_ollama_unreachable"
+    );
+    assert_eq!(
+        scripted_error["recovery_actions"],
+        error["recovery_actions"]
+    );
+    assert!(scripted_error["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("`ollama serve`")));
+    assert!(!scripted_error.to_string().contains(url_secret));
+    assert_eq!(
+        scripted_events
+            .last()
+            .and_then(|event| event["type"].as_str()),
+        Some("final_summary")
+    );
+    assert_eq!(scripted_events.last().unwrap()["provider_failures"], 1);
+
+    let doctor = base_cmd(home.path())
+        .args(["--timeout-secs", "1", "doctor", "--online", "--json"])
+        .output()
+        .expect("run unreachable local Ollama doctor");
+    assert_eq!(doctor.status.code(), Some(1), "{doctor:?}");
+    let report: serde_json::Value = serde_json::from_slice(&doctor.stdout).unwrap();
+    assert_eq!(report["online"]["request_sent"], true);
+    let status = report["online"]["status"].as_str().expect("online status");
+    assert!(status.contains("local Ollama"), "{status}");
+    assert!(status.contains("`ollama serve`"), "{status}");
+    assert!(!status.contains(url_secret), "{status}");
+
+    let models = base_cmd(home.path())
+        .args(["--jsonl", "--timeout-secs", "1", "models"])
+        .output()
+        .expect("run unreachable local Ollama catalog");
+    assert_eq!(models.status.code(), Some(2), "{models:?}");
+    assert!(models.stderr.is_empty(), "{models:?}");
+    let model_events = String::from_utf8(models.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        model_events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "provider_request",
+            "provider_attempt",
+            "error",
+            "final_summary",
+        ]
+    );
+    assert_eq!(model_events[1]["operation_id"], "models:1");
+    assert_eq!(model_events[1]["purpose"], "model_catalog");
+    assert_eq!(model_events[1]["message_count"], 0);
+    assert_eq!(model_events[1]["tools_offered"], 0);
+    assert_eq!(model_events[1]["structured_output"], false);
+    assert_eq!(model_events[1]["request_timeout_ms"], 1_000);
+    assert_eq!(
+        model_events[1]["turn_remaining_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(model_events[2]["operation_id"], "models:1");
+    assert_eq!(model_events[2]["purpose"], "model_catalog");
+    assert_eq!(model_events[2]["attempt"], 1);
+    assert_eq!(model_events[2]["max_attempts"], 1);
+    assert_eq!(model_events[2]["category"], "connection");
+    assert_eq!(model_events[2]["status"], serde_json::Value::Null);
+    assert_eq!(model_events[2]["outcome"], "transport_failed");
+    assert_eq!(model_events[2]["terminal"], true);
+    assert_eq!(model_events[2]["deadline_scope"], "provider_request");
+    assert_eq!(
+        model_events[2]["turn_remaining_ms"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        model_events[3]["diagnostic_code"],
+        "local_ollama_unreachable"
+    );
+    assert_eq!(
+        model_events[3]["recovery_actions"],
+        error["recovery_actions"]
+    );
+    assert!(!serde_json::to_string(&model_events)
+        .unwrap()
+        .contains(url_secret));
+}
+
+#[test]
+#[serial]
+fn test_doctor_reports_config_artifact_storage_disable() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let config = home.path().join(".kitsu/config.toml");
+    let contents = fs::read_to_string(&config).unwrap();
+    fs::write(&config, format!("artifact_storage = false\n{contents}")).unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args(["doctor", "--json"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["artifact_policy"]["mode"], "disabled");
+    assert_eq!(report["artifact_policy"]["source"], "config");
+    assert_eq!(
+        report["artifact_policy"]["new_automatic_artifact_writes"],
+        false
+    );
+    assert_eq!(report["artifact_policy"]["tool_result_offload"], false);
+    assert_eq!(
+        report["artifact_policy"]["existing_artifacts_unchanged"],
+        true
+    );
+}
+
+#[test]
+#[serial]
+fn test_managed_auth_login_status_logout_is_provider_free_and_secret_safe() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "https://gateway.invalid");
+    let secret = "test-token-managed-731";
+
+    let mut login = base_cmd(home.path());
+    login.env_remove("ANTHROPIC_AUTH_TOKEN");
+    let output = login
+        .args([
+            "--gateway",
+            "example",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin(format!("{secret}\n"))
+        .output()
+        .expect("managed login");
+    assert!(output.status.success(), "{:?}", output);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(secret));
+    assert!(!combined.contains("credentials"));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["stored"], true);
+    assert_eq!(report["effective_source"], "managed");
+    assert_eq!(report["remote_validity_checked"], false);
+    assert_eq!(report["request_sent"], false);
+
+    let credential_dir = home.path().join(".kitsu/credentials");
+    let entries = fs::read_dir(&credential_dir)
+        .expect("credential directory")
+        .collect::<Result<Vec<_>, _>>()
+        .unwrap();
+    assert_eq!(entries.len(), 1);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        assert_eq!(
+            fs::metadata(&credential_dir).unwrap().permissions().mode() & 0o777,
+            0o700
+        );
+        let metadata = entries[0].metadata().unwrap();
+        assert_eq!(metadata.permissions().mode() & 0o777, 0o600);
+        assert_eq!(metadata.nlink(), 1);
+    }
+
+    let rotated_secret = "test-token-managed-rotated-844";
+    let mut rotate = base_cmd(home.path());
+    let output = rotate
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args([
+            "--gateway",
+            "example",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin(format!("{rotated_secret}\n"))
+        .output()
+        .expect("atomic managed rotation");
+    assert!(output.status.success());
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(rotated_secret));
+    assert_eq!(
+        fs::read_to_string(entries[0].path()).unwrap(),
+        rotated_secret
+    );
+    assert_eq!(fs::read_dir(&credential_dir).unwrap().count(), 1);
+
+    let mut status = base_cmd(home.path());
+    status.env_remove("ANTHROPIC_AUTH_TOKEN");
+    let output = status
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("managed status");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["credential_present"], true);
+    assert_eq!(report["managed_credential_present"], true);
+    assert_eq!(report["environment_override_present"], false);
+    assert_eq!(report["effective_source"], "managed");
+    assert_eq!(report["locally_usable"], true);
+    assert_eq!(report["request_sent"], false);
+
+    let mut override_status = base_cmd(home.path());
+    let output = override_status
+        .env("ANTHROPIC_AUTH_TOKEN", "environment-override")
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("environment override status");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["effective_source"], "environment");
+    assert_eq!(report["environment_override_present"], true);
+    assert_eq!(report["managed_credential_present"], true);
+
+    let mut malformed_override = base_cmd(home.path());
+    let output = malformed_override
+        .env("ANTHROPIC_AUTH_TOKEN", "malformed\nvalue")
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("malformed environment override status");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["effective_source"], "environment");
+    assert_eq!(report["managed_credential_present"], true);
+    assert_eq!(report["locally_usable"], false);
+    assert_eq!(report["request_sent"], false);
+
+    let mut doctor = base_cmd(home.path());
+    let output = doctor
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "doctor", "--json"])
+        .output()
+        .expect("offline doctor with managed credential");
+    assert!(output.status.success(), "{:?}", output);
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["auth"]["effective_source"], "managed");
+    assert_eq!(report["auth"]["managed_credential_present"], true);
+    assert_eq!(report["online"]["request_sent"], false);
+
+    let mut logout = base_cmd(home.path());
+    let output = logout
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "logout", "--json"])
+        .output()
+        .expect("managed logout");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["removed"], true);
+    assert_eq!(report["effective_source"], "missing");
+    assert!(!credential_dir.join(entries[0].file_name()).exists());
+
+    let mut second_logout = base_cmd(home.path());
+    let output = second_logout
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "logout", "--json"])
+        .output()
+        .expect("idempotent logout");
+    assert!(output.status.success());
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["removed"], false);
+
+    let mut missing = base_cmd(home.path());
+    let output = missing
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("missing managed status");
+    assert_eq!(output.status.code(), Some(1));
+    let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(report["credential_present"], false);
+    assert_eq!(report["request_sent"], false);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_managed_auth_is_used_for_provider_requests_without_environment_export() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "managed-model"
+context_window = 8000
+auth = {{ method = "bearer-env", env = "KITSU_TEST_MANAGED_REQUEST_TOKEN" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let secret = "managed-request-token-205";
+    let mut login = base_cmd(home.path());
+    login
+        .env_remove("KITSU_TEST_MANAGED_REQUEST_TOKEN")
+        .args([
+            "--gateway",
+            "example",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin(format!("{secret}\n"))
+        .assert()
+        .success();
+
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .and(header("authorization", format!("Bearer {secret}")))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "managed-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let mut models = base_cmd(home.path());
+    let output = models
+        .env_remove("KITSU_TEST_MANAGED_REQUEST_TOKEN")
+        .args(["--gateway", "example", "models"])
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{:?}", output);
+    assert_eq!(
+        String::from_utf8_lossy(&output.stdout).trim(),
+        "managed-model"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(secret));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[test]
+#[serial]
+fn test_auth_login_requires_explicit_stdin_or_hidden_terminal() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "https://gateway.invalid");
+    let mut login = base_cmd(home.path());
+    login
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "login", "--json"])
+        .assert()
+        .failure()
+        .code(1)
+        .stdout("")
+        .stderr(predicate::str::contains("--token-stdin"));
+    assert!(!home.path().join(".kitsu/credentials").exists());
+}
+
+#[test]
+fn test_auth_login_never_uses_temporary_state_when_home_is_missing() {
+    let root = TempDir::new().expect("temp root");
+    write_config(root.path(), "https://gateway.invalid");
+    let config = root.path().join(".kitsu/config.toml");
+    let secret = "test-token-no-home";
+    let mut login = Command::cargo_bin("kitsu").unwrap();
+    let output = login
+        .env_remove("HOME")
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--gateway",
+            "example",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin(format!("{secret}\n"))
+        .output()
+        .expect("login without HOME");
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(combined.contains("requires an absolute HOME"));
+    assert!(!combined.contains(secret));
+    assert!(!root.path().join(".kitsu/credentials").exists());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_auth_login_hides_tty_input_and_restores_echo_on_sigint() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn run_tty(home: &Path, input: Option<&str>) -> (std::process::ExitStatus, String, bool) {
+        let mut master = -1;
+        let mut slave = -1;
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0
+        );
+        let child_stdin = unsafe { libc::dup(slave) };
+        let child_stdout = unsafe { libc::dup(slave) };
+        let probe_slave = unsafe { libc::dup(slave) };
+        assert!(child_stdin >= 0 && child_stdout >= 0 && probe_slave >= 0);
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+        command
+            .env("HOME", home)
+            .env_remove("ANTHROPIC_AUTH_TOKEN")
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+            .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+            .stderr(unsafe { Stdio::from_raw_fd(slave) })
+            .args(["--gateway", "example", "auth", "login", "--json"]);
+        let mut child = command.spawn().expect("spawn auth login on PTY");
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut transcript = Vec::new();
+        let mut acted = false;
+        let status = loop {
+            let mut buffer = [0_u8; 2048];
+            match terminal.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                Err(error) => panic!("read auth PTY: {error}"),
+            }
+            if !acted
+                && transcript
+                    .windows(b"credential: ".len())
+                    .any(|window| window == b"credential: ")
+            {
+                if let Some(input) = input {
+                    terminal.write_all(input.as_bytes()).unwrap();
+                    terminal.write_all(b"\n").unwrap();
+                    terminal.flush().unwrap();
+                } else {
+                    assert_eq!(
+                        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGINT) },
+                        0
+                    );
+                }
+                acted = true;
+            }
+            if let Some(status) = child.try_wait().unwrap() {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "auth PTY timed out: {}",
+                    String::from_utf8_lossy(&transcript)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        let mut termios = std::mem::MaybeUninit::<libc::termios>::uninit();
+        assert_eq!(
+            unsafe { libc::tcgetattr(probe_slave, termios.as_mut_ptr()) },
+            0
+        );
+        let echo_restored = unsafe { termios.assume_init() }.c_lflag & libc::ECHO != 0;
+        unsafe { libc::close(probe_slave) };
+        (
+            status,
+            String::from_utf8_lossy(&transcript).into_owned(),
+            echo_restored,
+        )
+    }
+
+    let success_home = TempDir::new().unwrap();
+    write_config(success_home.path(), "https://gateway.invalid");
+    let secret = "test-token-hidden-421";
+    let (status, transcript, echo_restored) = run_tty(success_home.path(), Some(secret));
+    assert!(status.success(), "{status}: {transcript}");
+    assert!(transcript.contains("credential: "));
+    assert!(!transcript.contains(secret));
+    assert!(echo_restored);
+
+    let cancel_home = TempDir::new().unwrap();
+    write_config(cancel_home.path(), "https://gateway.invalid");
+    let (status, transcript, echo_restored) = run_tty(cancel_home.path(), None);
+    assert_eq!(status.code(), Some(130), "{status}: {transcript}");
+    assert!(
+        echo_restored,
+        "terminal echo was not restored: {transcript}"
+    );
+    assert!(!cancel_home.path().join(".kitsu/credentials").exists());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_managed_auth_rejects_hard_links_and_intersecting_command_roots() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "https://gateway.invalid");
+    let secret = "test-token-private-913";
+    let mut login = base_cmd(home.path());
+    login
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args([
+            "--gateway",
+            "example",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin(format!("{secret}\n"))
+        .assert()
+        .success();
+
+    let empty_script = home.path().join("empty.script");
+    fs::write(&empty_script, "# provider-free\n").unwrap();
+    let mut broad_command = base_cmd(home.path());
+    broad_command
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--script",
+            &empty_script.to_string_lossy(),
+            "--command-root",
+            &home.path().to_string_lossy(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "intersects Kitsu's managed-credential namespace",
+        ));
+
+    let credential = fs::read_dir(home.path().join(".kitsu/credentials"))
+        .unwrap()
+        .next()
+        .unwrap()
+        .unwrap()
+        .path();
+    let alias = home.path().join("credential-hard-link-sentinel");
+    fs::hard_link(&credential, &alias).unwrap();
+    let mut status = base_cmd(home.path());
+    let output = status
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("status with unsafe hard link");
+    assert_eq!(output.status.code(), Some(1));
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(secret));
+    assert!(!combined.contains(&credential.to_string_lossy().to_string()));
+    assert!(combined.contains("managed credential store is unavailable or unsafe"));
+
+    fs::remove_file(&alias).unwrap();
+    fs::remove_file(&credential).unwrap();
+    let symlink_target = home.path().join("credential-symlink-target");
+    fs::write(&symlink_target, "outside-sentinel").unwrap();
+    std::os::unix::fs::symlink(&symlink_target, &credential).unwrap();
+    let mut symlink_status = base_cmd(home.path());
+    let output = symlink_status
+        .env_remove("ANTHROPIC_AUTH_TOKEN")
+        .args(["--gateway", "example", "auth", "status", "--json"])
+        .output()
+        .expect("status with symlinked credential leaf");
+    assert_eq!(output.status.code(), Some(1));
+    assert_eq!(
+        fs::read_to_string(&symlink_target).unwrap(),
+        "outside-sentinel"
+    );
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(!combined.contains(&symlink_target.to_string_lossy().to_string()));
+    assert!(combined.contains("managed credential store is unavailable or unsafe"));
+}
+
+#[test]
+#[serial]
+fn test_managed_auth_is_isolated_by_config_and_gateway() {
+    let home = TempDir::new().unwrap();
+    let config_body = |default: &str| {
+        format!(
+            r#"default_gateway = "{default}"
+[gateways.alpha]
+flavor = "openai"
+base_url = "https://gateway.invalid"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test"
+auth = {{ method = "bearer-env", env = "KITSU_TEST_ISOLATED_TOKEN" }}
+[gateways.beta]
+flavor = "openai"
+base_url = "https://gateway.invalid"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "test"
+auth = {{ method = "bearer-env", env = "KITSU_TEST_ISOLATED_TOKEN" }}
+"#
+        )
+    };
+    let config_one = home.path().join("one.toml");
+    let config_two = home.path().join("two.toml");
+    fs::write(&config_one, config_body("alpha")).unwrap();
+    fs::write(&config_two, config_body("alpha")).unwrap();
+
+    let mut login = base_cmd(home.path());
+    login
+        .env_remove("KITSU_TEST_ISOLATED_TOKEN")
+        .args([
+            "--config",
+            &config_one.to_string_lossy(),
+            "--gateway",
+            "alpha",
+            "auth",
+            "login",
+            "--token-stdin",
+            "--json",
+        ])
+        .write_stdin("isolated-token\n")
+        .assert()
+        .success();
+
+    for (config, gateway, expected_code) in [
+        (&config_one, "alpha", 0),
+        (&config_one, "beta", 1),
+        (&config_two, "alpha", 1),
+    ] {
+        let mut status = base_cmd(home.path());
+        let output = status
+            .env_remove("KITSU_TEST_ISOLATED_TOKEN")
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--gateway",
+                gateway,
+                "auth",
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert_eq!(output.status.code(), Some(expected_code), "{:?}", output);
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["managed_credential_present"], expected_code == 0);
+        assert_eq!(report["request_sent"], false);
+    }
+}
+
+#[test]
+fn test_auth_status_is_truthful_for_none_and_static_profiles() {
+    let home = TempDir::new().unwrap();
+    let config = home.path().join("profiles.toml");
+    let static_secret = "static-test-secret-633";
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "local"
+[gateways.local]
+flavor = "openai"
+base_url = "http://127.0.0.1:1"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "local"
+auth = {{ method = "none" }}
+[gateways.inline]
+flavor = "openai"
+base_url = "https://gateway.invalid"
+chat_path = "/v1/chat/completions"
+models_path = ""
+model = "hosted"
+auth = {{ method = "static", token = "{static_secret}" }}
+"#
+        ),
+    )
+    .unwrap();
+
+    for (gateway, source, present) in [("local", "none", false), ("inline", "static", true)] {
+        let mut status = base_cmd(home.path());
+        let output = status
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--gateway",
+                gateway,
+                "auth",
+                "status",
+                "--json",
+            ])
+            .output()
+            .unwrap();
+        assert!(output.status.success(), "{:?}", output);
+        let combined = format!(
+            "{}{}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        assert!(!combined.contains(static_secret));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["effective_source"], source);
+        assert_eq!(report["credential_present"], present);
+        assert_eq!(report["managed_credential_present"], false);
+        assert_eq!(report["locally_usable"], true);
+        assert_eq!(report["request_sent"], false);
+    }
+
+    let mut login = base_cmd(home.path());
+    login
+        .args([
+            "--config",
+            &config.to_string_lossy(),
+            "--gateway",
+            "local",
+            "auth",
+            "login",
+            "--token-stdin",
+        ])
+        .write_stdin("unused-secret\n")
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "auth login supports bearer-env gateways",
+        ));
+    assert!(!home.path().join(".kitsu/credentials").exists());
 }
 
 /// A positional prompt after `--` is never reinterpreted by the outer error
@@ -93,6 +1071,19 @@ fn test_jsonl_word_after_double_dash_remains_plain_prompt_text() {
         .stdout("")
         .stderr(predicate::str::contains("refresh-token"))
         .stderr(predicate::str::contains("\"schema\":\"kitsu.chat.v1\"").not());
+}
+
+#[test]
+fn test_prompt_flag_rejects_an_explicit_subcommand() {
+    let home = TempDir::new().expect("temp home");
+    let mut cmd = base_cmd(home.path());
+    cmd.args(["-p", "one-shot", "ask", "second prompt"]);
+    cmd.assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains(
+            "-p/--prompt is a top-level one-shot mode",
+        ));
 }
 
 /// Scripted chat classifies a locally missing credential the same way as
@@ -117,8 +1108,10 @@ fn test_script_missing_token_exits_one() {
     cmd.assert()
         .failure()
         .code(1)
+        .stdout("")
         .stderr(predicate::str::contains("refresh-token"))
-        .stderr(predicate::str::contains("script summary: 1 failure"));
+        .stderr(predicate::str::contains("script summary").not())
+        .stderr(predicate::str::contains("kitsu-context").not());
 }
 
 /// Auth methods are a closed config vocabulary. A typo must fail before any
@@ -234,10 +1227,40 @@ fn test_empty_durable_script_does_not_create_a_session_snapshot() {
     fs::write(&script, "\n# no turns\n").unwrap();
 
     let mut chat = base_cmd(home.path());
-    chat.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
-        .args(["chat", "--session", "--script", &script.to_string_lossy()])
-        .assert()
-        .success();
+    let output = chat
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "chat",
+            "--session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run empty durable script");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let started = events
+        .iter()
+        .find(|event| event["type"] == "run_started")
+        .expect("run_started");
+    assert!(started["session_id"].is_string());
+    assert_eq!(
+        started["session_snapshot_state"],
+        "pending_until_first_success"
+    );
+    let summary = events.last().expect("final_summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert!(summary["session_id"].is_null());
+    assert_eq!(
+        summary["session_snapshot_state"],
+        "pending_until_first_success"
+    );
 
     let mut sessions = base_cmd(home.path());
     let output = sessions
@@ -320,7 +1343,10 @@ fn test_query_only_interactive_session_does_not_create_a_snapshot() {
         .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
         // SAFETY: `slave` remains valid and ownership transfers here.
         .stderr(unsafe { Stdio::from_raw_fd(slave) })
-        .arg("chat");
+        // This session-lifecycle test submits complete canonical lines before
+        // reading output. Select literal input explicitly so it does not rely
+        // on an ambient NO_COLOR setting or race Rustyline's raw-mode startup.
+        .args(["--plain", "chat"]);
     let mut child = cmd.spawn().expect("spawn interactive chat on PTY");
     // SAFETY: `master` is the remaining live descriptor returned by openpty
     // and is transferred to this File exactly once.
@@ -355,6 +1381,307 @@ fn test_query_only_interactive_session_does_not_create_a_snapshot() {
     assert!(output.status.success(), "{output:?}");
     let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(listed, serde_json::json!([]));
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_terminal_mode_pty_matrix_decouples_rendering_and_input() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    fn run_case(name: &str, args: &[&str], env: &[(&str, &str)]) -> Vec<u8> {
+        let home = TempDir::new().expect("temp home");
+        write_config(home.path(), "http://127.0.0.1:1");
+
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: both output pointers are valid; null termios and winsize
+        // request the platform defaults.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "allocate PTY for {name}"
+        );
+        // SAFETY: `master` is a live descriptor and F_GETFL/F_SETFL do not
+        // change its ownership. Nonblocking reads let the test synchronize on
+        // the visible prompt without racing Rustyline's raw-mode setup.
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        assert!(flags >= 0, "read PTY flags for {name}");
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0,
+            "set nonblocking PTY reads for {name}"
+        );
+
+        // SAFETY: each duplicated live descriptor is transferred exactly once
+        // to a Stdio owner below.
+        let child_stdin = unsafe { libc::dup(slave) };
+        let child_stdout = unsafe { libc::dup(slave) };
+        assert!(child_stdin >= 0 && child_stdout >= 0);
+
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+        cmd.env("HOME", home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .env("TERM", "xterm-256color")
+            .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+            .env_remove("NO_COLOR")
+            .env_remove("KITSU_PLAIN")
+            .env_remove("KITSU_SCREEN_READER")
+            .env_remove("KITSU_REDUCED_MOTION")
+            // SAFETY: the descriptors are valid and transferred to their
+            // Stdio owners exactly once.
+            .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+            .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+            .stderr(unsafe { Stdio::from_raw_fd(slave) });
+        for (key, value) in env {
+            cmd.env(key, value);
+        }
+        cmd.args(args).args(["chat", "--no-session"]);
+
+        let mut child = cmd
+            .spawn()
+            .unwrap_or_else(|error| panic!("spawn {name}: {error}"));
+        // SAFETY: `master` is the remaining live descriptor and ownership is
+        // transferred to this File exactly once.
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut submitted_exit = false;
+        let status = loop {
+            let mut buffer = [0_u8; 4096];
+            match terminal.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                // Linux PTY masters report EIO after the last slave closes.
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                Err(error) => panic!("read {name} PTY: {error}"),
+            }
+            if !submitted_exit && output.windows(b"kitsu>".len()).any(|w| w == b"kitsu>") {
+                terminal
+                    // Ctrl+D is EOF at an empty canonical prompt and Rustyline's
+                    // EOF binding in raw mode, so one byte exits both input paths.
+                    .write_all(b"\x04")
+                    .unwrap_or_else(|error| panic!("submit EOF for {name}: {error}"));
+                submitted_exit = true;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .unwrap_or_else(|error| panic!("poll {name}: {error}"))
+            {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "{name} terminal mode did not exit; output: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(submitted_exit, "{name} never displayed an input prompt");
+        assert!(status.success(), "{name} failed: {status}");
+        output
+    }
+
+    let cases = [
+        ("default", vec![], vec![], false, true),
+        ("NO_COLOR", vec![], vec![("NO_COLOR", "1")], false, false),
+        ("--plain", vec!["--plain"], vec![], true, false),
+        ("TERM=dumb", vec![], vec![("TERM", "dumb")], true, false),
+        (
+            "--reduced-motion",
+            vec!["--reduced-motion"],
+            vec![],
+            false,
+            true,
+        ),
+        (
+            "--screen-reader",
+            vec!["--screen-reader"],
+            vec![],
+            true,
+            false,
+        ),
+    ];
+    for (name, args, env, assistive, styled) in cases {
+        let output = run_case(name, &args, &env);
+        let bracketed_paste = output
+            .windows(b"\x1b[?2004h".len())
+            .any(|window| window == b"\x1b[?2004h");
+        assert_eq!(bracketed_paste, !assistive, "{name}: {output:?}");
+        if assistive {
+            assert!(
+                !output.contains(&b'\x1b'),
+                "{name} emitted terminal escapes: {output:?}"
+            );
+        }
+        let fox_truecolor = output
+            .windows(b"\x1b[38;2;255;140;0m".len())
+            .any(|window| window == b"\x1b[38;2;255;140;0m");
+        assert_eq!(fox_truecolor, styled, "{name}: {output:?}");
+        assert!(
+            !output
+                .windows(b"\x1b]".len())
+                .any(|window| window == b"\x1b]"),
+            "{name} emitted an OSC sequence: {output:?}"
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_slash_palette_and_footer_fit_a_fifty_column_pty() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use unicode_width::UnicodeWidthStr as _;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+
+    let mut master = -1;
+    let mut slave = -1;
+    let size = libc::winsize {
+        ws_row: 24,
+        ws_col: 50,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: output pointers and the initialized winsize remain valid for the
+    // call; openpty initializes both descriptors on success.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0,
+        "allocate narrow PTY"
+    );
+    // SAFETY: `master` is live and these fcntl calls do not transfer ownership.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: each duplicate is independently transferred to one Stdio owner.
+    let child_stdin = unsafe { libc::dup(slave) };
+    let child_stdout = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0);
+
+    let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    cmd.env("HOME", home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("TERM", "xterm-256color")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .env_remove("NO_COLOR")
+        .env_remove("KITSU_PLAIN")
+        .env_remove("KITSU_SCREEN_READER")
+        // SAFETY: the live descriptors transfer to the child exactly once.
+        .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+        .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args(["chat", "--no-session"]);
+    let mut child = cmd.spawn().expect("spawn Kitsu in narrow PTY");
+    // SAFETY: ownership of the remaining master descriptor transfers here.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+    let mut output = Vec::new();
+    let mut opened_palette = false;
+    let mut cleared_palette = false;
+    let mut sent_eof = false;
+    let deadline = Instant::now() + Duration::from_secs(5);
+
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read narrow PTY: {error}"),
+        }
+        if !opened_palette && output.windows(6).any(|window| window == b"kitsu>") {
+            terminal.write_all(b"/").expect("open slash palette");
+            opened_palette = true;
+        }
+        if opened_palette
+            && !cleared_palette
+            && output
+                .windows("slash commands".len())
+                .any(|window| window == b"slash commands")
+        {
+            terminal.write_all(b"\x03").expect("clear slash palette");
+            cleared_palette = true;
+        }
+        if cleared_palette
+            && !sent_eof
+            && output
+                .windows("input cleared".len())
+                .any(|window| window == b"input cleared")
+        {
+            terminal.write_all(b"\x04").expect("exit narrow PTY");
+            sent_eof = true;
+        }
+        if let Some(status) = child.try_wait().expect("poll narrow PTY") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "narrow PTY did not exit; output: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    assert!(status.success(), "narrow Kitsu failed: {status}");
+    assert!(opened_palette && cleared_palette && sent_eof);
+
+    let visible = kitsu_render::sanitize_terminal_text(&String::from_utf8_lossy(&output));
+    let lines = visible.lines().collect::<Vec<_>>();
+    let palette_start = lines
+        .iter()
+        .position(|line| line.starts_with("╭ slash commands"))
+        .unwrap_or_else(|| panic!("slash palette missing from narrow PTY: {visible}"));
+    let mut saw_status = false;
+    for line in &lines[palette_start..] {
+        if line.starts_with('╭')
+            || line.starts_with('│')
+            || line.starts_with('├')
+            || line.starts_with('╰')
+        {
+            assert_eq!(line.width(), 50, "wrapped narrow surface row: {line:?}");
+        }
+        if line.starts_with("╰ model ") {
+            saw_status = true;
+            break;
+        }
+    }
+    assert!(saw_status, "responsive status footer missing: {visible}");
 }
 
 #[test]
@@ -671,6 +1998,149 @@ fn test_sessions_missing_namespace_is_provider_free_and_friendly() {
 }
 
 #[test]
+#[serial]
+fn test_scripted_sessions_filter_handles_missing_namespace_provider_free() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("filtered-empty-sessions.script");
+    fs::write(&script, "/sessions Needle-That-Is-Not-Saved\n/quit\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("filter sessions in a fresh namespace");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1, "{events:?}");
+    let result = &results[0]["result"];
+    assert_eq!(result["kind"], "sessions");
+    assert_eq!(result["count"], 0);
+    assert_eq!(result["filtered_count"], 0);
+    assert!(result["current_session_id"].is_null());
+    assert_eq!(result["sessions"], serde_json::json!([]));
+    assert!(result["text"]
+        .as_str()
+        .unwrap()
+        .contains("no sessions matched 'Needle-That-Is-Not-Saved'"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["failures"], 0);
+    assert_eq!(summary["successful_operations"], 1);
+    assert!(
+        !home.path().join(".kitsu/sessions").exists(),
+        "a read-only empty search created the session namespace"
+    );
+}
+
+#[test]
+#[serial]
+fn test_jsonl_help_registry_exposes_canonical_alias_relationships_provider_free() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("typed-help.script");
+    fs::write(&script, "/help\n/quit\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("render typed help registry");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    let result = &events[2]["result"];
+    assert_eq!(result["kind"], "help");
+    let commands = result["commands"].as_array().expect("typed commands");
+    assert!(commands
+        .iter()
+        .all(|command| command.get("alias_of").is_some()));
+    let command = |name: &str| {
+        commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap_or_else(|| panic!("missing /{name}: {commands:?}"))
+    };
+    assert_eq!(command("agents")["alias_of"], "jobs");
+    assert_eq!(command("quit")["alias_of"], "exit");
+    assert!(command("jobs")["alias_of"].is_null());
+    assert!(command("exit")["alias_of"].is_null());
+    assert!(result["text"]
+        .as_str()
+        .unwrap()
+        .contains("(alias: /agents)"));
+    assert!(result["text"].as_str().unwrap().contains("(alias: /quit)"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(summary["failures"], 0);
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+    assert!(
+        !home.path().join(".kitsu/sessions").exists(),
+        "provider-free help created session state"
+    );
+}
+
+#[test]
 fn test_script_session_flags_reject_ambiguous_no_session() {
     let home = TempDir::new().expect("temp home");
     let script = home.path().join("empty.txt");
@@ -707,6 +2177,529 @@ fn test_script_session_flags_reject_ambiguous_no_session() {
 }
 
 // --- happy path against wiremock --------------------------------------------
+
+#[test]
+fn test_chat_no_tools_conflicts_with_capability_grants() {
+    let cases = [
+        (vec!["--allow-write", "."], "--allow-write"),
+        (vec!["--allow-read-write", "."], "--allow-read-write"),
+        (vec!["--enable-commands"], "--enable-commands"),
+        (vec!["--command-root", "."], "--command-root"),
+        (
+            vec!["--command-runtime-root", "."],
+            "--command-runtime-root",
+        ),
+        (vec!["--command-env", "PATH"], "--command-env"),
+        (
+            vec!["--allow-command", "[\"cargo\",\"test\"]"],
+            "--allow-command",
+        ),
+    ];
+
+    for (capability, expected_flag) in cases {
+        let mut cmd = Command::cargo_bin("kitsu").expect("kitsu binary should build");
+        cmd.args(["chat", "--no-tools"]).args(capability);
+        cmd.assert()
+            .failure()
+            .code(1)
+            .stderr(predicate::str::contains("cannot be used with"))
+            .stderr(predicate::str::contains("--no-tools"))
+            .stderr(predicate::str::contains(expected_flag));
+    }
+}
+
+#[tokio::test]
+#[serial]
+async fn test_chat_no_tools_omits_every_model_tool() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "tool-free answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let attachment = home.path().join("tool-free-context.txt");
+    fs::write(&attachment, "TOOL_FREE_ATTACHMENT_MARKER").unwrap();
+    let home_path = home.path().to_path_buf();
+    let prompt = format!("summarize @{}", attachment.to_string_lossy());
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+            "--no-stream",
+            "chat",
+            "--no-tools",
+            "--allow-path",
+            &home_path.to_string_lossy(),
+            &prompt,
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("tool-free answer"));
+    })
+    .await
+    .expect("spawned tool-free chat should join");
+
+    let requests = server.received_requests().await.expect("record request");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert!(body.to_string().contains("TOOL_FREE_ATTACHMENT_MARKER"));
+    assert!(
+        body.get("tools")
+            .map(serde_json::Value::is_null)
+            .unwrap_or(true),
+        "--no-tools request advertised tools: {body}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_rebase() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "tool-free answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 7, "completion_tokens": 3, "total_tokens": 10}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut first = base_cmd(&home_path);
+        let output = first
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--session",
+                "--name",
+                "merged-no-tools",
+                "first saved turn",
+            ])
+            .output()
+            .expect("create named tool-free session");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut list = base_cmd(&home_path);
+        let output = list
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list named session");
+        assert!(output.status.success(), "{:?}", output);
+        let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        assert_eq!(listed[0]["name"], "merged-no-tools");
+        let id = listed[0]["id"].as_str().unwrap().to_string();
+
+        let mut fork = base_cmd(&home_path);
+        let output = fork
+            .args(["sessions", "--json", "fork", "last"])
+            .output()
+            .expect("fork named tool-free session");
+        assert!(output.status.success(), "{:?}", output);
+        let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(forked["source_session_id"], id);
+        assert_eq!(forked["permissions_restored"], false);
+        let forked_id = forked["session"]["id"].as_str().unwrap().to_string();
+        assert!(
+            forked["session"]["name"].is_null(),
+            "a fork must not duplicate its source's resume selector: {forked}"
+        );
+
+        let mut second = base_cmd(&home_path);
+        let output = second
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--resume",
+                "merged-no-tools",
+                "second saved turn",
+            ])
+            .output()
+            .expect("resume named tool-free session");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+
+        let mut show = base_cmd(&home_path);
+        let output = show
+            .args(["sessions", "--json", "show", &id])
+            .output()
+            .expect("show resumed tool-free session");
+        assert!(output.status.success(), "{:?}", output);
+        let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(saved["name"], "merged-no-tools");
+        let transcript = saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("first saved turn"), "{transcript}");
+        assert!(transcript.contains("second saved turn"), "{transcript}");
+
+        let mut show_fork = base_cmd(&home_path);
+        let output = show_fork
+            .args(["sessions", "--json", "show", &forked_id])
+            .output()
+            .expect("show forked tool-free session");
+        assert!(output.status.success(), "{:?}", output);
+        let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert!(forked["name"].is_null());
+        let forked_transcript = forked["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            forked_transcript.contains("first saved turn"),
+            "{forked_transcript}"
+        );
+        assert!(
+            !forked_transcript.contains("second saved turn"),
+            "fork transcript changed with its source: {forked_transcript}"
+        );
+
+        let mut human_fork = base_cmd(&home_path);
+        let output = human_fork
+            .args(["sessions", "fork", &id])
+            .output()
+            .expect("render human fork lineage");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("forked session {id} -> s-")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("permissions were not copied"), "{stdout}");
+    })
+    .await
+    .expect("tool-free named-session process should join");
+
+    let requests = server.received_requests().await.expect("record requests");
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert!(
+            body.get("tools")
+                .map(serde_json::Value::is_null)
+                .unwrap_or(true),
+            "named --no-tools request advertised merged tool schemas: {body}"
+        );
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scripted_session_catalog_handles_filters_and_archived_recovery() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "searchable saved answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let first = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--session",
+                "--name",
+                "Searchable-Demo",
+                "first saved turn",
+            ])
+            .output()
+            .expect("create searchable named session");
+        assert!(
+            first.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        let listed = base_cmd(&home_path)
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list searchable session");
+        assert!(listed.status.success(), "{listed:?}");
+        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        let session_id = listed[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(listed[0]["name"], "Searchable-Demo");
+        assert_eq!(listed[0]["turns"], 1);
+
+        let jsonl_script = home_path.join("filtered-sessions-jsonl.script");
+        fs::write(
+            &jsonl_script,
+            "/sessions sEaRcHaBlE-dEmO\n/sessions no-such-session\n/quit\n",
+        )
+        .unwrap();
+        let jsonl = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--resume",
+                "Searchable-Demo",
+                "--script",
+                &jsonl_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("filter a named session in JSONL mode");
+        assert!(
+            jsonl.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&jsonl.stderr),
+            String::from_utf8_lossy(&jsonl.stdout)
+        );
+        assert!(jsonl.stderr.is_empty());
+        let events = String::from_utf8(jsonl.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let results = events
+            .iter()
+            .filter(|event| event["type"] == "command_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "{events:?}");
+
+        let hit = &results[0]["result"];
+        assert_eq!(hit["kind"], "sessions");
+        assert_eq!(hit["count"], 1);
+        assert_eq!(hit["filtered_count"], 1);
+        assert_eq!(hit["current_session_id"], session_id);
+        assert_eq!(hit["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(hit["sessions"][0]["id"], session_id);
+        assert_eq!(hit["sessions"][0]["name"], "Searchable-Demo");
+        assert!(hit["text"]
+            .as_str()
+            .unwrap()
+            .contains(" * Searchable-Demo ("));
+
+        let miss = &results[1]["result"];
+        assert_eq!(miss["kind"], "sessions");
+        assert_eq!(miss["count"], 1);
+        assert_eq!(miss["filtered_count"], 0);
+        assert_eq!(miss["current_session_id"], session_id);
+        assert_eq!(miss["sessions"], serde_json::json!([]));
+        assert!(miss["text"]
+            .as_str()
+            .unwrap()
+            .contains("no sessions matched 'no-such-session'"));
+
+        let summary = events.last().expect("final summary");
+        assert_eq!(summary["type"], "final_summary");
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["failures"], 0);
+        assert_eq!(summary["successful_operations"], 2);
+        assert_eq!(summary["session_id"], session_id);
+
+        let human_script = home_path.join("filtered-sessions-human.script");
+        fs::write(
+            &human_script,
+            "/help\n/sessions SEARCHABLE-demo\n/sessions absent-human\n/quit\n",
+        )
+        .unwrap();
+        let human = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--resume",
+                "Searchable-Demo",
+                "--script",
+                &human_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("filter a named session in human mode");
+        assert!(human.status.success(), "{human:?}");
+        let human_stderr = String::from_utf8_lossy(&human.stderr);
+        assert!(
+            human_stderr.contains("/sessions [filter]"),
+            "{human_stderr}"
+        );
+        assert!(
+            human_stderr.contains(" * Searchable-Demo ("),
+            "{human_stderr}"
+        );
+        assert!(
+            human_stderr.contains("no sessions matched 'absent-human'"),
+            "{human_stderr}"
+        );
+
+        let shown = base_cmd(&home_path)
+            .args(["sessions", "--json", "show", &session_id])
+            .output()
+            .expect("show session after provider-free filters");
+        assert!(shown.status.success(), "{shown:?}");
+        let snapshot_before_archive = shown.stdout.clone();
+        let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert_eq!(
+            shown["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            1
+        );
+        let transcript = shown["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("first saved turn"), "{transcript}");
+        assert!(
+            transcript.contains("searchable saved answer"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains("/sessions"), "{transcript}");
+        assert!(!transcript.contains("no-such-session"), "{transcript}");
+
+        let archived = base_cmd(&home_path)
+            .args(["sessions", "archive", &session_id])
+            .output()
+            .expect("archive the only live session");
+        assert!(archived.status.success(), "{archived:?}");
+
+        let archived_resume = base_cmd(&home_path)
+            .args(["sessions", "--json", "resume", "Searchable-Demo"])
+            .output()
+            .expect("try to resume archived session by name");
+        assert_eq!(
+            archived_resume.status.code(),
+            Some(1),
+            "{archived_resume:?}"
+        );
+
+        let archived_script = home_path.join("archived-empty-sessions.script");
+        fs::write(&archived_script, "/sessions\n/quit\n").unwrap();
+        let archived_catalog = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &archived_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("inspect live sessions while the only snapshot is archived");
+        assert!(archived_catalog.status.success(), "{archived_catalog:?}");
+        assert!(archived_catalog.stderr.is_empty());
+        let archived_events = String::from_utf8(archived_catalog.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let catalog = archived_events
+            .iter()
+            .find(|event| event["type"] == "command_result")
+            .expect("empty live session catalog");
+        assert_eq!(catalog["result"]["kind"], "sessions");
+        assert_eq!(catalog["result"]["count"], 0);
+        assert_eq!(catalog["result"]["filtered_count"], 0);
+        let guidance = catalog["result"]["text"].as_str().unwrap();
+        assert!(guidance.contains("/restore <exact-id>"), "{guidance}");
+        assert!(!guidance.contains("/resume"), "{guidance}");
+        let archived_summary = archived_events.last().expect("archived catalog summary");
+        assert_eq!(archived_summary["status"], "ok");
+        assert_eq!(archived_summary["successful_operations"], 1);
+
+        let restored = base_cmd(&home_path)
+            .args(["sessions", "--json", "restore", &session_id])
+            .output()
+            .expect("restore exact archived session");
+        assert!(restored.status.success(), "{restored:?}");
+        let restored: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+        assert_eq!(restored["action"], "restore");
+        assert_eq!(restored["session"]["id"], session_id);
+        assert_eq!(restored["session"]["name"], "Searchable-Demo");
+
+        let resolved = base_cmd(&home_path)
+            .args(["sessions", "--json", "resume", "Searchable-Demo"])
+            .output()
+            .expect("resolve restored session by name");
+        assert!(resolved.status.success(), "{resolved:?}");
+        let resolved: serde_json::Value = serde_json::from_slice(&resolved.stdout).unwrap();
+        assert_eq!(resolved["session_id"], session_id);
+
+        let restored_show = base_cmd(&home_path)
+            .args(["sessions", "--json", "show", &session_id])
+            .output()
+            .expect("show exact restored snapshot");
+        assert!(restored_show.status.success(), "{restored_show:?}");
+        assert_eq!(
+            restored_show.stdout, snapshot_before_archive,
+            "archive/restore changed the saved snapshot"
+        );
+    })
+    .await
+    .expect("scripted session filters should join");
+
+    let requests = server.received_requests().await.expect("record requests");
+    assert_eq!(requests.len(), 1, "filters must remain provider-free");
+    server.verify().await;
+}
 
 /// design §6 acceptance: with a valid token and a mock gateway, `kitsu ask` exits
 /// 0 and prints the model's text.
@@ -761,6 +2754,180 @@ async fn test_ask_against_mock() {
     })
     .await
     .expect("spawned kitsu process should join");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scripted_clear_preserves_old_session_and_rotates_jsonl_identity() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const OLD_MARKER: &str = "CLEAR_BOUNDARY_OLD_731";
+    const NEW_MARKER: &str = "CLEAR_BOUNDARY_NEW_947";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "saved boundary answer"},
+                "finish_reason": "stop"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 3, "total_tokens": 11}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("clear-boundary.txt");
+    fs::write(
+        &script,
+        format!("remember {OLD_MARKER}\n/clear\nremember {NEW_MARKER}\n"),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    let (events, old_id, new_id, old_saved, new_saved, listed) =
+        tokio::task::spawn_blocking(move || {
+            let mut run = base_cmd(&home_path);
+            let output = run
+                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .args([
+                    "--jsonl",
+                    "--no-stream",
+                    "--timeout-secs",
+                    "10",
+                    "chat",
+                    "--session",
+                    "--no-tools",
+                    "--script",
+                    script.to_str().unwrap(),
+                ])
+                .output()
+                .expect("run scripted clear boundary");
+            assert!(
+                output.status.success(),
+                "stderr: {}\nstdout: {}",
+                String::from_utf8_lossy(&output.stderr),
+                String::from_utf8_lossy(&output.stdout)
+            );
+            assert!(
+                output.stderr.is_empty(),
+                "JSONL leaked human diagnostics: {}",
+                String::from_utf8_lossy(&output.stderr)
+            );
+            let events: Vec<serde_json::Value> = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+                .collect();
+            let started = events
+                .iter()
+                .find(|event| event["type"] == "run_started")
+                .expect("run_started");
+            let old_id = started["session_id"]
+                .as_str()
+                .expect("initial durable id")
+                .to_string();
+            let clear = events
+                .iter()
+                .find(|event| event["type"] == "command_result" && event["command"] == "/clear")
+                .expect("typed clear receipt");
+            let receipt = &clear["result"];
+            let new_id = receipt["session_id"]
+                .as_str()
+                .expect("fresh durable id")
+                .to_string();
+            assert_ne!(new_id, old_id);
+            assert_eq!(receipt["kind"], "clear_session_boundary");
+            assert_eq!(receipt["previous_session_id"], old_id);
+            assert_eq!(receipt["removed_turns"], 1);
+            assert_eq!(receipt["removed_messages"], 2);
+            assert_eq!(receipt["history_preserved"], true);
+            assert_eq!(receipt["previous_session_resumable"], true);
+            assert_eq!(
+                receipt["new_session_snapshot_state"],
+                "pending_until_first_success"
+            );
+            assert_eq!(receipt["runtime_grants_reset"], true);
+            assert!(receipt["artifact_warning"].is_null());
+            let summary = events
+                .iter()
+                .find(|event| event["type"] == "final_summary")
+                .expect("final_summary");
+            assert_eq!(summary["status"], "ok");
+            assert_eq!(summary["session_id"], new_id);
+            assert_eq!(summary["session_snapshot_state"], "resumable");
+
+            let mut list = base_cmd(&home_path);
+            let output = list
+                .args(["sessions", "--json"])
+                .output()
+                .expect("list split sessions");
+            assert!(output.status.success(), "{:?}", output);
+            let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+
+            let show = |id: &str| {
+                let mut command = base_cmd(&home_path);
+                let output = command
+                    .args(["sessions", "--json", "show", id])
+                    .output()
+                    .expect("show split session");
+                assert!(output.status.success(), "{:?}", output);
+                serde_json::from_slice::<serde_json::Value>(&output.stdout).unwrap()
+            };
+            let old_saved = show(&old_id);
+            let new_saved = show(&new_id);
+            (events, old_id, new_id, old_saved, new_saved, listed)
+        })
+        .await
+        .expect("scripted clear process should join");
+
+    let transcript = |saved: &serde_json::Value| {
+        saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    let old_transcript = transcript(&old_saved);
+    let new_transcript = transcript(&new_saved);
+    assert!(old_transcript.contains(OLD_MARKER), "{old_transcript}");
+    assert!(!old_transcript.contains(NEW_MARKER), "{old_transcript}");
+    assert!(new_transcript.contains(NEW_MARKER), "{new_transcript}");
+    assert!(!new_transcript.contains(OLD_MARKER), "{new_transcript}");
+    let sessions = listed.as_array().expect("session inventory");
+    assert_eq!(sessions.len(), 2, "{listed}");
+    for id in [&old_id, &new_id] {
+        let saved = sessions
+            .iter()
+            .find(|summary| summary["id"] == *id)
+            .expect("both split sessions listed");
+        assert_eq!(saved["turns"], 1);
+    }
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| event["type"] == "command_result" && event["command"] == "/clear")
+            .count(),
+        1
+    );
+
+    let requests = server.received_requests().await.expect("record requests");
+    assert_eq!(requests.len(), 2);
+    let first: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let first = first.to_string();
+    let second = second.to_string();
+    assert!(first.contains(OLD_MARKER), "{first}");
+    assert!(!first.contains(NEW_MARKER), "{first}");
+    assert!(second.contains(NEW_MARKER), "{second}");
+    assert!(!second.contains(OLD_MARKER), "{second}");
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -908,6 +3075,7 @@ async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
             .expect("fork session");
         assert!(output.status.success(), "{:?}", output);
         let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(forked["source_session_id"], id);
         let forked_id = forked["session"]["id"].as_str().unwrap().to_string();
         assert_ne!(forked_id, id);
         assert_eq!(forked["permissions_restored"], false);
@@ -1011,7 +3179,7 @@ async fn test_doctor_online_reachability_is_explicit_and_machine_readable() {
                 {"id": "   "}
             ]
         })))
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -1085,9 +3253,216 @@ auth = {{ method = "none" }}
             .any(|issue| issue.as_str().is_some_and(|issue| {
                 issue.contains("not advertised by the normalized gateway catalog")
             })));
+
+        let mut human = base_cmd(&home_path);
+        human
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "provider check: reachable — model catalog only; chat/inference access was not tested",
+            ))
+            .stdout(predicate::str::contains(
+                "doctor: no blocking issues found — run `kitsu` to verify chat/inference access",
+            ))
+            .stdout(predicate::str::contains("you're ready").not());
     })
     .await
     .expect("online doctor process should join");
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_doctor_inference_probe_is_explicit_minimal_and_machine_readable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"content": "OK"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-inference.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "doctor-model"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--inference",
+                "--json",
+            ])
+            .output()
+            .expect("run inference doctor");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["requested"], true);
+        assert_eq!(report["online"]["scope"], "chat_inference");
+        assert_eq!(report["online"]["chat_route_probed"], true);
+        assert_eq!(report["online"]["potentially_billable"], true);
+        assert_eq!(report["online"]["request_sent"], true);
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["effective_model"], "doctor-model");
+
+        let mut human = base_cmd(&home_path);
+        human
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--inference",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "provider check: reachable — chat/inference accepted one minimal tool-free completion",
+            ))
+            .stdout(predicate::str::contains(
+                "doctor: inference probe succeeded — the configured chat route accepted this model",
+            ));
+    })
+    .await
+    .expect("inference doctor process should join");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("record inference requests");
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        assert_eq!(request.method.as_str(), "POST");
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["model"], "doctor-model");
+        assert_eq!(
+            body["messages"],
+            serde_json::json!([{"role": "user", "content": "Reply OK."}])
+        );
+        assert_eq!(body["stream"], false);
+        assert_eq!(body["max_tokens"], 1);
+        assert!(body.get("tools").is_none());
+        assert!(body.get("temperature").is_none());
+        assert!(body.get("reasoning_effort").is_none());
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_doctor_inference_classifies_access_billing_model_and_quota_failures() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let cases = [
+        (
+            "unauthorized",
+            401_u16,
+            "authentication/access was rejected",
+        ),
+        ("forbidden", 403_u16, "was forbidden"),
+        ("billing", 402_u16, "billing or quota"),
+        ("model", 404_u16, "rejected the chat route or model"),
+        ("quota", 429_u16, "rate-limited"),
+    ];
+    for (route, status, _) in cases {
+        Mock::given(method("POST"))
+            .and(path(format!("/probe/{route}")))
+            .respond_with(
+                ResponseTemplate::new(status).set_body_string(format!("provider-secret-{route}")),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+    }
+
+    let home = TempDir::new().expect("temp home");
+    let mut configs = Vec::new();
+    for (route, _, expected) in cases {
+        let config = home.path().join(format!("doctor-{route}.toml"));
+        fs::write(
+            &config,
+            format!(
+                r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/probe/{route}"
+models_path = ""
+model = "doctor-model"
+auth = {{ method = "none" }}
+"#,
+                server.uri()
+            ),
+        )
+        .unwrap();
+        configs.push((config, route, expected));
+    }
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        for (config, route, expected) in configs {
+            let mut doctor = base_cmd(&home_path);
+            let output = doctor
+                .args([
+                    "--config",
+                    &config.to_string_lossy(),
+                    "doctor",
+                    "--inference",
+                    "--json",
+                ])
+                .output()
+                .expect("run failing inference doctor");
+            assert_eq!(output.status.code(), Some(1), "route {route}");
+            let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+            assert_eq!(report["online"]["scope"], "chat_inference");
+            assert_eq!(report["online"]["chat_route_probed"], true);
+            assert_eq!(report["online"]["request_sent"], true);
+            let status = report["online"]["status"].as_str().unwrap();
+            assert!(status.contains(expected), "route {route}: {status}");
+            assert!(!status.contains(&format!("provider-secret-{route}")));
+        }
+    })
+    .await
+    .expect("failing inference doctor processes should join");
 
     server.verify().await;
 }
@@ -1165,10 +3540,20 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
     let home = TempDir::new().unwrap();
     write_config(home.path(), &server.uri());
     let home_path = home.path().to_path_buf();
+    let last_message = home.path().join("last-message.txt");
+    let last_message_for_run = last_message.clone();
     tokio::task::spawn_blocking(move || {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-        cmd.args(["--jsonl", "--reasoning-effort", "high", "ask", "hello"]);
+        cmd.args([
+            "--jsonl",
+            "--reasoning-effort",
+            "high",
+            "-o",
+            &last_message_for_run.to_string_lossy(),
+            "ask",
+            "hello",
+        ]);
         let output = cmd.output().unwrap();
         assert!(
             output.status.success(),
@@ -1216,8 +3601,33 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
             .expect("terminal assistant disposition");
         assert!(assistant_index < disposition_index);
         assert_eq!(events[disposition_index]["status"], "committed");
+        let turn_finished_index = events
+            .iter()
+            .position(|event| event["type"] == "turn_finished")
+            .expect("terminal turn frame");
+        let output_index = events
+            .iter()
+            .position(|event| event["type"] == "output_last_message")
+            .expect("typed output receipt");
+        assert!(disposition_index < turn_finished_index && turn_finished_index < output_index);
+        assert_eq!(events[output_index]["turn_id"], "ask:1");
+        assert_eq!(
+            events[output_index]["destination"],
+            last_message_for_run.to_string_lossy().as_ref()
+        );
+        assert_eq!(events[output_index]["bytes"], "json answer".len());
+        assert_eq!(
+            events[output_index]["sha256"],
+            "47267c917dcf68d6884df621a7b9d2fc20f77735d93e1255d8a4872df7403ddd"
+        );
+        assert_eq!(events[output_index]["atomic"], true);
+        assert_eq!(events[output_index]["assistant_committed"], true);
+        assert_eq!(events[output_index]["content_included"], false);
+        assert_eq!(events[output_index]["model_write_authority"], false);
+        assert_eq!(fs::read(&last_message_for_run).unwrap(), b"json answer");
         assert_eq!(events.last().unwrap()["type"], "final_summary");
         assert_eq!(events.last().unwrap()["status"], "ok");
+        assert_eq!(events.last().unwrap()["successful_operations"], 1);
         assert!(!stdout.lines().any(|line| !line.starts_with('{')));
         assert!(
             output.stderr.is_empty(),
@@ -1228,6 +3638,15 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
     .await
     .unwrap();
 
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        assert_eq!(
+            fs::metadata(&last_message).unwrap().permissions().mode() & 0o777,
+            0o600
+        );
+    }
+
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1);
     let request: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
@@ -1236,6 +3655,2319 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         "JSONL must preserve provider streaming"
     );
     assert_eq!(request["reasoning_effort"], "high");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_schema_is_forwarded_validated_and_framed_before_commit() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"},"count":{"type":"integer","minimum":0}},"required":["status","count"],"additionalProperties":false}"#;
+    const ANSWER: &str = r#"{"status":"ok","count":3}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": ANSWER},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema_path = home.path().join("answer.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema_path, SCHEMA).unwrap();
+    let home_path = home.path().to_path_buf();
+    let schema_for_run = schema_path.clone();
+    let destination_for_run = destination.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-schema",
+                &schema_for_run.to_string_lossy(),
+                "--output-last-message",
+                &destination_for_run.to_string_lossy(),
+                "ask",
+                "return the requested object",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_to_string(&destination).unwrap(), ANSWER);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let index = |kind: &str| {
+        events
+            .iter()
+            .position(|event| event["type"] == kind)
+            .unwrap_or_else(|| panic!("missing {kind}: {events:#?}"))
+    };
+    let schema_index = index("output_schema");
+    assert!(index("run_started") < schema_index && schema_index < index("turn_started"));
+    let receipt = &events[schema_index];
+    assert_eq!(receipt["name"], "kitsu_output");
+    assert_eq!(receipt["bytes"], SCHEMA.len());
+    assert_eq!(
+        receipt["sha256"],
+        "ab2d534e73e0ac7a64401d7901b76a6c7b739e12e0842cc6a85b523391cc18b1"
+    );
+    assert_eq!(receipt["strict"], true);
+    assert_eq!(receipt["provider_format"], "json_schema");
+    assert_eq!(receipt["schema_preflight_validated"], true);
+    assert_eq!(receipt["local_validation"], true);
+    assert_eq!(receipt["schema_content_included"], false);
+    assert_eq!(receipt["model_file_authority"], false);
+    assert!(receipt.get("path").is_none());
+    let provider = &events[index("provider_request")];
+    assert_eq!(provider["structured_output"], true);
+    assert!(index("assistant") < index("assistant_disposition"));
+    assert_eq!(
+        events[index("assistant_disposition")]["status"],
+        "committed"
+    );
+    assert!(index("turn_finished") < index("output_last_message"));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(events.last().unwrap()["successful_operations"], 1);
+    assert_eq!(events.last().unwrap()["output_schema_failures"], 0);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"],
+        "kitsu_output"
+    );
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"],
+        serde_json::from_str::<serde_json::Value>(SCHEMA).unwrap()
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_schema_mismatch_discards_turn_and_preserves_output_destination() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"},"count":{"type":"integer","minimum":0}},"required":["status","count"],"additionalProperties":false}"#;
+    // Exact failure shape from Cycle 23: syntactically valid JSON that violates
+    // one schema keyword must be rejected with machine-readable diagnostics.
+    const INVALID: &str = r#"{"status":"wrong","count":3}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": INVALID},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema_path = home.path().join("answer.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema_path, SCHEMA).unwrap();
+    fs::write(&destination, "previous committed value").unwrap();
+    let home_path = home.path().to_path_buf();
+    let schema_for_run = schema_path.clone();
+    let destination_for_run = destination.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-schema",
+                &schema_for_run.to_string_lossy(),
+                "-o",
+                &destination_for_run.to_string_lossy(),
+                "ask",
+                "return the requested object",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "previous committed value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .any(|event| event["type"] == "provider_request" && event["structured_output"] == true));
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant_disposition"
+            && event["status"] == "discarded"
+            && event["reason"]
+                .as_str()
+                .unwrap()
+                .contains("failed --output-schema validation")
+    }));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .unwrap();
+    assert_eq!(error["kind"], "output_schema");
+    assert_eq!(error["exit_code"], 2);
+    assert_eq!(
+        error["schema_sha256"],
+        "ab2d534e73e0ac7a64401d7901b76a6c7b739e12e0842cc6a85b523391cc18b1"
+    );
+    assert_eq!(error["instance_path"], "$/status");
+    assert_eq!(error["validation_keyword"], "const");
+    assert!(error["message"]
+        .as_str()
+        .unwrap()
+        .contains("does not equal const"));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["provider_failures"], 1);
+    assert_eq!(summary["output_schema_failures"], 1);
+    assert_eq!(summary["tool_failures"], 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_invalid_output_schema_fails_before_provider_and_preserves_destination() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("unsupported.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(
+        &schema,
+        r#"{"type":"object","properties":{},"required":[],"additionalProperties":false,"format":"unsupported"}"#,
+    )
+    .unwrap();
+    fs::write(&destination, "preserve").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "ask",
+            "hello",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read_to_string(&destination).unwrap(), "preserve");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("unsupported keyword 'format'")
+    }));
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "output_schema"
+            && event["type"] != "provider_request"
+            && event["type"] != "output_last_message"
+    }));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_schema_file_is_protected_from_model_filesystem_writes() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"},"count":{"type":"integer","minimum":0}},"required":["status","count"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let schema = work.path().join("answer.schema.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    let arguments = serde_json::json!({
+        "path": schema.to_string_lossy(),
+        "content": "model attempted schema overwrite"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok","count":1}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "overwrite_schema",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("schema-protection.script");
+    fs::write(&script, "try the requested operation\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+    let schema_for_run = schema.clone();
+    let script_for_run = script.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-schema",
+                &schema_for_run.to_string_lossy(),
+                "chat",
+                "--no-session",
+                "--allow-read-write",
+                &work_path.to_string_lossy(),
+                "--script",
+                &script_for_run.to_string_lossy(),
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(&schema).unwrap(), SCHEMA);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let tool = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("protected write result");
+    assert_eq!(tool["success"], false);
+    let tool_error: serde_json::Value =
+        serde_json::from_str(tool["output"].as_str().unwrap()).unwrap();
+    assert_eq!(tool_error["error"], "PolicyDenied");
+    assert!(tool_error["detail"]
+        .as_str()
+        .unwrap()
+        .contains("Kitsu-private"));
+    assert_eq!(events.last().unwrap()["policy_failures"], 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_schema_failure_rolls_back_context_but_reports_retained_file_effects() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let effect = work.path().join("effect.txt");
+    let arguments = serde_json::json!({
+        "path": effect.to_string_lossy(),
+        "content": "completed tool effect\n",
+        "expected_current_content": null
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "```json\n{\"status\":\"ok\"}\n```"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "create_effect",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("answer.schema.json");
+    let script = home.path().join("retained-effect.script");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    fs::write(&script, "create the requested effect and return JSON\n").unwrap();
+    fs::write(&destination, "previous committed value").unwrap();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+    let schema_for_run = schema.clone();
+    let script_for_run = script.clone();
+    let destination_for_run = destination.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-schema",
+                &schema_for_run.to_string_lossy(),
+                "-o",
+                &destination_for_run.to_string_lossy(),
+                "chat",
+                "--no-session",
+                "--allow-read-write",
+                &work_path.to_string_lossy(),
+                "--script",
+                &script_for_run.to_string_lossy(),
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&effect).unwrap(),
+        "completed tool effect\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "previous committed value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let schema_error = events
+        .iter()
+        .find(|event| event["type"] == "error" && event["kind"] == "output_schema")
+        .expect("typed output schema error");
+    assert_eq!(schema_error["exit_code"], 2);
+    assert_eq!(
+        schema_error["schema_sha256"],
+        "95d025be509b57ee1b4c07f8a5541e50c1c635a7fbe1fe260dfeb044f5dcefaa"
+    );
+    assert_eq!(schema_error["instance_path"], "$");
+    assert_eq!(schema_error["validation_keyword"], "json_syntax");
+    let retained = events
+        .iter()
+        .find(|event| event["type"] == "rollback_retained_changes")
+        .expect("retained effect must be machine-visible");
+    assert_eq!(retained["change_count"], 1);
+    assert!(retained["paths"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|path| path.as_str() == Some(effect.to_string_lossy().as_ref())));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["provider_failures"], 1);
+    assert_eq!(summary["output_schema_failures"], 1);
+    assert_eq!(summary["recovered_tool_errors"], 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_piped_success_is_verified_before_output_install() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("required-result.txt");
+    let arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "verified result\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "TASK COMPLETE"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_required_result",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let destination = home.path().join("last-message.txt");
+    let expected_sha256 =
+        "db095dd5d3123eae56051704b1a97ad1fb51bd17c9f4cef481e43cffdaca26dd".to_ascii_uppercase();
+    let exact_requirement = format!("{}={}", required.to_string_lossy(), expected_sha256);
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &exact_requirement,
+        ])
+        .write_stdin("write the required result, then finish\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fs::read(&required).unwrap(), b"verified result\n");
+    assert_eq!(fs::read(&destination).unwrap(), b"TASK COMPLETE");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let postconditions = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "completion_postcondition")
+        .collect::<Vec<_>>();
+    assert_eq!(postconditions.len(), 2, "events: {events:#?}");
+    assert_eq!(postconditions[0].1["phase"], "armed");
+    assert_eq!(postconditions[0].1["status"], "pending");
+    assert_eq!(postconditions[0].1["write_authority_granted"], false);
+    assert_eq!(
+        postconditions[0].1["expectations"],
+        serde_json::json!([{
+            "path": required.to_string_lossy(),
+            "sha256": "db095dd5d3123eae56051704b1a97ad1fb51bd17c9f4cef481e43cffdaca26dd"
+        }])
+    );
+    let (evaluated_index, evaluated) = postconditions[1];
+    assert_eq!(evaluated["phase"], "evaluated");
+    assert_eq!(evaluated["status"], "satisfied");
+    assert_eq!(evaluated["results"][0]["satisfied"], true);
+    assert_eq!(evaluated["results"][0]["journal_recorded"], true);
+    assert_eq!(
+        evaluated["results"][0]["current_matches_latest_write"],
+        true
+    );
+    assert_eq!(evaluated["results"][0]["final_state_changed"], true);
+    assert!(evaluated["results"][0]["initial_sha256"].is_null());
+    assert_eq!(evaluated["results"][0]["final_bytes"], 16);
+    assert_eq!(
+        evaluated["results"][0]["expected_sha256"],
+        "db095dd5d3123eae56051704b1a97ad1fb51bd17c9f4cef481e43cffdaca26dd"
+    );
+    assert_eq!(evaluated["results"][0]["expected_sha256_matches"], true);
+    let output_index = events
+        .iter()
+        .position(|event| event["type"] == "output_last_message")
+        .unwrap();
+    assert!(evaluated_index < output_index && output_index < events.len() - 1);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["postcondition_failures"], 0);
+    assert_eq!(summary["user_failures"], 0);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let first_request = String::from_utf8_lossy(&requests[0].body);
+    assert!(first_request.contains("Host-enforced completion postcondition"));
+    assert!(first_request.contains(required.to_string_lossy().as_ref()));
+    assert!(
+        first_request.contains("db095dd5d3123eae56051704b1a97ad1fb51bd17c9f4cef481e43cffdaca26dd")
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_sha256_mismatch_fails_and_preserves_output() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("exact-result.txt");
+    let arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "wrong exact result\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "TASK COMPLETE"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_wrong_exact_result",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let destination = home.path().join("last-message.txt");
+    fs::write(&destination, "preserved host output").unwrap();
+    let exact_requirement = format!(
+        "{}={}",
+        required.to_string_lossy(),
+        "67db563e8cbb230fdef94e09b9961f99375986d4f9d90bf1e393998ad6a3bcb4"
+    );
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &exact_requirement,
+        ])
+        .write_stdin("write the exact required result, then finish\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fs::read(&required).unwrap(), b"wrong exact result\n");
+    assert_eq!(fs::read(&destination).unwrap(), b"preserved host output");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let evaluated = events
+        .iter()
+        .find(|event| event["type"] == "completion_postcondition" && event["phase"] == "evaluated")
+        .expect("evaluated exact write receipt");
+    assert_eq!(evaluated["status"], "failed");
+    assert_eq!(evaluated["results"][0]["journal_recorded"], true);
+    assert_eq!(evaluated["results"][0]["journal_net_content_changed"], true);
+    assert_eq!(
+        evaluated["results"][0]["current_matches_latest_write"],
+        true
+    );
+    assert_eq!(evaluated["results"][0]["final_state_changed"], true);
+    assert_eq!(
+        evaluated["results"][0]["final_sha256"],
+        "224fa499e3f4053c86c2b86733108cf6ffe3640a765d0cc8258d89965fc6552d"
+    );
+    assert_eq!(
+        evaluated["results"][0]["expected_sha256"],
+        "67db563e8cbb230fdef94e09b9961f99375986d4f9d90bf1e393998ad6a3bcb4"
+    );
+    assert_eq!(evaluated["results"][0]["expected_sha256_matches"], false);
+    assert!(evaluated["results"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("does not match required"));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error" && event["kind"] == "postcondition")
+        .expect("typed exact postcondition failure");
+    assert_eq!(error["exit_code"], 1);
+    let summary = events.last().unwrap();
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["postcondition_failures"], 1);
+    assert_eq!(summary["user_failures"], 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_existing_target_needs_read_authority_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("existing-result.txt");
+    fs::write(&required, "launch contents\n").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("replace the required result\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(&required).unwrap(), "launch contents\n");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "provider_request"
+            && event["type"] != "completion_postcondition"
+    }));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed preflight error");
+    let message = error["message"].as_str().unwrap();
+    assert!(message.contains("already exists"), "{message}");
+    assert!(message.contains("--allow-read-write"), "{message}");
+    assert!(message.contains("--allow-write alone is only valid for creating a new file"));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_sha256_equal_to_launch_state_fails_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("already-exact.txt");
+    fs::write(&required, "launch contents\n").unwrap();
+    let exact_requirement = format!(
+        "{}={}",
+        required.to_string_lossy(),
+        "15175a608b3cd1cb5f69395f60dc4055efbb9f9b07d09647f67c97c2a7d240fa"
+    );
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-read-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &exact_requirement,
+        ])
+        .write_stdin("complete the exact artifact\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read(&required).unwrap(), b"launch contents\n");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "provider_request"
+            && event["type"] != "completion_postcondition"
+    }));
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .and_then(|event| event["message"].as_str())
+        .expect("typed preflight error");
+    assert!(
+        message.contains("already has the required SHA-256"),
+        "{message}"
+    );
+    assert!(message.contains("final content change"), "{message}");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_sha256_conflicting_canonical_duplicates_fail_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("new-exact.txt");
+    let aliased = work.path().join(".").join("new-exact.txt");
+    let first = format!("{}={}", required.to_string_lossy(), "11".repeat(32));
+    let second = format!("{}={}", aliased.to_string_lossy(), "22".repeat(32));
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &first,
+            "--require-write-sha256",
+            &second,
+        ])
+        .write_stdin("complete the exact artifact\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!required.exists());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "provider_request"
+            && event["type"] != "completion_postcondition"
+    }));
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .and_then(|event| event["message"].as_str())
+        .expect("typed preflight error");
+    assert!(
+        message.contains("conflicting --require-write-sha256 expectations"),
+        "{message}"
+    );
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_existing_read_write_target_succeeds() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("existing-result.txt");
+    fs::write(&required, "launch contents\n").unwrap();
+    let read_arguments = serde_json::json!({
+        "path": required.to_string_lossy()
+    })
+    .to_string();
+    let write_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "verified replacement\n",
+        "expected_previous_content": "launch contents\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"write_existing\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "TASK COMPLETE"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"read_existing\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_existing",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": write_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read_existing",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-read-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("read and safely replace the required result\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&required).unwrap(),
+        "verified replacement\n"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let evaluated = events
+        .iter()
+        .find(|event| event["type"] == "completion_postcondition" && event["phase"] == "evaluated")
+        .expect("evaluated required-write receipt");
+    assert_eq!(evaluated["status"], "satisfied");
+    assert_eq!(evaluated["expectations"], serde_json::json!([]));
+    assert_eq!(evaluated["results"][0]["journal_recorded"], true);
+    assert_eq!(evaluated["results"][0]["final_state_changed"], true);
+    assert!(evaluated["results"][0]["expected_sha256"].is_null());
+    assert!(evaluated["results"][0]["expected_sha256_matches"].is_null());
+    assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(server.received_requests().await.unwrap().len(), 3);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_structured_output_uses_tool_then_finalization_phases() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("structured-result.txt");
+    let write_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "verified structured effect\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("tool-action phase is complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok"}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"tool_call_id\":\"write_structured\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "provisional action result"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_structured",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": write_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("answer.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("create the required effect and return structured status\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&required).unwrap(),
+        "verified structured effect\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        r#"{"status":"ok"}"#
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .map(|event| {
+            (
+                event["tools_offered"].as_u64().unwrap(),
+                event["structured_output"].as_bool().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].0 > 0);
+    assert_eq!(requests[1].0, requests[0].0);
+    assert_eq!(
+        requests.iter().map(|value| value.1).collect::<Vec<_>>(),
+        [false, false, true]
+    );
+    assert_eq!(requests[2].0, 0);
+    assert!(events.iter().all(|event| {
+        event["type"] != "assistant" || event["text"].as_str() != Some("provisional action result")
+    }));
+    assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(
+        events.last().unwrap()["session_snapshot_state"],
+        "resumable"
+    );
+
+    let session_id = events.last().unwrap()["session_id"]
+        .as_str()
+        .expect("durable structured-output session id");
+    let mut list = base_cmd(home.path());
+    let listed_output = list
+        .args(["sessions", "--json"])
+        .output()
+        .expect("list structured-output session");
+    assert!(listed_output.status.success(), "{listed_output:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed_output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["id"], session_id);
+    assert_eq!(
+        listed[0]["turns"], 1,
+        "the provider-only finalization nudge is not a second durable user turn"
+    );
+
+    let mut show = base_cmd(home.path());
+    let shown_output = show
+        .args(["sessions", "--json", "show", session_id])
+        .output()
+        .expect("show structured-output session");
+    assert!(shown_output.status.success(), "{shown_output:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown_output.stdout).unwrap();
+    let saved_messages = shown["messages"].as_array().expect("saved transcript");
+    assert!(saved_messages.iter().all(|message| {
+        message["content"].as_str() != Some("provisional action result")
+            && !message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("tool-action phase is complete"))
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "assistant" && message["tool_calls"][0]["call_id"] == "write_structured"
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "write_structured"
+    }));
+    assert_eq!(
+        saved_messages.last().unwrap()["content"],
+        r#"{"status":"ok"}"#
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let bodies = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert!(bodies[0].get("response_format").is_none());
+    assert!(bodies[1].get("response_format").is_none());
+    assert_eq!(bodies[2]["response_format"]["type"], "json_schema");
+    assert!(bodies[0]["tools"].is_array());
+    assert!(bodies[1]["tools"].is_array());
+    assert!(bodies[2].get("tools").is_none());
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_exact_write_mismatch_gets_bounded_tool_repair_before_finalization() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    const EXPECTED_SHA256: &str =
+        "bdbb8f375955d2fdcd0792b830b135a7edab099e626a8d9078c13f9f062922df";
+    const WRONG_SHA256: &str = "b435f9a7a4c3d6a12feb5bf83ed470aea19292b293769472c184cb14e7957167";
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("repair-before-final.json");
+    let wrong_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "wrong repaired result\n"
+    })
+    .to_string();
+    let corrected_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "verified repaired result\n",
+        "expected_previous_content": "wrong repaired result\n"
+    })
+    .to_string();
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("tool-action phase is complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok"}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"tool_call_id\":\"write_corrected_exact\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "provisional repaired result"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(3)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "latest filesystem write does not yet match the required raw-byte SHA-256",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_corrected_exact",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": corrected_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"tool_call_id\":\"write_wrong_exact\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "provisional mismatched result"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(7)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_wrong_exact",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": wrong_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("repair-answer.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    fs::write(&destination, "previous host output").unwrap();
+    let requirement = format!("{}={EXPECTED_SHA256}", required.to_string_lossy());
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--max-rounds",
+            "5",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &requirement,
+        ])
+        .write_stdin("create the exact required result and return structured status\n")
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fs::read(&required).unwrap(), b"verified repaired result\n");
+    assert_eq!(fs::read(&destination).unwrap(), br#"{"status":"ok"}"#);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .map(|event| {
+            (
+                event["tools_offered"].as_u64().unwrap(),
+                event["structured_output"].as_bool().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 5, "events: {events:#?}");
+    assert_eq!(
+        requests.iter().map(|request| request.1).collect::<Vec<_>>(),
+        [false, false, false, false, true]
+    );
+    assert!(requests[..4].iter().all(|request| request.0 > 0));
+    assert_eq!(requests[4], (0, true));
+    let deferred = events
+        .iter()
+        .find(|event| event["type"] == "structured_finalization_deferred")
+        .expect("typed bounded-repair receipt");
+    assert_eq!(deferred["round"], 2);
+    assert_eq!(deferred["repair_round"], 3);
+    assert_eq!(deferred["finalization_round_reserved"], true);
+    assert_eq!(deferred["cause"], "required_write_sha256_mismatch");
+    assert_eq!(deferred["repair_instruction_disclosed"], true);
+    assert_eq!(deferred["write_authority_granted"], false);
+    assert_eq!(
+        deferred["targets"][0]["path"],
+        required.to_string_lossy().as_ref()
+    );
+    assert_eq!(deferred["targets"][0]["expected_sha256"], EXPECTED_SHA256);
+    assert_eq!(deferred["targets"][0]["actual_sha256"], WRONG_SHA256);
+    let evaluated = events
+        .iter()
+        .find(|event| event["type"] == "completion_postcondition" && event["phase"] == "evaluated")
+        .expect("satisfied exact postcondition");
+    assert_eq!(evaluated["status"], "satisfied");
+    assert_eq!(evaluated["results"][0]["expected_sha256_matches"], true);
+    let deferred_index = events
+        .iter()
+        .position(|event| event["type"] == "structured_finalization_deferred")
+        .unwrap();
+    let repair_request_index = events
+        .iter()
+        .enumerate()
+        .skip(deferred_index + 1)
+        .find(|(_, event)| event["type"] == "provider_request")
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(deferred_index < repair_request_index);
+    assert_eq!(events.last().unwrap()["status"], "ok");
+
+    let session_id = events.last().unwrap()["session_id"]
+        .as_str()
+        .expect("durable repaired session");
+    let mut list = base_cmd(home.path());
+    let listed_output = list.args(["sessions", "--json"]).output().unwrap();
+    assert!(listed_output.status.success(), "{listed_output:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed_output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["turns"], 1);
+    let mut show = base_cmd(home.path());
+    let shown_output = show
+        .args(["sessions", "--json", "show", session_id])
+        .output()
+        .unwrap();
+    assert!(shown_output.status.success(), "{shown_output:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown_output.stdout).unwrap();
+    let saved_messages = shown["messages"].as_array().expect("saved transcript");
+    assert!(saved_messages.iter().all(|message| {
+        let content = message["content"].as_str().unwrap_or_default();
+        content != "provisional mismatched result"
+            && content != "provisional repaired result"
+            && !content.contains("latest filesystem write does not yet match")
+            && !content.contains("tool-action phase is complete")
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "assistant" && message["tool_calls"][0]["call_id"] == "write_wrong_exact"
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "assistant"
+            && message["tool_calls"][0]["call_id"] == "write_corrected_exact"
+    }));
+    assert_eq!(
+        saved_messages.last().unwrap()["content"],
+        r#"{"status":"ok"}"#
+    );
+
+    let bodies = server
+        .received_requests()
+        .await
+        .unwrap()
+        .into_iter()
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies.len(), 5);
+    assert!(bodies[2].get("response_format").is_none());
+    assert!(bodies[2]["tools"].is_array());
+    assert!(bodies[2]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| {
+            message["role"] == "user"
+                && message["content"].as_str().is_some_and(|content| {
+                    content.contains(EXPECTED_SHA256) && content.contains(WRONG_SHA256)
+                })
+        }));
+    assert!(bodies[4].get("tools").is_none());
+    assert_eq!(bodies[4]["response_format"]["type"], "json_schema");
+    assert!(bodies[4]["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .all(|message| {
+            !message["content"].as_str().is_some_and(|content| {
+                content.contains("latest filesystem write does not yet match")
+            })
+        }));
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_failed_structured_postcondition_session_excludes_finalization_scaffolding() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    const EXPECTED_SHA256: &str =
+        "6decf6cca7939a61838a68c115c35fd10f664ed25012c99cb3af39058d9002ef";
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("durable-mismatch.txt");
+    let write_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "wrong durable result\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("tool-action phase is complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok"}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(
+            "\"tool_call_id\":\"write_durable_mismatch\"",
+        ))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "provisional failure handoff"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_durable_mismatch",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": write_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("answer.schema.json");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    fs::write(&destination, "preserved host output").unwrap();
+    let requirement = format!("{}={EXPECTED_SHA256}", required.to_string_lossy());
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--max-rounds",
+            "3",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write-sha256",
+            &requirement,
+        ])
+        .write_stdin("write and finalize the durable result\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(fs::read(&required).unwrap(), b"wrong durable result\n");
+    assert_eq!(fs::read(&destination).unwrap(), b"preserved host output");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["postcondition_failures"], 1);
+    assert_eq!(summary["session_snapshot_state"], "resumable");
+    let session_id = summary["session_id"]
+        .as_str()
+        .expect("resumable failed-postcondition session");
+
+    let mut list = base_cmd(home.path());
+    let listed_output = list.args(["sessions", "--json"]).output().unwrap();
+    assert!(listed_output.status.success(), "{listed_output:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&listed_output.stdout).unwrap();
+    assert_eq!(listed.as_array().unwrap().len(), 1, "{listed}");
+    assert_eq!(listed[0]["id"], session_id);
+    assert_eq!(listed[0]["turns"], 1);
+
+    let mut show = base_cmd(home.path());
+    let shown_output = show
+        .args(["sessions", "--json", "show", session_id])
+        .output()
+        .unwrap();
+    assert!(shown_output.status.success(), "{shown_output:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown_output.stdout).unwrap();
+    let saved_messages = shown["messages"].as_array().expect("saved transcript");
+    assert!(saved_messages.iter().all(|message| {
+        message["content"].as_str() != Some("provisional failure handoff")
+            && !message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("tool-action phase is complete"))
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "assistant"
+            && message["tool_calls"][0]["call_id"] == "write_durable_mismatch"
+    }));
+    assert!(saved_messages.iter().any(|message| {
+        message["role"] == "tool" && message["tool_call_id"] == "write_durable_mismatch"
+    }));
+    assert_eq!(
+        saved_messages.last().unwrap()["content"],
+        r#"{"status":"ok"}"#
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_finalization_tool_call_is_typed_and_never_executed() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("retained-action-result.txt");
+    let action_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "verified action effect\n"
+    })
+    .to_string();
+    let forbidden_final_arguments = serde_json::json!({
+        "path": required.to_string_lossy(),
+        "content": "forbidden final mutation\n",
+        "expected_previous_content": "verified action effect\n"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("tool-action phase is complete"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "forbidden_final_write",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": forbidden_final_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"write_action\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok"}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_action",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": action_arguments}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let schema = home.path().join("answer.schema.json");
+    let script = home.path().join("finalization-tool-call.script");
+    let destination = home.path().join("last-message.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    fs::write(&script, "create the required effect and return status\n").unwrap();
+    fs::write(&destination, "preserved host output").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&required).unwrap(),
+        "verified action effect\n",
+        "the unoffered finalization call must not mutate the retained action effect"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "preserved host output"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .map(|event| {
+            (
+                event["tools_offered"].as_u64().unwrap(),
+                event["structured_output"].as_bool().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(requests.len(), 3);
+    assert!(requests[0].0 > 0);
+    assert_eq!(requests[1].0, requests[0].0);
+    assert_eq!(requests[2], (0, true));
+    let tool_starts = events
+        .iter()
+        .filter(|event| event["type"] == "tool_started")
+        .collect::<Vec<_>>();
+    assert_eq!(tool_starts.len(), 1);
+    assert_eq!(tool_starts[0]["call_id"], "write_action");
+    assert!(events.iter().all(|event| {
+        event["type"] != "assistant" || event["text"].as_str() != Some(r#"{"status":"ok"}"#)
+    }));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error" && event["kind"] == "provider")
+        .expect("typed provider-class finalization error");
+    assert_eq!(error["cause"], "tool_call_during_tool_free_finalization");
+    assert_eq!(
+        error["message"],
+        "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
+    );
+    assert_eq!(error["exit_code"], 2);
+    let evaluated = events
+        .iter()
+        .find(|event| event["type"] == "completion_postcondition" && event["phase"] == "evaluated")
+        .expect("required-write effects remain independently auditable");
+    assert_eq!(evaluated["status"], "satisfied");
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["provider_failures"], 1);
+    assert_eq!(summary["output_schema_failures"], 0);
+    assert_eq!(summary["postcondition_failures"], 0);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_script_failure_is_typed_and_preserves_output() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string","const":"ok"}},"required":["status"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": r#"{"status":"ok"}"#},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("must-change.txt");
+    fs::write(&required, "unchanged task output\n").unwrap();
+    let schema = home.path().join("answer.schema.json");
+    fs::write(&schema, SCHEMA).unwrap();
+    let script = home.path().join("required-write.script");
+    fs::write(&script, "complete the task and return valid JSON\n").unwrap();
+    let destination = home.path().join("last-message.json");
+    fs::write(&destination, "previous host output").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "-o",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-turn-errors",
+            "--allow-read-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&required).unwrap(),
+        "unchanged task output\n"
+    );
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "previous host output"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let provider_requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .map(|event| {
+            (
+                event["tools_offered"].as_u64().unwrap(),
+                event["structured_output"].as_bool().unwrap(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(provider_requests.len(), 2);
+    assert!(provider_requests[0].0 > 0);
+    assert!(!provider_requests[0].1);
+    assert_eq!(provider_requests[1], (0, true));
+    let disposition = events
+        .iter()
+        .position(|event| event["type"] == "assistant_disposition")
+        .unwrap();
+    assert_eq!(events[disposition]["status"], "committed");
+    let turn_finished = events
+        .iter()
+        .position(|event| event["type"] == "turn_finished")
+        .unwrap();
+    let evaluated = events
+        .iter()
+        .position(|event| {
+            event["type"] == "completion_postcondition" && event["phase"] == "evaluated"
+        })
+        .unwrap();
+    assert!(disposition < turn_finished && turn_finished < evaluated);
+    assert_eq!(events[evaluated]["status"], "failed");
+    assert_eq!(events[evaluated]["results"][0]["satisfied"], false);
+    assert_eq!(events[evaluated]["results"][0]["journal_recorded"], false);
+    assert!(events[evaluated]["results"][0]["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no verified model filesystem write"));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error" && event["kind"] == "postcondition")
+        .expect("typed postcondition error");
+    assert_eq!(error["condition"], "required_write");
+    assert_eq!(error["exit_code"], 1);
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["provider_failures"], 0);
+    assert_eq!(summary["output_schema_failures"], 0);
+    assert_eq!(summary["postcondition_failures"], 1);
+    assert_eq!(summary["user_failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_postcondition_failure"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_postcondition_failure_reports_absent_output_preserved_only_when_requested() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "committed answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("missing-required.txt");
+    let absent_output = home.path().join("absent-last-message.txt");
+
+    let requested = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "-o",
+            &absent_output.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("finish without writing the required target\n")
+        .output()
+        .unwrap();
+    assert_eq!(requested.status.code(), Some(1), "{requested:?}");
+    assert!(requested.stderr.is_empty(), "{requested:?}");
+    assert!(!absent_output.exists());
+    let requested_events = String::from_utf8(requested.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(requested_events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let requested_summary = requested_events.last().expect("requested final summary");
+    assert_eq!(requested_summary["status"], "error");
+    assert_eq!(requested_summary["postcondition_failures"], 1);
+    assert_eq!(requested_summary["successful_operations"], 1);
+    assert_eq!(
+        requested_summary["output_last_message_state"],
+        "preserved_postcondition_failure"
+    );
+
+    let unrequested = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("finish without writing the required target\n")
+        .output()
+        .unwrap();
+    assert_eq!(unrequested.status.code(), Some(1), "{unrequested:?}");
+    assert!(unrequested.stderr.is_empty(), "{unrequested:?}");
+    let unrequested_events = String::from_utf8(unrequested.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let unrequested_summary = unrequested_events
+        .last()
+        .expect("unrequested final summary");
+    assert_eq!(unrequested_summary["postcondition_failures"], 1);
+    assert_eq!(unrequested_summary["successful_operations"], 1);
+    assert!(unrequested_summary
+        .get("output_last_message_state")
+        .is_none());
+    assert!(!required.exists());
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_without_write_authority_fails_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("not-authorized.txt");
+    fs::write(&required, "original").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("try to complete the task\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(&required).unwrap(), "original");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "provider_request"
+            && event["type"] != "completion_postcondition"
+    }));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_required_write_structured_output_reserves_a_final_round_before_provider() {
+    use wiremock::MockServer;
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"status":{"type":"string"}},"required":["status"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("new-result.txt");
+    let schema = home.path().join("answer.schema.json");
+    fs::write(&schema, SCHEMA).unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--max-rounds",
+            "1",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("create the required result\n")
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(!required.exists());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "provider_request"
+            && event["type"] != "completion_postcondition"
+    }));
+    let message = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .and_then(|event| event["message"].as_str())
+        .expect("typed preflight error");
+    assert!(message.contains("--max-rounds 2 or higher"), "{message}");
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_schema_rejects_command_root_visibility_before_provider() {
+    use wiremock::MockServer;
+
+    const SCHEMA: &str = r#"{"type":"object","properties":{"answer":{"type":"string"}},"required":["answer"],"additionalProperties":false}"#;
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let command_root = TempDir::new().unwrap();
+    let schema = command_root.path().join("answer.schema.json");
+    fs::write(&schema, SCHEMA).unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-schema",
+            &schema.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--enable-commands",
+            "--command-root",
+            &command_root.path().to_string_lossy(),
+            "do not run anything",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(fs::read_to_string(&schema).unwrap(), SCHEMA);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("--output-schema file")
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("writable command root")
+    }));
+    assert!(events.iter().all(|event| {
+        event["type"] != "run_started"
+            && event["type"] != "output_schema"
+            && event["type"] != "provider_request"
+    }));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+/// Model commands end with total elapsed time in both human and automation
+/// surfaces. The provider delay makes this an accuracy assertion rather than
+/// merely checking that a numeric field exists.
+#[tokio::test]
+#[serial]
+async fn test_model_command_timing_receipt_and_jsonl_summary() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(40))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "timed answer"},
+                        "finish_reason": "stop"
+                    }],
+                    "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
+                })),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut human = base_cmd(&home_path);
+        let output = human
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--no-stream", "-p", "time this"])
+            .output()
+            .expect("run timed human prompt");
+        assert!(output.status.success(), "{output:?}");
+        assert_eq!(String::from_utf8(output.stdout).unwrap(), "timed answer\n");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let timing = stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .expect("timing receipt is the terminal human record");
+        let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
+        assert_eq!(timing["status"], "ok");
+        assert!(timing["duration_ms"].as_u64().unwrap() >= 35, "{timing}");
+
+        let mut jsonl = base_cmd(&home_path);
+        let output = jsonl
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--jsonl", "--no-stream", "-p", "time this"])
+            .output()
+            .expect("run timed JSONL prompt");
+        assert!(output.status.success(), "{output:?}");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let events = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let summary = events.last().expect("final summary");
+        assert_eq!(summary["type"], "final_summary");
+        assert_eq!(summary["status"], "ok");
+        assert!(summary["duration_ms"].as_u64().unwrap() >= 35, "{summary}");
+
+        let mut management = base_cmd(&home_path);
+        let output = management
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .arg("doctor")
+            .output()
+            .expect("run provider-free management command");
+        assert!(output.status.success(), "{output:?}");
+        assert!(
+            !String::from_utf8(output.stderr)
+                .unwrap()
+                .contains("kitsu-timing:"),
+            "management commands must not gain a model-run receipt"
+        );
+    })
+    .await
+    .expect("timed prompt processes should join");
+
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -1381,6 +6113,616 @@ async fn test_jsonl_script_happy_path_has_no_transcript_or_routine_stderr() {
         .any(|event| { event["type"] == "assistant" && event["text"] == "quiet answer" }));
     assert_eq!(events.last().unwrap()["type"], "final_summary");
     assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(events.last().unwrap()["successful_operations"], 2);
+}
+
+#[tokio::test]
+#[serial]
+async fn test_script_output_last_message_uses_the_last_committed_turn_once() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("second-output-marker"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "second committed"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "first committed"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("two-turns.script");
+    fs::write(&script, "first-output-marker\nsecond-output-marker\n").unwrap();
+    let last_message = home.path().join("last-message.txt");
+    fs::write(&last_message, "stale").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.clone();
+    let last_message_for_run = last_message.clone();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-last-message",
+                &last_message_for_run.to_string_lossy(),
+                "chat",
+                "--script",
+                &script_path.to_string_lossy(),
+                "--no-session",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    assert_eq!(fs::read(&last_message).unwrap(), b"second committed");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let receipts = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "output_last_message")
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1, "events: {events:#?}");
+    let (receipt_index, receipt) = receipts[0];
+    assert!(receipt["turn_id"]
+        .as_str()
+        .unwrap()
+        .ends_with("two-turns.script:2"));
+    assert_eq!(receipt["bytes"], "second committed".len());
+    assert_eq!(
+        receipt["sha256"],
+        "1b0cb82e06ef712077f1979f4263ac892c6e319bc0690ab018503f30e1bc61d2"
+    );
+    assert_eq!(receipt["model_write_authority"], false);
+    let final_turn = events
+        .iter()
+        .rposition(|event| event["type"] == "turn_finished")
+        .unwrap();
+    assert!(final_turn < receipt_index && receipt_index < events.len() - 1);
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert!(events
+        .last()
+        .unwrap()
+        .get("output_last_message_state")
+        .is_none());
+    server.verify().await;
+}
+
+#[test]
+fn test_script_output_last_message_reports_preserved_without_committed_assistant() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("query-only-output.script");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+
+    let existing = home.path().join("existing-last-message.txt");
+    fs::write(&existing, "keep this host-owned value").unwrap();
+    let mut jsonl = base_cmd(home.path());
+    let output = jsonl
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--output-last-message",
+            &existing.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run query-only JSONL script");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&existing).unwrap(),
+        "keep this host-owned value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_no_committed_assistant"
+    );
+
+    let absent = home.path().join("absent-last-message.txt");
+    let mut human = base_cmd(home.path());
+    human
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--output-last-message",
+            &absent.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains(
+            "~ --output-last-message unchanged: no committed assistant message",
+        ))
+        .stderr(predicate::str::contains(
+            "~ run summary: 1 successful operation,",
+        ))
+        .stderr(predicate::str::contains("turn(s) ok").not());
+    assert!(!absent.exists(), "a no-op must not create the destination");
+}
+
+#[tokio::test]
+#[serial]
+async fn test_script_output_last_message_keeps_earlier_commit_after_later_blank_turn() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(|request: &wiremock::Request| {
+            let body = String::from_utf8_lossy(&request.body);
+            let content = if body.contains("SECOND_BLANK_PROMPT") {
+                " \n\t"
+            } else {
+                "first committed"
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("commit-then-blank.script");
+    fs::write(&script, "FIRST_COMMIT_PROMPT\nSECOND_BLANK_PROMPT\n").unwrap();
+    let destination = home.path().join("last-message.txt");
+    fs::write(&destination, "older host output").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-last-message",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-turn-errors",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .unwrap();
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(fs::read(&destination).unwrap(), b"first committed");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let receipts = events
+        .iter()
+        .filter(|event| event["type"] == "output_last_message")
+        .collect::<Vec<_>>();
+    assert_eq!(receipts.len(), 1, "events: {events:#?}");
+    assert!(receipts[0]["turn_id"]
+        .as_str()
+        .unwrap()
+        .ends_with("commit-then-blank.script:1"));
+    assert_eq!(receipts[0]["bytes"], "first committed".len());
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "partial");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["provider_failures"], 1);
+    assert!(summary.get("output_last_message_state").is_none());
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_last_message_install_failure_is_typed_and_nonzero() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let output_dir = TempDir::new().unwrap();
+    let destination = output_dir.path().join("last-message.txt");
+    let displaced = output_dir.path().join("preflight-value.txt");
+    fs::write(&destination, "host-owned previous value").unwrap();
+    let destination_at_response = destination.clone();
+    let displaced_at_response = displaced.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            fs::rename(&destination_at_response, &displaced_at_response).unwrap();
+            fs::create_dir(&destination_at_response).unwrap();
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": "committed answer"},
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-last-message",
+            &destination.to_string_lossy(),
+            "ask",
+            "finish the task",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert!(destination.is_dir());
+    assert_eq!(
+        fs::read_to_string(&displaced).unwrap(),
+        "host-owned previous value"
+    );
+    assert!(fs::read_dir(output_dir.path()).unwrap().all(|entry| {
+        !entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .starts_with(".kitsu-")
+    }));
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["kind"] == "output_last_message"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("destination was left unchanged")
+    }));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let summary = events.last().unwrap();
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_last_message_destination_is_not_model_filesystem_authority() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let destination = work.path().join("last-message.txt");
+    fs::write(&destination, "host-owned previous value").unwrap();
+    let tool_args = serde_json::json!({
+        "path": destination.to_string_lossy(),
+        "content": "model attempted overwrite"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "provisional answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "overwrite_host_sink",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("protected-output.script");
+    fs::write(&script, "attempt the requested task\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+    let destination_for_run = destination.clone();
+    let script_path = script.clone();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--output-last-message",
+                &destination_for_run.to_string_lossy(),
+                "chat",
+                "--no-session",
+                "--allow-read-write",
+                &work_path.to_string_lossy(),
+                "--script",
+                &script_path.to_string_lossy(),
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "host-owned previous value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let tool = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("failed protected write receipt");
+    assert_eq!(tool["success"], false);
+    let tool_error: serde_json::Value =
+        serde_json::from_str(tool["output"].as_str().unwrap()).unwrap();
+    assert_eq!(tool_error["error"], "PolicyDenied");
+    assert!(tool_error["detail"]
+        .as_str()
+        .unwrap()
+        .contains("Kitsu-private"));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    assert_eq!(events.last().unwrap()["policy_failures"], 1);
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_last_message_rejects_writable_command_authority_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let destination = work.path().join("last-message.txt");
+    fs::write(&destination, "host-owned previous value").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-last-message",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--enable-commands",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "do not run anything",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty());
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "host-owned previous value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("writable command root")
+    }));
+    assert!(events.iter().all(|event| {
+        event["type"] != "provider_request" && event["type"] != "output_last_message"
+    }));
+    assert_eq!(events.last().unwrap()["type"], "final_summary");
+    assert_eq!(events.last().unwrap()["status"], "error");
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[tokio::test]
+#[serial]
+async fn test_output_last_message_rejects_readonly_command_runtime_authority_before_provider() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let runtime_root = TempDir::new().unwrap();
+    let destination = runtime_root.path().join("last-message.txt");
+    fs::write(&destination, "host-owned previous value").unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-last-message",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--command-runtime-root",
+            &runtime_root.path().to_string_lossy(),
+            "do not run anything",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "host-owned previous value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("read-only command runtime root")
+    }));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "provider_request"));
+    assert!(server.received_requests().await.unwrap().is_empty());
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_output_last_message_rejects_command_root_hard_link_alias() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let command_root = TempDir::new().unwrap();
+    let host = TempDir::new().unwrap();
+    let destination = host.path().join("last-message.txt");
+    let alias = command_root.path().join("command-visible-alias.txt");
+    fs::write(&destination, "host-owned previous value").unwrap();
+    fs::hard_link(&destination, &alias).unwrap();
+
+    let mut cmd = base_cmd(home.path());
+    let output = cmd
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "--output-last-message",
+            &destination.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--enable-commands",
+            "--command-root",
+            &command_root.path().to_string_lossy(),
+            "do not run anything",
+        ])
+        .output()
+        .unwrap();
+
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert_eq!(
+        fs::read_to_string(&destination).unwrap(),
+        "host-owned previous value"
+    );
+    assert_eq!(
+        fs::read_to_string(&alias).unwrap(),
+        "host-owned previous value"
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["message"]
+                .as_str()
+                .unwrap()
+                .contains("multiple hard links")
+    }));
+    assert!(events
+        .iter()
+        .all(|event| event["type"] != "provider_request"));
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[cfg(target_os = "linux")]
@@ -1449,6 +6791,12 @@ async fn test_jsonl_agent_provider_failures_are_typed_for_ask_and_piped_chat() {
                 .expect("typed error event");
             assert_eq!(error["kind"], "provider", "piped={piped}");
             assert_eq!(error["exit_code"], 2, "piped={piped}");
+            let summary = events.last().expect("final_summary");
+            assert_eq!(summary["type"], "final_summary", "piped={piped}");
+            assert_eq!(summary["tool_errors"], 0, "piped={piped}");
+            assert_eq!(summary["policy_errors"], 0, "piped={piped}");
+            assert_eq!(summary["recovered_tool_errors"], 0, "piped={piped}");
+            assert_eq!(summary["recovered_policy_errors"], 0, "piped={piped}");
         }
     })
     .await
@@ -1474,21 +6822,12 @@ fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
         .iter()
         .map(|event| event["type"].as_str().unwrap())
         .collect();
-    assert_eq!(
-        kinds,
-        [
-            "run_started",
-            "turn_started",
-            "provider_request",
-            "assistant_disposition",
-            "error",
-            "turn_finished",
-            "final_summary",
-        ]
-    );
-    assert_eq!(events[3]["status"], "discarded");
-    assert_eq!(events[4]["exit_code"], 1);
-    assert_eq!(events[6]["user_failures"], 1);
+    assert_eq!(kinds, ["error", "final_summary"]);
+    assert_eq!(events[0]["exit_code"], 1);
+    assert!(events[0]["message"]
+        .as_str()
+        .is_some_and(|message| message.contains("refresh-token")));
+    assert_eq!(events[1]["user_failures"], 1);
 }
 
 #[test]
@@ -1518,6 +6857,8 @@ fn test_jsonl_parse_error_is_framed_and_has_a_final_summary() {
     assert_eq!(events[1]["type"], "final_summary");
     assert_eq!(events[1]["status"], "error");
     assert_eq!(events[1]["user_failures"], 1);
+    assert!(events[1]["session_id"].is_null());
+    assert_eq!(events[1]["session_snapshot_state"], "disabled");
 }
 
 #[test]
@@ -1540,6 +6881,17 @@ fn test_jsonl_rejects_human_help_and_version_without_raw_stdout() {
         assert_eq!(events[0]["exit_code"], 1, "flag: {flag}");
         assert_eq!(events[1]["type"], "final_summary", "flag: {flag}");
     }
+}
+
+#[test]
+fn test_help_exposes_screen_reader_mode() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.arg("--help");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--screen-reader"))
+        .stdout(predicate::str::contains("KITSU_SCREEN_READER"));
 }
 
 #[cfg(unix)]
@@ -1910,6 +7262,50 @@ auth = {{ method = "none" }}
         let mut cmd = base_cmd(&home_path);
         cmd.args(["models"]);
         cmd.assert().success().stdout("model-a\nmodel-b\n");
+
+        let mut jsonl = base_cmd(&home_path);
+        let output = jsonl
+            .args(["--jsonl", "models"])
+            .output()
+            .expect("run machine-readable catalog");
+        assert!(output.status.success(), "{output:?}");
+        let events = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let catalog = events
+            .iter()
+            .find(|event| event["type"] == "model_catalog")
+            .expect("model_catalog event");
+        assert_eq!(catalog["count"], 2);
+        assert_eq!(catalog["models"], serde_json::json!(["model-a", "model-b"]));
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "run_started",
+                "provider_request",
+                "provider_attempt",
+                "model_catalog",
+                "final_summary",
+            ]
+        );
+        assert_eq!(events[1]["operation_id"], "models:1");
+        assert_eq!(events[1]["purpose"], "model_catalog");
+        assert_eq!(events[1]["request_timeout_ms"], 120_000);
+        assert_eq!(events[1]["turn_remaining_ms"], serde_json::Value::Null);
+        assert_eq!(events[2]["operation_id"], "models:1");
+        assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["deadline_scope"], "provider_request");
+        assert_eq!(events[2]["turn_remaining_ms"], serde_json::Value::Null);
+        assert_eq!(events[2]["category"], "success");
+        assert_eq!(events[2]["status"], 200);
+        assert_eq!(events[2]["outcome"], "body_completed");
+        assert_eq!(events[2]["terminal"], true);
+        assert_eq!(events.last().unwrap()["successful_operations"], 1);
     })
     .await
     .unwrap();
@@ -2007,6 +7403,29 @@ auth = {{ method = "none" }}
             .expect("typed error event");
         assert_eq!(error["kind"], "provider");
         assert_eq!(error["exit_code"], 2);
+        assert_eq!(
+            events
+                .iter()
+                .map(|event| event["type"].as_str().unwrap())
+                .collect::<Vec<_>>(),
+            [
+                "run_started",
+                "provider_request",
+                "provider_attempt",
+                "error",
+                "final_summary",
+            ]
+        );
+        assert_eq!(events[1]["operation_id"], "models:1");
+        assert_eq!(events[1]["purpose"], "model_catalog");
+        assert_eq!(events[2]["operation_id"], "models:1");
+        assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["attempt"], 1);
+        assert_eq!(events[2]["max_attempts"], 1);
+        assert_eq!(events[2]["category"], "unavailable");
+        assert_eq!(events[2]["status"], 503);
+        assert_eq!(events[2]["outcome"], "rejected");
+        assert_eq!(events[2]["terminal"], true);
         assert_eq!(events.last().unwrap()["provider_failures"], 1);
     })
     .await
@@ -2075,13 +7494,23 @@ auth = {{ method = "none" }}
         .lines()
         .map(|line| serde_json::from_str(line).unwrap())
         .collect();
-    assert_eq!(events.len(), 3, "events: {events:#?}");
+    assert_eq!(events.len(), 5, "events: {events:#?}");
     assert_eq!(events[0]["type"], "run_started");
-    assert_eq!(events[1]["kind"], "cancelled");
-    assert_eq!(events[1]["exit_code"], 130);
-    assert_eq!(events[2]["type"], "final_summary");
-    assert_eq!(events[2]["status"], "cancelled");
-    assert_eq!(events[2]["cancelled_failures"], 1);
+    assert_eq!(events[1]["type"], "provider_request");
+    assert_eq!(events[1]["operation_id"], "models:1");
+    assert_eq!(events[1]["purpose"], "model_catalog");
+    assert_eq!(events[2]["type"], "provider_attempt");
+    assert_eq!(events[2]["operation_id"], "models:1");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[2]["category"], "cancelled");
+    assert_eq!(events[2]["status"], serde_json::Value::Null);
+    assert_eq!(events[2]["outcome"], "cancelled");
+    assert_eq!(events[2]["terminal"], true);
+    assert_eq!(events[3]["kind"], "cancelled");
+    assert_eq!(events[3]["exit_code"], 130);
+    assert_eq!(events[4]["type"], "final_summary");
+    assert_eq!(events[4]["status"], "cancelled");
+    assert_eq!(events[4]["cancelled_failures"], 1);
 }
 
 // --- chat: piped-stdin one-shot ---------------------------------------------
@@ -2117,19 +7546,296 @@ async fn test_chat_piped_stdin_one_shot() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), &base_url);
     let home_path = home.path().to_path_buf();
+    let last_message = home.path().join("piped-last-message.txt");
+    let last_message_for_run = last_message.clone();
 
     tokio::task::spawn_blocking(move || {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
-        cmd.args(["chat", "--gateway", "example"]);
+        cmd.args([
+            "--output-last-message",
+            &last_message_for_run.to_string_lossy(),
+            "chat",
+            "--gateway",
+            "example",
+        ]);
         cmd.write_stdin("hello\n"); // piped → non-TTY → one-shot
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("hi from chat"))
-            .stdout(predicate::str::contains(TOKEN).not());
+            .stdout(predicate::str::contains(TOKEN).not())
+            .stderr(predicate::str::contains(
+                "saved last committed assistant message",
+            ));
     })
     .await
     .expect("spawned kitsu chat should join");
+    assert_eq!(fs::read(&last_message).unwrap(), b"hi from chat");
+}
+
+/// Bare `kitsu` is chat, `-p` is the one-shot shorthand, environment selectors
+/// beat config defaults, explicit flags beat the environment, and `/model`
+/// remains the final in-session override. This wire-level test protects the
+/// complete user-facing precedence chain rather than only clap field values.
+#[tokio::test]
+#[serial]
+async fn test_default_chat_prompt_flag_and_environment_selection_precedence() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "selection ok"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(4)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "configured"
+
+[gateways.configured]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/configured/chat"
+models_path = ""
+model = "configured-model"
+auth = {{ method = "none" }}
+
+[gateways.environment]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/environment/chat"
+models_path = ""
+model = "environment-profile-model"
+auth = {{ method = "none" }}
+
+[gateways.explicit]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/explicit/chat"
+models_path = ""
+model = "explicit-profile-model"
+auth = {{ method = "none" }}
+"#,
+            server.uri(),
+            server.uri(),
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let script = home.path().join("environment-model-override.txt");
+    fs::write(&script, "/model slash-model\nslash override prompt\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    tokio::task::spawn_blocking(move || {
+        let mut bare = base_cmd(&home_path);
+        bare.env("KITSU_GATEWAY", "environment")
+            .env("KITSU_MODEL", "environment-model")
+            .arg("--no-stream")
+            .write_stdin("bare default chat prompt\n");
+        bare.assert()
+            .success()
+            .stdout(predicate::str::contains("selection ok"));
+
+        let mut prompt = base_cmd(&home_path);
+        prompt
+            .env("KITSU_GATEWAY", "environment")
+            .env("KITSU_MODEL", "environment-model")
+            .args(["--no-stream", "-p", "prompt flag input"]);
+        prompt
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("selection ok"));
+
+        let mut explicit = base_cmd(&home_path);
+        explicit
+            .env("KITSU_GATEWAY", "environment")
+            .env("KITSU_MODEL", "environment-model")
+            .args([
+                "--no-stream",
+                "--gateway",
+                "explicit",
+                "--model",
+                "explicit-model",
+                "-p",
+                "explicit flag input",
+            ]);
+        explicit
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("selection ok"));
+
+        let mut slash = base_cmd(&home_path);
+        slash
+            .env("KITSU_GATEWAY", "environment")
+            .env("KITSU_MODEL", "environment-model")
+            .args(["--no-stream", "chat", "--script", &script_path]);
+        slash
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("selection ok"))
+            .stderr(predicate::str::contains("switched to slash-model"));
+    })
+    .await
+    .expect("selection commands should join");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 4);
+    let mut observed = std::collections::HashMap::new();
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        let prompt = body["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .rev()
+            .find(|message| message["role"] == "user")
+            .and_then(|message| message["content"].as_str())
+            .unwrap()
+            .to_string();
+        observed.insert(
+            prompt,
+            (
+                request.url.path().to_string(),
+                body["model"].as_str().unwrap().to_string(),
+            ),
+        );
+    }
+    assert_eq!(
+        observed.get("bare default chat prompt"),
+        Some(&(
+            "/environment/chat".to_string(),
+            "environment-model".to_string()
+        ))
+    );
+    assert_eq!(
+        observed.get("prompt flag input"),
+        Some(&(
+            "/environment/chat".to_string(),
+            "environment-model".to_string()
+        ))
+    );
+    assert_eq!(
+        observed.get("explicit flag input"),
+        Some(&("/explicit/chat".to_string(), "explicit-model".to_string()))
+    );
+    assert_eq!(
+        observed.get("slash override prompt"),
+        Some(&("/environment/chat".to_string(), "slash-model".to_string()))
+    );
+    assert!(
+        observed
+            .values()
+            .all(|(path, _)| path != "/configured/chat"),
+        "environment selection did not override the configured default: {observed:?}"
+    );
+    server.verify().await;
+}
+
+/// Every logical inference request identifies the exact model sent on the
+/// wire. This remains truthful across an in-session `/model` switch; the
+/// intervening catalog lookup is not routed to a model and omits the field.
+#[tokio::test]
+#[serial]
+async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "model identity ok"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("model-request-identity.script");
+    fs::write(
+        &script,
+        "first model prompt\n/model switched-model\nsecond model prompt\n/quit\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &script_path,
+            ])
+            .output()
+            .expect("run model-switch JSONL script")
+    })
+    .await
+    .expect("model-switch command should join");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let inference_models = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request" && event["purpose"] == "inference")
+        .map(|event| {
+            event["model"]
+                .as_str()
+                .expect("inference request model")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inference_models, ["example-model-v1", "switched-model"]);
+
+    let catalog_request = events
+        .iter()
+        .find(|event| event["type"] == "provider_request" && event["purpose"] == "model_catalog")
+        .expect("logical model-catalog request");
+    assert!(
+        catalog_request.get("model").is_none(),
+        "catalog lookup is not routed to a model: {catalog_request}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let wire_models = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(wire_models, inference_models);
+    server.verify().await;
 }
 
 /// A positional chat prompt is authoritative input and must not wait for an
@@ -2232,6 +7938,161 @@ async fn test_chat_piped_input_obeys_end_to_end_deadline() {
                 .is_some_and(|message| message.contains("end-to-end deadline"))
     }));
     assert_eq!(events.last().unwrap()["type"], "final_summary");
+}
+
+/// A scripted turn gets one inference deadline across every provider/tool
+/// round. Two individually-fast rounds whose combined delay exceeds the budget
+/// must time out instead of receiving a fresh `--timeout-secs` allowance after
+/// the tool call.
+#[tokio::test]
+#[serial]
+async fn test_script_turn_timeout_is_shared_across_tool_rounds() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().expect("work dir");
+    let file = work.path().join("deadline.txt");
+    fs::write(&file, "deadline marker").expect("write fixture");
+    let tool_args = serde_json::json!({"path": file}).to_string();
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(700))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {
+                            "role": "assistant",
+                            "content": null,
+                            "tool_calls": [{
+                                "id": "deadline_read_1",
+                                "type": "function",
+                                "function": {
+                                    "name": "fs_read_file",
+                                    "arguments": tool_args
+                                }
+                            }]
+                        },
+                        "finish_reason": "tool_calls"
+                    }]
+                })),
+        )
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_millis(700))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "too late"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("deadline.script");
+    fs::write(&script, "read the deadline fixture\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--timeout-secs",
+                "1",
+                "chat",
+                "--no-session",
+                "--allow-path",
+                &work_path.to_string_lossy(),
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run bounded scripted tool turn")
+    })
+    .await
+    .expect("scripted deadline process should join");
+
+    assert_eq!(output.status.code(), Some(2));
+    assert!(
+        output.stderr.is_empty(),
+        "JSONL stderr: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let provider_requests = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_requests.len(), 2);
+    assert!(provider_requests
+        .iter()
+        .all(|event| event["request_timeout_ms"] == 1_000));
+    let turn_at_request = provider_requests
+        .iter()
+        .map(|event| event["turn_remaining_ms"].as_u64().unwrap())
+        .collect::<Vec<_>>();
+    assert!(turn_at_request[0] <= 1_000);
+    assert!(turn_at_request[1] < turn_at_request[0]);
+    let provider_attempts = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt")
+        .collect::<Vec<_>>();
+    assert_eq!(provider_attempts.len(), 2);
+    assert!(provider_attempts
+        .iter()
+        .all(|event| event["deadline_scope"] == "provider_request"));
+    assert!(provider_attempts
+        .iter()
+        .all(|event| event["turn_remaining_ms"].is_u64()));
+    let cancelled_attempt = provider_attempts.last().unwrap();
+    assert_eq!(cancelled_attempt["category"], "cancelled");
+    assert_eq!(cancelled_attempt["outcome"], "cancelled");
+    assert!(cancelled_attempt["turn_remaining_ms"].as_u64().unwrap() <= 100);
+    assert!(
+        cancelled_attempt["remaining_deadline_ms"].as_u64().unwrap()
+            > cancelled_attempt["turn_remaining_ms"].as_u64().unwrap()
+    );
+    assert!(events.iter().any(|event| {
+        event["type"] == "tool_finished"
+            && event["name"] == "fs_read_file"
+            && event["success"] == true
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "error"
+            && event["kind"] == "provider"
+            && event["message"]
+                .as_str()
+                .is_some_and(|message| message.contains("timed out after 1s"))
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "assistant_disposition" && event["status"] == "discarded"
+    }));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["provider_failures"], 1);
+    server.verify().await;
 }
 
 // --- chat: end-to-end tool round --------------------------------------------
@@ -2411,6 +8272,129 @@ fn test_allow_write_registers_only_write_capability() {
         .stderr(predicate::str::contains("fs_edit_file").not())
         .stderr(predicate::str::contains("read roots   none"))
         .stderr(predicate::str::contains("(invocation/base)"));
+}
+
+#[tokio::test]
+#[serial]
+async fn test_zero_spawn_cap_unregisters_agent_tools_from_slash_and_provider() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "DONE"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().expect("tool root");
+    fs::write(work.path().join("note.txt"), "fixture\n").unwrap();
+    let script = home.path().join("zero-spawn-cap.script");
+    fs::write(&script, "/tools\nReply with DONE without calling a tool.\n").unwrap();
+    let home_path = home.path().to_path_buf();
+    let work_path = work.path().to_path_buf();
+
+    let events = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        let output = cmd
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--no-project-context",
+                "--no-workspace-evidence",
+                "--agent-spawn-cap",
+                "0",
+                "chat",
+                "--no-session",
+                "--allow-read-write",
+                &work_path.to_string_lossy(),
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run cap-zero chat");
+        assert!(
+            output.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert!(output.stderr.is_empty());
+        String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>()
+    })
+    .await
+    .expect("cap-zero chat process should join");
+
+    let tools_result = events
+        .iter()
+        .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "tools")
+        .expect("structured /tools result");
+    let slash_tools = tools_result["result"]["tools"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|name| name.as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert!(slash_tools.iter().any(|name| name == "fs_read_file"));
+    assert!(slash_tools.iter().any(|name| name == "fs_write_file"));
+    for disabled in [
+        "spawn_agent",
+        "spawn_agents",
+        "spawn_agent_bg",
+        "agent_result",
+    ] {
+        assert!(
+            !slash_tools.iter().any(|name| name == disabled),
+            "cap-zero /tools advertised {disabled}: {slash_tools:?}"
+        );
+    }
+    let provider_request = events
+        .iter()
+        .find(|event| event["type"] == "provider_request")
+        .expect("provider request event");
+    assert_eq!(
+        provider_request["tools_offered"].as_u64().unwrap() as usize,
+        slash_tools.len()
+    );
+
+    let requests = server.received_requests().await.expect("record request");
+    assert_eq!(requests.len(), 1);
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    let offered = body["tools"]
+        .as_array()
+        .expect("tool schemas")
+        .iter()
+        .map(|tool| tool["function"]["name"].as_str().unwrap().to_string())
+        .collect::<Vec<_>>();
+    assert_eq!(offered, slash_tools);
+    let system_prompt = body["messages"][0]["content"]
+        .as_str()
+        .expect("system prompt");
+    for disabled in [
+        "spawn_agent",
+        "spawn_agents",
+        "spawn_agent_bg",
+        "agent_result",
+    ] {
+        assert!(
+            !system_prompt.contains(disabled),
+            "cap-zero system prompt advertised {disabled}: {system_prompt}"
+        );
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -2877,7 +8861,9 @@ async fn test_script_allow_turn_errors_preserves_zero_exit() {
         cmd.assert()
             .success()
             .stdout(predicate::str::contains("still works"))
-            .stderr(predicate::str::contains("script summary: 1 failure"));
+            .stderr(predicate::str::contains("script summary: 1 failure\n"))
+            .stderr(predicate::str::contains("failure(s)").not())
+            .stderr(predicate::str::contains("\"status\":\"partial\""));
     })
     .await
     .expect("join");
@@ -3027,9 +9013,607 @@ async fn test_scripted_recovered_tool_error_commits_turn() {
                 "1 earlier tool error(s) were recovered within the turn",
             ))
             .stderr(predicate::str::contains("strict scripted turn failed").not());
+
+        let mut jsonl = base_cmd(&home_path);
+        let output = jsonl
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--allow-path",
+                &allowed.to_string_lossy(),
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run recovered JSONL turn");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let events = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let turn = events
+            .iter()
+            .find(|event| event["type"] == "turn_finished")
+            .expect("turn_finished");
+        assert_eq!(turn["status"], "ok");
+        assert_eq!(turn["tool_errors"], 1);
+        assert_eq!(turn["policy_errors"], 0);
+        let summary = events.last().expect("final_summary");
+        assert_eq!(summary["type"], "final_summary");
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["failures"], 0);
+        assert_eq!(summary["tool_failures"], 0);
+        assert_eq!(summary["policy_failures"], 0);
+        assert_eq!(summary["tool_errors"], 1);
+        assert_eq!(summary["policy_errors"], 0);
+        assert_eq!(summary["recovered_tool_errors"], 1);
+        assert_eq!(summary["recovered_policy_errors"], 0);
+
+        let mut piped = base_cmd(&home_path);
+        let output = piped
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-session",
+                "--allow-path",
+                &allowed.to_string_lossy(),
+            ])
+            .write_stdin("read the data file\n")
+            .output()
+            .expect("run recovered piped JSONL turn");
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let summary = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .next_back()
+            .expect("piped final_summary");
+        assert_eq!(summary["type"], "final_summary");
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["failures"], 0);
+        assert_eq!(summary["tool_failures"], 0);
+        assert_eq!(summary["tool_errors"], 1);
+        assert_eq!(summary["recovered_tool_errors"], 1);
+        assert_eq!(summary["policy_errors"], 0);
+        assert_eq!(summary["recovered_policy_errors"], 0);
     })
     .await
     .expect("join");
+}
+
+/// Strict automation must not turn a blank terminal model message into a
+/// successful recovery. This is especially dangerous after earlier tool work:
+/// the process would otherwise exit zero even though it produced no completion
+/// and never proved the requested outcome.
+#[tokio::test]
+#[serial]
+async fn test_scripted_empty_final_response_after_tool_activity_is_provider_failure() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("strict-empty-marker"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "   \n\t"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let data = TempDir::new().unwrap();
+    let data_path = data.path().join("data.txt");
+    fs::write(&data_path, "strict-empty-marker").unwrap();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read_ok",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_read_file",
+                            "arguments": serde_json::json!({"path": data_path}).to_string()
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "bad_first",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": "{}"}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("empty-final.script");
+    fs::write(&script, "recover and answer\n").unwrap();
+    let last_message = home.path().join("last-message.txt");
+    fs::write(&last_message, "keep previous committed answer").unwrap();
+    let last_message_for_run = last_message.clone();
+    let home_path = home.path().to_path_buf();
+    let allowed = data.path().to_path_buf();
+
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "--output-last-message",
+                &last_message_for_run.to_string_lossy(),
+                "chat",
+                "--session",
+                "--allow-path",
+                &allowed.to_string_lossy(),
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run strict empty-response script")
+    })
+    .await
+    .expect("join");
+
+    assert_eq!(output.status.code(), Some(2), "{output:?}");
+    assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let disposition = events
+        .iter()
+        .find(|event| event["type"] == "assistant_disposition")
+        .expect("assistant disposition");
+    assert_eq!(disposition["status"], "discarded");
+    assert!(disposition["reason"]
+        .as_str()
+        .unwrap()
+        .contains("no final assistant text"));
+    let error = events
+        .iter()
+        .find(|event| event["type"] == "error")
+        .expect("typed error");
+    assert_eq!(error["kind"], "incomplete_turn");
+    assert_eq!(error["exit_code"], 2);
+    assert_eq!(error["tool_errors"], 1);
+    assert_eq!(error["policy_errors"], 0);
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["provider_failures"], 1);
+    assert_eq!(summary["tool_failures"], 0);
+    assert_eq!(summary["tool_errors"], 1);
+    assert_eq!(summary["recovered_tool_errors"], 0);
+    assert!(summary["session_id"].is_null());
+    assert_eq!(
+        summary["session_snapshot_state"],
+        "pending_until_first_success"
+    );
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_no_committed_assistant"
+    );
+    assert!(
+        events
+            .iter()
+            .all(|event| event["type"] != "output_last_message"),
+        "discarded assistant text must never produce an output receipt"
+    );
+    assert_eq!(
+        fs::read_to_string(&last_message).unwrap(),
+        "keep previous committed answer"
+    );
+
+    let mut sessions = base_cmd(home.path());
+    let listed = sessions
+        .args(["sessions", "--json"])
+        .output()
+        .expect("list sessions after failed fresh durable turn");
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap(),
+        serde_json::json!([])
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_failed_resumed_turn_keeps_resumable_terminal_session_receipt() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const SAVED_MARKER: &str = "SESSION_RECEIPT_SAVED_731";
+    const FAILED_MARKER: &str = "SESSION_RECEIPT_FAILED_947";
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(FAILED_MARKER))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "  \n\t"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "saved receipt answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let create_script = home.path().join("receipt-create.script");
+    let fail_script = home.path().join("receipt-fail.script");
+    fs::write(&create_script, format!("remember {SAVED_MARKER}\n")).unwrap();
+    fs::write(&fail_script, format!("do not retain {FAILED_MARKER}\n")).unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let run = |resume: Option<&str>, script: &Path| {
+            let mut command = base_cmd(&home_path);
+            command.env("ANTHROPIC_AUTH_TOKEN", TOKEN).args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+            ]);
+            if let Some(id) = resume {
+                command.args(["--resume", id]);
+            } else {
+                command.arg("--session");
+            }
+            command
+                .args(["--no-tools", "--script", &script.to_string_lossy()])
+                .output()
+                .expect("run session-receipt lifecycle")
+        };
+
+        let created = run(None, &create_script);
+        assert!(created.status.success(), "{created:?}");
+        assert!(created.stderr.is_empty(), "{created:?}");
+        let created_events = String::from_utf8(created.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let created_summary = created_events.last().expect("created final_summary");
+        let id = created_summary["session_id"]
+            .as_str()
+            .expect("materialized session id")
+            .to_string();
+        assert_eq!(created_summary["session_snapshot_state"], "resumable");
+
+        let failed = run(Some(&id), &fail_script);
+        assert_eq!(failed.status.code(), Some(2), "{failed:?}");
+        assert!(failed.stderr.is_empty(), "{failed:?}");
+        let failed_events = String::from_utf8(failed.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let started = failed_events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("resumed run_started");
+        assert_eq!(started["session_id"], id);
+        assert_eq!(started["session_snapshot_state"], "resumable");
+        let summary = failed_events.last().expect("failed final_summary");
+        assert_eq!(summary["status"], "error");
+        assert_eq!(summary["session_id"], id);
+        assert_eq!(summary["session_snapshot_state"], "resumable");
+
+        let mut show = base_cmd(&home_path);
+        let output = show
+            .args(["sessions", "--json", "show", &id])
+            .output()
+            .expect("show preserved session");
+        assert!(output.status.success(), "{output:?}");
+        let saved: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        let transcript = saved["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains(SAVED_MARKER), "{transcript}");
+        assert!(!transcript.contains(FAILED_MARKER), "{transcript}");
+    })
+    .await
+    .expect("join session-receipt lifecycle");
+
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_empty_final_response_is_provider_failure_for_ask_and_piped_chat() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": ""},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        for piped in [false, true] {
+            let mut cmd = base_cmd(&home_path);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+            if piped {
+                cmd.args([
+                    "--gateway",
+                    "example",
+                    "--jsonl",
+                    "--no-stream",
+                    "chat",
+                    "--no-session",
+                    "--no-tools",
+                ])
+                .write_stdin("answer this\n");
+            } else {
+                cmd.args([
+                    "--gateway",
+                    "example",
+                    "--jsonl",
+                    "--no-stream",
+                    "ask",
+                    "answer this",
+                ]);
+            }
+            let output = cmd.output().expect("run empty-response mode");
+            assert_eq!(output.status.code(), Some(2), "piped={piped}: {output:?}");
+            assert!(
+                output.stderr.is_empty(),
+                "piped={piped}: {:?}",
+                output.stderr
+            );
+            let events = String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                .collect::<Vec<_>>();
+            let disposition = events
+                .iter()
+                .find(|event| event["type"] == "assistant_disposition")
+                .expect("assistant disposition");
+            assert_eq!(disposition["status"], "discarded", "piped={piped}");
+            let error = events
+                .iter()
+                .find(|event| event["type"] == "error")
+                .expect("typed incomplete-turn error");
+            assert_eq!(error["kind"], "incomplete_turn", "piped={piped}");
+            assert_eq!(error["exit_code"], 2, "piped={piped}");
+            let summary = events.last().expect("final summary");
+            assert_eq!(summary["status"], "error", "piped={piped}");
+            assert_eq!(summary["provider_failures"], 1, "piped={piped}");
+            assert_eq!(summary["tool_errors"], 0, "piped={piped}");
+            assert_eq!(summary["recovered_tool_errors"], 0, "piped={piped}");
+        }
+    })
+    .await
+    .expect("join");
+    server.verify().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() {
+    use std::io::{Read as _, Write as _};
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": " \n\t"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+
+    let transcript = tokio::task::spawn_blocking(move || {
+        let mut master = -1;
+        let mut slave = -1;
+        // SAFETY: both output pointers are valid; null termios and winsize
+        // request the platform defaults.
+        assert_eq!(
+            unsafe {
+                libc::openpty(
+                    &mut master,
+                    &mut slave,
+                    std::ptr::null_mut(),
+                    std::ptr::null(),
+                    std::ptr::null(),
+                )
+            },
+            0,
+            "allocate interactive empty-response PTY"
+        );
+        // SAFETY: `master` is live; changing descriptor flags preserves its
+        // ownership and lets this test synchronize without blocking forever.
+        let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+        assert!(flags >= 0);
+        assert_eq!(
+            unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+            0
+        );
+        // SAFETY: each duplicated slave descriptor is transferred to exactly
+        // one Stdio owner below.
+        let child_stdin = unsafe { libc::dup(slave) };
+        let child_stdout = unsafe { libc::dup(slave) };
+        assert!(child_stdin >= 0 && child_stdout >= 0);
+
+        let mut cmd = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+        cmd.env("HOME", &home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+            // SAFETY: the duplicated descriptors are valid and transferred
+            // exactly once. Ownership of the original slave transfers to
+            // stderr.
+            .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+            .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+            .stderr(unsafe { Stdio::from_raw_fd(slave) })
+            .args([
+                "--plain",
+                "--gateway",
+                "example",
+                "--no-stream",
+                "chat",
+                "--session",
+                "--no-tools",
+            ]);
+        let mut child = cmd.spawn().expect("spawn interactive empty-response chat");
+        // SAFETY: `master` is the remaining live descriptor and transfers to
+        // this File exactly once.
+        let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut output = Vec::new();
+        let mut prompt_sent = false;
+        let mut quit_sent = false;
+        let marker = b"turn rolled back - /retry to try again";
+
+        let status = loop {
+            let mut buffer = [0_u8; 4096];
+            match terminal.read(&mut buffer) {
+                Ok(0) => {}
+                Ok(read) => output.extend_from_slice(&buffer[..read]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+                Err(error) => panic!("read interactive empty-response PTY: {error}"),
+            }
+            let prompt_count = output
+                .windows(b"kitsu>".len())
+                .filter(|window| *window == b"kitsu>")
+                .count();
+            if !prompt_sent && prompt_count >= 1 {
+                terminal.write_all(b"answer this\n").unwrap();
+                terminal.flush().unwrap();
+                prompt_sent = true;
+            }
+            let saw_rollback = output.windows(marker.len()).any(|window| window == marker);
+            if prompt_sent && !quit_sent && saw_rollback && prompt_count >= 2 {
+                terminal.write_all(b"/quit\n").unwrap();
+                terminal.flush().unwrap();
+                quit_sent = true;
+            }
+            if let Some(status) = child.try_wait().expect("poll interactive empty response") {
+                break status;
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                panic!(
+                    "interactive empty-response chat did not exit: {}",
+                    String::from_utf8_lossy(&output)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(10));
+        };
+        assert!(status.success(), "interactive child failed: {status}");
+        assert!(
+            prompt_sent && quit_sent,
+            "incomplete PTY handshake: {output:?}"
+        );
+        String::from_utf8_lossy(&output).into_owned()
+    })
+    .await
+    .expect("interactive PTY task joins");
+
+    assert!(transcript.contains("model returned no final assistant text"));
+    assert!(transcript.contains("turn rolled back - /retry to try again"));
+    let mut sessions = base_cmd(home.path());
+    let output = sessions
+        .args(["sessions", "--json"])
+        .output()
+        .expect("list sessions after blank interactive turn");
+    assert!(output.status.success(), "{output:?}");
+    let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+    assert_eq!(listed, serde_json::json!([]));
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -3077,12 +9661,141 @@ async fn test_strict_script_rejects_length_truncated_turn() {
             .code(2)
             .stdout(predicate::str::contains("partial answer"))
             .stderr(predicate::str::contains(
-                "strict scripted turn failed: model output was truncated",
+                "strict scripted turn failed: model output hit the gateway's length limit",
+            ))
+            .stderr(predicate::str::contains(
+                "retry with an explicit larger --max-output-tokens <n>",
             ))
             .stderr(predicate::str::contains("kitsu-context-rollback"));
     })
     .await
     .expect("join");
+}
+
+/// A user-selected output cap is already known when the provider returns
+/// finish_reason=length. Preserve strict exit/disposition semantics, but turn
+/// that value into an exact retry action in human and JSONL modes.
+#[tokio::test]
+#[serial]
+async fn test_prompt_length_limit_names_current_cap_and_retry_value() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "partial but useful"},
+                "finish_reason": "length"
+            }],
+            "usage": {"prompt_tokens": 8, "completion_tokens": 12, "total_tokens": 20}
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut human = base_cmd(&home_path);
+        let output = human
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "--max-output-tokens",
+                "12",
+                "-p",
+                "give a long answer",
+            ])
+            .output()
+            .expect("run capped human prompt");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stdout.contains("partial but useful"), "{stdout}");
+        assert!(
+            stdout.contains("[truncated: model output length limit reached]"),
+            "{stdout}"
+        );
+        assert!(
+            stderr.contains("assistant output above is provisional and was not committed"),
+            "{stderr}"
+        );
+        assert!(stderr.contains("hit --max-output-tokens 12"), "{stderr}");
+        assert!(
+            stderr.contains("retry with --max-output-tokens 24 or higher"),
+            "{stderr}"
+        );
+        assert!(!stderr.contains("DISCARDED"), "{stderr}");
+        let timing = stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .expect("failed model command ends with a timing receipt");
+        let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
+        assert_eq!(timing["status"], "error");
+
+        let mut jsonl = base_cmd(&home_path);
+        let output = jsonl
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--max-output-tokens",
+                "12",
+                "-p",
+                "give a long answer",
+            ])
+            .output()
+            .expect("run capped JSONL prompt");
+        assert_eq!(output.status.code(), Some(2), "{output:?}");
+        assert!(output.stderr.is_empty(), "{:?}", output.stderr);
+        let events = String::from_utf8(output.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let assistant = events
+            .iter()
+            .find(|event| event["type"] == "assistant")
+            .expect("partial assistant event");
+        assert!(assistant["text"]
+            .as_str()
+            .unwrap()
+            .contains("partial but useful"));
+        let disposition = events
+            .iter()
+            .find(|event| event["type"] == "assistant_disposition")
+            .expect("discarded disposition");
+        assert_eq!(disposition["status"], "discarded");
+        assert!(disposition["reason"]
+            .as_str()
+            .unwrap()
+            .contains("--max-output-tokens 24 or higher"));
+        let error = events
+            .iter()
+            .find(|event| event["type"] == "error")
+            .expect("strict error event");
+        assert_eq!(error["exit_code"], 2);
+        assert!(error["message"]
+            .as_str()
+            .unwrap()
+            .contains("hit --max-output-tokens 12"));
+        assert_eq!(events.last().unwrap()["status"], "error");
+        assert!(events.last().unwrap()["duration_ms"].is_u64());
+    })
+    .await
+    .expect("capped prompt processes should join");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    for request in requests {
+        let body: serde_json::Value = serde_json::from_slice(&request.body).unwrap();
+        assert_eq!(body["max_tokens"], 12);
+    }
+    server.verify().await;
 }
 
 #[tokio::test]
@@ -3184,6 +9897,10 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
             summary["policy_failures"],
             u64::from(expected_kind == "policy")
         );
+        assert_eq!(summary["tool_errors"], 1);
+        assert_eq!(summary["policy_errors"], expected_policy_errors);
+        assert_eq!(summary["recovered_tool_errors"], 0);
+        assert_eq!(summary["recovered_policy_errors"], 0);
         server.verify().await;
     }
 
@@ -3720,6 +10437,7 @@ async fn test_top_level_review_is_verified_tool_free_and_jsonl_framed() {
     fs::write(repo.path().join("review-me.rs"), "fn reviewed() {}\n").unwrap();
     let home = TempDir::new().unwrap();
     write_config(home.path(), &server.uri());
+    let last_message = home.path().join("review-last-message.txt");
 
     let mut human = base_cmd(home.path());
     human
@@ -3748,6 +10466,8 @@ async fn test_top_level_review_is_verified_tool_free_and_jsonl_framed() {
             "example",
             "--jsonl",
             "--no-stream",
+            "--output-last-message",
+            &last_message.to_string_lossy(),
             "review",
             "--instructions",
             "focus on public API compatibility",
@@ -3768,6 +10488,63 @@ async fn test_top_level_review_is_verified_tool_free_and_jsonl_framed() {
         .collect::<Vec<_>>();
     assert_eq!(events[0]["type"], "run_started");
     assert_eq!(events[0]["mode"], "review");
+    let disclosures = events
+        .iter()
+        .enumerate()
+        .filter(|(_, event)| event["type"] == "review_disclosure")
+        .collect::<Vec<_>>();
+    assert_eq!(
+        disclosures.len(),
+        1,
+        "top-level review must disclose its one bounded evidence payload exactly once: {events:#?}"
+    );
+    let (disclosure_index, disclosure) = disclosures[0];
+    let turn_index = events
+        .iter()
+        .position(|event| event["type"] == "turn_started")
+        .expect("review turn_started");
+    let provider_index = events
+        .iter()
+        .position(|event| event["type"] == "provider_request")
+        .expect("review provider_request");
+    assert!(
+        disclosure_index < turn_index && turn_index < provider_index,
+        "disclosure must precede the turn that sends the evidence: {events:#?}"
+    );
+    assert_eq!(disclosure["source"], "top_level_review");
+    assert_eq!(disclosure["target"], "working_tree");
+    assert_eq!(disclosure["resolved_revision"], serde_json::Value::Null);
+    assert_eq!(disclosure["merge_base"], serde_json::Value::Null);
+    assert_eq!(disclosure["truncated"], false);
+    assert_eq!(disclosure["model_disclosed"], true);
+    assert_eq!(disclosure["model_read_root_granted"], false);
+    assert!(disclosure["evidence_bytes"].as_u64().unwrap() > 0);
+    let output_index = events
+        .iter()
+        .position(|event| event["type"] == "output_last_message")
+        .expect("review final-output receipt");
+    let turn_finished_index = events
+        .iter()
+        .position(|event| event["type"] == "turn_finished")
+        .expect("review turn_finished");
+    assert!(turn_finished_index < output_index && output_index < events.len() - 1);
+    assert_eq!(
+        events[output_index]["destination"],
+        last_message.to_string_lossy().as_ref()
+    );
+    assert_eq!(
+        events[output_index]["bytes"],
+        "verified review complete".len()
+    );
+    assert_eq!(
+        events[output_index]["sha256"],
+        "3035ffbf3e7292f9a007c48056376c72f73ee5377f2d533916934223b2a3f7ce"
+    );
+    assert_eq!(events[output_index]["model_write_authority"], false);
+    assert_eq!(
+        fs::read(&last_message).unwrap(),
+        b"verified review complete"
+    );
     assert_eq!(events.last().unwrap()["type"], "final_summary");
     assert_eq!(events.last().unwrap()["status"], "ok");
 
@@ -3786,6 +10563,16 @@ async fn test_top_level_review_is_verified_tool_free_and_jsonl_framed() {
             .unwrap();
         assert!(prompt.contains("review-me.rs"));
         assert!(prompt.contains("focus on public API compatibility"));
+        let disclosed_diff = prompt
+            .split_once("```diff\n")
+            .and_then(|(_, rest)| rest.split_once("\n```"))
+            .map(|(diff, _)| diff)
+            .expect("verified review diff block");
+        assert_eq!(
+            disclosure["evidence_bytes"].as_u64().unwrap(),
+            disclosed_diff.len() as u64,
+            "receipt byte count must describe the exact diff sent to the provider"
+        );
     }
 }
 
@@ -3918,6 +10705,707 @@ async fn test_jsonl_command_exec_reports_native_metadata_and_retains_private_art
     assert_eq!(events.last().unwrap()["status"], "ok");
 }
 
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_no_artifacts_command_keeps_inline_receipt_without_creating_generation() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let tool_args = serde_json::json!({
+        "argv": ["/bin/echo", "KITSU_INLINE_ONLY"],
+        "cwd": work.path().to_string_lossy(),
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "inline_command",
+                        "type": "function",
+                        "function": {"name": "command_exec", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "inline command checked"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let allow_command = serde_json::to_string(&vec![
+        "/bin/echo".to_string(),
+        "KITSU_INLINE_ONLY".to_string(),
+    ])
+    .unwrap();
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "--no-stream",
+            "--no-artifacts",
+            "chat",
+            "--no-session",
+            "--enable-commands",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "--allow-command",
+            &allow_command,
+            "run the approved command",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let run = &events[0];
+    assert_eq!(run["type"], "run_started");
+    assert_eq!(run["artifact_policy"]["mode"], "disabled");
+    assert_eq!(run["artifact_policy"]["source"], "cli");
+    assert_eq!(
+        run["artifact_policy"]["new_automatic_artifact_writes"],
+        false
+    );
+    assert_eq!(run["artifact_policy"]["command_output_persistence"], false);
+    assert_eq!(
+        run["artifact_policy"]["model_artifact_read_root_granted"],
+        false
+    );
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("native tool_finished event");
+    assert_eq!(finished["artifact_status"], "suppressed_by_policy");
+    assert_eq!(finished["output_bytes"], 18);
+    assert_eq!(finished["output_retained_bytes"], 18);
+    assert_eq!(finished["output_truncated"], false);
+    assert_eq!(
+        finished["command"]["artifact_status"],
+        "suppressed_by_policy"
+    );
+    assert!(finished["command"].get("artifact").is_none());
+    assert!(finished["command"].get("artifact_error").is_none());
+    assert_eq!(events.last().unwrap()["status"], "ok");
+    assert!(
+        !home.path().join(".kitsu/artifacts").exists(),
+        "artifact-free stateless command run created an artifact namespace"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let final_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert!(final_body["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .any(|message| message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("KITSU_INLINE_ONLY"))));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_no_artifacts_bounds_large_read_and_multibyte_command_output_inline() {
+    use std::os::unix::fs::PermissionsExt as _;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    fn utf8_tail_boundary_stress(total_bytes: usize, glyph: &str, fill: u8) -> Vec<u8> {
+        let tail_boundary = total_bytes - 32 * 1024;
+        let glyph_start = tail_boundary - 1;
+        let mut bytes = vec![fill; total_bytes];
+        bytes[glyph_start..glyph_start + glyph.len()].copy_from_slice(glyph.as_bytes());
+        let text = std::str::from_utf8(&bytes).expect("fixture remains valid UTF-8");
+        assert!(
+            !text.is_char_boundary(tail_boundary),
+            "the retained tail must begin inside a multibyte scalar"
+        );
+        bytes
+    }
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let input = work.path().join("large-read.txt");
+    fs::write(
+        &input,
+        format!(
+            "READ_HEAD{}READ_CENTER_MUST_BE_OMITTED{}READ_TAIL",
+            "r".repeat(5_800),
+            "s".repeat(5_800)
+        ),
+    )
+    .unwrap();
+
+    let stdout_bytes = utf8_tail_boundary_stress(106_062, "🦊", b'o');
+    let stderr_bytes = utf8_tail_boundary_stress(105_051, "界", b'e');
+    fs::write(work.path().join("stdout.bin"), &stdout_bytes).unwrap();
+    fs::write(work.path().join("stderr.bin"), &stderr_bytes).unwrap();
+    let emitter = work.path().join("emit-large-output.sh");
+    fs::write(
+        &emitter,
+        "#!/bin/sh\n/bin/cat stdout.bin\n/bin/cat stderr.bin >&2\n",
+    )
+    .unwrap();
+    fs::set_permissions(&emitter, fs::Permissions::from_mode(0o700)).unwrap();
+
+    let read_args = serde_json::json!({"path": input}).to_string();
+    let command_argv = vec![emitter.to_string_lossy().to_string()];
+    let command_args = serde_json::json!({
+        "argv": command_argv,
+        "cwd": work.path(),
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"large_command\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "large outputs stayed bounded"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"large_read\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "large_command",
+                        "type": "function",
+                        "function": {"name": "command_exec", "arguments": command_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "large_read",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let allow_command = serde_json::to_string(&command_argv).unwrap();
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(work.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "--no-stream",
+            "--no-artifacts",
+            "--context-window",
+            "262144",
+            "--max-rounds",
+            "4",
+            "chat",
+            "--no-session",
+            "--allow-path",
+            &work.path().to_string_lossy(),
+            "--enable-commands",
+            "--command-root",
+            &work.path().to_string_lossy(),
+            "--allow-command",
+            &allow_command,
+            "read the fixture, run the approved emitter, and report completion",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let read = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished" && event["name"] == "fs_read_file")
+        .expect("large read completion");
+    assert_eq!(read["artifact_status"], "suppressed_by_policy");
+    assert_eq!(read["output_truncated"], true);
+    assert!(read["output_bytes"].as_u64().unwrap() > 11_600);
+    assert!(read["output_retained_bytes"].as_u64().unwrap() <= 8 * 1024);
+
+    let command = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished" && event["name"] == "command_exec")
+        .expect("large command completion");
+    assert_eq!(command["artifact_status"], "suppressed_by_policy");
+    assert_eq!(command["output_bytes"], 106_062 + 105_051);
+    assert_eq!(command["output_retained_bytes"], 2 * 64 * 1024);
+    assert_eq!(command["output_truncated"], true);
+    assert_eq!(command["command"]["stdout_bytes"], 106_062);
+    assert_eq!(command["command"]["stderr_bytes"], 105_051);
+    assert_eq!(command["command"]["stdout_retained_bytes"], 64 * 1024);
+    assert_eq!(command["command"]["stderr_retained_bytes"], 64 * 1024);
+    assert_eq!(command["command"]["stdout_truncated"], true);
+    assert_eq!(command["command"]["stderr_truncated"], true);
+    assert_eq!(command["command"]["stdout_capture_complete"], true);
+    assert_eq!(command["command"]["stderr_capture_complete"], true);
+    assert_eq!(
+        command["command"]["artifact_status"],
+        "suppressed_by_policy"
+    );
+    assert!(command["command"].get("artifact").is_none());
+    assert!(command["command"].get("artifact_error").is_none());
+    assert_eq!(events.last().unwrap()["status"], "ok");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let read_request: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let read_content = read_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "large_read")
+        .and_then(|message| message["content"].as_str())
+        .expect("bounded read result in second request");
+    assert!(read_content.contains("bytes omitted by artifact-free policy"));
+    assert!(!read_content.contains("READ_CENTER_MUST_BE_OMITTED"));
+    let command_request: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    let command_content = command_request["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["tool_call_id"] == "large_command")
+        .and_then(|message| message["content"].as_str())
+        .expect("bounded command result in final request");
+    let command_payload: serde_json::Value = serde_json::from_str(command_content).unwrap();
+    assert_eq!(command_payload["stdout_bytes"], 106_062);
+    assert_eq!(command_payload["stderr_bytes"], 105_051);
+    assert!(command_payload["stdout"]
+        .as_str()
+        .unwrap()
+        .contains("bytes omitted"));
+    assert!(command_payload["stderr"]
+        .as_str()
+        .unwrap()
+        .contains("bytes omitted"));
+    assert!(
+        !home.path().join(".kitsu/artifacts").exists(),
+        "artifact-free command run created a global artifact namespace"
+    );
+    assert!(
+        !home.path().join(".kitsu/sessions").exists(),
+        "stateless artifact-free run created a session sidecar namespace"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_no_artifacts_bounds_large_tool_result_and_saves_session_without_sidecar() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let input = work.path().join("large.txt");
+    fs::write(
+        &input,
+        format!(
+            "HEAD{}CENTER_MUST_BE_OMITTED{}TAIL",
+            "a".repeat(6_000),
+            "b".repeat(6_000)
+        ),
+    )
+    .unwrap();
+    let read_args = serde_json::json!({"path": input.to_string_lossy()}).to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "large_read",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"large_read\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "large read checked"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "--no-stream",
+            "--no-artifacts",
+            "chat",
+            "--session",
+            "--allow-path",
+            &work.path().to_string_lossy(),
+        ])
+        .write_stdin("inspect the large file\n")
+        .output()
+        .unwrap();
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty());
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let finished = events
+        .iter()
+        .find(|event| event["type"] == "tool_finished")
+        .expect("tool completion");
+    assert_eq!(finished["artifact_status"], "suppressed_by_policy");
+    assert_eq!(finished["output_truncated"], true);
+    assert!(finished["output_bytes"].as_u64().unwrap() > 12_000);
+    assert!(finished["output_retained_bytes"].as_u64().unwrap() <= 8 * 1024);
+    assert_eq!(events.last().unwrap()["status"], "ok");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let second: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    let tool_content = second["messages"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|message| message["role"] == "tool")
+        .and_then(|message| message["content"].as_str())
+        .expect("bounded tool result in second request");
+    assert!(tool_content.contains("bytes omitted by artifact-free policy"));
+    assert!(!tool_content.contains("CENTER_MUST_BE_OMITTED"));
+
+    let sessions = home.path().join(".kitsu/sessions");
+    let entries = fs::read_dir(&sessions)
+        .unwrap()
+        .map(|entry| entry.unwrap().path())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        entries
+            .iter()
+            .filter(|path| path
+                .extension()
+                .is_some_and(|extension| extension == "json"))
+            .count(),
+        1,
+        "durable session snapshot should still be saved"
+    );
+    assert!(
+        entries.iter().all(|path| !path
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy()
+            .ends_with(".artifacts")),
+        "artifact-free durable session created an artifact sidecar: {entries:?}"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_no_artifacts_resume_keeps_historical_pointer_but_grants_no_artifact_root() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    const FIRST_PROMPT: &str = "HISTORICAL_ARTIFACT_POINTER_731";
+    const RESUME_PROMPT: &str = "RESUME_WITHOUT_NEW_ARTIFACTS_947";
+
+    fn snapshot_tree(root: &Path) -> Vec<(String, bool, Vec<u8>)> {
+        fn visit(root: &Path, current: &Path, out: &mut Vec<(String, bool, Vec<u8>)>) {
+            let mut entries = fs::read_dir(current)
+                .unwrap()
+                .map(|entry| entry.unwrap().path())
+                .collect::<Vec<_>>();
+            entries.sort();
+            for entry in entries {
+                let relative = entry
+                    .strip_prefix(root)
+                    .unwrap()
+                    .to_string_lossy()
+                    .to_string();
+                if entry.is_dir() {
+                    out.push((relative, true, Vec::new()));
+                    visit(root, &entry, out);
+                } else {
+                    out.push((relative, false, fs::read(&entry).unwrap()));
+                }
+            }
+        }
+
+        let mut snapshot = Vec::new();
+        visit(root, root, &mut snapshot);
+        snapshot
+    }
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().unwrap();
+    let input = work.path().join("historical-large.txt");
+    fs::write(
+        &input,
+        format!("HISTORICAL_HEAD{}HISTORICAL_TAIL", "h".repeat(20_000)),
+    )
+    .unwrap();
+    let read_args = serde_json::json!({"path": input}).to_string();
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(RESUME_PROMPT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "resumed without new artifacts"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"tool_call_id\":\"historical_read\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "historical artifact saved"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(5)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains(FIRST_PROMPT))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "historical_read",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let first = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--session",
+            "--allow-path",
+            &work.path().to_string_lossy(),
+            FIRST_PROMPT,
+        ])
+        .output()
+        .unwrap();
+    assert!(first.status.success(), "{first:?}");
+    assert!(first.stderr.is_empty(), "{first:?}");
+    let first_events = String::from_utf8(first.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let historical = first_events
+        .iter()
+        .find(|event| event["type"] == "tool_finished" && event["name"] == "fs_read_file")
+        .expect("historical offload receipt");
+    assert_eq!(historical["artifact_status"], "retained");
+    assert!(historical["output"]
+        .as_str()
+        .unwrap()
+        .contains("full result saved to"));
+    let session_id = first_events.last().unwrap()["session_id"]
+        .as_str()
+        .expect("durable historical session")
+        .to_string();
+    let sidecar = home
+        .path()
+        .join(".kitsu/sessions")
+        .join(format!("{session_id}.artifacts"));
+    assert!(sidecar.is_dir(), "missing historical sidecar: {sidecar:?}");
+    let before = snapshot_tree(&sidecar);
+    assert!(
+        before
+            .iter()
+            .any(|(_, is_dir, bytes)| !is_dir && !bytes.is_empty()),
+        "historical sidecar should contain the offloaded result: {before:?}"
+    );
+
+    let resumed = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "--no-stream",
+            "--no-artifacts",
+            "chat",
+            "--resume",
+            &session_id,
+            "--allow-path",
+            &work.path().to_string_lossy(),
+            RESUME_PROMPT,
+        ])
+        .output()
+        .unwrap();
+    assert!(resumed.status.success(), "{resumed:?}");
+    assert!(resumed.stderr.is_empty(), "{resumed:?}");
+    let resumed_events = String::from_utf8(resumed.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let run = &resumed_events[0];
+    assert_eq!(run["type"], "run_started");
+    assert_eq!(run["artifact_policy"]["mode"], "disabled");
+    assert_eq!(run["artifact_policy"]["source"], "cli");
+    assert_eq!(
+        run["artifact_policy"]["new_automatic_artifact_writes"],
+        false
+    );
+    assert_eq!(run["artifact_policy"]["existing_artifacts_unchanged"], true);
+    assert_eq!(
+        run["artifact_policy"]["model_artifact_read_root_granted"],
+        false
+    );
+    assert_eq!(snapshot_tree(&sidecar), before);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 3);
+    let body: serde_json::Value = serde_json::from_slice(&requests[2].body).unwrap();
+    let messages = body["messages"].as_array().unwrap();
+    let system = messages
+        .iter()
+        .find(|message| message["role"] == "system")
+        .and_then(|message| message["content"].as_str())
+        .expect("refreshed system instruction");
+    assert!(
+        system.contains("No new saved full-output path is created"),
+        "{system}"
+    );
+    assert!(
+        system.contains("historical artifact pointers may remain in resumed context"),
+        "{system}"
+    );
+    assert!(
+        system.contains("no managed artifact read root is granted"),
+        "{system}"
+    );
+    assert!(
+        !system.contains("do not claim a saved full-output path exists"),
+        "{system}"
+    );
+    assert!(
+        messages.iter().any(|message| message["role"] == "tool"
+            && message["content"]
+                .as_str()
+                .is_some_and(|content| content.contains("full result saved to"))),
+        "historical pointer was removed from resumed context: {messages:?}"
+    );
+    assert!(
+        !home.path().join(".kitsu/artifacts").exists(),
+        "artifact-free resume created a new global artifact namespace"
+    );
+    server.verify().await;
+}
+
 #[test]
 fn test_project_context_source_is_disclosed_and_can_be_disabled() {
     let home = TempDir::new().expect("temp home");
@@ -3992,6 +11480,180 @@ fn test_unknown_script_command_is_echoed_suggested_and_nonzero() {
         .stderr(predicate::str::contains("typo.txt:1"));
 }
 
+#[test]
+fn test_jsonl_unknown_script_commands_keep_actionable_host_hints() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("jsonl-typos.txt");
+    fs::write(&script_path, "/statsu\n/definitely-not-a-command-123456\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run JSONL typo script");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let errors = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 2, "{events:#?}");
+    assert_eq!(errors[0]["line"], 1);
+    assert_eq!(errors[0]["command"], "/statsu");
+    assert_eq!(
+        errors[0]["message"],
+        "unknown command: /statsu - did you mean /status?"
+    );
+    assert_eq!(errors[1]["line"], 2);
+    assert_eq!(errors[1]["command"], "/definitely-not-a-command-123456");
+    assert_eq!(
+        errors[1]["message"],
+        "unknown command: /definitely-not-a-command-123456 (try /help)"
+    );
+    assert!(errors
+        .iter()
+        .all(|error| error["kind"] == "user" && error["exit_code"] == 1));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 2);
+    assert_eq!(summary["user_failures"], 2);
+    assert_eq!(summary["successful_operations"], 0);
+
+    // A summary-only consumer must not count `/quit` merely because its
+    // command frame finished `ok`: only `/status` is a successful operation.
+    let partial_script = home.path().join("jsonl-partial-typo.txt");
+    fs::write(&partial_script, "/status\n/statsu\n/quit\n").unwrap();
+    let partial = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &partial_script.to_string_lossy(),
+            "--allow-turn-errors",
+            "--no-session",
+        ])
+        .output()
+        .expect("run accepted-partial JSONL typo script");
+    assert!(partial.status.success(), "{partial:?}");
+    assert!(partial.stderr.is_empty(), "{partial:?}");
+    let partial_events = String::from_utf8(partial.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let partial_summary = partial_events.last().expect("partial final summary");
+    assert_eq!(partial_summary["type"], "final_summary");
+    assert_eq!(partial_summary["status"], "partial");
+    assert_eq!(partial_summary["failures"], 1);
+    assert_eq!(partial_summary["user_failures"], 1);
+    assert_eq!(partial_summary["successful_operations"], 1);
+}
+
+#[test]
+fn test_missing_checkpoint_keeps_actionable_host_hint_in_jsonl_and_human_scripts() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("missing-checkpoint.txt");
+    fs::write(&script_path, "/checkpoints\n/checkpoint 54007\n/quit\n").unwrap();
+    let message =
+        "checkpoint #54007 is not available; run /checkpoints to list recoverable checkpoints";
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run missing-checkpoint JSONL script");
+    assert_eq!(jsonl.status.code(), Some(1), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "error",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[2]["result"]["kind"], "checkpoints");
+    assert_eq!(events[2]["result"]["count"], 0);
+    assert_eq!(events[5]["line"], 2);
+    assert_eq!(events[5]["command"], "/checkpoint 54007");
+    assert_eq!(events[5]["kind"], "user");
+    assert_eq!(events[5]["message"], message);
+    assert_eq!(events[5]["exit_code"], 1);
+    assert_eq!(events[6]["status"], "error");
+    assert_eq!(events[9]["status"], "error");
+    assert_eq!(events[9]["failures"], 1);
+    assert_eq!(events[9]["user_failures"], 1);
+    assert_eq!(events[9]["successful_operations"], 1);
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+
+    let human = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run missing-checkpoint human script");
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}:2: {message}", script_path.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("command failed: /checkpoint 54007"));
+}
+
 /// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is
 /// intercepted with a close-match suggestion and an escape hatch, instead of
 /// being silently queued as a prompt.
@@ -4017,6 +11679,95 @@ fn test_queue_subaction_typo_suggests_close_match_instead_of_queueing() {
         .stderr(predicate::str::contains("did you mean '/queue list'"))
         .stderr(predicate::str::contains("/queue add lst"))
         .stderr(predicate::str::contains("1 / 8 prompts queued").not());
+}
+
+#[test]
+fn test_scripted_queue_command_reports_queue_specific_recovery() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("scripted-queue.txt");
+    fs::write(&script_path, "/status\n/queue list\n/quit\n").unwrap();
+    let message = "queue commands require interactive chat; put prompts on later script lines";
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--allow-turn-errors",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run scripted queue JSONL case");
+    assert!(jsonl.status.success(), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "error",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[5]["line"], 2);
+    assert_eq!(events[5]["command"], "/queue list");
+    assert_eq!(events[5]["kind"], "user");
+    assert_eq!(events[5]["message"], message);
+    assert_eq!(events[5]["exit_code"], 1);
+    assert_eq!(events[6]["status"], "error");
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "partial");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["user_failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(summary["session_snapshot_state"], "disabled");
+    assert!(summary["session_id"].is_null());
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+
+    let human = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--allow-turn-errors",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run scripted queue human case");
+    assert!(human.status.success(), "{human:?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}:2: {message}", script_path.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("session commands require interactive chat"));
 }
 
 #[test]
@@ -4323,9 +12074,10 @@ auth = {{ method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }}
         cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
         cmd.assert()
             .success()
-            .stderr(predicate::str::contains("alpha-model"))
+            .stderr(predicate::str::contains("* alpha-model (current)"))
             .stderr(predicate::str::contains("beta-model"))
-            .stderr(predicate::str::contains("2 model(s)"));
+            .stderr(predicate::str::contains("2 model(s)"))
+            .stderr(predicate::str::contains("switch with: /model <id>"));
     })
     .await
     .expect("join");
@@ -4449,6 +12201,33 @@ auth = {{ method = "none" }}
     assert_eq!(error["kind"], "provider");
     assert_eq!(error["exit_code"], 2);
     assert!(error["message"].as_str().unwrap().contains("HTTP 503"));
+    let kinds = events
+        .iter()
+        .map(|event| event["type"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        kinds,
+        [
+            "run_started",
+            "command_started",
+            "provider_request",
+            "provider_attempt",
+            "error",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[2]["line"], 1);
+    assert_eq!(events[2]["command"], "/models");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[2]["message_count"], 0);
+    assert_eq!(events[2]["tools_offered"], 0);
+    assert_eq!(events[3]["line"], 1);
+    assert_eq!(events[3]["command"], "/models");
+    assert_eq!(events[3]["purpose"], "model_catalog");
+    assert_eq!(events[3]["category"], "unavailable");
+    assert_eq!(events[3]["status"], 503);
+    assert_eq!(events[3]["outcome"], "rejected");
     let summary = events.last().unwrap();
     assert_eq!(summary["type"], "final_summary");
     assert_eq!(summary["provider_failures"], 1);
@@ -4587,13 +12366,24 @@ auth = {{ method = "none" }}
         [
             "run_started",
             "command_started",
+            "provider_request",
+            "provider_attempt",
             "error",
             "command_finished",
             "final_summary",
         ]
     );
-    assert_eq!(events[3]["status"], "cancelled");
-    assert_eq!(events[4]["status"], "cancelled");
+    assert_eq!(events[2]["line"], 1);
+    assert_eq!(events[2]["command"], "/models");
+    assert_eq!(events[2]["purpose"], "model_catalog");
+    assert_eq!(events[3]["line"], 1);
+    assert_eq!(events[3]["command"], "/models");
+    assert_eq!(events[3]["purpose"], "model_catalog");
+    assert_eq!(events[3]["category"], "cancelled");
+    assert_eq!(events[3]["status"], serde_json::Value::Null);
+    assert_eq!(events[3]["outcome"], "cancelled");
+    assert_eq!(events[5]["status"], "cancelled");
+    assert_eq!(events[6]["status"], "cancelled");
 }
 
 /// `/context` prints the model, resolved window, and a per-category breakdown —
@@ -5012,7 +12802,7 @@ async fn test_durable_script_save_failure_finalizes_earlier_background_work_befo
     let spawn_args = serde_json::json!({"task": "durable background task"}).to_string();
     let command_args = serde_json::json!({
         "argv": chmod_argv,
-        "cwd": home.path(),
+        "cwd": sessions_dir.to_string_lossy(),
     })
     .to_string();
     Mock::given(method("POST"))
@@ -5051,12 +12841,15 @@ async fn test_durable_script_save_failure_finalizes_earlier_background_work_befo
 
     let script = home.path().join("durable-save-failure.script");
     fs::write(&script, "start work before the durable save\n").unwrap();
-    let allow_command = serde_json::to_string(&vec![
-        "/bin/chmod".to_string(),
-        "0500".to_string(),
-        sessions_dir.to_string_lossy().into_owned(),
-    ])
-    .unwrap();
+    let allow_command = serde_json::json!({
+        "argv": [
+            "/bin/chmod",
+            "0500",
+            sessions_dir.to_string_lossy().into_owned(),
+        ],
+        "cwd": sessions_dir.to_string_lossy(),
+    })
+    .to_string();
     let mut cmd = base_cmd(home.path());
     let output = cmd
         .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
@@ -5071,7 +12864,7 @@ async fn test_durable_script_save_failure_finalizes_earlier_background_work_befo
             "--allow-turn-errors",
             "--enable-commands",
             "--command-root",
-            &home.path().to_string_lossy(),
+            &sessions_dir.to_string_lossy(),
             "--allow-command",
             &allow_command,
             "--script",
@@ -5127,6 +12920,21 @@ async fn test_durable_script_save_failure_finalizes_earlier_background_work_befo
     assert_eq!(events[summary_index]["failures"], 1);
     assert_eq!(events[summary_index]["provider_failures"], 0);
     assert_eq!(events[summary_index]["user_failures"], 1);
+    assert!(events[summary_index]["session_id"].is_null());
+    assert_eq!(
+        events[summary_index]["session_snapshot_state"],
+        "pending_until_first_success"
+    );
+    let mut sessions = base_cmd(home.path());
+    let listed = sessions
+        .args(["sessions", "--json"])
+        .output()
+        .expect("list sessions after pre-install save failure");
+    assert!(listed.status.success(), "{listed:?}");
+    assert_eq!(
+        serde_json::from_slice::<serde_json::Value>(&listed.stdout).unwrap(),
+        serde_json::json!([])
+    );
     server.verify().await;
 }
 

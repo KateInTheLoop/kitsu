@@ -24,7 +24,8 @@ use std::time::Instant;
 
 use futures::StreamExt;
 use kitsu_core::{
-    run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent, SpawnBudget,
+    bound_inline_output, run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent,
+    ArtifactStoragePolicy, SpawnBudget,
 };
 use kitsu_providers::{
     ChatMessage, Provider, ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError,
@@ -1192,6 +1193,9 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
             ProviderError::ToolsNotSupported => AgentFailureClass::ProviderToolsUnsupported,
             ProviderError::Auth(_) => AgentFailureClass::ProviderAuthConfiguration,
         },
+        AgentError::ToolCallDuringToolFreeFinalization => {
+            AgentFailureClass::ProviderInvalidResponse
+        }
         AgentError::Loop(_) => AgentFailureClass::AgentLoop,
         AgentError::ContextOverflow { .. } => AgentFailureClass::ContextOverflow,
         AgentError::ContextWindowUnknown => AgentFailureClass::ContextWindowUnknown,
@@ -1224,6 +1228,10 @@ fn safe_subagent_error(error: &AgentError) -> String {
             }
             ProviderError::Auth(_) => "provider credentials are not configured".to_string(),
         },
+        AgentError::ToolCallDuringToolFreeFinalization => {
+            "model returned a tool call during tool-free structured finalization; no tool was executed"
+                .to_string()
+        }
         AgentError::Loop(_) => "agent loop failed".to_string(),
         AgentError::ContextOverflow {
             required,
@@ -1323,6 +1331,15 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
         AgentRuntimeEvent::ProviderRequest { round, .. } => {
             telemetry.record_activity(format!("provider request round {round}"));
         }
+        AgentRuntimeEvent::StructuredFinalizationDeferred {
+            repair_round,
+            targets,
+            ..
+        } => telemetry.record_activity(format!(
+            "structured finalization deferred to repair {} target{} in round {repair_round}",
+            targets.len(),
+            if targets.len() == 1 { "" } else { "s" }
+        )),
         AgentRuntimeEvent::ProviderAttempt {
             attempt,
             max_attempts,
@@ -1405,6 +1422,8 @@ async fn run_subagent_report_with_progress<P: Provider>(
     progress: Option<(Arc<AgentRegistry>, u64)>,
     mut thread_runtime: Option<AgentThreadRuntime>,
 ) -> SubagentRunReport {
+    let bound_registry_result =
+        progress.is_some() && cfg.artifact_policy == ArtifactStoragePolicy::InlineOnly;
     let mut system = SUBAGENT_SYSTEM.to_string();
     if !extra_system.is_empty() {
         system.push_str("\n\n");
@@ -1464,7 +1483,11 @@ async fn run_subagent_report_with_progress<P: Provider>(
     let failure_class = outcome.as_ref().err().map(classify_agent_error);
     let telemetry = summarize_events(cfg.model.clone(), event_log.take(), failure_class);
     let result = match outcome {
-        Ok(text) if !text.trim().is_empty() => Ok(text),
+        Ok(text) if !text.trim().is_empty() => Ok(if bound_registry_result {
+            bound_inline_output(text).content
+        } else {
+            text
+        }),
         Ok(_) => Ok("(subagent returned no result)".to_string()),
         Err(error) => Err(safe_subagent_error(&error)),
     };
@@ -2227,6 +2250,10 @@ mod tests {
                     success: true,
                     cancelled: false,
                     output: "SECRET_OUTPUT".to_string(),
+                    output_bytes: 13,
+                    output_retained_bytes: 13,
+                    output_truncated: false,
+                    artifact_status: kitsu_core::ToolArtifactStatus::NotNeeded,
                     command: None,
                 },
                 AgentRuntimeEvent::ToolFinished {
@@ -2236,6 +2263,10 @@ mod tests {
                     success: false,
                     cancelled: false,
                     output: "ANOTHER_SECRET".to_string(),
+                    output_bytes: 14,
+                    output_retained_bytes: 14,
+                    output_truncated: false,
+                    artifact_status: kitsu_core::ToolArtifactStatus::NotNeeded,
                     command: None,
                 },
                 AgentRuntimeEvent::TurnFinished {
@@ -2354,8 +2385,12 @@ mod tests {
                         AgentRuntimeEvent::ProviderRequest {
                             round: 1,
                             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+                            model: Some("live-model".to_string()),
                             message_count: 2,
                             tools_offered: 1,
+                            structured_output: false,
+                            request_timeout_ms: None,
+                            turn_remaining_ms: None,
                         },
                     );
                     running_registry.record_progress_event(

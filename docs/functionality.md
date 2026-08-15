@@ -1,6 +1,6 @@
 # Kitsu — supported functionality
 
-> Status: 2026-08-11. This is a source- and test-backed description of the
+> Status: 2026-08-13. This is a source- and test-backed description of the
 > current CLI. Hosted-provider availability, credentials, billing, and the
 > quality of a particular model remain external to this contract.
 
@@ -9,23 +9,79 @@ top-level entry points are:
 
 | Command | Behavior |
 |---|---|
+| `kitsu` | Default interactive chat entry point. |
+| `kitsu -p <prompt>` | Top-level one-shot prompt shorthand; stream the answer and exit. |
 | `kitsu init [--path PATH]` | No-clobber, credential-free starter config creation. |
-| `kitsu doctor [--online]` | Read-only config/auth/context/state/tool-policy diagnostics; network checks are opt-in. |
+| `kitsu doctor [--online\|--inference]` | Offline config/auth/context/state/tool-policy diagnostics by default. `--online` performs a non-billable catalog-only check; `--inference` sends one explicitly labeled, potentially billable, tool-free completion. |
+| `kitsu auth <login\|status\|logout>` | Provider-free, config-scoped managed bearer credentials. Login uses hidden TTY input or explicit `--token-stdin`; status is secret-free; logout removes only the managed value. |
 | `kitsu ask <prompt>` | One checked model turn; streaming by default. |
 | `kitsu review [path]` | One tool-free turn over host-verified working/staged/unstaged/base/commit evidence, with optional JSONL and session continuity. |
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
-| `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`. |
+| `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`; fork receipts identify the exact resolved source session. |
 | `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
 See the [README CLI reference](../README.md#cli-reference) for every flag and
 gateway recipe.
 
+Chat, review, and model-catalog provider work validates its local credential
+source before loading project context, registering tools, emitting run-start
+telemetry, or contacting a gateway. Missing or malformed credentials are
+user/configuration errors (exit `1`), and configured recovery prose is shown
+only after terminal sanitization, length bounding, and credential-pattern
+filtering.
+
+Connection failures are provider errors (exit `2`) and never interpolate the
+provider's URL/body detail. When the selected profile is named or flavored
+`ollama` and its configured URL host is structurally loopback (`localhost`, a
+`127.0.0.0/8` address, or `::1`), the bounded remedy identifies local Ollama,
+suggests starting or verifying `ollama serve`, and offers another gateway as an
+alternative. Non-loopback and non-Ollama profiles retain the generic gateway,
+network-access, availability, and `doctor --online` guidance. In JSONL mode the
+same scoped failure adds `diagnostic_code: "local_ollama_unreachable"` and
+bounded recovery-action enums, so automation does not need to parse prose;
+generic connection failures omit those optional fields.
+
+JSONL catalog discovery does not hide its network lifecycle. Top-level
+`kitsu models` and scripted `/models` or `/model ...` emit a logical
+`provider_request` with `purpose: "model_catalog"`; each uncached physical GET
+then emits one bounded, secret-free `provider_attempt` before the catalog or
+typed error. Top-level events use `operation_id: "models:1"`, while scripted
+events keep their command line and text. A provider-local cache hit emits no
+attempt because it performs no send.
+
+For `bearer-env`, a non-empty configured environment value wins over the
+managed credential. A malformed/non-Unicode environment value fails closed and
+never falls back. Managed values are bounded, atomically replaced, `0600`
+single-link files below a `0700` config-scoped namespace. Auth management never
+contacts the provider or reports a token, length, hash, or path; only
+`doctor --inference` checks remote validity. Developer-command roots that
+intersect the managed namespace are rejected before a model turn. Login also
+requires an absolute `HOME`, so a credential is never written to temporary
+fallback state.
+
+`doctor --inference` is the readiness gate for unattended hosted-provider
+work. It sends one non-streaming request with no tools, no project context, one
+short user message, and a one-token output cap. Its JSON report uses
+`online.scope = "chat_inference"`, sets `chat_route_probed`, `request_sent`, and
+`potentially_billable` explicitly, and classifies authentication, forbidden
+access, billing, model/route rejection, quota, timeout, and transport failures
+without echoing provider response bodies. It conflicts with catalog-only
+`--online`, so every invocation has one unambiguous network scope.
+
 ## Chat interface
 
 Interactive chat uses normal terminal scrollback rather than an alternate-screen
 TUI. Rustyline supplies history, editing keys, bracketed multi-line paste, and
-Tab completion. `/help` and completion share one command registry. `@path`
+Tab completion. Typing `/` opens a bounded, bordered palette below the input;
+typing narrows it and Tab completes. Rich mode uses a colored Unicode boundary,
+while `NO_COLOR` keeps Rustyline with an uncolored ASCII boundary. `/help`, the
+palette, and completion share one command registry. A persistent composer footer
+shows the active model and the launch directory; it reads the shared live model
+state, so `/model` updates it on the next redraw. Both composer surfaces use
+Unicode display-cell widths, cap at 70 columns, and shrink to the live terminal
+width. Below 42 terminal columns, the palette drops descriptions and keeps only
+command syntax so boundaries do not wrap. `@path`
 completion is additionally restricted to already granted, non-protected paths
 and refuses symlink-directory traversal.
 
@@ -33,7 +89,8 @@ The implemented chat controls include:
 
 - Inspection: `/status`, `/context [refresh]`, `/permissions`, `/tools`, scoped
   `/diff`, `/checkpoints`, `/checkpoint <id>`, `/jobs`, `/agent`, `/profiles`,
-  `/artifacts`, and `/sessions`.
+  `/artifacts`, and `/sessions [filter]`; session filters match IDs, names, and
+  previews case-insensitively.
 - Model/context: `/model`, `/models`, `/reasoning`, `/compact`, `/clear`, and
   `/retry`.
 - Files/workflow: `/allow`, `/allow-write`, `/allow-read-write`,
@@ -52,6 +109,10 @@ The implemented chat controls include:
   <prompt>` (2-20, via the bounded prompt queue; interactive chat only).
 - Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
   `/restore`, and `/delete`.
+
+JSONL `/help` exposes the same complete command registry as human help. Every
+command object includes `alias_of`: the canonical command name for aliases such
+as `/agents` and `/quit`, or `null` for canonical commands.
 
 `/status` reports the active session, endpoint, model, directory/Git state,
 project-context source, context usage, tool and permission state, command roots,
@@ -78,6 +139,9 @@ the queue is full, the collector waits for a slot rather than evicting work. A
 `/steer <correction>` line uses a separate turn-scoped channel: it rolls back the
 partial conversation, retains/reports completed file effects, and restarts that
 turn before queued follow-ups. Corrections never become later prompts implicitly.
+Script files have no live input queue: put follow-up prompts on later non-slash
+lines. A scripted `/queue` command fails as a user error with that recovery hint
+instead of being mislabeled as a session-management command.
 
 Automatic type-ahead collection is not implemented on non-Unix platforms.
 `/queue <prompt>` still works there when the normal prompt is available, but text
@@ -90,6 +154,12 @@ needed. The launch directory is read-granted; writes begin ungranted. Scripted
 and piped runs advertise filesystem capabilities only when corresponding
 `--allow-path`, `--allow-write`, or `--allow-read-write` roots were supplied.
 `--allow-write` is write-only; the combined flag is required for readback.
+`chat --no-tools` removes every model-facing filesystem, command, skill-loader,
+and agent tool for the invocation while retaining client-side context,
+explicitly preloaded skills, attachments, and session continuity. It conflicts
+with write and command capability flags so a grant is never silently ignored.
+`--allow-path` remains compatible to authorize client-side project-context or
+attachment reads in scripted and piped chat without advertising read tools.
 `--yes` suppresses prompts while preserving current-root confinement and never
 creates a capability. Only `--dangerously-allow-all-filesystem` bypasses roots
 for enabled filesystem tools, and protected Kitsu-private paths still win.
@@ -106,6 +176,14 @@ prompter; ungranted background work fails closed without racing foreground
 stdin.
 
 - `fs_read_file`, `fs_list_dir`, and `repo_grep` inspect granted paths.
+  On Unix, `repo_grep` is an always-available in-process UTF-8 content search:
+  it traverses pinned no-symlink handles in deterministic order and applies
+  global match, file, scanned-byte, time, and output bounds. It accepts regular
+  expressions by default or exact text with `literal: true`; reaching a bound
+  produces an explicit truncation receipt rather than a silent partial result.
+  Hidden entries and files larger than 1 MiB are skipped. Non-Unix builds use
+  the fixed-argv `rg` fallback until an equivalent no-reparse walker exists and
+  omit the tool when that dependency is unavailable.
 - `fs_write_file` performs a bounded whole-file create/replace.
 - `fs_edit_file` is advertised only when both read and write capabilities are
   present. It replaces exact UTF-8 `old_text`; the precondition must match
@@ -114,8 +192,9 @@ stdin.
 - Successful model writes are grouped into checkpoints. Kitsu reports bounded,
   snapshot-derived unified diffs and an exact recovery command. `/checkpoints`
   lists them, `/checkpoint <id>` previews one, and `/undo [id]` restores the
-  selected checkpoint only when its files still match. Undo is blocked while
-  background agents are active.
+  selected checkpoint only when its files still match. A missing checkpoint
+  retains the host-authored `/checkpoints` recovery hint in both human and
+  JSONL script output. Undo is blocked while background agents are active.
 - `/diff` derives bounded working/staged/unstaged+untracked/base/commit/checkpoint
   evidence from Git, the journal, and filesystem. `/review` submits exactly that
   evidence in a no-tools turn. `kitsu review` is the one-shot automation surface.
@@ -127,6 +206,10 @@ stdin.
   perform one bounded disclosure of that diff to the provider and say so
   (`~ disclosing N bytes …; no read root granted`). `/permissions` reports the
   evidence root, its private exclusions, and that it is not a model read root.
+  In JSONL mode, top-level `kitsu review` emits one typed `review_disclosure`
+  after `run_started` and before `turn_started`, recording the scope, byte
+  count, truncation state, and absence of a model read grant without repeating
+  the diff body.
   This differs from `@file` attachments, which do consume model read authority
   because their scope is user-nameable.
 
@@ -135,7 +218,9 @@ registers `command_exec`; roots come from `--command-root` or the launch
 directory. It accepts a literal argv array and an explicit cwd—never a shell
 string—and returns bounded stdout/stderr plus exit, signal, timeout, truncation,
 elapsed-time metadata, safe head/tail previews, and a retained protected `0600`
-full-output artifact. The completed serialized artifact is capped at 16 MiB,
+full-output artifact by default. Inline-only artifact policy retains the same
+bounded previews and counters but deliberately creates no full-output file. The
+completed serialized artifact is capped at 16 MiB,
 including JSONL framing and hex expansion; it reports separately how many raw
 stdout/stderr bytes were retained, marks truncation, and keeps draining both
 child pipes. Interactive invocations have their own approval
@@ -189,6 +274,15 @@ switch or exit. Scripted JSONL emits the same retained evidence as
 `background_result`; an unacknowledged failed detached job makes strict
 automation fail.
 
+One per-turn spawn budget covers synchronous `spawn_agent`, parallel
+`spawn_agents`, and detached `spawn_agent_bg` calls. It defaults to eight in
+interactive chat and two in scripted or piped automation, and can be overridden
+by `--agent-spawn-cap` or `agent_spawn_cap` in config. A zero cap unregisters
+all four multi-agent schemas, including `agent_result`, so `/tools`, the system
+prompt, `provider_request.tools_offered`, and the actual provider body agree
+that multi-agent work is disabled; unrelated filesystem, command, skill, and
+workspace-evidence tools remain available.
+
 ### `@file` attachments
 
 Prompts may contain `@path`, `@path:line`, `@path:start-end`, or
@@ -212,7 +306,9 @@ Snapshots contain the conversation/tool transcript, not credentials or runtime
 permission grants. `--no-session` disables both snapshots and prompt history.
 It does not discard full-output artifacts from explicitly approved developer
 commands: those remain in a unique protected runtime-state directory so a
-one-shot command never reports a dead recovery path.
+one-shot command never reports a dead recovery path. `--no-artifacts` is the
+separate storage control; combine both flags for session-stateless automation
+with no new automatic command/tool-result files.
 
 Scripted and piped chat are stateless by default. `--session` explicitly
 creates a durable conversation, and `--resume [id|name|last|auto]` resumes and
@@ -223,13 +319,24 @@ session, `kitsu sessions rename <id|name> [name]` names, renames, or clears
 one at rest, and names resolve anywhere a resume selector is accepted. Names
 are 1-40 characters of letters, digits, `-` or `_`; `last`, `auto`, and
 id-shaped (`s-…`) values are reserved, and duplicates are refused so a name
-never becomes ambiguous. Each successful automation turn is
+never becomes ambiguous. Forks receive a fresh id and no name, preserving the
+source name as its unique resume selector until the user explicitly names the
+fork. Each successful automation turn is
 saved before the next one; a save failure makes the automation command fail.
 `--resume` already implies `--session`, so passing both explicitly is a
 harmless no-op confirmation rather than an error; `--no-session` conflicts
 with both continuity forms. Resume/new-session
 boundaries drop runtime grants and restore current invocation roots; no saved
 session can restore authority.
+`/clear` uses the same authority boundary but preserves history first: it saves
+the active durable transcript, atomically acquires a fresh unnamed session ID,
+then clears context, background-result state, write checkpoints, and runtime
+grants. A save or lease failure leaves the old ID and in-memory context
+untouched. Human output names both IDs and preserved counts; scripted JSONL
+emits a typed `clear_session_boundary` command result. The prior ID remains
+resumable, while the fresh ID is `pending_until_first_success` until a model
+turn publishes it. Under `--no-session`, the receipt explicitly reports that
+discarded in-memory history was not saved.
 A newly requested durable session is not published until its first successful
 model turn or a slash command that changes durable conversation/model state.
 Failed, empty, and query-only starts therefore cannot displace a productive
@@ -257,8 +364,10 @@ error.
   `chat.md.artifacts`) and rewrites exact exported pointers to that sidecar.
   Existing primary or sidecar destinations are refused.
 - `/archive` and `/restore` move inactive snapshots and their artifacts through
-  recoverable private archive storage. `/delete` requires an exact inactive live
-  ID and permanently removes its validated snapshot/artifacts.
+  recoverable private archive storage. Archived snapshots are absent from the
+  live inventory and cannot be resumed until `/restore <exact-id>` (or
+  `kitsu sessions restore <exact-id>`) succeeds. `/delete` requires an exact
+  inactive live ID and permanently removes its validated snapshot/artifacts.
 - Leases prevent concurrent activation or lifecycle mutation of the same saved
   session. Lifecycle commands reject symlinked or irregular private entries.
 
@@ -272,6 +381,20 @@ are never trusted. Chat startup sweeps only provably empty orphans (including
 sidecars whose session never committed a snapshot) and otherwise prints a
 threshold notice rather than deleting anything. In-session `/artifacts` reports
 what other runs left on disk alongside this session's own usage.
+
+Global `--no-artifacts`, or top-level config `artifact_storage = false`, selects
+an inline-only run policy. It creates no command-output sink, offload generation,
+or durable-session artifact sidecar; skips automatic orphan sweeping; and never
+grants the model a managed artifact read root. Commands retain their bounded
+stdout/stderr previews and keep draining to completion. Oversized generic and
+background-agent results are reduced to a deterministic UTF-8-safe head/tail
+representation that states original, retained, and omitted raw byte counts; no
+pointer implies recoverability. Existing sidecars/pointers remain byte-unchanged
+but receive no read grant in that run. Sessions, managed credentials, `-o`,
+schema inputs, required-write files, explicit model writes, and explicit
+lifecycle/export commands are outside this automatic-storage policy.
+`/status`, `/permissions`, `/artifacts`, doctor JSON, and JSONL
+`run_started.artifact_policy` disclose the effective mode and source.
 
 ## Context management
 
@@ -291,10 +414,17 @@ resolves the new model's window before switching; a CLI/profile-pinned window is
 kept. `/context refresh` explicitly refreshes unpinned metadata, preserves the
 current known window when discovery fails, and reports cache-write status.
 
+Human catalog views are bounded to 12 rows and pin the exact active model before
+the alphabetical preview, matching the footer's current state even when a large
+catalog would otherwise hide it. Filter hints use the correct top-level or slash
+syntax. Redirected top-level stdout and JSONL keep every normalized matching ID
+for automation; a missing configured model still does not block discovery.
+
 The context meter estimates cold requests structurally, then anchors subsequent
 estimates on real provider `prompt_tokens`. It includes tool schemas and reserves
 reply space. Large successful tool results are stored as private artifacts with
-a re-readable pointer and preview. Under pressure Kitsu elides old tool bodies,
+a re-readable pointer and preview by default; inline-only artifact policy keeps
+an explicitly lossy bounded head/tail preview instead. Under pressure Kitsu elides old tool bodies,
 then drops or summarizes eligible whole exchanges while preserving the leading
 system context and two newest exchanges. Every concrete provider request gets a
 final local fit check; protected recent context that cannot fit returns an
@@ -331,6 +461,91 @@ line: run/turn/command framing, provider/tool/usage events, assistant text,
 typed errors, and exactly one `final_summary`. It rejects interactive TTY chat
 and human help/version output. Human diagnostics may still use stderr, but the
 event stream contains enough status and counters to determine the run outcome.
+Top-level verified review additionally emits one `review_disclosure` before
+its turn starts, so automation can audit the provider disclosure without
+parsing the raw prompt.
+`-o/--output-last-message <PATH>` gives non-interactive ask, review, piped chat,
+and scripted chat a separate host-owned final-answer artifact without changing
+stdout. After model and background work ends, Kitsu atomically installs the
+exact bytes of the last fully committed assistant message (`0600` on Unix); a
+script selects its last committed turn. Discarded, cancelled, blank,
+length-limited, and committed-partial responses never replace the destination.
+JSONL emits one body-free `output_last_message` receipt after the selected turn
+and before `final_summary`, including the exact byte count and SHA-256 plus an
+explicit `model_write_authority: false`. The destination is excluded from model
+filesystem tools and cannot intersect Kitsu's protected config/state namespace.
+`--output-schema <PATH>` adds fail-closed structured output to those same four
+automation surfaces. Kitsu accepts one regular, non-symlink schema file up to
+64 KiB, validates its supported strict-object shape before provider contact,
+sends it through the OpenAI-compatible `json_schema` response format, and then
+validates the exact terminal assistant text locally. Only valid JSON matching
+the schema can receive a committed disposition or replace `-o`; malformed,
+fenced, or mismatched output is discarded and exits `2`. The source file is
+protected from model filesystem tools and must be outside any enabled command
+or read-only runtime root. JSONL emits a body-free `output_schema` preflight
+receipt and marks constrained provider requests with `structured_output: true`.
+Schema-rejection errors carry the exact schema SHA-256, instance path, and
+validation keyword; `final_summary.output_schema_failures` counts this subset
+of `provider_failures` without changing the existing outcome classification.
+Scripted and piped chat also accept repeatable `--require-write <PATH>`
+completion assertions. The option grants no authority and therefore requires
+the exact resolved path to be inside an explicit filesystem write root. If a
+target already exists, it must also have model read authority (normally from
+`--allow-read-write`, or a matching `--allow-path` plus `--allow-write`);
+otherwise Kitsu exits before provider contact because safe replacement needs
+the prior contents. Write-only authority remains sufficient for creating an
+absent target. Kitsu
+adds the resolved targets to the system instruction, then after joined model
+and background work verifies a retained filesystem-tool journal mutation, a
+net content change from process launch, and an unchanged latest post-write
+identity/content snapshot. A missing effect is a user/postcondition failure
+(exit `1`) that never installs `-o`; `--allow-turn-errors` does not waive it.
+JSONL brackets the run with `completion_postcondition` armed/evaluated receipts
+and exposes the additive `final_summary.postcondition_failures` subset of
+`user_failures`.
+Repeatable `--require-write-sha256 <PATH=64HEX>` strengthens that same contract
+with an exact final raw-byte digest. It grants no authority, uses the final `=`
+as its delimiter (so paths may contain `=`), accepts case-insensitive hex and
+normalizes it lowercase, and retains every ordinary journal/net-change/read
+requirement. Malformed or conflicting canonical expectations and an existing
+target already equal to its expected digest fail before provider contact. The
+evaluated digest is derived from the same descriptor-pinned postimage used to
+verify the latest journal write, rather than a second pathname open. A mismatch
+is a non-waivable user/postcondition failure (exit `1`), preserves the observed
+filesystem effect, and withholds `-o`. JSONL exposes additive expectation and
+match fields. Because this check finalizes the whole run after turns and joined
+background work, a durable transcript that was already committed can remain
+resumable for correction while `final_summary.status` truthfully remains
+`error`.
+When `--output-schema` is paired with either required-write flag, at least two model
+rounds are required. Kitsu omits the provider response format while tools are
+offered, treats a no-tool action response as provisional, then withholds tools
+and applies the strict schema to one reserved finalization round. The action and
+final rounds stay inside the same whole-turn timeout and `--max-rounds` cap.
+Before consuming the finalizer, Kitsu reuses the descriptor-pinned active-turn
+journal observation for exact-SHA requirements. If an otherwise valid model
+write has the wrong digest and both a repair round and the reserved finalizer
+remain, Kitsu emits `structured_finalization_deferred` and keeps the existing
+tools available with a bounded host correction containing expected/actual
+digests. The correction grants no authority. It may repeat only while the
+existing round budget can still reserve finalization; exhaustion preserves the
+ordinary finalization and terminal postcondition failure. Missing or
+unverifiable writes do not trigger this eager gate.
+The provisional assistant, repair correction, and host-authored finalization
+nudge are provider-only request scaffolding that is removed before conversation
+state is committed, so one submitted prompt remains one durable user turn. Real
+tool calls/results and the committed final assistant remain resumable. The final
+locally valid answer still cannot replace `-o` unless the independent
+required-write evaluation succeeds. A native tool call returned after tools are
+withheld is never executed; the provider-class failure carries the safe typed
+cause `tool_call_during_tool_free_finalization` instead of suggesting a generic
+gateway-compatibility problem.
+`final_summary.duration_ms` is a monotonic process-entry-to-summary duration on
+success, error, and cancellation; consumers do not need an external timer.
+Its `*_failures` counters classify failed requested operations/turns, while
+`tool_errors` counts individual foreground tool-call errors, `policy_errors`
+is its authority-denial subset, and `recovered_*` identifies errors belonging
+to turns that ultimately committed.
 Error events distinguish user/provider/cancelled failures, ordinary tool
 failures, and local policy denials. Status, permissions, context, diff, model,
 compaction, session-inventory, skill, and job commands return typed
@@ -339,16 +554,39 @@ compaction, session-inventory, skill, and job commands return typed
 pending-until-first-success, and immediately resumable continuity. Resuming
 always rebuilds the leading system context from the current project, skills,
 tools, model, and permission surface instead of trusting a stale saved system
-message.
+message. `final_summary` repeats the terminal snapshot state and includes a
+session ID only when that state is `resumable`; a planned ID whose first turn
+failed remains visible for correlation in `run_started` but is never presented
+as a resumable terminal destination.
+
+Length-limited strict turns keep their partial assistant text visible but roll
+back and exit `2`. When the request used `--max-output-tokens N`, human errors
+and JSONL disposition reasons name the current value and suggest retrying with
+`2N` or higher. If the gateway supplied the limit, the recovery text instead
+asks for an explicit larger `--max-output-tokens <n>`. The JSONL terminal status
+remains `discarded`; recovery guidance does not weaken the commit contract.
+Likewise, an empty or whitespace-only terminal assistant message is an
+incomplete model turn, never evidence that a tool workflow finished. Strict
+ask/review/piped/script runs discard it and exit `2`; interactive chat rolls it
+back, preserves `/retry`, and reports any completed filesystem effects that
+remain on disk. Empty intermediate assistant content attached to real tool
+calls remains valid.
 
 For one-shot chat, `--timeout-secs` is one deadline across piped-input reading,
 attachment preflight, retries, response-body streaming, and the model turn. A
 positional prompt is consumed immediately and never waits for an unrelated open
-stdin handle. Script file acquisition is also bounded; each scripted turn keeps
-its documented request deadline.
+stdin handle. Script file acquisition is also bounded. Each scripted turn gets
+one inference deadline across all of its provider and tool rounds; a tool call
+does not reset the timer before the follow-up provider request.
 
-Without JSONL, stdout contains assistant text only. Human metadata is on stderr;
-redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
+Without JSONL, stdout contains assistant text only. Human metadata is on stderr.
+Inference-capable commands end with elapsed time: terminals receive a compact
+secondary status row, while redirected runs receive
+`kitsu-timing: {"duration_ms":...,"status":"..."}`. The status is `ok`,
+`partial`, `error`, or `cancelled`; accepted partial scripts use `partial` even
+though `--allow-turn-errors` preserves exit code `0`. Redirected turns retain
+the existing stable `kitsu-usage:` and `kitsu-context:` records. Provider-free
+management commands remain free of the timing receipt.
 
 | Exit | Meaning |
 |---:|---|
@@ -359,15 +597,24 @@ redirected turns retain stable `kitsu-usage:` and `kitsu-context:` records.
 
 ## Terminal and portability notes
 
-`KITSU_PLAIN=1`, `NO_COLOR=1`, or `TERM=dumb` selects plain rendering.
-Renderer-owned banners, progress, context tables, telemetry, tool activity, and
-approval prompts then use ASCII structural markers without ANSI/OSC styling.
-The interactive prompt uses canonical line input without raw mode, cursor
-control, bracketed-paste negotiation, completion, or history editing; notices
-are deferred until a line returns. Model output is always stripped of terminal
-control strings, but arbitrary safe Unicode in model text, paths, and user data
-is preserved. `KITSU_REDUCED_MOTION=1` uses a visible static status instead of
-the animated spinner.
+`--plain`/`KITSU_PLAIN=1`, `--screen-reader`/`KITSU_SCREEN_READER=1`, and
+`TERM=dumb` select plain rendering plus literal canonical line input. The input
+path uses no raw mode, cursor control, bracketed-paste negotiation, completion,
+or history editing; notices are deferred until a line returns. It is
+intentionally line-oriented: each newline submits a turn instead of preserving
+a pasted multi-line draft as one prompt. `--screen-reader` is the discoverable
+assistive-technology contract; `--plain` remains suitable for stable terminal
+transcripts.
+
+`NO_COLOR=1` selects the same ASCII, no-animation rendering but does not change
+the rich Rustyline editor, so history, completion, and bracketed multi-line paste
+continue to work; the automatic slash palette and persistent model/directory
+footer remain available with ASCII boundaries. Literal plain/screen-reader
+input omits both cursor-controlled surfaces and keeps `/help` available. In
+every mode, model output is stripped of terminal control
+strings while arbitrary safe Unicode in model text, paths, and user data is
+preserved. `--reduced-motion`/`KITSU_REDUCED_MOTION=1` uses a visible static
+status instead of the animated spinner.
 
 Linux builds additionally use mandatory Bubblewrap command containment.
 Unix builds use descriptor-bound command cwd, process-group command cancellation,
