@@ -3,7 +3,8 @@
 //! append results → repeat until the model stops or a cap is hit.
 
 use crate::context::{
-    estimate_str, message_tokens, ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
+    clamp_window_for_shortfall, estimate_str, message_tokens, ContextBudget, ContextMeter,
+    CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
 };
 use futures::StreamExt;
 use kitsu_providers::{
@@ -795,6 +796,13 @@ pub struct ContextWindowEvidence {
     pub resolved_window: u64,
     /// The one-time warning for this evidence has already been emitted.
     pub warned: bool,
+    /// Number of shortfall hits recorded for THIS `resolved_window` (>= 1).
+    /// Resets to 1 whenever the resolved window changes (see the recording
+    /// site in `run_agent_turn_inner`). P6: once this reaches 2 (two-strike
+    /// rule), [`clamp_window_for_shortfall`] clamps the EFFECTIVE SESSION
+    /// BUDGET fed to [`ContextBudget::new`] toward `reported_prompt_tokens` —
+    /// `resolved_window` itself is never rewritten, only the derived budget.
+    pub shortfall_count: u32,
 }
 
 /// Truncation heuristic for [`ContextWindowEvidence`]. Estimates are chars/4
@@ -956,7 +964,12 @@ where
             turn_usage.total_tokens,
         ));
         let context = cfg.context_window.map(|window| {
-            let budget = ContextBudget::new(window, cfg.max_tokens);
+            // P6: report the effective budget actually gating requests, not the
+            // raw resolved window, once shortfall evidence has clamped it.
+            let budget = ContextBudget::new(
+                effective_budget_window(window, state.window_evidence),
+                cfg.max_tokens,
+            );
             (state.meter.estimate(messages), budget.effective, window)
         });
         if result.is_ok() {
@@ -1095,6 +1108,7 @@ where
             round,
             CompactionReason::ContextTargetExceeded,
             false,
+            *window_evidence,
         )
         .await?;
 
@@ -1113,7 +1127,7 @@ where
         // edit adds another message or tool mutation between compaction and
         // request construction, this check fails locally instead of leaking an
         // oversized request to the gateway.
-        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter)?;
+        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter, *window_evidence)?;
         // Token-denominated estimate of the request being sent, kept so the
         // usage report below can be cross-checked against what left the door.
         let sent_estimate_tokens =
@@ -1199,16 +1213,30 @@ where
                     if let (Some(window), Some(sent_estimate)) =
                         (cfg.context_window, sent_estimate_tokens)
                     {
-                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window)
-                            && window_evidence
-                                .map_or(true, |evidence| evidence.resolved_window != window)
-                        {
-                            *window_evidence = Some(ContextWindowEvidence {
-                                reported_prompt_tokens: u.prompt_tokens,
-                                estimated_sent_tokens: sent_estimate,
-                                resolved_window: window,
-                                warned: false,
-                            });
+                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window) {
+                            match window_evidence {
+                                // Same resolved window as the last shortfall: count this
+                                // as another strike (P6 two-strike rule) and refresh the
+                                // reported numbers to the latest observation.
+                                Some(evidence) if evidence.resolved_window == window => {
+                                    evidence.shortfall_count =
+                                        evidence.shortfall_count.saturating_add(1);
+                                    evidence.reported_prompt_tokens = u.prompt_tokens;
+                                    evidence.estimated_sent_tokens = sent_estimate;
+                                }
+                                // First shortfall ever, or the resolved window changed
+                                // (new gateway/model/`--context-window`): start a fresh
+                                // strike count for the new window.
+                                _ => {
+                                    *window_evidence = Some(ContextWindowEvidence {
+                                        reported_prompt_tokens: u.prompt_tokens,
+                                        estimated_sent_tokens: sent_estimate,
+                                        resolved_window: window,
+                                        warned: false,
+                                        shortfall_count: 1,
+                                    });
+                                }
+                            }
                         }
                     }
                     if let Some(log) = &cfg.event_log {
@@ -1497,6 +1525,7 @@ where
                     tools,
                     messages,
                     cfg,
+                    *window_evidence,
                 )
             };
             if let Some(mut summary) = summary {
@@ -2170,6 +2199,22 @@ fn structural_request_bytes(messages: &[ChatMessage], schema_json: &str, has_sch
         }
 }
 
+/// The window this session should actually budget requests against right now:
+/// the resolved `window`, clamped by [`clamp_window_for_shortfall`] once P6's
+/// two-strike rule is satisfied for shortfall evidence recorded against this
+/// SAME resolved window (a stale `window_evidence` from a since-changed window
+/// is ignored). Pure read — never mutates `window` or the evidence; the
+/// resolved window and config stay exactly what they always were, only the
+/// number handed to [`ContextBudget::new`] adapts.
+fn effective_budget_window(window: u64, window_evidence: Option<ContextWindowEvidence>) -> u64 {
+    match window_evidence {
+        Some(ev) if ev.resolved_window == window => {
+            clamp_window_for_shortfall(window, ev.reported_prompt_tokens, ev.shortfall_count)
+        }
+        _ => window,
+    }
+}
+
 fn request_measurement(
     messages: &[ChatMessage],
     cfg: &AgentConfig,
@@ -2177,6 +2222,7 @@ fn request_measurement(
     has_schema: bool,
     max_tokens: Option<u32>,
     meter: &ContextMeter,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> RequestMeasurement {
     if let Some(window) = cfg.context_window {
         let schema_tokens = if has_schema {
@@ -2193,7 +2239,11 @@ fn request_measurement(
             } else {
                 schema_tokens
             };
-        let budget = ContextBudget::new(window, max_tokens);
+        // P6: budget against the clamped effective window (if repeated shortfall
+        // evidence earned one), not necessarily the raw resolved window. `window`
+        // itself — reported below as the resolved model window — is untouched.
+        let budget =
+            ContextBudget::new(effective_budget_window(window, window_evidence), max_tokens);
         RequestMeasurement {
             used,
             target: budget.target,
@@ -2235,6 +2285,7 @@ fn ensure_chat_request_fits(
     req: &ChatRequest,
     cfg: &AgentConfig,
     meter: &ContextMeter,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Result<RequestMeasurement, AgentError> {
     let has_schema = req.tools.as_ref().is_some_and(|tools| !tools.is_empty());
     let schema_json = req
@@ -2249,6 +2300,7 @@ fn ensure_chat_request_fits(
         has_schema,
         req.max_tokens,
         meter,
+        window_evidence,
     ))
 }
 
@@ -2286,6 +2338,7 @@ where
         1,
         CompactionReason::ManualRequest,
         true,
+        state.window_evidence,
     )
     .await
 }
@@ -2320,6 +2373,7 @@ where
         1,
         CompactionReason::ContextTargetExceeded,
         false,
+        None,
     )
     .await
 }
@@ -2352,6 +2406,7 @@ async fn enforce_context_budget_recording<P>(
     round: u32,
     reason: CompactionReason,
     force: bool,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Result<CompactionReport, AgentError>
 where
     P: Provider,
@@ -2365,6 +2420,7 @@ where
         has_schema,
         cfg.max_tokens,
         meter,
+        window_evidence,
     );
     let mut progress = CompactionProgress::default();
 
@@ -2422,6 +2478,7 @@ where
             has_schema,
             cfg.max_tokens,
             meter,
+            window_evidence,
         );
         let record = record_progress(
             ledger,
@@ -2516,6 +2573,7 @@ where
                     meter,
                     &mut progress,
                     round,
+                    window_evidence,
                 )
                 .await?;
             }
@@ -2540,6 +2598,7 @@ where
         has_schema,
         cfg.max_tokens,
         meter,
+        window_evidence,
     ))?;
     Ok(CompactionReport {
         changed: record.is_some(),
@@ -2681,10 +2740,19 @@ fn truncate_middle_to_bytes(text: &str, max_bytes: usize) -> String {
 fn bounded_summary_request(
     cfg: &AgentConfig,
     old_messages: &[ChatMessage],
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Option<(ChatRequest, bool)> {
     let window = cfg.context_window?;
     let max_tokens = summary_max_tokens(window, cfg.max_tokens)?;
-    let target = ContextBudget::new(window, Some(max_tokens)).target;
+    // P6: the compaction summarizer's own outbound request must fit inside the
+    // same clamped session budget as everything else — a resolved-window-sized
+    // summary target would re-risk the exact truncation this clamp exists to
+    // prevent.
+    let target = ContextBudget::new(
+        effective_budget_window(window, window_evidence),
+        Some(max_tokens),
+    )
+    .target;
     // Budget the request in TOKEN space, not a flat bytes/CHARS_PER_TOKEN
     // guess, so the request this function hands back is actually estimated at
     // or under `target` once built (message_tokens is what `ensure_chat_-
@@ -2789,6 +2857,7 @@ async fn summarize_or_fallback<P>(
     meter: &mut ContextMeter,
     progress: &mut CompactionProgress,
     round: u32,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Result<(), AgentError>
 where
     P: Provider,
@@ -2800,14 +2869,18 @@ where
     let fallback = if *failures >= MAX_COMPACT_FAILURES {
         Some(SummaryFallbackReason::CircuitBreaker)
     } else {
-        match bounded_summary_request(cfg, &messages[span.prefix_end..span.recent_start]) {
+        match bounded_summary_request(
+            cfg,
+            &messages[span.prefix_end..span.recent_start],
+            window_evidence,
+        ) {
             None => Some(SummaryFallbackReason::RequestTooLarge),
             Some((req, shortened)) => {
                 progress.summary_input_shortened = shortened;
                 // This is a provider request in its own right. Check the concrete
                 // bounded request immediately before crossing the boundary.
                 let cold_meter = ContextMeter::new();
-                if ensure_chat_request_fits(&req, cfg, &cold_meter).is_err() {
+                if ensure_chat_request_fits(&req, cfg, &cold_meter, window_evidence).is_err() {
                     Some(SummaryFallbackReason::RequestTooLarge)
                 } else {
                     if let Some(log) = &cfg.event_log {
@@ -3080,11 +3153,23 @@ pub struct RunTallies {
 /// with a 500-char preview only starves the model (cycle-15 headline: a
 /// 131k-window turn lost a 1828-line read at 1.5k tokens used, then answered
 /// honestly from the preview and was blamed for fabricating).
-fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) -> bool {
+fn offload_pressure(
+    messages: &[ChatMessage],
+    content: &str,
+    cfg: &AgentConfig,
+    window_evidence: Option<ContextWindowEvidence>,
+) -> bool {
     let Some(window) = cfg.context_window else {
         return true; // unknown window: keep the old conservative behavior
     };
-    let effective = ContextBudget::new(window, cfg.max_tokens).effective;
+    // P6: offload against the clamped effective budget once shortfall evidence
+    // has earned one, so a session pinned to a too-large resolved window still
+    // starts offloading at the REAL usable threshold instead of the stale one.
+    let effective = ContextBudget::new(
+        effective_budget_window(window, window_evidence),
+        cfg.max_tokens,
+    )
+    .effective;
     let used: u64 = messages.iter().map(message_tokens).sum();
     let added = estimate_str(content);
     used.saturating_add(added).saturating_mul(2) > effective
@@ -3101,13 +3186,14 @@ fn maybe_offload_for_tools(
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> (String, Option<std::path::PathBuf>) {
     let can_read = tools.is_registered("fs_read_file")
         && tools
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_read_file");
-    if !can_read || !offload_pressure(messages, &content, cfg) {
+    if !can_read || !offload_pressure(messages, &content, cfg, window_evidence) {
         return (content, None);
     }
     maybe_offload(content, call_id, dir)

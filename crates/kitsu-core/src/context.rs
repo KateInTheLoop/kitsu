@@ -40,6 +40,13 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 8_192;
 /// Always leave at least this many tokens for the model's reply.
 pub const MIN_OUTPUT_RESERVE: u64 = 512;
 
+/// Smallest window a shortfall clamp may set. Even with strong evidence that
+/// the server truncates to `reported` tokens, never budget below this floor:
+/// it must still fit a minimal system+user turn plus the reply reserve, and a
+/// pathological `reported` value (e.g. a gateway that bills instead of
+/// counting) must not strand the session at a zero-sized budget.
+pub const MIN_VIABLE_WINDOW_FLOOR: u64 = 2_048;
+
 /// Token estimate for a string with `ascii` ASCII chars and `non_ascii`
 /// multibyte chars at the given ASCII chars-per-token rate. Non-ASCII text
 /// (CJK etc.) tokenizes at roughly one token per char, so it is counted
@@ -305,6 +312,37 @@ impl ContextBudget {
     }
 }
 
+/// Compute the window a caller should feed to [`ContextBudget::new`] given
+/// repeated evidence that the server truncates to a smaller real window.
+///
+/// Two-strike rule: a single shortfall (`shortfall_count < 2`) never clamps —
+/// token estimates are heuristic, so one odd usage report is not actionable.
+/// From the second shortfall for the SAME resolved window onward, the session
+/// budget is clamped to `reported.max(MIN_VIABLE_WINDOW_FLOOR)`, provided
+/// `reported` passes the same plausibility guard the orchestrator's
+/// `context_window_shortfall` uses (`reported * 4 >= resolved_window`): when
+/// the implied real window is under a quarter of the resolved one, the far
+/// likelier story is the chars/4 estimator overshooting an accurate tokenizer,
+/// not a clamped server.
+///
+/// Pure: takes its inputs by value and returns a new number. Nothing here
+/// holds or rewrites the resolved window or config — the caller decides what
+/// to pass to `ContextBudget::new`.
+pub fn clamp_window_for_shortfall(
+    resolved_window: u64,
+    reported: u64,
+    shortfall_count: u32,
+) -> u64 {
+    if shortfall_count < 2 {
+        return resolved_window;
+    }
+    let plausible_clamp = reported.saturating_mul(4) >= resolved_window;
+    if !plausible_clamp {
+        return resolved_window;
+    }
+    reported.max(MIN_VIABLE_WINDOW_FLOOR)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -377,6 +415,45 @@ mod tests {
         assert_eq!(b.assistant, 4);
         assert_eq!(b.tool_results, 6);
         assert_eq!(b.total(), 19);
+    }
+
+    #[test]
+    fn shortfall_single_strike_never_clamps() {
+        // One shortfall is heuristic noise; the resolved window is unchanged.
+        assert_eq!(clamp_window_for_shortfall(8_192, 4_096, 1), 8_192);
+    }
+
+    #[test]
+    fn shortfall_two_strikes_clamp_to_reported_with_floor() {
+        // Second shortfall for the same window: budget against the reported
+        // real window (above the floor), strictly below the resolved window.
+        let clamped = clamp_window_for_shortfall(8_192, 4_096, 2);
+        assert_eq!(clamped, 4_096);
+        assert!(clamped < 8_192);
+        // A reported value below the floor clamps to the floor, not to zero.
+        assert_eq!(
+            clamp_window_for_shortfall(4_096, 1_024, 2),
+            MIN_VIABLE_WINDOW_FLOOR
+        );
+    }
+
+    #[test]
+    fn shortfall_clamp_never_rewrites_resolved_window() {
+        // The resolved window is an input, not a mutable slot: the function
+        // returns the budget window while the original stays untouched.
+        let resolved_window = 8_192;
+        let clamped = clamp_window_for_shortfall(resolved_window, 4_096, 3);
+        assert_eq!(resolved_window, 8_192);
+        assert_ne!(clamped, resolved_window);
+    }
+
+    #[test]
+    fn shortfall_implausible_report_never_clamps() {
+        // reported*4 < resolved_window: the estimator overshooting an accurate
+        // tokenizer is far likelier than a real clamp — stay at the resolved
+        // window even with many strikes.
+        assert_eq!(clamp_window_for_shortfall(32_768, 4_096, 2), 32_768);
+        assert_eq!(clamp_window_for_shortfall(32_768, 4_096, 9), 32_768);
     }
 
     #[test]
