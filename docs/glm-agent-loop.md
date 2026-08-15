@@ -1841,3 +1841,96 @@ is graded B+ for confirmed citation-numbering errors (not substantive or
 hedging errors). Standing remains strong — top-tier contributor — but no
 longer flawless; this is the first mark on the record and worth
 monitoring for recurrence rather than treating as noise.
+
+### Cycle 15 — 2026-08-15 — non-streaming `error: null` parity fix (grade A) — implements its own cycle-14 P0
+
+Implemented GLM's own cycle-14 finding P0 in `parse_completion`
+(`crates/kitsu-providers/src/openai_compat.rs:602`): the non-streaming
+completion parser rejected ANY response body carrying an `error` key,
+including `"error": null` (a JSON null is still `Some`), diverging from
+the streaming path (line 466), which already ignores a null error via
+`.filter(|e| !e.is_null())`. Fix (the only line touched):
+`value.get("error").is_some()` → `value.get("error").is_some_and(|e|
+!e.is_null())`. Signature and everything else unchanged. Commit
+`f3c38d4`, pushed. Success on `:together` attempt 1, exit 0, cap-1 held,
+no spawn attempted.
+
+- **Correctness: all three criteria hold.** `"error": null` alongside a
+  valid choice now parses (content delta + `Done(Stop)`); a real
+  `"error": {...}` object still returns `InvalidResponse`; the fix now
+  matches the streaming path's established parity (confirmed by GLM
+  reading line 466 briefly, per the brief's instruction, and
+  independently re-confirmed by the supervisor before dispatch).
+- **Tests genuinely prove the behavior change, not a proxy — supervisor
+  independently verified fail-without-impl.** Two new tests added
+  directly on `parse_completion` in `openai_compat_tests.rs`:
+  (a) `test_parse_completion_null_error_alongside_valid_choice_parses_ok`
+  — a body with `"error": null` + a valid choice parses OK, yielding the
+  content delta and `Done(Stop)`; (b)
+  `test_parse_completion_real_error_object_still_rejected` — a body with
+  a real `"error": {...}` object still returns `InvalidResponse`. The
+  supervisor `git stash push`-ed ONLY `openai_compat.rs` (keeping the
+  test file, which lives in a separate `openai_compat_tests.rs`), reran
+  test (a) alone against the unfixed impl: it panicked exactly as
+  predicted —
+  `InvalidResponse("provider returned an error object in a successful
+  completion response")` at the `.expect()` call — a genuine failure,
+  not a compile error or a vacuous pass. Test (b) was run the same way
+  and passed even against the unfixed code (expected: the old code
+  already rejected real error objects too — it's a regression guard
+  against over-correction, not itself proof of the fix, and the run
+  summary above states this distinction plainly). Stash was then popped
+  and the full fixed suite reverified: kitsu-providers 81/81 (79
+  pre-existing + 2 new).
+- **Checked for stale assumptions:** grepped the test file for any
+  pre-existing test that encoded the OLD `"error": null` rejection as
+  intended behavior — none found. The one pre-existing rejection test
+  (`test_nonstream_completion_rejects_error_and_empty_choice_objects`)
+  uses a real `{"message": ...}` payload, unaffected by the fix.
+- **Stayed tight vs. cycle 14's over-read.** This was a CODE cycle
+  (cycle 14 was a review, so tool-call profiles aren't directly
+  comparable), but worth recording: GLM used 8 `Read` calls (ranged: the
+  target function 590–660, the streaming null-filter 455–485, two
+  apparently-exploratory ranges at 300–330 and 1760–1790 that turned out
+  unnecessary for the one-line fix, a struct range 775–790, the file's
+  import header 1–35, one capped read of the 78 KiB
+  `openai_compat_tests.rs`, and a final 930–955 to place the new tests
+  near the existing sibling test) plus 6 lightweight `find_symbol`/
+  `fs_scan_file` grep-style calls — more raw tool calls than the ~5
+  ranged-read guidance, though each individual read was narrow and nothing
+  approached cycle 14's whole-file re-read pattern. No citation-drift risk
+  here since the deliverable is code + tests, not quoted prose, so the
+  extra exploration cost tool-calls/tokens but not correctness.
+  kitsu-usage: `{"prompt_tokens":186206,"completion_tokens":2713,
+  "total_tokens":188919}`, kitsu-context:
+  `{"used":27348,"effective":107072,"window":131072}` — a fairly large
+  prompt-token count for a one-line fix, consistent with the read count
+  above.
+- **Supervisor-only mechanical fix:** `cargo fmt --all` reformatted one
+  line in GLM's second new test (a two-line `let error = ...` wrapped to
+  fit rustfmt's width) — a pure style nit, not a correctness or logic
+  change. `cargo build/clippy/test --workspace` all clean; the only test
+  failure was the pre-known PTY `cli.rs` flake
+  (`test_query_only_interactive_session_does_not_create_a_snapshot`,
+  unrelated to `openai_compat.rs`, reproduced in isolation too — an
+  environment/PTY-availability issue in this sandbox, not caused by this
+  change).
+
+**No new kitsu weaknesses observed this cycle.** Transport, spawn cap,
+and turn-commit behavior all behaved as expected on the first attempt.
+
+**GLM is now 8-for-8 A on code and 6-for-7 on reviews (14-for-15
+overall, one B+, review-then-implement alternation working as intended
+— a genuine finding from a review turned into a genuinely tested fix
+one cycle later).** Next: alternate back to a fresh review of new
+surface (`fetch_models_response`, `StaticAuth`/`NoAuth` `header()`
+impls, `expiry_status()`, retry/backoff paths — per cycle 14's
+remaining-surface note) or pick up the next-ranked backlog item
+(cycle-10 findings 2-4, cycle-8 finding 2, cycle-5 findings 5/6,
+cycle-12 P2/P3).
+
+**Ramp status:** GLM holds a strong 14-for-15 overall record (8-for-8 on
+code cycles, unbroken). Cycle 14's citation-numbering slip stands alone;
+cycle 15's code discipline (correct fix, genuine fail-without-impl-
+verified tests, no stale-assumption misses) shows no carryover effect
+from the prior cycle's grade dip.
