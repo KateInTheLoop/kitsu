@@ -217,6 +217,12 @@ kitsu sessions delete <exact-id>
 kitsu sessions resume last --json  # prints exact argv outside interactive chat
 ```
 
+Fork receipts resolve `last` before cloning and identify the exact lineage as
+`source-session-id -> fork-session-id`. JSON adds `source_session_id` alongside
+the existing forked `session` and `permissions_restored` fields. The source
+keeps its unique name, the fork starts unnamed, and saved permission grants are
+never copied.
+
 ### Artifacts on disk
 
 Developer-command output is captured in full into Kitsu-private *generation*
@@ -565,7 +571,7 @@ single tool-free `ask` turn and exits after the answer.
 | `ask <prompt>` | Ask a single question; stream the answer. |
 | `review [path]` | Run one tool-free review over host-verified working/staged/unstaged/base/commit evidence; supports JSONL, focus instructions, and opt-in session continuity. |
 | `models [filter]` | List models advertised by the selected gateway without requiring a configured model ID. |
-| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
+| `sessions [action]` | List/show/fork/export/archive/restore/delete sessions without a provider; fork receipts name the exact resolved source; `list [filter]` narrows by substring; `resume` launches chat on a TTY or emits exact argv otherwise. |
 | `artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs. Live generations are never removed. |
 | `chat [prompt]` | Interactive multi-turn REPL. An optional first prompt is queued as the first turn. With piped stdin (non-TTY), the prompt/stdin is a single turn. |
 

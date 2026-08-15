@@ -54,6 +54,15 @@ pub struct SavedSession {
     pub messages: Vec<ChatMessage>,
 }
 
+/// Exact lineage returned by a successful durable-session fork. Selectors such
+/// as `last` are resolved before cloning so callers can report the immutable
+/// source identity alongside the new snapshot.
+#[derive(Debug, Clone)]
+pub struct SessionFork {
+    pub source_session_id: String,
+    pub session: SavedSession,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 pub struct SessionSummary {
     pub id: String,
@@ -2380,8 +2389,10 @@ impl SessionStore {
     /// data is copied; permission grants live outside `SavedSession` and are
     /// therefore deliberately absent from the fork. Offloaded tool evidence is
     /// copied into the new session's sidecar and message pointers are rewritten
-    /// to that independent copy.
-    pub fn fork(dir: &Path, selector: &str) -> Result<SavedSession, String> {
+    /// to that independent copy. The exact source identity resolved from
+    /// `selector` is retained for user-facing and machine-readable lineage
+    /// receipts.
+    pub fn fork_with_source(dir: &Path, selector: &str) -> Result<SessionFork, String> {
         let directory = open_session_directory(dir)?;
         let mut forked = if selector == "last" || selector.is_empty() {
             let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
@@ -2393,6 +2404,7 @@ impl SessionStore {
         } else {
             return Err(format!("invalid session id '{selector}'"));
         };
+        let source_session_id = forked.id.clone();
         let source_artifacts_name = artifacts_name(&forked.id);
         let source_artifacts_path = directory.path.join(&source_artifacts_name);
         let source_artifacts = directory
@@ -2452,7 +2464,10 @@ impl SessionStore {
                 &forked_snapshot_path,
             )
         })?;
-        Ok(forked)
+        Ok(SessionFork {
+            source_session_id,
+            session: forked,
+        })
     }
 
     /// Export a saved session without replacing an existing destination. When
@@ -3572,11 +3587,14 @@ mod tests {
             )
             .unwrap();
 
-        // Forking the current id is valid; permissions are not an input to or
-        // a field of the durable snapshot API.
-        let forked = SessionStore::fork(&dir, source.id()).unwrap();
+        // Forking `last` resolves the current source exactly; permissions are
+        // not an input to or a field of the durable snapshot API.
+        let source_id = source.id().to_string();
+        let receipt = SessionStore::fork_with_source(&dir, "last").unwrap();
+        assert_eq!(receipt.source_session_id, source_id);
+        let forked = receipt.session;
 
-        assert_ne!(forked.id, source.id());
+        assert_ne!(forked.id, source_id);
         assert_eq!(forked.name, None);
         assert_eq!(
             SessionStore::load(&dir, "named-source").unwrap().id,
@@ -3641,7 +3659,9 @@ mod tests {
             .save(root.path(), "gateway", "model", None, &messages)
             .unwrap();
 
-        let forked = SessionStore::fork(&dir, source.id()).unwrap();
+        let forked = SessionStore::fork_with_source(&dir, source.id())
+            .unwrap()
+            .session;
         let forked_artifacts = dir.join(artifacts_name(&forked.id));
         let forked_file = forked_artifacts.join("nested").join("call-1.txt");
 
@@ -4122,7 +4142,7 @@ mod tests {
         let sidecar = dir.join(artifacts_name(&id));
         symlink(&outside, &sidecar).unwrap();
 
-        assert!(SessionStore::fork(&dir, &id).is_err());
+        assert!(SessionStore::fork_with_source(&dir, &id).is_err());
         assert!(SessionStore::export(
             &dir,
             &id,
@@ -4140,7 +4160,7 @@ mod tests {
         std::fs::remove_file(&sidecar).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
         symlink(&sentinel, sidecar.join("linked.txt")).unwrap();
-        assert!(SessionStore::fork(&dir, &id).is_err());
+        assert!(SessionStore::fork_with_source(&dir, &id).is_err());
         assert!(SessionStore::export(
             &dir,
             &id,

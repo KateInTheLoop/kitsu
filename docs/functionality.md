@@ -17,7 +17,7 @@ top-level entry points are:
 | `kitsu ask <prompt>` | One checked model turn; streaming by default. |
 | `kitsu review [path]` | One tool-free turn over host-verified working/staged/unstaged/base/commit evidence, with optional JSONL and session continuity. |
 | `kitsu models [filter]` | Query the configured model catalog without requiring a configured model ID. |
-| `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`. |
+| `kitsu sessions [action]` | Provider-free list/show/resume/fork/export/archive/restore/delete operations, with `--json`; fork receipts identify the exact resolved source session. |
 | `kitsu artifacts [list\|prune <id\|all>]` | Host-only, provider-free inventory and reclamation of command-artifact storage left by earlier runs, with `--json`. |
 | `kitsu chat [prompt]` | Interactive chat on a TTY, deterministic `--script` chat, or one piped turn. |
 
