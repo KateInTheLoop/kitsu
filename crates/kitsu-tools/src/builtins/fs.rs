@@ -3419,8 +3419,16 @@ mod tests {
 
         let output = read_file_run(&policy, &args).await.unwrap();
 
-        assert!(output.ends_with("...[truncated: output exceeded byte cap]"));
-        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 64);
+        // cap_output's generic marker is replaced by the served-of-total
+        // disclosure appended after capping (cycle 31); the ~90-byte overflow
+        // past the cap is deliberate — the disclosure is the point.
+        assert!(
+            output.contains("...[truncated: output exceeded byte cap"),
+            "missing truncation marker: ...{}",
+            &output[output.len().saturating_sub(160)..]
+        );
+        assert!(output.ends_with("re-read a line range for the rest]"));
+        assert!(output.len() <= crate::permissions::DEFAULT_MAX_BYTES + 256);
     }
 
     #[cfg(unix)]
