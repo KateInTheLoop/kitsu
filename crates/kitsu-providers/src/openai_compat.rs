@@ -16,9 +16,7 @@ use crate::error::{ProviderError, ProviderResponsePart};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
-use crate::types::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
-};
+use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, Usage};
 use crate::{ChatStream, Provider};
 
 #[cfg(test)]
@@ -112,7 +110,7 @@ impl OpenAICompatProvider {
 
 // --- wire types (internal to this module) -----------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
@@ -131,12 +129,12 @@ struct WireRequest<'a> {
     max_tokens: Option<u32>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct StreamOptions {
     include_usage: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireMessage<'a> {
     role: &'a str,
     content: &'a str,
@@ -146,7 +144,7 @@ struct WireMessage<'a> {
     tool_calls: Option<Vec<WireToolCall<'a>>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolCall<'a> {
     id: &'a str,
     #[serde(rename = "type")]
@@ -154,20 +152,20 @@ struct WireToolCall<'a> {
     function: WireToolCallFn<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolCallFn<'a> {
     name: &'a str,
     arguments: &'a str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireTool<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     function: WireToolFn<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolFn<'a> {
     name: &'a str,
     description: &'a str,
@@ -183,7 +181,7 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
+fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError> {
     let messages = req
         .messages
         .iter()
@@ -214,20 +212,34 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         })
         .collect();
 
-    let tools = req.tools.as_ref().map(|ts| {
-        ts.iter()
-            .map(|t: &ToolDescriptor| WireTool {
-                kind: "function",
-                function: WireToolFn {
-                    name: &t.name,
-                    description: &t.description,
-                    parameters: &t.parameters,
-                },
-            })
-            .collect()
-    });
+    let tools = match req.tools.as_ref() {
+        Some(ts) => {
+            let mut wire_tools = Vec::with_capacity(ts.len());
+            for t in ts {
+                // Fast-fail: shipping a non-object `parameters` to the gateway
+                // fails opaquely downstream. A valid tool schema must be a JSON
+                // object; reject anything else before serialization.
+                if !t.parameters.is_object() {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "tool {}: parameters must be a JSON Schema object",
+                        t.name
+                    )));
+                }
+                wire_tools.push(WireTool {
+                    kind: "function",
+                    function: WireToolFn {
+                        name: &t.name,
+                        description: &t.description,
+                        parameters: &t.parameters,
+                    },
+                });
+            }
+            Some(wire_tools)
+        }
+        None => None,
+    };
 
-    WireRequest {
+    Ok(WireRequest {
         model: &req.model,
         messages,
         tools,
@@ -242,7 +254,7 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         temperature: req.temperature,
         reasoning_effort: req.reasoning_effort,
         max_tokens: req.max_tokens,
-    }
+    })
 }
 
 // --- streaming/non-streaming response wire types ----------------------------
@@ -1405,7 +1417,7 @@ impl Provider for OpenAICompatProvider {
         telemetry: Option<ProviderTelemetrySink>,
     ) -> Result<ChatStream, ProviderError> {
         let url = format!("{}{}", self.base_url, self.chat_path);
-        let body = build_body(&req);
+        let body = build_body(&req)?;
 
         // Retry transient 429/503 responses within one end-to-end deadline.
         // Each attempt receives only the remaining budget; reqwest keeps that

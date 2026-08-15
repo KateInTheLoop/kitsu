@@ -623,3 +623,89 @@ made explicit that "the stub is hit exactly once" is not sufficient
 proof of no re-parse when a lower cache layer already exists — GLM
 should be asked directly for a parse-counter or corrupted-cache proof
 this time.
+
+### Cycle 4 — 2026-08-14 — GLM's SECOND CODE CYCLE, genuine tests this time (grade A)
+
+Implemented its own cycle-2 proposal P3 (tool-schema `parameters` fast-fail
+guard) in `openai_compat.rs`. Success on `:together` attempt 1 — no
+transport failure, no retry, no provider fallback needed. Committed on
+`dogfood/glm-5.2` (Kate identity verified), pushed.
+
+**The implementation is correct.** `build_body` now returns
+`Result<WireRequest<'a>, ProviderError>`; the tool-mapping loop checks
+`t.parameters.is_object()` and fast-fails with
+`ProviderError::InvalidResponse("tool {name}: parameters must be a JSON
+Schema object")` before any serialization happens; the wire shape is
+otherwise unchanged.
+
+**GLM handled the caller ripple itself, correctly
+and independently**: it located the SOLE production call site
+(`chat_stream_with_telemetry`, which already returned
+`Result<ChatStream, ProviderError>`) and changed `build_body(&req)` to
+`build_body(&req)?` — a one-token fix, applied without prompting beyond
+the task description. No spawn attempted (cap 1 unexercised).
+
+**THE HEADLINE: tests-fail-without-impl was independently verified by
+the supervisor and is genuine, not a proxy.** GLM wrote 3 tests: (a)
+non-object `parameters` (a string, then a number) makes `build_body`
+return `Err` with the exact actionable message — asserted via
+`expect_err` + substring match; (b) a valid object `parameters` still
+returns `Ok`; (c) no tools / empty tools still returns `Ok`. The
+supervisor manually reverted ONLY the implementation (restored the old
+infallible `build_body` signature and the unguarded `.map()` tool
+mapping, restored the unguarded call site) while leaving GLM's tests
+untouched, then ran `cargo test -p kitsu-providers build_body`: **the
+crate fails to COMPILE** — `expect`/`expect_err` don't exist on
+`WireRequest` once it is no longer a `Result` (E0599 on all three new
+tests, not just test (a), since all three call the same now-infallible
+function). This is strictly stronger than the "fails, not just proxies"
+bar set by the cycle-3 lesson: the tests are structurally inseparable
+from the claim. Implementation was then restored byte-for-byte and the
+full suite re-verified green. This directly closes cycle 3's W4/test
+gap.
+
+**Supervisor fixes required (both mechanical, pre-existing-pattern gaps,
+not implementation bugs):** (1) GLM's rewrite of the tool-mapping closure
+into a `for` loop dropped the `t: &ToolDescriptor` type annotation,
+leaving the `ToolDescriptor` import unused — a stray `cargo build
+--workspace` warning; fixed by dropping the now-unused import. (2) GLM's
+tests use `.expect_err()` on `Result<WireRequest, ProviderError>`, which
+requires `WireRequest: Debug` — none of the seven `Wire*` wrapper structs
+derived `Debug`, so `cargo clippy --all-targets` (and `cargo test`) failed
+to compile the test target even with the real implementation in place.
+Fixed by adding `Debug` to all seven `#[derive(Serialize)]` wire structs
+(harmless, no behavior change). Also ran `cargo fmt --all` for two minor
+reflow diffs in the new tests. None of these are review-worthy design
+gaps — they are the same "verify-what-you-claim-compiles" gap as cycle 3,
+now shifted from test *rigor* (fixed) to test *compilability under
+`--all-targets`*, a new, narrower thing to watch.
+
+**Read/edit discipline:** 10 reads, 4 edits (vs. the ~5-read guidance) —
+over budget, but for a legitimate reason disclosed in-transcript: the
+supervisor's prompt assumed a single test call site inside
+`openai_compat.rs` at line 1408; GLM discovered mid-task that tests
+actually live in a separate `openai_compat_tests.rs` module (`#[path =
+"openai_compat_tests.rs"]`), requiring extra reads of that file plus
+`types.rs` for `ToolDescriptor`'s shape before it could write correct
+tests. This is a supervisor prompt inaccuracy GLM correctly worked
+around, not GLM over-reading blindly.
+
+**Workspace-wide verification:** `cargo build --workspace` clean (after
+the import fix); `cargo clippy --workspace --all-targets` clean (after
+the `Debug` derives); `cargo test --workspace` — 67/67 `kitsu-providers`
+tests pass including all 3 new ones; one `kitsu` crate CLI test
+(`test_query_only_interactive_session_does_not_create_a_snapshot`, a PTY
+interactive-session test) fails identically on the pre-change tip
+(confirmed via `git stash`) — pre-existing sandbox PTY flake, unrelated
+to this diff. `cargo fmt --all -- --check` clean after one `cargo fmt
+--all` pass.
+
+**kitsu-usage:** `{"prompt_tokens":148271,"completion_tokens":10603,"total_tokens":158874}`.
+
+**GLM is now 2-for-2 A on reviews, and with this cycle 2-for-2 on code
+(B then A) — the test-rigor lesson from cycle 3 fully landed on the
+first retry.** No new kitsu weaknesses filed this cycle (W1-W4 from
+prior cycles still open, none re-triggered). Next code cycle: a fresh
+P-item Kimi hasn't taken (P8 trim-buffer scaling, or P11 tool-schema
+re-serialization); consider tightening the read-scope guidance to
+account for split test-module files going forward.
