@@ -166,3 +166,39 @@ keep cap 0 only once R4.8 is fixed — until then, drop to
 `--agent-spawn-cap 1` for DeepSeek so a stray spawn attempt degrades
 instead of crashing; (b) hard-cap reads ("read at most these N ranges,
 then you MUST write") to curb over-reading.
+
+### Cycle 2 RETRY — 2026-08-14 — FAILED again (no deliverable)
+
+Ran with the mitigations: `--agent-spawn-cap 1`, explicit no-spawn prose,
+a strict prose read-cap, and re-read-before-cite discipline. Commit
+`b80ee21` records the failure. DeepSeek is now **1-for-5 on kitsu
+invocations** (cycle 1 B; cycles 2 original ×2 + this retry ×2 all
+shipless).
+
+- **`--agent-spawn-cap 1` worked:** both attempts still called
+  `spawn_agent` despite the prose ban, but cap-1 absorbed each cleanly —
+  no HTTP 400, no crash. This confirms the W3 crash is specific to the
+  cap-0 deny→retry→withhold sequence, not to spawning-while-capped.
+- **The prose read-cap did NOT work:** attempt 1 made ~15 reads (incl. a
+  broad 1-400 sweep nowhere near the target functions past line 1950) + 2
+  out-of-scope context.rs reads; the retry was worse (~28 reads, dupes).
+  Neither ever called `write`; both hit the 300s timeout and were
+  discarded (nothing billed). **Prose caps are 0-for-3 against this model.**
+- Citation discipline still untested — no deliverable has ever existed.
+- Grade: incomplete/F.
+
+**New weakness W6 (→ roadmap R4.10):** kitsu has a technical spawn cap
+but no technical read/tool-call cap; a compulsive over-reader can only be
+stopped by a `--max-tool-calls-per-turn`-style lever, not prose.
+
+**Ground truth for future spot-checks** (worktree orchestrator.rs):
+`request_measurement` 1954-2014, `ensure_chat_request_fits` 2015-2040,
+`compact_context` 2041-2122, `enforce_context_budget_recording`
+2123-2384, `summarize_or_fallback` 2545-2661.
+
+**Next cycle (3): shrink the scope drastically** — assign ONE ~60-line
+function (e.g. `request_measurement` alone, lines 1954-2014) so we can
+tell whether DeepSeek's failure is scope-sizing or a deeper
+exploration-discipline problem. If it fails on a single 60-line function
+too, DeepSeek may not be viable as a contributor under the current kitsu
+levers until R4.10 (technical read cap) lands.
