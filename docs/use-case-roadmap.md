@@ -75,10 +75,22 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   one receipt summarizes all N with per-file line deltas. *Accept:* a
   two-file edit turn emits a single grouped receipt; machine records
   unchanged.
-- R1.5 Dependency/build awareness: read and summarize `Cargo.toml` /
-  `package.json` / `pyproject.toml` for the model on request without it
-  guessing. *Accept:* project-context discovery includes the manifest
-  summary; `--no-project-context` still suppresses it.
+- [~] (2026-08-15) R1.5 Dependency/build awareness — **tool half shipped**
+  as the `read_manifest` builtin (commit 2932451): on request the model
+  reads a project's real deps/build shape via a summary of `Cargo.toml`
+  (name/version/edition, dependencies/dev/build sections, feature count,
+  virtual-workspace note), `package.json` (name/version, deps/devDeps/
+  peerDeps, script names), or `pyproject.toml` (PEP 621 `[project]` with a
+  `[tool.poetry]` fallback, PEP 508 requirement names or the Poetry table
+  minus the `python` pin, build-backend). Sorted + de-duplicated + bounded
+  (default 50/section, ceiling 500) with `+N more`; pure-Rust `toml` +
+  serde_json; same allowlist guard as `fs_read_file`; a malformed manifest
+  is disclosed ("could not parse — …"), never guessed. 5 tests. Haiku
+  review: SHIP-AS-IS. **Remaining (the acceptance's other half):**
+  project-context DISCOVERY should auto-include the manifest summary, and
+  `--no-project-context` still suppress it — that path lives in the kitsu
+  binary (`llms.rs` `discover`/`session.rs`), a UI/main-loop surface, so
+  it is deferred there like R3.4 and R2.3's vision passthrough.
 - [x] (2026-08-14) R1.6 **Edit files larger than the read cap** (found by
   the Kimi loop, cycle 13) — the journaled edit/write snapshotted the
   existing file at the 64 KiB *read* cap, so any file above it (e.g.
@@ -345,9 +357,13 @@ Priority order the loop follows (revisit as lanes close):
    document types — **advance to lane 3 next** (do R2.3 opportunistically).
 2. **System administration** (lane 3) — R3.1 log scan ✅, R3.2 config
    diff ✅. Next: R3.3 structured command results, R3.4 runbook mode.
-3. **Code analysis hardening** (lane 1) — R1.3 symbol nav ✅. Next:
-   R1.4 grouped multi-file edit receipts, R1.5 manifest (Cargo.toml/
-   package.json/pyproject.toml) summary in project-context.
+3. **Code analysis hardening** (lane 1) — R1.3 symbol nav ✅; R1.5
+   manifest **tool** ✅ (`read_manifest`). Both remaining lane-1 items now
+   live in the UI/main-loop surfaces: R1.4 grouped multi-file edit
+   receipts (receipt aggregation in `main.rs`) and R1.5's second half
+   (manifest summary auto-wired into project-context discovery in
+   `llms.rs`, suppressed by `--no-project-context`). The capability loop
+   has picked the low-cost self-contained slices dry — advance to lane 4.
 4. **Automation trust** (lane 4) — R4.3 budget ceiling, R4.4 run report.
 5. **Security** (lane 5) and **scientific docs** (lane 6) — only
    opportunistically, per the scope notes above.
@@ -405,6 +421,28 @@ additive-only, non-vacuous tests), no findings. Next lane-1: R1.4
 grouped multi-file edit receipts or R1.5 manifest summary; or the
 higher-value R4.10 (technical read cap) / R4.12 (failure classification,
 still open HIGH) when a bigger deliberate cycle is warranted.
+
+### Cycle 11 — 2026-08-15 — R1.5 read_manifest (dependency/build summary, lane 1)
+
+Shipped `read_manifest` (commit 2932451), the self-contained TOOL half of
+R1.5: Cargo.toml / package.json / pyproject.toml summarized (name/version,
+edition/build-backend, dependency names by section — sorted, de-duped,
+bounded 50/section) so the model reads real deps instead of guessing.
+Pure-Rust (`toml` + serde_json); PEP 508 requirement-name extraction and a
+Poetry `[tool.poetry]` fallback (minus the `python` pin); same allowlist
+guard; malformed input disclosed honestly, never guessed. 5 tests
+(three-format rendering + requirement parsing + e2e/allowlist). Functional
+check = the e2e through read_manifest_run (roadmap permits a direct tool
+test). Haiku review: SHIP-AS-IS — 8 areas traced (detection routing, parse/
+panic safety incl. the requirement_name char-boundary slice, honest
+malformed disclosure, real bounds, extraction correctness, sandbox,
+additive-only, genuine tests), no findings. This drains the last
+low-cost self-contained lane-1 slice: R1.4 (grouped edit receipts,
+main.rs) and R1.5's project-context wiring (llms.rs) are both UI/main-loop
+surfaces. **Sequencing advanced to lane 4** (automation trust — R4.3
+budget ceiling, R4.4 run report) for the next capability cycle, mindful
+those touch the run layer; the fully self-contained wins are now in lane
+4's tool-shaped items or opportunistic lane-5/6.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
