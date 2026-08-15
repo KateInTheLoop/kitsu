@@ -2058,6 +2058,89 @@ fn test_scripted_sessions_filter_handles_missing_namespace_provider_free() {
 }
 
 #[test]
+#[serial]
+fn test_jsonl_help_registry_exposes_canonical_alias_relationships_provider_free() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("typed-help.script");
+    fs::write(&script, "/help\n/quit\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("render typed help registry");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    let result = &events[2]["result"];
+    assert_eq!(result["kind"], "help");
+    let commands = result["commands"].as_array().expect("typed commands");
+    assert!(commands
+        .iter()
+        .all(|command| command.get("alias_of").is_some()));
+    let command = |name: &str| {
+        commands
+            .iter()
+            .find(|command| command["name"] == name)
+            .unwrap_or_else(|| panic!("missing /{name}: {commands:?}"))
+    };
+    assert_eq!(command("agents")["alias_of"], "jobs");
+    assert_eq!(command("quit")["alias_of"], "exit");
+    assert!(command("jobs")["alias_of"].is_null());
+    assert!(command("exit")["alias_of"].is_null());
+    assert!(result["text"]
+        .as_str()
+        .unwrap()
+        .contains("(alias: /agents)"));
+    assert!(result["text"].as_str().unwrap().contains("(alias: /quit)"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(summary["failures"], 0);
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+    assert!(
+        !home.path().join(".kitsu/sessions").exists(),
+        "provider-free help created session state"
+    );
+}
+
+#[test]
 fn test_script_session_flags_reject_ambiguous_no_session() {
     let home = TempDir::new().expect("temp home");
     let script = home.path().join("empty.txt");
