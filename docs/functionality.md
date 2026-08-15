@@ -189,8 +189,9 @@ stdin.
 - Successful model writes are grouped into checkpoints. Kitsu reports bounded,
   snapshot-derived unified diffs and an exact recovery command. `/checkpoints`
   lists them, `/checkpoint <id>` previews one, and `/undo [id]` restores the
-  selected checkpoint only when its files still match. Undo is blocked while
-  background agents are active.
+  selected checkpoint only when its files still match. A missing checkpoint
+  retains the host-authored `/checkpoints` recovery hint in both human and
+  JSONL script output. Undo is blocked while background agents are active.
 - `/diff` derives bounded working/staged/unstaged+untracked/base/commit/checkpoint
   evidence from Git, the journal, and filesystem. `/review` submits exactly that
   evidence in a no-tools turn. `kitsu review` is the one-shot automation surface.
