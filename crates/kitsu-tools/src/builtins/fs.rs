@@ -919,6 +919,159 @@ where
     }
 }
 
+// --- fs.read_pdf ------------------------------------------------------------
+
+/// Default number of pages returned in one `fs_read_pdf` window.
+const PDF_DEFAULT_MAX_PAGES: usize = 10;
+/// Hard ceiling on pages per call so one call cannot blow the output budget.
+const PDF_MAX_PAGES_CEILING: usize = 50;
+/// Refuse to parse a PDF larger than this (lopdf loads the whole file; this
+/// bounds memory). Generous for text documents, well below OOM territory.
+const PDF_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadPdfArgs {
+    path: String,
+    /// 1-based first page to extract (optional, default 1).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    start_page: Option<usize>,
+    /// Max pages in this window (clamped to `PDF_MAX_PAGES_CEILING`).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_pages: Option<usize>,
+}
+
+pub fn read_pdf_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_pdf".to_string(),
+        description: "Extract the text layer of a PDF from an allowed path, page by page. Reports \
+                      total page count and returns a bounded page window (start_page/max_pages). \
+                      Text-layer only — no OCR; a scanned/image-only page is disclosed as having \
+                      no extractable text rather than returning garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "PDF file path to read"},
+                "start_page": {"type": "integer", "description": "1-based first page (optional, default 1)"},
+                "max_pages": {"type": "integer", "description": "Max pages in this window (optional, default 10, max 50)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_pdf_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_pdf_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadPdfArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > PDF_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "PDF is {} MiB, over the {} MiB read limit — extract the pages you need with an external tool first",
+            metadata.len() / (1024 * 1024),
+            PDF_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let start_page = a.start_page.unwrap_or(1).max(1);
+    let max_pages = a
+        .max_pages
+        .unwrap_or(PDF_DEFAULT_MAX_PAGES)
+        .min(PDF_MAX_PAGES_CEILING);
+
+    let rendered = tokio::task::spawn_blocking(move || extract_pdf(&path, start_page, max_pages))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("pdf parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Load `path` with lopdf and render the disclosure block for the requested
+/// page window. Blocking (CPU-bound parse); callers run it off the reactor.
+fn extract_pdf(path: &Path, start_page: usize, max_pages: usize) -> Result<String, String> {
+    let doc = lopdf::Document::load(path).map_err(|e| e.to_string())?;
+    let pages = doc.get_pages(); // BTreeMap<u32, ObjectId>, 1-based page numbers
+    let total_pages = pages.len();
+    let mut extracted: Vec<(u32, Result<String, String>)> = Vec::new();
+    let end_page = start_page.saturating_add(max_pages);
+    for &page_no in pages.keys() {
+        let idx = page_no as usize;
+        if idx < start_page || idx >= end_page {
+            continue;
+        }
+        let text = doc
+            .extract_text(&[page_no])
+            .map_err(|e| e.to_string())
+            .map(|t| t.trim().to_string());
+        extracted.push((page_no, text));
+    }
+    Ok(render_pdf(&extracted, total_pages, start_page))
+}
+
+/// Pure formatter: turn per-page extraction results into the disclosure block.
+/// Kept IO-free so it is unit-testable without a real PDF.
+fn render_pdf(
+    extracted: &[(u32, Result<String, String>)],
+    total_pages: usize,
+    start_page: usize,
+) -> String {
+    let mut out = String::new();
+    out.push_str(&format!(
+        "pdf> {total_pages} page(s), text-layer only (no OCR)\n"
+    ));
+    if total_pages == 0 {
+        out.push_str("(no pages found — the file may not be a valid PDF)\n");
+        return out;
+    }
+    if extracted.is_empty() {
+        out.push_str(&format!(
+            "(no pages in window: start_page {start_page} is past the {total_pages} page(s))\n"
+        ));
+        return out;
+    }
+    let first = extracted.first().map(|(n, _)| *n).unwrap_or(0);
+    let last = extracted.last().map(|(n, _)| *n).unwrap_or(0);
+    out.push_str(&format!("pages {first}-{last} of {total_pages}:\n"));
+    let mut image_only = 0usize;
+    for (page_no, result) in extracted {
+        out.push_str(&format!("\n--- page {page_no} ---\n"));
+        match result {
+            Ok(text) if !text.is_empty() => {
+                out.push_str(text);
+                out.push('\n');
+            }
+            Ok(_) => {
+                image_only += 1;
+                out.push_str("(no extractable text on this page — likely a scanned/image-only page; OCR is not applied)\n");
+            }
+            Err(e) => {
+                out.push_str(&format!("(text extraction failed for this page: {e})\n"));
+            }
+        }
+    }
+    if (last as usize) < total_pages {
+        out.push_str(&format!(
+            "\n[showing pages {first}-{last} of {total_pages}; pass start_page/max_pages for more]\n"
+        ));
+    }
+    if image_only > 0 {
+        out.push_str(&format!(
+            "[disclosure: {image_only} page(s) in this window had no text layer]\n"
+        ));
+    }
+    out
+}
+
 // --- fs.list_dir ------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -3717,6 +3870,137 @@ mod tests {
         assert!(out.contains("TSV: 2 columns, 3 data rows"), "{out}");
         assert!(out.contains("col1:int, col2:string"), "nullable int: {out}");
         assert!(out.contains("1 | col1=1 | col2=x"), "{out}");
+    }
+
+    /// Build an in-memory PDF: each entry is `Some(text)` for a text page or
+    /// `None` for an image-only page (no text operators).
+    fn build_pdf(pages_text: &[Option<&str>]) -> Vec<u8> {
+        use lopdf::content::{Content, Operation};
+        use lopdf::{Dictionary, Document, Object, Stream};
+
+        let mut doc = Document::with_version("1.5");
+        let pages_id = doc.new_object_id();
+        let font_id = doc.add_object({
+            let mut d = Dictionary::new();
+            d.set("Type", "Font");
+            d.set("Subtype", "Type1");
+            d.set("BaseFont", "Courier");
+            d
+        });
+        let resources_id = doc.add_object({
+            let mut fonts = Dictionary::new();
+            fonts.set("F1", font_id);
+            let mut res = Dictionary::new();
+            res.set("Font", fonts);
+            res
+        });
+        let mut kids: Vec<Object> = Vec::new();
+        for text in pages_text {
+            let ops = match text {
+                Some(t) => vec![
+                    Operation::new("BT", vec![]),
+                    Operation::new("Tf", vec!["F1".into(), 24.into()]),
+                    Operation::new("Td", vec![72.into(), 720.into()]),
+                    Operation::new("Tj", vec![Object::string_literal(*t)]),
+                    Operation::new("ET", vec![]),
+                ],
+                None => vec![], // no text operators → image-only page
+            };
+            let content = Content { operations: ops };
+            let content_id =
+                doc.add_object(Stream::new(Dictionary::new(), content.encode().unwrap()));
+            let mut page = Dictionary::new();
+            page.set("Type", "Page");
+            page.set("Parent", pages_id);
+            page.set("Contents", content_id);
+            kids.push(doc.add_object(page).into());
+        }
+        let count = kids.len() as i64;
+        let mut pages = Dictionary::new();
+        pages.set("Type", "Pages");
+        pages.set("Kids", kids);
+        pages.set("Count", count);
+        pages.set("Resources", resources_id);
+        pages.set("MediaBox", vec![0.into(), 0.into(), 595.into(), 842.into()]);
+        doc.objects.insert(pages_id, Object::Dictionary(pages));
+        let mut catalog = Dictionary::new();
+        catalog.set("Type", "Catalog");
+        catalog.set("Pages", pages_id);
+        let catalog_id = doc.add_object(catalog);
+        doc.trailer.set("Root", catalog_id);
+        let mut buf = Vec::new();
+        doc.save_to(&mut buf).expect("save pdf");
+        buf
+    }
+
+    #[test]
+    fn pdf_render_formats_pages_and_discloses_image_only() {
+        let extracted = vec![
+            (1u32, Ok("Hello from page one".to_string())),
+            (2u32, Ok(String::new())), // image-only
+            (3u32, Ok("Third page text".to_string())),
+        ];
+        let out = render_pdf(&extracted, 5, 1);
+        assert!(out.contains("5 page(s), text-layer only (no OCR)"), "{out}");
+        assert!(out.contains("pages 1-3 of 5:"), "{out}");
+        assert!(out.contains("--- page 1 ---"), "{out}");
+        assert!(out.contains("Hello from page one"), "{out}");
+        assert!(
+            out.contains("no extractable text on this page"),
+            "image-only disclosure: {out}"
+        );
+        assert!(
+            out.contains("1 page(s) in this window had no text layer"),
+            "{out}"
+        );
+        assert!(out.contains("[showing pages 1-3 of 5"), "more hint: {out}");
+    }
+
+    #[test]
+    fn pdf_render_empty_and_past_end() {
+        assert!(render_pdf(&[], 0, 1).contains("may not be a valid PDF"));
+        assert!(render_pdf(&[], 4, 99).contains("no pages in window"));
+    }
+
+    #[tokio::test]
+    async fn read_pdf_end_to_end_extracts_text_and_flags_scanned_page() {
+        // Page 1 has text, page 2 is image-only (no text operators).
+        let bytes = build_pdf(&[Some("Kitsune runs on foxfire"), None]);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("doc.pdf");
+        std::fs::write(&path, &bytes).expect("write pdf");
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+        let args = serde_json::json!({"path": path.to_string_lossy()}).to_string();
+        let out = read_pdf_run(&policy, &args).await.expect("pdf read ok");
+        assert!(out.contains("2 page(s), text-layer only (no OCR)"), "{out}");
+        assert!(
+            out.contains("Kitsune runs on foxfire"),
+            "extracted text: {out}"
+        );
+        assert!(
+            out.contains("no extractable text on this page"),
+            "scanned-page disclosure: {out}"
+        );
+
+        // Outside the allowlist → PolicyDenied, same guard as fs_read_file.
+        let other = tempfile::tempdir().expect("other");
+        let bad = other.path().join("x.pdf");
+        std::fs::write(&bad, &bytes).expect("write");
+        let bad_args = serde_json::json!({"path": bad.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_pdf_run(&policy, &bad_args).await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+
+        // A non-PDF file surfaces a parse error, not a panic or garbage.
+        let notpdf = dir.path().join("plain.pdf");
+        std::fs::write(&notpdf, b"this is not a pdf at all").expect("write");
+        let np_args = serde_json::json!({"path": notpdf.to_string_lossy()}).to_string();
+        assert!(matches!(
+            read_pdf_run(&policy, &np_args).await,
+            Err(ToolError::ExecError(_))
+        ));
     }
 
     #[test]
