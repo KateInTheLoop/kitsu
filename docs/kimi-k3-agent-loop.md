@@ -400,3 +400,35 @@ correct). Committed `1afb464` (Kate verified), pushed. `--agent-spawn-cap
 Backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅. Kimi is 5-for-5 on code work since the
 ramp (cycles 7-11). Next: P6 evidence-clamps-budget, P5 anchor sanity
 clamp, or P7/P10/P11.
+
+### Cycle 12 — 2026-08-14 — P5 anchor sanity clamp (grade A-)
+
+Kimi implemented P5 correctly and completely in `context.rs` (+166/-14):
+`anchor_plausible(anchor, full)` — exact `u128` integer-ratio comparison,
+inclusive band `[0.4x, 2.5x]` of the anchor-free full estimate (no
+floats, boundary-exact, overflow-safe). `estimate()` now always computes
+the full estimate and, when a structurally-valid anchor falls outside the
+band, discards it FOR THAT CALL ONLY (stored anchor untouched — advisory,
+never mutated, never errors) and bumps a new `anchor_rejections`
+telemetry counter. Committed `ac3d5bf` (Kate verified), pushed. cap-1
+held — zero spawn attempts.
+
+- Single attempt, 15 tool calls, completion 8,311/24,000 (35%). 3 genuine
+  tests (plausible anchor trusted; anchors 0 and 100x both reject + fall
+  back + counter increments; exact boundary 16/17/99/100 trusted, 15/101
+  rejected). 5 pre-existing round-number-anchor tests honestly recomputed.
+- Cross-file fix (expected pattern): one orchestrator test relied on an
+  implausible anchor (500 vs ~8-token fixture) being trusted to force a
+  synthetic overflow — now correctly rejected by P5. Fixed by padding the
+  fixture + a plausible-but-over-target anchor. Honest fix, not tolerance
+  widening. kitsu-core 104/104.
+- **Flake escalating:** `kitsu-tools …read_file_caps_input_before_allocating_the_whole_file`
+  now reproduces **3/3 consecutive cycles** on the branch (stash-confirmed
+  pre-existing, unrelated to P5), yet passes on main's newer kitsu-tools.
+  No longer plausibly "just load-sensitive" — likely a real code
+  difference between the branch's older kitsu-tools and main. **Needs a
+  dedicated diff investigation** before the kimi branch is merge-ready.
+
+**Backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅. Kimi is 6-for-6 on code work
+(cycles 7-12).** Next: P6 evidence-clamps-budget, P7 anchor schema
+fingerprint, P10 model-context caching, or P11 tool-schema re-serialization.
