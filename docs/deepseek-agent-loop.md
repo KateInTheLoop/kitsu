@@ -1,11 +1,12 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 1 banked (grade B); cycle 2 and its retry have
-> now both produced no deliverable (4 of 4 kitsu invocations against the
-> orchestrator review task have failed to write a file).** A fresh HF
-> token was present at cycle-1 spawn time (the earlier birth-blocking
-> rotation is no longer in effect for this token). See the Cycle log
-> below.
+> **LIVE 2026-08-14: cycle 3 shipped (grade A-) after cycles 2 and its
+> retry produced no deliverable (4 of 4 shipless).** DeepSeek is
+> 2-for-6 on kitsu invocations. Cycle 3 shrunk the review scope to a
+> single ~60-line function and the over-reading vanished — 1 read, then
+> write, vs. 15–28 reads at larger scope — but n=1; see the Cycle 3
+> entry for the scope-sizing-vs-discipline verdict and caveats. See the
+> Cycle log below.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -436,3 +437,103 @@ be reconsidered for this model in favor of more constrained,
 single-read-then-answer tasks. The citation-discipline hypothesis from
 cycle 2's brief remains completely untested and should not be
 re-attempted until a deliverable actually ships.
+
+### Cycle 3 (2026-08-14) — single ~60-line function, shipped. Grade: A-
+
+**Scope-sizing experiment, result: over-reading vanished.** Target
+shrunk to exactly `request_measurement` (`crates/kitsu-core/src/orchestrator.rs`
+L1954–1999) + its helper `check_measurement` (L2001–2012), confirmed by
+direct read of the worktree file before dispatch. Prompt repeated cycle
+2's read-cap and write-early instructions but pinned them to a single
+named range instead of four disjoint ones, and dropped `--agent-spawn-cap`
+to 1 (unchanged from the retry). Attempt 1 shipped on the first try — no
+retry needed.
+
+**THE KEY RESULT: exactly 1 read, then write.** kitsu stderr shows one
+`Read(…/orchestrator.rs)` call — `ranged read 1950-2012`, 63 lines — then
+one `Write(…/reviews/deepseek-cycle-3.md)` call, then done. Run summary:
+"1 turn(s) ok, 1 file(s) read, 1 file(s) written (1 change(s))". No
+spawn attempt this time (cap 1 was never exercised — the model simply
+didn't try). kitsu-usage: prompt_tokens 12,985 / completion_tokens 3,536
+/ total 16,521 — far under the 24K output cap and well inside the 300s
+timeout (turn completed in well under a minute). This is a complete
+reversal from cycles 2/2-retry's 15–28 reads, 4-for-4 shipless, and it
+happened with the *same* prose read-cap wording that was "0-for-3" at
+larger scope — the only variable that changed was scope size.
+
+**Deliverable — `reviews/deepseek-cycle-3.md`, 4 ranked proposals:**
+1. *(Medium)* `check_measurement` gates on `measurement.target` and never
+   consults `measurement.effective`, hypothesized to let a request that
+   fits the full window but exceeds the max-tokens reservation pass the
+   guard — explicitly hedged as conditional on `ContextBudget`'s
+   internals, which are out of scope and correctly not read.
+2. *(Low)* the byte-path (`cfg.context_window` is `None`) silently drops
+   `max_tokens`, an asymmetric contract vs. the token path.
+3. *(Low)* `has_schema: bool` + `schema_json: &str` is a redundant pair;
+   collapse to `schema_json: Option<&str>`.
+4. *(Low)* the two `if let Some(window)` / `else` branches duplicate the
+   full `RequestMeasurement` struct literal; suggests a single
+   construction with conditional fields.
+
+**Citation spot-check: every direct quote is letter-perfect.** Checked
+all five quoted fragments against the actual lines 1945–2019 (read
+independently by the supervisor before dispatch):
+- `if measurement.used > measurement.target {` — exact match, L2002.
+- `target: cfg.max_context_bytes as u64,` — exact match, L1993.
+- `fn request_measurement(` / `messages: &[ChatMessage],` /
+  `cfg: &AgentConfig,` / `schema_json: &str,` / `has_schema: bool,` —
+  exact match, L1954–1958, including indentation.
+This is a sharp reversal from cycle 1's citation drift (buffer cap
+mis-cited by 37 lines, `ContextBudget::new` mis-cited by a full range) —
+zero drift here, on every checkable citation.
+
+**One proposal is analytically wrong when checked against out-of-scope
+ground truth, but honestly hedged.** Proposal 1's "bug" doesn't actually
+exist: `ContextBudget::new` (`crates/kitsu-core/src/context.rs` L159–173,
+outside the granted scope) defines `target = effective − buffer`, i.e.
+`target` is *always* the stricter of the two bounds, so checking against
+`target` alone is more conservative than checking `effective`, not less.
+The model could not have known this without reading `context.rs`, which
+it correctly did not do — and it phrased the finding as "If
+`ContextBudget::target` returns X, then Y", not as an assertion. That is
+the right way to flag an out-of-scope dependency; it just happened to
+resolve to "no bug" once checked. Docked half a grade for the top-ranked
+proposal being wrong in substance despite the process being sound;
+proposals 2–4 are all correct and citation-accurate.
+
+**Grade: A-.** Best citation accuracy of any DeepSeek cycle to date
+(cycle 1 was B, docked specifically for drift); this cycle has zero
+drift but loses ground on one proposal's real-world correctness.
+Compares favorably to Kimi's citation-perfect A-grade context.rs review
+in scope discipline, though this was a much smaller unit.
+
+**Scope-sizing vs. exploration-discipline verdict: this data point
+favors scope-sizing.** The only variables that changed between this
+cycle and the 4-for-4-failed cycle-2/retry are (a) the named range
+shrank from four disjoint multi-hundred-line spans in a 2,957-line file
+to one contiguous ~60-line span, and (b) the prompt made the "read
+exactly once" instruction more mechanically explicit ("ONE single
+ranged read of that range"). Prose read-caps were "0-for-3" at the
+larger scope and "1-for-1" here with materially the same prose style —
+the shrink is the more likely explanatory variable, not a prompt
+rewording alone, since cycle 2's retry already had an explicit numeric
+prose cap ("~6 reads") and still blew it 2–4x. **Caveat: n=1.** This
+does not rule out a discipline problem that only manifests past some
+scope threshold, and it does not prove DeepSeek would stay disciplined
+on a *review* task with more than one function, or on an *implementation*
+task. Recommended next steps before declaring DeepSeek broadly viable:
+(a) replicate at this same tiny scope once more to rule out a lucky
+draw; (b) if that replicates, step scope size back up incrementally
+(e.g. ~150 lines, ~400 lines) to find the discipline threshold rather
+than jumping back to a 2,957-line file; (c) R4.10 (technical read cap)
+is still worth building regardless — it would make the *next* cycle's
+result deterministic instead of prompt-luck-dependent. DeepSeek is not
+ruled out as a contributor, but it should stay on tightly-scoped,
+single-unit review tasks until a second small-scope success replicates
+this one.
+
+**Ramp status update:** DeepSeek is now 2-for-6 on kitsu invocations
+(cycle 1 B, cycle 2 ×2 + retry ×2 shipless, cycle 3 A-). First shipped
+deliverable since cycle 1. Next cycle: replicate at the same tiny scope
+(a different ~60-line function, e.g. `ensure_chat_request_fits` alone)
+before widening scope, to confirm this wasn't a one-off.
