@@ -5188,6 +5188,106 @@ async fn test_required_write_script_failure_is_typed_and_preserves_output() {
     assert_eq!(summary["postcondition_failures"], 1);
     assert_eq!(summary["user_failures"], 1);
     assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(
+        summary["output_last_message_state"],
+        "preserved_postcondition_failure"
+    );
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_postcondition_failure_reports_absent_output_preserved_only_when_requested() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "committed answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+    let work = TempDir::new().unwrap();
+    let required = work.path().join("missing-required.txt");
+    let absent_output = home.path().join("absent-last-message.txt");
+
+    let requested = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "-o",
+            &absent_output.to_string_lossy(),
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("finish without writing the required target\n")
+        .output()
+        .unwrap();
+    assert_eq!(requested.status.code(), Some(1), "{requested:?}");
+    assert!(requested.stderr.is_empty(), "{requested:?}");
+    assert!(!absent_output.exists());
+    let requested_events = String::from_utf8(requested.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert!(requested_events
+        .iter()
+        .all(|event| event["type"] != "output_last_message"));
+    let requested_summary = requested_events.last().expect("requested final summary");
+    assert_eq!(requested_summary["status"], "error");
+    assert_eq!(requested_summary["postcondition_failures"], 1);
+    assert_eq!(requested_summary["successful_operations"], 1);
+    assert_eq!(
+        requested_summary["output_last_message_state"],
+        "preserved_postcondition_failure"
+    );
+
+    let unrequested = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--allow-write",
+            &work.path().to_string_lossy(),
+            "--require-write",
+            &required.to_string_lossy(),
+        ])
+        .write_stdin("finish without writing the required target\n")
+        .output()
+        .unwrap();
+    assert_eq!(unrequested.status.code(), Some(1), "{unrequested:?}");
+    assert!(unrequested.stderr.is_empty(), "{unrequested:?}");
+    let unrequested_events = String::from_utf8(unrequested.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let unrequested_summary = unrequested_events
+        .last()
+        .expect("unrequested final summary");
+    assert_eq!(unrequested_summary["postcondition_failures"], 1);
+    assert_eq!(unrequested_summary["successful_operations"], 1);
+    assert!(unrequested_summary
+        .get("output_last_message_state")
+        .is_none());
+    assert!(!required.exists());
     server.verify().await;
 }
 

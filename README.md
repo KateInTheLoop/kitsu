@@ -916,7 +916,11 @@ emits one `output_last_message` receipt after the selected turn and before
 `final_summary`, with destination, turn id, byte count, SHA-256,
 atomic/commit facts, explicit `model_write_authority: false`, and no duplicate
 message body. The destination is protected from model filesystem tools and
-cannot overlap Kitsu's config or private state. Add
+cannot overlap Kitsu's config or private state. If a required-write
+postcondition blocks installation after a committed answer, the destination
+remains unchanged and JSONL reports
+`output_last_message_state: "preserved_postcondition_failure"`; a destination
+that did not exist remains absent. Add
 `--output-schema <PATH>` when the final answer must be machine-validated JSON.
 The source must be a regular, non-symlink file no larger than 64 KiB containing
 a strict object schema (`additionalProperties: false`, with every property

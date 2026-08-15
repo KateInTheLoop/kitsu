@@ -221,10 +221,13 @@ guarantees requires a new schema identifier.
   the destination remains exactly as it was (including remaining absent) and
   `final_summary.output_last_message_state` is
   `"preserved_no_committed_assistant"`. Human output says
-  `--output-last-message unchanged: no committed assistant message`. This
-  additive summary field is absent after a successful installation and when a
-  committed assistant exists but another typed finalization error prevents the
-  installation.
+  `--output-last-message unchanged: no committed assistant message`. When a
+  committed assistant exists but a required-write completion postcondition
+  fails before installation, the same field is
+  `"preserved_postcondition_failure"`; the destination again remains exactly
+  as it was. This additive summary field is absent after a successful
+  installation and when `-o` was not requested. Older v1 streams may omit it,
+  which means the preservation reason is unknown.
 - A detached job whose terminal result was not already consumed is emitted as a
   `background_result` before `final_summary`; successful detached work is never
   silently lost when a script exits. An unacknowledged failed job also makes
