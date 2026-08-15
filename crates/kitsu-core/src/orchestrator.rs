@@ -2,7 +2,10 @@
 //! docs/architecture.md §5: call model → parse tool calls → run tools →
 //! append results → repeat until the model stops or a cap is hit.
 
-use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
+use crate::context::{
+    clamp_max_tokens_to_reserve, clamp_window_for_shortfall, estimate_str, message_tokens,
+    schema_fingerprint, ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
+};
 
 /// Detect mangled chat-template control tokens (e.g. Kimi's `<|close|>`,
 /// `<|sep|>`) in the TAIL of a final answer — the residue a provider leaks
@@ -672,6 +675,14 @@ struct PreparedToolOutput {
     artifact_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct ToolOutputRequest<'a> {
+    call_id: &'a str,
+    tool_name: &'a str,
+    is_err: bool,
+    window_evidence: Option<ContextWindowEvidence>,
+}
+
 impl ToolOutputRetention {
     fn complete(value: &str) -> Self {
         let bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
@@ -893,6 +904,8 @@ pub enum CompactionOutcome {
     Trimmed,
     Summarized,
     SummaryFallbackTrim,
+    /// The summary fallback ran but found no eligible old exchanges to remove.
+    SummaryFallbackNoOp,
 }
 
 /// Why a requested summary used the trim fallback.
@@ -902,8 +915,10 @@ pub enum SummaryFallbackReason {
     CircuitBreaker,
     /// Even a locally shortened summary prompt could not fit the model window.
     RequestTooLarge,
-    /// The provider failed or returned no usable summary text.
+    /// The provider failed (transport or stream error).
     ProviderFailure,
+    /// The provider completed successfully but returned no usable summary text.
+    EmptyCompletion,
     /// The summary stream produced partial text but did not terminate with a
     /// complete `stop` finish (for example length truncation, a tool-call finish,
     /// or EOF without a terminal finish event).
@@ -977,7 +992,7 @@ impl CompactionLedger {
             CompactionOutcome::Trimmed | CompactionOutcome::SummaryFallbackTrim => {
                 self.trims = self.trims.saturating_add(1);
             }
-            CompactionOutcome::ToolResultsElided => {}
+            CompactionOutcome::ToolResultsElided | CompactionOutcome::SummaryFallbackNoOp => {}
         }
         self.tool_results_elided = self
             .tool_results_elided
@@ -1142,6 +1157,14 @@ pub struct AgentSessionState {
     pub run_usage: kitsu_providers::Usage,
     /// Completed model turns across the run, for `/cost`.
     pub run_turns: u32,
+    /// P11: cached (fingerprint, schema_json, token estimate) for the tool
+    /// schema. The preflight at every provider boundary used to re-run
+    /// `estimate_str` over the full serialized schema every round even though
+    /// the tool registry almost never changes within a session. Keyed by the
+    /// P7 [`schema_fingerprint`] of the serialized schema: a matching
+    /// fingerprint reuses the cached estimate, a mismatch recomputes and
+    /// overwrites. Session-scoped so no cross-session staleness is possible.
+    pub schema_cache: Option<(u64, String, u64)>,
 }
 
 /// Evidence, gathered from a provider `usage` report, that the server accepted
@@ -1161,6 +1184,13 @@ pub struct ContextWindowEvidence {
     pub resolved_window: u64,
     /// The one-time warning for this evidence has already been emitted.
     pub warned: bool,
+    /// Number of shortfall hits recorded for THIS `resolved_window` (>= 1).
+    /// Resets to 1 whenever the resolved window changes (see the recording
+    /// site in `run_agent_turn_inner`). P6: once this reaches 2 (two-strike
+    /// rule), [`clamp_window_for_shortfall`] clamps the EFFECTIVE SESSION
+    /// BUDGET fed to [`ContextBudget::new`] toward `reported_prompt_tokens` —
+    /// `resolved_window` itself is never rewritten, only the derived budget.
+    pub shortfall_count: u32,
 }
 
 /// Truncation heuristic for [`ContextWindowEvidence`]. Estimates are chars/4
@@ -1322,7 +1352,12 @@ where
             turn_usage.total_tokens,
         ));
         let context = cfg.context_window.map(|window| {
-            let budget = ContextBudget::new(window, cfg.max_tokens);
+            // P6: report the effective budget actually gating requests, not the
+            // raw resolved window, once shortfall evidence has clamped it.
+            let budget = ContextBudget::new(
+                effective_budget_window(window, state.window_evidence),
+                cfg.max_tokens,
+            );
             (state.meter.estimate(messages), budget.effective, window)
         });
         if result.is_ok() {
@@ -1365,6 +1400,7 @@ where
         run_reads,
         run_usage: _,
         run_turns: _,
+        schema_cache,
     } = state;
     let mut last_assistant_text = String::new();
     let mut round: u32 = 0;
@@ -1502,6 +1538,7 @@ where
             round,
             CompactionReason::ContextTargetExceeded,
             false,
+            *window_evidence,
         )
         .await?;
 
@@ -1532,8 +1569,22 @@ where
             None
         };
 
-        // Number of messages this request sends — the anchor point for the meter.
-        let sent_len = messages.len();
+        // P9: the budget promised `effective = window - reserve`, so the reply
+        // the provider is told it may send must be bounded by that same clamped
+        // reserve. Clamp down only: a smaller caller-supplied max_tokens is left
+        // alone, and None stays None (no artificial cap is invented).
+        let max_tokens = match cfg.context_window {
+            Some(window) => {
+                let budget = ContextBudget::new(
+                    effective_budget_window(window, *window_evidence),
+                    cfg.max_tokens,
+                );
+                clamp_max_tokens_to_reserve(cfg.max_tokens, &budget)
+            }
+            // No resolved window: no budget to clamp against; send as-is.
+            None => cfg.max_tokens,
+        };
+
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
@@ -1541,8 +1592,9 @@ where
             stream: cfg.stream,
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
-            max_tokens: cfg.max_tokens,
+            max_tokens,
             response_format,
+            prompt_cache_key: None,
         };
         let request_history_reshaped = if let Some(nudge) = structured_repair_nudge.take() {
             let nudge_index = messages
@@ -1568,7 +1620,8 @@ where
         // edit adds another message or tool mutation between compaction and
         // request construction, this check fails locally instead of leaking an
         // oversized request to the gateway.
-        let sent_measurement = ensure_chat_request_fits(&req, cfg, meter)?;
+        let sent_measurement =
+            ensure_chat_request_fits(&req, cfg, meter, *window_evidence, schema_cache)?;
         // Token-denominated estimate of the request being sent, kept so the
         // usage report below can be cross-checked against what left the door.
         let sent_estimate_tokens =
@@ -1652,7 +1705,12 @@ where
                     if request_history_reshaped {
                         meter.invalidate();
                     } else {
-                        meter.record(u.prompt_tokens, sent_len, request_constraints_present);
+                        meter.record(
+                            u.prompt_tokens,
+                            messages,
+                            request_constraints_present,
+                            &schema_json,
+                        );
                     }
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
@@ -1663,16 +1721,30 @@ where
                     if let (Some(window), Some(sent_estimate)) =
                         (cfg.context_window, sent_estimate_tokens)
                     {
-                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window)
-                            && window_evidence
-                                .map_or(true, |evidence| evidence.resolved_window != window)
-                        {
-                            *window_evidence = Some(ContextWindowEvidence {
-                                reported_prompt_tokens: u.prompt_tokens,
-                                estimated_sent_tokens: sent_estimate,
-                                resolved_window: window,
-                                warned: false,
-                            });
+                        if context_window_shortfall(u.prompt_tokens, sent_estimate, window) {
+                            match window_evidence {
+                                // Same resolved window as the last shortfall: count this
+                                // as another strike (P6 two-strike rule) and refresh the
+                                // reported numbers to the latest observation.
+                                Some(evidence) if evidence.resolved_window == window => {
+                                    evidence.shortfall_count =
+                                        evidence.shortfall_count.saturating_add(1);
+                                    evidence.reported_prompt_tokens = u.prompt_tokens;
+                                    evidence.estimated_sent_tokens = sent_estimate;
+                                }
+                                // First shortfall ever, or the resolved window changed
+                                // (new gateway/model/`--context-window`): start a fresh
+                                // strike count for the new window.
+                                _ => {
+                                    *window_evidence = Some(ContextWindowEvidence {
+                                        reported_prompt_tokens: u.prompt_tokens,
+                                        estimated_sent_tokens: sent_estimate,
+                                        resolved_window: window,
+                                        warned: false,
+                                        shortfall_count: 1,
+                                    });
+                                }
+                            }
                         }
                     }
                     if let Some(log) = &cfg.event_log {
@@ -2039,9 +2111,12 @@ where
             // mode.
             let prepared = prepare_tool_output(
                 content,
-                &tc.call_id,
-                &tc.tool_name,
-                is_err,
+                ToolOutputRequest {
+                    call_id: &tc.call_id,
+                    tool_name: &tc.tool_name,
+                    is_err,
+                    window_evidence: *window_evidence,
+                },
                 tools,
                 messages,
                 cfg,
@@ -2176,8 +2251,8 @@ fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -
         // common alias. Default to `{}` when the model omitted args entirely.
         let args = match obj.get("arguments").or_else(|| obj.get("parameters")) {
             Some(serde_json::Value::String(s)) => s.clone(),
-            Some(v) => v.to_string(),
-            None => "{}".to_string(),
+            Some(v @ serde_json::Value::Object(_)) => v.to_string(),
+            _ => "{}".to_string(),
         };
         let call_id = format!("textcall-{}", calls.len());
         calls.push(ToolCall {
@@ -2607,7 +2682,7 @@ fn format_command_result(output: &CommandOutput) -> String {
     );
     if let Some(status) = &output.artifact_error {
         fields.push(format!(
-            "artifact status={:?}",
+            "artifact status={}",
             bounded_human_value(status, 160)
         ));
     }
@@ -2619,7 +2694,7 @@ fn format_command_result(output: &CommandOutput) -> String {
     // when a terminal wraps the receipt, the line ends with a copyable path.
     if let Some(artifact) = &output.artifact {
         fields.push(format!(
-            "full output={:?}",
+            "full output={}",
             terminal_safe_inline(&artifact.reference)
         ));
     }
@@ -2719,13 +2794,12 @@ struct RequestMeasurement {
     unit: ContextUnit,
 }
 
-fn structural_request_tokens(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
-    messages.iter().map(message_tokens).sum::<u64>()
-        + if has_schema {
-            estimate_str(schema_json)
-        } else {
-            0
-        }
+/// Structural token total for a request shape. `schema_tokens` is the
+/// precomputed estimate for the (fixed-per-call) tool schema — P11 threads one
+/// computed/cached value through instead of re-running `estimate_str` on every
+/// invocation (some callers, e.g. `fit_summary_rebuild`, call this in a loop).
+fn structural_request_tokens(messages: &[ChatMessage], schema_tokens: u64) -> u64 {
+    messages.iter().map(message_tokens).sum::<u64>() + schema_tokens
 }
 
 fn structural_request_bytes(messages: &[ChatMessage], schema_json: &str, has_schema: bool) -> u64 {
@@ -2737,30 +2811,53 @@ fn structural_request_bytes(messages: &[ChatMessage], schema_json: &str, has_sch
         }
 }
 
+/// The window this session should actually budget requests against right now:
+/// the resolved `window`, clamped by [`clamp_window_for_shortfall`] once P6's
+/// two-strike rule is satisfied for shortfall evidence recorded against this
+/// SAME resolved window (a stale `window_evidence` from a since-changed window
+/// is ignored). Pure read — never mutates `window` or the evidence; the
+/// resolved window and config stay exactly what they always were, only the
+/// number handed to [`ContextBudget::new`] adapts.
+fn effective_budget_window(window: u64, window_evidence: Option<ContextWindowEvidence>) -> u64 {
+    match window_evidence {
+        Some(ev) if ev.resolved_window == window => {
+            clamp_window_for_shortfall(window, ev.reported_prompt_tokens, ev.shortfall_count)
+        }
+        _ => window,
+    }
+}
+
+// P11 added `schema_tokens` (the cached/fresh estimate) alongside the
+// pre-existing `schema_json`/`has_schema`, which are still needed here for
+// the anchor fingerprint check and the byte-mode fallback — matches the
+// `#[allow(clippy::too_many_arguments)]` precedent already used by the other
+// measurement-plumbing functions in this module.
+#[allow(clippy::too_many_arguments)]
 fn request_measurement(
     messages: &[ChatMessage],
     cfg: &AgentConfig,
     schema_json: &str,
     has_schema: bool,
+    schema_tokens: u64,
     max_tokens: Option<u32>,
     meter: &ContextMeter,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> RequestMeasurement {
     if let Some(window) = cfg.context_window {
-        let schema_tokens = if has_schema {
-            estimate_str(schema_json)
-        } else {
-            0
-        };
         // A valid real-usage anchor is stronger than a cold chars/token pass.
         // Add schemas only if that exact anchored request did not already carry
         // them. Any mutation of covered messages invalidates the anchor first.
         let used = meter.estimate(messages)
-            + if meter.anchor_includes_schema(messages) {
+            + if meter.anchor_includes_schema(messages, schema_json) {
                 0
             } else {
                 schema_tokens
             };
-        let budget = ContextBudget::new(window, max_tokens);
+        // P6: budget against the clamped effective window (if repeated shortfall
+        // evidence earned one), not necessarily the raw resolved window. `window`
+        // itself — reported below as the resolved model window — is untouched.
+        let budget =
+            ContextBudget::new(effective_budget_window(window, window_evidence), max_tokens);
         RequestMeasurement {
             used,
             target: budget.target,
@@ -2798,22 +2895,39 @@ fn check_measurement(measurement: RequestMeasurement) -> Result<RequestMeasureme
 }
 
 /// The last-line guard used at every provider boundary in this module.
+///
+/// P11: the schema token estimate is cached per session, keyed by the P7
+/// [`schema_fingerprint`] of the serialized schema. A cache hit reuses the
+/// stored `schema_json` and estimate without re-running `estimate_str`; a miss
+/// (first preflight or a changed tool registry) recomputes and overwrites the
+/// cache. Serialization of `req.tools` still happens here — it is required to
+/// fingerprint the CURRENT request's schema — but the chars/token pass over it
+/// does not.
 fn ensure_chat_request_fits(
     req: &ChatRequest,
     cfg: &AgentConfig,
     meter: &ContextMeter,
+    window_evidence: Option<ContextWindowEvidence>,
+    schema_cache: &mut Option<(u64, String, u64)>,
 ) -> Result<RequestMeasurement, AgentError> {
     let has_schema =
         req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) || req.response_format.is_some();
     let schema_json =
         serialized_request_constraints(req.tools.as_deref(), req.response_format.as_ref());
+    let schema_tokens = if has_schema {
+        cached_schema_estimate(schema_cache, &schema_json)
+    } else {
+        0
+    };
     check_measurement(request_measurement(
         &req.messages,
         cfg,
         &schema_json,
         has_schema,
+        schema_tokens,
         req.max_tokens,
         meter,
+        window_evidence,
     ))
 }
 
@@ -2845,6 +2959,22 @@ fn serialized_request_constraints(
         );
     }
     serialized
+}
+
+/// P11 helper: return the cached token estimate for `schema_json` when the
+/// session cache's fingerprint matches, otherwise compute `estimate_str` fresh
+/// and overwrite the cache with the new (fingerprint, schema_json, estimate)
+/// triple. Reuses the P7 [`schema_fingerprint`] — no new hashing scheme.
+fn cached_schema_estimate(cache: &mut Option<(u64, String, u64)>, schema_json: &str) -> u64 {
+    let fingerprint = schema_fingerprint(schema_json);
+    if let Some((cached_fp, _, cached_estimate)) = cache.as_ref() {
+        if *cached_fp == fingerprint {
+            return *cached_estimate;
+        }
+    }
+    let estimate = estimate_str(schema_json);
+    *cache = Some((fingerprint, schema_json.to_string(), estimate));
+    estimate
 }
 
 /// Compact eligible old exchanges immediately, even when the conversation is
@@ -2884,6 +3014,7 @@ where
         1,
         CompactionReason::ManualRequest,
         true,
+        state.window_evidence,
     )
     .await
 }
@@ -2918,6 +3049,7 @@ where
         1,
         CompactionReason::ContextTargetExceeded,
         false,
+        None,
     )
     .await
 }
@@ -2950,19 +3082,31 @@ async fn enforce_context_budget_recording<P>(
     round: u32,
     reason: CompactionReason,
     force: bool,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Result<CompactionReport, AgentError>
 where
     P: Provider,
 {
-    let token_before = structural_request_tokens(messages, schema_json, has_schema);
+    // P11: the schema is fixed for this whole call, so its token estimate is
+    // computed once here and threaded into every request_measurement /
+    // structural_request_tokens call below instead of being re-derived from
+    // schema_json on each pass.
+    let schema_tokens = if has_schema {
+        estimate_str(schema_json)
+    } else {
+        0
+    };
+    let token_before = structural_request_tokens(messages, schema_tokens);
     let messages_before = messages.len();
     let initial = request_measurement(
         messages,
         cfg,
         schema_json,
         has_schema,
+        schema_tokens,
         cfg.max_tokens,
         meter,
+        window_evidence,
     );
     let mut progress = CompactionProgress::default();
 
@@ -3018,8 +3162,10 @@ where
             cfg,
             schema_json,
             has_schema,
+            schema_tokens,
             cfg.max_tokens,
             meter,
+            window_evidence,
         );
         let record = record_progress(
             ledger,
@@ -3027,7 +3173,7 @@ where
             reason,
             &progress,
             token_before,
-            structural_request_tokens(messages, schema_json, has_schema),
+            structural_request_tokens(messages, schema_tokens),
             messages_before,
             messages.len(),
         );
@@ -3036,7 +3182,7 @@ where
             changed: record.is_some(),
             target_tokens: 0,
             tokens_before: token_before,
-            tokens_after: structural_request_tokens(messages, schema_json, has_schema),
+            tokens_after: structural_request_tokens(messages, schema_tokens),
             record,
             usage: *turn_usage,
         });
@@ -3069,7 +3215,7 @@ where
             progress.outcome = Some(CompactionOutcome::ToolResultsElided);
             // Once covered content changes, use one consistent cold estimate for
             // all subsequent stages and the final adjacent preflight.
-            running = structural_request_tokens(messages, schema_json, has_schema);
+            running = structural_request_tokens(messages, schema_tokens);
         }
     }
 
@@ -3091,7 +3237,7 @@ where
                     }
                     meter.invalidate();
                     removed_total = removed_total.saturating_add(removed);
-                    current = structural_request_tokens(messages, schema_json, has_schema);
+                    current = structural_request_tokens(messages, schema_tokens);
                     if force || current <= target {
                         break;
                     }
@@ -3106,21 +3252,21 @@ where
                     provider,
                     messages,
                     cfg,
-                    schema_json,
-                    has_schema,
+                    schema_tokens,
                     target,
                     compact_failures,
                     turn_usage,
                     meter,
                     &mut progress,
                     round,
+                    window_evidence,
                 )
                 .await?;
             }
         }
     }
 
-    let token_after = structural_request_tokens(messages, schema_json, has_schema);
+    let token_after = structural_request_tokens(messages, schema_tokens);
     let record = record_progress(
         ledger,
         cfg,
@@ -3136,8 +3282,10 @@ where
         cfg,
         schema_json,
         has_schema,
+        schema_tokens,
         cfg.max_tokens,
         meter,
+        window_evidence,
     ))?;
     Ok(CompactionReport {
         changed: record.is_some(),
@@ -3279,18 +3427,42 @@ fn truncate_middle_to_bytes(text: &str, max_bytes: usize) -> String {
 fn bounded_summary_request(
     cfg: &AgentConfig,
     old_messages: &[ChatMessage],
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Option<(ChatRequest, bool)> {
     let window = cfg.context_window?;
     let max_tokens = summary_max_tokens(window, cfg.max_tokens)?;
-    let target = ContextBudget::new(window, Some(max_tokens)).target;
-    let max_prompt_bytes = usize::try_from(target.saturating_mul(4)).unwrap_or(usize::MAX);
-    let fixed_bytes =
-        SUMMARY_INPUT_PREFIX.len() + SUMMARY_INPUT_SUFFIX.len() + SUMMARY_PROMPT.len();
-    if fixed_bytes >= max_prompt_bytes {
+    // P6: the compaction summarizer's own outbound request must fit inside the
+    // same clamped session budget as everything else — a resolved-window-sized
+    // summary target would re-risk the exact truncation this clamp exists to
+    // prevent.
+    let target = ContextBudget::new(
+        effective_budget_window(window, window_evidence),
+        Some(max_tokens),
+    )
+    .target;
+    // Budget the request in TOKEN space, not a flat bytes/CHARS_PER_TOKEN
+    // guess, so the request this function hands back is actually estimated at
+    // or under `target` once built (message_tokens is what `ensure_chat_-
+    // request_fits` measures it with just after). Reserve PER_MESSAGE_TOKENS
+    // for the single wrapping message's own overhead, and the fixed prefix/
+    // suffix/prompt text's REAL estimate (not its byte length — the prompt
+    // text contains non-ASCII punctuation that costs a full token each under
+    // the two-rate estimator, not a byte-len/4 fraction of one). Only the
+    // remaining token headroom is converted back to a byte budget, and only
+    // for the variable transcript, which is ASCII-dominated conversation
+    // text in the common case.
+    let fixed_tokens = estimate_str(SUMMARY_INPUT_PREFIX)
+        + estimate_str(SUMMARY_INPUT_SUFFIX)
+        + estimate_str(SUMMARY_PROMPT);
+    let transcript_token_budget = target
+        .saturating_sub(PER_MESSAGE_TOKENS)
+        .saturating_sub(fixed_tokens);
+    if transcript_token_budget == 0 {
         return None;
     }
+    let available = usize::try_from(transcript_token_budget.saturating_mul(CHARS_PER_TOKEN as u64))
+        .unwrap_or(usize::MAX);
     let transcript = summary_transcript(old_messages);
-    let available = max_prompt_bytes - fixed_bytes;
     let bounded = truncate_middle_to_bytes(&transcript, available);
     if bounded.trim().is_empty() {
         return None;
@@ -3307,6 +3479,7 @@ fn bounded_summary_request(
             reasoning_effort: cfg.reasoning_effort,
             max_tokens: Some(max_tokens),
             response_format: None,
+            prompt_cache_key: None,
         },
         shortened,
     ))
@@ -3329,8 +3502,7 @@ fn fit_summary_rebuild(
     messages: &[ChatMessage],
     span: CompactionSpan,
     summary: &str,
-    schema_json: &str,
-    has_schema: bool,
+    schema_tokens: u64,
     target: u64,
 ) -> Option<(Vec<ChatMessage>, bool)> {
     let mut cap = summary.len();
@@ -3340,7 +3512,7 @@ fn fit_summary_rebuild(
             return None;
         }
         let rebuilt = rebuilt_with_summary(messages, span, bounded.trim());
-        let used = structural_request_tokens(&rebuilt, schema_json, has_schema);
+        let used = structural_request_tokens(&rebuilt, schema_tokens);
         if used <= target {
             return Some((rebuilt, bounded.len() < summary.len()));
         }
@@ -3364,14 +3536,14 @@ async fn summarize_or_fallback<P>(
     provider: &P,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
-    schema_json: &str,
-    has_schema: bool,
+    schema_tokens: u64,
     target: u64,
     failures: &mut u32,
     turn_usage: &mut kitsu_providers::Usage,
     meter: &mut ContextMeter,
     progress: &mut CompactionProgress,
     round: u32,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> Result<(), AgentError>
 where
     P: Provider,
@@ -3383,14 +3555,22 @@ where
     let fallback = if *failures >= MAX_COMPACT_FAILURES {
         Some(SummaryFallbackReason::CircuitBreaker)
     } else {
-        match bounded_summary_request(cfg, &messages[span.prefix_end..span.recent_start]) {
+        match bounded_summary_request(
+            cfg,
+            &messages[span.prefix_end..span.recent_start],
+            window_evidence,
+        ) {
             None => Some(SummaryFallbackReason::RequestTooLarge),
             Some((req, shortened)) => {
                 progress.summary_input_shortened = shortened;
                 // This is a provider request in its own right. Check the concrete
                 // bounded request immediately before crossing the boundary.
                 let cold_meter = ContextMeter::new();
-                if ensure_chat_request_fits(&req, cfg, &cold_meter).is_err() {
+                // The bounded summary request carries no tools, so the P11
+                // schema cache is irrelevant here — pass a fresh empty slot.
+                if ensure_chat_request_fits(&req, cfg, &cold_meter, window_evidence, &mut None)
+                    .is_err()
+                {
                     Some(SummaryFallbackReason::RequestTooLarge)
                 } else {
                     if let Some(log) = &cfg.event_log {
@@ -3429,8 +3609,7 @@ where
                                 messages,
                                 span,
                                 text.trim(),
-                                schema_json,
-                                has_schema,
+                                schema_tokens,
                                 target,
                             ) {
                                 *messages = rebuilt;
@@ -3452,7 +3631,7 @@ where
                                 record_compaction_usage(cfg, round, turn_usage, usage)?;
                             }
                             *failures = failures.saturating_add(1);
-                            Some(SummaryFallbackReason::ProviderFailure)
+                            Some(SummaryFallbackReason::EmptyCompletion)
                         }
                         SummaryTextCollection::Failed { reason, usage } => {
                             if let Some(usage) = usage {
@@ -3471,12 +3650,19 @@ where
     // eligible old exchange, preserve the leading system/marker plus the two
     // recent exchanges, then let the common final preflight either accept that
     // smallest safe history or return ContextOverflow for protected context.
-    let current = structural_request_tokens(messages, schema_json, has_schema);
+    let current = structural_request_tokens(messages, schema_tokens);
     let removed = drop_old_exchanges_detailed(messages, current, target, message_tokens, true);
     if removed > 0 {
         meter.invalidate();
         progress.exchanges_removed = removed;
         progress.outcome = Some(CompactionOutcome::SummaryFallbackTrim);
+        progress.fallback_reason = fallback;
+    } else {
+        // The fallback ran but there was nothing left to trim. Record a
+        // distinct outcome so a caller never mistakes a stale prior-round
+        // outcome for this round's result.
+        progress.exchanges_removed = 0;
+        progress.outcome = Some(CompactionOutcome::SummaryFallbackNoOp);
         progress.fallback_reason = fallback;
     }
     Ok(())
@@ -3668,11 +3854,23 @@ pub struct RunTallies {
 /// with a 500-char preview only starves the model (cycle-15 headline: a
 /// 131k-window turn lost a 1828-line read at 1.5k tokens used, then answered
 /// honestly from the preview and was blamed for fabricating).
-fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) -> bool {
+fn offload_pressure(
+    messages: &[ChatMessage],
+    content: &str,
+    cfg: &AgentConfig,
+    window_evidence: Option<ContextWindowEvidence>,
+) -> bool {
     let Some(window) = cfg.context_window else {
         return true; // unknown window: keep the old conservative behavior
     };
-    let effective = ContextBudget::new(window, cfg.max_tokens).effective;
+    // P6: offload against the clamped effective budget once shortfall evidence
+    // has earned one, so a session pinned to a too-large resolved window still
+    // starts offloading at the REAL usable threshold instead of the stale one.
+    let effective = ContextBudget::new(
+        effective_budget_window(window, window_evidence),
+        cfg.max_tokens,
+    )
+    .effective;
     let used: u64 = messages.iter().map(message_tokens).sum();
     let added = estimate_str(content);
     used.saturating_add(added).saturating_mul(2) > effective
@@ -3680,16 +3878,14 @@ fn offload_pressure(messages: &[ChatMessage], content: &str, cfg: &AgentConfig) 
 
 fn prepare_tool_output(
     content: String,
-    call_id: &str,
-    tool_name: &str,
-    is_err: bool,
+    request: ToolOutputRequest<'_>,
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
 ) -> PreparedToolOutput {
     // Native command results are already bounded per stream and must remain
     // valid JSON so the event layer can parse their authoritative counters.
-    if tool_name == "command_exec" {
+    if request.tool_name == "command_exec" {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,
@@ -3719,7 +3915,7 @@ fn prepare_tool_output(
 
     // Preserve the existing default: errors remain inline, while successful
     // oversized results may be offloaded if the model can recover the pointer.
-    if is_err {
+    if request.is_err {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,
@@ -3729,11 +3925,12 @@ fn prepare_tool_output(
     }
     maybe_offload_for_tools_detailed(
         content,
-        call_id,
+        request.call_id,
         cfg.offload_dir.as_deref(),
         tools,
         messages,
         cfg,
+        request.window_evidence,
     )
 }
 
@@ -3749,8 +3946,17 @@ fn maybe_offload_for_tools(
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> (String, Option<std::path::PathBuf>) {
-    let prepared = maybe_offload_for_tools_detailed(content, call_id, dir, tools, messages, cfg);
+    let prepared = maybe_offload_for_tools_detailed(
+        content,
+        call_id,
+        dir,
+        tools,
+        messages,
+        cfg,
+        window_evidence,
+    );
     (prepared.content, prepared.artifact_path)
 }
 
@@ -3761,13 +3967,14 @@ fn maybe_offload_for_tools_detailed(
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
+    window_evidence: Option<ContextWindowEvidence>,
 ) -> PreparedToolOutput {
     let can_read = tools.is_registered("fs_read_file")
         && tools
             .descriptors()
             .iter()
             .any(|descriptor| descriptor.name == "fs_read_file");
-    if !can_read || !offload_pressure(messages, &content, cfg) {
+    if !can_read || !offload_pressure(messages, &content, cfg, window_evidence) {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,

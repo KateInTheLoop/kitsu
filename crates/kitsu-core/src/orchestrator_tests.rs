@@ -193,6 +193,7 @@ impl Provider for SummaryTelemetryProvider {
                 prompt_tokens: 111,
                 completion_tokens: 22,
                 total_tokens: 133,
+                prompt_tokens_details: None,
             })),
             Ok(ChatDelta::Done(FinishReason::Stop)),
         ])))
@@ -389,6 +390,7 @@ async fn structured_output_can_be_reserved_for_a_tool_free_finalization_round() 
                 prompt_tokens: 100,
                 completion_tokens: 5,
                 total_tokens: 105,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -525,6 +527,7 @@ async fn exact_output_gate_keeps_tools_available_for_one_bounded_repair() {
                 prompt_tokens: 120,
                 completion_tokens: 5,
                 total_tokens: 125,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -803,6 +806,7 @@ async fn deferred_finalization_remeasures_the_changed_response_schema() {
             prompt_tokens: 10,
             completion_tokens: 2,
             total_tokens: 12,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
@@ -2122,7 +2126,7 @@ fn tool_activity_formatting() {
     assert!(command_result.contains("89"));
     assert!(command_result.contains("stderr 3 B"));
     assert!(command_result.contains("bad"));
-    assert!(command_result.contains("full output=\"session:command-1\""));
+    assert!(command_result.contains("full output=session:command-1"));
 
     let mut cancelled_without_artifact = command_output.clone();
     cancelled_without_artifact["termination"] = serde_json::json!("cancelled");
@@ -2229,7 +2233,7 @@ fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
     });
     let receipt = format_tool_result("command_exec", "{}", &output.to_string(), false);
     assert!(
-        receipt.contains(&format!("full output={long_reference:?}")),
+        receipt.contains(&format!("full output={long_reference}")),
         "artifact path must appear complete and unelided: {receipt}"
     );
     assert!(
@@ -2653,28 +2657,30 @@ fn offload_pressure_requires_real_window_pressure() {
     let mut roomy = cfg(10);
     roomy.context_window = Some(131_072);
     assert!(
-        !offload_pressure(&messages, &big, &roomy),
+        !offload_pressure(&messages, &big, &roomy, None),
         "1.5k used + 5k added in a 131k window is not pressure"
     );
 
     let mut tight = cfg(10);
     tight.context_window = Some(8_192);
     assert!(
-        offload_pressure(&messages, &big, &tight),
+        offload_pressure(&messages, &big, &tight, None),
         "the same result in an 8k window is pressure"
     );
 
     let mut unknown = cfg(10);
     unknown.context_window = None;
     assert!(
-        offload_pressure(&messages, &big, &unknown),
+        offload_pressure(&messages, &big, &unknown, None),
         "unknown window keeps the conservative old behavior"
     );
 }
 
 #[test]
 fn artifact_policy_and_context_pressure_select_one_retention_path() {
-    use crate::orchestrator::{prepare_tool_output, ArtifactStoragePolicy, ToolArtifactStatus};
+    use crate::orchestrator::{
+        prepare_tool_output, ArtifactStoragePolicy, ToolArtifactStatus, ToolOutputRequest,
+    };
     use kitsu_providers::ToolDescriptor;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2695,9 +2701,12 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     roomy.offload_dir = Some(dir.path().to_path_buf());
     let inline = prepare_tool_output(
         content.clone(),
-        "roomy",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "roomy",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &roomy,
@@ -2715,9 +2724,12 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     tight.offload_dir = Some(dir.path().to_path_buf());
     let retained = prepare_tool_output(
         content.clone(),
-        "tight",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "tight",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &tight,
@@ -2736,9 +2748,12 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     tight.artifact_policy = ArtifactStoragePolicy::InlineOnly;
     let suppressed = prepare_tool_output(
         content,
-        "suppressed",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "suppressed",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &tight,
@@ -2756,6 +2771,105 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         std::fs::read_dir(dir.path()).unwrap().count(),
         1,
         "artifact-free retention must not create a second file"
+    );
+}
+
+#[test]
+fn repeated_window_shortfall_drives_retention_without_bypassing_artifact_policy() {
+    use crate::orchestrator::{
+        prepare_tool_output, ArtifactStoragePolicy, ContextWindowEvidence, ToolArtifactStatus,
+        ToolOutputRequest,
+    };
+    use kitsu_providers::ToolDescriptor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let content = format!("HEAD{}TAIL", "x".repeat(20_000));
+    let messages = initial_messages();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "fs_read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    let mut config = cfg(10);
+    config.context_window = Some(32_768);
+    config.offload_dir = Some(dir.path().to_path_buf());
+
+    let one_strike = ContextWindowEvidence {
+        reported_prompt_tokens: 8_192,
+        estimated_sent_tokens: 12_000,
+        resolved_window: 32_768,
+        warned: false,
+        shortfall_count: 1,
+    };
+    let still_inline = prepare_tool_output(
+        content.clone(),
+        ToolOutputRequest {
+            call_id: "one-strike",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(one_strike),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        still_inline.retention.artifact_status,
+        ToolArtifactStatus::NotNeeded,
+        "one shortfall must not clamp the offload threshold"
+    );
+
+    let two_strikes = ContextWindowEvidence {
+        shortfall_count: 2,
+        ..one_strike
+    };
+    let retained = prepare_tool_output(
+        content.clone(),
+        ToolOutputRequest {
+            call_id: "two-strikes",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(two_strikes),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        retained.retention.artifact_status,
+        ToolArtifactStatus::Retained,
+        "two plausible shortfalls must apply the smaller effective window"
+    );
+    assert!(retained.artifact_path.as_ref().is_some_and(|p| p.is_file()));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+    config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
+    let suppressed = prepare_tool_output(
+        content,
+        ToolOutputRequest {
+            call_id: "policy-wins",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(two_strikes),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        suppressed.retention.artifact_status,
+        ToolArtifactStatus::SuppressedByPolicy
+    );
+    assert!(suppressed.artifact_path.is_none());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "artifact-free policy must not create another retained file"
     );
 }
 
@@ -2786,6 +2900,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         &tools,
         &msgs,
         &tight,
+        None,
     );
     assert_eq!(inline, (big.clone(), None));
     assert!(
@@ -2801,8 +2916,15 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
-    let (pointer, offloaded_to) =
-        maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools, &msgs, &tight);
+    let (pointer, offloaded_to) = maybe_offload_for_tools(
+        big,
+        "readable",
+        Some(dir.path()),
+        &tools,
+        &msgs,
+        &tight,
+        None,
+    );
     assert!(pointer.contains("full result saved to"));
     assert!(pointer.contains("fs_read_file"));
     assert!(offloaded_to.is_some());
@@ -3236,7 +3358,7 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
     // Real usage for exactly these messages was 300 tokens — comfortably under
     // the 400 target on its own (and already reflects that round's schema cost,
     // hence `had_schema: true`).
-    meter.record(300, sent_len, true);
+    meter.record(300, &msgs, true, &schema_json);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
@@ -3361,11 +3483,22 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
 
     // Only ONE user exchange (<= KEEP_RECENT_EXCHANGES) — nothing is safely
     // droppable, so drop_old_exchanges is a guaranteed no-op on `messages`.
-    let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
+    //
+    // P5 (context.rs): estimate() now sanity-checks a recorded anchor against
+    // the anchor-free full estimate and ignores it outside a 0.4x-2.5x band.
+    // The old anchor here (500 against a ~8-token full estimate for "sys"/"q")
+    // is far outside that band and would now be rejected, silently defeating
+    // the overflow this test forces. Padded content raises the full estimate
+    // to 41 so a still-over-target anchor of 90 stays plausible (90 <= 2.5*41
+    // = 102.5, 90 >= 0.4*41 = 16.4) while remaining well above the ~80 target.
+    let mut msgs = vec![
+        ChatMessage::system("x".repeat(136).as_str()),
+        ChatMessage::user("q"),
+    ];
     let mut meter = ContextMeter::new();
-    let sent_len = msgs.len();
-    // A real anchor that's over target, forcing the compaction match to run.
-    meter.record(500, sent_len, true);
+    // A real, plausible anchor that's over target, forcing the compaction
+    // match to run.
+    meter.record(90, &msgs, true, "");
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
@@ -3699,6 +3832,7 @@ async fn structured_event_log_frames_provider_usage_tools_and_completion() {
                 prompt_tokens: 10,
                 completion_tokens: 2,
                 total_tokens: 12,
+                prompt_tokens_details: None,
             }),
             ChatDelta::Done(FinishReason::Stop),
         ],
@@ -4523,6 +4657,7 @@ async fn test_usage_shortfall_records_window_evidence() {
             prompt_tokens: 4096,
             completion_tokens: 3,
             total_tokens: 4099,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
@@ -4554,6 +4689,7 @@ async fn test_healthy_usage_records_no_window_evidence() {
             prompt_tokens: 5100,
             completion_tokens: 2,
             total_tokens: 5102,
+            prompt_tokens_details: None,
         }),
         ChatDelta::Done(FinishReason::Stop),
     ]]);
@@ -4593,4 +4729,668 @@ fn template_control_debris_detector_fires_on_tails_not_quotes() {
     assert!(!template_control_debris_in_tail(
         "a perfectly normal answer."
     ));
+}
+
+/// P6: a single shortfall strike (`shortfall_count == 1`) must NOT clamp the
+/// effective session budget that gates outgoing requests — the two-strike
+/// rule holds end-to-end through `request_measurement`, not just in the pure
+/// `clamp_window_for_shortfall` helper.
+#[test]
+fn test_single_shortfall_does_not_clamp_request_measurement() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{request_measurement, ContextWindowEvidence};
+
+    let mut c = cfg(2);
+    c.context_window = Some(8_192);
+    let meter = ContextMeter::new();
+    let unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, None);
+
+    let one_strike = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 4_096,
+        estimated_sent_tokens: 5_000,
+        resolved_window: 8_192,
+        warned: false,
+        shortfall_count: 1,
+    });
+    let still_unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, one_strike);
+    assert_eq!(unclamped.effective, still_unclamped.effective);
+    assert_eq!(unclamped.target, still_unclamped.target);
+    // The resolved window reported alongside the budget is never rewritten.
+    assert_eq!(still_unclamped.window, Some(8_192));
+}
+
+/// P6: two shortfall strikes for the SAME resolved window DO clamp the
+/// effective session budget toward the reported size, end-to-end through
+/// `request_measurement` (the function that actually gates outgoing
+/// requests) — while `window` (the resolved window) is still reported
+/// unchanged, proving only the derived budget adapted.
+#[test]
+fn test_two_shortfalls_clamp_request_measurement_effective_budget() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{request_measurement, ContextWindowEvidence};
+
+    let mut c = cfg(2);
+    c.context_window = Some(8_192);
+    let meter = ContextMeter::new();
+    let unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, None);
+
+    let two_strikes = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 4_096,
+        estimated_sent_tokens: 5_000,
+        resolved_window: 8_192,
+        warned: false,
+        shortfall_count: 2,
+    });
+    let clamped = request_measurement(&[], &c, "", false, 0, None, &meter, two_strikes);
+    assert!(
+        clamped.effective.unwrap() < unclamped.effective.unwrap(),
+        "two strikes must shrink the effective budget below the unclamped one"
+    );
+    assert!(clamped.target < unclamped.target);
+    // Resolved window is STILL reported as 8192 — never rewritten, only the
+    // derived effective/target budget changed.
+    assert_eq!(clamped.window, Some(8_192));
+
+    // Evidence for a DIFFERENT resolved window (a stale carry-over from a
+    // previous `--context-window`/model) must not clamp against the current one.
+    let stale = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 2_048,
+        estimated_sent_tokens: 3_000,
+        resolved_window: 4_096,
+        warned: false,
+        shortfall_count: 5,
+    });
+    let ignored_stale = request_measurement(&[], &c, "", false, 0, None, &meter, stale);
+    assert_eq!(unclamped.effective, ignored_stale.effective);
+}
+
+// --- P11: schema estimate cached per session, keyed by the P7 schema_fingerprint ---
+//
+// `cached_schema_estimate` is the primitive `ensure_chat_request_fits` (the
+// "last-line guard used at every provider boundary") calls on every preflight.
+// These tests exercise it directly plus one integration-level check through
+// `ensure_chat_request_fits` itself, so the win (no re-serialize, no
+// re-estimate on an unchanged tool schema) is proven at both layers.
+
+fn sample_tool_descriptor(name: &str) -> kitsu_providers::ToolDescriptor {
+    kitsu_providers::ToolDescriptor {
+        name: name.to_string(),
+        description: "a sample tool for P11 cache tests".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }
+}
+
+#[test]
+fn test_cached_schema_estimate_reuses_cache_on_matching_fingerprint() {
+    use crate::context::schema_fingerprint;
+    use crate::orchestrator::cached_schema_estimate;
+
+    let schema_json = serde_json::to_string(&[sample_tool_descriptor("read_file")]).unwrap();
+    let real_fingerprint = schema_fingerprint(&schema_json);
+
+    // Seed the cache with a SENTINEL estimate under the fingerprint the
+    // current schema will actually produce. If `cached_schema_estimate`
+    // genuinely reuses the cache on a hit (rather than silently
+    // re-serializing/re-estimating and happening to match), it must return
+    // this exact sentinel — a value no real `estimate_str` pass over this
+    // schema could ever produce.
+    const SENTINEL_ESTIMATE: u64 = 999_999_999;
+    let mut cache = Some((
+        real_fingerprint,
+        "stale-but-fingerprint-matching-placeholder".to_string(),
+        SENTINEL_ESTIMATE,
+    ));
+
+    let returned = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(
+        returned, SENTINEL_ESTIMATE,
+        "a fingerprint-matching cache entry must be reused verbatim, proving no recompute happened"
+    );
+    // The cache itself must be left untouched by a hit.
+    assert_eq!(
+        cache,
+        Some((
+            real_fingerprint,
+            "stale-but-fingerprint-matching-placeholder".to_string(),
+            SENTINEL_ESTIMATE
+        ))
+    );
+
+    // Same proof one level up, through the actual preflight entry point:
+    // two consecutive `ensure_chat_request_fits` calls with the SAME tool set
+    // reuse the seeded sentinel rather than the real schema tokens. Use a
+    // smaller (but still unmistakably non-real) sentinel here so the request
+    // stays inside the context budget and the preflight can return Ok.
+    use crate::context::ContextMeter;
+    use crate::orchestrator::ensure_chat_request_fits;
+    use kitsu_providers::ChatRequest;
+
+    const PREFLIGHT_SENTINEL: u64 = 50_000;
+    let mut c = cfg(2);
+    c.context_window = Some(131_072);
+    let meter = ContextMeter::new();
+    let req = ChatRequest {
+        model: c.model.clone(),
+        messages: vec![],
+        tools: Some(vec![sample_tool_descriptor("read_file")]),
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
+    };
+
+    let mut preflight_cache = Some((real_fingerprint, schema_json.clone(), PREFLIGHT_SENTINEL));
+    let first = ensure_chat_request_fits(&req, &c, &meter, None, &mut preflight_cache).unwrap();
+    let second = ensure_chat_request_fits(&req, &c, &meter, None, &mut preflight_cache).unwrap();
+    // `used` is messages (0 here) + schema tokens; both preflights must have
+    // used the sentinel, not a freshly estimated value (which would be a few
+    // tens of tokens for this one-tool schema, nowhere near 50,000).
+    assert_eq!(first.used, PREFLIGHT_SENTINEL);
+    assert_eq!(second.used, PREFLIGHT_SENTINEL);
+}
+
+#[test]
+fn test_cached_schema_estimate_recomputes_on_fingerprint_mismatch() {
+    use crate::context::{estimate_str, schema_fingerprint};
+    use crate::orchestrator::cached_schema_estimate;
+
+    let old_schema_json = serde_json::to_string(&[sample_tool_descriptor("read_file")]).unwrap();
+    let old_fingerprint = schema_fingerprint(&old_schema_json);
+    let mut cache = Some((old_fingerprint, old_schema_json, 42_u64));
+
+    // A CHANGED tool set — different descriptor, different fingerprint.
+    let new_schema_json = serde_json::to_string(&[
+        sample_tool_descriptor("read_file"),
+        sample_tool_descriptor("write_file"),
+    ])
+    .unwrap();
+    let new_fingerprint = schema_fingerprint(&new_schema_json);
+    assert_ne!(
+        old_fingerprint, new_fingerprint,
+        "test fixture must actually change the schema identity"
+    );
+
+    let returned = cached_schema_estimate(&mut cache, &new_schema_json);
+    let fresh = estimate_str(&new_schema_json);
+    assert_eq!(
+        returned, fresh,
+        "a fingerprint mismatch must recompute the estimate from the new schema, not reuse the stale 42"
+    );
+    assert_ne!(
+        returned, 42,
+        "must not silently keep serving the old cached value"
+    );
+
+    // The cache must be overwritten with the new triple.
+    assert_eq!(cache, Some((new_fingerprint, new_schema_json, fresh)));
+}
+
+#[test]
+fn test_cached_schema_estimate_correctness_matches_fresh_estimate() {
+    use crate::context::estimate_str;
+    use crate::orchestrator::cached_schema_estimate;
+
+    let schema_json = serde_json::to_string(&[
+        sample_tool_descriptor("read_file"),
+        sample_tool_descriptor("workspace_diff"),
+        sample_tool_descriptor("spawn_agent"),
+    ])
+    .unwrap();
+
+    // First use: no cache yet, must compute correctly.
+    let mut cache = None;
+    let first = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(first, estimate_str(&schema_json));
+
+    // Second use, same schema: cache hit must still equal a fresh estimate
+    // of the identical schema — the cache must never return a wrong number.
+    let second = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(second, estimate_str(&schema_json));
+    assert_eq!(first, second);
+}
+
+/// Build a conversation with a system prefix plus `exchanges` user/assistant
+/// exchanges (more than KEEP_RECENT_EXCHANGES so a compaction span exists).
+fn compaction_conversation(exchanges: usize) -> Vec<kitsu_providers::ChatMessage> {
+    let mut msgs = vec![kitsu_providers::ChatMessage::system("you are a test bot")];
+    for i in 0..exchanges {
+        msgs.push(kitsu_providers::ChatMessage::user(format!(
+            "question {i}: please do some work"
+        )));
+        msgs.push(kitsu_providers::ChatMessage::assistant(
+            format!("answer {i}: work done"),
+            vec![],
+        ));
+    }
+    msgs
+}
+
+/// An EMPTY (whitespace-only) but cleanly terminated (`Done(Stop)`) summary
+/// completion must fall back with SummaryFallbackReason::EmptyCompletion, NOT
+/// ProviderFailure: the provider succeeded; it simply returned no usable text.
+#[tokio::test]
+async fn summarize_or_fallback_empty_completion_uses_empty_completion_reason() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = MockProvider::new(vec![vec![
+        ChatDelta::Text("   \n\t ".to_string()),
+        ChatDelta::Done(FinishReason::Stop),
+    ]]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(4);
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        64_000,
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on an empty completion");
+
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::EmptyCompletion),
+        "an empty-but-terminated completion is not a provider failure"
+    );
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the fallback must still trim the old exchanges"
+    );
+    assert!(
+        messages
+            .iter()
+            .any(|m| m.content == crate::orchestrator::TRIM_MARKER),
+        "the trim fallback must leave its marker in the rebuilt history"
+    );
+}
+
+/// A genuine provider FAILURE (stream error) must still fall back with
+/// SummaryFallbackReason::ProviderFailure — the new EmptyCompletion variant
+/// must not swallow real failures.
+#[tokio::test]
+async fn summarize_or_fallback_provider_failure_still_uses_provider_failure_reason() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = FallibleMockProvider::new(vec![Err(ProviderError::Connection(
+        "stream interrupted".to_string(),
+    ))]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(4);
+    let mut failures = 0u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        64_000,
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on a provider failure");
+
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::ProviderFailure),
+        "a real provider failure must keep the ProviderFailure reason"
+    );
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the fallback must still trim the old exchanges"
+    );
+}
+
+/// `drop_old_exchanges_detailed` (the helper the `summarize_or_fallback`
+/// tail's `removed == 0` branch depends on) really does return 0 when
+/// nothing is safely droppable — and, separately, that `force_all: true`
+/// ignores an arbitrarily generous `target` and drops everything droppable
+/// once a droppable span exists at all.
+///
+/// That second fact is why `summarize_or_fallback`'s new `removed == 0`
+/// (`SummaryFallbackNoOp`) branch is currently UNREACHABLE from its own
+/// call site: `compaction_span()` gates entry to the whole fallback tail
+/// using the exact same "too few exchanges" threshold this function uses
+/// to return 0 (`actual <= KEEP_RECENT_EXCHANGES`), and no message mutation
+/// happens in between. So by the time the tail's hardcoded `force_all:
+/// true` call runs, at least one exchange is always still droppable and
+/// WILL be dropped, regardless of `target`. An end-to-end
+/// `summarize_or_fallback` test that reaches `removed == 0` with a real
+/// compaction span present cannot be constructed against the current code
+/// (confirmed empirically: the natural first attempt at such a test — a
+/// 4-exchange conversation with a deliberately generous target — asserted
+/// `SummaryFallbackNoOp` but observed `SummaryFallbackTrim` with 2
+/// exchanges actually removed, exactly as this test predicts).
+///
+/// The fix is still correct, additive, defensive code: it stops a latent
+/// silent stale-outcome bug the instant `force_all`'s hardcoding or the two
+/// thresholds above ever drift apart. This test pins down the two facts
+/// the unreachability argument rests on, directly against the helper.
+#[test]
+fn drop_old_exchanges_detailed_force_all_zero_only_when_nothing_droppable() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::drop_old_exchanges_detailed;
+    use kitsu_providers::ChatMessage;
+
+    // Too few exchanges to safely drop anything (<= KEEP_RECENT_EXCHANGES):
+    // force_all must still return 0, even with target 0 ("drop everything
+    // you possibly can").
+    let mut few = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q0"),
+        ChatMessage::assistant("a0", vec![]),
+    ];
+    let total: u64 = few.iter().map(message_tokens).sum();
+    let removed = drop_old_exchanges_detailed(&mut few, total, 0, message_tokens, true);
+    assert_eq!(removed, 0, "nothing safely droppable, even under force_all");
+    assert_eq!(few.len(), 3, "messages must be untouched");
+
+    // A real droppable span exists: force_all must drop it even given an
+    // arbitrarily generous target that would need no trimming at all.
+    let mut many = compaction_conversation(4);
+    let total: u64 = many.iter().map(message_tokens).sum();
+    let generous_target = total * 100; // nowhere near exceeded
+    let removed =
+        drop_old_exchanges_detailed(&mut many, total, generous_target, message_tokens, true);
+    assert!(
+        removed > 0,
+        "force_all must drop droppable exchanges regardless of target"
+    );
+}
+
+/// `CompactionLedger::push` must not count a `SummaryFallbackNoOp` outcome
+/// as a trim (it removed nothing) while still recording the compaction
+/// attempt itself — proving the ledger's new match arm is correct, not
+/// merely that it compiles.
+#[test]
+fn compaction_ledger_does_not_count_summary_fallback_no_op_as_a_trim() {
+    use crate::orchestrator::{
+        CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord,
+        SummaryFallbackReason,
+    };
+
+    let mut ledger = CompactionLedger::default();
+    let record = CompactionRecord {
+        sequence: 0, // overwritten by push
+        reason: CompactionReason::ContextTargetExceeded,
+        configured_mode: CompactionMode::Summarize,
+        outcome: CompactionOutcome::SummaryFallbackNoOp,
+        fallback_reason: Some(SummaryFallbackReason::CircuitBreaker),
+        tokens_before: 1000,
+        tokens_after: 1000,
+        messages_before: 10,
+        messages_after: 10,
+        tool_results_elided: 0,
+        exchanges_removed: 0,
+        summary_input_shortened: false,
+        summary_output_shortened: false,
+    };
+
+    ledger.push(record);
+
+    assert_eq!(ledger.total_compactions, 1, "the attempt is still recorded");
+    assert_eq!(
+        ledger.trims, 0,
+        "a no-op fallback removed nothing and must not count as a trim"
+    );
+    assert_eq!(
+        ledger.summaries, 0,
+        "a no-op fallback is not a completed summary either"
+    );
+}
+
+/// The removed > 0 fallback path must keep recording
+/// `SummaryFallbackTrim` with a positive `exchanges_removed` — unchanged.
+#[tokio::test]
+async fn summarize_or_fallback_removed_path_still_records_summary_fallback_trim() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = MockProvider::new(vec![]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(6);
+    let mut failures = 3u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        1, // a tiny target forces the fallback to actually drop old exchanges
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on the trim fallback path");
+
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the removed > 0 path must keep the SummaryFallbackTrim outcome"
+    );
+    assert!(
+        progress.exchanges_removed > 0,
+        "the removed > 0 path must report the exchanges it dropped"
+    );
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::CircuitBreaker)
+    );
+}
+
+/// The artifact reference and artifact status are already sanitized single-line
+/// Strings, so they must render with `{}` — not `{:?}`, which adds spurious
+/// surrounding quotes and double-escapes. The `full output=` field stays last
+/// so a wrapped terminal line still ends with a clean, copyable path.
+#[test]
+fn format_command_result_renders_artifact_fields_unquoted() {
+    use kitsu_tools::{
+        CommandAmbientAuthority, CommandExecutableIdentity, CommandExecutableResolution,
+        CommandOutput, CommandOutputArtifact, CommandTermination,
+    };
+
+    let output = CommandOutput {
+        argv: vec!["ls".to_string()],
+        cwd: "/repo".to_string(),
+        executable: CommandExecutableIdentity {
+            invocation: "ls".to_string(),
+            resolution: CommandExecutableResolution::AmbientPath,
+            observed_path: None,
+            pinned: false,
+        },
+        ambient_authority: CommandAmbientAuthority::CURRENT,
+        termination: CommandTermination::Exited,
+        success: true,
+        exit_code: Some(0),
+        signal: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        stdout_retained_bytes: 0,
+        stderr_retained_bytes: 0,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        stdout_capture_complete: true,
+        stderr_capture_complete: true,
+        elapsed_ms: 3,
+        artifact: Some(CommandOutputArtifact {
+            reference: "/tmp/session/artifacts/cmd-1.log".to_string(),
+            captured_bytes: 0,
+            truncated: false,
+            limit_bytes: 0,
+            artifact_bytes: 0,
+        }),
+        artifact_error: Some("artifact sink degraded".to_string()),
+        containment_hint: None,
+    };
+
+    let rendered = super::format_command_result(&output);
+    assert!(
+        rendered.contains("artifact status=artifact sink degraded"),
+        "artifact status must render unquoted, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("artifact status=\""),
+        "artifact status must not be Debug-quoted, got: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("full output=/tmp/session/artifacts/cmd-1.log"),
+        "the line must end with a clean copyable path, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("full output=\""),
+        "full output must not be Debug-quoted, got: {rendered}"
+    );
+}
+
+// --- text tool-call recovery: arguments normalization -----------------------
+
+/// `parse_text_tool_calls` must turn `arguments: null` (and any non-object,
+/// non-string scalar) into `"{}"`, keep a JSON-encoded string as-is, and
+/// stringify a nested object — only objects/strings are valid tool args.
+#[test]
+fn test_parse_text_tool_calls_arguments_normalization() {
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "foo".to_string(),
+            description: "a no-arg tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    // 1. null arguments → "{}" (NOT the literal string "null")
+    let recovery = super::parse_text_tool_calls(r#"{"name":"foo","arguments":null}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(
+        recovery.calls[0].args, "{}",
+        "null arguments must fall back"
+    );
+
+    // 2. object arguments → stringified object
+    let recovery =
+        super::parse_text_tool_calls(r#"{"name":"foo","arguments":{"a":1}}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(recovery.calls[0].args, r#"{"a":1}"#);
+
+    // 3. JSON-encoded string arguments → used as-is
+    let recovery =
+        super::parse_text_tool_calls(r#"{"name":"foo","arguments":"{\"a\":1}"}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(recovery.calls[0].args, r#"{"a":1}"#);
+}
+
+#[test]
+fn response_schema_participates_in_session_cache_identity() {
+    use crate::context::{estimate_str, schema_fingerprint, ContextMeter};
+    use crate::orchestrator::{ensure_chat_request_fits, serialized_request_constraints};
+    use kitsu_providers::{ChatRequest, JsonSchemaFormat};
+
+    fn response_format(expected: &str) -> JsonSchemaFormat {
+        JsonSchemaFormat {
+            name: "result".to_string(),
+            strict: true,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"status": {"const": expected}},
+                "required": ["status"]
+            }),
+        }
+    }
+
+    let format_a = response_format("alpha");
+    let format_b = response_format("bravo");
+    let serialized_a = serialized_request_constraints(None, Some(&format_a));
+    let serialized_b = serialized_request_constraints(None, Some(&format_b));
+    assert_eq!(
+        serialized_a.len(),
+        serialized_b.len(),
+        "fixtures must prove identity, rather than length, drives invalidation"
+    );
+    assert_ne!(
+        schema_fingerprint(&serialized_a),
+        schema_fingerprint(&serialized_b)
+    );
+
+    let mut config = cfg(2);
+    config.context_window = Some(131_072);
+    let meter = ContextMeter::new();
+    let mut request = ChatRequest {
+        model: config.model.clone(),
+        messages: vec![],
+        tools: None,
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: Some(format_a),
+        prompt_cache_key: None,
+    };
+
+    const SENTINEL_ESTIMATE: u64 = 50_000;
+    let mut cache = Some((
+        schema_fingerprint(&serialized_a),
+        serialized_a,
+        SENTINEL_ESTIMATE,
+    ));
+    let cached = ensure_chat_request_fits(&request, &config, &meter, None, &mut cache).unwrap();
+    assert_eq!(cached.used, SENTINEL_ESTIMATE);
+
+    request.response_format = Some(format_b);
+    let refreshed = ensure_chat_request_fits(&request, &config, &meter, None, &mut cache).unwrap();
+    let expected = estimate_str(&serialized_b);
+    assert_eq!(refreshed.used, expected);
+    assert_eq!(
+        cache,
+        Some((schema_fingerprint(&serialized_b), serialized_b, expected))
+    );
 }
