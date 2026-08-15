@@ -199,6 +199,34 @@ fn test_non_unicode_environment_refuses_managed_fallback() {
     assert!(matches!(result, Err(AuthError::Malformed { .. })));
 }
 
+/// A SET but non-UTF-8 env var is NOT missing — the var exists, its value is
+/// just undecodable. It must map to AuthError::Malformed, never
+/// AuthError::Missing ("is not set" would be a false message).
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_header_non_utf8_env_is_malformed_not_missing() {
+    use std::os::unix::ffi::OsStrExt;
+
+    let prev = env::var_os(TEST_ENV);
+    env::set_var(TEST_ENV, std::ffi::OsStr::from_bytes(&[0xFF, 0xFE]));
+    let result = auth_for_test().header();
+    match prev {
+        Some(v) => env::set_var(TEST_ENV, v),
+        None => env::remove_var(TEST_ENV),
+    }
+
+    let err = result.expect_err("header() should fail when env is non-UTF-8");
+    assert!(
+        matches!(err, AuthError::Malformed { .. }),
+        "non-UTF-8 token must map to AuthError::Malformed, got {err:?}"
+    );
+    assert!(
+        !matches!(err, AuthError::Missing { .. }),
+        "a SET env var must never report 'is not set'"
+    );
+}
+
 /// The refresh hint must surface in the Display of the Missing error (so the CLI
 /// can print an actionable message), and the token value must never appear.
 #[test]
