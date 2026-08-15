@@ -1728,3 +1728,80 @@ against reviews/kimi-cycle-6.md if picked up), P10 (model-context caching,
 GLM's item — do not duplicate), P11 (cache serialized schema size — a
 natural pairing with P7's now-per-round schema fingerprint, since both
 touch the same `schema_json` construction site).
+
+### Cycle 15 — 2026-08-14 — P8 trim buffer scales with estimate error (grade A)
+
+Kimi implemented P8 correctly and completely in `context.rs` (+43/-2):
+new `pub(crate) const ERROR_FRACTION: f64 = 0.05` with a doc comment; the
+buffer formula in `ContextBudget::new` became `error_buffer =
+(effective as f64 * ERROR_FRACTION) as u64` then `buffer =
+error_buffer.max(2_048).min(window / 10)`. **Circularity resolved
+cleanly**: the pre-buffer quantity is `effective` (= `window - reserve`),
+which is already computed before `buffer` in the function body, so there
+is no dependency on `target` (which is itself `effective - buffer`) — a
+one-line inline comment states this explicitly. The doc comment above
+`ContextBudget::new` was updated to `min(window/10, max(2048, effective *
+ERROR_FRACTION))`. Committed on `dogfood/kimi-k3` (Kate verified author),
+pushed. `--agent-spawn-cap 1` held — **zero spawn attempts**.
+
+- Single successful attempt (one preceding zero-cost clap-syntax miss —
+  the supervisor passed `--prompt "$X"` instead of positional `-- "$X"`;
+  corrected before any tokens were spent, not a Kimi retry). 7 tool calls
+  (4 Read, 3 Edit — all on context.rs, exactly in scope), completion
+  2,769/24,000 (11.5%), 39,694 prompt tokens, zero debris, zero
+  truncation, 0.03s reported wall via kitsu-context receipt (`used:
+  8712, effective: 107072, window: 131072`).
+- **3 genuine new tests**, exactly as scoped:
+  1. `budget_buffer_stays_at_floor_on_small_windows` (window=32_768,
+     max_output=4_096) — asserts `target == 32_768 - 4_096 - 2_048`,
+     proving the 32k case is byte-identical to pre-P8 behavior (effective
+     * 0.05 = 1_433 < 2_048, so the floor still wins).
+  2. `budget_buffer_scales_with_error_on_large_windows` (window=1_000_000,
+     max_output=None → reserve=512, effective=999_488) — asserts the
+     exact scaled buffer `49_974` (`floor(999_488 * 0.05)`), confirms it
+     is above the 2_048 floor and below the window/10=100_000 cap (cap
+     does not bind in this case, noted in a comment), and cross-checks
+     `b.target == effective - 49_974`.
+  3. `budget_invariant_holds_on_large_windows` (same 1M window) — asserts
+     `target <= effective <= window`.
+  All three independently re-verified by the supervisor by hand before
+  the run (same arithmetic) and confirmed passing in isolation
+  (`cargo test -p kitsu-core budget_buffer` / `budget_invariant`, both
+  green) as well as in the full `kitsu-core` suite: **116/116** (113
+  pre-existing + 3 new).
+- **Pre-existing small-window tests genuinely UNCHANGED** — Kimi did not
+  touch `budget_reserves_output_and_buffer` (32k), `budget_uses_min_
+  reserve_when_output_unset` (8k), `budget_clamps_reserve_to_half_
+  window_on_tiny_windows` (8k), or `budget_saturates_on_a_tiny_window`
+  (window=100); supervisor re-verified arithmetically that all four stay
+  on the 2_048 floor under the new formula (32k→1_433, 8k→384/205,
+  100→2, all below 2_048), so leaving them untouched was the correct
+  call, not an oversight.
+- Gates: `cargo build --workspace` clean; `cargo clippy --workspace
+  --all-targets` warning-free (zero output beyond the build line);
+  `cargo fmt --all -- --check` clean, no reformatting needed; `cargo
+  test --workspace` 122 passed / 1 failed in the `kitsu` crate's `cli`
+  target — the pre-known PTY flake
+  `test_query_only_interactive_session_does_not_create_a_snapshot`
+  (re-ran standalone, reproduces consistently on this branch per cycles
+  10-14's notes, confirmed unrelated to P8/context.rs). No other test
+  anywhere in the workspace changed value or broke — P8 was purely
+  additive to the buffer's large-window behavior, so no downstream
+  orchestrator/summary-budget test depended on the old flat cap (unlike
+  P4's zero-margin summarizer fallout).
+- **Grade A, no dock.** Clean scope (context.rs only, untracked
+  `reviews/kimi-open-E.md` left untouched as instructed), circularity
+  explicitly reasoned about and resolved with a documented choice
+  (`effective`, not `window` — a defensible pick since `effective`
+  already excludes the reserve, so the 5% applies to the actual
+  prompt-fillable budget rather than the raw window), no cross-file
+  fallout, no supervisor mechanical fixes beyond the pre-run clap-syntax
+  correction (zero tokens), zero spawn attempts against cap 1, all 3
+  required tests genuine and independently verified.
+
+**Backlog status: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅ P6 ✅ P7 ✅ P8 ✅. Kimi is
+9-for-9 on code work since the ramp (cycles 7–15).** Remaining open
+items: P9 (reserve/max_output disagreement — unverified against this
+doc, check reviews/kimi-cycle-6.md before assigning), P10 (model-context
+caching, GLM's item — do not duplicate), P11 (cache serialized schema
+size — pairs naturally with P7's schema fingerprint).

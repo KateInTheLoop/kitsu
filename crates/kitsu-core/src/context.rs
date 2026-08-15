@@ -47,6 +47,11 @@ pub const MIN_OUTPUT_RESERVE: u64 = 512;
 /// counting) must not strand the session at a zero-sized budget.
 pub const MIN_VIABLE_WINDOW_FLOOR: u64 = 2_048;
 
+/// Fraction of the pre-buffer budget assumed to be estimate error; the trim
+/// buffer scales with this on large windows (floored at 2048, capped at
+/// window/10) because absolute estimate error grows with fill.
+pub(crate) const ERROR_FRACTION: f64 = 0.05;
+
 /// Token estimate for a string with `ascii` ASCII chars and `non_ascii`
 /// multibyte chars at the given ASCII chars-per-token rate. Non-ASCII text
 /// (CJK etc.) tokenizes at roughly one token per char, so it is counted
@@ -325,7 +330,8 @@ impl ContextBudget {
     /// Derive the budget from a window and the request's max output tokens.
     /// The reply reservation is `max(max_output, MIN_OUTPUT_RESERVE)`, clamped to
     /// at most half the window so tiny windows still leave room for the prompt.
-    /// The trim buffer is `min(window/10, 2048)`.
+    /// The trim buffer is `min(window/10, max(2048, effective * ERROR_FRACTION))`:
+    /// it scales with estimate error on large windows instead of going flat.
     pub fn new(window: u64, max_output: Option<u32>) -> Self {
         let reserve = max_output
             .map(u64::from)
@@ -333,7 +339,11 @@ impl ContextBudget {
             .max(MIN_OUTPUT_RESERVE)
             .min(window / 2);
         let effective = window.saturating_sub(reserve);
-        let buffer = (window / 10).min(2_048);
+        // Base the error scaling on `effective` (window - reserve), which is
+        // already known here; using `target` would be circular since
+        // target = effective - buffer.
+        let error_buffer = (effective as f64 * ERROR_FRACTION) as u64;
+        let buffer = error_buffer.max(2_048).min(window / 10);
         let target = effective.saturating_sub(buffer);
         Self {
             window,
@@ -514,6 +524,37 @@ mod tests {
         let b = ContextBudget::new(8_192, Some(20_000));
         assert_eq!(b.effective, 8_192 - 8_192 / 2);
         assert!(b.target < b.effective);
+    }
+
+    #[test]
+    fn budget_buffer_stays_at_floor_on_small_windows() {
+        // No-regression: on a 32k window effective*0.05 = 1433 < 2048, so the
+        // buffer still hits the 2048 floor exactly as before P8.
+        let b = ContextBudget::new(32_768, Some(4_096));
+        assert_eq!(b.target, 32_768 - 4_096 - 2_048);
+    }
+
+    #[test]
+    fn budget_buffer_scales_with_error_on_large_windows() {
+        // window=1M, max_output=None -> reserve=512 -> effective=999_488.
+        // error buffer = floor(999_488 * 0.05) = 49_974, which is above the
+        // 2048 floor and below the window/10 = 100_000 cap (cap does NOT bind
+        // here; the scaled value is asserted directly).
+        let b = ContextBudget::new(1_000_000, None);
+        let effective = 1_000_000 - MIN_OUTPUT_RESERVE;
+        let expected_buffer = (effective as f64 * ERROR_FRACTION) as u64; // 49_974
+        assert_eq!(expected_buffer, 49_974);
+        assert!(expected_buffer > 2_048);
+        assert!(expected_buffer < 1_000_000 / 10);
+        assert_eq!(b.effective, effective);
+        assert_eq!(b.target, effective - expected_buffer);
+    }
+
+    #[test]
+    fn budget_invariant_holds_on_large_windows() {
+        // target <= effective <= window must hold at window=1_000_000.
+        let b = ContextBudget::new(1_000_000, None);
+        assert!(b.target <= b.effective && b.effective <= b.window);
     }
 
     #[test]
