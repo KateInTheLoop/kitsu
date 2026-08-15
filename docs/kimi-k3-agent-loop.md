@@ -508,3 +508,25 @@ verified), pushed. cap-1 held, zero spawns. kitsu-core 113/113.
 **Backlog: P1-P7 ✅. Kimi is 8-for-8 on code work (cycles 7-14).** Next:
 P8 trim-buffer scaling, P11 tool-schema re-serialization, or P9 — all now
 freely editable (orchestrator.rs direct edits work post-R1.6).
+
+### Cycle 15 — 2026-08-14 — P8 trim-buffer scales with error (grade A)
+
+Kimi made the headroom buffer scale with fill instead of capping flat.
+`ERROR_FRACTION = 0.05` const; `buffer = (effective * ERROR_FRACTION)
+.max(2048).min(window/10)`. **Circularity resolved cleanly** — based on
+`effective` (= window − reserve), computed BEFORE the buffer, so it never
+depends on `target` (= effective − buffer). Commit `b2faeb0` (Kate
+verified), pushed. Single attempt, 7 tool calls, completion 2,769/24,000
+(11.5%), cap-1 held, zero spawns, purely additive.
+
+- Small windows genuinely unchanged (32k→1,433, 8k→384, all under the
+  2,048 floor) — none of the 4 pre-existing budget tests touched. Large
+  window scales: 1,000,000 → buffer 49,974 (above floor, below the
+  window/10=100k cap). The invariant target ≤ effective ≤ window holds.
+- 3 genuine tests (floor-on-small, scales-on-large with exact 49,974,
+  invariant-holds). kitsu-core 116/116, workspace green. No kitsu
+  weaknesses this cycle. **Cleanest implementation cycle yet — a clear A.**
+
+**Backlog: P1-P8 ✅. Kimi is 9-for-9 on code work (cycles 7-15).** Next:
+P9 (budget-reserve/max_output consistency, context.rs+orchestrator.rs),
+P11 (schema re-serialization cache, synergizes with P7), or a fresh item.
