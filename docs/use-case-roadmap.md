@@ -70,6 +70,9 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   hand-fixes for cycles 9-13. Fixed (commit 333e97b): the pre-image is
   bound by the *write* cap (1 MiB) via a new `max_write_bytes()`
   accessor; a 200 KiB file is now edit/write-able (regression-tested).
+  **Validated in production 2026-08-14:** GLM edited the 63 KiB
+  `openai_compat.rs` directly across 4 in-place edits with zero
+  journal-limit errors (was one addition from the old wall).
 - R1.7 **Line-number prefixes on ranged reads** (found by the DeepSeek
   loop, cycle 4) — `fs_read_file`'s ranged read returns raw joined text
   with no line numbers, so a model citing a range must self-count from
