@@ -4083,6 +4083,7 @@ fn compaction_fallback_name(reason: kitsu_core::SummaryFallbackReason) -> &'stat
         kitsu_core::SummaryFallbackReason::CircuitBreaker => "circuit_breaker",
         kitsu_core::SummaryFallbackReason::RequestTooLarge => "request_too_large",
         kitsu_core::SummaryFallbackReason::ProviderFailure => "provider_failure",
+        kitsu_core::SummaryFallbackReason::EmptyCompletion => "empty_completion",
         kitsu_core::SummaryFallbackReason::IncompleteResponse => "incomplete_response",
         kitsu_core::SummaryFallbackReason::ResponseTooLarge => "response_too_large",
         kitsu_core::SummaryFallbackReason::ContextWindowUnknown => "context_window_unknown",

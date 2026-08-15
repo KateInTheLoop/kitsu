@@ -905,8 +905,10 @@ pub enum SummaryFallbackReason {
     CircuitBreaker,
     /// Even a locally shortened summary prompt could not fit the model window.
     RequestTooLarge,
-    /// The provider failed or returned no usable summary text.
+    /// The provider failed (transport or stream error).
     ProviderFailure,
+    /// The provider completed successfully but returned no usable summary text.
+    EmptyCompletion,
     /// The summary stream produced partial text but did not terminate with a
     /// complete `stop` finish (for example length truncation, a tool-call finish,
     /// or EOF without a terminal finish event).
@@ -3617,7 +3619,7 @@ where
                                 record_compaction_usage(cfg, round, turn_usage, usage)?;
                             }
                             *failures = failures.saturating_add(1);
-                            Some(SummaryFallbackReason::ProviderFailure)
+                            Some(SummaryFallbackReason::EmptyCompletion)
                         }
                         SummaryTextCollection::Failed { reason, usage } => {
                             if let Some(usage) = usage {

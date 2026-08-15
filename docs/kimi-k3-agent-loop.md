@@ -1398,3 +1398,210 @@ pushed. First attempt, cap-1 held, zero spawns.
 P11 (schema re-serialization cache — synergizes with Kimi's own P7), or
 the unwrap_or_default() serialization-swallow sweep (4 sites in
 orchestrator.rs, DeepSeek-flagged; defensive), or a fresh item.
+
+### Cycle 17 — 2026-08-14 — P11 schema-estimate cache (grade C+ — design sound, delivery incomplete)
+
+**This closes out Kimi's original P1–P11 backlog**, but not cleanly: this
+is the first cycle since the ramp where the delivered diff did not
+compile and shipped zero tests, requiring substantial supervisor repair.
+Recorded honestly below rather than smoothed over.
+
+Kimi's design (correct, and preserved as-authored): `AgentSessionState`
+grew `pub schema_cache: Option<(u64, String, u64)>` — (fingerprint,
+schema_json, token estimate) for the tool schema, keyed by Kimi's own P7
+`schema_fingerprint()` (no new hashing scheme, no registry-generation
+counter, exactly as scoped). A new `cached_schema_estimate()` helper:
+fingerprint the current schema, return the cached estimate verbatim on a
+match, else `estimate_str()` fresh and overwrite the cache. Wired into
+`ensure_chat_request_fits` (the exact "last-line guard used at every
+provider boundary" the review named) via a new `schema_cache: &mut
+Option<(u64, String, u64)>` parameter, and into `compact_context`'s own
+schema build. `request_measurement`/`structural_request_tokens` were
+refactored to take a precomputed `schema_tokens: u64` instead of
+re-deriving it from `schema_json`/`has_schema` on every call — a genuine
+bonus: `enforce_context_budget_recording` used to call `estimate_str`
+up to 8x per invocation on an unchanged schema; it now computes it once
+per call and threads the value through.
+
+**What went wrong:** single attempt, 59 tool calls (mostly `fs_scan_file`
+probes plus ~17 `Edit`s), completion 9,900/24,000 measured after the
+FIRST round alone (usage receipt appeared at line 125 of a 1,619-line
+stderr log — most of the run happened after it). Two early
+SELF-RECOVERED `PolicyDenied` errors (a relative-path read and a
+directory read of `crates/kitsu-providers/src`, both immediately
+recovered from) poisoned the turn per the now-familiar R4.12 pattern —
+"2 tool call(s) were denied by local policy" drove exit 1 and a
+COMMITTED-AS-PARTIAL answer — but unlike prior R4.12 sightings (cycles
+14, 16) where the underlying edit was actually finished, this time the
+turn was ALSO genuinely cut off mid-work: the model's own trailing
+reasoning stopped mid-sentence ("Wait — the `token_before` is computed
+before `schema_tokens` is defined. Let me check the order in
+`enforce_context_budget_recording`:") with no further tool call —
+Kimi had spotted its own bug and was about to fix it when the turn
+ended. Per the brief's explicit guidance, this was NOT retried as a
+transport failure (it wasn't one); the disk state was verified and
+repaired instead, one retry being reserved for actual transport faults.
+
+**Supervisor repair required (larger than any prior cycle):**
+1. **Compile-breaking bug**, exactly the one Kimi's own last thought
+   named: `token_before = structural_request_tokens(messages,
+   schema_tokens)` was emitted BEFORE `let schema_tokens = ...` in
+   `enforce_context_budget_recording` — moved the `let` above its use.
+2. **Two missed call-site updates** left over from the
+   `structural_request_tokens`/`request_measurement` signature changes:
+   `fit_summary_rebuild` and `summarize_or_fallback` still had
+   `schema_json: &str, has_schema: bool` params calling the OLD 3-arg
+   `structural_request_tokens` — rethreaded both to the new
+   `schema_tokens: u64` shape and dropped the now-dead params (fixing a
+   clippy `unused_variables` warning as a result).
+3. **Five stale test call sites** in `orchestrator_tests.rs`
+   (`request_measurement(&[], &c, "", false, None, ...)`) missing the new
+   `schema_tokens` argument — fixed with `0` (all five pass `has_schema:
+   false`, so this is the mathematically correct value, not a stub).
+4. **`clippy::too_many_arguments` on `request_measurement`** (now 8
+   params) — added `#[allow(...)]`, matching the exact precedent already
+   used 4x elsewhere in this file for equivalent measurement-plumbing
+   functions.
+5. **Zero tests were authored by Kimi this cycle** (the turn was cut off
+   before reaching them) — all 3 required tests are supervisor-authored:
+   `test_cached_schema_estimate_reuses_cache_on_matching_fingerprint`
+   (seeds the cache with a SENTINEL estimate under the real fingerprint,
+   asserts it comes back verbatim through both `cached_schema_estimate`
+   directly AND `ensure_chat_request_fits` across two consecutive calls —
+   proves an actual cache hit, not a coincidental match, since no real
+   `estimate_str` pass could ever produce the sentinel value),
+   `test_cached_schema_estimate_recomputes_on_fingerprint_mismatch`
+   (changed tool set → different fingerprint → fresh `estimate_str`,
+   cache overwritten, old stale value never returned), and
+   `test_cached_schema_estimate_correctness_matches_fresh_estimate` (cold
+   and warm calls both equal a fresh `estimate_str` on the same schema —
+   the cache never returns a wrong number). All three pass; grounded
+   directly in Kimi's own `cached_schema_estimate`/`ensure_chat_request_fits`
+   functions, not rewritten logic.
+
+**Verification (all clean after repair):** `cargo build --workspace`,
+`cargo clippy --workspace --all-targets` (zero warnings), `cargo fmt --all
+-- --check` (one reformat needed on the supervisor-authored tests,
+applied), `cargo test --workspace --no-fail-fast`: kitsu-core 122/122
+(119 pre-existing + 3 new), kitsu-providers 64/64, kitsu-render 51/51,
+kitsu-tools 141/141, kitsu 251/251 + 2 doctests, only the pre-known PTY
+flake (`test_query_only_interactive_session_does_not_create_a_snapshot`)
+red, unrelated and reproducing since cycles 10-15.
+
+**Grade C+.** Docked well below the cycle 9-16 A/B range: this is the
+first cycle where the delivered diff would not compile and the
+required-by-brief unit tests did not exist in Kimi's own output at all —
+a materially larger supervisor share than the mechanical completions of
+cycles 10/13/14 (which relocated or lightly adapted Kimi-authored text).
+The credit that keeps this above a flat fail: the underlying cache
+design is entirely Kimi's, correctly reuses P7 without inventing a new
+mechanism, the bug it ran out of budget before fixing was one it had
+*already correctly diagnosed*, and the refactor's mechanical shape
+(threading `schema_tokens: u64`) was consistently applied everywhere
+except the two missed sites — this reads as a genuinely interrupted
+turn, not a wrong design.
+
+**kitsu weaknesses (two):**
+1. **R4.12 sighted a THIRD time this loop** (cycles 14, 16, now 17): an
+   early self-recovered `PolicyDenied` (here: a relative path read + a
+   directory read, both auto-recovered) still discards/exit-1's the
+   whole turn even when most of the turn's later work is sound. This
+   cycle sharpens the earlier finding — it is not just a discard of an
+   otherwise-COMPLETE answer (cycles 14/16's shape); here it likely also
+   correlates with (or contributes to) truncated completion, since the
+   turn's last visible token is mid-sentence with no `[truncated:
+   model output length limit reached]` marker. Whether the two are
+   causally linked (does entering the poisoned/partial-commit path
+   somehow shorten remaining budget or change stop handling?) is worth a
+   dedicated look — three sightings in one loop is no longer noise.
+2. **No visibility into WHY a turn stopped mid-sentence.** The stderr
+   receipt names `2 tool call(s) were denied by local policy` as the
+   error but gives no signal distinguishing "policy-poisoned but
+   otherwise complete" (cycles 14/16) from "policy-poisoned AND ran out
+   of rounds/tokens mid-edit" (this cycle) — the supervisor had to infer
+   the latter from the trailing reasoning text ending mid-thought with no
+   truncation marker. A completion-status field on the receipt (e.g.
+   distinguishing `policy-denied-but-complete` from
+   `policy-denied-and-incomplete`) would let a supervisor triage without
+   reading the full transcript.
+
+**This completes Kimi's original P1–P11 backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅
+P5 ✅ P6 ✅ P7 ✅ P8 ✅ P9 ✅ P10 (GLM's item, out of scope) P11 ✅.** Kimi
+is 10-for-11 on code work since the ramp (cycles 7–17), with cycle 17
+being the first incomplete delivery. Next: either a fresh item from
+GLM/DeepSeek-adjacent backlogs, or (per this cycle's own finding) a
+focused look at the R4.12 self-recovered-policy-denial pattern now that
+it has reproduced three times.
+
+### Cycle 18 — 2026-08-15 — FIRST CROSS-MODEL implementation (grade A)
+
+Kimi implemented DeepSeek's cycle-7 review finding 1
+(`reviews/deepseek-cycle-7.md` on the DeepSeek worktree): in
+`summarize_or_fallback`, the `SummaryTextCollection::Complete { usage,
+.. }` arm that catches an EMPTY/whitespace-only completion (sibling of
+the non-empty arm guarded by `!text.trim().is_empty()`) was labeling its
+fallback `SummaryFallbackReason::ProviderFailure` — conflating "provider
+errored" with "provider succeeded but returned nothing." Kimi's fix,
+exactly as scoped: a new `SummaryFallbackReason::EmptyCompletion`
+variant (enum ~line 546, doc comment "The provider completed
+successfully but returned no usable summary text"; also tightened
+`ProviderFailure`'s own doc to "transport or stream error" so the two
+can't drift back together), used in the empty-`Complete` arm (~line
+3022) instead of `ProviderFailure`. Grepped the workspace for exhaustive
+matches and found exactly the one predicted: `compaction_fallback_name`
+in `crates/kitsu/src/main.rs` (~line 2387), a JSONL string map — added
+`EmptyCompletion => "empty_completion"`. Purely additive: no function
+signature changed, `Failed`/`IncompleteResponse` arms untouched.
+Committed `<SHA filled below>` (Kate verified), pushed.
+
+- **Diff: +130/-2 across 3 files** (`orchestrator.rs` +6/-2,
+  `orchestrator_tests.rs` +125, `main.rs` +1). Genuinely small —
+  the ripple was exactly the one predicted site, nothing more.
+- **2 genuine tests**, both exercising `summarize_or_fallback` end-to-end
+  (not just the enum): `summarize_or_fallback_empty_completion_uses_empty_completion_reason`
+  scripts a `MockProvider` returning whitespace-only text + `Done(Stop)`
+  and asserts `fallback_reason == Some(EmptyCompletion)` (would fail
+  against the old code, which always produced `ProviderFailure` here) —
+  plus asserts the trim fallback still ran and left `TRIM_MARKER`.
+  `summarize_or_fallback_provider_failure_still_uses_provider_failure_reason`
+  scripts a `FallibleMockProvider` erroring with `ProviderError::Connection`
+  and asserts the reason is still `Some(ProviderFailure)`, proving the
+  new variant didn't swallow real failures. Both pass in isolation
+  (`cargo test -p kitsu-core summarize_or_fallback`: 2 passed).
+- **Tool-call shape:** 12 Reads + 4 Edits + 22 `fs_scan_file` calls (38
+  total) — more than the "~5 reads" the prompt asked for (Kimi grepped
+  extensively for the exhaustive-match site and re-scanned its own edits
+  for debris before finishing) but nowhere near cycle 17's 59-call
+  overrun; the turn finished at round budget with headroom, completion
+  8,142/24,000 tokens (34%), no truncation. **Stayed small in outcome**
+  (diff size, correctness) even though the process was chattier than
+  ideal.
+- **Zero spawn attempts** — `--agent-spawn-cap 1` never exercised.
+- **One false-positive debris warning** (R1.8, third sighting: cycles
+  16, and now 18) — the trailing `Edit(orchestrator_tests.rs)` fired
+  "content contains a raw model chat-template control marker" because
+  the file already contains literal `<|im_start|>` as test DATA (a
+  pre-existing `sanitize_warning` test at line ~1641), unrelated to
+  Kimi's actual edit location. Content verified clean on disk; not a
+  real corruption. R1.8 keeps reproducing whenever a model edits near
+  literal template-marker strings used as test fixtures.
+- **Verification:** `cargo build --workspace` clean; `cargo clippy
+  --workspace --all-targets` warning-free (no new non-exhaustive-match
+  lint — Kimi's own match update covered it); `cargo fmt --all --check`
+  clean (no reformat needed); `cargo test --workspace` — 122 passed / 1
+  failed in the `kitsu` crate's `cli.rs`
+  (`test_query_only_interactive_session_does_not_create_a_snapshot`, a
+  PTY "did not exit" panic). **Confirmed pre-existing and unrelated:**
+  stashed the diff and reran the same test standalone against
+  unmodified `ac77340` — it fails identically. Environment/PTY flake,
+  not caused by this cycle.
+
+**Backlog: P1–P11 ✅ (original backlog complete since cycle 17). Kimi is
+now 11-for-12 on code work (cycles 7–18) and has landed its first
+CROSS-MODEL contribution — DeepSeek reviewed, Kimi implemented, both on
+their own worktrees.** No new kitsu weaknesses this cycle beyond the
+R1.8 debris false-positive reconfirmation. Next: another cross-model
+finding (DeepSeek proposals 2/3 in the same review — the silent
+zero-`removed` no-op path, and the circuit-breaker-vs-RequestTooLarge
+diagnostic precedence — or a GLM-adjacent finding), keeping scope to a
+single function/match-ripple per cycle.
