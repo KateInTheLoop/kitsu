@@ -1833,3 +1833,112 @@ cross-model work — DeepSeek cycle-7 proposal 3 (circuit-breaker-vs-
 RequestTooLarge diagnostic precedence, still open) or GLM's remaining
 cycle-8 findings, whichever the supervisor can verify as reachable and
 minimal before handing off.
+
+### Cycle 21 (2026-08-15) — cross-model #4: DeepSeek cycle-11 proposal 3, `format_command_result` Debug-vs-Display (grade B+ — correct fix, genuine test, but broke 2 pre-existing tests that had to be supervisor-repaired)
+
+Kimi's 4th cross-model implementation, back in `kitsu-core`: DeepSeek's
+cycle-11 review flagged that `format_command_result`
+(`crates/kitsu-core/src/orchestrator.rs`) rendered two already-sanitized
+`String`s — `bounded_human_value(status, 160)` and
+`terminal_safe_inline(&artifact.reference)` — with `{:?}` (Debug)
+instead of `{}` (Display). Both helpers already run
+`kitsu_render::sanitize_terminal_text` and escape `\n`/`\t`/`\r`, so
+`{:?}` only added spurious surrounding quotes and re-escaped backslashes
+— and directly broke the artifact-path site's own load-bearing comment
+("the line ends with a copyable path"), since a Debug-quoted path is
+not cleanly copyable. Fix (verified minimal by the supervisor before
+handing off): `artifact status={:?}` → `artifact status={}` (line
+~2102) and `full output={:?}` → `full output={}` (line ~2114). Kimi's
+diff matched exactly: two one-character-class edits, no signature or
+helper changes, no other `{:?}` site touched.
+
+**Deliverable, verified on disk.** `git diff` on `orchestrator.rs` is
+exactly the two prescribed substitutions — nothing else in the 138 KB
+file changed. Kimi also added
+`format_command_result_renders_artifact_fields_unquoted`
+(`orchestrator_tests.rs`), which builds a full `CommandOutput` (mirroring
+the struct from `kitsu-tools`) with an artifact reference and an
+`artifact_error`, and asserts the rendered line contains
+`artifact status=artifact sink degraded` and ends with
+`full output=/tmp/session/artifacts/cmd-1.log` — both unquoted, with
+explicit negative assertions that neither field contains a `"`.
+
+**Independently confirmed fail-without-fix (supervisor-verified).**
+Temporarily reverted just the two `{}`→`{:?}` in `orchestrator.rs`
+(new test kept in place) and reran the new test: it **failed** exactly
+as expected — `artifact status must render unquoted, got: exit 0 | 3
+ms | artifact status="artifact sink degraded" | full output="/tmp/
+session/artifacts/cmd-1.log"` — showing the exact spurious-quote bug
+DeepSeek described. Restored the fix and reran: green. The new test is
+genuine, not a tautology.
+
+**Supervisor repair required: 2 pre-existing tests hardcoded the bug.**
+`cargo test -p kitsu-core` after Kimi's turn showed 2 failures beyond
+the new test: `tool_activity_formatting` asserted
+`command_result.contains("full output=\"session:command-1\"")` (the
+literal Debug-quoted string) and
+`command_receipt_never_elides_the_artifact_path_and_renders_hints`
+asserted `receipt.contains(&format!("full output={long_reference:?}"))`
+— both encoded the pre-fix (buggy) rendering as the expected behavior.
+Kimi could not have caught this: it self-reported "I can't run `cargo
+test` from here" (`command_exec` was not among its granted tools this
+cycle — only `--allow-path`/`--allow-write`, no `--allow-command`), so
+it had no way to discover the two-test ripple. The supervisor updated
+both assertions to the unquoted form (`full output=session:command-1`
+and `format!("full output={long_reference}")`) — the minimal fix
+consistent with the corrected behavior, no other change — and reran:
+`cargo test -p kitsu-core` now 128/128 passing.
+
+**Run stats.** Single attempt, exit 0, no retry, no spawn attempted
+(`--agent-spawn-cap 1` never exercised, no `spawn_agent` calls in the
+transcript). Tool-call shape: 12 `Read` + 4 `find_symbol` + 13
+`fs_scan_file` + 1 `List` + 4 `Edit` (2 successful substitutions in
+`orchestrator.rs`, 1 failed edit-conflict attempt against
+`orchestrator.rs` for the test insertion, 1 successful `Edit` that
+landed the test in `orchestrator_tests.rs`) = **34 tool calls total** —
+well over the brief's "~4 reads, write early" budget and the largest
+cycle since 18 (18: 38, 19: 14, 20: 5, 21: 34). The bulk of the excess
+was `find_symbol`/`fs_scan_file` calls exploring `kitsu-tools`'
+`CommandOutput`/`CommandOutputArtifact` struct shape before writing the
+test — reasonable diligence for building a correct struct literal, but
+not the "SMALL" cycle this task asked for. `kitsu-usage`: 299,425 /
+5,052 / 304,477 (completion 21% of the 24,000 cap). `kitsu-context`:
+used 17,524 / effective 107,072 / window 131,072. One harness false
+positive: the successful `orchestrator_tests.rs` edit was flagged
+"content contains a raw model chat-template control marker" — checked
+the file for control bytes and `<|...|>` markers directly; the only
+hit was the file's own pre-existing test string literal about
+`<|im_start|>` sanitization, no actual garbage was written (R1.8-shaped
+false positive, not filed as new since it didn't reproduce with real
+corruption).
+
+**Verification (clean after supervisor repair).** `cargo build
+--workspace`: clean. `cargo clippy --workspace --all-targets`: zero
+warnings. `cargo fmt --all -- --check`: clean, no reformat needed.
+`cargo test --workspace --no-fail-fast`: only the pre-known PTY flake
+`test_query_only_interactive_session_does_not_create_a_snapshot`
+(cycles 10-20) failed; every other target green, including
+`kitsu-core` at 128/128 (127 pre-existing + repaired 2 + Kimi's 1 new).
+
+**Grade B+.** Correct core fix (both `{:?}`→`{}`, verified
+fail-without-fix), single-function in `orchestrator.rs` itself (no
+signature/helper changes, no stray `{:?}` touched), and a genuine new
+test — but not SMALL (34 tool calls against a "~4 reads" budget, the
+worst overrun since cycle 18) and incomplete delivery: shipping without
+running `cargo test` left 2 pre-existing tests broken, requiring
+supervisor repair before the branch was clean. This is structurally a
+tooling gap, not a Kimi judgment failure — this cycle granted no
+`command_exec`, so Kimi had no way to self-check; future EXECUTION
+briefs for `orchestrator.rs`-touching fixes should consider whether a
+scoped `--allow-command '["cargo","test","-p","kitsu-core"]'` is worth
+granting so Kimi can catch cross-test ripple itself. Kimi is now
+14-for-15 on code work (cycles 7-21) and 4-for-4 on cross-model
+implementations, with only 1-for-4 (cycle 20) landing clean without any
+supervisor repair — 18 needed a main-branch-collision repair, 19 needed
+a reachability-driven test-premise repair, 21 needed this cycle's
+2-test ripple repair. Next:
+continue cross-model work — DeepSeek cycle-7 proposal 3
+(circuit-breaker-vs-RequestTooLarge diagnostic precedence, still open)
+or GLM's remaining cycle-8 findings; consider granting scoped
+`--allow-command` test access on future `orchestrator.rs`/format-string
+fixes given this cycle's ripple.
