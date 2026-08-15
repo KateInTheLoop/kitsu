@@ -2672,7 +2672,7 @@ fn format_command_result(output: &CommandOutput) -> String {
     );
     if let Some(status) = &output.artifact_error {
         fields.push(format!(
-            "artifact status={:?}",
+            "artifact status={}",
             bounded_human_value(status, 160)
         ));
     }
@@ -2684,7 +2684,7 @@ fn format_command_result(output: &CommandOutput) -> String {
     // when a terminal wraps the receipt, the line ends with a copyable path.
     if let Some(artifact) = &output.artifact {
         fields.push(format!(
-            "full output={:?}",
+            "full output={}",
             terminal_safe_inline(&artifact.reference)
         ));
     }

@@ -2126,7 +2126,7 @@ fn tool_activity_formatting() {
     assert!(command_result.contains("89"));
     assert!(command_result.contains("stderr 3 B"));
     assert!(command_result.contains("bad"));
-    assert!(command_result.contains("full output=\"session:command-1\""));
+    assert!(command_result.contains("full output=session:command-1"));
 
     let mut cancelled_without_artifact = command_output.clone();
     cancelled_without_artifact["termination"] = serde_json::json!("cancelled");
@@ -2233,7 +2233,7 @@ fn command_receipt_never_elides_the_artifact_path_and_renders_hints() {
     });
     let receipt = format_tool_result("command_exec", "{}", &output.to_string(), false);
     assert!(
-        receipt.contains(&format!("full output={long_reference:?}")),
+        receipt.contains(&format!("full output={long_reference}")),
         "artifact path must appear complete and unelided: {receipt}"
     );
     assert!(
@@ -5115,5 +5115,71 @@ async fn summarize_or_fallback_removed_path_still_records_summary_fallback_trim(
     assert_eq!(
         progress.fallback_reason,
         Some(SummaryFallbackReason::CircuitBreaker)
+    );
+}
+
+/// The artifact reference and artifact status are already sanitized single-line
+/// Strings, so they must render with `{}` — not `{:?}`, which adds spurious
+/// surrounding quotes and double-escapes. The `full output=` field stays last
+/// so a wrapped terminal line still ends with a clean, copyable path.
+#[test]
+fn format_command_result_renders_artifact_fields_unquoted() {
+    use kitsu_tools::{
+        CommandAmbientAuthority, CommandExecutableIdentity, CommandExecutableResolution,
+        CommandOutput, CommandOutputArtifact, CommandTermination,
+    };
+
+    let output = CommandOutput {
+        argv: vec!["ls".to_string()],
+        cwd: "/repo".to_string(),
+        executable: CommandExecutableIdentity {
+            invocation: "ls".to_string(),
+            resolution: CommandExecutableResolution::AmbientPath,
+            observed_path: None,
+            pinned: false,
+        },
+        ambient_authority: CommandAmbientAuthority::CURRENT,
+        termination: CommandTermination::Exited,
+        success: true,
+        exit_code: Some(0),
+        signal: None,
+        stdout: String::new(),
+        stderr: String::new(),
+        stdout_bytes: 0,
+        stderr_bytes: 0,
+        stdout_retained_bytes: 0,
+        stderr_retained_bytes: 0,
+        stdout_truncated: false,
+        stderr_truncated: false,
+        stdout_capture_complete: true,
+        stderr_capture_complete: true,
+        elapsed_ms: 3,
+        artifact: Some(CommandOutputArtifact {
+            reference: "/tmp/session/artifacts/cmd-1.log".to_string(),
+            captured_bytes: 0,
+            truncated: false,
+            limit_bytes: 0,
+            artifact_bytes: 0,
+        }),
+        artifact_error: Some("artifact sink degraded".to_string()),
+        containment_hint: None,
+    };
+
+    let rendered = super::format_command_result(&output);
+    assert!(
+        rendered.contains("artifact status=artifact sink degraded"),
+        "artifact status must render unquoted, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("artifact status=\""),
+        "artifact status must not be Debug-quoted, got: {rendered}"
+    );
+    assert!(
+        rendered.ends_with("full output=/tmp/session/artifacts/cmd-1.log"),
+        "the line must end with a clean copyable path, got: {rendered}"
+    );
+    assert!(
+        !rendered.contains("full output=\""),
+        "full output must not be Debug-quoted, got: {rendered}"
     );
 }
