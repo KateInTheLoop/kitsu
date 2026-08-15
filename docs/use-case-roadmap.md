@@ -322,7 +322,11 @@ scoped to ranged reads only so fs_edit_file is unaffected. 4 tests
 (prefixed ranged reads + full-read-no-prefix); live-verified a model
 citing the exact line. This fixes the ~1-line citation drift that hit
 DeepSeek every review cycle — the dogfooding's own finding, now shipped.
-Haiku review pending (key check: fs_edit_file never sees the prefix).
+Haiku review: SHIP-AS-IS — all 10 cases traced, and the load-bearing
+invariant confirmed (fs_edit_file uses a separate read path,
+read_existing_text → read_snapshot_limited, so the prefix never reaches
+edit-matching); cap accounting, oversized-line underflow guard, and
+char-boundary safety all correct; no findings.
 Next: R3.4 (for the UI/main loop) or lane 1/4 hardening.
 
 ### Cycle 6 — 2026-08-14 — R3.2 config drift audit (sysadmin lane)
