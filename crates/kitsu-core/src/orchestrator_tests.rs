@@ -4636,7 +4636,7 @@ fn test_single_shortfall_does_not_clamp_request_measurement() {
     let mut c = cfg(2);
     c.context_window = Some(8_192);
     let meter = ContextMeter::new();
-    let unclamped = request_measurement(&[], &c, "", false, None, &meter, None);
+    let unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, None);
 
     let one_strike = Some(ContextWindowEvidence {
         reported_prompt_tokens: 4_096,
@@ -4645,7 +4645,7 @@ fn test_single_shortfall_does_not_clamp_request_measurement() {
         warned: false,
         shortfall_count: 1,
     });
-    let still_unclamped = request_measurement(&[], &c, "", false, None, &meter, one_strike);
+    let still_unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, one_strike);
     assert_eq!(unclamped.effective, still_unclamped.effective);
     assert_eq!(unclamped.target, still_unclamped.target);
     // The resolved window reported alongside the budget is never rewritten.
@@ -4665,7 +4665,7 @@ fn test_two_shortfalls_clamp_request_measurement_effective_budget() {
     let mut c = cfg(2);
     c.context_window = Some(8_192);
     let meter = ContextMeter::new();
-    let unclamped = request_measurement(&[], &c, "", false, None, &meter, None);
+    let unclamped = request_measurement(&[], &c, "", false, 0, None, &meter, None);
 
     let two_strikes = Some(ContextWindowEvidence {
         reported_prompt_tokens: 4_096,
@@ -4674,7 +4674,7 @@ fn test_two_shortfalls_clamp_request_measurement_effective_budget() {
         warned: false,
         shortfall_count: 2,
     });
-    let clamped = request_measurement(&[], &c, "", false, None, &meter, two_strikes);
+    let clamped = request_measurement(&[], &c, "", false, 0, None, &meter, two_strikes);
     assert!(
         clamped.effective.unwrap() < unclamped.effective.unwrap(),
         "two strikes must shrink the effective budget below the unclamped one"
@@ -4693,6 +4693,153 @@ fn test_two_shortfalls_clamp_request_measurement_effective_budget() {
         warned: false,
         shortfall_count: 5,
     });
-    let ignored_stale = request_measurement(&[], &c, "", false, None, &meter, stale);
+    let ignored_stale = request_measurement(&[], &c, "", false, 0, None, &meter, stale);
     assert_eq!(unclamped.effective, ignored_stale.effective);
+}
+
+// --- P11: schema estimate cached per session, keyed by the P7 schema_fingerprint ---
+//
+// `cached_schema_estimate` is the primitive `ensure_chat_request_fits` (the
+// "last-line guard used at every provider boundary") calls on every preflight.
+// These tests exercise it directly plus one integration-level check through
+// `ensure_chat_request_fits` itself, so the win (no re-serialize, no
+// re-estimate on an unchanged tool schema) is proven at both layers.
+
+fn sample_tool_descriptor(name: &str) -> kitsu_providers::ToolDescriptor {
+    kitsu_providers::ToolDescriptor {
+        name: name.to_string(),
+        description: "a sample tool for P11 cache tests".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }
+}
+
+#[test]
+fn test_cached_schema_estimate_reuses_cache_on_matching_fingerprint() {
+    use crate::context::schema_fingerprint;
+    use crate::orchestrator::cached_schema_estimate;
+
+    let schema_json = serde_json::to_string(&[sample_tool_descriptor("read_file")]).unwrap();
+    let real_fingerprint = schema_fingerprint(&schema_json);
+
+    // Seed the cache with a SENTINEL estimate under the fingerprint the
+    // current schema will actually produce. If `cached_schema_estimate`
+    // genuinely reuses the cache on a hit (rather than silently
+    // re-serializing/re-estimating and happening to match), it must return
+    // this exact sentinel — a value no real `estimate_str` pass over this
+    // schema could ever produce.
+    const SENTINEL_ESTIMATE: u64 = 999_999_999;
+    let mut cache = Some((
+        real_fingerprint,
+        "stale-but-fingerprint-matching-placeholder".to_string(),
+        SENTINEL_ESTIMATE,
+    ));
+
+    let returned = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(
+        returned, SENTINEL_ESTIMATE,
+        "a fingerprint-matching cache entry must be reused verbatim, proving no recompute happened"
+    );
+    // The cache itself must be left untouched by a hit.
+    assert_eq!(
+        cache,
+        Some((
+            real_fingerprint,
+            "stale-but-fingerprint-matching-placeholder".to_string(),
+            SENTINEL_ESTIMATE
+        ))
+    );
+
+    // Same proof one level up, through the actual preflight entry point:
+    // two consecutive `ensure_chat_request_fits` calls with the SAME tool set
+    // reuse the seeded sentinel rather than the real schema tokens. Use a
+    // smaller (but still unmistakably non-real) sentinel here so the request
+    // stays inside the context budget and the preflight can return Ok.
+    use crate::context::ContextMeter;
+    use crate::orchestrator::ensure_chat_request_fits;
+    use kitsu_providers::ChatRequest;
+
+    const PREFLIGHT_SENTINEL: u64 = 50_000;
+    let mut c = cfg(2);
+    c.context_window = Some(131_072);
+    let meter = ContextMeter::new();
+    let req = ChatRequest {
+        model: c.model.clone(),
+        messages: vec![],
+        tools: Some(vec![sample_tool_descriptor("read_file")]),
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
+    };
+
+    let mut preflight_cache = Some((real_fingerprint, schema_json.clone(), PREFLIGHT_SENTINEL));
+    let first = ensure_chat_request_fits(&req, &c, &meter, None, &mut preflight_cache).unwrap();
+    let second = ensure_chat_request_fits(&req, &c, &meter, None, &mut preflight_cache).unwrap();
+    // `used` is messages (0 here) + schema tokens; both preflights must have
+    // used the sentinel, not a freshly estimated value (which would be a few
+    // tens of tokens for this one-tool schema, nowhere near 50,000).
+    assert_eq!(first.used, PREFLIGHT_SENTINEL);
+    assert_eq!(second.used, PREFLIGHT_SENTINEL);
+}
+
+#[test]
+fn test_cached_schema_estimate_recomputes_on_fingerprint_mismatch() {
+    use crate::context::{estimate_str, schema_fingerprint};
+    use crate::orchestrator::cached_schema_estimate;
+
+    let old_schema_json = serde_json::to_string(&[sample_tool_descriptor("read_file")]).unwrap();
+    let old_fingerprint = schema_fingerprint(&old_schema_json);
+    let mut cache = Some((old_fingerprint, old_schema_json, 42_u64));
+
+    // A CHANGED tool set — different descriptor, different fingerprint.
+    let new_schema_json = serde_json::to_string(&[
+        sample_tool_descriptor("read_file"),
+        sample_tool_descriptor("write_file"),
+    ])
+    .unwrap();
+    let new_fingerprint = schema_fingerprint(&new_schema_json);
+    assert_ne!(
+        old_fingerprint, new_fingerprint,
+        "test fixture must actually change the schema identity"
+    );
+
+    let returned = cached_schema_estimate(&mut cache, &new_schema_json);
+    let fresh = estimate_str(&new_schema_json);
+    assert_eq!(
+        returned, fresh,
+        "a fingerprint mismatch must recompute the estimate from the new schema, not reuse the stale 42"
+    );
+    assert_ne!(
+        returned, 42,
+        "must not silently keep serving the old cached value"
+    );
+
+    // The cache must be overwritten with the new triple.
+    assert_eq!(cache, Some((new_fingerprint, new_schema_json, fresh)));
+}
+
+#[test]
+fn test_cached_schema_estimate_correctness_matches_fresh_estimate() {
+    use crate::context::estimate_str;
+    use crate::orchestrator::cached_schema_estimate;
+
+    let schema_json = serde_json::to_string(&[
+        sample_tool_descriptor("read_file"),
+        sample_tool_descriptor("workspace_diff"),
+        sample_tool_descriptor("spawn_agent"),
+    ])
+    .unwrap();
+
+    // First use: no cache yet, must compute correctly.
+    let mut cache = None;
+    let first = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(first, estimate_str(&schema_json));
+
+    // Second use, same schema: cache hit must still equal a fresh estimate
+    // of the identical schema — the cache must never return a wrong number.
+    let second = cached_schema_estimate(&mut cache, &schema_json);
+    assert_eq!(second, estimate_str(&schema_json));
+    assert_eq!(first, second);
 }
