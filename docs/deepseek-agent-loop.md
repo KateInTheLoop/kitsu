@@ -416,3 +416,105 @@ reviewer, now 5-for-5 on clean process (cycles 3, 4, 6, 7, 8) and
 until R4.10 addresses implementation type-chasing. Future cron authors
 should verify function ranges against the live worktree before dispatch;
 this is the second stale-range assignment after cycle 4.
+
+### Cycle 9 — 2026-08-15 — 3rd zero-drift citation cycle; assigned range overshot the function, DeepSeek self-corrected
+
+Target: `record_progress` (`crates/kitsu-core/src/orchestrator.rs`),
+a fresh 27-line ledger-recording function no prior cycle had touched.
+Pre-dispatch check confirmed the *start* of the assigned range (2336)
+and that the *next function*, `compaction_span`, starts at 2385 — but
+did not confirm the assigned range's *end* actually tracked
+`record_progress`'s own closing brace. It didn't: `record_progress`
+closes at line **2362**; lines 2363-2384 are unrelated trailing content
+(a doc comment + four `const` declarations + the `CompactionSpan`
+struct) that happen to sit between it and `compaction_span`. The
+assigned 2336-2384 read range was therefore ~22 lines wider than the
+actual function — the same class of pre-dispatch verification gap
+cycles 4 and 8 hit, this time on the *end* boundary rather than the
+start. DeepSeek was not told about the extra trailing content and was
+not misled by it: its own review header cites the function's true span
+(`2336-2362`), and all four proposals' citations land inside 2338-2361
+— it implicitly self-corrected the oversized range without comment.
+
+**Setup hiccup (supervisor-side, not billed against DeepSeek's
+process):** the first invocation was run from the main checkout's
+default cwd, so the prompt's relative path
+`crates/kitsu-core/src/orchestrator.rs` resolved against
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu` instead of the worktree,
+tripping `PolicyDenied` (that root isn't in `--allow-path`) before any
+read happened — a supervisor cwd mistake, not a transport failure or a
+DeepSeek scope violation, so it did not consume the cycle's one
+transport retry. It did burn a small real API call (usage
+9,589/493/10,082 prompt/completion/total) that produced no output file
+before failing closed — filed below as a kitsu-usage weakness. Re-run
+with `cd` into the worktree first: exit 0, no discard.
+
+- **Process: 6th clean review cycle running.** Exactly 1 ranged read
+  (2336-2384, 49 lines, matching the assigned — if overshot — range
+  exactly) → 1 write, no re-read, no spawn attempt (cap 1 unexercised).
+  kitsu-usage (successful run) `{"prompt_tokens":16322,"completion_tokens":1814,"total_tokens":18136}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))".
+- **Citations letter-perfect — 3rd zero-drift cycle (after 7, 8).**
+  Spot-checked all citations against ground truth: line 2348
+  (`sequence: 0,`), lines 2346-2347 (`let outcome = progress.outcome?;`
+  / `Some(ledger.push(CompactionRecord {`), lines 2347-2361 (the
+  13-field struct literal, open-to-close), line 2338
+  (`cfg: &AgentConfig,`), and line 2350 (`configured_mode:
+  cfg.compaction,`) — every quote and every line-number label matches
+  the source exactly. R1.7 holding, third cycle running.
+- **Hedging correctly calibrated, no unhedged wrong claims.** Proposal
+  1 (high — hardcoded `sequence: 0` at 2348 may be a latent ledger bug)
+  hedges appropriately on `CompactionLedger::push`'s unread behavior.
+  Proposal 2 (high — `progress.outcome?` at 2346 silently drops the
+  whole compaction attempt with no ledger entry, log, or telemetry when
+  `outcome` is `None`) is stated as fact and is directly verifiable
+  from the read range alone — correctly unhedged. Proposal 4 (low —
+  `cfg: &AgentConfig` is threaded through solely to read
+  `cfg.compaction` at line 2350) is also correctly unhedged for the
+  same reason: the single usage is fully visible in-range. Proposal 3
+  (medium — the 13-field struct literal at 2347-2361 lists every field
+  positionally with no `..` update syntax, brittle to struct
+  evolution) is the one soft spot: it frames this as "every field of
+  `CompactionProgress` is individually splatted into `CompactionRecord`,"
+  which overstates the 1:1-ness — several `CompactionRecord` fields
+  (`tokens_before`, `tokens_after`, `messages_before`,
+  `messages_after`, `sequence`, `reason`, `configured_mode`) come from
+  other function parameters, not from `progress` at all, and whether
+  `CompactionProgress` has additional unused fields is unverifiable
+  from this range. The proposal does hedge this ("I have not read
+  either struct definition. If they are intended to stay 1:1, this is
+  cosmetic; if they already have diverged fields...") — imprecise
+  framing but not an unhedged false-fact claim like cycle 6's proposal
+  2, so not flagged as a correctness dock, only as a precision note.
+
+**Grade: A-.** Matches cycles 7-8's clean-process, zero-citation-drift
+bar, and adds a new positive data point: DeepSeek stayed inside the
+*true* function boundary even when handed a read range ~75% wider than
+the function itself, rather than treating the extra trailing consts/
+struct as fair game for citations. Docked half a grade from straight A
+only for proposal 3's loose "every field" framing (adequately hedged,
+not wrong, just imprecise) — otherwise indistinguishable in quality
+from cycle 7/8's best work.
+
+**kitsu weakness noted (not yet filed to roadmap):** a `PolicyDenied`
+read failure that occurs before any file is touched still bills a real,
+non-trivial API call (9,589 prompt tokens here) with zero useful
+output — the turn fails closed correctly, but the cost isn't free. A
+caller who mis-scopes `--allow-path` relative to their invocation cwd
+pays for it in tokens, not just wall-clock. Low severity (this was a
+supervisor error, not a kitsu bug), but a candidate for a future
+R-item: resolve/validate policy-denied paths pre-flight so a doomed
+turn can fail before the first model call rather than after.
+
+**Ramp status:** unchanged — DeepSeek remains a STRONG tiny-scope
+reviewer, now 6-for-6 on clean process (cycles 3, 4, 6, 7, 8, 9) and
+3-for-3 on zero-drift citations (cycles 7, 8, 9). Still review-only
+until R4.10 (implementation type-chasing, per cycle 5, is unaddressed).
+**Process note for future cron/supervisor authors (2nd instance of this
+specific gap):** confirming a range's start and confirming the *next*
+function's start is not sufficient to confirm the range matches the
+*target* function's actual end — non-function content (consts, doc
+comments, unrelated structs) can sit between a function's closing brace
+and the next `fn`. Verify the target function's own closing brace
+directly, not just its neighbor's opening line.
