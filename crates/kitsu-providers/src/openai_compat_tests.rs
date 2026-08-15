@@ -2104,6 +2104,132 @@ async fn test_model_context_length_unknown_model_stays_none_through_memo() {
     assert_eq!(provider.model_context_length("unknown-model").await, None);
 }
 
+/// A refresh that returns the SAME catalog text must PRESERVE the warm
+/// per-model context-length memo — not discard it to an empty HashMap.
+/// Before the fix, the cache write in `get_models_response` always reset
+/// `context_lengths` to an empty `HashMap::new()`, so the assertion below
+/// FAILED: the memo was cleared on every refresh regardless of whether the
+/// catalog actually changed. After the fix, the memo is carried across a
+/// refresh only when the new catalog text exactly equals the previous
+/// successful catalog text.
+///
+/// We prove the ACTUAL behavior change by inspecting the memo directly (not a
+/// proxy return value): the first call memoizes `{"m": Some(8192)}`; we force
+/// TTL expiry; we trigger a refresh via `get_models_response` directly (so
+/// `model_context_length` doesn't re-populate the memo via a parse); then we
+/// assert the carried-over memo still contains the entry.
+#[tokio::test]
+async fn test_context_length_memo_preserved_on_same_catalog_refresh() {
+    let server = MockServer::start().await;
+    let catalog = r#"{"data":[{"id":"m","context_length":8192}]}"#;
+    // First fetch — consumed once, then the second mock (same text) takes over.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: fetches catalog, parses, memoizes {"m": Some(8192)}.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force TTL expiry so the next call triggers a refresh.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // Trigger the refresh directly. This rebuilds the cache entry WITHOUT
+    // going through `model_context_length`, so the memo is NOT re-populated
+    // by a parse — letting us inspect the carried-over memo in isolation.
+    provider
+        .get_models_response()
+        .await
+        .expect("refresh succeeds");
+
+    // Inspect the memo directly: it must still contain the entry from before
+    // the refresh. Before the fix this was an empty HashMap → assertion fails.
+    {
+        let cache = provider.models_cache.lock().await;
+        let entry = cache.as_ref().expect("catalog cached after refresh");
+        let memo = entry.context_lengths.lock().unwrap();
+        assert_eq!(
+            memo.get("m"),
+            Some(&Some(8192)),
+            "memo must be preserved across a refresh with identical catalog text"
+        );
+    }
+}
+
+/// A refresh that returns a DIFFERENT catalog text must CLEAR the memo —
+/// carrying the warm memo across a changed catalog would serve stale context
+/// lengths (a correctness bug: the crux). This is the guard that the
+/// carry-only-on-identical-text rule doesn't introduce staleness.
+///
+/// We inspect the memo directly: after a refresh with changed catalog text
+/// the memo must be empty. We additionally confirm a subsequent
+/// `model_context_length` call returns the NEW value (16384), not the stale
+/// memoized one (8192).
+#[tokio::test]
+async fn test_context_length_memo_cleared_on_different_catalog_refresh() {
+    let server = MockServer::start().await;
+    let catalog_a = r#"{"data":[{"id":"m","context_length":8192}]}"#;
+    let catalog_b = r#"{"data":[{"id":"m","context_length":16384}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog_a))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog_b))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: fetches catalog A, memoizes {"m": Some(8192)}.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force TTL expiry so the next call triggers a refresh.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // Refresh with a DIFFERENT catalog (catalog B, context_length 16384).
+    provider
+        .get_models_response()
+        .await
+        .expect("refresh succeeds");
+
+    // Inspect the memo directly: it must be EMPTY. Carrying {"m": Some(8192)}
+    // across to a catalog that now says 16384 would be stale.
+    {
+        let cache = provider.models_cache.lock().await;
+        let entry = cache.as_ref().expect("catalog cached after refresh");
+        let memo = entry.context_lengths.lock().unwrap();
+        assert!(
+            memo.get("m").is_none(),
+            "memo must be cleared when the catalog text changes — carrying the old value would serve stale context lengths"
+        );
+    }
+
+    // A subsequent call must return the NEW value from catalog B, not the stale
+    // memoized 8192.
+    assert_eq!(provider.model_context_length("m").await, Some(16384));
+}
+
 /// P3 — `build_body` must fast-fail when a tool's `parameters` is not a JSON
 /// object. A non-object schema would otherwise be serialized verbatim and
 /// fail opaquely downstream at the gateway. This test could not compile against
