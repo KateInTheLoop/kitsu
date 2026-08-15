@@ -249,8 +249,8 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   discarded" notice (stderr + machine record), listing the paths, so the
   operator/next-run knows the workspace changed.
 - R4.12 **Don't classify a RECOVERED-tool-error turn as a failure**
-  (found by the GLM loop W5 AND the Kimi loop cycle 16 in the SAME hour —
-  two independent models, promote): a turn that hit a tool error (e.g. a
+  (HIGH — GLM loop W5 + Kimi loop cycles 14/16/17: FOUR sightings across
+  two models, escalate): a turn that hit a tool error (e.g. a
   PolicyDenied misfire) or a self-corrected edit conflict, then RECOVERED
   and produced a complete committed deliverable, is still marked
   `DISCARDED` / `session not saved` / exit 1 because ANY tool/policy error
@@ -260,7 +260,12 @@ event stream, `--resume`, subagent spawn caps, `--timeout-secs`,
   banner. *Accept:* a turn that ends with a committed assistant answer is
   NOT classified a failure merely because it recovered from an earlier
   tool/policy error mid-turn; the errors are still reported (counts/JSONL)
-  but the turn's disposition reflects the committed outcome.
+  but the turn's disposition reflects the committed outcome. Related gap
+  (Kimi cycle 17): the receipt does not distinguish "policy-poisoned but
+  COMPLETE" from "policy-poisoned and INCOMPLETE (budget/round cutoff)" —
+  a supervisor had to read the raw transcript to tell the turn actually
+  ran out of budget mid-edit. The disposition should carry both facts:
+  whether a final answer committed, AND whether the turn was cut off.
   `invalid response; HTTP 200; body failed` does not say which parse
   step or chunk failed, so a transport/format failure can't be
   root-caused from the receipt alone. *Accept:* a malformed provider
