@@ -153,9 +153,13 @@ templated runbooks, no fleet dispatch.
   regardless of size); tail mode does a true seek-to-end read of the last
   ≤4 MiB and returns the last N lines (correct + bounded for any size).
   Same allowlist guard. Opens the sysadmin lane.
-- R3.2 **Config-diff/audit helper**: read a config, compare against a
-  reference or a prior snapshot, report drift. *Accept:* two versions of
-  an `sshd_config`-shaped file produce a structured drift report.
+- [x] (2026-08-14) R3.2 **Config-diff/audit helper** — shipped as
+  `fs_diff_config` (commit 647f5a5): parses two line-oriented configs
+  (`key value` / `key=value` / `key: value`, # and ; comments skipped)
+  and reports drift — added/removed/changed with reference→current
+  values + unchanged count; `ignore_case` for sshd-style directives;
+  duplicate keys disclosed. Both paths authorized. Live-verified diffing
+  a default vs hardened sshd_config.
 - R3.3 **Structured command results**: `command_exec` results expose
   exit code, timing, and truncation flags as fields the model can
   branch on (partly present — confirm and formalize). *Accept:* a
@@ -269,9 +273,8 @@ Priority order the loop follows (revisit as lanes close):
    ✅, R2.4 xlsx ✅. Only R2.3 (image metadata) remains, and docx text as
    an optional follow-up. Lane 2 is effectively complete for the common
    document types — **advance to lane 3 next** (do R2.3 opportunistically).
-2. **System administration** (lane 3) — R3.1 log scanning ✅. Next:
-   R3.2 config-diff/audit, R3.3 structured command results, R3.4 runbook
-   mode.
+2. **System administration** (lane 3) — R3.1 log scan ✅, R3.2 config
+   diff ✅. Next: R3.3 structured command results, R3.4 runbook mode.
 3. **Code analysis hardening** (lane 1) — R1.3 symbol nav, R1.4 grouped
    edit receipts.
 4. **Automation trust** (lane 4) — R4.3 budget ceiling, R4.4 run report.
@@ -285,6 +288,17 @@ requirements are met, note it here and move down the sequence.
 ## Cycle log
 
 (appended each cycle, newest last)
+
+### Cycle 6 — 2026-08-14 — R3.2 config drift audit (sysadmin lane)
+
+Shipped `fs_diff_config` (commit 647f5a5): parses two line-oriented
+configs and reports added/removed/changed keys + unchanged count,
+handling `key value`/`key=value`/`key: value`, comments, case-insensitive
+directives, and duplicates. Both paths authorized; parse off-reactor.
+5 test scenarios incl. the sshd_config case-insensitive match; live-
+verified on default-vs-hardened sshd_config (correct drift). Haiku review
+pending (flagged the delimiter-parsing edge cases and indexing safety).
+Next in lane 3: R3.3 structured command results, R3.4 runbook mode.
 
 ### Cycle 5 — 2026-08-14 — R3.1 log scan/tail (opens the sysadmin lane)
 
