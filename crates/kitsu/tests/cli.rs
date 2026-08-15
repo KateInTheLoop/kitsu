@@ -2178,11 +2178,13 @@ async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_re
 
         let mut fork = base_cmd(&home_path);
         let output = fork
-            .args(["sessions", "--json", "fork", &id])
+            .args(["sessions", "--json", "fork", "last"])
             .output()
             .expect("fork named tool-free session");
         assert!(output.status.success(), "{:?}", output);
         let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(forked["source_session_id"], id);
+        assert_eq!(forked["permissions_restored"], false);
         let forked_id = forked["session"]["id"].as_str().unwrap().to_string();
         assert!(
             forked["session"]["name"].is_null(),
@@ -2249,6 +2251,19 @@ async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_re
             !forked_transcript.contains("second saved turn"),
             "fork transcript changed with its source: {forked_transcript}"
         );
+
+        let mut human_fork = base_cmd(&home_path);
+        let output = human_fork
+            .args(["sessions", "fork", &id])
+            .output()
+            .expect("render human fork lineage");
+        assert!(output.status.success(), "{output:?}");
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert!(
+            stdout.starts_with(&format!("forked session {id} -> s-")),
+            "{stdout}"
+        );
+        assert!(stdout.contains("permissions were not copied"), "{stdout}");
     })
     .await
     .expect("tool-free named-session process should join");
@@ -2641,6 +2656,7 @@ async fn test_scripted_session_continuity_and_provider_free_lifecycle() {
             .expect("fork session");
         assert!(output.status.success(), "{:?}", output);
         let forked: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(forked["source_session_id"], id);
         let forked_id = forked["session"]["id"].as_str().unwrap().to_string();
         assert_ne!(forked_id, id);
         assert_eq!(forked["permissions_restored"], false);

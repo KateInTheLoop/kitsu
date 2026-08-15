@@ -2372,18 +2372,20 @@ async fn run_sessions(
         }
         Some(SessionCommand::Fork { id }) => {
             require_session_namespace(&sessions_dir, "fork", &config_path)?;
-            let saved = session::SessionStore::fork(&sessions_dir, id)
+            let forked = session::SessionStore::fork_with_source(&sessions_dir, id)
                 .map_err(|error| session_error("fork", &config_path, error))?;
             if json {
                 print_json(&serde_json::json!({
                     "action": "fork",
-                    "session": saved,
+                    "source_session_id": forked.source_session_id,
+                    "session": forked.session,
                     "permissions_restored": false,
                 }))
             } else {
                 println!(
-                    "forked session {} (permissions were not copied)",
-                    terminal_inline(&saved.id)
+                    "forked session {} -> {} (permissions were not copied)",
+                    terminal_inline(&forked.source_session_id),
+                    terminal_inline(&forked.session.id)
                 );
                 Ok(())
             }
@@ -15087,13 +15089,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         eprintln!("cannot fork: session autosave is disabled");
                         continue;
                     };
-                    match session::SessionStore::fork(&sessions_dir, &selector) {
+                    match session::SessionStore::fork_with_source(&sessions_dir, &selector) {
                         Ok(forked) => {
                             eprintln!(
                                 "~ forked {} -> {}; switching with fresh runtime permissions",
-                                selector, forked.id
+                                forked.source_session_id, forked.session.id
                             );
-                            priority_command = Some(format!("/resume {}", forked.id));
+                            priority_command = Some(format!("/resume {}", forked.session.id));
                         }
                         Err(error) => eprintln!("cannot fork session: {error}"),
                     }
