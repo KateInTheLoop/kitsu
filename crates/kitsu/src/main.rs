@@ -17231,6 +17231,7 @@ async fn list_models_with_runtime_telemetry(
         runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderRequest {
             round: MODEL_CATALOG_ROUND,
             purpose: kitsu_core::ProviderRequestPurpose::ModelCatalog,
+            model: None,
             message_count: 0,
             tools_offered: 0,
             structured_output: false,

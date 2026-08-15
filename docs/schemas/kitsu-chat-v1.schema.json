@@ -255,6 +255,7 @@
             "type": { "const": "provider_request" },
             "round": { "type": "integer", "minimum": 1 },
             "purpose": { "enum": ["inference", "compaction", "model_catalog"] },
+            "model": { "type": "string", "minLength": 1 },
             "message_count": { "type": "integer", "minimum": 0 },
             "tools_offered": { "type": "integer", "minimum": 0 },
             "structured_output": { "type": "boolean" },

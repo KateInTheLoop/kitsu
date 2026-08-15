@@ -323,6 +323,10 @@ mod tests {
                 .iter()
                 .any(|purpose| purpose == "model_catalog")
         );
+        assert_eq!(
+            defs["provider_request"]["allOf"][2]["properties"]["model"]["type"],
+            "string"
+        );
         assert!(
             defs["provider_attempt"]["allOf"][2]["properties"]["purpose"]["enum"]
                 .as_array()
