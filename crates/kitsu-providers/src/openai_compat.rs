@@ -2,6 +2,7 @@
 //! AI gateway — they share one wire shape; only base_url/path/auth differ
 //! (design §1, §4).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -46,6 +47,11 @@ struct ModelsCacheEntry {
     stored_at: tokio::time::Instant,
     ttl: Duration,
     outcome: Result<(StatusCode, String), ProviderError>,
+    /// Memoized per-model context-length lookups parsed from the catalog JSON
+    /// on first miss; reused for the cache's lifetime (which is the catalog's
+    /// own TTL), so repeat `model_context_length` calls don't re-parse. Fresh on
+    /// every cache invalidation, so it inherits the existing TTL contract.
+    context_lengths: std::sync::Mutex<HashMap<String, Option<u64>>>,
 }
 
 /// Builder inputs for constructing a gateway-backed provider.
@@ -1255,6 +1261,7 @@ impl OpenAICompatProvider {
             stored_at: tokio::time::Instant::now(),
             ttl,
             outcome: outcome.clone(),
+            context_lengths: std::sync::Mutex::new(HashMap::new()),
         });
         outcome
     }
@@ -1385,43 +1392,74 @@ impl OpenAICompatProvider {
         if !status.is_success() {
             return None;
         }
-        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let entries = json.get("data")?.as_array()?;
-        // Prefer an exact id match; then a loose match, but ONLY if it's unique —
-        // an ambiguous loose match (e.g. "gpt-4" loosely matching both
-        // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
-        // to the wrong entry silently budgets against the wrong window. Finally
-        // fall back to a lone entry, whatever its id.
-        let exact = entries
-            .iter()
-            .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
-        let entry = if let Some(e) = exact {
-            e
+        // Memoize the parsed per-model lookup inside the cache entry so repeat
+        // calls skip re-parsing the catalog JSON. The memo lives in
+        // ModelsCacheEntry, so it is fresh on every cache invalidation — a
+        // refreshed catalog starts with an empty memo, and an expired entry is
+        // replaced wholesale. This preserves the existing TTL/invalidation
+        // contract: the memo never outlives the cached catalog it was derived
+        // from.
+        let cache = self.models_cache.lock().await;
+        if let Some(entry) = cache.as_ref() {
+            let mut memo = entry.context_lengths.lock().unwrap();
+            if let Some(cached) = memo.get(model) {
+                return *cached;
+            }
+            let parsed = context_length_from_catalog(&text, model);
+            memo.insert(model.to_string(), parsed);
+            parsed
         } else {
-            let mut loose = entries.iter().filter(|e| {
-                e.get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| loosely_matches(id, model))
-            });
-            match (loose.next(), loose.next()) {
-                (Some(only), None) => only,
-                _ => (entries.len() == 1).then(|| &entries[0])?,
-            }
-        };
-        for key in [
-            "max_model_len",
-            "context_length",
-            "context_window",
-            "max_context_length",
-            "max_input_tokens",
-        ] {
-            match entry.get(key).and_then(serde_json::Value::as_u64) {
-                Some(n) if n > 0 => return Some(n),
-                _ => {}
-            }
+            // The entry was evicted between get_models_response and now (e.g. a
+            // concurrent invalidation). Parse directly from the text we already
+            // hold — correctness is unaffected, just not memoized.
+            context_length_from_catalog(&text, model)
         }
-        None
     }
+}
+
+/// Pure parse: extract a model's advisory context length from a catalog JSON
+/// body. Prefers an exact id match, then a unique loose match (ambiguous loose
+/// matches give up rather than binding to the wrong window), then a lone entry.
+/// Checks `max_model_len`, `context_length`, `context_window`,
+/// `max_context_length`, and `max_input_tokens` in that order. Returns `None`
+/// on any parse error or when no usable field is present.
+fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let entries = json.get("data")?.as_array()?;
+    // Prefer an exact id match; then a loose match, but ONLY if it's unique —
+    // an ambiguous loose match (e.g. "gpt-4" loosely matching both
+    // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
+    // to the wrong entry silently budgets against the wrong window. Finally
+    // fall back to a lone entry, whatever its id.
+    let exact = entries
+        .iter()
+        .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
+    let entry = if let Some(e) = exact {
+        e
+    } else {
+        let mut loose = entries.iter().filter(|e| {
+            e.get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| loosely_matches(id, model))
+        });
+        match (loose.next(), loose.next()) {
+            (Some(only), None) => only,
+            _ => (entries.len() == 1).then(|| &entries[0])?,
+        }
+    };
+    for key in [
+        "max_model_len",
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_input_tokens",
+    ] {
+        match entry.get(key).and_then(serde_json::Value::as_u64) {
+            Some(n) if n > 0 => return Some(n),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Validate the common catalog envelope before assigning the positive cache
