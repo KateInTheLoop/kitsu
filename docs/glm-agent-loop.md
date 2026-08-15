@@ -272,6 +272,85 @@ in cycle 1 (the flags live on `kitsu chat`, not the top-level binary).
 provider-switch fallback (`fireworks-ai`) was never needed and the pin
 stays at `:together`.
 
+### Cycle 5 — 2026-08-14 — third review, portfolio expands to the SSE path (grade A)
+
+Fresh area: the SSE/streaming parse + error-recovery path in
+`openai_compat.rs` (`StreamChunk`, `SseDecoder`/`process_line`/`finalize`,
+the `SseState`/`sse_step` state machine, `chat_stream_with_telemetry`).
+Rebuilt the driver fresh off main (picks up R1.7's line-number-prefixed
+ranged reads). `:together` completed the round trip on attempt 1 with a
+real completion (236,260 prompt / 13,927 completion / 250,187 total
+tokens) — **not a transport failure** — so no retry and no
+`fireworks-ai` fallback were used.
+
+`reviews/glm-cycle-5.md`: 7 ranked, line-cited proposals (mid-stream
+`error` handling has a false-positive on `error: null` plus discards the
+gateway's real error detail; cancellation disposition relying solely on
+`Drop`; `Stop` silently synthesized when `[DONE]` arrives with no
+`finish_reason`; the 256 KiB per-line cap sits below the 1 MiB
+tool-argument cap, making the argument cap unreachable for single-line
+deltas; extra `choices` silently dropped; multi-line `data:` fields not
+accumulated (correctly scoped as a known, intentional OpenAI-specific
+limitation, not a bug); EOF mid-JSON reported as generic "malformed
+JSON" rather than distinguished from truncation) plus a new "Verified-solid
+/ do not regress" section calling out byte-accounting and ordering
+invariants that are already correct — a more mature review structure
+than cycles 1-2.
+
+- **Citation accuracy: every checked citation exact — spot-checked well
+  past the required 5 (12+ line-cited quotes across all 7 findings,
+  including the `SseState`/`sse_step` state machine and the
+  `ResponseBodyAttemptGuard::new` call site), zero drift. Third review in
+  a row with a perfect citation record.** Two findings (cancellation-Drop,
+  `finish_from_str` unknown-reason mapping) were correctly and explicitly
+  marked "confidence: verify" because their supporting code fell outside
+  the read ranges and GLM declined to re-read to confirm — exactly the
+  citation discipline the recipe asks for. No substantively-wrong or
+  unhedged-out-of-scope proposal found.
+- Read discipline: 7 ranged reads of the target (over the ~5 guidance by
+  2, same margin as cycle 2), each following a grep-located anchor
+  (`sse_step`, the `SseState` enum, `ResponseBodyAttemptGuard`) —
+  transparently reasoned, not silent overreach. No spawn attempted, cap 1
+  unexercised.
+- **New kitsu weakness observed (W5):** the run's own turn-commit
+  bookkeeping was alarming out of proportion to what actually happened.
+  GLM hit one `PolicyDenied` (an early `fs_scan_file` aimed at the
+  worktree directory itself, before it switched to `List`) and one
+  self-corrected `Edit` conflict (old_text not found after its own prior
+  edit; GLM re-read the file and reapplied correctly). Kitsu reported
+  `provisional assistant output was DISCARDED and was not committed`,
+  `session not saved`, and exit code 1 — yet the review file was fully
+  written, complete, and citation-perfect on disk via the checkpoint
+  mechanism (`1 file change(s) from the rolled-back turn remain on disk
+  (checkpoint #1)`). A supervisor following the retry rule literally
+  (retry on failure) could have burned a second run and 60s cooldown
+  discarding a perfectly good deliverable rather than checking the
+  checkpoint. The underlying checkpoint-durability behavior is sound and
+  consistent with the disclosure philosophy behind `07b7b59` (policy-denied
+  turns commit their truthful answer as partial) on the codex-ux branch;
+  the gap is that GLM's loop treated this as terminal turn failure rather
+  than distinguishing "conversational turn not saved" from "on-disk
+  deliverable complete" in its exit signaling. Filed for the roadmap.
+
+**Three reviews in, GLM's citation record is now 3-for-3 perfect (9/9,
+5/5, 12+/12+ exact) — the cleanest of the four contributors' review
+tracks.** The review structure keeps improving cycle over cycle
+(ranked findings → severity/confidence framing → this cycle's added
+"verified-solid, do not regress" section).
+
+**Ramp status:** GLM is 2-for-2 A on reviews-with-code-cycles-between
+plus this fresh third review at A — 3-for-3 on reviews overall, 2-for-2
+on code. **Next code cycle: implement the strongest proposal from this
+review** — finding 1 (fix the `error: null` false positive and surface
+the gateway's real error detail in `process_line`) is the best
+next-code candidate: small, well-scoped, a genuine correctness bug with
+a concrete proposed patch already in the review, and a natural
+follow-on to apply the now-proven test-rigor discipline (a test must
+fail against the *unfixed* code, not merely assert call counts) to a
+new corner of `openai_compat.rs`. Finding 3a (silent `Stop` synthesis on
+`[DONE]`-without-`finish_reason`) is the runner-up if P1 turns out to
+need broader plumbing than expected.
+
 Tool sequence: `Read` (full 378-line file) → `Write`
 `reviews/glm-cycle-1.md` (created, 6875 bytes — **kitsu flagged a
 warning**: "content contains a raw model chat-template control marker
