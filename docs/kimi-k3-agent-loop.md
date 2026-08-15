@@ -1605,3 +1605,108 @@ finding (DeepSeek proposals 2/3 in the same review — the silent
 zero-`removed` no-op path, and the circuit-breaker-vs-RequestTooLarge
 diagnostic precedence — or a GLM-adjacent finding), keeping scope to a
 single function/match-ripple per cycle.
+
+### Cycle 19 — 2026-08-15 — cross-model #2: DeepSeek cycle-7 proposal 2, `SummaryFallbackNoOp` (grade B+ — correct fix, but the described bug turned out to be currently unreachable; test premise had to be repaired)
+
+Kimi's 2nd cross-model implementation: DeepSeek reviewed
+`summarize_or_fallback`'s fallback tail in cycle-7, Kimi implements. Task:
+the tail block `if removed > 0 { ...; progress.outcome =
+Some(SummaryFallbackTrim); ... }` wrote NOTHING to `progress` when
+`removed == 0`, so a caller could see a STALE outcome from a prior
+compaction round. Single attempt, exit 0, clean tool-call shape: 2
+`find_symbol` + 7 `Read` + 5 `Edit` = **14 tool calls**, well inside the
+"~5 reads" budget and far under cycle 17/18's counts. Kimi read the
+`CompactionOutcome` enum first, chose **option (b)** (additive
+`CompactionOutcome::SummaryFallbackNoOp`, not an else-branch reusing an
+existing variant), and correctly found and updated BOTH exhaustive-match
+ripple sites without being told the exact line numbers:
+`CompactionLedger::push`'s match on `record.outcome` in orchestrator.rs
+itself (`ToolResultsElided | SummaryFallbackNoOp => {}`, i.e. a no-op
+fallback counts as neither a summary nor a trim) and
+`compaction_outcome_name` in `crates/kitsu/src/main.rs` (new arm
+`"summary_fallback_no_op"`). Diff: orchestrator.rs +9/-1, main.rs +1,
+orchestrator_tests.rs +115 (pre-repair). Zero spawn attempts
+(`--agent-spawn-cap 1` never exercised). `kitsu-usage`:
+119,811/3,913/123,724 (completion 16% of the 24,000 cap, zero
+truncation). One more R1.8 false-positive debris warning (5th sighting:
+cycles 16, 18, 19) on the `orchestrator_tests.rs` edit — file content
+verified clean.
+
+**The fix itself is correct and genuinely additive** — no signature
+changes, no call-site refactors, both match sites covered, `cargo build
+--workspace` / `clippy --workspace --all-targets` / `cargo fmt --all --
+--check` all clean with zero supervisor changes needed to the production
+code.
+
+**But `cargo test --workspace` caught a real problem in Kimi's own test**,
+`summarize_or_fallback_zero_removed_records_noop_not_stale_outcome`: it
+seeded a stale prior outcome, called `summarize_or_fallback` with a
+4-exchange conversation and a "generous" `target = 64_000`, and asserted
+`SummaryFallbackNoOp` — but got `SummaryFallbackTrim` with 2 exchanges
+actually removed. Root-caused rather than patched blindly: the tail's
+`drop_old_exchanges_detailed(messages, current, target, message_tokens,
+true)` call hardcodes `force_all: true`, whose while-loop condition
+`(force_all || total > target) && e < max_drop` makes `target`
+**irrelevant** whenever `force_all` is true — it unconditionally drops
+every droppable exchange up to `max_drop`. And `max_drop =
+actual - KEEP_RECENT_EXCHANGES`, gated by the SAME "too few exchanges"
+threshold (`actual <= KEEP_RECENT_EXCHANGES`, `KEEP_RECENT_EXCHANGES =
+2`) that `compaction_span()` already uses for its own early return
+(`let Some(span) = compaction_span(messages) else { return Ok(()); }`)
+at the top of `summarize_or_fallback`. No message mutation happens
+between that early-return check and the tail call. **Consequence: by the
+time the tail's `force_all: true` call runs, at least one exchange is
+*always* still droppable and WILL be dropped — `removed == 0` is
+currently unreachable from `summarize_or_fallback`'s own call site.**
+DeepSeek's finding (and this cycle's brief) didn't verify reachability
+before describing it as a live bug; it isn't one today, though the fix
+remains correct, harmless, additive defensive code that immediately
+stops a real staleness bug the moment `force_all`'s hardcoding or these
+two thresholds ever drift apart independently.
+
+**Supervisor repair:** replaced the failing test (not a retry — this
+was a test-logic problem, not a transport failure, so R4.12/W5 doesn't
+apply and no rerun was warranted) with two tests that pin down the
+actual, verifiable facts instead of an unreachable end-to-end path:
+`drop_old_exchanges_detailed_force_all_zero_only_when_nothing_droppable`
+(direct test of the helper: returns 0 for a too-small conversation even
+with `target = 0`; returns `> 0` for a real droppable span even with
+`target = total * 100`, proving `force_all` ignores `target`) and
+`compaction_ledger_does_not_count_summary_fallback_no_op_as_a_trim`
+(direct `CompactionLedger::push` test: a `SummaryFallbackNoOp` record
+increments `total_compactions` but neither `trims` nor `summaries`,
+proving the ledger match-arm update is correct, not merely
+compiling). Kimi's own `summarize_or_fallback_removed_path_still_records_summary_fallback_trim`
+test (the removed > 0 regression guard) passed unmodified and was kept.
+**Final test count: 5 new/kept tests**, all passing, all grounded in the
+actual diff (2 supervisor-authored + 1 Kimi-authored kept + the 2
+pre-existing cycle-18 EmptyCompletion/ProviderFailure tests still
+green).
+
+**Verification (final, all clean):** `cargo build --workspace`; `cargo
+clippy --workspace --all-targets` zero warnings; `cargo fmt --all --
+--check` clean (no reformat needed pre- or post-repair); `cargo test
+--workspace --no-fail-fast`: kitsu-core 126/126 (was 125 pre-repair with
+1 failing), kitsu-providers/kitsu-render/kitsu-tools all green, kitsu
+122/123 — only the pre-known PTY flake
+`test_query_only_interactive_session_does_not_create_a_snapshot`
+(cycles 10-18), confirmed unrelated. Diff: orchestrator.rs +11/-1,
+main.rs +1, orchestrator_tests.rs +149 across the 3 files.
+
+**Grade B+.** Docked from A: the code fix and match-ripple discovery
+were both flawless and delivered in a genuinely small tool-call budget,
+but the cross-model review this cycle implemented described a bug whose
+reachability was never verified — a gap in DeepSeek's original review
+this cycle exposed rather than repeated, and worth feeding back to
+future DeepSeek cycles ("verify a described branch is actually
+reachable through the real call graph before filing it, not just
+plausible from reading the code"). Kimi is now 12-for-13 on code work
+(cycles 7-19) with 2-for-2 on cross-model implementations, both requiring
+supervisor repair (cycle 18: main-branch collision on an unrelated file;
+cycle 19: an unreachable-path test). No new kitsu weaknesses this cycle
+beyond the R1.8 debris false-positive's 5th reconfirmation. Next: a
+DIFFERENT cross-model finding — DeepSeek cycle-7 proposal 3
+(circuit-breaker-vs-RequestTooLarge diagnostic precedence) or a
+GLM-adjacent finding — and when scoping it, the supervisor should
+pre-verify reachability of the described branch before handing Kimi the
+brief, to avoid repeating this cycle's test-repair overhead.

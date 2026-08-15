@@ -4075,6 +4075,7 @@ fn compaction_outcome_name(outcome: kitsu_core::CompactionOutcome) -> &'static s
         kitsu_core::CompactionOutcome::Trimmed => "trimmed",
         kitsu_core::CompactionOutcome::Summarized => "summarized",
         kitsu_core::CompactionOutcome::SummaryFallbackTrim => "summary_fallback_trim",
+        kitsu_core::CompactionOutcome::SummaryFallbackNoOp => "summary_fallback_no_op",
     }
 }
 

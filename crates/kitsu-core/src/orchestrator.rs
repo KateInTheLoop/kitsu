@@ -896,6 +896,8 @@ pub enum CompactionOutcome {
     Trimmed,
     Summarized,
     SummaryFallbackTrim,
+    /// The summary fallback ran but found no eligible old exchanges to remove.
+    SummaryFallbackNoOp,
 }
 
 /// Why a requested summary used the trim fallback.
@@ -982,7 +984,7 @@ impl CompactionLedger {
             CompactionOutcome::Trimmed | CompactionOutcome::SummaryFallbackTrim => {
                 self.trims = self.trims.saturating_add(1);
             }
-            CompactionOutcome::ToolResultsElided => {}
+            CompactionOutcome::ToolResultsElided | CompactionOutcome::SummaryFallbackNoOp => {}
         }
         self.tool_results_elided = self
             .tool_results_elided
@@ -3644,6 +3646,13 @@ where
         meter.invalidate();
         progress.exchanges_removed = removed;
         progress.outcome = Some(CompactionOutcome::SummaryFallbackTrim);
+        progress.fallback_reason = fallback;
+    } else {
+        // The fallback ran but there was nothing left to trim. Record a
+        // distinct outcome so a caller never mistakes a stale prior-round
+        // outcome for this round's result.
+        progress.exchanges_removed = 0;
+        progress.outcome = Some(CompactionOutcome::SummaryFallbackNoOp);
         progress.fallback_reason = fallback;
     }
     Ok(())

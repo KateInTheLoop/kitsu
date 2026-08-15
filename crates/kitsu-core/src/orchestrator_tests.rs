@@ -4968,3 +4968,152 @@ async fn summarize_or_fallback_provider_failure_still_uses_provider_failure_reas
         "the fallback must still trim the old exchanges"
     );
 }
+
+/// `drop_old_exchanges_detailed` (the helper the `summarize_or_fallback`
+/// tail's `removed == 0` branch depends on) really does return 0 when
+/// nothing is safely droppable — and, separately, that `force_all: true`
+/// ignores an arbitrarily generous `target` and drops everything droppable
+/// once a droppable span exists at all.
+///
+/// That second fact is why `summarize_or_fallback`'s new `removed == 0`
+/// (`SummaryFallbackNoOp`) branch is currently UNREACHABLE from its own
+/// call site: `compaction_span()` gates entry to the whole fallback tail
+/// using the exact same "too few exchanges" threshold this function uses
+/// to return 0 (`actual <= KEEP_RECENT_EXCHANGES`), and no message mutation
+/// happens in between. So by the time the tail's hardcoded `force_all:
+/// true` call runs, at least one exchange is always still droppable and
+/// WILL be dropped, regardless of `target`. An end-to-end
+/// `summarize_or_fallback` test that reaches `removed == 0` with a real
+/// compaction span present cannot be constructed against the current code
+/// (confirmed empirically: the natural first attempt at such a test — a
+/// 4-exchange conversation with a deliberately generous target — asserted
+/// `SummaryFallbackNoOp` but observed `SummaryFallbackTrim` with 2
+/// exchanges actually removed, exactly as this test predicts).
+///
+/// The fix is still correct, additive, defensive code: it stops a latent
+/// silent stale-outcome bug the instant `force_all`'s hardcoding or the two
+/// thresholds above ever drift apart. This test pins down the two facts
+/// the unreachability argument rests on, directly against the helper.
+#[test]
+fn drop_old_exchanges_detailed_force_all_zero_only_when_nothing_droppable() {
+    use crate::context::message_tokens;
+    use crate::orchestrator::drop_old_exchanges_detailed;
+    use kitsu_providers::ChatMessage;
+
+    // Too few exchanges to safely drop anything (<= KEEP_RECENT_EXCHANGES):
+    // force_all must still return 0, even with target 0 ("drop everything
+    // you possibly can").
+    let mut few = vec![
+        ChatMessage::system("sys"),
+        ChatMessage::user("q0"),
+        ChatMessage::assistant("a0", vec![]),
+    ];
+    let total: u64 = few.iter().map(message_tokens).sum();
+    let removed = drop_old_exchanges_detailed(&mut few, total, 0, message_tokens, true);
+    assert_eq!(removed, 0, "nothing safely droppable, even under force_all");
+    assert_eq!(few.len(), 3, "messages must be untouched");
+
+    // A real droppable span exists: force_all must drop it even given an
+    // arbitrarily generous target that would need no trimming at all.
+    let mut many = compaction_conversation(4);
+    let total: u64 = many.iter().map(message_tokens).sum();
+    let generous_target = total * 100; // nowhere near exceeded
+    let removed =
+        drop_old_exchanges_detailed(&mut many, total, generous_target, message_tokens, true);
+    assert!(
+        removed > 0,
+        "force_all must drop droppable exchanges regardless of target"
+    );
+}
+
+/// `CompactionLedger::push` must not count a `SummaryFallbackNoOp` outcome
+/// as a trim (it removed nothing) while still recording the compaction
+/// attempt itself — proving the ledger's new match arm is correct, not
+/// merely that it compiles.
+#[test]
+fn compaction_ledger_does_not_count_summary_fallback_no_op_as_a_trim() {
+    use crate::orchestrator::{
+        CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord,
+        SummaryFallbackReason,
+    };
+
+    let mut ledger = CompactionLedger::default();
+    let record = CompactionRecord {
+        sequence: 0, // overwritten by push
+        reason: CompactionReason::ContextTargetExceeded,
+        configured_mode: CompactionMode::Summarize,
+        outcome: CompactionOutcome::SummaryFallbackNoOp,
+        fallback_reason: Some(SummaryFallbackReason::CircuitBreaker),
+        tokens_before: 1000,
+        tokens_after: 1000,
+        messages_before: 10,
+        messages_after: 10,
+        tool_results_elided: 0,
+        exchanges_removed: 0,
+        summary_input_shortened: false,
+        summary_output_shortened: false,
+    };
+
+    ledger.push(record);
+
+    assert_eq!(ledger.total_compactions, 1, "the attempt is still recorded");
+    assert_eq!(
+        ledger.trims, 0,
+        "a no-op fallback removed nothing and must not count as a trim"
+    );
+    assert_eq!(
+        ledger.summaries, 0,
+        "a no-op fallback is not a completed summary either"
+    );
+}
+
+/// The removed > 0 fallback path must keep recording
+/// `SummaryFallbackTrim` with a positive `exchanges_removed` — unchanged.
+#[tokio::test]
+async fn summarize_or_fallback_removed_path_still_records_summary_fallback_trim() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{
+        summarize_or_fallback, CompactionMode, CompactionOutcome, CompactionProgress,
+        SummaryFallbackReason,
+    };
+
+    let provider = MockProvider::new(vec![]);
+    let mut cfg = cfg(4);
+    cfg.compaction = CompactionMode::Summarize;
+    cfg.context_window = Some(128_000);
+    let mut messages = compaction_conversation(6);
+    let mut failures = 3u32;
+    let mut turn_usage = kitsu_providers::Usage::default();
+    let mut meter = ContextMeter::new();
+    let mut progress = CompactionProgress::default();
+
+    summarize_or_fallback(
+        &provider,
+        &mut messages,
+        &cfg,
+        0,
+        1, // a tiny target forces the fallback to actually drop old exchanges
+        &mut failures,
+        &mut turn_usage,
+        &mut meter,
+        &mut progress,
+        1,
+        None,
+    )
+    .await
+    .expect("summarize_or_fallback must not error on the trim fallback path");
+
+    assert_eq!(
+        progress.outcome,
+        Some(CompactionOutcome::SummaryFallbackTrim),
+        "the removed > 0 path must keep the SummaryFallbackTrim outcome"
+    );
+    assert!(
+        progress.exchanges_removed > 0,
+        "the removed > 0 path must report the exchanges it dropped"
+    );
+    assert_eq!(
+        progress.fallback_reason,
+        Some(SummaryFallbackReason::CircuitBreaker)
+    );
+}
