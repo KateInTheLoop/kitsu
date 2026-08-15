@@ -1411,11 +1411,11 @@ pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerF
         name: "read_document".to_string(),
         description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
                       to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
-                      → text, XLSX → spreadsheet cells, DOCX → paragraph text. Always discloses \
-                      the detected type and which reader ran. Images report metadata only; other \
-                      Office types (e.g. pptx) are detected and disclosed but not text-extracted. \
-                      Unknown types fall back to a UTF-8 text read. For paging a large CSV/PDF, \
-                      call fs_read_csv/fs_read_pdf directly."
+                      → text, XLSX → spreadsheet cells, DOCX → paragraph text, PPTX → slide text. \
+                      Always discloses the detected type and which reader ran. Images report \
+                      metadata only; unknown zip-based Office types are detected and disclosed but \
+                      not text-extracted. Unknown types fall back to a UTF-8 text read. For paging \
+                      a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1474,6 +1474,10 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
             "DOCX → fs_read_docx",
             read_docx_run(policy, &path_args).await?,
         ),
+        DocType::Office("PPTX") => (
+            "PPTX → fs_read_pptx",
+            read_pptx_run(policy, &path_args).await?,
+        ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
             format!(
@@ -1513,7 +1517,17 @@ struct ReadDocxArgs {
 /// (`<w:p>`), turning `<w:tab/>` into a tab and `<w:br/>`/`<w:cr/>` into a
 /// newline. Returns the collected paragraphs and whether the collect ceiling
 /// was hit. Malformed XML stops parsing and returns what was gathered.
-fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
+/// Shared OOXML text extraction: concatenate `text_tag` runs into paragraphs
+/// delimited by `para_tag`, mapping `tab_tag` → tab and any `break_tags` →
+/// newline. Used by both docx (`w:t`/`w:p`) and pptx (`a:t`/`a:p`). Malformed
+/// XML stops parsing and returns what was gathered (honest partial).
+fn parse_ooxml_paragraphs(
+    xml: &str,
+    text_tag: &[u8],
+    para_tag: &[u8],
+    tab_tag: Option<&[u8]>,
+    break_tags: &[&[u8]],
+) -> (Vec<String>, bool) {
     use quick_xml::events::Event;
     use quick_xml::Reader;
 
@@ -1524,23 +1538,27 @@ fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
     let mut collect_capped = false;
     loop {
         match reader.read_event() {
-            Ok(Event::Start(e)) if e.name().as_ref() == b"w:t" => in_text = true,
-            Ok(Event::End(e)) => match e.name().as_ref() {
-                b"w:t" => in_text = false,
-                b"w:p" => {
+            Ok(Event::Start(e)) if e.name().as_ref() == text_tag => in_text = true,
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                if name.as_ref() == text_tag {
+                    in_text = false;
+                } else if name.as_ref() == para_tag {
                     paragraphs.push(std::mem::take(&mut current));
                     if paragraphs.len() >= DOCX_MAX_COLLECT {
                         collect_capped = true;
                         break;
                     }
                 }
-                _ => {}
-            },
-            Ok(Event::Empty(e)) => match e.name().as_ref() {
-                b"w:tab" => current.push('\t'),
-                b"w:br" | b"w:cr" => current.push('\n'),
-                _ => {}
-            },
+            }
+            Ok(Event::Empty(e)) => {
+                let name = e.name();
+                if tab_tag == Some(name.as_ref()) {
+                    current.push('\t');
+                } else if break_tags.contains(&name.as_ref()) {
+                    current.push('\n');
+                }
+            }
             Ok(Event::Text(e)) if in_text => {
                 if let Ok(decoded) = e.decode() {
                     match quick_xml::escape::unescape(&decoded) {
@@ -1565,16 +1583,25 @@ fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
                 }
             }
             Ok(Event::Eof) => break,
-            // Malformed XML: stop and keep what we have (honest partial).
             Err(_) => break,
             _ => {}
         }
     }
-    // A trailing run not closed by </w:p>.
+    // A trailing run not closed by the paragraph tag.
     if !current.is_empty() {
         paragraphs.push(current);
     }
     (paragraphs, collect_capped)
+}
+
+fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
+    parse_ooxml_paragraphs(
+        xml,
+        b"w:t",
+        b"w:p",
+        Some(b"w:tab".as_slice()),
+        &[b"w:br".as_slice(), b"w:cr".as_slice()],
+    )
 }
 
 fn render_docx(display: &str, xml: &str, max_paragraphs: usize, xml_truncated: bool) -> String {
@@ -1683,6 +1710,170 @@ async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolE
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("docx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_pptx (PowerPoint slide-text extraction) ------------------------
+
+const PPTX_MAX_TOTAL_XML_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadPptxArgs {
+    path: String,
+    /// Paragraphs shown across all slides (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_paragraphs: Option<usize>,
+}
+
+/// pptx text runs are `<a:t>`, paragraphs `<a:p>`, line breaks `<a:br/>`.
+fn parse_pptx_paragraphs(xml: &str) -> Vec<String> {
+    let (paras, _capped) = parse_ooxml_paragraphs(xml, b"a:t", b"a:p", None, &[b"a:br".as_slice()]);
+    paras
+}
+
+/// `ppt/slides/slideN.xml` → N. Excludes layouts, masters, notes, and rels.
+fn pptx_slide_number(name: &str) -> Option<u32> {
+    name.strip_prefix("ppt/slides/slide")?
+        .strip_suffix(".xml")?
+        .parse::<u32>()
+        .ok()
+}
+
+fn extract_pptx(path: &Path, display: &str, max_paragraphs: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| std::io::Error::other(format!("not a valid .pptx (zip) file: {e}")))?;
+    // Collect slide entry names (owned) so the archive can be re-borrowed mutably.
+    let mut slides: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(|n| pptx_slide_number(n).map(|num| (num, n.to_string())))
+        .collect();
+    if slides.is_empty() {
+        return Err(std::io::Error::other(
+            "not a PowerPoint .pptx document (no ppt/slides/slideN.xml inside)",
+        ));
+    }
+    // Numeric order — lexical would put slide10 before slide2.
+    slides.sort_by_key(|(num, _)| *num);
+
+    let mut body = String::new();
+    let mut total_paras = 0usize;
+    let mut shown = 0usize;
+    let mut budget = 0u64;
+    let mut byte_capped = false;
+    for (num, name) in &slides {
+        if budget >= PPTX_MAX_TOTAL_XML_BYTES {
+            byte_capped = true;
+            break;
+        }
+        let Ok(entry) = archive.by_name(name) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if Read::take(entry, DOCX_MAX_XML_BYTES)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        budget += buf.len() as u64;
+        let xml = String::from_utf8_lossy(&buf);
+        let paras = parse_pptx_paragraphs(&xml);
+        let with_text: Vec<&String> = paras.iter().filter(|p| !p.trim().is_empty()).collect();
+        total_paras += with_text.len();
+        if with_text.is_empty() || shown >= max_paragraphs {
+            continue;
+        }
+        body.push_str(&format!("--- slide {num} ---\n"));
+        for para in with_text {
+            if shown >= max_paragraphs {
+                break;
+            }
+            body.push_str(para);
+            body.push('\n');
+            shown += 1;
+        }
+    }
+
+    let note = if byte_capped {
+        format!(
+            ", stopped at {} MiB of slide XML",
+            PPTX_MAX_TOTAL_XML_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "pptx> {display}: {} slide(s), {total_paras} paragraph(s) with text \
+         [text only — no speaker notes, formatting, or images]{note}\n",
+        slides.len()
+    );
+    if total_paras == 0 {
+        out.push_str(
+            "(no extractable text — the slides may be image-only or use an unsupported structure)\n",
+        );
+        return Ok(out);
+    }
+    out.push_str(&body);
+    if shown < total_paras {
+        out.push_str(&format!(
+            "[showing {shown} of {total_paras} paragraphs; raise max_paragraphs for more]\n"
+        ));
+    }
+    Ok(out)
+}
+
+pub fn read_pptx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_pptx".to_string(),
+        description: "Extract the slide text of a PowerPoint .pptx (text only — no speaker notes, \
+                      formatting, or images), grouped per slide and bounded by paragraph. \
+                      Pure-Rust zip + XML; same allowlist as fs_read_file; a non-.pptx or corrupt \
+                      file is disclosed honestly, never emitted as binary garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .pptx file"},
+                "max_paragraphs": {"type": "integer", "description": "Paragraphs shown across all slides (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_pptx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_pptx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadPptxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > DOCX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            DOCX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let display = a.path.clone();
+    let max = a
+        .max_paragraphs
+        .unwrap_or(DOCX_DEFAULT_MAX_PARAGRAPHS)
+        .clamp(1, DOCX_MAX_PARAGRAPHS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || extract_pptx(&path, &display, max))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("pptx parse failed: {e}")))?;
     Ok(policy.cap_output(rendered))
 }
 
@@ -6859,6 +7050,115 @@ mod tests {
         .unwrap();
         zip.write_all(document_xml.as_bytes()).unwrap();
         zip.finish().unwrap();
+    }
+
+    /// Build a minimal real `.pptx` (a zip carrying `ppt/slides/slideN.xml`).
+    fn write_min_pptx(path: &std::path::Path, slides: &[(u32, &str)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (n, sp_tree_body) in slides {
+            zip.start_file(
+                format!("ppt/slides/slide{n}.xml"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            let xml = format!(
+                "<?xml version=\"1.0\"?><p:sld xmlns:a=\"x\"><p:cSld><p:spTree>{sp_tree_body}\
+                 </p:spTree></p:cSld></p:sld>"
+            );
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn pptx_paragraph_extraction_and_entities() {
+        let xml = "<p:sld xmlns:a=\"x\">\
+            <a:p><a:r><a:t>Hello</a:t></a:r></a:p>\
+            <a:p><a:r><a:t>World &amp; co</a:t></a:r></a:p>\
+            <a:p></a:p></p:sld>";
+        let paras = parse_pptx_paragraphs(xml);
+        let with_text: Vec<&String> = paras.iter().filter(|p| !p.trim().is_empty()).collect();
+        assert_eq!(with_text.len(), 2, "{paras:?}");
+        assert_eq!(with_text[0], "Hello");
+        assert_eq!(with_text[1], "World & co"); // entity decoded
+    }
+
+    #[tokio::test]
+    async fn read_pptx_end_to_end_ordering_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("deck.pptx");
+        // Slides added out of lexical order to exercise the numeric sort
+        // (lexically "slide10" precedes "slide2").
+        write_min_pptx(
+            &path,
+            &[
+                (2, "<a:p><a:r><a:t>Second slide</a:t></a:r></a:p>"),
+                (10, "<a:p><a:r><a:t>Tenth slide</a:t></a:r></a:p>"),
+                (1, "<a:p><a:r><a:t>First slide</a:t></a:r></a:p>"),
+            ],
+        );
+        let out = read_pptx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("pptx ok");
+        assert!(out.contains("3 slide(s)"), "{out}");
+        let (i1, i2, i10) = (
+            out.find("--- slide 1 ---").expect("slide 1"),
+            out.find("--- slide 2 ---").expect("slide 2"),
+            out.find("--- slide 10 ---").expect("slide 10"),
+        );
+        assert!(i1 < i2 && i2 < i10, "numeric slide order: {out}");
+        assert!(
+            out.contains("First slide") && out.contains("Tenth slide"),
+            "{out}"
+        );
+
+        // read_document routes a pptx to fs_read_pptx.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("PPTX → fs_read_pptx"), "{out}");
+        assert!(out.contains("First slide"), "{out}");
+
+        // A zip WITHOUT ppt/slides/slideN.xml → honest error, not garbage.
+        let notpptx = dir.path().join("weird.pptx");
+        {
+            let f = std::fs::File::create(&notpptx).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("other.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"not a slide deck").unwrap();
+            z.finish().unwrap();
+        }
+        assert!(matches!(
+            read_pptx_run(
+                &policy,
+                &serde_json::json!({"path": notpptx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.pptx");
+        write_min_pptx(&bad, &[(1, "<a:p><a:r><a:t>x</a:t></a:r></a:p>")]);
+        assert!(matches!(
+            read_pptx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
     }
 
     #[test]
