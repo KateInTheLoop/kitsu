@@ -2374,6 +2374,7 @@ mod tests {
                         AgentRuntimeEvent::ProviderRequest {
                             round: 1,
                             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+                            model: Some("live-model".to_string()),
                             message_count: 2,
                             tools_offered: 1,
                             structured_output: false,

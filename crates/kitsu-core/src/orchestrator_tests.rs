@@ -361,10 +361,11 @@ async fn test_loop_forwards_and_discloses_structured_output_constraint() {
     assert!(log.take().iter().any(|event| matches!(
         event,
         AgentRuntimeEvent::ProviderRequest {
+            model: Some(model),
             structured_output: true,
             tools_offered: 0,
             ..
-        }
+        } if model == "example-model-v1"
     )));
 }
 
@@ -2938,9 +2939,10 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         event,
         AgentRuntimeEvent::ProviderRequest {
             purpose: ProviderRequestPurpose::Compaction,
+            model: Some(model),
             tools_offered: 0,
             ..
-        }
+        } if model == "example-model-v1"
     )));
     assert!(events.iter().any(|event| matches!(
         event,

@@ -325,6 +325,10 @@ pub enum AgentRuntimeEvent {
     ProviderRequest {
         round: u32,
         purpose: ProviderRequestPurpose,
+        /// Exact model selected for this inference or compaction request.
+        /// Catalog lookups are not routed to a model and leave this absent.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
         message_count: usize,
         tools_offered: usize,
         /// True when this logical request carries a provider-native strict
@@ -1466,6 +1470,7 @@ where
             log.record(AgentRuntimeEvent::ProviderRequest {
                 round,
                 purpose: ProviderRequestPurpose::Inference,
+                model: Some(cfg.model.clone()),
                 message_count: req.messages.len(),
                 tools_offered: req.tools.as_ref().map_or(0, Vec::len),
                 structured_output: req.response_format.is_some(),
@@ -3117,6 +3122,7 @@ where
                         log.record(AgentRuntimeEvent::ProviderRequest {
                             round,
                             purpose: ProviderRequestPurpose::Compaction,
+                            model: Some(cfg.model.clone()),
                             message_count: req.messages.len(),
                             tools_offered: 0,
                             structured_output: false,

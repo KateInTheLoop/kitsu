@@ -933,6 +933,9 @@ existing final-message destination stays unchanged. JSONL emits one body-free
 `provider_request.structured_output` confirms which requests carried the
 constraint. The schema file is excluded from filesystem and command authority;
 command-enabled runs must place it outside command and runtime roots.
+Inference and compaction `provider_request` records also identify the exact
+`model` used for each logical request, including after `/model`; catalog
+requests omit it because they are not routed to a model.
 Schema-rejection errors expose the schema SHA-256, failing instance path, and
 validation keyword, and `final_summary.output_schema_failures` lets summary-only
 consumers distinguish local acceptance failure from provider transport failure.

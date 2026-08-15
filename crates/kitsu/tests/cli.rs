@@ -7308,6 +7308,101 @@ auth = {{ method = "none" }}
     server.verify().await;
 }
 
+/// Every logical inference request identifies the exact model sent on the
+/// wire. This remains truthful across an in-session `/model` switch; the
+/// intervening catalog lookup is not routed to a model and omits the field.
+#[tokio::test]
+#[serial]
+async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "model identity ok"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("model-request-identity.script");
+    fs::write(
+        &script,
+        "first model prompt\n/model switched-model\nsecond model prompt\n/quit\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &script_path,
+            ])
+            .output()
+            .expect("run model-switch JSONL script")
+    })
+    .await
+    .expect("model-switch command should join");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let inference_models = events
+        .iter()
+        .filter(|event| event["type"] == "provider_request" && event["purpose"] == "inference")
+        .map(|event| {
+            event["model"]
+                .as_str()
+                .expect("inference request model")
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(inference_models, ["example-model-v1", "switched-model"]);
+
+    let catalog_request = events
+        .iter()
+        .find(|event| event["type"] == "provider_request" && event["purpose"] == "model_catalog")
+        .expect("logical model-catalog request");
+    assert!(
+        catalog_request.get("model").is_none(),
+        "catalog lookup is not routed to a model: {catalog_request}"
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    let wire_models = requests
+        .iter()
+        .map(|request| {
+            serde_json::from_slice::<serde_json::Value>(&request.body).unwrap()["model"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(wire_models, inference_models);
+    server.verify().await;
+}
+
 /// A positional chat prompt is authoritative input and must not wait for an
 /// unrelated piped stdin handle to reach EOF.
 #[tokio::test]
