@@ -828,3 +828,61 @@ range was exact on the first check, and this is the first cycle to
 target a function whose neighbor (`format_command_result`, cycle 11) was
 itself a prior review target, confirming adjacent-function scoping
 doesn't blur DeepSeek's read boundary.
+
+### Cycle 14 — 2026-08-15 — format_tool_header review, grade A (flawless, 6th clean citation cycle)
+
+Reviewed `format_tool_header` (1653-1726, confirmed on disk before dispatch
+— pre-measured range was exact, no shift). Process perfect for the
+**11th cycle running**: exactly 1 ranged read (the single 1653-1726 read,
+confirmed via full transcript grep — zero other Read/Write/spawn_agent
+calls), 1 write, first attempt, no spawn attempt, clean exit (`1 turn(s)
+ok, 1 file(s) read, 1 file(s) written`). kitsu-usage 20,635 / 2,888 /
+23,523. Commit pending below, pushed after this entry.
+
+**Citations 4/4 letter-perfect on BOTH quoted text AND line-number
+labels** — every code block was diffed line-by-line against the file on
+disk (lines 1691-1710 spot-checked in full) and matched exactly,
+including whitespace/indentation. No prose citation restated a line
+number from memory either (the cycle-13 failure mode) — every number in
+free text matches a number that also appears, correctly, in an adjacent
+quoted block.
+
+- **Proposal 1 (medium, correct, unhedged):** `spawn_agents`'s `count`
+  (line 1692, `tasks.map_or(0, Vec::len)`) counts raw array length while
+  `labels` (1693-1702) drops non-string elements via `filter_map` —
+  a mixed-type `tasks` array (e.g. `["alpha", 42, "beta"]`) renders
+  `Agent(x3: "alpha", "beta")`, a count that overstates the visible
+  labels. Verified correct by inspection; the claim rests entirely on
+  the read range, so correctly left unhedged.
+- **Proposal 2 (low, correct, unhedged):** per-task strings are bounded
+  to 48 chars (line 1698) but the joined `labels` aggregate (1700-1703)
+  has no overall cap — a large batch produces an unbounded header.
+  Correct and in-range.
+- **Proposal 3 (low, correct, unhedged):** a non-array `tasks` value
+  (`tasks` JSON key present but not an array) makes `count` 0 and
+  `labels` empty, rendering the silent-looking `Agent(x0: )` instead of
+  an explicit invalid-payload marker like `command_exec`'s fallback at
+  line 1662. Correct, in-range, correctly unhedged.
+- **Proposal 4 (info, correct, correctly HEDGED):** `agent_result`'s
+  `id` field uses `as_u64` (line 1708), which returns `None` for a JSON
+  float, silently degrading to `AgentResult(#?)`. DeepSeek explicitly
+  flags "I cannot verify the callers from this range alone" — the
+  textbook-correct hedge for a claim whose real-world likelihood depends
+  on unread caller behavior.
+
+**Grade: A.** Matches cycles 7 and 8 as a fully flawless cycle: perfect
+process, perfect citations (quotes and labels), correctly calibrated
+hedging (hedged exactly the one claim resting on unread caller code,
+left the three purely in-range claims unhedged), and zero substantively
+wrong claims. No new kitsu weaknesses observed this cycle.
+
+**Ramp status:** process discipline now **11-for-11 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14); citation fidelity now **6-for-8 fully
+clean** (cycles 7, 8, 9, 11, 12, 14 clean; cycles 10 and 13 each showing
+one prior minor drift). DeepSeek continues to be a STRONG, reliable
+tiny-scope reviewer — still review-only until R4.10 (implementation
+type-chasing, per cycle 5, remains unaddressed). This is the third
+adjacent-function cycle in a row (11 `format_command_result`, 13
+`format_tool_result`, 14 `format_tool_header`) with no boundary bleed
+into neighboring functions, further confirming tight scoping holds even
+when review targets sit back-to-back in the file.
