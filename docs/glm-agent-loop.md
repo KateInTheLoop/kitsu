@@ -239,3 +239,33 @@ refill/invalidation replaces it wholesale — contract genuinely preserved.
 code).** Next code cycle: reinforce test-writing (prove the claim
 directly), a fresh P-item Kimi hasn't taken (P8 trim-buffer scaling, or
 P11 tool-schema re-serialization).
+
+### Cycle 4 — 2026-08-14 — P3 fast-fail (grade A) — TEST-RIGOR GAP CLOSED
+
+Implemented its own cycle-2 proposal P3: `build_body` now returns
+`Result<WireRequest, ProviderError>` and FAST-FAILS on a non-object tool
+`parameters` with an actionable message ("tool <name>: parameters must
+be a JSON Schema object") before serialization. Commit `05e469a` (Kate
+verified), pushed. Success on `:together` attempt 1, cap-1 held, no spawn.
+
+- **Caller ripple handled BY GLM itself:** it located the sole production
+  call site (`chat_stream_with_telemetry`) and changed `build_body(&req)`
+  → `build_body(&req)?` unprompted, and found the real split test module
+  (`openai_compat_tests.rs` via `#[path]`) the brief mis-pointed.
+- **THE HEADLINE — genuine tests, independently verified.** 3 tests
+  (non-object params → Err with exact message; valid object → Ok; no
+  tools → Ok). The supervisor reverted ONLY the impl and the crate
+  **fails to compile** against GLM's tests (expect_err doesn't exist once
+  build_body is infallible) — the tests are structurally inseparable from
+  the claim, the exact opposite of cycle 3's proxy tests. **The
+  test-rigor lesson landed on the first retry.**
+- Supervisor fixes were mechanical only (an unused import from GLM's
+  for-loop rewrite; added `Debug` to the 7 Wire* structs so expect_err
+  compiles) — not implementation bugs. kitsu-providers 67/67. 10 reads
+  (over the ~5 guidance, but for a disclosed reason: the split test file).
+
+**GLM is now 2-for-2 A on reviews AND 2-for-2 on code (B→A, test rigor
+fixed). It has fully reached Kimi-level contribution — reviews AND
+tested code.** Next: alternate — a fresh REVIEW of a new area (build its
+portfolio, avoid Kimi's P9/P11) then implement from it; e.g. review the
+SSE/streaming parse + error-recovery path in openai_compat.rs.
