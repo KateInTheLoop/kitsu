@@ -3,8 +3,8 @@
 //! append results → repeat until the model stops or a cap is hit.
 
 use crate::context::{
-    clamp_window_for_shortfall, estimate_str, message_tokens, ContextBudget, ContextMeter,
-    CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
+    clamp_max_tokens_to_reserve, clamp_window_for_shortfall, estimate_str, message_tokens,
+    ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
 };
 
 /// Detect mangled chat-template control tokens (e.g. Kimi's `<|close|>`,
@@ -1547,6 +1547,23 @@ where
         } else {
             None
         };
+
+        // P9: the budget promised `effective = window - reserve`, so the reply
+        // the provider is told it may send must be bounded by that same clamped
+        // reserve. Clamp down only: a smaller caller-supplied max_tokens is left
+        // alone, and None stays None (no artificial cap is invented).
+        let max_tokens = match cfg.context_window {
+            Some(window) => {
+                let budget = ContextBudget::new(
+                    effective_budget_window(window, *window_evidence),
+                    cfg.max_tokens,
+                );
+                clamp_max_tokens_to_reserve(cfg.max_tokens, &budget)
+            }
+            // No resolved window: no budget to clamp against; send as-is.
+            None => cfg.max_tokens,
+        };
+
         let req = ChatRequest {
             model: cfg.model.clone(),
             messages: messages.clone(),
@@ -1554,7 +1571,7 @@ where
             stream: cfg.stream,
             temperature: cfg.temperature,
             reasoning_effort: cfg.reasoning_effort,
-            max_tokens: cfg.max_tokens,
+            max_tokens,
             response_format,
             prompt_cache_key: None,
         };
