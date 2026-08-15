@@ -259,6 +259,9 @@ guarantees requires a new schema identifier.
   conversation transcript. If the live inventory is empty, its compatibility
   text points archived-session recovery to `/restore <exact-id>`; archived
   snapshots cannot be resumed directly.
+  The typed `help` result's command objects carry `name`, `syntax`,
+  `description`, and nullable `alias_of`; aliases identify their canonical
+  command without requiring consumers to parse the compatibility `text`.
   Failed commands instead emit a typed `error` before `command_finished`.
   Unknown slash commands retain Kitsu's host-authored recovery in `message`:
   either the bounded closest-command suggestion or `(try /help)`. The message

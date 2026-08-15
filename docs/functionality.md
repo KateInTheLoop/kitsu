@@ -107,6 +107,10 @@ The implemented chat controls include:
 - Session lifecycle: `/new`, `/resume`, `/fork`, `/export`, `/archive`,
   `/restore`, and `/delete`.
 
+JSONL `/help` exposes the same complete command registry as human help. Every
+command object includes `alias_of`: the canonical command name for aliases such
+as `/agents` and `/quit`, or `null` for canonical commands.
+
 `/status` reports the active session, endpoint, model, directory/Git state,
 project-context source, context usage, tool and permission state, command roots,
 background agents, cumulative compaction savings, and the last compaction
