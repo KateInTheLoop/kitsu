@@ -10844,6 +10844,60 @@ fn test_unknown_script_command_is_echoed_suggested_and_nonzero() {
         .stderr(predicate::str::contains("typo.txt:1"));
 }
 
+#[test]
+fn test_jsonl_unknown_script_commands_keep_actionable_host_hints() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("jsonl-typos.txt");
+    fs::write(&script_path, "/statsu\n/definitely-not-a-command-123456\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run JSONL typo script");
+    assert_eq!(output.status.code(), Some(1), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let errors = events
+        .iter()
+        .filter(|event| event["type"] == "error")
+        .collect::<Vec<_>>();
+    assert_eq!(errors.len(), 2, "{events:#?}");
+    assert_eq!(errors[0]["line"], 1);
+    assert_eq!(errors[0]["command"], "/statsu");
+    assert_eq!(
+        errors[0]["message"],
+        "unknown command: /statsu - did you mean /status?"
+    );
+    assert_eq!(errors[1]["line"], 2);
+    assert_eq!(errors[1]["command"], "/definitely-not-a-command-123456");
+    assert_eq!(
+        errors[1]["message"],
+        "unknown command: /definitely-not-a-command-123456 (try /help)"
+    );
+    assert!(errors
+        .iter()
+        .all(|error| error["kind"] == "user" && error["exit_code"] == 1));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["failures"], 2);
+    assert_eq!(summary["user_failures"], 2);
+}
+
 /// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is
 /// intercepted with a close-match suggestion and an escape hatch, instead of
 /// being silently queued as a prompt.

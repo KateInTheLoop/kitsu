@@ -876,7 +876,9 @@ script is never mislabeled as having completed a model turn.
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
 output, typed errors, and exactly one `final_summary`. Human stderr is not needed
-to determine the outcome. The final summary includes `duration_ms`, measured
+to determine the outcome. Unknown scripted slash commands keep the safe
+host-authored closest-command or `/help` hint in their typed error message.
+The final summary includes `duration_ms`, measured
 monotonically from process entry through summary emission, on success, error,
 and cancellation. Its `*_failures` fields count failed turns/operations, while
 `tool_errors`/`policy_errors` count individual calls and the corresponding
