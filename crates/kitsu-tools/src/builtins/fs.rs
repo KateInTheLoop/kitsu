@@ -1484,6 +1484,427 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
     Ok(format!("{disclosure}{body}"))
 }
 
+// --- fs.find_symbol (heuristic symbol navigation) ---------------------------
+
+/// Never scan more than this many files in one call (bounds a huge tree).
+const SYMBOL_MAX_FILES: usize = 5000;
+/// Stop after scanning this many total bytes across all files (disclosed).
+const SYMBOL_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Read at most this many bytes from any single file (bounds memory).
+const SYMBOL_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Definition sites shown — there are rarely many; references are the long list.
+const SYMBOL_MAX_DEFS_SHOWN: usize = 50;
+/// Reference lines shown by default and at most.
+const SYMBOL_DEFAULT_MAX_REFS: usize = 100;
+const SYMBOL_MAX_REFS_CEILING: usize = 1000;
+/// Reject absurdly long "symbols" — they are identifiers.
+const SYMBOL_MAX_LEN: usize = 128;
+/// Per-line display cap so one very long line cannot blow the output budget.
+const SYMBOL_LINE_DISPLAY_CAP: usize = 400;
+
+/// Directory names never descended into during a symbol walk.
+const SYMBOL_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+];
+
+/// A keyword that, appearing immediately before a whole-word occurrence of the
+/// symbol, marks that line as a *definition* site rather than a use. Kept
+/// language-agnostic: Rust/Go/JS/TS/Python/Java/Kotlin/C-family forms.
+const SYMBOL_DEF_KEYWORDS: &[&str] = &[
+    "fn",
+    "func",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "interface",
+    "impl",
+    "mod",
+    "module",
+    "namespace",
+    "package",
+    "union",
+    "const",
+    "static",
+    "let",
+    "var",
+    "val",
+    "function",
+];
+
+#[derive(Deserialize)]
+struct FindSymbolArgs {
+    /// The identifier to locate.
+    symbol: String,
+    /// File or directory to search (must be allowed). A directory is walked
+    /// recursively; a single file is scanned alone.
+    path: String,
+    /// Reference lines shown (default 100, max 1000). Definitions always shown.
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_results: Option<usize>,
+}
+
+#[derive(Default)]
+struct SymbolScanBudget {
+    files: usize,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct SymbolHits {
+    defs: Vec<(String, usize, String)>,
+    refs: Vec<(String, usize, String)>,
+    total_defs: usize,
+    total_refs: usize,
+    files_scanned: usize,
+    skipped_unreadable: usize,
+    files_capped: bool,
+}
+
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// True when `c` is a word boundary for identifier matching (a non-identifier
+/// char, or the start/end of the line).
+fn is_boundary(c: Option<char>) -> bool {
+    match c {
+        Some(ch) => !is_symbol_char(ch),
+        None => true,
+    }
+}
+
+/// Does `line` contain `symbol` as a whole word (not a fragment of a larger
+/// identifier)? `symbol` is assumed non-empty.
+fn line_mentions_symbol(line: &str, symbol: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(symbol) {
+        let start = from + rel;
+        let end = start + symbol.len();
+        if is_boundary(line[..start].chars().next_back()) && is_boundary(line[end..].chars().next())
+        {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The maximal identifier tokens of a line, in order.
+fn identifier_tokens(line: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, c) in line.char_indices() {
+        if is_symbol_char(c) {
+            start.get_or_insert(idx);
+        } else if let Some(s) = start.take() {
+            tokens.push(&line[s..idx]);
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&line[s..]);
+    }
+    tokens
+}
+
+/// Heuristic: is this line a *definition* of `symbol`? True when a definition
+/// keyword immediately precedes a whole-word occurrence (incl. `let mut <sym>`).
+fn is_definition_line(line: &str, symbol: &str) -> bool {
+    let tokens = identifier_tokens(line);
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok != symbol || i == 0 {
+            continue;
+        }
+        let prev = tokens[i - 1];
+        if SYMBOL_DEF_KEYWORDS.contains(&prev) {
+            return true;
+        }
+        // `let mut <sym>` / `var mut <sym>` — skip the mutability qualifier.
+        if prev == "mut" && i >= 2 && matches!(tokens[i - 2], "let" | "var") {
+            return true;
+        }
+    }
+    false
+}
+
+fn truncate_symbol_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() > SYMBOL_LINE_DISPLAY_CAP {
+        let cut: String = trimmed.chars().take(SYMBOL_LINE_DISPLAY_CAP).collect();
+        format!("{cut}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+pub fn find_symbol_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "find_symbol".to_string(),
+        description: "Locate where an identifier is DEFINED and USED without a full grep sweep. \
+                      Recursively scans an allowed file or directory (skipping VCS/build dirs and \
+                      binary files) and returns definition sites (fn/struct/class/def/type/const/\
+                      let …) first, then references, each as path:line. A heuristic textual scan — \
+                      no language server or index required, so it works anywhere and degrades to an \
+                      honest 'not found' when the symbol is absent."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Identifier to locate (letters, digits, underscore)"},
+                "path": {"type": "string", "description": "Allowed file or directory to search (directories are walked recursively)"},
+                "max_results": {"type": "integer", "description": "Max reference lines shown (optional, default 100, max 1000); definitions are always shown"}
+            },
+            "required": ["symbol", "path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { find_symbol_run(policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn find_symbol_run(policy: Arc<Permissions>, args: &str) -> Result<String, ToolError> {
+    let a: FindSymbolArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let symbol = a.symbol.trim().to_string();
+    if symbol.is_empty() {
+        return Err(ToolError::InvalidArgs("symbol must not be empty".into()));
+    }
+    if symbol.chars().count() > SYMBOL_MAX_LEN {
+        return Err(ToolError::InvalidArgs(format!(
+            "symbol too long (max {SYMBOL_MAX_LEN} chars)"
+        )));
+    }
+    if !symbol.chars().all(is_symbol_char) {
+        return Err(ToolError::InvalidArgs(
+            "symbol must be an identifier (letters, digits, underscore)".into(),
+        ));
+    }
+    let refs_cap = a
+        .max_results
+        .unwrap_or(SYMBOL_DEFAULT_MAX_REFS)
+        .clamp(1, SYMBOL_MAX_REFS_CEILING);
+    // Authorizes the root (file or dir), enforces protected-path denial, and
+    // pins the canonical path under an allowed read root.
+    let canon = policy.check_read(Path::new(&a.path)).await?;
+    let policy2 = policy.clone();
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        find_symbol_blocking(&policy2, &canon, &display, &symbol, refs_cap)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("find_symbol failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn find_symbol_blocking(
+    policy: &Permissions,
+    root: &Path,
+    display: &str,
+    symbol: &str,
+    refs_cap: usize,
+) -> std::io::Result<String> {
+    let meta = std::fs::symlink_metadata(root)?;
+    let mut hits = SymbolHits::default();
+    let mut budget = SymbolScanBudget::default();
+    if meta.is_file() {
+        scan_one_file(
+            policy,
+            root,
+            root,
+            display,
+            &mut hits,
+            symbol,
+            refs_cap,
+            &mut budget,
+        );
+    } else if meta.is_dir() {
+        // Iterative DFS; entries sorted so output is deterministic.
+        let mut stack = vec![root.to_path_buf()];
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(reader) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut paths: Vec<PathBuf> = reader.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            for path in paths {
+                if budget.files >= SYMBOL_MAX_FILES || budget.bytes >= SYMBOL_MAX_TOTAL_BYTES {
+                    hits.files_capped = true;
+                    break 'walk;
+                }
+                let Ok(entry_meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                // Never follow symlinks — keeps the walk inside the authorized root.
+                if entry_meta.file_type().is_symlink() {
+                    continue;
+                }
+                if entry_meta.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with('.') || SYMBOL_SKIP_DIRS.contains(&name) {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if entry_meta.is_file() {
+                    scan_one_file(
+                        policy,
+                        root,
+                        &path,
+                        display,
+                        &mut hits,
+                        symbol,
+                        refs_cap,
+                        &mut budget,
+                    );
+                }
+            }
+        }
+    } else {
+        return Err(std::io::Error::other(
+            "find_symbol target is not a file or directory",
+        ));
+    }
+    Ok(render_symbol_hits(display, symbol, &hits))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_one_file(
+    policy: &Permissions,
+    root: &Path,
+    path: &Path,
+    display: &str,
+    hits: &mut SymbolHits,
+    symbol: &str,
+    refs_cap: usize,
+    budget: &mut SymbolScanBudget,
+) {
+    if policy.is_read_protected(path) {
+        return;
+    }
+    let Ok(file) = open_read_file(path) else {
+        hits.skipped_unreadable += 1;
+        return;
+    };
+    let mut buf = Vec::new();
+    if Read::take(file, SYMBOL_MAX_FILE_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        hits.skipped_unreadable += 1;
+        return;
+    }
+    // Count the IO we actually performed, so the walk budget bounds real work.
+    budget.files += 1;
+    budget.bytes += buf.len() as u64;
+    let Ok(text) = std::str::from_utf8(&buf) else {
+        // Binary (or invalid UTF-8) file — not a source text; skip honestly.
+        hits.skipped_unreadable += 1;
+        return;
+    };
+    hits.files_scanned += 1;
+    let rel = if path == root {
+        display.to_string()
+    } else {
+        path.strip_prefix(root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    };
+    for (idx, line) in text.lines().enumerate() {
+        if !line_mentions_symbol(line, symbol) {
+            continue;
+        }
+        let line_no = idx + 1;
+        if is_definition_line(line, symbol) {
+            hits.total_defs += 1;
+            if hits.defs.len() < SYMBOL_MAX_DEFS_SHOWN {
+                hits.defs
+                    .push((rel.clone(), line_no, truncate_symbol_line(line)));
+            }
+        } else {
+            hits.total_refs += 1;
+            if hits.refs.len() < refs_cap {
+                hits.refs
+                    .push((rel.clone(), line_no, truncate_symbol_line(line)));
+            }
+        }
+    }
+}
+
+fn render_symbol_hits(display: &str, symbol: &str, hits: &SymbolHits) -> String {
+    let capped_note = if hits.files_capped {
+        format!(
+            ", stopped at the {}-file / {} MiB scan cap",
+            SYMBOL_MAX_FILES,
+            SYMBOL_MAX_TOTAL_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let skip_note = if hits.skipped_unreadable > 0 {
+        format!(", {} binary/unreadable skipped", hits.skipped_unreadable)
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "find_symbol> \"{symbol}\" in {display} — {} definition(s), {} reference(s) \
+         [heuristic text scan; not a semantic index] (scanned {} file(s){capped_note}{skip_note})\n",
+        hits.total_defs, hits.total_refs, hits.files_scanned
+    );
+    if hits.total_defs == 0 && hits.total_refs == 0 {
+        out.push_str(&format!(
+            "(no definitions or usages of \"{symbol}\" found)\n"
+        ));
+        return out;
+    }
+    if hits.defs.is_empty() {
+        out.push_str(
+            "definitions: (none found here — may be defined elsewhere, imported, or built-in)\n",
+        );
+    } else {
+        out.push_str("definitions:\n");
+        for (p, n, t) in &hits.defs {
+            out.push_str(&format!("  {p}:{n}: {t}\n"));
+        }
+        if hits.total_defs > hits.defs.len() {
+            out.push_str(&format!(
+                "  [showing {} of {} definitions]\n",
+                hits.defs.len(),
+                hits.total_defs
+            ));
+        }
+    }
+    if !hits.refs.is_empty() {
+        out.push_str("references:\n");
+        for (p, n, t) in &hits.refs {
+            out.push_str(&format!("  {p}:{n}: {t}\n"));
+        }
+        if hits.total_refs > hits.refs.len() {
+            out.push_str(&format!(
+                "  [showing {} of {} references; raise max_results for more]\n",
+                hits.refs.len(),
+                hits.total_refs
+            ));
+        }
+    }
+    out
+}
+
 // --- fs.scan_file (bounded log tail / grep) ---------------------------------
 
 const SCAN_DEFAULT_TAIL_LINES: usize = 200;
@@ -5394,6 +5815,116 @@ mod tests {
             read_image_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn symbol_whole_word_matching() {
+        assert!(line_mentions_symbol("let foo = 1;", "foo"));
+        assert!(line_mentions_symbol("a.foo()", "foo"));
+        assert!(line_mentions_symbol("foo", "foo"));
+        // Fragments of a larger identifier are NOT whole-word matches.
+        assert!(!line_mentions_symbol("foobar", "foo"));
+        assert!(!line_mentions_symbol("barfoo", "foo"));
+        assert!(!line_mentions_symbol("foo_bar", "foo"));
+        assert!(!line_mentions_symbol("nothing here", "foo"));
+    }
+
+    #[test]
+    fn symbol_definition_classification() {
+        // Definition forms across languages.
+        assert!(is_definition_line("fn parse(input: &str) {", "parse"));
+        assert!(is_definition_line("    pub struct Config {", "Config"));
+        assert!(is_definition_line("def parse(self):", "parse"));
+        assert!(is_definition_line("class Config:", "Config"));
+        assert!(is_definition_line("let count = 0;", "count"));
+        assert!(is_definition_line("let mut total = 0;", "total"));
+        assert!(is_definition_line("type Alias = u32;", "Alias"));
+        // Uses are NOT definitions.
+        assert!(!is_definition_line("self.parse();", "parse"));
+        assert!(!is_definition_line("use crate::parse;", "parse"));
+        assert!(!is_definition_line("return parse(x)", "parse"));
+        assert!(!is_definition_line("let n = count + 1;", "count"));
+    }
+
+    #[test]
+    fn symbol_render_reports_not_found_cleanly() {
+        let hits = SymbolHits::default();
+        let out = render_symbol_hits("src", "missing", &hits);
+        assert!(out.contains("0 definition(s), 0 reference(s)"), "{out}");
+        assert!(out.contains("no definitions or usages"), "{out}");
+        assert!(out.contains("heuristic text scan"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn find_symbol_locates_definition_and_references_across_a_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(&[root], &[]).expect("perms"));
+
+        // A small "repo": a definition in one file, two uses in a nested file.
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn widget() -> u32 { 42 }\nfn other() {}\n",
+        )
+        .unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join("main.rs"),
+            "fn main() {\n    let n = widget();\n    println!(\"{}\", widget());\n}\n",
+        )
+        .unwrap();
+        // A binary file must be skipped honestly, not garbled.
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        // A build dir must not be descended (else its generated def is counted).
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("gen.rs"), "fn widget() { /* generated */ }\n").unwrap();
+
+        let out = find_symbol_run(
+            policy.clone(),
+            &serde_json::json!({"symbol": "widget", "path": dir.path().to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("find ok");
+
+        assert!(out.contains("definitions:"), "{out}");
+        assert!(out.contains("lib.rs:1"), "def site: {out}");
+        assert!(out.contains("references:"), "{out}");
+        assert!(
+            out.contains("1 definition(s), 2 reference(s)"),
+            "counts: {out}"
+        );
+        // The build dir was skipped: the generated def is NOT counted.
+        assert!(!out.contains("gen.rs"), "should skip build dirs: {out}");
+        // The binary blob was skipped and disclosed.
+        assert!(
+            out.contains("binary/unreadable skipped"),
+            "binary disclosure: {out}"
+        );
+
+        // Degrades cleanly for an absent symbol.
+        let out = find_symbol_run(
+            policy.clone(),
+            &serde_json::json!({"symbol": "nonexistent", "path": dir.path().to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("find ok");
+        assert!(out.contains("no definitions or usages"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            find_symbol_run(
+                policy,
+                &serde_json::json!({"symbol": "widget", "path": other.path().to_string_lossy()})
+                    .to_string(),
             )
             .await,
             Err(ToolError::PolicyDenied(_))
