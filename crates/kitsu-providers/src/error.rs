@@ -69,6 +69,9 @@ pub enum AuthError {
 
     #[error("auth error: token in ${env} is malformed")]
     Malformed { env: String },
+
+    #[error("auth error: managed credential is malformed")]
+    MalformedManaged,
 }
 
 /// Best-effort token expiry status. Never fatal on its own (per design §3:

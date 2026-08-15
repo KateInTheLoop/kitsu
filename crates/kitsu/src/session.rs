@@ -27,6 +27,15 @@ const LOCKS_DIR_NAME: &str = ".locks";
 const ARTIFACTS_SUFFIX: &str = ".artifacts";
 static SESSION_SEQUENCE: AtomicU64 = AtomicU64::new(0);
 
+#[cfg(test)]
+thread_local! {
+    /// Deterministic lease failure for reset atomicity tests. Thread-local
+    /// state keeps parallel session tests isolated from one another.
+    static FAIL_NEXT_SESSION_LEASE: std::cell::Cell<bool> = const {
+        std::cell::Cell::new(false)
+    };
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SavedSession {
     pub version: u32,
@@ -43,6 +52,15 @@ pub struct SavedSession {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub project_context: Option<String>,
     pub messages: Vec<ChatMessage>,
+}
+
+/// Exact lineage returned by a successful durable-session fork. Selectors such
+/// as `last` are resolved before cloning so callers can report the immutable
+/// source identity alongside the new snapshot.
+#[derive(Debug, Clone)]
+pub struct SessionFork {
+    pub source_session_id: String,
+    pub session: SavedSession,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize)]
@@ -119,6 +137,23 @@ impl std::fmt::Display for SnapshotSaveError {
 }
 
 impl std::error::Error for SnapshotSaveError {}
+
+/// Failure while installing a user-requested, host-owned output file. The
+/// destination normally remains unchanged on failure; `installed` is true only
+/// when the atomic rename completed and a later durability sync failed.
+#[derive(Debug)]
+pub(crate) struct OutputFileWriteError {
+    message: String,
+    pub(crate) installed: bool,
+}
+
+impl std::fmt::Display for OutputFileWriteError {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for OutputFileWriteError {}
 
 /// A process-wide/session-wide exclusion lease. Lock files remain in place so
 /// dropping one lease can never unlink the inode while another process is
@@ -1231,6 +1266,10 @@ impl SessionLease {
         if !valid_id(id) {
             return Err("cannot lease a session with an invalid id".to_string());
         }
+        #[cfg(test)]
+        if FAIL_NEXT_SESSION_LEASE.with(|failure| failure.replace(false)) {
+            return Err("injected session lease failure".to_string());
+        }
         let locks_dir = dir.prepare_child(OsStr::new(LOCKS_DIR_NAME), "session lock")?;
         let lock_name = format!("{id}.lock");
         let lock_path = locks_dir.path.join(&lock_name);
@@ -1729,6 +1768,111 @@ fn atomic_write_private_in_detailed(
     }
 }
 
+/// Validate a future last-message destination without creating or replacing
+/// anything. Parent components are opened without following symlinks on Unix;
+/// an existing destination must be a regular file.
+pub(crate) fn validate_output_file_target(target: &Path) -> Result<(), String> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().ok_or_else(|| {
+        format!(
+            "--output-last-message destination '{}' has no filename",
+            target.display()
+        )
+    })?;
+    let directory = PrivateDirectory::open(parent, "output-last-message")?;
+    match directory.entry_kind(name) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Ok(PrivateEntryKind::File) => Ok(()),
+        Ok(_) => Err(format!(
+            "--output-last-message destination '{}' is not a regular file",
+            target.display()
+        )),
+        Err(error) => Err(format!(
+            "cannot inspect --output-last-message destination '{}': {error}",
+            target.display()
+        )),
+    }
+}
+
+/// Replace one user-selected output file atomically with the exact assistant
+/// bytes. The same-directory temporary file is mode 0600 on Unix, synced before
+/// a descriptor-relative rename, and the pinned parent directory is synced
+/// afterward. No model tool participates in this write.
+pub(crate) fn atomic_write_output_file(
+    target: &Path,
+    bytes: &[u8],
+) -> Result<(), OutputFileWriteError> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target.file_name().ok_or_else(|| OutputFileWriteError {
+        message: format!(
+            "--output-last-message destination '{}' has no filename",
+            target.display()
+        ),
+        installed: false,
+    })?;
+    let directory = PrivateDirectory::open(parent, "output-last-message").map_err(|message| {
+        OutputFileWriteError {
+            message,
+            installed: false,
+        }
+    })?;
+    atomic_write_private_in_detailed(&directory, name, bytes, true, "output-last-message")
+        .map(|_| ())
+        .map_err(|failure| OutputFileWriteError {
+            message: failure.message,
+            installed: failure.installed,
+        })
+}
+
+/// Read one small host-selected input through the same descriptor-pinned,
+/// no-symlink path discipline used by private state. This does not grant the
+/// model any filesystem authority over the source file.
+pub(crate) fn read_bounded_host_file(
+    target: &Path,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    let parent = target
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let name = target
+        .file_name()
+        .ok_or_else(|| format!("{context} path '{}' has no filename", target.display()))?;
+    let directory = PrivateDirectory::open(parent, context)?;
+    let file = directory.open_regular_file(name, context)?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect {context} file '{}': {error}",
+            target.display()
+        )
+    })?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{context} file '{}' is {} bytes; limit is {max_bytes}",
+            target.display(),
+            metadata.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {context} file '{}': {error}", target.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{context} file '{}' grew beyond the {max_bytes} byte limit while it was read",
+            target.display()
+        ));
+    }
+    Ok(bytes)
+}
+
 impl PrivateDirectory {
     fn remove_file(&self, name: &OsStr) -> std::io::Result<()> {
         #[cfg(unix)]
@@ -1741,6 +1885,149 @@ impl PrivateDirectory {
             std::fs::remove_file(self.path.join(name))
         }
     }
+}
+
+/// Read one bounded owner-private value from a protected namespace below the
+/// config-scoped state directory. Credential code uses this narrow wrapper so
+/// it inherits the session store's descriptor-relative no-follow traversal
+/// without exposing path-based secret I/O.
+pub(crate) fn read_private_value(
+    state_dir: &Path,
+    namespace: &OsStr,
+    name: &OsStr,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Option<Vec<u8>>, String> {
+    let Some(state) = PrivateDirectory::open_optional(state_dir, context)? else {
+        return Ok(None);
+    };
+    let Some(directory) = state.open_optional_child(namespace, context)? else {
+        return Ok(None);
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::{MetadataExt, PermissionsExt};
+        let metadata = directory.file.metadata().map_err(|error| {
+            format!(
+                "cannot inspect {context} directory '{}': {error}",
+                directory.path.display()
+            )
+        })?;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.permissions().mode() & 0o077 != 0
+        {
+            return Err(format!(
+                "{context} directory '{}' is not owner-only",
+                directory.path.display()
+            ));
+        }
+    }
+    let path = directory.path.join(name);
+    let kind = match directory.entry_kind(name) {
+        Ok(kind) => kind,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect {context} '{}': {error}",
+                path.display()
+            ))
+        }
+    };
+    if kind != PrivateEntryKind::File {
+        return Err(format!(
+            "{context} '{}' is not a private regular file",
+            path.display()
+        ));
+    }
+
+    #[cfg(unix)]
+    let file = openat_file(
+        &directory.file,
+        name,
+        libc::O_RDONLY | libc::O_NOFOLLOW | libc::O_NONBLOCK | libc::O_CLOEXEC,
+        0,
+    )
+    .map_err(|error| format!("cannot open {context} '{}': {error}", path.display()))?;
+    #[cfg(not(unix))]
+    let file = std::fs::OpenOptions::new()
+        .read(true)
+        .open(&path)
+        .map_err(|error| format!("cannot open {context} '{}': {error}", path.display()))?;
+
+    let metadata = file
+        .metadata()
+        .map_err(|error| format!("cannot inspect {context} '{}': {error}", path.display()))?;
+    if !metadata.is_file() || metadata.len() > max_bytes {
+        return Err(format!(
+            "{context} '{}' is not a bounded regular file",
+            path.display()
+        ));
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::MetadataExt;
+        if metadata.uid() != unsafe { libc::geteuid() }
+            || metadata.nlink() != 1
+            || metadata.mode() & 0o077 != 0
+        {
+            return Err(format!(
+                "{context} '{}' is not an owner-only single-link file",
+                path.display()
+            ));
+        }
+    }
+    let mut bytes = zeroize::Zeroizing::new(Vec::with_capacity(
+        usize::try_from(metadata.len()).unwrap_or(0),
+    ));
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {context} '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{context} exceeds its safety limit"));
+    }
+    Ok(Some(std::mem::take(&mut *bytes)))
+}
+
+/// Atomically replace one bounded owner-private value beneath the config state
+/// directory. The final file is `0600` and every traversed/created directory is
+/// opened without following symlinks.
+pub(crate) fn write_private_value(
+    state_dir: &Path,
+    namespace: &OsStr,
+    name: &OsStr,
+    bytes: &[u8],
+    max_bytes: u64,
+    context: &str,
+) -> Result<(), String> {
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!("{context} exceeds its safety limit"));
+    }
+    let state = PrivateDirectory::prepare(state_dir, context)?;
+    let directory = state.prepare_child(namespace, context)?;
+    atomic_write_private_in_detailed(&directory, name, bytes, true, context)
+        .map(|_| ())
+        .map_err(|failure| failure.message)
+}
+
+/// Remove one validated private value. Missing state/value is an idempotent
+/// success; an unsafe leaf is refused rather than followed or silently hidden.
+pub(crate) fn remove_private_value(
+    state_dir: &Path,
+    namespace: &OsStr,
+    name: &OsStr,
+    max_bytes: u64,
+    context: &str,
+) -> Result<bool, String> {
+    if read_private_value(state_dir, namespace, name, max_bytes, context)?.is_none() {
+        return Ok(false);
+    }
+    let state = PrivateDirectory::open(state_dir, context)?;
+    let directory = state.open_child(namespace, context)?;
+    directory
+        .remove_file(name)
+        .map_err(|error| format!("cannot remove {context}: {error}"))?;
+    directory.sync(context)?;
+    Ok(true)
 }
 
 fn encode_saved(saved: &SavedSession) -> Result<Vec<u8>, String> {
@@ -2012,6 +2299,9 @@ impl SessionStore {
         let lease = SessionLease::acquire(&self.directory, &id)?;
         self.id = id;
         self.created_at = now();
+        // Names are unique resume selectors for one saved conversation. A
+        // fresh boundary must never make two sessions claim the same name.
+        self.name = None;
         self.lease = lease;
         Ok(())
     }
@@ -2099,8 +2389,10 @@ impl SessionStore {
     /// data is copied; permission grants live outside `SavedSession` and are
     /// therefore deliberately absent from the fork. Offloaded tool evidence is
     /// copied into the new session's sidecar and message pointers are rewritten
-    /// to that independent copy.
-    pub fn fork(dir: &Path, selector: &str) -> Result<SavedSession, String> {
+    /// to that independent copy. The exact source identity resolved from
+    /// `selector` is retained for user-facing and machine-readable lineage
+    /// receipts.
+    pub fn fork_with_source(dir: &Path, selector: &str) -> Result<SessionFork, String> {
         let directory = open_session_directory(dir)?;
         let mut forked = if selector == "last" || selector.is_empty() {
             let id = preferred_last_id(&list_in(&directory)?, None).ok_or_else(|| {
@@ -2112,6 +2404,7 @@ impl SessionStore {
         } else {
             return Err(format!("invalid session id '{selector}'"));
         };
+        let source_session_id = forked.id.clone();
         let source_artifacts_name = artifacts_name(&forked.id);
         let source_artifacts_path = directory.path.join(&source_artifacts_name);
         let source_artifacts = directory
@@ -2127,6 +2420,10 @@ impl SessionStore {
 
         let timestamp = now();
         forked.id = fresh_id();
+        // Names are unique resume selectors, not transcript metadata. Keeping
+        // the source name on a second snapshot makes `--resume <name>`
+        // ambiguous immediately after a successful fork.
+        forked.name = None;
         forked.created_at = timestamp.clone();
         forked.updated_at = timestamp;
         let forked_artifacts_name = artifacts_name(&forked.id);
@@ -2167,7 +2464,10 @@ impl SessionStore {
                 &forked_snapshot_path,
             )
         })?;
-        Ok(forked)
+        Ok(SessionFork {
+            source_session_id,
+            session: forked,
+        })
     }
 
     /// Export a saved session without replacing an existing destination. When
@@ -2538,6 +2838,55 @@ mod tests {
                 "a private-directory sync failure is already queued"
             );
         });
+    }
+
+    #[test]
+    fn output_file_write_is_exact_atomic_and_replaces_only_a_regular_target() {
+        let root = tempfile::tempdir().unwrap();
+        let target = root.path().join("answer.txt");
+        std::fs::write(&target, "stale").unwrap();
+
+        validate_output_file_target(&target).unwrap();
+        atomic_write_output_file(&target, b"exact assistant bytes").unwrap();
+        assert_eq!(std::fs::read(&target).unwrap(), b"exact assistant bytes");
+        assert!(root.path().read_dir().unwrap().all(|entry| {
+            !entry
+                .unwrap()
+                .file_name()
+                .to_string_lossy()
+                .starts_with(".kitsu-")
+        }));
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(&target).unwrap().permissions().mode() & 0o777,
+                0o600
+            );
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn output_file_validation_rejects_symlinks_and_reports_post_install_sync_failure() {
+        use std::os::unix::fs::symlink;
+
+        let root = tempfile::tempdir().unwrap();
+        let outside = root.path().join("outside.txt");
+        std::fs::write(&outside, "outside").unwrap();
+        let linked = root.path().join("linked.txt");
+        symlink(&outside, &linked).unwrap();
+        assert!(validate_output_file_target(&linked)
+            .unwrap_err()
+            .contains("not a regular file"));
+        assert_eq!(std::fs::read_to_string(&outside).unwrap(), "outside");
+
+        let target = root.path().join("installed.txt");
+        inject_next_private_directory_sync_failure();
+        let error = atomic_write_output_file(&target, b"installed exactly").unwrap_err();
+        assert!(error.installed);
+        assert_eq!(std::fs::read(&target).unwrap(), b"installed exactly");
     }
 
     #[test]
@@ -2918,6 +3267,41 @@ mod tests {
         assert!(!outside_sessions.join(LOCKS_DIR_NAME).exists());
     }
 
+    #[test]
+    fn reset_is_atomic_on_lease_failure_and_starts_unnamed() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let mut store = SessionStore::create(dir.clone()).unwrap();
+        store.set_name(Some("named-source".to_string()));
+        let original_id = store.id().to_string();
+        store
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::user("durable before reset")],
+            )
+            .unwrap();
+
+        FAIL_NEXT_SESSION_LEASE.with(|failure| failure.set(true));
+        let error = store.reset().unwrap_err();
+        assert!(error.contains("injected session lease failure"));
+        assert_eq!(store.id(), original_id);
+        assert_eq!(store.name(), Some("named-source"));
+        assert_eq!(
+            SessionStore::load(&dir, &original_id)
+                .unwrap()
+                .name
+                .as_deref(),
+            Some("named-source")
+        );
+
+        store.reset().unwrap();
+        assert_ne!(store.id(), original_id);
+        assert_eq!(store.name(), None);
+    }
+
     #[cfg(unix)]
     #[test]
     fn lifecycle_operations_ignore_ancestor_swaps_after_pinning() {
@@ -3185,7 +3569,8 @@ mod tests {
     fn fork_uses_a_fresh_identity_and_preserves_snapshot_provenance() {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().join("sessions");
-        let source = SessionStore::create(dir.clone()).unwrap();
+        let mut source = SessionStore::create(dir.clone()).unwrap();
+        source.set_name(Some("named-source".to_string()));
         let project_context = root.path().join("KITSU.md");
         let messages = vec![
             ChatMessage::system("system provenance"),
@@ -3202,11 +3587,19 @@ mod tests {
             )
             .unwrap();
 
-        // Forking the current id is valid; permissions are not an input to or
-        // a field of the durable snapshot API.
-        let forked = SessionStore::fork(&dir, source.id()).unwrap();
+        // Forking `last` resolves the current source exactly; permissions are
+        // not an input to or a field of the durable snapshot API.
+        let source_id = source.id().to_string();
+        let receipt = SessionStore::fork_with_source(&dir, "last").unwrap();
+        assert_eq!(receipt.source_session_id, source_id);
+        let forked = receipt.session;
 
-        assert_ne!(forked.id, source.id());
+        assert_ne!(forked.id, source_id);
+        assert_eq!(forked.name, None);
+        assert_eq!(
+            SessionStore::load(&dir, "named-source").unwrap().id,
+            source.id()
+        );
         assert_eq!(forked.gateway, "gateway-a");
         assert_eq!(forked.model, "model-a");
         assert_eq!(forked.directory, root.path().display().to_string());
@@ -3266,7 +3659,9 @@ mod tests {
             .save(root.path(), "gateway", "model", None, &messages)
             .unwrap();
 
-        let forked = SessionStore::fork(&dir, source.id()).unwrap();
+        let forked = SessionStore::fork_with_source(&dir, source.id())
+            .unwrap()
+            .session;
         let forked_artifacts = dir.join(artifacts_name(&forked.id));
         let forked_file = forked_artifacts.join("nested").join("call-1.txt");
 
@@ -3747,7 +4142,7 @@ mod tests {
         let sidecar = dir.join(artifacts_name(&id));
         symlink(&outside, &sidecar).unwrap();
 
-        assert!(SessionStore::fork(&dir, &id).is_err());
+        assert!(SessionStore::fork_with_source(&dir, &id).is_err());
         assert!(SessionStore::export(
             &dir,
             &id,
@@ -3765,7 +4160,7 @@ mod tests {
         std::fs::remove_file(&sidecar).unwrap();
         std::fs::create_dir(&sidecar).unwrap();
         symlink(&sentinel, sidecar.join("linked.txt")).unwrap();
-        assert!(SessionStore::fork(&dir, &id).is_err());
+        assert!(SessionStore::fork_with_source(&dir, &id).is_err());
         assert!(SessionStore::export(
             &dir,
             &id,

@@ -19,7 +19,7 @@ use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::{ProviderError, ProviderResponsePart};
 use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use crate::telemetry::{ProviderAttemptCategory, ProviderAttemptOutcome, ProviderTelemetrySink};
-use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason};
+use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat};
 use crate::Provider;
 
 const CHAT_PATH: &str = "/v1/chat/completions";
@@ -78,6 +78,7 @@ fn simple_request() -> ChatRequest {
         temperature: Some(0.2),
         reasoning_effort: None,
         max_tokens: None,
+        response_format: None,
     }
 }
 
@@ -189,6 +190,59 @@ async fn test_gateway_chat_stream_ok() {
         finish,
         Some(FinishReason::Stop),
         "final delta should be Done(Stop)"
+    );
+}
+
+#[tokio::test]
+async fn test_gateway_forwards_strict_json_schema_response_format() {
+    let server = MockServer::start().await;
+    let captured: Arc<std::sync::Mutex<Option<serde_json::Value>>> =
+        Arc::new(std::sync::Mutex::new(None));
+    let observed = Arc::clone(&captured);
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |request: &wiremock::Request| {
+            *observed.lock().unwrap() = serde_json::from_slice(&request.body).ok();
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(sse_two_text_deltas())
+        })
+        .mount(&server)
+        .await;
+
+    let mut request = simple_request();
+    request.response_format = Some(JsonSchemaFormat {
+        name: "kitsu_output".to_string(),
+        strict: true,
+        schema: serde_json::json!({
+            "type": "object",
+            "properties": {"answer": {"type": "string"}},
+            "required": ["answer"],
+            "additionalProperties": false
+        }),
+    });
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let stream = provider
+        .chat_stream(request)
+        .await
+        .expect("structured request should reach the provider");
+    let _ = collect_stream(stream).await;
+
+    let body = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("request JSON should be captured");
+    assert_eq!(body["response_format"]["type"], "json_schema");
+    assert_eq!(
+        body["response_format"]["json_schema"]["name"],
+        "kitsu_output"
+    );
+    assert_eq!(body["response_format"]["json_schema"]["strict"], true);
+    assert_eq!(
+        body["response_format"]["json_schema"]["schema"]["properties"]["answer"]["type"],
+        "string"
     );
 }
 
@@ -1238,13 +1292,168 @@ async fn test_model_catalog_body_has_hard_ceiling() {
 
     let mut provider = provider_with_models(server.uri());
     provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
     assert!(matches!(
-        provider.list_models().await,
+        provider.list_models_with_telemetry(Some(sink)).await,
         Err(ProviderError::ResponseTooLarge {
             part: ProviderResponsePart::ModelCatalogBody,
             limit_bytes: MAX_MODEL_CATALOG_BODY_BYTES,
         })
     ));
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attempt, 1);
+    assert_eq!(events[0].max_attempts, 1);
+    assert_eq!(events[0].status, Some(200));
+    assert_eq!(
+        events[0].category,
+        ProviderAttemptCategory::ResponseTooLarge
+    );
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyFailed);
+    assert!(events[0].terminal);
+}
+
+#[tokio::test]
+async fn test_model_catalog_telemetry_reports_one_send_and_no_cache_attempt() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "cached-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+
+    for _ in 0..2 {
+        assert_eq!(
+            provider
+                .list_models_with_telemetry(Some(sink.clone()))
+                .await
+                .unwrap(),
+            Some(vec!["cached-model".to_string()])
+        );
+    }
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "the cache hit made no physical send");
+    assert_eq!(events[0].attempt, 1);
+    assert_eq!(events[0].max_attempts, 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::Success);
+    assert_eq!(events[0].status, Some(200));
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyCompleted);
+    assert!(events[0].terminal);
+}
+
+#[tokio::test]
+async fn test_model_catalog_telemetry_reports_http_rejection_without_body_details() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(503).set_body_string("secret catalog detail"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    assert!(matches!(
+        provider.list_models_with_telemetry(Some(sink)).await,
+        Err(ProviderError::Http { status: 503, .. })
+    ));
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].category, ProviderAttemptCategory::Unavailable);
+    assert_eq!(events[0].status, Some(503));
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::Rejected);
+    assert!(events[0].terminal);
+    let serialized = serde_json::to_string(&events[0]).unwrap();
+    assert!(!serialized.contains("secret catalog detail"));
+    assert!(!serialized.contains(&server.uri()));
+}
+
+#[tokio::test]
+async fn test_model_catalog_telemetry_reports_invalid_success_body_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string("{not valid json"))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    for _ in 0..2 {
+        assert!(matches!(
+            provider
+                .list_models_with_telemetry(Some(sink.clone()))
+                .await,
+            Err(ProviderError::InvalidResponse(_))
+        ));
+    }
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1, "the negative cache made no second send");
+    assert_eq!(events[0].category, ProviderAttemptCategory::InvalidResponse);
+    assert_eq!(events[0].status, Some(200));
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyFailed);
+    assert!(events[0].terminal);
+}
+
+#[tokio::test]
+async fn test_model_catalog_telemetry_closes_a_cancelled_send() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .set_body_json(serde_json::json!({"data": []})),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    let request =
+        tokio::spawn(async move { provider.list_models_with_telemetry(Some(sink)).await });
+    for _ in 0..100 {
+        if !server.received_requests().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert!(!server.received_requests().await.unwrap().is_empty());
+    request.abort();
+    assert!(request.await.unwrap_err().is_cancelled());
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attempt, 1);
+    assert_eq!(events[0].status, None);
+    assert_eq!(events[0].category, ProviderAttemptCategory::Cancelled);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::Cancelled);
+    assert!(events[0].terminal);
 }
 
 #[tokio::test]

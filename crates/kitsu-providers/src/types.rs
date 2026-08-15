@@ -93,6 +93,16 @@ pub struct ToolDescriptor {
     pub parameters: serde_json::Value,
 }
 
+/// OpenAI-compatible strict JSON Schema response format. Gateways receive this
+/// out-of-band from the conversation, so it constrains final assistant text
+/// without becoming a user-message prompt convention.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct JsonSchemaFormat {
+    pub name: String,
+    pub schema: serde_json::Value,
+    pub strict: bool,
+}
+
 /// A single chat request to a provider.
 #[derive(Debug, Clone)]
 pub struct ChatRequest {
@@ -106,6 +116,7 @@ pub struct ChatRequest {
     /// ignore it when omitted.
     pub reasoning_effort: Option<ReasoningEffort>,
     pub max_tokens: Option<u32>,
+    pub response_format: Option<JsonSchemaFormat>,
 }
 
 /// Common OpenAI-compatible reasoning-effort levels.

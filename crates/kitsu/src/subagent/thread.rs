@@ -464,6 +464,20 @@ impl AgentThreadState {
                 Some(*round),
                 &format!("{} request started", purpose_label(*purpose)),
             ),
+            AgentRuntimeEvent::StructuredFinalizationDeferred {
+                round,
+                repair_round,
+                targets,
+                ..
+            } => self.timeline.push(
+                AgentTimelineKind::Lifecycle,
+                Some(*round),
+                &format!(
+                    "structured finalization deferred; repair round {repair_round} for {} target{}",
+                    targets.len(),
+                    if targets.len() == 1 { "" } else { "s" }
+                ),
+            ),
             AgentRuntimeEvent::ProviderAttempt {
                 round,
                 attempt,
@@ -760,6 +774,7 @@ fn purpose_label(purpose: ProviderRequestPurpose) -> &'static str {
     match purpose {
         ProviderRequestPurpose::Inference => "inference",
         ProviderRequestPurpose::Compaction => "compaction",
+        ProviderRequestPurpose::ModelCatalog => "model catalog",
     }
 }
 
@@ -1082,6 +1097,10 @@ mod tests {
             success: true,
             cancelled: false,
             output: format!("file contained {secret}"),
+            output_bytes: 0,
+            output_retained_bytes: 0,
+            output_truncated: false,
+            artifact_status: kitsu_core::ToolArtifactStatus::NotNeeded,
             command: None,
         });
         state.record_runtime_event(&AgentRuntimeEvent::AssistantDelta {

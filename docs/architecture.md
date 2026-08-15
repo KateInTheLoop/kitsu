@@ -66,18 +66,27 @@ construction-time concern, not a trait concern.
 - The "profile" concept gives the user the `--gateway <name>` UX (one tool, many gateways)
   without coupling that selection to the provider taxonomy, and keeps existing Phase 1/2 work intact.
 
-### Trait shape (reuses design.md §5.1, no signature change)
+### Trait shape
 
 ```rust
 // kitsu-providers
 pub trait Provider {
     async fn healthcheck(&self) -> Result<(), ProviderError>;
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError>;
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError>;
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError>;
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError>;
 }
 ```
 
-`OpenAICompatProvider` gains construction-time fields (not new trait methods):
+`OpenAICompatProvider` uses these construction-time fields:
 
 ```rust
 pub struct OpenAICompatProvider {
@@ -97,8 +106,11 @@ pub struct OpenAICompatProvider {
 
 A new `[gateways.<name>]` set of named profiles, plus a top-level `default_gateway`. This sits
 alongside the existing `[provider]` config (which stays for the local-first Ollama/vLLM default).
-`--gateway <name>` selects a profile; when set, it supplies `base_url`, `model`, `flavor`,
-endpoint, and auth, overriding `[provider]`.
+Gateway precedence is explicit `--gateway`, then `KITSU_GATEWAY`, then
+`default_gateway`. Model precedence is explicit `--model`, then `KITSU_MODEL`,
+then the selected profile's model; interactive `/model` may replace that
+effective model for later turns. A selected profile supplies `base_url`, model,
+flavor, endpoint, and auth.
 
 ```toml
 # ~/.kitsu/config.toml
@@ -146,8 +158,10 @@ auth         = { method = "bearer-env", env = "MISTRAL_API_KEY" }
 
 `auth.method` is one of:
 
-- `"bearer-env"` — read token from env var `auth.env` (default name `ANTHROPIC_AUTH_TOKEN`).
-  Sent as `Authorization: Bearer <token>` unless `auth.header`/`auth.scheme` override it.
+- `"bearer-env"` — use a non-empty token from `auth.env` (default name
+  `ANTHROPIC_AUTH_TOKEN`), otherwise the config-scoped managed credential
+  installed by `kitsu auth login`. Sent as `Authorization: Bearer <token>`
+  unless `auth.header`/`auth.scheme` override it.
   Optional `auth.expires_env` (default `ANTHROPIC_TOKEN_EXPIRES`) and `auth.refresh_hint`.
 - `"static"` — `auth.token = "..."` inline. **Discouraged**; loader emits a warning and the
   value is redacted in `--print-config`. Never recommended for the example JWT.
@@ -164,8 +178,10 @@ auth         = { method = "bearer-env", env = "MISTRAL_API_KEY" }
   `config error: unknown gateway 'foo' — defined gateways: example, anthropic, openai, mistral`
 - `flavor` not in {`openai`, `anthropic`, `ollama`} → exit 1.
 - `base_url` must be absolute `https://` (warn, not error, on plain `http://`).
-- `model` resolution order: `--model` flag > `gateways.<name>.model` > error
-  (`provider.model is required — set it with --model <name>`), consistent with Gap 3.
+- `model` resolution order: `--model` flag > `KITSU_MODEL` >
+  `gateways.<name>.model` > error
+  (`provider.model is required — pass --model <name>, set KITSU_MODEL, or
+  configure the gateway model`), consistent with Gap 3.
 - `auth.token` (static) is **redacted** as `"***"` in `--print-config`; env-based tokens are
   never read at config-print time.
 
@@ -231,8 +247,11 @@ call. `kitsu doctor` shows gateway name, base_url, masked token presence
 
 ### Security invariants
 
-- Token read from env at request time only; never persisted, never written to the audit log
-  (`design.md` §7.3 — redact `Authorization`), never in `--print-config`, never in `tracing`.
+- Environment credentials are read at request time. Managed credentials are
+  bounded owner-only files in config-scoped private state, atomically replaced,
+  never written to the repository, and never exposed to model tools or command
+  roots. Neither source is written to the audit log, `--json`, config output, or
+  tracing (`design.md` §7.3 — redact `Authorization`).
 - `--json` output and error messages must never echo the token; tests assert this (§7).
 
 ---
@@ -253,6 +272,10 @@ Request `POST {base_url}{chat_path}`:
     {"role": "tool",      "tool_call_id": "call_1", "content": "<json result>"}
   ],
   "tools": [ {"type":"function","function":{"name":"fs.read_file","parameters":{}}} ],
+  "response_format": {
+    "type": "json_schema",
+    "json_schema": {"name":"kitsu_output","strict":true,"schema":{}}
+  },
   "stream": true,
   "temperature": 0.2
 }
@@ -263,6 +286,10 @@ Internal `ChatMessage` (`design.md` §4.1) maps directly. Response (streaming SS
 `choices[].delta.content` → text fragments; `choices[].delta.tool_calls[]` (incremental, by index)
 → `ToolCall`; `choices[].finish_reason`: `stop`→`Stop`, `length`→`Length`, `tool_calls`→`ToolCalls`.
 Non-streaming fallback (`stream:false`) selected by `--no-stream`.
+`response_format` is omitted unless the caller supplied `--output-schema`.
+The orchestrator budgets its exact serialized bytes, while the CLI independently
+validates the final assistant text before commit; provider enforcement is a
+quality/control layer, never the only acceptance check.
 
 ### Anthropic-native flavor (post-MVP — documented for honesty)
 

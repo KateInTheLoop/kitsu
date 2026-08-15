@@ -123,6 +123,22 @@ struct WireRequest<'a> {
     reasoning_effort: Option<crate::ReasoningEffort>,
     #[serde(skip_serializing_if = "Option::is_none")]
     max_tokens: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    response_format: Option<WireResponseFormat<'a>>,
+}
+
+#[derive(Serialize)]
+struct WireResponseFormat<'a> {
+    #[serde(rename = "type")]
+    kind: &'static str,
+    json_schema: WireJsonSchema<'a>,
+}
+
+#[derive(Serialize)]
+struct WireJsonSchema<'a> {
+    name: &'a str,
+    strict: bool,
+    schema: &'a serde_json::Value,
 }
 
 #[derive(Serialize)]
@@ -236,6 +252,17 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         temperature: req.temperature,
         reasoning_effort: req.reasoning_effort,
         max_tokens: req.max_tokens,
+        response_format: req
+            .response_format
+            .as_ref()
+            .map(|format| WireResponseFormat {
+                kind: "json_schema",
+                json_schema: WireJsonSchema {
+                    name: &format.name,
+                    strict: format.strict,
+                    schema: &format.schema,
+                },
+            }),
     }
 }
 
@@ -1180,7 +1207,10 @@ impl OpenAICompatProvider {
     /// status and raw body text; callers decide how to interpret non-success
     /// statuses (`list_models` maps 401/403 to `Unauthorized` and anything else to
     /// `Http`; `model_context_length` is advisory and gives up on any error).
-    async fn get_models_response(&self) -> Result<(StatusCode, String), ProviderError> {
+    async fn get_models_response(
+        &self,
+        telemetry: Option<&ProviderTelemetrySink>,
+    ) -> Result<(StatusCode, String), ProviderError> {
         let path = self
             .models_path
             .as_deref()
@@ -1203,12 +1233,7 @@ impl OpenAICompatProvider {
             }
         }
 
-        let outcome = match self.fetch_models_response(&url).await {
-            Ok((status, text)) if status.is_success() => {
-                validate_models_catalog(&text).map(|()| (status, text))
-            }
-            other => other,
-        };
+        let outcome = self.fetch_models_response(&url, telemetry).await;
         let ttl = match &outcome {
             Ok((status, _)) if status.is_success() => Some(Self::MODELS_CACHE_TTL),
             Ok((status, _))
@@ -1234,23 +1259,94 @@ impl OpenAICompatProvider {
     async fn fetch_models_response(
         &self,
         url: &str,
+        telemetry: Option<&ProviderTelemetrySink>,
     ) -> Result<(StatusCode, String), ProviderError> {
+        let started = tokio::time::Instant::now();
+        let max_attempts = 1;
         let rb = self.http.get(url).timeout(self.discovery_timeout);
         let rb = self.attach_auth(rb)?;
-        let resp = rb.send().await.map_err(map_send_error)?;
+        let attempt_guard =
+            InFlightAttemptGuard::new(telemetry, 1, max_attempts, started, self.discovery_timeout);
+        let send_result = rb.send().await;
+        attempt_guard.completed();
+        let resp = match send_result {
+            Ok(response) => response,
+            Err(error) => {
+                record_attempt(
+                    telemetry,
+                    ProviderAttemptEvent {
+                        attempt: 1,
+                        max_attempts,
+                        category: if error.is_timeout() {
+                            ProviderAttemptCategory::Timeout
+                        } else {
+                            ProviderAttemptCategory::Connection
+                        },
+                        status: None,
+                        outcome: ProviderAttemptOutcome::TransportFailed,
+                        terminal: true,
+                        retry_delay_ms: None,
+                        retry_after_used: false,
+                        remaining_deadline_ms: remaining_deadline_millis(
+                            started,
+                            self.discovery_timeout,
+                        ),
+                    },
+                );
+                return Err(map_send_error(error));
+            }
+        };
         let status = resp.status();
+        let body_guard = status.is_success().then(|| {
+            ResponseBodyAttemptGuard::new(
+                telemetry,
+                1,
+                max_attempts,
+                status.as_u16(),
+                started,
+                self.discovery_timeout,
+            )
+        });
+        if !status.is_success() {
+            record_attempt(
+                telemetry,
+                ProviderAttemptEvent {
+                    attempt: 1,
+                    max_attempts,
+                    category: status_category(status),
+                    status: Some(status.as_u16()),
+                    outcome: ProviderAttemptOutcome::Rejected,
+                    terminal: true,
+                    retry_delay_ms: None,
+                    retry_after_used: false,
+                    remaining_deadline_ms: remaining_deadline_millis(
+                        started,
+                        self.discovery_timeout,
+                    ),
+                },
+            );
+        }
         // On a non-success status, tolerate a body-read failure so the caller
         // still gets the real status — the diagnostic body is best-effort, and
         // losing it must not also lose the status that made the request fail in
         // the first place. A body-read failure on success IS load-bearing (the
         // caller needs that body to parse the actual data), so it still errors.
         let text = if status.is_success() {
-            read_response_bounded(
+            match read_response_bounded(
                 resp,
                 ProviderResponsePart::ModelCatalogBody,
                 MAX_MODEL_CATALOG_BODY_BYTES,
             )
-            .await?
+            .await
+            {
+                Ok(text) => text,
+                Err(error) => {
+                    body_guard
+                        .expect("successful catalog response has a body guard")
+                        .failed(&error);
+                    return Err(error);
+                }
+            }
         } else {
             match read_response_bounded(resp, ProviderResponsePart::ErrorBody, MAX_ERROR_BODY_BYTES)
                 .await
@@ -1260,6 +1356,17 @@ impl OpenAICompatProvider {
                 Err(_) => String::new(),
             }
         };
+        if status.is_success() {
+            if let Err(error) = validate_models_catalog(&text) {
+                body_guard
+                    .expect("successful catalog response has a body guard")
+                    .failed(&error);
+                return Err(error);
+            }
+            body_guard
+                .expect("successful catalog response has a body guard")
+                .completed();
+        }
         Ok((status, text))
     }
 
@@ -1271,7 +1378,7 @@ impl OpenAICompatProvider {
     pub async fn model_context_length(&self, model: &str) -> Option<u64> {
         // get_models_response already errors when models_path is unset/empty;
         // `.ok()?` turns that into the same `None` a redundant check here would.
-        let (status, text) = self.get_models_response().await.ok()?;
+        let (status, text) = self.get_models_response(None).await.ok()?;
         if !status.is_success() {
             return None;
         }
@@ -1655,6 +1762,13 @@ impl Provider for OpenAICompatProvider {
     }
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        self.list_models_with_telemetry(None).await
+    }
+
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
         if self
             .models_path
             .as_deref()
@@ -1663,7 +1777,7 @@ impl Provider for OpenAICompatProvider {
         {
             return Ok(None);
         }
-        let (status, text) = self.get_models_response().await?;
+        let (status, text) = self.get_models_response(telemetry.as_ref()).await?;
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(ProviderError::Unauthorized {
                 status: status.as_u16(),

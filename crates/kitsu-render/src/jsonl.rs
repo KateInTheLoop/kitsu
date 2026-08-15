@@ -313,6 +313,83 @@ mod tests {
         assert!(defs["command_execution_result"].is_object());
         assert!(defs["command_result"]["allOf"].is_array());
         assert_eq!(
+            defs["model_catalog_identity"]["properties"]["operation_id"]["pattern"],
+            "^models:[1-9][0-9]*$"
+        );
+        assert!(
+            defs["provider_request"]["allOf"][2]["properties"]["purpose"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|purpose| purpose == "model_catalog")
+        );
+        assert_eq!(
+            defs["provider_request"]["allOf"][2]["properties"]["model"]["type"],
+            "string"
+        );
+        assert!(
+            defs["provider_attempt"]["allOf"][2]["properties"]["purpose"]["enum"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|purpose| purpose == "model_catalog")
+        );
+        assert_eq!(
+            defs["review_disclosure"]["allOf"][1]["properties"]["source"]["const"],
+            "top_level_review"
+        );
+        assert_eq!(
+            defs["output_last_message"]["allOf"][2]["properties"]["assistant_committed"]["const"],
+            true
+        );
+        assert_eq!(
+            defs["output_last_message"]["allOf"][2]["properties"]["model_write_authority"]["const"],
+            false
+        );
+        assert_eq!(
+            defs["structured_finalization_deferred"]["allOf"][2]["properties"]["cause"]["const"],
+            "required_write_sha256_mismatch"
+        );
+        assert_eq!(
+            defs["structured_finalization_deferred"]["allOf"][2]["properties"]["targets"]["items"]
+                ["properties"]["actual_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            defs["structured_finalization_deferred"]["allOf"][2]["properties"]
+                ["write_authority_granted"]["const"],
+            false
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["properties"]["diagnostic_code"]["enum"][0],
+            "local_ollama_unreachable"
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["dependentRequired"]["diagnostic_code"][0],
+            "recovery_actions"
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["properties"]["recovery_actions"]["items"]["enum"],
+            serde_json::json!([
+                "start_ollama_serve",
+                "verify_ollama_serve",
+                "select_another_gateway"
+            ])
+        );
+        assert_eq!(
+            defs["error"]["allOf"][1]["properties"]["schema_sha256"]["pattern"],
+            "^[0-9a-f]{64}$"
+        );
+        assert_eq!(
+            defs["final_summary"]["allOf"][1]["properties"]["output_schema_failures"]["minimum"],
+            0
+        );
+        assert!(!defs["final_summary"]["allOf"][1]["required"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|field| field == "output_schema_failures"));
+        assert_eq!(
             defs["tool_finished"]["allOf"][2]["properties"]["command"]["$ref"],
             "#/$defs/command_execution_result"
         );
@@ -320,6 +397,24 @@ mod tests {
             source.matches("    \"command_result\": {").count(),
             1,
             "duplicate JSON object keys silently replace an earlier schema definition"
+        );
+
+        let summary = &defs["final_summary"]["allOf"][1];
+        assert_eq!(
+            summary["properties"]["session_snapshot_state"]["enum"],
+            serde_json::json!(["disabled", "pending_until_first_success", "resumable"])
+        );
+        assert_eq!(
+            summary["properties"]["session_id"]["type"],
+            serde_json::json!(["string", "null"])
+        );
+        assert!(
+            !summary["required"]
+                .as_array()
+                .expect("final summary required fields")
+                .iter()
+                .any(|field| field == "session_snapshot_state"),
+            "additive v1 fields must not invalidate historical summaries"
         );
 
         let exclusions = defs["forward_compatible_event"]["allOf"][1]["properties"]["type"]["not"]
@@ -331,6 +426,24 @@ mod tests {
                 .iter()
                 .any(|value| value.as_str() == Some("command_result")),
             "a known command_result must not also match the forward-compatible branch"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|value| value.as_str() == Some("review_disclosure")),
+            "a known review_disclosure must not also match the forward-compatible branch"
+        );
+        assert!(
+            exclusions
+                .iter()
+                .any(|value| value.as_str() == Some("output_last_message")),
+            "a known output_last_message must not also match the forward-compatible branch"
+        );
+        assert!(
+            exclusions.iter().any(|value| {
+                value.as_str() == Some("structured_finalization_deferred")
+            }),
+            "a known structured-finalization deferral must not also match the forward-compatible branch"
         );
     }
 }
