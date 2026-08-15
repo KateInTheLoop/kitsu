@@ -127,3 +127,42 @@ help next cycle.
   `reasoning_tokens` near the cap is a silent-truncation footgun — kitsu
   should emit a warning ("output budget consumed entirely by hidden
   reasoning; raise --max-output-tokens or lower --reasoning-effort").
+
+### Cycle 2 — 2026-08-14 — FAILED to ship (no deliverable)
+
+Fresh review target (orchestrator trim/summarize path) with a mandatory
+re-read-before-cite discipline added to fix cycle-1's citation drift.
+**Both kitsu attempts died before writing `reviews/deepseek-cycle-2.md`,
+so the citation-discipline hypothesis is still untested.** Commit
+`7ae4723` records the failure log only.
+
+- Attempt 1: DeepSeek tried to spawn 6 parallel read subagents against
+  `--agent-spawn-cap 0`, was denied, retried spawning, kitsu withheld
+  spawn tools for the rest of the turn — then the very next provider call
+  returned a terminal `HTTP 400` and killed the turn.
+- Retry: no spawns, but it ignored "named ranges only / write early" —
+  35 reads, near-full-file passes over the 2957-line file, never called
+  write, hit the 300s timeout, turn correctly discarded (no usage
+  billed). Per the one-retry rule, no third attempt.
+- Grade: incomplete/F on this cycle's own terms (failure to ship, not a
+  bad review). DeepSeek's over-reading + spawn-happiness are the ramp
+  gaps to fix next.
+
+**kitsu weaknesses filed (backlog):**
+- W3 (**real bug, promoted to roadmap R4.8**): after kitsu withholds
+  spawn tools mid-turn following repeated `--agent-spawn-cap 0` refusals,
+  the next provider request in the same turn is rejected `HTTP 400` —
+  a request-shape break from the mid-turn tool-list mutation. `cap 0`
+  should mean spawn tools are never advertised, not advertised-then-
+  withheld. This affects the Kimi loop too (same flag).
+- W4: no mid-turn nudge when a model burns many rounds without ever
+  calling write, despite an explicit "write early" instruction.
+- W5: timeout-discard is correct but lets an over-reading model burn the
+  whole cycle with zero salvageable output.
+
+**Ramp status:** cycle 1 banked (B), cycle 2 failed to ship. Next cycle:
+keep the review-lane task but (a) explicitly forbid spawns in prose AND
+keep cap 0 only once R4.8 is fixed — until then, drop to
+`--agent-spawn-cap 1` for DeepSeek so a stray spawn attempt degrades
+instead of crashing; (b) hard-cap reads ("read at most these N ranges,
+then you MUST write") to curb over-reading.
