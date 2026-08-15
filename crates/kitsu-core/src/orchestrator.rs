@@ -1666,7 +1666,12 @@ where
                     if request_history_reshaped {
                         meter.invalidate();
                     } else {
-                        meter.record(u.prompt_tokens, messages, request_constraints_present);
+                        meter.record(
+                            u.prompt_tokens,
+                            messages,
+                            request_constraints_present,
+                            &schema_json,
+                        );
                     }
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
@@ -2801,7 +2806,7 @@ fn request_measurement(
         // Add schemas only if that exact anchored request did not already carry
         // them. Any mutation of covered messages invalidates the anchor first.
         let used = meter.estimate(messages)
-            + if meter.anchor_includes_schema(messages) {
+            + if meter.anchor_includes_schema(messages, schema_json) {
                 0
             } else {
                 schema_tokens

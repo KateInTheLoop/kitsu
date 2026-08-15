@@ -117,12 +117,12 @@ impl ContextBreakdown {
 pub struct ContextMeter {
     /// `(prompt_tokens, number of leading messages that request covered, whether
     /// that request carried tool and/or response schema constraints, fingerprint
-    /// of those leading messages)`. The constraint flag prevents a schema-free
-    /// request from covering later schema overhead; callers still invalidate
-    /// the anchor when one non-empty constraint set replaces another. The
-    /// fingerprint detects in-place edits inside the anchored prefix that keep
-    /// the message count unchanged.
-    anchor: Option<(u64, usize, bool, u64)>,
+    /// of those leading messages, fingerprint of the serialized constraints)`.
+    /// The constraint flag prevents a schema-free request from covering later
+    /// schema overhead. The schema fingerprint detects a changed tool registry
+    /// or response schema, while the message fingerprint detects in-place edits
+    /// inside the anchored prefix that keep the message count unchanged.
+    anchor: Option<(u64, usize, bool, u64, u64)>,
     /// Telemetry: how many times [`Self::estimate`] rejected a recorded anchor
     /// as implausible (outside the wide 0.4x–2.5x band around the anchor-free
     /// full estimate) and fell back to a full recompute. Advisory only; a
@@ -173,6 +173,19 @@ fn prefix_fingerprint(messages: &[ChatMessage]) -> u64 {
     h.finish()
 }
 
+/// Cheap content-identity fingerprint of the serialized tool-schema JSON, for
+/// the anchor's schema-coverage check. Unlike [`prefix_fingerprint`] this DOES
+/// hash the string bytes: schema JSON is built once per turn and is small
+/// (kilobytes), so a full `DefaultHasher` pass over it is still near-free,
+/// while a length-only fingerprint would miss the common real-world change of
+/// swapping one same-sized tool description for another. A 2^-64 collision
+/// risk is acceptable for the same reason as the prefix fingerprint.
+pub fn schema_fingerprint(schema_json: &str) -> u64 {
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    schema_json.hash(&mut h);
+    h.finish()
+}
+
 impl ContextMeter {
     pub fn new() -> Self {
         Self::default()
@@ -180,16 +193,24 @@ impl ContextMeter {
 
     /// Record the authoritative `prompt_tokens` from a response, for a request
     /// that sent exactly `messages` and — per `had_schema` — did or didn't
-    /// include tool or response schemas that round. Replace one non-empty
-    /// constraint set with another only after [`Self::invalidate`]. Also
-    /// fingerprint `messages` so later in-place prefix edits are not silently
-    /// trusted.
-    pub fn record(&mut self, prompt_tokens: u64, messages: &[ChatMessage], had_schema: bool) {
+    /// include tool or response schemas that round. `schema_json` is the
+    /// serialized constraint set that request carried (pass `""` when
+    /// `had_schema` is false). Only its fingerprint is stored, so later schema
+    /// changes are detected and re-estimated. The message prefix is
+    /// fingerprinted as well.
+    pub fn record(
+        &mut self,
+        prompt_tokens: u64,
+        messages: &[ChatMessage],
+        had_schema: bool,
+        schema_json: &str,
+    ) {
         self.anchor = Some((
             prompt_tokens,
             messages.len(),
             had_schema,
             prefix_fingerprint(messages),
+            schema_fingerprint(schema_json),
         ));
     }
 
@@ -219,7 +240,7 @@ impl ContextMeter {
     pub fn estimate(&self, messages: &[ChatMessage]) -> u64 {
         let full: u64 = messages.iter().map(message_tokens).sum();
         match self.anchor {
-            Some((tokens, sent_len, _, fingerprint))
+            Some((tokens, sent_len, _, fingerprint, _))
                 if sent_len <= messages.len()
                     && prefix_fingerprint(&messages[..sent_len]) == fingerprint =>
             {
@@ -244,23 +265,21 @@ impl ContextMeter {
     /// True when [`Self::estimate`] would use the real-usage anchor (rather than
     /// a full chars/token re-tokenize) for `messages`.
     pub fn anchored(&self, messages: &[ChatMessage]) -> bool {
-        matches!(self.anchor, Some((_, sent_len, _, fingerprint))
+        matches!(self.anchor, Some((_, sent_len, _, fingerprint, _))
             if sent_len <= messages.len()
                 && prefix_fingerprint(&messages[..sent_len]) == fingerprint)
     }
 
     /// True when the CURRENT anchor is valid for `messages` *and* the request
-    /// that produced it already included request-schema tokens. Callers that need
-    /// to add static overhead not reflected in a plain chars/token estimate
-    /// (tool/response schema tokens) should only skip doing so when this is
-    /// `true` — an anchor from a schema-less request does NOT cover that
-    /// overhead, so it must still be added
-    /// even though the meter is otherwise anchored.
-    pub fn anchor_includes_schema(&self, messages: &[ChatMessage]) -> bool {
-        matches!(self.anchor, Some((_, sent_len, had_schema, fingerprint))
+    /// that produced it already included the same serialized tool/response
+    /// constraints. A schema-free request or a request whose constraint set has
+    /// changed does not cover the current schema overhead.
+    pub fn anchor_includes_schema(&self, messages: &[ChatMessage], schema_json: &str) -> bool {
+        matches!(self.anchor, Some((_, sent_len, had_schema, fingerprint, schema_fp))
             if had_schema
                 && sent_len <= messages.len()
-                && prefix_fingerprint(&messages[..sent_len]) == fingerprint)
+                && prefix_fingerprint(&messages[..sent_len]) == fingerprint
+                && schema_fingerprint(schema_json) == schema_fp)
     }
 
     /// Per-role breakdown (pure estimate; ignores the usage anchor so callers can
@@ -357,6 +376,11 @@ mod tests {
         }
     }
 
+    /// Two distinct serialized tool-schema payloads for the P7 schema-
+    /// fingerprint tests (different tool sets, as after a registry change).
+    const SCHEMA_A: &str = r#"[{"name":"read_file","description":"read a file"}]"#;
+    const SCHEMA_B: &str = r#"[{"name":"read_file","description":"read a file"},{"name":"write_file","description":"write a file"}]"#;
+
     #[test]
     fn estimate_str_is_chars_over_four_rounded_up() {
         assert_eq!(estimate_str(""), 0);
@@ -379,7 +403,7 @@ mod tests {
         // (Anchor updated from 1000 to 20 for P5: 1000 is outside the 0.4x–2.5x
         // plausibility band of the ~18-token full estimate and would now be
         // rejected; 20 is a plausible anchor and exercises the same path.)
-        meter.record(20, &msgs, false);
+        meter.record(20, &msgs, false, "");
         // Append an 8-char user turn: +2 text tokens + 3 per-message overhead.
         msgs.push(msg(Role::User, "abcdefgh"));
         assert_eq!(meter.estimate(&msgs), 25);
@@ -394,7 +418,7 @@ mod tests {
             msg(Role::User, "abcd"),
             msg(Role::User, "abcd"),
         ];
-        meter.record(1000, &sent, false);
+        meter.record(1000, &sent, false, "");
         // ...but history was trimmed to 1 message: anchor no longer describes a
         // prefix, so estimate ignores it and estimates the whole set.
         let msgs = vec![msg(Role::User, "abcd")];
@@ -506,9 +530,9 @@ mod tests {
         // (Anchors updated from 100/200 to 6/12 for P5: the full estimate of
         // these two messages is 8, so 100/200 are outside the 0.4x–2.5x
         // plausibility band and would now be rejected; 6 and 12 are inside it.)
-        meter.record(6, &[msg(Role::System, "abcd")], false);
+        meter.record(6, &[msg(Role::System, "abcd")], false, "");
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(12, &msgs, false);
+        meter.record(12, &msgs, false, "");
         // Two messages, anchor covers both, no tail -> exactly the latest anchor.
         assert_eq!(meter.estimate(&msgs), 12);
     }
@@ -519,7 +543,7 @@ mod tests {
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
         // (Anchor updated from 500 to 12 for P5: 500 is outside the
         // 0.4x–2.5x band of the 8-token full estimate and would be rejected.)
-        meter.record(12, &msgs, false);
+        meter.record(12, &msgs, false, "");
         assert_eq!(meter.estimate(&msgs), 12);
     }
 
@@ -542,7 +566,7 @@ mod tests {
             msg(Role::User, "abcd"),
             msg(Role::User, "abcd"),
         ];
-        meter.record(1000, &sent, false);
+        meter.record(1000, &sent, false, "");
         meter.invalidate();
 
         // The conversation was reshaped (e.g. dropped/summarized) and then grew
@@ -577,13 +601,13 @@ mod tests {
     fn anchor_includes_schema_is_false_when_recorded_without_tools() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, &msgs, false); // that request had NO tools field
+        meter.record(500, &msgs, false, ""); // that request had NO tools field
         assert!(
             meter.anchored(&msgs),
             "sanity: anchor is structurally valid"
         );
         assert!(
-            !meter.anchor_includes_schema(&msgs),
+            !meter.anchor_includes_schema(&msgs, ""),
             "a schema-less anchor must not be reported as already covering schema tokens"
         );
     }
@@ -592,8 +616,54 @@ mod tests {
     fn anchor_includes_schema_is_true_when_recorded_with_tools() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, &msgs, true); // that request DID include tools
-        assert!(meter.anchor_includes_schema(&msgs));
+        meter.record(500, &msgs, true, SCHEMA_A); // that request DID include tools
+        assert!(meter.anchor_includes_schema(&msgs, SCHEMA_A));
+    }
+
+    /// P7(a): fast path preserved — recording with a schema and querying with
+    /// the SAME schema content must still report the anchor as covering the
+    /// schema tokens (no re-estimate on the normal, registry-unchanged flow).
+    #[test]
+    fn anchor_includes_schema_is_true_when_schema_unchanged() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, &msgs, true, SCHEMA_A);
+        assert!(
+            meter.anchor_includes_schema(&msgs, SCHEMA_A),
+            "an unchanged schema must keep the schema-covered fast path"
+        );
+    }
+
+    /// P7(b): the tool registry changed mid-session (tools toggled, subagent
+    /// profile switch) — the anchored request's schema differs from the
+    /// CURRENT schema_json, so the anchor must NOT be treated as covering the
+    /// new schema's tokens (they must be re-estimated).
+    #[test]
+    fn anchor_includes_schema_is_false_when_schema_changed() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, &msgs, true, SCHEMA_A);
+        assert!(
+            meter.anchored(&msgs),
+            "sanity: the message anchor itself is still valid"
+        );
+        assert!(
+            !meter.anchor_includes_schema(&msgs, SCHEMA_B),
+            "a changed tool registry must force schema re-estimation"
+        );
+    }
+
+    /// P7(c): a schema-less anchor stays schema-less regardless of the schema
+    /// fingerprint — the new field must not change the existing
+    /// had_schema=false behavior.
+    #[test]
+    fn anchor_includes_schema_is_false_without_schema_regardless_of_fingerprint() {
+        let mut meter = ContextMeter::new();
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
+        meter.record(500, &msgs, false, "");
+        assert!(!meter.anchor_includes_schema(&msgs, ""));
+        assert!(!meter.anchor_includes_schema(&msgs, SCHEMA_A));
+        assert!(!meter.anchor_includes_schema(&msgs, SCHEMA_B));
     }
 
     /// (a) Guards the anchor fast path itself: an UNCHANGED prefix (same
@@ -609,7 +679,7 @@ mod tests {
         ];
         // (Anchor updated from 1000 to 30 for P5: 1000 is outside the
         // 0.4x–2.5x band of the ~22-token full estimate and would be rejected.)
-        meter.record(30, &msgs, false);
+        meter.record(30, &msgs, false, "");
         msgs.push(msg(Role::User, "abcdefgh")); // identical prefix + 8-char tail (+2+3)
         assert!(meter.anchored(&msgs));
         assert_eq!(meter.estimate(&msgs), 35);
@@ -630,7 +700,7 @@ mod tests {
             msg(Role::User, "short"),
             msg(Role::User, "abcd"),
         ];
-        meter.record(1000, &sent, false);
+        meter.record(1000, &sent, false, "");
 
         // SAME count (3), but message [1] was rewritten in place.
         let edited = vec![
@@ -668,11 +738,11 @@ mod tests {
         ];
         // (Anchor updated from 800 to 40 for P5: 800 is outside the 0.4x–2.5x
         // band of the ~31-token full estimate and would now be rejected.)
-        meter.record(40, &msgs, true);
+        meter.record(40, &msgs, true, SCHEMA_A);
         msgs.push(msg(Role::Assistant, "abcdefgh")); // +2+3
         msgs.push(msg(Role::Tool, "abcd")); // +1+3
         assert!(meter.anchored(&msgs));
-        assert!(meter.anchor_includes_schema(&msgs));
+        assert!(meter.anchor_includes_schema(&msgs, SCHEMA_A));
         assert_eq!(meter.estimate(&msgs), 49);
     }
 
@@ -686,7 +756,7 @@ mod tests {
             msg(Role::User, "abcd"),                    // 1 + 3
         ];
         // Full estimate of the prefix is 17; 30 is well inside [6.8, 42.5].
-        meter.record(30, &msgs, false);
+        meter.record(30, &msgs, false, "");
         msgs.push(msg(Role::User, "abcdefgh")); // +2+3
         assert_eq!(meter.estimate(&msgs), 35, "plausible anchor must be used");
         assert_eq!(
@@ -711,7 +781,7 @@ mod tests {
 
         // Case 1: gateway reports 0 prompt tokens for real content.
         let mut meter = ContextMeter::new();
-        meter.record(0, &msgs, false);
+        meter.record(0, &msgs, false, "");
         assert_eq!(
             meter.estimate(&msgs),
             full,
@@ -727,7 +797,7 @@ mod tests {
 
         // Case 2: gateway reports ~100x the real content (aggregate usage).
         let mut meter = ContextMeter::new();
-        meter.record(100 * full, &msgs, false);
+        meter.record(100 * full, &msgs, false, "");
         assert_eq!(
             meter.estimate(&msgs),
             full,
@@ -750,7 +820,7 @@ mod tests {
 
         for anchor in [16_u64, 17, 100, 99] {
             let mut meter = ContextMeter::new();
-            meter.record(anchor, &msgs, false);
+            meter.record(anchor, &msgs, false, "");
             assert_eq!(
                 meter.estimate(&msgs),
                 anchor,
@@ -760,7 +830,7 @@ mod tests {
         }
         for anchor in [15_u64, 101] {
             let mut meter = ContextMeter::new();
-            meter.record(anchor, &msgs, false);
+            meter.record(anchor, &msgs, false, "");
             assert_eq!(
                 meter.estimate(&msgs),
                 full,
