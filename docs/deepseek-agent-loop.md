@@ -236,3 +236,37 @@ once the scope is single-function-tight. The path to contribution is
 narrow-scope tasks. Cycle 4: replicate on another ~60-line function
 (e.g. `ensure_chat_request_fits`) to confirm the pattern, then consider a
 tiny single-function IMPLEMENTATION task.
+
+### Cycle 4 — 2026-08-14 — REPLICATED, n=2 confirmed (grade A-)
+
+Same tiny-scope discipline on a different function (`ensure_chat_request_fits`
+— the supervisor caught that the assigned 2015-2077 range actually
+spanned into an unrelated `compact_context`; the real function is only
+2015-2034, so it corrected the scope to 2013-2034 to keep the
+single-function experiment honest). **Pattern replicated exactly: 1
+source read, wrote first attempt, zero over-reads, no spawn attempt.**
+kitsu-usage 27,081 / 4,684 / 31,765. Commit `fcfbbeb` (Kate verified),
+pushed.
+
+- Grade A-. 4 ranked proposals, **none substantively wrong** (an
+  improvement over cycle 3's one bad top proposal). Citation quoted TEXT
+  letter-perfect on every citation — but the line-number LABELS drifted
+  ~1 line throughout (cited 2013 vs actual 2014, 2019 vs 2020, etc.).
+- **New cross-model finding (candidate roadmap R1.7):** the ~1-line drift
+  is caused by `fs_read_file`'s ranged read (`read_capped_line_range`)
+  returning raw joined text with NO line-number prefixes — the model must
+  self-count from `start_line` and undercounted by one (the range's first
+  line was blank). This is why RANGED-read reviewers (DeepSeek) drift
+  while WHOLE-file reviewers (GLM, counting from line 1) don't. Prefixing
+  ranged reads with absolute line numbers (cat -n style) would likely
+  eliminate this drift class for every model — but carries an
+  edit-matching tradeoff (models may copy the prefix into `old_text`), so
+  it needs care.
+
+**Verdict CONFIRMED (n=2): tiny single-function scope is DeepSeek's
+reliable viability lever — 3-for-3 there, 3-for-7 overall.** Cycle 5 =
+DeepSeek's FIRST IMPLEMENTATION cycle: a tiny, self-contained
+single-function change with `--allow-write` on the crate. The journal-cap
+bug that blocked orchestrator.rs edits is FIXED on main (edit/write now
+use the 1 MiB write cap), so a fresh binary can edit it — but keep
+DeepSeek's first code target small and self-contained regardless.
