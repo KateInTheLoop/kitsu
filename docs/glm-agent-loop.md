@@ -1241,3 +1241,109 @@ live-reasoning slips about dependency internals (cycle 8's unhedged
 claim, cycle 9's mispredicted test-failure mode) is noted for the next
 review cycle to watch, not yet a downgrade since neither slip has
 touched a shipped artifact's correctness.
+
+### Cycle 10 — 2026-08-15 — fifth review, model-catalog parsing (grade A) — the hedging-slip pattern breaks
+
+Fresh review target per the alternation (cycle 9 was code): the PURE
+parse function `context_length_from_catalog` in
+`crates/kitsu-providers/src/openai_compat.rs` (lines 1348–1385, ~38
+lines, confirmed on disk before the run) — a models-catalog JSON
+extractor that resolves a model's advisory context length via
+exact-id/unique-loose-match/lone-entry fallback, then a fixed key
+precedence. Confirmed unreviewed: `reviews/` held only cycles 1, 2, 5,
+8 before this run. GLM was permitted to also glance at the
+`loosely_matches` helper (~1195) for context. Driver rebuilt fresh from
+main immediately before the run. Success on `:together` attempt 1 — no
+transport failure, no retry, no provider fallback, no spawn attempted
+(cap 1 unexercised).
+
+**Read discipline: 2 file reads** ("1 turn(s) ok, 2 file(s) read, 1
+file(s) written (1 change(s)), session not saved" — clean exit, no
+PolicyDenied, no discard), well under the ~5-read guidance and wrote
+early (`reviews/glm-cycle-10.md` was the sole write). One of the two
+reads evidently spanned slightly past the pinned range, since the
+review also precisely cites `get_models_response`'s doc comment at
+line 1219 — correctly flagged as incidental, out-of-scope context
+("context I happened to see"), not asserted as a verified fact.
+
+**Citation spot-check: every citation verified exact against the
+worktree source.** The full reproduced function block (lines
+1348–1385) matches the source verbatim line-for-line. The
+`loosely_matches` worked example is not just quoted but independently
+re-derived: GLM traced `loosely_matches("gpt-4-turbo", "gpt-4")`
+through the actual branch logic (`short`/`long` selection, `pos ==
+0` at line 1207, `long.as_bytes()[5] == '-'` at line 1209) to correctly
+show both `"gpt-4-turbo"` and `"gpt-4-mini"` loosely match `"gpt-4"`,
+making `(loose.next(), loose.next())` at line 1367 land on `(Some,
+Some)` — genuine reasoning, not paraphrase, and every line number
+(1195, 1207, 1209, 1367) checks out exactly. The incidental
+`get_models_response` line-1219 citation ("`model_context_length` is
+advisory and gives up on any error") also matches the source verbatim.
+No misquote, no wrong line number found anywhere in the review.
+
+**Four ranked, line-cited proposals, all technically sound:**
+
+1. **(highest) Lone-entry fallback binds a totally unrelated id.**
+   Line 1369's `_ => (entries.len() == 1).then(|| &entries[0])?` accepts
+   the sole catalog entry with zero regard for its id whenever the
+   loose-match iterator yields 0 or ≥2 hits — silently accepting a
+   worse match (no match at all) in the single-entry case than the
+   ambiguous-loose-match case the same function explicitly rejects one
+   branch earlier. Verified correct against the code; properly hedged
+   (did not read the caller, notes the branch may exist on purpose for
+   single-model local servers whose id doesn't string-match).
+2. **`as_u64` silently drops float/string-encoded windows.** Line 1379
+   only accepts `serde_json::Value::as_u64`, so a catalog emitting
+   `8192.0` or `"32768"` would silently fall through to `None`.
+   **Explicitly and correctly hedged this time**: "Per serde_json's
+   documented behavior (not verified here — I did not read
+   serde_json)..." — the exact discipline that slipped in cycles 8 and
+   9 (both unhedged/mispredicted claims about `HeaderValue` internals)
+   held cleanly here. Also hedges the caller-severity question via the
+   incidental `get_models_response` line-1219 doc comment, correctly
+   distinguishing "loses advisory info" from "mis-budgets."
+3. **(clarity, cosmetic) Double `loose.next()` idiom is correct but
+   opaque** — suggests naming the pattern or adding an inline comment;
+   no behavior change, honestly ranked lowest apart from proposal 4.
+4. **(minor) Exact-match `find` returns the first duplicate id** —
+   correctly notes this is almost certainly a non-issue (duplicate ids
+   are a server bug) and hedges the key-precedence-correctness claim
+   since it verified no real server's behavior.
+
+**Grade: A.** Tight scope discipline (2 reads, wrote early), a
+substantively strong finding (proposal 1 is a genuine, previously
+undetected correctness gap that inverts the function's own stated
+ambiguity policy), and — the headline of this cycle — **the two-cycle
+hedging-slip pattern from cycles 8/9 did not recur.** Where cycle 8 use
+an unhedged factual claim about unread `HeaderValue` internals and
+cycle 9 mispredicted its own tests' failure mode against the same
+dependency, this cycle's structurally identical opportunity (a claim
+about `serde_json::Value::as_u64`'s float/string behavior) was
+explicitly and correctly hedged as unverified. Also notable: the one
+piece of incidental out-of-scope material it picked up (the
+`get_models_response` doc line) was cited precisely and hedged rather
+than smuggled in as scope-verified fact — a positive sign for the
+hedging discipline generally, not just on the dependency-internals
+axis specifically.
+
+**GLM is now 5-for-5 A on reviews and 5-for-5 on code (10-for-10
+overall) — the model-catalog parsing path is the fifth distinct area
+reviewed (env/HTTP setup, an OpenAI-compat parse path, the SSE
+streaming path, auth.rs's header construction, now catalog parsing).**
+No new kitsu weaknesses filed (W1–W5 from prior cycles still open, none
+re-triggered — no recovered tool error, no discard, no PolicyDenied).
+Open candidates for future cycles: implement this cycle's proposal 1
+(the lone-entry-id gap) as the next code cycle — small, single-function,
+well-hedged, matches the proven pattern of implementing GLM's own
+graded-A findings; cycle-8 finding 2, cycle-5 findings 5/6, and P8/P11
+remain open; on the review side, `StaticAuth`/`NoAuth` `header()`
+impls, `expiry_status()`, `validate_models_catalog` (the function
+immediately below this cycle's target), and the retry/backoff paths
+remain unreviewed.
+
+**Ramp status:** GLM holds a perfect grade record across 10 cycles (5
+reviews, 5 code). Top-tier standing unchanged, and the dependency-
+internals hedging concern flagged after cycles 8/9 is now resolved
+rather than escalating — this cycle explicitly hedged the structurally
+identical claim it would have been natural to assert outright. No
+downgrade; the watch item is closed pending any recurrence.
