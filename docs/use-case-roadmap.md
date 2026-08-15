@@ -73,18 +73,17 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   **Validated in production 2026-08-14:** GLM edited the 63 KiB
   `openai_compat.rs` directly across 4 in-place edits with zero
   journal-limit errors (was one addition from the old wall).
-- R1.8 **Debris-detector false positive on Edit content** (found by the
-  Kimi loop, cycle 16): the template-control-debris scanner (added
-  cycle 30 to catch raw `<|...|>` markers leaking from a provider) also
-  fires on `fs_edit_file`/`fs_write_file` content that legitimately
-  CONTAINS such marker strings as data — e.g. editing kitsu's own
-  debris-detector code, or any file with template markers as string
-  literals — producing a spurious "content contains a raw model
-  chat-template control marker" warning 3× in Kimi cycle 16. *Accept:* the
-  debris scanner distinguishes markers in MODEL-GENERATED tail output
-  (its real target) from marker strings in file content the model is
-  intentionally writing/editing; editing a file that contains `<|...|>`
-  literals raises no false debris warning.
+- [x] (2026-08-14) R1.8 **Debris-detector false positive on Edit content**
+  (found by the Kimi loop, cycle 16) — FIXED (commit dad6882): the write/
+  edit content-quality heuristic (`content_quality_warning`) naively did
+  `content.contains(marker)`, so writing a file that lists the chat-template
+  tokens as quoted data (kitsu's own token table, debris-detector code)
+  spuriously warned. Made quote-aware: `has_unquoted_chat_template_marker`
+  flags a marker only when it is NOT immediately preceded by a `"`/`'` — a
+  raw leaked completion has bare markers, source code quotes them. Still
+  advisory (never blocks). Tests: quoted table + single-quoted → no warning;
+  bare marker still warns; e2e through write_file_run on the JSON warning
+  field.
 - [x] (2026-08-14) R1.7 **Line-number prefixes on ranged reads** — shipped
   (commit 51fc5cf): `read_capped_line_range` prefixes each served line with
   its absolute number + tab (`42\t<code>`), cap accounting included. The
@@ -331,6 +330,20 @@ requirements are met, note it here and move down the sequence.
 ## Cycle log
 
 (appended each cycle, newest last)
+
+### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
+
+Lane 3 is done for this loop (R3.1/R3.2/R3.3; R3.4 is the UI loop's).
+Advanced to lane 1 (code-assistant hardening) with R1.8 — a real
+false-positive Kimi hit editing files that contain chat-template markers
+as data. `content_quality_warning` now flags a marker only when it is
+UNQUOTED (a leaked completion is bare; source quotes it), via
+`has_unquoted_chat_template_marker`. Advisory, never blocks. 3 tests +
+an e2e through write_file_run (commit dad6882). Another dogfooding
+finding (Kimi cycle 16) fixed. Haiku review pending (key checks: loop
+advance / byte-boundary safety, still-advisory). Next lane-1: R1.3 symbol
+nav or R1.4 grouped edit receipts; or the high-value R4.10 (technical
+read cap, doubly-motivated by DeepSeek).
 
 ### Cycle 7 — 2026-08-14 — R3.3 verified done + R1.7 shipped (line-number prefixes)
 
