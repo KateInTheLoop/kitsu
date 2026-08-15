@@ -1072,6 +1072,156 @@ fn render_pdf(
     out
 }
 
+// --- fs.read_document (type-aware dispatch) ---------------------------------
+
+#[derive(Deserialize)]
+struct ReadDocumentArgs {
+    path: String,
+}
+
+/// The document class `read_document` detected, and how it will be handled.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DocType {
+    /// Delegated to `fs_read_csv`.
+    Csv,
+    /// Delegated to `fs_read_pdf`.
+    Pdf,
+    /// Delegated to the plain UTF-8 text read (`fs_read_file`).
+    Text,
+    /// Recognized image; no text to extract from a text tool.
+    Image(&'static str),
+    /// Zip-based Office document (xlsx/docx/pptx); no extractor yet.
+    Office(&'static str),
+}
+
+/// Detect the document class from magic bytes first (authoritative for binary
+/// formats), then fall back to the file extension (needed for CSV/TSV, which
+/// have no magic number). Unknown → `Text`, so the UTF-8-with-truncation
+/// behavior is preserved for anything unrecognized.
+fn detect_doc_type(path: &Path, magic: &[u8]) -> DocType {
+    // Magic numbers for binary formats we recognize.
+    if magic.starts_with(b"%PDF-") {
+        return DocType::Pdf;
+    }
+    if magic.starts_with(&[0x89, b'P', b'N', b'G']) {
+        return DocType::Image("PNG");
+    }
+    if magic.starts_with(&[0xFF, 0xD8, 0xFF]) {
+        return DocType::Image("JPEG");
+    }
+    if magic.starts_with(b"GIF87a") || magic.starts_with(b"GIF89a") {
+        return DocType::Image("GIF");
+    }
+    // RIFF....WEBP
+    if magic.len() >= 12 && magic.starts_with(b"RIFF") && &magic[8..12] == b"WEBP" {
+        return DocType::Image("WEBP");
+    }
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .map(|e| e.to_ascii_lowercase());
+    // Zip container: distinguish Office formats by extension.
+    if magic.starts_with(&[b'P', b'K', 0x03, 0x04]) {
+        return match ext.as_deref() {
+            Some("xlsx") => DocType::Office("XLSX"),
+            Some("docx") => DocType::Office("DOCX"),
+            Some("pptx") => DocType::Office("PPTX"),
+            _ => DocType::Office("ZIP-based"),
+        };
+    }
+    match ext.as_deref() {
+        Some("csv") | Some("tsv") => DocType::Csv,
+        Some("pdf") => DocType::Pdf, // extensionless-magic already handled above
+        // Extension-only image hints (e.g. a truncated header) still classify.
+        Some("png") => DocType::Image("PNG"),
+        Some("jpg") | Some("jpeg") => DocType::Image("JPEG"),
+        Some("gif") => DocType::Image("GIF"),
+        Some("webp") => DocType::Image("WEBP"),
+        Some("xlsx") => DocType::Office("XLSX"),
+        Some("docx") => DocType::Office("DOCX"),
+        Some("pptx") => DocType::Office("PPTX"),
+        _ => DocType::Text,
+    }
+}
+
+pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "read_document".to_string(),
+        description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
+                      to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
+                      → text. Always discloses the detected type and which reader ran. Images and \
+                      Office (xlsx/docx) files are detected and disclosed but not yet text-extracted \
+                      (use a dedicated tool or convert first). Unknown types fall back to a UTF-8 \
+                      text read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to read (any supported type)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_document_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadDocumentArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    // Authorize + sniff the first bytes for magic-number detection. This uses
+    // the same guard the delegated readers use, so no path escapes it.
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let mut magic = [0u8; 16];
+    let n = {
+        use std::io::Read as _;
+        let mut f = &file;
+        f.read(&mut magic).unwrap_or(0)
+    };
+    let doc_type = detect_doc_type(authorization.path(), &magic[..n]);
+
+    // Re-serialize just the path for the delegate readers (they re-authorize
+    // the same path — cheap and keeps a single guard implementation).
+    let path_args = serde_json::json!({ "path": a.path }).to_string();
+    let (label, body) = match doc_type {
+        DocType::Csv => (
+            "CSV/TSV → fs_read_csv",
+            read_csv_run(policy, &path_args).await?,
+        ),
+        DocType::Pdf => ("PDF → fs_read_pdf", read_pdf_run(policy, &path_args).await?),
+        DocType::Text => (
+            "text → fs_read_file",
+            read_file_run(policy, &path_args).await?,
+        ),
+        DocType::Image(fmt) => (
+            "image (no text extraction)",
+            format!(
+                "detected {fmt} image. This is a text-oriented reader — image content is not \
+                 extracted here; a vision-capable model/gateway is required to interpret the \
+                 picture."
+            ),
+        ),
+        DocType::Office(fmt) => (
+            "office (no extractor yet)",
+            format!(
+                "detected {fmt} (zip-based Office document). kitsu has no structured extractor \
+                 for this type yet — convert it to CSV/text first, or use a dedicated tool. Not \
+                 read as raw bytes to avoid emitting binary garbage."
+            ),
+        ),
+    };
+    let disclosure = format!("read_document> {}: {label}\n", a.path);
+    // The delegate readers already cap their own output; the disclosure line
+    // is a small fixed prefix, so no additional cap is needed here.
+    Ok(format!("{disclosure}{body}"))
+}
+
 // --- fs.list_dir ------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -3931,6 +4081,132 @@ mod tests {
         let mut buf = Vec::new();
         doc.save_to(&mut buf).expect("save pdf");
         buf
+    }
+
+    #[test]
+    fn doc_type_detection_prefers_magic_then_extension() {
+        use std::path::Path;
+        // Magic wins for binary formats.
+        assert_eq!(
+            detect_doc_type(Path::new("x.dat"), b"%PDF-1.7"),
+            DocType::Pdf
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("photo.bin"), &[0x89, b'P', b'N', b'G', 0, 0]),
+            DocType::Image("PNG")
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("j"), &[0xFF, 0xD8, 0xFF, 0xE0]),
+            DocType::Image("JPEG")
+        );
+        // Zip magic + extension distinguishes Office formats.
+        assert_eq!(
+            detect_doc_type(Path::new("book.xlsx"), &[b'P', b'K', 0x03, 0x04]),
+            DocType::Office("XLSX")
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("memo.docx"), &[b'P', b'K', 0x03, 0x04]),
+            DocType::Office("DOCX")
+        );
+        // Extension carries CSV/TSV (no magic number).
+        assert_eq!(
+            detect_doc_type(Path::new("data.csv"), b"a,b\n"),
+            DocType::Csv
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("data.tsv"), b"a\tb\n"),
+            DocType::Csv
+        );
+        // Unknown/plain → Text (UTF-8 fallback preserved).
+        assert_eq!(
+            detect_doc_type(Path::new("notes.md"), b"# hello"),
+            DocType::Text
+        );
+        assert_eq!(
+            detect_doc_type(Path::new("noext"), b"just words"),
+            DocType::Text
+        );
+    }
+
+    #[tokio::test]
+    async fn read_document_routes_csv_pdf_text_and_discloses() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+
+        // CSV → structured table.
+        let csv = dir.path().join("t.csv");
+        std::fs::write(&csv, "id,name\n1,Ada\n2,Grace\n").unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": csv.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("csv route");
+        assert!(out.contains("read_document>"), "disclosure: {out}");
+        assert!(out.contains("CSV/TSV → fs_read_csv"), "{out}");
+        assert!(out.contains("2 data rows"), "delegated body: {out}");
+
+        // Plain text → text read.
+        let txt = dir.path().join("notes.md");
+        std::fs::write(&txt, "line one\nline two\n").unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": txt.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("text route");
+        assert!(out.contains("text → fs_read_file"), "{out}");
+        assert!(out.contains("line one"), "{out}");
+
+        // PDF → text-layer extraction (build a real 1-page PDF).
+        let pdf = dir.path().join("doc.pdf");
+        std::fs::write(&pdf, build_pdf(&[Some("routed via read_document")])).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": pdf.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("pdf route");
+        assert!(out.contains("PDF → fs_read_pdf"), "{out}");
+        assert!(out.contains("routed via read_document"), "extracted: {out}");
+
+        // PNG magic → detected image, no extraction, no garbage.
+        let png = dir.path().join("pic.png");
+        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": png.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("png route");
+        assert!(out.contains("detected PNG image"), "{out}");
+        assert!(out.contains("not extracted"), "{out}");
+
+        // xlsx (zip magic + extension) → detected office, declined honestly.
+        let xlsx = dir.path().join("book.xlsx");
+        std::fs::write(&xlsx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": xlsx.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("xlsx route");
+        assert!(out.contains("detected XLSX"), "{out}");
+        assert!(out.contains("no structured extractor"), "{out}");
+
+        // Outside the allowlist → PolicyDenied before any routing.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.csv");
+        std::fs::write(&bad, "a,b\n1,2\n").unwrap();
+        assert!(matches!(
+            read_document_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
     }
 
     #[test]
