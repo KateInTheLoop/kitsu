@@ -104,15 +104,17 @@ impl EnvBearerAuth {
 
 impl AuthProvider for EnvBearerAuth {
     fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
-        // A non-empty environment value is authoritative. Non-Unicode input is
-        // malformed and must not silently fall back to a managed credential.
+        // A non-empty, trimmed environment value is authoritative. Non-Unicode
+        // input is malformed and must not silently fall back to a managed
+        // credential. Empty or whitespace-only input permits managed fallback.
         let environment_token = match std::env::var_os(&self.env) {
-            Some(value) if value.is_empty() => None,
-            Some(value) => Some(Zeroizing::new(value.into_string().map_err(|_| {
-                AuthError::Malformed {
+            Some(value) => {
+                let value = value.into_string().map_err(|_| AuthError::Malformed {
                     env: self.env.clone(),
-                }
-            })?)),
+                })?;
+                let value = value.trim();
+                (!value.is_empty()).then(|| Zeroizing::new(value.to_string()))
+            }
             None => None,
         };
         let (token, managed) = if let Some(token) = environment_token.as_ref() {
