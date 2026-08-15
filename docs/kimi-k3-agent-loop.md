@@ -422,12 +422,14 @@ held — zero spawn attempts.
   synthetic overflow — now correctly rejected by P5. Fixed by padding the
   fixture + a plausible-but-over-target anchor. Honest fix, not tolerance
   widening. kitsu-core 104/104.
-- **Flake escalating:** `kitsu-tools …read_file_caps_input_before_allocating_the_whole_file`
-  now reproduces **3/3 consecutive cycles** on the branch (stash-confirmed
-  pre-existing, unrelated to P5), yet passes on main's newer kitsu-tools.
-  No longer plausibly "just load-sensitive" — likely a real code
-  difference between the branch's older kitsu-tools and main. **Needs a
-  dedicated diff investigation** before the kimi branch is merge-ready.
+- **"Flake" root-caused and FIXED (commit 1bb6b81, Kate):** not a flake —
+  a stale test assertion. `read_file_caps_input_before_allocating_the_whole_file`
+  asserted the OLD truncation marker and a `+64` length bound, but the
+  branch's code already emits the cycle-31 served-of-total disclosure
+  (longer). The branch got the new disclosure code without the matching
+  test update; main had updated both. Mirrored main's assertion (substring
+  marker + new suffix + `+256` bound). The kimi branch's kitsu-tools test
+  target is now clean — merge-blocker removed. Unrelated to any Kimi cycle.
 
 **Backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅. Kimi is 6-for-6 on code work
 (cycles 7-12).** Next: P6 evidence-clamps-budget, P7 anchor schema
