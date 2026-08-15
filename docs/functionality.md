@@ -136,6 +136,9 @@ the queue is full, the collector waits for a slot rather than evicting work. A
 `/steer <correction>` line uses a separate turn-scoped channel: it rolls back the
 partial conversation, retains/reports completed file effects, and restarts that
 turn before queued follow-ups. Corrections never become later prompts implicitly.
+Script files have no live input queue: put follow-up prompts on later non-slash
+lines. A scripted `/queue` command fails as a user error with that recovery hint
+instead of being mislabeled as a session-management command.
 
 Automatic type-ahead collection is not implemented on non-Unix platforms.
 `/queue <prompt>` still works there when the normal prompt is available, but text

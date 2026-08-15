@@ -11284,8 +11284,17 @@ async fn run_scripted_body(
                     }
                     continue;
                 }
+                SlashResult::QueueAction(_) => {
+                    status.failures += 1;
+                    let message =
+                        "queue commands require interactive chat; put prompts on later script lines";
+                    finish_command("error", Some(message), EXIT_USER)?;
+                    if !cli.jsonl {
+                        eprintln!("{}:{line_number}: {message}", terminal_inline(path));
+                    }
+                    continue;
+                }
                 SlashResult::NewSession
-                | SlashResult::QueueAction(_)
                 | SlashResult::ResumeSession(_)
                 | SlashResult::ForkSession(_)
                 | SlashResult::ExportSession { .. }
