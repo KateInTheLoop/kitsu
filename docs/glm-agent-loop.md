@@ -269,3 +269,40 @@ fixed). It has fully reached Kimi-level contribution — reviews AND
 tested code.** Next: alternate — a fresh REVIEW of a new area (build its
 portfolio, avoid Kimi's P9/P11) then implement from it; e.g. review the
 SSE/streaming parse + error-recovery path in openai_compat.rs.
+
+### Cycle 5 — 2026-08-14 — SSE/streaming review (grade A, 3rd perfect-citation review)
+
+Reviewed the SSE/streaming parse + error-recovery path in
+`openai_compat.rs` → reviews/glm-cycle-5.md, 7 ranked line-cited
+findings. Commit `6335347` (Kate verified), pushed. cap-1 unexercised.
+
+- **Citation accuracy: 12+/12+ EXACT** (supervisor verified nearly every
+  quoted block, incl. SseState/sse_step, finish_sse, the
+  ResponseBodyAttemptGuard call site) — GLM's THIRD perfect-citation
+  review running (9/9, 5/5, 12+/12+). Zero drift. Two out-of-scope
+  findings correctly marked "confidence: verify" — the exact discipline
+  DeepSeek lacks. This run used the R1.7-enabled binary (ranged reads now
+  line-numbered), reinforcing the perfect record.
+- Finding 1 (an `error: null` false-positive path + discarded gateway
+  error detail in the stream) is the strongest candidate for GLM's next
+  CODE cycle.
+- kitsu-usage 236,260 / 13,927 / 250,187 (a large 250K-token round trip).
+  7 reads (2 over the ~5 guidance, grep-anchored, transparently reasoned).
+
+**kitsu weakness W5 (reinforces R4.11, new angle):** the run hit a
+recovered `PolicyDenied` (an early fs_scan_file misfire on the directory)
++ a self-corrected Edit conflict, and kitsu marked the WHOLE turn
+`DISCARDED`/`not committed`/`session not saved`, exit 1 — even though the
+deliverable was fully written, complete, and citation-perfect on disk via
+the checkpoint mechanism. So a turn that RECOVERS from tool errors and
+produces a good committed deliverable is still classified a failure. This
+is too aggressive: (a) it wrongly signals failure (a literal
+retry-on-failure would waste a run discarding a GOOD deliverable — the
+supervisor correctly did NOT retry), and (b) combined with R4.11 the
+files are on disk despite "discarded". Candidate roadmap refinement:
+don't discard a turn for RECOVERED tool errors when a final answer/file
+was produced.
+
+**GLM is 3-for-3 A on reviews, 2-for-2 on code — a fully proven
+contributor.** Next code cycle: implement cycle-5 finding 1 (the
+error:null false positive) with the proven test-rigor discipline.
