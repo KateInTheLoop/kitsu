@@ -886,3 +886,100 @@ adjacent-function cycle in a row (11 `format_command_result`, 13
 `format_tool_result`, 14 `format_tool_header`) with no boundary bleed
 into neighboring functions, further confirming tight scoping holds even
 when review targets sit back-to-back in the file.
+
+### Cycle 15 — 2026-08-15 — compaction trimmer review, grade A- (12th clean process cycle, one hedge-phrasing slip)
+
+Target: `drop_old_exchanges_detailed`
+(`crates/kitsu-core/src/orchestrator.rs`), the compaction TRIMMER that
+removes old conversation exchanges to fit the token budget and returns
+how many were dropped — the first cycle to review the trimmer itself
+rather than a function that calls it (cycle 7's `summarize_or_fallback`
+calls into this compaction path but never touched this function).
+Pre-dispatch check confirmed the assigned range (2915-2957) was exact:
+`fn drop_old_exchanges_detailed` opens at line 2915, its own closing
+brace is at line 2957 (43 lines total) — no correction needed, a clean
+range measurement on the first try.
+
+- **Process: 12th clean review cycle running.** Rebuilt the kitsu
+  driver fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build in 6.6s, no
+  errors — most of the dependency graph was already warm in the shared
+  target dir). Exactly **1 ranged read** (2915-2957, 43 lines, matching
+  the assigned range exactly — transcript shows a single `Read(…/orchestrator.rs)`
+  call and nothing else) → **1 write**
+  (`reviews/deepseek-cycle-15.md`, 5174 bytes, 4 proposals), no re-read,
+  no spawn attempt (cap 1 unexercised), first attempt succeeded, clean
+  exit (`1 turn(s) ok, 1 file(s) read, 1 file(s) written`). kitsu-usage
+  `{"prompt_tokens":20923,"completion_tokens":6111,"total_tokens":27034}`.
+- **Citations 4/4 letter-perfect on both quoted text and line-number
+  labels.** Every quoted block (2939-2940 and 2950-2951 in proposal 1;
+  2956, 2931, 2938 in proposal 2; 2941-2944 in proposal 3; the full
+  2937-2946 loop body in proposal 4) was diffed against the source on
+  disk and matches exactly, including whitespace — the R1.7 line-prefix
+  fix continues to hold.
+- **Proposal 1 (out-of-bounds panic risk if `KEEP_RECENT_EXCHANGES`
+  were ever 0, correctly hedged):** reasons that if the line-2928-2930
+  guard's threshold constant were 0, `max_drop` would equal `actual`
+  and the loop's last iteration would read `user_idxs[first_actual + e
+  + 1]` at index `user_idxs.len()` — out of bounds. Explicitly hedged
+  ("I cannot see the definition of `KEEP_RECENT_EXCHANGES`. If it is
+  always ≥ 1 ... no panic occurs today"). Supervisor verified out of
+  scope: `KEEP_RECENT_EXCHANGES` is a hardcoded `const ... = 2` (line
+  2876, not configurable), so the hedge's own stated condition resolves
+  to "no live bug today" — same treatment as cycle 3's honestly-hedged
+  wrong-but-plausible proposal: correct reasoning about the code shape,
+  hedge appropriately gated the claim, and it happens to resolve inert.
+- **Proposal 2 (force_all's return value can't distinguish
+  "budget met" from "ran out of droppable exchanges," correctly
+  hedged):** accurate close reading of line 2956's `u32::try_from(e)`
+  return — the count alone doesn't tell a caller which case occurred.
+  Hedged correctly on caller behavior it didn't read.
+- **Proposal 3 (marker-cost adjustment to `total` is dead computation
+  on a force_all-only pass, correct core claim but a minor
+  hedge-phrasing inaccuracy):** correctly observes `total` is never
+  read again after the loop within the visible range. **Flagged:** the
+  hedge itself says "if callers... re-read `total` from the mutable
+  reference after the call" — but `total` is passed **by value**
+  (`mut total: u64`, line 2917, itself inside the assigned range and
+  part of the same read), not by reference, so no caller can ever
+  re-read it this way; the premise of the hedge is impossible given
+  information from the same read. This makes the claim actually
+  *stronger* than DeepSeek framed it (the computation is unconditionally
+  dead within this function, not conditionally dead pending caller
+  behavior) rather than wrong, but it is a real in-scope inaccuracy in
+  how the hedge was worded — the first "hedged against a scenario the
+  same read range already rules out" instance in the loop's history.
+- **Proposal 4 (loop-counter dual-role clarity note, correct, no
+  hedge needed):** accurate, low-risk maintainability observation,
+  entirely in-range, no defect claimed.
+
+**Grade: A-.** Process matches the best cycles (12th clean, exact range,
+first-attempt, no spawn), and citations are fully clean on both quotes
+and labels. Docked half a grade below cycles 7/8/9/11/12/14's flawless-A
+bar for proposal 3's hedge-phrasing slip — a small, non-invalidating
+inaccuracy (misdescribing a by-value parameter as passed by mutable
+reference, when the parameter's own declaration was inside the read
+range) rather than a wrong core finding. All four proposals covered the
+brief's requested angles (boundary/off-by-one, returned-count accuracy,
+the force_all path, clarity); no proposal touched anchor/system-message
+preservation specifically since the read range's only anchor-adjacent
+logic is the `KEEP_RECENT_EXCHANGES`-gated recent-exchange floor, which
+proposal 1 did address via the boundary angle.
+
+**Kitsu weaknesses observed:** none new. The main-checkout read-only
+verification build (`cargo build -p kitsu` in
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu`) was also clean; the main
+checkout was left untouched (no git mutations), consistent with another
+session's concurrent work there.
+
+**Ramp status:** process discipline now **12-for-12 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); citation fidelity now **7-for-9
+fully clean on quotes+labels** (cycles 7, 8, 9, 11, 12, 14, 15 clean;
+cycles 10 and 13 each showing one prior minor drift). This is the first
+cycle to review the compaction TRIMMER itself (prior cycles reviewed
+callers/siblings in the same compaction path: 6 `compact_context`, 7
+`summarize_or_fallback`, 10 `context_window_shortfall`) — correctness
+here is directly load-bearing for which messages get dropped, and no
+substantively-wrong claim was found. DeepSeek remains a STRONG,
+reliable tiny-scope reviewer — still review-only until R4.10
+(implementation type-chasing, per cycle 5, remains unaddressed).
