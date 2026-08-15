@@ -122,10 +122,16 @@ richest greenfield lane.
   limitation: lopdf 0.34 fails ToUnicode CMap on some real-world PDFs
   (e.g. LibreOffice output) — degrades to an honest per-page disclosure;
   a richer extractor can follow if this bites.
-- R2.3 **Image handling**: for a vision-capable gateway, pass images
-  through; otherwise report dimensions/format/EXIF and decline to
-  hallucinate content. *Accept:* `.png`/`.jpg` reads route to the vision
-  path when the model supports it, else a factual metadata receipt.
+- [x] (2026-08-15) R2.3 **Image handling** (metadata half) — shipped as
+  `fs_read_image` (commit 5f8fe17): reports format + pixel dimensions from
+  the header via pure-Rust `imagesize` (PNG/JPEG/GIF/WEBP/BMP…), reading
+  only the first 64 KiB (memory-bounded), and explicitly declines to
+  interpret content ("a vision-capable model is required"). Wired into
+  `read_document`'s image branch, so it yields real dimensions instead of
+  a bare "detected PNG". Same allowlist guard; never decodes pixels.
+  **Follow-up:** vision passthrough (routing images to a vision-capable
+  gateway when the model supports it) — the other half of the acceptance,
+  a larger gateway-integration task, not yet done.
 - [x] (2026-08-14) R2.4 **xlsx cell extraction** — shipped as
   `fs_read_xlsx` (commit 63a139a): pure-Rust `calamine`, lists sheet
   names + a bounded cell window (sheet by name/index, start_row/max_rows,
@@ -335,6 +341,21 @@ requirements are met, note it here and move down the sequence.
 ## Cycle log
 
 (appended each cycle, newest last)
+
+### Cycle 9 — 2026-08-15 — R2.3 image metadata (completes lane-2 image handling)
+
+Shipped `fs_read_image` (commit 5f8fe17): format + pixel dimensions from
+the header via pure-Rust `imagesize`, memory-bounded (64 KiB), wired into
+`read_document`'s image branch — 'detected PNG' becomes 'PNG, 120x80 px'.
+Metadata-only: it declines to interpret content, so a text model can't
+hallucinate what an image depicts. 5 tests (formatter, e2e direct +
+dispatch on an embedded real PNG, allowlist). Live-verified through
+ollama: reported PNG 120x80. Picked over the higher-value-but-riskier
+R4.10 (CLI+config+orchestrator plumbing) and R4.12 (main.rs, UI-loop-
+owned) as the clean low-cost slice, and it completes lane 2's document
+types (CSV/PDF/xlsx/image + dispatch). Vision passthrough deferred (a
+gateway-integration follow-up). Haiku review pending. Next: R4.10 or
+R4.12 (both need a bigger, deliberate cycle) or lane-1 R1.4/R1.5.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
