@@ -312,3 +312,37 @@ only a technical read cap (R4.10) will contain. **Role decision: keep
 DeepSeek on tiny-scope REVIEWS (its proven contribution mode) until R4.10
 lands; revisit implementation after.** Cycle 6 = a tiny-scope review of a
 fresh single function.
+
+### Cycle 6 — 2026-08-14 — tiny-scope review, process clean but accuracy slips (B+)
+
+Reviewed `compact_context` (2041-2077). **Process perfect for the 3rd
+clean review running: exactly 1 ranged read → 1 write, no over-read, no
+spawn.** Cheapest cycle yet (kitsu-usage 14,204 / 2,338 / 16,542). Commit
+`0121b43` (Kate verified), pushed. Citation QUOTES letter-perfect; labels
+drift ~1 line (R1.7, judged on quotes).
+
+- **Proposal 1 (high) is a genuine, valuable catch:** DeepSeek
+  independently re-derived the same `unwrap_or_default()`-swallows-
+  serialization-errors bug class it FIXED in cycle 5's sibling
+  (`ensure_chat_request_fits`) — confirming it is a **recurring
+  anti-pattern in orchestrator.rs** (candidate for a systematic sweep;
+  see backlog note).
+- **Accuracy slip (why B+, not A-):** Proposal 2 (medium) is
+  substantively WRONG and, for the first time, UNHEDGED — it claims the
+  `usage` local is discarded, but `compact_context`'s body is a bare
+  tail-expression return of `enforce_context_budget_recording(...)`, so
+  nothing is discarded. (Cycle 3's wrong proposal was at least hedged.)
+  Proposal 3 mislabels an out-of-scope positional arg (`1` called a
+  "retry count"; it's `round`) though the underlying code-smell holds.
+- **DeepSeek's profile is now clear:** rock-solid PROCESS discipline on
+  tiny scope, but CONTENT accuracy is B+/A- with occasional
+  confidently-wrong claims about things outside the single function it
+  read. **Cron fix: instruct DeepSeek to HEDGE any claim it cannot verify
+  from the one assigned range** (it keeps reasoning about callers/callees
+  it did not read). Ramp verdict unchanged: tiny-scope reviews until R4.10.
+
+**Backlog note (recurring anti-pattern):** `unwrap_or_default()` silently
+swallowing `serde_json::to_string` failures appears in multiple
+orchestrator.rs functions (fixed in `ensure_chat_request_fits` cycle 5;
+flagged again around `compact_context`). Worth a Kimi sweep to find and
+guard all instances.
