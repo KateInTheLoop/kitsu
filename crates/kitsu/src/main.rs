@@ -3032,7 +3032,7 @@ fn print_doctor_human(report: &serde_json::Value) {
                 .and_then(serde_json::Value::as_u64)
                 .unwrap_or(0);
             format!(
-                "reachable ({models} models in catalog) — catalog route only; credentials and the chat route are NOT validated until a real turn"
+                "reachable — model catalog only; chat/inference access was not tested ({models} models in catalog)"
             )
         }
         (true, Some("chat_inference"), Some("reachable"), true) => {
@@ -17990,9 +17990,14 @@ mod tests {
         registry.finish(done, Ok("collected".to_string()));
 
         let deck = format_jobs(&registry);
-        // Exactly one running row → exactly one ↳ child line, with an age.
-        assert_eq!(deck.matches('↳').count(), 1, "{deck}");
-        assert!(deck.contains("↳ started · 0s ago"), "{deck}");
+        // Exactly one running row gets exactly one activity child line, with
+        // the glyph and separator selected by the active terminal mode.
+        let activity = if kitsu_render::plain_mode() {
+            "-> started | 0s ago"
+        } else {
+            "↳ started · 0s ago"
+        };
+        assert_eq!(deck.matches(activity).count(), 1, "{deck}");
         let _ = running;
 
         // Formatter tiers: plain uses ASCII arrow and separator; no-activity
@@ -20457,6 +20462,35 @@ mod tests {
         let parsed = Cli::try_parse_from(["kitsu", "ask", "hello", "--skill", "review"])
             .expect("global flag after subcommand");
         assert_eq!(parsed.skill, vec!["review"]);
+    }
+
+    #[test]
+    fn common_global_options_compose_before_or_after_chat() {
+        let before = Cli::try_parse_from([
+            "kitsu",
+            "--theme",
+            "ocean",
+            "--no-artifacts",
+            "chat",
+            "--no-session",
+        ])
+        .expect("common global options before the subcommand");
+        assert_eq!(before.theme.as_deref(), Some("ocean"));
+        assert!(before.no_artifacts);
+        assert!(matches!(before.command, Some(Command::Chat { .. })));
+
+        let after = Cli::try_parse_from([
+            "kitsu",
+            "chat",
+            "--no-session",
+            "--theme",
+            "forest",
+            "--no-artifacts",
+        ])
+        .expect("common global options after the subcommand");
+        assert_eq!(after.theme.as_deref(), Some("forest"));
+        assert!(after.no_artifacts);
+        assert!(matches!(after.command, Some(Command::Chat { .. })));
     }
 
     #[test]
