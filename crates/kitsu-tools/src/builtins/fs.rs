@@ -1391,6 +1391,251 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
     Ok(format!("{disclosure}{body}"))
 }
 
+// --- fs.scan_file (bounded log tail / grep) ---------------------------------
+
+const SCAN_DEFAULT_TAIL_LINES: usize = 200;
+const SCAN_MAX_TAIL_LINES: usize = 2000;
+const SCAN_DEFAULT_MAX_MATCHES: usize = 200;
+const SCAN_MAX_MATCHES_CEILING: usize = 2000;
+/// Forward grep stops after scanning this many bytes (disclosed if hit), so a
+/// pathological file can never make one call run unbounded.
+const SCAN_MAX_SCAN_BYTES: u64 = 256 * 1024 * 1024;
+/// Bytes read from the end for tail mode — bounds memory regardless of file
+/// size (a true seek-to-end tail, not a full-file scan).
+const SCAN_TAIL_WINDOW_BYTES: u64 = 4 * 1024 * 1024;
+/// Per-line display cap so one very long line cannot blow the output budget.
+const SCAN_LINE_DISPLAY_CAP: usize = 2000;
+
+#[derive(Deserialize)]
+struct ScanFileArgs {
+    path: String,
+    /// If present, grep mode: return lines containing this literal substring.
+    /// Absent → tail mode (last N lines).
+    #[serde(default)]
+    pattern: Option<String>,
+    #[serde(default, deserialize_with = "lenient_bool")]
+    ignore_case: bool,
+    /// Tail-mode window (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    tail_lines: Option<usize>,
+    /// Grep-mode match cap (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_matches: Option<usize>,
+}
+
+pub fn scan_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_scan_file".to_string(),
+        description: "Scan a large file (e.g. a log) without loading it whole. With a pattern: \
+                      streams the file and returns matching lines (with line numbers), disclosing \
+                      how many of the total matches are shown and how much was scanned. Without a \
+                      pattern: returns the LAST tail_lines lines (a true seek-to-end tail). \
+                      Memory stays bounded regardless of file size — use this instead of \
+                      fs_read_file (which only sees the first bytes) for logs."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File path to scan"},
+                "pattern": {"type": "string", "description": "Literal substring to grep for (optional; omit for tail mode)"},
+                "ignore_case": {"type": "boolean", "description": "Case-insensitive match (optional, default false)"},
+                "tail_lines": {"type": "integer", "description": "Tail mode: last N lines (optional, default 200, max 2000)"},
+                "max_matches": {"type": "integer", "description": "Grep mode: max matched lines shown (optional, default 200, max 2000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { scan_file_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn scan_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ScanFileArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || scan_file_blocking(file, &display, &a))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("scan failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn truncate_line(line: &str) -> String {
+    let trimmed = line.trim_end_matches(['\n', '\r']);
+    if trimmed.chars().count() > SCAN_LINE_DISPLAY_CAP {
+        let cut: String = trimmed.chars().take(SCAN_LINE_DISPLAY_CAP).collect();
+        format!("{cut}…[line truncated]")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+fn scan_file_blocking(
+    file: std::fs::File,
+    display: &str,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("scan target is not a regular file"));
+    }
+    let total_bytes = metadata.len();
+    match args.pattern.as_deref() {
+        Some(pattern) if !pattern.is_empty() => {
+            scan_grep(file, display, total_bytes, pattern, args)
+        }
+        _ => scan_tail(file, display, total_bytes, args),
+    }
+}
+
+fn scan_grep(
+    file: std::fs::File,
+    display: &str,
+    total_bytes: u64,
+    pattern: &str,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    use std::io::BufRead;
+
+    let cap = args
+        .max_matches
+        .unwrap_or(SCAN_DEFAULT_MAX_MATCHES)
+        .min(SCAN_MAX_MATCHES_CEILING);
+    let needle = if args.ignore_case {
+        pattern.to_lowercase()
+    } else {
+        pattern.to_string()
+    };
+    // Bound total bytes scanned so a huge file cannot run unbounded.
+    let mut reader = std::io::BufReader::new(Read::take(file, SCAN_MAX_SCAN_BYTES + 1));
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut total_matches = 0usize;
+    let mut bytes_read = 0u64;
+    let mut shown: Vec<(usize, String)> = Vec::new();
+    let mut scan_truncated = false;
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > SCAN_MAX_SCAN_BYTES {
+            scan_truncated = true;
+            break;
+        }
+        line_no += 1;
+        let hay = if args.ignore_case {
+            line.to_lowercase()
+        } else {
+            line.clone()
+        };
+        if hay.contains(&needle) {
+            total_matches += 1;
+            if shown.len() < cap {
+                shown.push((line_no, truncate_line(&line)));
+            }
+        }
+    }
+
+    let case = if args.ignore_case {
+        " (case-insensitive)"
+    } else {
+        ""
+    };
+    let scanned_note = if scan_truncated {
+        format!(
+            " — stopped after scanning {} MiB of {} MiB (refine or split the file)",
+            SCAN_MAX_SCAN_BYTES / (1024 * 1024),
+            total_bytes / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "scan> {display}: grep {pattern:?}{case} — {total_matches} match(es) in {line_no} lines scanned{scanned_note}\n"
+    );
+    if shown.is_empty() {
+        out.push_str("(no matching lines)\n");
+    } else {
+        for (no, text) in &shown {
+            out.push_str(&format!("{no}: {text}\n"));
+        }
+        if total_matches > shown.len() {
+            out.push_str(&format!(
+                "[showing {} of {} matches; narrow the pattern or raise max_matches for more]\n",
+                shown.len(),
+                total_matches
+            ));
+        }
+    }
+    Ok(out)
+}
+
+fn scan_tail(
+    mut file: std::fs::File,
+    display: &str,
+    total_bytes: u64,
+    args: &ScanFileArgs,
+) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+
+    let want = args
+        .tail_lines
+        .unwrap_or(SCAN_DEFAULT_TAIL_LINES)
+        .clamp(1, SCAN_MAX_TAIL_LINES);
+    // Read only the trailing window — bounds memory for any file size.
+    let window = total_bytes.min(SCAN_TAIL_WINDOW_BYTES);
+    let start = total_bytes - window;
+    file.seek(SeekFrom::Start(start))?;
+    let mut buf = Vec::with_capacity(window as usize);
+    Read::by_ref(&mut file).take(window).read_to_end(&mut buf)?;
+    let text = String::from_utf8_lossy(&buf);
+    // If we did not start at the file head, the first (partial) line is
+    // incomplete — drop it so we only show whole lines.
+    let mut lines: Vec<&str> = text.lines().collect();
+    let window_clipped = start > 0;
+    if window_clipped && !lines.is_empty() {
+        lines.remove(0);
+    }
+    let total_in_window = lines.len();
+    let tail: Vec<&str> = lines
+        .iter()
+        .skip(total_in_window.saturating_sub(want))
+        .copied()
+        .collect();
+
+    let mut out = format!(
+        "scan> {display}: tail — last {} line(s) of a {} byte file",
+        tail.len(),
+        total_bytes
+    );
+    if window_clipped {
+        out.push_str(&format!(
+            " (read the final {} KiB; earlier lines not shown)",
+            window / 1024
+        ));
+    }
+    out.push('\n');
+    if tail.is_empty() {
+        out.push_str("(no complete lines in the tail window)\n");
+    } else {
+        for line in &tail {
+            out.push_str(&truncate_line(line));
+            out.push('\n');
+        }
+    }
+    Ok(out)
+}
+
 // --- fs.list_dir ------------------------------------------------------------
 
 #[derive(Deserialize)]
@@ -4140,6 +4385,103 @@ mod tests {
     /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
     /// LibreOffice, embedded so the xlsx tests need no writer dependency.
     const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+
+    #[tokio::test]
+    async fn scan_file_grep_returns_matches_with_served_of_total_disclosure() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("app.log");
+        // 1000 lines; every 100th is an ERROR (10 total matches).
+        let mut body = String::new();
+        for i in 1..=1000 {
+            if i % 100 == 0 {
+                body.push_str(&format!("line {i}: ERROR disk full\n"));
+            } else {
+                body.push_str(&format!("line {i}: info ok\n"));
+            }
+        }
+        std::fs::write(&path, &body).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Grep with a cap below the match count → served-of-total disclosure.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "ERROR", "max_matches": 3})
+                .to_string(),
+        )
+        .await
+        .expect("grep ok");
+        assert!(out.contains("10 match(es) in 1000 lines scanned"), "{out}");
+        assert!(
+            out.contains("100: line 100: ERROR"),
+            "line-numbered match: {out}"
+        );
+        assert!(
+            out.contains("[showing 3 of 10 matches"),
+            "cap disclosure: {out}"
+        );
+
+        // Case-insensitive matches lowercase too.
+        std::fs::write(&path, "Warn: A\nwarn: b\nWARN: c\ninfo\n").unwrap();
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "warn", "ignore_case": true})
+                .to_string(),
+        )
+        .await
+        .expect("ci ok");
+        assert!(out.contains("3 match(es)"), "case-insensitive: {out}");
+
+        // No match discloses zero, not an error.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "pattern": "zzz"}).to_string(),
+        )
+        .await
+        .expect("nomatch ok");
+        assert!(
+            out.contains("0 match(es)") && out.contains("no matching lines"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_file_tail_returns_the_last_lines_via_seek() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("big.log");
+        let mut body = String::new();
+        for i in 1..=5000 {
+            body.push_str(&format!("row {i}\n"));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let policy = Permissions::for_roots(&[dir.path().to_string_lossy().into_owned()], &[])
+            .expect("perms");
+
+        // Default tail (no pattern) returns the LAST lines, not the first.
+        let out = scan_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy(), "tail_lines": 3}).to_string(),
+        )
+        .await
+        .expect("tail ok");
+        assert!(out.contains("tail — last 3 line(s)"), "{out}");
+        assert!(out.contains("row 5000"), "last line present: {out}");
+        assert!(out.contains("row 4998"), "{out}");
+        assert!(!out.contains("row 1\n"), "must not include the head: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.log");
+        std::fs::write(&bad, "secret\n").unwrap();
+        assert!(matches!(
+            scan_file_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
 
     #[tokio::test]
     async fn read_xlsx_lists_sheets_and_returns_a_bounded_cell_window() {
