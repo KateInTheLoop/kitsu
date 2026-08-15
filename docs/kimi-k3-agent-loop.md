@@ -361,3 +361,42 @@ pushed. `--agent-spawn-cap 0` held — zero spawn attempts.
 include **`--max-rounds 30`** so a design-correct many-edit cycle is not
 throttled on edit count. Backlog: P1 ✅, P2 ✅, P3 ✅. Next: P6
 evidence-clamps-budget or P4 estimator overhead.
+
+### Cycle 11 — 2026-08-14 — P4 estimator overhead (grade A-)
+
+Kimi implemented P4 correctly and completely in `context.rs`:
+`PER_MESSAGE_TOKENS = 3` (conservative low end per the spec), and a
+genuine two-rate ASCII/non-ASCII estimator (`ascii_split` +
+`estimate_mixed`) — ASCII stays byte-identical to the old math, non-ASCII
+counts ~1 token/char so CJK is no longer undercounted. 3 genuine tests
+(overhead applied, CJK 12 chars: old=9 → new=12, ASCII unchanged); 8
+pre-existing exact-value tests honestly recomputed by hand (spot-checked
+correct). Committed `1afb464` (Kate verified), pushed. `--agent-spawn-cap
+1` held — zero spawn attempts.
+
+- Single successful run, 19 tool calls, completion 7,085/24,000 (30%).
+  (First attempt used `kitsu ask` with chat-only flags → instant clap
+  error, corrected within the retry budget at zero token cost — a
+  supervisor slip, not Kimi's.)
+- **Bonus: a genuine latent kitsu bug found and fixed.** The estimator
+  change tripped 4 orchestrator tests, whose root cause was a real
+  zero-margin defect in `orchestrator.rs::bounded_summary_request`: the
+  compaction summarizer budgeted its OWN request at a flat `bytes/4` with
+  no headroom, so a request built to the cap now measured a few tokens
+  over (from `PER_MESSAGE_TOKENS` + a hardcoded em-dash now correctly
+  counted) and was rejected before reaching the provider — **silently
+  downgrading every summarize-mode compaction to drop-fallback.** The
+  supervisor diagnosed it numerically and rewrote the budget in token
+  space (`estimate_str` of the fixed prompt + `PER_MESSAGE_TOKENS`;
+  `CHARS_PER_TOKEN`/`PER_MESSAGE_TOKENS` widened to `pub(crate)`). All 80
+  orchestrator tests pass. This is a shipped correctness fix, not just
+  test churn.
+- **Flake now consistent:** `kitsu-tools …read_file_caps_input_before_allocating_the_whole_file`
+  now reproduces reliably on the branch (cycle 10 saw it once). Confirmed
+  pre-existing via stash, unrelated to P4; passes on main. Likely
+  resource/timing-sensitive under the now-four concurrent worktree
+  builds. Worth a dedicated look if it spreads to main.
+
+Backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅. Kimi is 5-for-5 on code work since the
+ramp (cycles 7-11). Next: P6 evidence-clamps-budget, P5 anchor sanity
+clamp, or P7/P10/P11.
