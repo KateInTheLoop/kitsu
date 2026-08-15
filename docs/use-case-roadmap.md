@@ -615,6 +615,32 @@ delivering self-contained tool value, but the numbered roadmap needs the
 run-layer surfaces — a gen-2 repoint (a coordinated lane-4 mandate, or a
 fresh backlog) is the standing recommendation.
 
+### Cycle 17 — 2026-08-15 — fs_read_html (HTML → text, extends doc review)
+
+Shipped `fs_read_html` (commit 72e0137): best-effort HTML → readable text
+instead of raw tag soup. Removes `<script>`/`<style>`/comments WHOLESALE
+at the raw byte level (so `a < b` inside a script never derails tag
+parsing — the crux, pinned by a test), strips remaining tags, decodes
+entities (XML five via quick_xml + numeric `&#N;`/`&#xH;` + common named
+like `&nbsp;`/`&mdash;`), turns block tags into line breaks, collapses
+whitespace. Manual byte-index scanner that stays UTF-8-safe by only ever
+advancing to ASCII delimiters (`<`/`>`/`&`/`;`/end) — `i` is always on a
+char boundary. New `DocType::Html` (`.html`/`.htm`) wired through
+read_document. Dep-free, 32 MiB guard, cap_output backstop. HTML (web
+pages, saved articles, emails) was a very common opaque format; now in
+the document-review lane. Security-focused haiku review: SHIP-AS-IS —
+8 areas traced (UTF-8/panic-freedom on adversarial input confirmed,
+script-skip no-leak, entity safety, bounded, honest, sandboxed), no
+findings (one acceptable note: pathological-unclosed-tag worst case is
+O(n²) but bounded by the 32 MiB cap).
+
+**Document-review lane now spans:** CSV, PDF, XLSX, DOCX, PPTX,
+notebooks, HTML + image metadata + type-aware dispatch — essentially
+every common text-bearing document a reviewer encounters. Runway note
+unchanged: numbered-roadmap work now lives in the run layer / needs a
+gen-2 repoint; the recent cycles are self-contained doc-review
+extensions beyond the numbered requirements.
+
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
 Lane 3 is done for this loop (R3.1/R3.2/R3.3; R3.4 is the UI loop's).
