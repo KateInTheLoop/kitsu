@@ -833,3 +833,67 @@ proposal 2 here) into flagged hedges (like cycle 3's hedged wrong
 proposal, which the grading rubric treated more leniently). Role
 decision unchanged: stay on tiny-scope reviews until R4.10 (technical
 read cap) lands and an implementation retry is warranted.
+
+### Cycle 7 — 2026-08-14 — tiny-scope review, best cycle yet (grade A)
+
+Reviewed `summarize_or_fallback` (2545-2661), a fresh ~117-line
+function no prior cycle had touched. Rebuilt the kitsu driver fresh
+from `main` (has R1.7 — ranged reads now prefix each line with its
+absolute line number). One CLI hiccup on the first invocation
+(`--prompt` is not a flag; the prompt is positional, passed after
+`--`) — fixed and re-run; not a transport failure, so it didn't consume
+the cycle's one retry. Second invocation: exit 0. Commit `<see below>`
+(Kate verified), pushed.
+
+- **Process: 4th clean review cycle running.** Exactly 1 ranged read
+  (2542-2661, 120 lines) → 1 write, no over-read, no spawn attempt (cap
+  1 unexercised). kitsu-usage `{"prompt_tokens":17152,"completion_tokens":4922,"total_tokens":22074}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))" — no discard this time.
+- **R1.7 CONFIRMED FIXED for DeepSeek:** citation spot-check on all 3
+  proposals — both the quoted TEXT and the line-number LABELS are
+  letter-perfect against ground truth (verified against a fresh read of
+  2560-2661). Proposal 1's 2627-2633 block, proposal 2's 2651-2658
+  block, and proposal 3's 2565-2569 block all match the source exactly,
+  including secondary in-prose citations (2599-2600, 2625, 2634). This
+  is the first cycle with zero label drift anywhere — the historical
+  ~1-line self-count error (cycle 4) is gone now that ranged reads carry
+  absolute line-number prefixes.
+- **Content: no substantively wrong claims, hedging used correctly.**
+  Proposal 1 (high) — the `Complete { usage, .. }` arm at 2627 (no text
+  guard, catches the empty/whitespace-only case since the sibling arm
+  at 2599-2600 requires non-empty text) is labeled
+  `SummaryFallbackReason::ProviderFailure`, conflating "provider
+  errored" with "provider succeeded but returned nothing useful" —
+  correct and verifiable entirely from the read range. Proposal 2
+  (medium) — when `drop_old_exchanges_detailed` removes zero exchanges,
+  `progress.outcome`/`fallback_reason` are never written, leaving stale
+  state from a prior round visible to the caller — correct, local
+  reasoning only. Proposal 3 (low) — the circuit-breaker branch at
+  2565-2567 short-circuits before `bounded_summary_request` runs, so a
+  request that would also have been oversized is recorded only as
+  `CircuitBreaker`, losing the more specific cause — correct. All three
+  proposals correctly HEDGE the parts they could not verify (whether
+  `SummaryFallbackReason`/`CompactionOutcome` have a suitable variant,
+  the magnitude of `MAX_COMPACT_FAILURES`, and whether callers treat the
+  two fallback reasons identically) without hedging claims that were
+  fully verifiable from the assigned range — the calibration the
+  CRITICAL hedging instruction asked for.
+
+**Verdict: best cycle yet.** First cycle to combine clean process,
+zero citation drift (quotes AND labels), and zero substantively-wrong
+claims, with hedging correctly scoped to genuinely out-of-range
+dependencies rather than either over-hedging local facts or
+under-hedging external ones. Grade **A**. Ramp status unchanged in
+substance (tiny-scope reviews remain the reliable lane) but the
+evidence for "role = tiny-scope reviewer" is now stronger: 4-for-4
+clean-process review cycles (3, 4, 6, 7), and this is the first with no
+accuracy dock at all.
+
+**kitsu weakness noted (not filed to roadmap, minor):** the `--prompt`
+flag does not exist on `kitsu chat` — the prompt is a positional
+argument (`kitsu chat [OPTIONS] [PROMPT]`), so `--prompt "..."` fails
+with `unexpected argument` before reaching the model. Low severity
+(clear error message, no cost incurred), but worth a one-line mention
+in the CLI's `--help` epilogue or docs since it is an easy trap for
+scripted invocations like this loop's.
