@@ -50,10 +50,27 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
 **Requirements:**
 - R1.1 ✅ Conflict-safe edits (precondition `old_text` / `expected_previous_content`).
 - R1.2 ✅ Host-verified diff review that the model cannot fabricate.
-- R1.3 Symbol-aware navigation: a tool to locate a definition/usages
-  without a full grep sweep (LSP bridge or ctags fallback). *Accept:* a
-  `find_symbol`-style tool returns definition site + references for a
-  named symbol in a test repo; degrades cleanly when no indexer present.
+- [x] (2026-08-15) R1.3 **Symbol-aware navigation** — shipped as the
+  `find_symbol` builtin (commit 6aa8357): recursively scans an allowed
+  file or directory (skipping VCS/build dirs + binaries, bounded to 5000
+  files / 64 MiB / 2 MiB per file) and returns definition sites first,
+  then references, each as `path:line`. Definitions are classified
+  language-agnostically — a definition keyword (`fn`/`func`/`def`/`class`/
+  `struct`/`enum`/`trait`/`type`/`impl`/`const`/`let`/… incl. `let mut
+  <sym>`) immediately before a WHOLE-WORD occurrence marks the line a
+  definition; every other whole-word hit is a reference (`foo` never
+  matches `foobar`/`foo_bar`). A heuristic textual scan — no LSP/ctags/
+  index required, so it works anywhere and degrades to an honest "no
+  definitions or usages found" when the symbol is absent (the
+  degrade-cleanly half of the acceptance). Same allowlist guard
+  (`check_read` authorizes the root; the walk never follows symlinks out
+  of it; protected paths skipped). 4 tests (whole-word matching,
+  cross-language classification, clean not-found render, and an e2e tree
+  scan proving def + both refs found, build-dir + binary skipped, absent
+  degrade, allowlist denial). Haiku review: SHIP-AS-IS — all 8 areas
+  traced (boundary/char-safety, classification precision, symlink+
+  protected guards, real bounds, panic-freedom, determinism, additive
+  only, non-vacuous tests), no findings.
 - R1.4 Multi-file coherent edit receipts: when an edit touches N files,
   one receipt summarizes all N with per-file line deltas. *Accept:* a
   two-file edit turn emits a single grouped receipt; machine records
@@ -328,8 +345,9 @@ Priority order the loop follows (revisit as lanes close):
    document types — **advance to lane 3 next** (do R2.3 opportunistically).
 2. **System administration** (lane 3) — R3.1 log scan ✅, R3.2 config
    diff ✅. Next: R3.3 structured command results, R3.4 runbook mode.
-3. **Code analysis hardening** (lane 1) — R1.3 symbol nav, R1.4 grouped
-   edit receipts.
+3. **Code analysis hardening** (lane 1) — R1.3 symbol nav ✅. Next:
+   R1.4 grouped multi-file edit receipts, R1.5 manifest (Cargo.toml/
+   package.json/pyproject.toml) summary in project-context.
 4. **Automation trust** (lane 4) — R4.3 budget ceiling, R4.4 run report.
 5. **Security** (lane 5) and **scientific docs** (lane 6) — only
    opportunistically, per the scope notes above.
@@ -359,6 +377,34 @@ traced (64 KiB memory bound, authorized path, double-Result no-panic
 handling, graceful non-image degradation, never decodes pixels), no
 findings. Next: R4.10 or R4.12 (both need a bigger, deliberate cycle) or
 lane-1 R1.4/R1.5.
+
+### Cycle 10 — 2026-08-15 — R1.3 find_symbol (symbol navigation, lane 1)
+
+Shipped `find_symbol` (commit 6aa8357), the next sequenced item after
+lane 2 (complete) and lane 3 (complete bar the UI-loop-owned R3.4):
+heuristic symbol navigation with no language-server/index dependency, so
+it satisfies R1.3's "degrades cleanly when no indexer present" by design
+— it IS the fallback. Recursive bounded walk of an allowed file/dir
+(skips VCS/build dirs + binaries; 5000-file / 64-MiB / 2-MiB-per-file
+caps; never follows symlinks out of the authorized root), returning
+labeled definition sites first then references as `path:line`.
+Definition vs reference is a whole-word + definition-keyword heuristic
+(so `foo` never matches `foobar`; `self.parse()` / `use crate::parse` /
+`return parse(x)` are references, `fn parse` / `let mut total` are
+definitions). Chosen as a clean self-contained builtin (like the lane-2/3
+fs tools) that needs NO main.rs/render surgery — keeping it off the
+concurrently-edited UI surfaces. Functional check: the e2e test drives
+the real tool path (authorize → walk → scan → render) over a temp tree
+incl. binary-skip, build-dir-skip, absent-symbol degrade, and allowlist
+denial (roadmap permits a direct tool test in lieu of a live gateway).
+Full workspace suite green bar the known PTY cli flake. Haiku review:
+SHIP-AS-IS — 8 areas traced (boundary/char-safety, classification
+precision, symlink + protected-path guards, real bounds incl. the
+disclosed one-file byte-cap overshoot, panic-freedom, determinism,
+additive-only, non-vacuous tests), no findings. Next lane-1: R1.4
+grouped multi-file edit receipts or R1.5 manifest summary; or the
+higher-value R4.10 (technical read cap) / R4.12 (failure classification,
+still open HIGH) when a bigger deliberate cycle is warranted.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
