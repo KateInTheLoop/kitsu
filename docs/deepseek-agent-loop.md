@@ -599,3 +599,69 @@ hit on cycles 4, 8, 9) continues to require supervisor pre-dispatch
 verification of the target function's own closing brace, not just its
 neighbor's opening line; cycle 10's pre-check caught it before dispatch,
 so DeepSeek was not exposed to the oversized range this time.
+
+### Cycle 11 — 2026-08-15 — first PRODUCTION formatting function; zero-drift streak restored (grade A)
+
+Target: `format_command_result` (`crates/kitsu-core/src/orchestrator.rs`),
+a 55-line production formatter (`fn format_command_result(output:
+&CommandOutput) -> String`) that renders exit status, elapsed time, and
+stdout/stderr truncation-disclosure flags for display — the first cycle to
+review a genuinely production display/formatting function rather than a
+predicate, wrapper, or ledger-recording helper. Pre-dispatch check confirmed
+the cron-supplied range (1796-1850) was exact: the function's own closing
+brace is at line 1850 and the next function (`append_command_stream_summary`)
+starts at line 1852, so no correction was needed this time.
+
+- **Process: 8th clean review cycle running.** Exactly 1 ranged read
+  (1796-1850, 55 lines, matching the assigned range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised), exit 0, no transport retry
+  needed. kitsu-usage `{"prompt_tokens":17710,"completion_tokens":3274,
+  "total_tokens":20984}`. Run summary: "1 turn(s) ok, 1 file(s) read, 1
+  file(s) written (1 change(s))".
+- **Citations 4/4 letter-perfect — zero-drift streak restored after cycle
+  10's off-by-one.** Spot-checked every quoted block against the source:
+  lines 1806-1809 (the `TimedOut => match output.signal` arm), line 1812
+  (`let mut fields = vec![completion, format!("{} ms", output.elapsed_ms)];`),
+  lines 1832-1834 and 1844-1847 (the two `{:?}`-formatted `fields.push`
+  calls), and lines 1840-1842 (the artifact-path design comment) all match
+  the source verbatim, on both text and line-number labels. Every quoted
+  block was reproduced as a complete contiguous span with no ellipsis or
+  line-dropping — the cycle-10 prompt fix ("quote each source line
+  verbatim... do not elide or merge lines") held.
+- **Hedging correctly calibrated on all 4 proposals, and the hedged claims
+  checked out.** Supervisor spot-verified the out-of-range facts DeepSeek
+  hedged on (not required for grading, but done here for calibration
+  data): (1) `output.signal` is `Option<i32>` and is genuinely the same
+  field read by both the `Signaled` and `TimedOut` arms (line 212 in the
+  `CommandOutput` struct) — proposal 1's copy-paste suspicion is a
+  legitimate, correctly-hedged catch ("I have not read the definitions of
+  `CommandOutput`... cannot confirm whether reuse is intentional"); (2)
+  `elapsed_ms` is `u64` (line 213) — proposal 2 correctly hedged that "if
+  it is a plain integer... the practical risk is low," which is exactly
+  right; (3) both `bounded_human_value` (line 1642) and
+  `terminal_safe_inline` (line 1616) return `String` — proposal 3's claim
+  that `{:?}` on a `String`-returning helper adds spurious quote
+  characters is **substantively correct**, and was appropriately hedged
+  ("I have not read the signatures of either helper"). No unhedged
+  out-of-scope claims, and no substantively-wrong claims of any kind this
+  cycle. Proposal 4 (documentation nit on the join-contract comment,
+  lines 1840-1842) needed no hedge and got none, correctly.
+
+**Grade: A.** Matches cycles 7 and 9's best-cycle bar: perfect process,
+perfect citations, well-calibrated hedging, and — uniquely this cycle —
+every hedged claim was independently verified to be factually correct
+once the supervisor checked the out-of-range code, showing DeepSeek's
+hedged inferences about unread callee/struct behavior are not just
+cautious but actually well-reasoned from the visible call-site evidence
+(e.g. inferring `String`-typed returns from `format!`/string-building
+usage patterns in-range). First cycle on a true production
+formatting/display function (vs. predicates, test wrappers, or
+ledger-recording helpers in cycles 8-10), and the discipline held.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 8-for-8 clean (cycles 3, 4, 6, 7, 8, 9, 10, 11), and
+citation fidelity is 4-for-5 (cycles 7, 8, 9, 11 clean; cycle 10 the lone
+off-by-one, now with a demonstrated fix holding for a full cycle). Still
+review-only until R4.10 (implementation type-chasing, per cycle 5, is
+unaddressed). No range-overshoot this cycle — the cron's pre-measured
+1796-1850 range was exact on the first check.
