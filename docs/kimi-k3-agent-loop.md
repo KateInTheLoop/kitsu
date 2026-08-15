@@ -1942,3 +1942,99 @@ continue cross-model work — DeepSeek cycle-7 proposal 3
 or GLM's remaining cycle-8 findings; consider granting scoped
 `--allow-command` test access on future `orchestrator.rs`/format-string
 fixes given this cycle's ripple.
+
+### Cycle 22 (2026-08-15) — cross-model #5: DeepSeek cycle-12 proposal 2, `parse_text_tool_calls` arguments normalization (grade B+ — correct fix, test used the wrong Registry API and needed supervisor repair plus a fmt pass)
+
+Kimi's 5th cross-model implementation, back in `kitsu-core`:
+DeepSeek's cycle-12 review flagged that the `args` match in
+`parse_text_tool_calls` (`crates/kitsu-core/src/orchestrator.rs`,
+function spans 1643-1704) had `Some(v) => v.to_string()` as its
+catch-all arm, which is correct for a nested JSON Object but wrong for
+`Value::Null` and non-string scalars — `arguments: null` stringified
+to the literal `"null"`, a number to `"5"`, a bool to `"true"`, none a
+valid tool-arguments object, while the sibling `None` arm already
+correctly fell back to `"{}"`. Fix (verified minimal by the supervisor
+before handing off): replace the two-arm `Some(v) => .. / None => "{}"`
+tail with `Some(v @ serde_json::Value::Object(_)) => v.to_string(), _
+=> "{}".to_string()`, so only a genuine JSON Object (or the existing
+JSON-encoded-String arm) is used as-is and Null/Number/Bool/Array/None
+all collapse to `"{}"`. Kimi's diff matched exactly, one hunk, no
+signature or other logic touched.
+
+**Deliverable, verified on disk.** `git diff` on `orchestrator.rs` is
+exactly the prescribed 2-line substitution — nothing else in the file
+changed. Kimi added
+`test_parse_text_tool_calls_arguments_normalization`
+(`orchestrator_tests.rs`) covering all three required cases: `null` →
+`"{}"`, object `{"a":1}` → stringified object, JSON-encoded string
+`"{\"a\":1}"` → used as-is.
+
+**Independently confirmed fail-without-fix (supervisor-verified).**
+Temporarily reverted just the match arm to the pre-fix two-arm form
+(new test kept in place) and reran: it **failed** exactly as
+predicted — `left: "null" right: "{}"` on the null-arguments
+assertion, the precise bug DeepSeek described. Restored the fix and
+reran: green. The new test is genuine, not a tautology.
+
+**Supervisor repair required: Kimi's test used the wrong Registry
+API.** As written, the test called the legacy `tools.register("foo",
+ok_handler("{}"))`, which registers a handler but no
+`ToolDescriptor`. `parse_text_tool_calls` returns an empty
+`TextToolRecovery` immediately whenever `tools.descriptors()` is
+empty (line ~1648) — a guard that exists precisely so descriptor-free
+tools (the `ask` path) never enter text-tool-call recovery. Every
+other existing test that exercises `parse_text_tool_calls` in this
+file uses `register_with_descriptor` for exactly this reason; Kimi's
+new test was the only one using the plain `register`, so it failed
+even with the correct fix (`recovery.calls.len()` was 0, not 1) — a
+test-authoring miss, not a fix defect. The supervisor swapped in
+`register_with_descriptor` with a matching `ToolDescriptor` (mirroring
+the established pattern at e.g. line ~2056), the minimal change
+consistent with the rest of the file; reran and the test passed
+cleanly, including the fail-without-fix round-trip above. Kimi also
+shipped the test unformatted — `cargo fmt --all -- --check` failed on
+the new test's multi-line call expressions; the supervisor ran `cargo
+fmt --all` (reflowed 3 call sites to one-line form, no logic change)
+and reconfirmed `--check` clean.
+
+**Run stats.** Single attempt, exit 0, no retry, no spawn attempted
+(`--agent-spawn-cap 1` never exercised, no `spawn_agent` calls in the
+transcript). Tool-call shape: 6 `Read` + 2 `find_symbol` + 9
+`fs_scan_file` + 2 `Edit` (1 in `orchestrator.rs`, 1 in
+`orchestrator_tests.rs`) = **19 tool calls total** — over the brief's
+"~3 reads, write early" budget but well under cycle 21's 34, roughly
+half. `kitsu-usage`: 170,527 / 3,590 / 174,117 (completion 15% of the
+24,000 cap). `kitsu-context`: used 12,914 / effective 107,072 / window
+131,072.
+
+**Verification (clean after supervisor repair).** `cargo build
+--workspace`: clean. `cargo clippy --workspace --all-targets`: zero
+warnings — the `Some(v @ Value::Object(_))` / `_` match is exhaustive
+with no unreachable-pattern or unused-binding warning. `cargo fmt --all
+-- --check`: clean after the one repair pass above. `cargo test
+--workspace --no-fail-fast`: only the pre-known PTY flake
+`test_query_only_interactive_session_does_not_create_a_snapshot`
+(cycles 10-21) failed; every other target green, including
+`kitsu-core` at 129/129 (128 pre-existing + Kimi's 1 new, post-repair).
+
+**Grade B+.** Correct core fix (Null/scalar → `"{}"`, Object/String
+preserved, verified fail-without-fix), single-function in
+`orchestrator.rs` itself, SMALLer than the last cycle (19 tool calls
+vs. 34) though still over the "~3 reads" budget, and a genuine,
+well-designed 3-case test — but delivery was incomplete twice over: the
+test used the legacy descriptor-free `Registry::register` instead of
+`register_with_descriptor` (so it would have failed regardless of the
+fix's correctness) and was left unformatted, both requiring supervisor
+repair before the branch was clean. Like cycle 21, this cycle granted
+no `command_exec`, so Kimi had no way to self-check either defect.
+Kimi is now 15-for-16 on code work (cycles 7-22) and 5-for-5 on
+cross-model implementations, with only 1-for-5 (cycle 20) landing
+clean without any supervisor repair — 18: main-branch collision, 19:
+test-premise repair, 21: 2-test ripple, 22: wrong-Registry-API +
+fmt. Next: continue cross-model work — DeepSeek cycle-7 proposal 3
+(circuit-breaker-vs-RequestTooLarge diagnostic precedence, still open)
+or GLM's remaining cycle-8 findings; the recurring pattern across
+cycles 21-22 (shipped tests need a `cargo test`/`cargo fmt` pass Kimi
+cannot run itself) makes scoped `--allow-command
+'["cargo","test","-p","kitsu-core"]'` and `'["cargo","fmt"]'` grants
+worth trying on the next `orchestrator.rs`-touching fix.

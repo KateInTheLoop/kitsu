@@ -5183,3 +5183,41 @@ fn format_command_result_renders_artifact_fields_unquoted() {
         "full output must not be Debug-quoted, got: {rendered}"
     );
 }
+
+// --- text tool-call recovery: arguments normalization -----------------------
+
+/// `parse_text_tool_calls` must turn `arguments: null` (and any non-object,
+/// non-string scalar) into `"{}"`, keep a JSON-encoded string as-is, and
+/// stringify a nested object — only objects/strings are valid tool args.
+#[test]
+fn test_parse_text_tool_calls_arguments_normalization() {
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        kitsu_providers::ToolDescriptor {
+            name: "foo".to_string(),
+            description: "a no-arg tool".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    // 1. null arguments → "{}" (NOT the literal string "null")
+    let recovery = super::parse_text_tool_calls(r#"{"name":"foo","arguments":null}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(
+        recovery.calls[0].args, "{}",
+        "null arguments must fall back"
+    );
+
+    // 2. object arguments → stringified object
+    let recovery =
+        super::parse_text_tool_calls(r#"{"name":"foo","arguments":{"a":1}}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(recovery.calls[0].args, r#"{"a":1}"#);
+
+    // 3. JSON-encoded string arguments → used as-is
+    let recovery =
+        super::parse_text_tool_calls(r#"{"name":"foo","arguments":"{\"a\":1}"}"#, &tools, &[]);
+    assert_eq!(recovery.calls.len(), 1);
+    assert_eq!(recovery.calls[0].args, r#"{"a":1}"#);
+}

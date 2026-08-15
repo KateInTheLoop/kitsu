@@ -2241,8 +2241,8 @@ fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -
         // common alias. Default to `{}` when the model omitted args entirely.
         let args = match obj.get("arguments").or_else(|| obj.get("parameters")) {
             Some(serde_json::Value::String(s)) => s.clone(),
-            Some(v) => v.to_string(),
-            None => "{}".to_string(),
+            Some(v @ serde_json::Value::Object(_)) => v.to_string(),
+            _ => "{}".to_string(),
         };
         let call_id = format!("textcall-{}", calls.len());
         calls.push(ToolCall {
