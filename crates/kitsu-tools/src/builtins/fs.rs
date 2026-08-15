@@ -3345,6 +3345,153 @@ fn truncate_symbol_line(line: &str) -> String {
     }
 }
 
+// --- fs.outline_file (definitions/structure of a source file) ---------------
+
+/// Structural definition keywords — `SYMBOL_DEF_KEYWORDS` minus local bindings
+/// (`let`/`var`/`val`), which are far too noisy for a file outline.
+const OUTLINE_KEYWORDS: &[&str] = &[
+    "fn",
+    "func",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "interface",
+    "impl",
+    "mod",
+    "module",
+    "namespace",
+    "package",
+    "union",
+    "const",
+    "static",
+    "function",
+];
+
+const OUTLINE_DEFAULT_MAX: usize = 500;
+const OUTLINE_MAX_CEILING: usize = 5000;
+
+#[derive(Deserialize)]
+struct OutlineArgs {
+    path: String,
+    /// Definitions shown (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_items: Option<usize>,
+}
+
+/// True when a structural keyword is immediately followed by an identifier
+/// (a definition, not a use). Comment lines are filtered by the caller.
+fn line_defines(line: &str) -> bool {
+    let tokens = identifier_tokens(line);
+    tokens
+        .iter()
+        .enumerate()
+        .any(|(i, tok)| OUTLINE_KEYWORDS.contains(tok) && tokens.get(i + 1).is_some())
+}
+
+/// Skip obvious comment lines to cut false positives (`// fn foo does …`).
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("<!--")
+}
+
+fn render_outline(display: &str, text: &str, max_items: usize, truncated: bool) -> String {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut total = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if is_comment_line(trimmed) || !line_defines(line) {
+            continue;
+        }
+        total += 1;
+        if hits.len() < max_items {
+            hits.push((idx + 1, truncate_symbol_line(line)));
+        }
+    }
+    let scanned = if truncated {
+        format!(
+            ", scanned first {} MiB",
+            SYMBOL_MAX_FILE_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "outline> {display}: {total} definition(s) \
+         [heuristic — fn/struct/class/def/type/impl/const/…{scanned}]\n"
+    );
+    if total == 0 {
+        out.push_str("(no top-level definitions detected)\n");
+        return out;
+    }
+    for (no, line) in &hits {
+        out.push_str(&format!("  {no}: {line}\n"));
+    }
+    if total > hits.len() {
+        out.push_str(&format!(
+            "  [showing {} of {total}; raise max_items for more]\n",
+            hits.len()
+        ));
+    }
+    out
+}
+
+pub fn outline_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "outline_file".to_string(),
+        description: "List the definitions in a source file (functions, structs/classes, enums, \
+                      traits, types, impls, consts, modules) with line numbers — a quick \
+                      structural map so you don't have to read the whole file. Heuristic + \
+                      language-agnostic; comment lines and local let/var bindings are excluded. \
+                      Same allowlist as fs_read_file. Use find_symbol to then jump to one."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a source file"},
+                "max_items": {"type": "integer", "description": "Definitions shown (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { outline_file_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn outline_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: OutlineArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let max = a
+        .max_items
+        .unwrap_or(OUTLINE_DEFAULT_MAX)
+        .clamp(1, OUTLINE_MAX_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, SYMBOL_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let truncated = buf.len() as u64 >= SYMBOL_MAX_FILE_BYTES;
+        let text = String::from_utf8_lossy(&buf);
+        Ok(render_outline(&display, &text, max, truncated))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
 pub fn find_symbol_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "find_symbol".to_string(),
@@ -7410,6 +7557,85 @@ mod tests {
         std::fs::write(&bad, "<p>hi</p>").unwrap();
         assert!(matches!(
             read_html_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn outline_lists_definitions_and_skips_noise() {
+        let src = r#"// fn commented_out does nothing
+use std::fmt;
+
+pub struct Config {
+    name: String,
+}
+
+const MAX: usize = 10;
+
+impl Config {
+    pub fn new(name: String) -> Self {
+        let mut count = 0;
+        Self { name }
+    }
+}
+
+fn helper(x: u32) -> u32 { x + MAX as u32 }
+"#;
+        let out = render_outline("lib.rs", src, 500, false);
+        assert!(out.contains("struct Config"), "{out}");
+        assert!(out.contains("const MAX"), "{out}");
+        assert!(out.contains("impl Config"), "{out}");
+        assert!(out.contains("fn new"), "{out}");
+        assert!(out.contains("fn helper"), "{out}");
+        assert!(out.contains("5 definition(s)"), "{out}");
+        // The commented `fn commented_out` is not a definition.
+        assert!(!out.contains("commented_out"), "comment leaked: {out}");
+        // A local `let mut count` binding is excluded.
+        assert!(
+            !out.contains("let mut count"),
+            "local binding leaked: {out}"
+        );
+        // `use` is not a definition.
+        assert!(!out.contains("use std::fmt"), "{out}");
+    }
+
+    #[test]
+    fn outline_no_defs_is_honest() {
+        let out = render_outline("x.txt", "just some prose\nno code here\n", 500, false);
+        assert!(out.contains("(no top-level definitions detected)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn outline_file_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("mod.rs");
+        std::fs::write(&path, "pub fn alpha() {}\nstruct Beta;\nfn gamma() {}\n").unwrap();
+
+        let out = outline_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("outline ok");
+        assert!(out.contains("3 definition(s)"), "{out}");
+        assert!(
+            out.contains("fn alpha") && out.contains("struct Beta") && out.contains("fn gamma"),
+            "{out}"
+        );
+        assert!(out.contains("1: pub fn alpha"), "line numbers: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.rs");
+        std::fs::write(&bad, "fn z() {}\n").unwrap();
+        assert!(matches!(
+            outline_file_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
             )
