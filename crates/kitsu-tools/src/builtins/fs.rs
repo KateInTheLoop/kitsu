@@ -1349,6 +1349,8 @@ enum DocType {
     Office(&'static str),
     /// Jupyter notebook (`.ipynb`) — JSON with a `cells` array.
     Notebook,
+    /// HTML document (`.html`/`.htm`) — extracted to plain text.
+    Html,
 }
 
 /// Detect the document class from magic bytes first (authoritative for binary
@@ -1389,6 +1391,7 @@ fn detect_doc_type(path: &Path, magic: &[u8]) -> DocType {
     match ext.as_deref() {
         Some("csv") | Some("tsv") => DocType::Csv,
         Some("ipynb") => DocType::Notebook,
+        Some("html") | Some("htm") => DocType::Html,
         Some("pdf") => DocType::Pdf, // extensionless-magic already handled above
         // Extension-only image hints (e.g. a truncated header) still classify.
         Some("png") => DocType::Image("PNG"),
@@ -1408,10 +1411,11 @@ pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerF
         description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
                       to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
                       → text, XLSX → spreadsheet cells, DOCX → paragraph text, PPTX → slide text, \
-                      .ipynb → notebook cells. Always discloses the detected type and which reader \
-                      ran. Images report metadata only; unknown zip-based Office types are detected \
-                      and disclosed but not text-extracted. Unknown types fall back to a UTF-8 text \
-                      read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+                      .ipynb → notebook cells, .html/.htm → readable text. Always discloses the \
+                      detected type and which reader ran. Images report metadata only; unknown \
+                      zip-based Office types are detected and disclosed but not text-extracted. \
+                      Unknown types fall back to a UTF-8 text read. For paging a large CSV/PDF, \
+                      call fs_read_csv/fs_read_pdf directly."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1477,6 +1481,10 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
         DocType::Notebook => (
             "notebook → fs_read_notebook",
             read_notebook_run(policy, &path_args).await?,
+        ),
+        DocType::Html => (
+            "HTML → fs_read_html",
+            read_html_run(policy, &path_args).await?,
         ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
@@ -1710,6 +1718,257 @@ async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolE
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("docx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_html (best-effort HTML → text) ---------------------------------
+
+const HTML_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadHtmlArgs {
+    path: String,
+}
+
+/// Common HTML named entities beyond the XML five (which quick_xml decodes).
+fn html_named_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "nbsp" => " ",
+        "copy" => "(c)",
+        "reg" => "(r)",
+        "trade" => "(tm)",
+        "mdash" => "—",
+        "ndash" => "–",
+        "hellip" => "…",
+        "lsquo" | "rsquo" | "sbquo" => "'",
+        "ldquo" | "rdquo" | "bdquo" => "\"",
+        "laquo" => "«",
+        "raquo" => "»",
+        "bull" => "•",
+        "middot" => "·",
+        "deg" => "°",
+        _ => return None,
+    })
+}
+
+/// Decode one entity body (the text between `&` and `;`). Falls back to the
+/// literal `&body;` when unknown.
+fn decode_html_entity(body: &str) -> String {
+    if let Some(mapped) = html_named_entity(body) {
+        return mapped.to_string();
+    }
+    if let Some(rest) = body.strip_prefix('#') {
+        let code = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            rest.parse::<u32>().ok()
+        };
+        if let Some(c) = code.and_then(char::from_u32) {
+            return c.to_string();
+        }
+    }
+    match quick_xml::escape::unescape(&format!("&{body};")) {
+        Ok(s) => s.into_owned(),
+        Err(_) => format!("&{body};"),
+    }
+}
+
+/// A block-level tag whose presence should become a line break in the text.
+fn is_html_block_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div"
+            | "br"
+            | "hr"
+            | "li"
+            | "tr"
+            | "table"
+            | "blockquote"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "main"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "pre"
+            | "figure"
+            | "figcaption"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "form"
+            | "title"
+    )
+}
+
+/// Collapse each line's internal whitespace to single spaces and cap runs of
+/// blank lines at one.
+fn collapse_html_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_blank = false;
+    for line in text.lines() {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            pending_blank = true;
+            continue;
+        }
+        if !out.is_empty() && pending_blank {
+            out.push('\n');
+        }
+        pending_blank = false;
+        out.push_str(&collapsed);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+/// Best-effort HTML → text: drop `<script>`/`<style>`/comments wholesale (so
+/// `a<b` inside a script never derails tag parsing), strip remaining tags,
+/// emit a newline at block-level tags, and decode entities.
+fn html_to_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let hb = html.as_bytes();
+    let n = hb.len();
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut i = 0;
+    while i < n {
+        match hb[i] {
+            b'<' => {
+                if lower[i..].starts_with("<!--") {
+                    i = lower[i..].find("-->").map_or(n, |e| i + e + 3);
+                    continue;
+                }
+                // Skip <script>…</script> and <style>…</style> as raw blocks.
+                let mut skipped = false;
+                for tag in ["script", "style"] {
+                    let open = format!("<{tag}");
+                    if lower[i..].starts_with(&open)
+                        && matches!(
+                            hb.get(i + open.len()),
+                            Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+                        )
+                    {
+                        let close = format!("</{tag}>");
+                        i = lower[i..].find(&close).map_or(n, |e| i + e + close.len());
+                        skipped = true;
+                        break;
+                    }
+                }
+                if skipped {
+                    continue;
+                }
+                let Some(rel_end) = lower[i..].find('>') else {
+                    break; // unterminated tag — drop the rest
+                };
+                let inner = &lower[i + 1..i + rel_end];
+                let name_part = inner.strip_prefix('/').unwrap_or(inner);
+                let name: String = name_part
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if is_html_block_tag(&name) && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                i += rel_end + 1;
+            }
+            b'&' => {
+                // Bounded lookahead for the entity terminator.
+                if let Some(rel) = lower[i + 1..].find(';') {
+                    if rel <= 32 {
+                        out.push_str(&decode_html_entity(&html[i + 1..i + 1 + rel]));
+                        i += 1 + rel + 1;
+                        continue;
+                    }
+                }
+                out.push('&');
+                i += 1;
+            }
+            _ => {
+                // Append the whole run of text up to the next '<' or '&'.
+                let rest = &html[i..];
+                let stop = rest.find(['<', '&']).unwrap_or(rest.len());
+                out.push_str(&rest[..stop]);
+                i += stop;
+            }
+        }
+    }
+    collapse_html_whitespace(&out)
+}
+
+fn render_html(display: &str, html: &str) -> String {
+    let text = html_to_text(html);
+    let mut out = format!(
+        "html> {display}: text extracted (tags stripped, scripts/styles removed, \
+         whitespace collapsed — layout and formatting are not preserved)\n"
+    );
+    if text.is_empty() {
+        out.push_str("(no extractable text)\n");
+    } else {
+        out.push_str(&text);
+        out.push('\n');
+    }
+    out
+}
+
+pub fn read_html_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_html".to_string(),
+        description: "Extract readable text from an HTML file (tags stripped, <script>/<style>/\
+                      comments removed, entities decoded, block tags become line breaks). \
+                      Best-effort — layout, tables, and formatting are NOT preserved. Dep-free; \
+                      same allowlist as fs_read_file."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to an .html/.htm file"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_html_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_html_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadHtmlArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > HTML_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            HTML_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, HTML_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let html = String::from_utf8_lossy(&buf);
+        Ok(render_html(&display, &html))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
     Ok(policy.cap_output(rendered))
 }
 
@@ -7080,6 +7339,77 @@ mod tests {
         std::fs::write(&bad, SAMPLE_NOTEBOOK).unwrap();
         assert!(matches!(
             read_notebook_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_scripts_and_decodes_entities() {
+        let html = "<!DOCTYPE html><html><head><title>Doc</title>\
+            <style>.c{color:red}</style></head><body>\
+            <h1>Heading</h1><p>Hello &amp; <b>world</b> — 5 &lt; 6</p>\
+            <script>var secret = a < b && c > d;</script>\
+            <!-- a comment --><ul><li>one</li><li>two</li></ul>\
+            <p>&#65; &#x42; &nbsp;end</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Heading"), "{text}");
+        assert!(text.contains("Hello & world — 5 < 6"), "{text}");
+        // <script>/<style> content removed wholesale (incl. the `a < b` that
+        // would derail a naive tag parser).
+        assert!(!text.contains("var secret"), "script leaked: {text}");
+        assert!(!text.contains("color:red"), "style leaked: {text}");
+        assert!(!text.contains("a comment"), "comment leaked: {text}");
+        // Block tags become line breaks; list items land on their own lines.
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        // Entities: &#65;=A, &#x42;=B, &nbsp;=space.
+        assert!(text.contains("A B end"), "entities: {text}");
+    }
+
+    #[tokio::test]
+    async fn read_html_end_to_end_dispatch_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("page.html");
+        std::fs::write(
+            &path,
+            "<html><body><h1>Report</h1><p>Body &amp; text</p>\
+             <script>x<y</script></body></html>",
+        )
+        .unwrap();
+
+        let out = read_html_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("html ok");
+        assert!(
+            out.contains("Report") && out.contains("Body & text"),
+            "{out}"
+        );
+        assert!(!out.contains("x<y"), "script leaked: {out}");
+
+        // read_document routes .html to fs_read_html.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("HTML → fs_read_html"), "{out}");
+        assert!(out.contains("Report"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.html");
+        std::fs::write(&bad, "<p>hi</p>").unwrap();
+        assert!(matches!(
+            read_html_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
             )
