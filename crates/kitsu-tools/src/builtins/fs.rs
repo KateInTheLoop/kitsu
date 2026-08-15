@@ -404,13 +404,22 @@ fn read_capped_line_range(
             .strip_suffix('\n')
             .map(|rest| rest.strip_suffix('\r').unwrap_or(rest))
             .unwrap_or(&line);
+        // Prefix each served line with its ABSOLUTE line number + a tab, so a
+        // model citing a ranged read counts from the file's real numbering
+        // instead of self-counting from `start` (which drifts ~1 line,
+        // especially on a blank first line — the R1.7 fix). The prefix is
+        // display-only: fs_edit_file matches raw file text, so `old_text`
+        // must NOT include it (documented in the tool description).
+        let prefix = format!("{line_number}\t");
         let separator = usize::from(!text.is_empty());
-        if text.len() + separator + stripped.len() > max_bytes {
+        if text.len() + separator + prefix.len() + stripped.len() > max_bytes {
             truncated = true;
             if text.is_empty() {
-                // A single line larger than the whole budget: serve its
-                // prefix on a char boundary rather than nothing.
-                let mut cut = max_bytes;
+                // A single line larger than the whole budget: serve the line
+                // number prefix and the content prefix on a char boundary.
+                text.push_str(&prefix);
+                let budget = max_bytes.saturating_sub(prefix.len());
+                let mut cut = budget.min(stripped.len());
                 while cut > 0 && !stripped.is_char_boundary(cut) {
                     cut -= 1;
                 }
@@ -421,6 +430,7 @@ fn read_capped_line_range(
         if separator == 1 {
             text.push('\n');
         }
+        text.push_str(&prefix);
         text.push_str(stripped);
     }
     Ok(CappedText {
@@ -471,7 +481,11 @@ pub fn read_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
     let descriptor = ToolDescriptor {
         name: "fs_read_file".to_string(),
         description: "Read a UTF-8 text file from an allowed path. Optionally restrict to a \
-                      1-based inclusive line range with start_line/end_line."
+                      1-based inclusive line range with start_line/end_line. A ranged read \
+                      prefixes each line with its absolute line number and a tab (e.g. \
+                      \"42\\t<code>\") so you can cite exact line numbers; this prefix is \
+                      display-only — do NOT include it in fs_edit_file old_text. A full read \
+                      (no range) is returned verbatim with no prefixes."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -5413,7 +5427,21 @@ UseDNS no
             serde_json::json!({"path": path.to_string_lossy(), "start_line": 2, "end_line": 3})
                 .to_string();
         let out = read_file_run(&policy, &args).await.expect("read ok");
-        assert_eq!(out, "l2\nl3");
+        // Ranged reads are line-number prefixed (R1.7) so citations are exact.
+        assert_eq!(out, "2\tl2\n3\tl3");
+    }
+
+    #[tokio::test]
+    async fn full_read_has_no_line_prefixes() {
+        // A full read (no range) is verbatim — prefixes are ranged-only, so
+        // the edit-context path is unchanged.
+        let (dir, root) = temp_with_file("a.txt", "l1\nl2\nl3\n");
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("a.txt");
+        let args = serde_json::json!({"path": path.to_string_lossy()}).to_string();
+        let out = read_file_run(&policy, &args).await.expect("read ok");
+        assert_eq!(out, "l1\nl2\nl3\n");
+        assert!(!out.contains('\t'), "no line-number prefix on a full read");
     }
 
     #[tokio::test]
@@ -5461,8 +5489,8 @@ UseDNS no
 
         let output = read_file_run(&policy, &args).await.unwrap();
 
-        assert!(output.starts_with("line-03000"), "got: {output}");
-        assert!(output.contains("line-03004"));
+        assert!(output.starts_with("3000\tline-03000"), "got: {output}");
+        assert!(output.contains("3004\tline-03004"));
         assert_eq!(output.lines().count(), 5);
         assert!(
             !output.contains("truncated"),
@@ -5489,7 +5517,7 @@ UseDNS no
         // Serving starts at the requested line, fills the budget, and the
         // disclosure reports post-slice served bytes (~64 KiB), not the
         // pre-slice absolute read.
-        assert!(output.starts_with("line-03000"), "got: {output}");
+        assert!(output.starts_with("3000\tline-03000"), "got: {output}");
         assert!(output.contains("served 63 KiB") || output.contains("served 64 KiB"));
         assert!(output.ends_with("re-read a line range for the rest]"));
     }
