@@ -217,6 +217,11 @@ kitsu sessions delete <exact-id>
 kitsu sessions resume last --json  # prints exact argv outside interactive chat
 ```
 
+Archived snapshots are intentionally absent from the live inventory and cannot
+be resumed until restored. Keep the exact ID from the archive receipt and run
+`kitsu sessions restore <exact-id>` (or `/restore <exact-id>` inside chat)
+before resuming it.
+
 Fork receipts resolve `last` before cloning and identify the exact lineage as
 `source-session-id -> fork-session-id`. JSON adds `source_session_id` alongside
 the existing forked `session` and `permissions_restored` fields. The source
