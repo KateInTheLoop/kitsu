@@ -262,6 +262,10 @@ gateway run (ollama qwen2.5-coder) confirmed the tool is registered,
 invoked, policy-enforced, and parses page count correctly — and
 usefully exposed that lopdf 0.34 can't decode some LibreOffice PDFs'
 ToUnicode CMap, which the tool discloses honestly per page rather than
-emitting garbage (the acceptance signal's intent). Haiku review pending.
+emitting garbage (the acceptance signal's intent). Haiku review:
+SHIP-AS-IS — all 10 edge cases traced (per-page error isolation,
+half-open paging bounds, 1-based numbering, size guard before parse,
+corrupt-input handling, spawn_blocking, panic-freedom), acceptance
+signal met, no findings.
 Next in lane 2: R2.3 image handling, then R2.4 docx/xlsx, then R2.5
 type-aware dispatch — after which lane 2's core is complete.
