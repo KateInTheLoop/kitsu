@@ -1468,3 +1468,101 @@ unreviewed.
 
 **Ramp status:** GLM holds a perfect grade record across 11 cycles (5
 reviews, 6 code). Top-tier standing unchanged.
+
+### Cycle 12 — 2026-08-15 — sixth review, the catalog FETCH path (grade A) — perfect citation record extends to 6-for-6
+
+Fresh area, alternation held (cycle 11 was code): the catalog-fetching half of
+`openai_compat.rs`, distinct from cycle 10's catalog-*parsing* review
+(`context_length_from_catalog`) and cycle 8's `auth.rs`. Target:
+`get_models_response`, lines 1220-1270 — pre-flight re-grepped
+(`grep -n 'fn get_models_response'`) and read in full to confirm the exact
+range before spawning: the function opens at line 1220 and its closing
+`    }` sits at line 1270 exactly as pinned, zero drift from the assigned
+range. Driver rebuilt fresh from the main checkout immediately before the
+run (`CARGO_TARGET_DIR=/home/mmpg/.cache/glm-worktree-target cargo build -p
+kitsu`, clean, fresh binary mtime confirmed). Ran from inside the worktree.
+Success on `:together` attempt 1 — no transport failure, no retry, no
+provider fallback needed, no spawn attempted (cap 1 unexercised).
+
+**Read discipline: excellent — 4 `Read` calls (under the ~5 guidance) plus
+one `fs_scan_file` and one `find_symbol` lightweight lookup, 1 `Write`.**
+Sequence: read the target function, read the surrounding struct/TTL-const
+context, a `fs_scan_file` probe, a third `Read`, then a self-narrated
+`find_symbol` to locate `validate_models_catalog` ("I have not read
+`fetch_models_response`, `validate_models_catalog`, or `auth.header()`. Let
+me locate `validate_models_catalog` since it directly determines the error
+class mapped at line 1245") before a final targeted `Read` of it, then wrote
+the review once — no re-reading loops, no over-scope drift. `kitsu-usage:
+{"prompt_tokens":54568,"completion_tokens":4007,"total_tokens":58575}`.
+`kitsu-context: {"used":10440,"effective":107072,"window":131072}`. Run
+summary: "1 turn(s) ok, 4 file(s) read, 1 file(s) written (1 change(s)),
+session not saved" — clean exit, no `PolicyDenied`, no discard.
+
+**Grade: A.** `reviews/glm-cycle-12.md` opens with an explicit scope/hedge
+preamble naming exactly what was read in-file (the function itself,
+`MODELS_CACHE_TTL`/`MODELS_NEGATIVE_CACHE_TTL` at lines 68-69, the
+`OpenAICompatProvider`/`ModelsCacheEntry` definitions at lines 26-53, and
+`validate_models_catalog` at 1393-1410) versus what was explicitly NOT read
+(`fetch_models_response`, `self.auth.header()`/`AuthProvider`,
+`model_context_length`) — the cleanest up-front hedge declaration of any
+cycle so far, ahead of any individual proposal needing it. 3 ranked,
+line-cited proposals:
+- **P1** — every cache write (line 1267,
+  `context_lengths: std::sync::Mutex::new(HashMap::new())`) allocates a
+  fresh empty memo map, including on the far-more-frequent 5s negative-cache
+  refreshes where the map can never be populated (outcome is `Err`) — pure
+  allocation waste on the hot path, plus a positive→positive refresh
+  silently discards any warm memo. Explicitly hedged on `model_context_length`
+  call frequency ("If `model_context_length` is called rarely... this drops
+  to P3 cosmetics"). The illustrative proposal snippet has a minor bug of
+  its own (references `e.context_lengths` inside a closure where `e` is no
+  longer bound after the first `.and_then` consumed it) — a sketch-only
+  slip, not applied to the tree, but worth noting as the first citation-
+  adjacent rough edge in six reviews.
+- **P2** — the auth-before-cache ordering (line 1231's `self.auth.header()`
+  ahead of the line 1236 lock) is correct and matches the block comment's
+  stated invariant verbatim, but is enforced only by source-order, not by
+  types; proposes binding the result (`let _header = ...`) so a future
+  refactor can't silently reorder it. Correctly hedges `auth.header()`'s
+  actual cost/semantics as unread.
+- **P3** — a 200-with-structurally-invalid-body is converted to
+  `Err(InvalidResponse(...))` and negatively cached for 5s using kitsu's own
+  diagnostic text rather than the server's raw body; also notes the flat 5s
+  TTL applies identically to a transient 503 and a permanent 400 with no
+  distinction. Correctly hedges which `ProviderError` variant a real 5xx
+  produces, since `fetch_models_response` was not read.
+
+**Citation spot-check: every citation exact, zero drift — sixth review in a
+row with a perfect record.** Re-verified directly against the file:
+line 1231 (`self.auth.header().map_err(ProviderError::Auth)?;`), lines
+1236-1241 (the cache-hit block, verbatim including the `if entry.stored_at
+.elapsed() < entry.ttl` guard), the 1228-1230 block comment ("A cached
+catalog must never turn a now-missing credential into an apparent
+healthcheck success. Validate current auth before consulting the cache;
+auth failures themselves are deliberately never cached." — exact), lines
+1243-1248 and 1256-1260 (the outcome match and negative-cache error arms),
+lines 1263-1268 (the cache-write literal), the struct-doc quote "Fresh on
+every cache invalidation, so it inherits the existing TTL contract."
+(lines 50-51, exact), the two TTL consts (`Duration::from_secs(60)` /
+`Duration::from_secs(5)`, lines 68-69, exact), and `validate_models_catalog`
+'s three error paths (lines 1393-1412, matching GLM's description of
+malformed-JSON / missing-data-array / missing-string-id exactly). No
+substantively-wrong claim and no unhedged out-of-scope assertion found —
+every claim touching `fetch_models_response`, `self.auth.header()`,
+`AuthProvider`, or `model_context_length` carries an explicit "hedged"
+tag, exactly per the prompt's mandate.
+
+**Observed kitsu weaknesses / notes:** none new this cycle — clean single-
+attempt run, no transport issue, no `PolicyDenied`, no discard, no spawn
+attempt. W1-W5 from prior cycles still open, none re-triggered.
+
+**GLM is now 6-for-6 A on reviews and 6-for-6 on code (12-for-12 overall),
+citation record 6-for-6 perfect on reviews.** Next code cycle: a fresh item
+from this review's own P1 (negative-cache `HashMap` churn) is a reasonable
+small-scope candidate, or pull from the still-open backlog (cycle-10
+findings 2-4, cycle-8 finding 2, cycle-5 findings 5/6, P8/P11). Remaining
+unreviewed surface: `fetch_models_response`, `StaticAuth`/`NoAuth`
+`header()` impls, `expiry_status()`, and the retry/backoff paths.
+
+**Ramp status:** GLM holds a perfect grade record across 12 cycles (6
+reviews, 6 code). Top-tier standing unchanged.
