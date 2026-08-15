@@ -202,3 +202,40 @@ efficiency fix GLM proposed in this very cycle (implementing its own
 finding, as Kimi did with P3). Widen `--allow-write` to `kitsu-providers`
 for that cycle; apply the full write-first recipe + workspace-wide
 verification.
+
+### Cycle 3 — 2026-08-14 — GLM's FIRST CODE CONTRIBUTION (grade B)
+
+Implemented P10 (its own cycle-2 proposal). Commit `2c0c796` (Kate
+verified), pushed. **Implementation genuinely correct:** a
+`context_lengths: Mutex<HashMap<String, Option<u64>>>` memo inside
+`ModelsCacheEntry`, parsing extracted into a pure
+`context_length_from_catalog()`, `model_context_length` checks the memo
+before parsing; the memo lives inside the cache entry so TTL
+refill/invalidation replaces it wholesale — contract genuinely preserved.
+
+- **JOURNAL-CAP FIX VALIDATED ON A REAL MODEL:** GLM edited
+  `openai_compat.rs` (63 KiB, near the old 64 KiB cap) DIRECTLY across 4
+  in-place edits with **zero journal-limit errors** — the first
+  production confirmation of last cycle's R1.6 fix on the exact file
+  class it was built for. 5 reads, 5 edits, no re-read loops, cap-1
+  unexercised, no spawn.
+- **Docked to B — superficial tests (new weakness).** GLM's 3 tests
+  asserted HTTP-call-count (`.expect(1)` on a wiremock stub), which
+  proves "no re-FETCH" (already true pre-P10) — NOT "no re-PARSE" (the
+  actual P10 claim). The supervisor VERIFIED this empirically: stashed
+  the impl, GLM's tests still passed against unmemoized code. Replaced
+  with 3 genuine tests (corrupted-cache: mutate the cached body, assert
+  the memo still returns the pre-corruption value; TTL-refill re-parses;
+  unknown-model → None). All 6 pass. **Lesson for GLM's code ramp: a test
+  must prove the actual claim, not a proxy for it** — its review-side
+  rigor didn't fully transfer to test design yet.
+- Narrow non-blocking race filed as follow-up (memo could inherit a value
+  from a fetch superseded during a concurrent TTL refill).
+- Weaknesses: W3 CLI friction (--allow-path/--allow-write under `chat`
+  only, third hit — roadmap R4.7); W4 the superficial-test pattern above.
+
+**GLM is a code contributor (first diff landed, correct design). It is
+2-for-2 A on reviews + 1 code cycle at B (tests were the gap, not the
+code).** Next code cycle: reinforce test-writing (prove the claim
+directly), a fresh P-item Kimi hasn't taken (P8 trim-buffer scaling, or
+P11 tool-schema re-serialization).
