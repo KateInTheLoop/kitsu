@@ -11682,6 +11682,95 @@ fn test_queue_subaction_typo_suggests_close_match_instead_of_queueing() {
 }
 
 #[test]
+fn test_scripted_queue_command_reports_queue_specific_recovery() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("scripted-queue.txt");
+    fs::write(&script_path, "/status\n/queue list\n/quit\n").unwrap();
+    let message = "queue commands require interactive chat; put prompts on later script lines";
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--allow-turn-errors",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run scripted queue JSONL case");
+    assert!(jsonl.status.success(), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "error",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[5]["line"], 2);
+    assert_eq!(events[5]["command"], "/queue list");
+    assert_eq!(events[5]["kind"], "user");
+    assert_eq!(events[5]["message"], message);
+    assert_eq!(events[5]["exit_code"], 1);
+    assert_eq!(events[6]["status"], "error");
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["status"], "partial");
+    assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["user_failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
+    assert_eq!(summary["session_snapshot_state"], "disabled");
+    assert!(summary["session_id"].is_null());
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+
+    let human = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--allow-turn-errors",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run scripted queue human case");
+    assert!(human.status.success(), "{human:?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}:2: {message}", script_path.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("session commands require interactive chat"));
+}
+
+#[test]
 fn test_script_transcript_echo_strips_terminal_control_sequences() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), "http://127.0.0.1:1");

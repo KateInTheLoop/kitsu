@@ -268,6 +268,8 @@ guarantees requires a new schema identifier.
   is terminal-safe and never contains provider-controlled error detail. A
   missing `/checkpoint <id>` likewise retains its host-authored instruction to
   run `/checkpoints` rather than degrading to the generic command-failed text.
+  Scripted `/queue` failures retain the queue-specific instruction to put
+  prompts on later script lines; they are not classified as session commands.
   The `permissions` result carries `commands.exact_grants[].cwd_source`
   (`"explicit"`, `"launch_directory"`, or `null` for a grant created at runtime
   through the approval prompt) and a `host_evidence` object describing the
