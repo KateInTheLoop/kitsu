@@ -454,10 +454,20 @@ impl SseDecoder {
         let value: serde_json::Value = serde_json::from_str(data).map_err(|_| {
             ProviderError::InvalidResponse("malformed JSON in SSE data record".to_string())
         })?;
-        if value.get("error").is_some() {
-            return Err(ProviderError::InvalidResponse(
-                "provider returned an error object in a successful SSE response".to_string(),
-            ));
+        if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
+            // A real (non-null) error object in a "successful" SSE response means the
+            // gateway failed mid-stream. Surface the gateway's own message text so the
+            // caller can see *why* (e.g. "rate limited"); fall back to a sane fixed
+            // string only when no message/string form is present. A JSON `null` error
+            // is NOT an error and must be ignored (some gateways emit `"error": null`).
+            let detail = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err.as_str())
+                .unwrap_or("provider returned an error object in a successful SSE response");
+            return Err(ProviderError::InvalidResponse(format!(
+                "provider error in SSE stream: {detail}"
+            )));
         }
         let chunk: StreamChunk = serde_json::from_value(value).map_err(|_| {
             ProviderError::InvalidResponse(
