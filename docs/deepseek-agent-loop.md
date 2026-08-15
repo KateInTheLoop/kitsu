@@ -1,10 +1,11 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 1 banked (grade B); cycle 2 produced no
-> deliverable (both attempts failed before writing the review file).**
-> A fresh HF token was present at cycle-1 spawn time (the earlier
-> birth-blocking rotation is no longer in effect for this token). See
-> the Cycle log below.
+> **LIVE 2026-08-14: cycle 1 banked (grade B); cycle 2 and its retry have
+> now both produced no deliverable (4 of 4 kitsu invocations against the
+> orchestrator review task have failed to write a file).** A fresh HF
+> token was present at cycle-1 spawn time (the earlier birth-blocking
+> rotation is no longer in effect for this token). See the Cycle log
+> below.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -311,3 +312,127 @@ subagents; this run has none available") reduces the spawn-retry
 behavior that preceded the W3 HTTP 400. The citation-discipline
 hypothesis from this cycle's brief remains untested and should be
 retried once a deliverable actually ships.
+
+### Cycle 2 retry — 2026-08-14 — same task, mitigated flags, still 0 deliverables (grade F/incomplete)
+
+Same orchestrator trim/summarize/compaction review task as cycle 2
+(`enforce_context_budget_recording`, the summarize/compaction fallback,
+`request_measurement`, `ensure_chat_request_fits`), deliverable
+`reviews/deepseek-cycle-2.md`, with the two ramp-status mitigations from
+the cycle 2 entry applied: **`--agent-spawn-cap 1`** (not `0`, so a
+stray spawn degrades instead of triggering the W3 crash path) and a
+prompt hard-capping reads ("read ONLY these ranges, AT MOST once each
+... total reads: at most ~6 ranged reads ... write EARLY"), plus the
+citation re-read-before-cite instruction carried over unchanged. Flags:
+`--gateway huggingface --model deepseek-ai/DeepSeek-V4-Pro:together
+--context-window 131072 --timeout-secs 300 --max-output-tokens 24000
+--reasoning-effort low --max-rounds 30 --agent-spawn-cap 1`.
+
+**Neither attempt produced a deliverable.** `reviews/deepseek-cycle-2.md`
+still does not exist. This is DeepSeek's 4th consecutive shipless
+invocation on this task (2 from the original cycle 2, 2 here); the
+citation-discipline hypothesis remains completely untested three cycles
+running.
+
+- **Attempt 1:** ~15 `Read` calls, starting with a broad, out-of-brief
+  sweep (`1–50`, `1–60`, `60–120`, `120–180`, `180–240`, `240–300`,
+  `300–400` — none of those ranges contain any of the four named
+  functions, which all live past line 1950) before it located the real
+  targets and read around them (`1951–2070`, `2075–2380`, `2375–2670`,
+  `2670–2780`, plus several small re-reads). It also **spawned one
+  sub-agent** ("find the four target functions...") despite the prompt's
+  explicit "Do NOT spawn sub-agents. Do every read yourself." — the
+  spawn was allowed through `--agent-spawn-cap 1` cleanly (81.8s, 21
+  lines back) with **no crash and no HTTP 400**, unlike cycle 2's
+  cap-0 run. It then read two ranges of `crates/kitsu-core/src/context.rs`
+  (explicitly out of scope, already reviewed in cycle 1). No write call
+  was ever made. The turn hit the 300s timeout
+  (`inference provider attempt 1/3: cancelled; HTTP 200; cancelled;
+  terminal=true`) and was correctly discarded with no `kitsu-usage` line
+  emitted (never reached a billed completion).
+- **Retry (this cycle's own one allowed retry, per the loop's cost-bound
+  rule):** worse over-reading — ~28 `Read` calls, including duplicate
+  reads of the same ranges (e.g. `1962–2006` read twice, `2013–2025`
+  overlapping a prior `2007–2030` read, `2127–2135` re-reading a subset
+  of an already-read `2127–2180`), one more disobeyed **spawn** ("Search
+  ... for the line numbers where these functions are defined", 111.2s,
+  13 lines back — again absorbed cleanly by cap 1, no crash), and again
+  two reads into out-of-scope `context.rs`. No write call. Same 300s
+  timeout, same clean discard, no `kitsu-usage` line.
+
+Per the loop's cost-bound rule, no third attempt was made.
+
+**Grade: incomplete / F on this cycle's own terms**, same as the
+original cycle 2 — not a bad review, no review at all.
+
+**What the mitigations did and didn't fix:**
+- **Fixed:** the W3 crash path. `--agent-spawn-cap 1` absorbed a
+  disobeyed spawn attempt in both attempts with a clean tool response
+  and no downstream `HTTP 400` — the mid-turn tool-list-mutation crash
+  that killed cycle 2's first attempt did not recur. This is now decent
+  evidence the crash is specifically tied to the cap-0 "deny, retry,
+  deny-and-withhold" sequence, not to spawning-while-capped in general;
+  R4.8 should reproduce with cap 0 specifically to confirm the isolate.
+- **Not fixed:** DeepSeek still tried to spawn in both attempts despite
+  an explicit, unambiguous prose prohibition ("Do NOT spawn sub-agents")
+  — a model-adherence gap, not a kitsu bug, but each spawn cost 80–110s
+  of the 300s budget, materially contributing to both timeouts.
+- **Not fixed:** the "at most ~6 ranged reads" cap was not merely missed
+  but blown by 2–4x in both attempts (15 and 28 reads respectively, the
+  second attempt *more* over-read than the first despite being a retry
+  with the same tightened prompt). Prose-only read caps have now failed
+  in 3 of 3 tries across cycle 2 and this retry.
+- **Not fixed:** "write the deliverable EARLY" was ignored in all 4
+  invocations across both cycles; kitsu still has no mid-turn mechanism
+  to surface or enforce this class of instruction (W4, unchanged).
+- **Recurred:** both attempts here also strayed into `context.rs`,
+  mirroring cycle 2's retry exactly — scope creep beyond the named file
+  is a repeatable failure mode, not a one-off.
+
+**kitsu weaknesses observed / follow-ups:**
+
+- **W3 status: mitigation confirmed working.** `--agent-spawn-cap 1`
+  is a safe near-term default for models that disobey spawn
+  instructions — it avoids the cap-0 crash entirely. Recommend keeping
+  cap 1 as the loop default until R4.8 lands, and only then
+  re-testing cap 0 to verify the fix directly.
+- **W6 (new):** kitsu has a technical spawn-count cap
+  (`--agent-spawn-cap`) but no analogous technical *read-count* or
+  *read-scope* cap. Every read-discipline instruction in this loop has
+  been prose-only and prose-only read caps are now 0-for-3 against this
+  model on this task. A `--max-tool-calls-per-turn <tool> <N>` style
+  cap (or a narrower `--allow-path` that excludes files not named in a
+  companion allowlist) would give the supervisor a real lever instead
+  of relying on the model to self-limit.
+- **W4 (recurred, unchanged):** still no mid-turn nudge when a model
+  burns many rounds with zero write calls, despite explicit "write
+  early" prompt instructions ignored in all 4 invocations so far.
+- **W5 (recurred, unchanged):** timeout-discard is still correct and
+  honest but still zero-salvage; two more full 300s budgets burned with
+  nothing scored.
+- **New observation:** disobeyed spawns are expensive even when
+  harmless — 81.8s and 111.2s respectively, roughly a quarter to a
+  third of the entire 300s timeout budget, on top of the model already
+  over-reading. A prompt that both forbids spawning *and* explains why
+  ("no sub-agents are needed or available for a task this size") did
+  not stop the attempt; worth testing whether kitsu withholding spawn
+  tools proactively for very small `--agent-spawn-cap` values (e.g. 1)
+  when the prompt contains an explicit no-spawn instruction is
+  feasible, though this borders on prompt-inspection scope creep for
+  kitsu and may not be worth building.
+
+**Ramp status update:** DeepSeek is now 1-for-5 on kitsu invocations
+(cycle 1 succeeded at B; cycles 2 and 2-retry combine for 4 straight
+shipless turns). The spawn-crash mitigation (cap 1) worked as intended
+and should stay in place. The read-scope mitigation (prose cap) did not
+work and needs a different approach next cycle: shrink the task to a
+**single function** (e.g. just `request_measurement`, ~60 lines) rather
+than four disjoint ranges, to test whether DeepSeek can stay disciplined
+on a task an order of magnitude smaller before re-attempting the full
+four-function ask. If a single-function cycle also fails to ship, that
+points at a deeper DeepSeek-V4 exploration-discipline problem rather
+than a scope-sizing problem, and the review-lane task type itself should
+be reconsidered for this model in favor of more constrained,
+single-read-then-answer tasks. The citation-discipline hypothesis from
+cycle 2's brief remains completely untested and should not be
+re-attempted until a deliverable actually ships.
