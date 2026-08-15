@@ -95,10 +95,14 @@ richest greenfield lane.
   through; otherwise report dimensions/format/EXIF and decline to
   hallucinate content. *Accept:* `.png`/`.jpg` reads route to the vision
   path when the model supports it, else a factual metadata receipt.
-- R2.4 **Office/Markdown-adjacent docs**: `.docx`/`.xlsx` text and cell
-  extraction (both are zip+XML; pure-Rust `calamine` covers xlsx).
-  *Accept:* a `.docx` yields its paragraph text; an `.xlsx` yields
-  sheet names + a bounded cell window.
+- [x] (2026-08-14) R2.4 **xlsx cell extraction** — shipped as
+  `fs_read_xlsx` (commit 63a139a): pure-Rust `calamine`, lists sheet
+  names + a bounded cell window (sheet by name/index, start_row/max_rows,
+  500 ceiling), wired into `read_document`'s XLSX branch (real extraction
+  now, not a decline). Same allowlist guard; 32 MiB cap. `.docx`
+  paragraph text is NOT yet done (calamine covers spreadsheets, not Word)
+  — docx remains detected-and-declined by the dispatcher; a small
+  zip+XML docx reader can follow if needed.
 - [x] (2026-08-14) R2.5 **Type-aware dispatch** — shipped as the
   `read_document` tool (commit 1d01628): detects type by magic bytes
   then extension, routes `.csv/.tsv`→fs_read_csv, `.pdf`/%PDF→fs_read_pdf,
@@ -237,10 +241,10 @@ no dependency-vulnerability integration.
 Priority order the loop follows (revisit as lanes close):
 
 1. **Document review** (lane 2) — R2.1 CSV ✅, R2.2 PDF ✅, R2.5 dispatch
-   ✅ (the sequenced core is done). Remaining lane-2 items now plug real
-   extractors into the `read_document` dispatcher: R2.4 xlsx (calamine,
-   pure-Rust) next, then R2.3 image metadata.
-2. **System administration** (lane 3) — R3.1 log scanning first.
+   ✅, R2.4 xlsx ✅. Only R2.3 (image metadata) remains, and docx text as
+   an optional follow-up. Lane 2 is effectively complete for the common
+   document types — **advance to lane 3 next** (do R2.3 opportunistically).
+2. **System administration** (lane 3) — R3.1 log scanning first. NEXT LANE.
 3. **Code analysis hardening** (lane 1) — R1.3 symbol nav, R1.4 grouped
    edit receipts.
 4. **Automation trust** (lane 4) — R4.3 budget ceiling, R4.4 run report.
