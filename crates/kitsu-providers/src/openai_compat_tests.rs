@@ -1444,3 +1444,177 @@ async fn test_model_context_length_unique_loose_match_still_resolves() {
     // ONLY "my-model-v2" — unambiguous, so it should still resolve.
     assert_eq!(provider.model_context_length("my-model").await, Some(32768));
 }
+
+/// P10: a cache hit must return the memoized context length WITHOUT re-parsing
+/// the catalog JSON. We prove the memo is used by stubbing the catalog with a
+/// single response, calling `model_context_length` (cold miss → parse + memo),
+/// then asserting the second call for the same model returns the same value
+/// while the stub is hit exactly once.
+#[tokio::test]
+async fn test_model_context_length_memoized_on_cache_hit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: populates the catalog and memoizes 8192 for "m".
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+    // Cache hit: served from the memo, no second HTTP fetch.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+}
+
+/// P10: the memo stores `None` results too, so a model whose length can't be
+/// discovered isn't re-parsed on every call. The stub is hit exactly once.
+#[tokio::test]
+async fn test_model_context_length_memoizes_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"no-field"}]}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("no-field").await, None);
+    // Second call returns the memoized `None`; no re-parse, no second fetch.
+    assert_eq!(provider.model_context_length("no-field").await, None);
+}
+
+/// P10: per-model memo entries are independent — resolving one model does not
+/// short-circuit another. The catalog is fetched once (shared cache) and each
+/// distinct model parses/memoizes independently.
+#[tokio::test]
+async fn test_model_context_length_memo_is_per_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"a","context_length":4096},{"id":"b","context_length":32768}]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("a").await, Some(4096));
+    assert_eq!(provider.model_context_length("b").await, Some(32768));
+    // Distinct models re-serve from their own memo slots, still one catalog fetch.
+    assert_eq!(provider.model_context_length("a").await, Some(4096));
+    assert_eq!(provider.model_context_length("b").await, Some(32768));
+}
+
+/// P10, requirement (a) proven rigorously: the earlier `expect(1)` tests above
+/// only show the raw catalog body isn't re-fetched over HTTP — that was ALREADY
+/// true before this change (the catalog body itself was already cached). What's
+/// new here is that the *parsed* length is memoized too, so a cache hit never
+/// touches `serde_json::from_str` again. We prove that by corrupting the cached
+/// raw body in place after the first call: if the second call fell back to
+/// re-parsing the (now-corrupted) cached text instead of returning the memo, it
+/// would return `None`.
+#[tokio::test]
+async fn test_model_context_length_second_call_does_not_reparse_cached_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Corrupt the cached raw catalog body in place. A naive re-parse of `text`
+    // on the second call would now fail and return `None`.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        if let Ok((_, text)) = &mut entry.outcome {
+            *text = "not valid json".to_string();
+        }
+    }
+
+    // Still 8192: the memo served the hit, the corrupted body was never touched.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+}
+
+/// P10, requirement (b): once the catalog cache's TTL has actually expired, the
+/// next call must refetch AND re-parse — the memo must not go on serving a
+/// value derived from the now-stale catalog. We force expiry by rewinding
+/// `stored_at` (rather than sleeping out the real 60s TTL) and prove the fresh
+/// value wins.
+#[tokio::test]
+async fn test_model_context_length_memo_refills_after_ttl_expiry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":16384}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force the cached entry to look TTL-expired without waiting out the real
+    // 60s window.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // TTL expired -> refetch (second mock, now 16384) -> the memo rebuilds from
+    // the fresh body instead of serving the stale 8192 it had cached before.
+    assert_eq!(provider.model_context_length("m").await, Some(16384));
+}
+
+/// P10, requirement (c): a model that isn't in the catalog at all (as opposed
+/// to being present but missing the length field) still returns `None`, and
+/// stays `None` on a repeat call served from the memo.
+#[tokio::test]
+async fn test_model_context_length_unknown_model_stays_none_through_memo() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"a","context_length":4096},{"id":"b","context_length":8192}]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // "unknown-model" matches neither entry exactly nor loosely, and there's
+    // more than one entry, so the lone-entry fallback doesn't apply either.
+    assert_eq!(provider.model_context_length("unknown-model").await, None);
+    assert_eq!(provider.model_context_length("unknown-model").await, None);
+}

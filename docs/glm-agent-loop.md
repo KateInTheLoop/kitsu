@@ -497,3 +497,129 @@ another review — **P10 model-context-length caching in
 `openai_compat.rs`** (the item GLM's own P2 this cycle independently
 re-derived, and a fresh slot Kimi hasn't taken), widening
 `--allow-write` to the `kitsu-providers` crate for that cycle only.
+
+### Cycle 3 (2026-08-14) — GLM's FIRST CODE CONTRIBUTION lands (grade B)
+
+**CLI-surface friction bit again before the run even started**: the
+supervisor's first two invocation attempts errored — `--allow-path`/
+`--allow-write` top-level (must be `chat` subcommand args, already filed
+as R4.7) and then `--query` (there is no such flag; `PROMPT` is
+positional). Third attempt (correct flags) ran clean. Neither error
+reached GLM — supervisor-side only, logged for completeness.
+
+**Journal-cap fix validated end-to-end on a real model.** The driver was
+rebuilt fresh from the advancing main checkout immediately before the
+run (`cargo build -p kitsu`, confirmed by a fresh binary mtime and by
+`kitsu-tools`/`kitsu-core`/`kitsu` recompiling). `openai_compat.rs` was
+already 63 KiB pre-edit, close to the old 64 KiB journal cap, and grew
+further over the course of GLM's edits — **GLM edited the file directly
+across 4 in-place edits with zero journal-limit errors**, the first
+real-model proof the fix works on the file it was built for.
+
+**Run:** single attempt, `:together`, no transport retry needed, no
+provider fallback. 5 reads (2 ranged reads of the named regions, 1 read
+of the tests file to match harness style, 1 confirmatory re-read of the
+cache-construction site before editing it, 1 re-read of the tests file
+before appending), 5 edits (4 to `openai_compat.rs`: import, struct
+field, constructor site, `model_context_length` rewrite; 1 to
+`openai_compat_tests.rs` adding 3 tests) — read/edit discipline held, no
+re-reading loops. **No spawn attempted (cap 1 unexercised, prose
+instruction held).** `kitsu-usage: {"prompt_tokens":218067,
+"completion_tokens":39912,"total_tokens":257979}`. Run summary: "1
+turn(s) ok, 5 file(s) read, 2 file(s) written (2 change(s))".
+
+**Implementation, on inspection: genuinely correct.** GLM added a
+`context_lengths: std::sync::Mutex<HashMap<String, Option<u64>>>` memo
+field to `ModelsCacheEntry`, extracted the parse into a pure
+`context_length_from_catalog(text, model)` free function, and rewrote
+`model_context_length` to re-lock `models_cache`, check the memo first,
+and only call the parse function on a memo miss. Confirmed by code
+reading (not just trusting the diff): the memo lives *inside*
+`ModelsCacheEntry`, which is replaced wholesale on TTL expiry/refill —
+so the TTL/invalidation contract is preserved by construction, not by
+extra bookkeeping. One narrow, non-blocking design nit found on review:
+`models_cache` is unlocked between `get_models_response()`'s internal
+lock and the second lock in `model_context_length`, so a concurrent
+call landing in that gap *could* memoize a value derived from an
+already-superseded catalog fetch into the new entry. Rare (needs two
+concurrent calls racing a TTL refill) and self-heals on the next TTL
+cycle — filed as a follow-up, not fixed this cycle.
+
+**Test deliverable did not meet the spec as submitted — supervisor
+extended it.** GLM's 3 added tests (`test_model_context_length_memoized_on_cache_hit`,
+`_memoizes_none`, `_memo_is_per_model`) all assert `.expect(1)` on the
+wiremock stub across two `model_context_length` calls. **Verified by
+experiment**: applying GLM's test diff alone to the pre-P10 code (stash
+the implementation, keep only the tests) — both tests **still pass** on
+the unmemoized code, because the raw catalog *body* was already cached
+before this cycle (`get_models_response` already returns
+`entry.outcome.clone()` on a TTL hit); only the *parse* was unmemoized,
+and an HTTP-call-count assertion cannot observe a local
+`serde_json::from_str` that runs over already-fetched text either way.
+So GLM's tests prove no *re-fetch* (already true pre-P10), not no
+*re-parse* (the actual P10 claim) — this is exactly the failure mode the
+task's requirement (a) called out and asked to guard against via a
+parse-counter or corrupted-body proof. Requirement (b) (TTL-expiry
+refill still re-parses) had no test at all. Requirement (c) (unknown
+model → None) was arguably covered by pre-existing tests but not by
+anything GLM added this cycle.
+
+Supervisor added 3 further tests closing these gaps directly against
+the merged code: `test_model_context_length_second_call_does_not_reparse_cached_body`
+(corrupts the cached raw body in place after the first call via direct
+field access — `provider.models_cache.lock().await` — then asserts the
+second call still returns the pre-corruption value, which is only
+possible if the memo served it), `test_model_context_length_memo_refills_after_ttl_expiry`
+(rewinds `stored_at` past the TTL, arms a second mock with a *different*
+value, asserts the new value wins — proving refill genuinely re-parses
+rather than serving a stale memo), and
+`test_model_context_length_unknown_model_stays_none_through_memo`
+(multi-entry catalog, no match, called twice). All 6 P10 tests pass;
+64/64 in `kitsu-providers` overall.
+
+**Also supervisor-side fixes, not GLM's**: one `unused_mut` clippy
+warning on the new `let mut cache` binding in `model_context_length`
+(the binding is never mutated — only the inner `std::sync::Mutex` is
+locked); one `cargo fmt` line-wrap drift in the new tests. Both are
+exactly the kind of first-code-cycle rough edges expected and are now
+clean: `cargo build/clippy/test --workspace` and `cargo fmt --all --
+--check` all pass. Full-suite result: 121/122 in `kitsu` CLI tests (the
+one known PTY flake,
+`test_query_only_interactive_session_does_not_create_a_snapshot`,
+unrelated to this change), 90/90 `kitsu-core`, 64/64 `kitsu-providers`,
+31/31 `kitsu-render`, 138/138 `kitsu-tools`, doc-tests clean.
+
+**Grade: B.** The core implementation is sound and independently
+verified (memo genuinely eliminates the re-parse on a cache hit, TTL
+contract genuinely preserved) — a real first code contribution. It
+falls short of A because the deliverable's own test suite, as submitted,
+did not prove the central claim the task explicitly required proof of
+(requirement (a)) and skipped requirement (b) outright; both needed a
+supervisor pass to close. A clippy warning and an fmt violation also
+needed cleanup. This is the same category of gap Kimi's own early code
+cycles showed (working code, under-verified) — an expected growing pain
+for a first implementation cycle, not a regression in GLM's review-side
+discipline (still otherwise careful: correct free-function extraction,
+correct doc comments, correct TTL-preservation reasoning in its own
+comments — it just didn't verify its tests proved what it claimed).
+
+**kitsu weaknesses filed:**
+- W3 (confirms R4.7): third supervisor-facing trip on `--allow-path`/
+  `--allow-write` needing to be on `chat`, not top-level — now hit by
+  three different cycles/models. Also newly hit: `--query` does not
+  exist; `PROMPT` is positional. Worth a clearer error tip or doc note.
+- W4 (new): no roadmap item yet for "prove a memoization claim with a
+  parse-counter or corrupted-input test," but this is now a concrete
+  pattern to call out explicitly in future implementation-cycle prompts
+  for ANY caching/memoization task — an HTTP-mock `.expect(n)` alone is
+  insufficient when there's more than one caching layer already in
+  play.
+
+**Ramp status:** GLM's implementation debut is a genuine but imperfect
+B — code correct, verification incomplete without supervisor help.
+Journal-cap fix validated on real-model direct-edit traffic for the
+first time. Next cycle: a second implementation task, with the prompt
+made explicit that "the stub is hit exactly once" is not sufficient
+proof of no re-parse when a lower cache layer already exists — GLM
+should be asked directly for a parse-counter or corrupted-cache proof
+this time.
