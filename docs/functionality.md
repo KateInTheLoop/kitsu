@@ -353,8 +353,10 @@ error.
   `chat.md.artifacts`) and rewrites exact exported pointers to that sidecar.
   Existing primary or sidecar destinations are refused.
 - `/archive` and `/restore` move inactive snapshots and their artifacts through
-  recoverable private archive storage. `/delete` requires an exact inactive live
-  ID and permanently removes its validated snapshot/artifacts.
+  recoverable private archive storage. Archived snapshots are absent from the
+  live inventory and cannot be resumed until `/restore <exact-id>` (or
+  `kitsu sessions restore <exact-id>`) succeeds. `/delete` requires an exact
+  inactive live ID and permanently removes its validated snapshot/artifacts.
 - Leases prevent concurrent activation or lifecycle mutation of the same saved
   session. Lifecycle commands reject symlinked or irregular private entries.
 

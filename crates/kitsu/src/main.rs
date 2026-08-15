@@ -6349,7 +6349,7 @@ fn format_session_summaries(
     if sessions.is_empty() {
         let filter = filter.trim();
         if filter.is_empty() {
-            return "no saved sessions — start one with /new or use /resume to continue an archived session".to_string();
+            return "no saved sessions — start one with /new or restore an archived session with /restore <exact-id>".to_string();
         } else {
             return format!(
                 "no sessions matched '{}' — try /sessions to see all saved sessions",
@@ -18174,6 +18174,8 @@ mod tests {
         assert!(sessions_empty.contains("no saved sessions"));
         assert!(sessions_empty.contains("—"));
         assert!(sessions_empty.contains("/new"));
+        assert!(sessions_empty.contains("/restore <exact-id>"));
+        assert!(!sessions_empty.contains("/resume"));
 
         // Checkpoints empty state includes guidance
         let checkpoints_empty = format_checkpoint_summaries(&[]);

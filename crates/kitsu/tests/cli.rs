@@ -2344,7 +2344,7 @@ async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_re
 
 #[tokio::test]
 #[serial]
-async fn test_scripted_sessions_filter_matches_named_session_in_human_and_jsonl_modes() {
+async fn test_scripted_session_catalog_handles_filters_and_archived_recovery() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
@@ -2504,6 +2504,7 @@ async fn test_scripted_sessions_filter_matches_named_session_in_human_and_jsonl_
             .output()
             .expect("show session after provider-free filters");
         assert!(shown.status.success(), "{shown:?}");
+        let snapshot_before_archive = shown.stdout.clone();
         let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
         assert_eq!(
             shown["messages"]
@@ -2528,6 +2529,86 @@ async fn test_scripted_sessions_filter_matches_named_session_in_human_and_jsonl_
         );
         assert!(!transcript.contains("/sessions"), "{transcript}");
         assert!(!transcript.contains("no-such-session"), "{transcript}");
+
+        let archived = base_cmd(&home_path)
+            .args(["sessions", "archive", &session_id])
+            .output()
+            .expect("archive the only live session");
+        assert!(archived.status.success(), "{archived:?}");
+
+        let archived_resume = base_cmd(&home_path)
+            .args(["sessions", "--json", "resume", "Searchable-Demo"])
+            .output()
+            .expect("try to resume archived session by name");
+        assert_eq!(
+            archived_resume.status.code(),
+            Some(1),
+            "{archived_resume:?}"
+        );
+
+        let archived_script = home_path.join("archived-empty-sessions.script");
+        fs::write(&archived_script, "/sessions\n/quit\n").unwrap();
+        let archived_catalog = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &archived_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("inspect live sessions while the only snapshot is archived");
+        assert!(archived_catalog.status.success(), "{archived_catalog:?}");
+        assert!(archived_catalog.stderr.is_empty());
+        let archived_events = String::from_utf8(archived_catalog.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let catalog = archived_events
+            .iter()
+            .find(|event| event["type"] == "command_result")
+            .expect("empty live session catalog");
+        assert_eq!(catalog["result"]["kind"], "sessions");
+        assert_eq!(catalog["result"]["count"], 0);
+        assert_eq!(catalog["result"]["filtered_count"], 0);
+        let guidance = catalog["result"]["text"].as_str().unwrap();
+        assert!(guidance.contains("/restore <exact-id>"), "{guidance}");
+        assert!(!guidance.contains("/resume"), "{guidance}");
+        let archived_summary = archived_events.last().expect("archived catalog summary");
+        assert_eq!(archived_summary["status"], "ok");
+        assert_eq!(archived_summary["successful_operations"], 1);
+
+        let restored = base_cmd(&home_path)
+            .args(["sessions", "--json", "restore", &session_id])
+            .output()
+            .expect("restore exact archived session");
+        assert!(restored.status.success(), "{restored:?}");
+        let restored: serde_json::Value = serde_json::from_slice(&restored.stdout).unwrap();
+        assert_eq!(restored["action"], "restore");
+        assert_eq!(restored["session"]["id"], session_id);
+        assert_eq!(restored["session"]["name"], "Searchable-Demo");
+
+        let resolved = base_cmd(&home_path)
+            .args(["sessions", "--json", "resume", "Searchable-Demo"])
+            .output()
+            .expect("resolve restored session by name");
+        assert!(resolved.status.success(), "{resolved:?}");
+        let resolved: serde_json::Value = serde_json::from_slice(&resolved.stdout).unwrap();
+        assert_eq!(resolved["session_id"], session_id);
+
+        let restored_show = base_cmd(&home_path)
+            .args(["sessions", "--json", "show", &session_id])
+            .output()
+            .expect("show exact restored snapshot");
+        assert!(restored_show.status.success(), "{restored_show:?}");
+        assert_eq!(
+            restored_show.stdout, snapshot_before_archive,
+            "archive/restore changed the saved snapshot"
+        );
     })
     .await
     .expect("scripted session filters should join");
