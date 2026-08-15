@@ -378,3 +378,27 @@ It remains review-only until R4.10 (implementation type-chasing unchanged),
 but as a reviewer it now matches GLM's discipline. (Minor: `--prompt`
 isn't a flag on `kitsu chat` — prompt is positional; same CLI-friction
 family as R4.7.)
+
+### Cycle 8 — 2026-08-15 — enforce_context_budget review (grade A, 5th clean)
+
+Reviewed `enforce_context_budget` (turned out to be a small `#[cfg(test)]`
+wrapper, 2074-2106 — the supervisor caught that the cron's 2078-2122 range
+was wrong and spanned into an unrelated struct + the next fn's doc; a
+lower-value target than intended, steer to PRODUCTION functions next).
+Process perfect: 1 ranged read (33 lines) → 1 write, no over-read, no
+spawn, exit 0. Cheapest cycle yet: kitsu-usage 15,034 / 2,295 / 17,329.
+Commit `fabe302` (Kate verified), pushed.
+
+- **Citations 4/4 letter-perfect on quotes AND labels — 2nd flawless
+  R1.7 cycle running** (7, 8 both A). Hedging well-calibrated: hedged the
+  callee-behavior proposals ("if the callee..."), and correctly did NOT
+  hedge "the callee takes 12 args" because the 12 positional args are
+  directly countable from the read range. No substantively-wrong or
+  unhedged-out-of-scope claims.
+- Minor cosmetic: the review self-dated "2025-07-15" (hallucinated;
+  harmless, doesn't affect substance).
+
+**DeepSeek is a consistent A tiny-scope reviewer now (7, 8 both A after
+the R1.7 + hedging fixes). Steady, cheap, reliable.** Its findings feed
+the other loops (Kimi is implementing DeepSeek's cycle-7 finding). Next:
+a fresh PRODUCTION function (not a test wrapper).
