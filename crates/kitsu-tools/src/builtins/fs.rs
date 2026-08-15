@@ -1679,6 +1679,358 @@ async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolE
     Ok(policy.cap_output(rendered))
 }
 
+// --- fs.scan_secrets (apparent-credential guard for diffs/files) ------------
+//
+// Detection mirrors the kitsu binary's credential filter
+// (subagent::thread::sanitize_and_redact_text). Kept as a self-contained copy
+// because kitsu-tools cannot depend on the binary crate; a future refactor
+// could hoist these into a shared module the binary also adopts. A line is
+// "flagged" iff redacting it changes it, and only the REDACTED line is ever
+// emitted — the tool never echoes the raw secret it found.
+
+const SECRET_DEFAULT_MAX_FINDINGS: usize = 200;
+const SECRET_MAX_FINDINGS_CEILING: usize = 2000;
+const SECRET_PREFIXES: &[&str] = &[
+    "github_pat_",
+    "hf_",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "glpat-",
+    "npm_",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "AIza",
+];
+const SECRET_ASSIGN_KEYWORDS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+];
+
+#[derive(Deserialize)]
+struct ScanSecretsArgs {
+    path: String,
+    /// Flagged lines shown (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_findings: Option<usize>,
+}
+
+fn redact_known_prefixes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let tail = &value[index..];
+        let Some(prefix) = SECRET_PREFIXES
+            .iter()
+            .find(|prefix| tail.starts_with(**prefix))
+        else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+            continue;
+        };
+        let mut end = index + prefix.len();
+        while end < value.len() {
+            let character = value[end..].chars().next().expect("non-empty tail");
+            if !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        // Short words such as "hf_model" are ordinary identifiers; a credential
+        // prefix is redacted only when followed by a plausible secret body.
+        if end.saturating_sub(index + prefix.len()) >= 8 {
+            output.push_str("<redacted>");
+            index = end;
+        } else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+        }
+    }
+    output
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = value[search..].find("://") {
+        let authority_start = search + relative + 3;
+        let authority_end = value[authority_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                matches!(character, '/' | '?' | '#' | ' ' | '\n' | '\t')
+                    .then_some(authority_start + offset)
+            })
+            .unwrap_or(value.len());
+        if let Some(relative_at) = value[authority_start..authority_end].rfind('@') {
+            let at = authority_start + relative_at;
+            output.push_str(&value[copied..authority_start]);
+            output.push_str("<redacted>");
+            output.push_str(&value[at..authority_end]);
+            copied = authority_end;
+        }
+        search = authority_end;
+        if search == value.len() {
+            break;
+        }
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_assignment(value: &str, keyword: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find(keyword) {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_keyword = start + keyword.len();
+        let after_ok = after_keyword == lowercase.len()
+            || !lowercase.as_bytes()[after_keyword].is_ascii_alphanumeric();
+        if !before_ok || !after_ok {
+            search = after_keyword;
+            continue;
+        }
+        let mut delimiter = after_keyword;
+        while delimiter < value.len() && value.as_bytes()[delimiter].is_ascii_whitespace() {
+            delimiter += 1;
+        }
+        if delimiter == value.len() || !matches!(value.as_bytes()[delimiter], b'=' | b':') {
+            search = after_keyword;
+            continue;
+        }
+        let mut secret_start = delimiter + 1;
+        while secret_start < value.len()
+            && (value.as_bytes()[secret_start].is_ascii_whitespace()
+                || matches!(value.as_bytes()[secret_start], b'\'' | b'"'))
+        {
+            secret_start += 1;
+        }
+        let mut end = secret_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(
+                value.as_bytes()[end],
+                b',' | b';' | b'&' | b'\'' | b'"' | b'}' | b']'
+            )
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..secret_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_bearer(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find("bearer") {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let mut token_start = start + "bearer".len();
+        if !before_ok
+            || token_start == value.len()
+            || !value.as_bytes()[token_start].is_ascii_whitespace()
+        {
+            search = token_start;
+            continue;
+        }
+        while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
+            token_start += 1;
+        }
+        let mut end = token_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(value.as_bytes()[end], b',' | b';' | b'\'' | b'"')
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..token_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+/// The full redaction pipeline (no terminal sanitize — the scanner works on
+/// raw file bytes already). A line is a "finding" iff this changes it.
+///
+/// Bearer runs FIRST: on `Authorization: Bearer <token>` the `authorization:`
+/// assignment rule would otherwise redact the literal word "Bearer" as its
+/// value and leave the real token exposed — unacceptable for a tool whose
+/// output must never echo a secret. Redacting the bearer token up front closes
+/// that leak; assignments then run last over the already-scrubbed line.
+fn redact_secrets_line(value: &str) -> String {
+    let mut output = redact_url_userinfo(&redact_known_prefixes(&redact_bearer(value)));
+    for keyword in SECRET_ASSIGN_KEYWORDS {
+        output = redact_assignment(&output, keyword);
+    }
+    output
+}
+
+/// Which detector(s) fired on this line — for the human-facing label.
+fn detect_secret_kinds(value: &str) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    if redact_known_prefixes(value) != value {
+        kinds.push("token-prefix");
+    }
+    if redact_url_userinfo(value) != value {
+        kinds.push("url-credentials");
+    }
+    if SECRET_ASSIGN_KEYWORDS
+        .iter()
+        .any(|kw| redact_assignment(value, kw) != value)
+    {
+        kinds.push("secret-assignment");
+    }
+    if redact_bearer(value) != value {
+        kinds.push("bearer-token");
+    }
+    kinds
+}
+
+pub fn scan_secrets_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "scan_secrets".to_string(),
+        description: "Flag lines that appear to contain a credential — known API-key/token \
+                      prefixes (hf_/sk-/ghp_/AKIA/AIza/…), URL user:pass@host, secret \
+                      assignments (api_key=/password:/token=/…), and Bearer tokens. Point it at a \
+                      file — e.g. a `git diff` written to disk before commit — and it reports each \
+                      flagged line number with the matched kind and the line REDACTED (it never \
+                      echoes the raw secret). Same allowlist as fs_read_file. Advisory: it can miss \
+                      novel formats and may flag placeholders, so it never blocks."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File to scan (e.g. a saved git diff)"},
+                "max_findings": {"type": "integer", "description": "Flagged lines shown (optional, default 200, max 2000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { scan_secrets_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn scan_secrets_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ScanSecretsArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let cap = a
+        .max_findings
+        .unwrap_or(SECRET_DEFAULT_MAX_FINDINGS)
+        .min(SECRET_MAX_FINDINGS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || scan_secrets_blocking(file, &display, cap))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("scan failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn scan_secrets_blocking(
+    file: std::fs::File,
+    display: &str,
+    cap: usize,
+) -> std::io::Result<String> {
+    use std::io::BufRead;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("scan target is not a regular file"));
+    }
+    let mut reader = std::io::BufReader::new(Read::take(file, SCAN_MAX_SCAN_BYTES + 1));
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut total = 0usize;
+    let mut bytes_read = 0u64;
+    let mut scan_truncated = false;
+    let mut shown: Vec<(usize, Vec<&'static str>, String)> = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > SCAN_MAX_SCAN_BYTES {
+            scan_truncated = true;
+            break;
+        }
+        line_no += 1;
+        let redacted = redact_secrets_line(&line);
+        if redacted != line {
+            total += 1;
+            if shown.len() < cap {
+                let kinds = detect_secret_kinds(&line);
+                shown.push((line_no, kinds, truncate_line(&redacted)));
+            }
+        }
+    }
+
+    let scanned_note = if scan_truncated {
+        format!(
+            " — stopped after scanning {} MiB (refine or split the file)",
+            SCAN_MAX_SCAN_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "scan_secrets> {display}: {total} line(s) with apparent credentials in {line_no} lines \
+         scanned{scanned_note}\n"
+    );
+    if total == 0 {
+        out.push_str(
+            "no apparent credentials found (checked known token prefixes, url user:pass, secret \
+             assignments, and bearer tokens)\n",
+        );
+        return Ok(out);
+    }
+    for (no, kinds, redacted) in &shown {
+        let label = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", kinds.join(", "))
+        };
+        out.push_str(&format!("{no}: {label}{redacted}\n"));
+    }
+    if total > shown.len() {
+        out.push_str(&format!(
+            "[showing {} of {} flagged lines; raise max_findings for more]\n",
+            shown.len(),
+            total
+        ));
+    }
+    Ok(out)
+}
+
 // --- fs.audit_summary (cargo-audit advisory summary) ------------------------
 
 const AUDIT_DEFAULT_MAX_ITEMS: usize = 100;
@@ -5981,6 +6333,85 @@ mod tests {
         ]
       }
     }"#;
+
+    #[test]
+    fn scan_secrets_detects_and_redacts_known_forms() {
+        // Known token prefix with a long body.
+        let line = "let key = \"sk-abcdefgh12345678\";";
+        assert!(
+            detect_secret_kinds(line).contains(&"token-prefix"),
+            "{line}"
+        );
+        let red = redact_secrets_line(line);
+        assert!(
+            red.contains("<redacted>") && !red.contains("abcdefgh12345678"),
+            "{red}"
+        );
+        // Bearer token.
+        let line = "Authorization: Bearer abcdef.ghijkl.mnopqr";
+        assert!(detect_secret_kinds(line).contains(&"bearer-token"));
+        assert!(!redact_secrets_line(line).contains("abcdef.ghijkl.mnopqr"));
+        // Secret assignment.
+        let line = "password = hunter2hunter2";
+        assert!(detect_secret_kinds(line).contains(&"secret-assignment"));
+        assert!(!redact_secrets_line(line).contains("hunter2hunter2"));
+        // URL user:pass@host.
+        let line = "clone https://user:s3cr3tpass@example.com/repo.git";
+        assert!(detect_secret_kinds(line).contains(&"url-credentials"));
+        assert!(!redact_secrets_line(line).contains("s3cr3tpass"));
+        // Benign: a short hf_ identifier and ordinary code are NOT flagged.
+        assert!(detect_secret_kinds("let hf_model = load();").is_empty());
+        assert!(detect_secret_kinds("let total = count + 1;").is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("changes.diff");
+        std::fs::write(
+            &path,
+            "+const A = 1;\n+let token = \"ghp_0123456789abcdefghij\";\n+normal line\n",
+        )
+        .unwrap();
+        let out = scan_secrets_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("scan ok");
+        assert!(out.contains("1 line(s) with apparent credentials"), "{out}");
+        assert!(out.contains("2: ") && out.contains("token-prefix"), "{out}");
+        assert!(
+            out.contains("<redacted>") && !out.contains("0123456789abcdefghij"),
+            "secret leaked: {out}"
+        );
+
+        // A clean file → honest "no apparent credentials".
+        let clean = dir.path().join("clean.txt");
+        std::fs::write(&clean, "just some code\nno secrets here\n").unwrap();
+        let out = scan_secrets_run(
+            &policy,
+            &serde_json::json!({"path": clean.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("scan ok");
+        assert!(out.contains("no apparent credentials found"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.diff");
+        std::fs::write(&bad, "token = ghp_0123456789abcdefghij\n").unwrap();
+        assert!(matches!(
+            scan_secrets_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
 
     #[test]
     fn audit_summary_ranked_view() {
