@@ -324,6 +324,10 @@ pub struct ContextBudget {
     pub effective: u64,
     /// Trim target: stay at or below this, leaving a small buffer under effective.
     pub target: u64,
+    /// The reply reservation actually used: `max(max_output, MIN_OUTPUT_RESERVE)`
+    /// clamped to at most half the window. Callers must bound the provider's
+    /// `max_tokens` by this so the promised `effective` holds end-to-end.
+    pub reserve: u64,
 }
 
 impl ContextBudget {
@@ -349,8 +353,25 @@ impl ContextBudget {
             window,
             effective,
             target,
+            reserve,
         }
     }
+
+    /// The clamped reserve as a `u32`, suitable for rewriting a request's
+    /// `max_tokens` when the caller's value exceeds the reserve. Always
+    /// returns the reserve actually used to derive `effective` — callers
+    /// decide whether to apply it (clamp DOWN only; never inflate a smaller
+    /// caller-supplied value, and never invent a cap for `None`).
+    pub fn clamped_max_output(&self) -> u32 {
+        self.reserve.min(u64::from(u32::MAX)) as u32
+    }
+}
+
+/// Clamp a request's `max_tokens` down to the budget's reserve. Only ever
+/// lowers a caller-supplied value; `None` stays `None` (no artificial cap is
+/// invented for a caller that never asked for one).
+pub fn clamp_max_tokens_to_reserve(max_tokens: Option<u32>, budget: &ContextBudget) -> Option<u32> {
+    max_tokens.map(|t| t.min(budget.clamped_max_output()))
 }
 
 /// Compute the window a caller should feed to [`ContextBudget::new`] given
@@ -555,6 +576,39 @@ mod tests {
         // target <= effective <= window must hold at window=1_000_000.
         let b = ContextBudget::new(1_000_000, None);
         assert!(b.target <= b.effective && b.effective <= b.window);
+    }
+
+    #[test]
+    fn clamped_max_output_exposes_reserve_used() {
+        // P9 (a): window=8192, max_output=Some(8192) -> reserve clamps to
+        // window/2 = 4096, and clamping the request rewrites 8192 -> 4096.
+        let b = ContextBudget::new(8_192, Some(8_192));
+        assert_eq!(b.reserve, 4_096);
+        assert_eq!(b.clamped_max_output(), 4_096);
+        assert_eq!(clamp_max_tokens_to_reserve(Some(8_192), &b), Some(4_096));
+        // The budget's promise (effective) now holds end-to-end against the
+        // value actually sent to the provider.
+        assert_eq!(b.effective, 8_192 - 4_096);
+    }
+
+    #[test]
+    fn clamp_max_tokens_leaves_fitting_value_unchanged() {
+        // P9 (b): max_output already under the reserve is NOT clamped down.
+        let b = ContextBudget::new(131_072, Some(1_000));
+        assert_eq!(b.reserve, 1_000);
+        assert_eq!(clamp_max_tokens_to_reserve(Some(1_000), &b), Some(1_000));
+        // A smaller caller value is never inflated to the reserve.
+        let b2 = ContextBudget::new(131_072, Some(4_096));
+        assert_eq!(clamp_max_tokens_to_reserve(Some(1_000), &b2), Some(1_000));
+    }
+
+    #[test]
+    fn clamp_max_tokens_none_stays_none() {
+        // P9 (c): max_output=None -> reserve is the floor, but no artificial
+        // cap is invented for the request.
+        let b = ContextBudget::new(8_192, None);
+        assert_eq!(b.reserve, MIN_OUTPUT_RESERVE);
+        assert_eq!(clamp_max_tokens_to_reserve(None, &b), None);
     }
 
     #[test]

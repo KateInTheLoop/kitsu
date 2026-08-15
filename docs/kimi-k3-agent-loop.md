@@ -1805,3 +1805,105 @@ items: P9 (reserve/max_output disagreement — unverified against this
 doc, check reviews/kimi-cycle-6.md before assigning), P10 (model-context
 caching, GLM's item — do not duplicate), P11 (cache serialized schema
 size — pairs naturally with P7's schema fingerprint).
+
+### Cycle 16 — 2026-08-14 — P9 reserve/max_tokens agreement (grade A)
+
+Kimi implemented P9 correctly and completely across both files, exactly
+per the spec. `context.rs` (+54): `ContextBudget` grew `pub reserve: u64`
+(the clamped `max(max_output, MIN_OUTPUT_RESERVE).min(window/2)` value
+already computed inside `new`, now stored instead of discarded) and a
+`clamped_max_output(&self) -> u32` accessor (saturating at `u32::MAX`);
+a free function `clamp_max_tokens_to_reserve(max_tokens: Option<u32>,
+budget: &ContextBudget) -> Option<u32>` clamps a caller's `max_tokens`
+DOWN to the reserve, leaves smaller values alone, and maps `None` to
+`None` (no invented cap). `orchestrator.rs` (+22/-3): at the primary
+provider-request build site (~line 1112, right before the `ChatRequest`
+literal `ensure_chat_request_fits` checks at ~1130), Kimi computed the
+same `ContextBudget` (`effective_budget_window(window, *window_evidence)`
++ `cfg.max_tokens`) used by the measurement path and rewrote the local
+`max_tokens` via `clamp_max_tokens_to_reserve` before it goes into
+`ChatRequest.max_tokens` — so the value sent to the provider and the
+value the budget measured against are now the SAME reserve, closing the
+disagreement the review flagged. With no resolved `context_window`,
+`cfg.max_tokens` passes through unchanged (correctly out of scope — no
+budget exists to clamp against). The compaction/summary request path
+(`bounded_summary_request`, ~2805) was correctly left alone — it computes
+its own summarizer cap, unrelated to the primary reply reservation.
+Committed `<SEE SHA BELOW>` (Kate verified), pushed. `--agent-spawn-cap 1`
+held — **zero spawn attempts**.
+
+- Single attempt, 30 tool calls (12 Read, 10 `fs_scan_file`, 8 Edit — one
+  Edit no-opped on `InvalidArgs` "old_text and new_text are identical"
+  and was immediately retried correctly), completion 5,397/24,000 (22%),
+  prompt 299,991, zero debris. `kitsu-usage`/`kitsu-context` receipts:
+  `{"prompt_tokens":299991,"completion_tokens":5397,"total_tokens":305388}`
+  / `{"used":18745,"effective":107072,"window":131072}`.
+- **3 genuine tests, exactly the 3 the brief required:**
+  1. `clamped_max_output_exposes_reserve_used` — window=8192,
+     max_output=Some(8192) → `reserve == 4096`, `clamped_max_output() ==
+     4096`, `clamp_max_tokens_to_reserve(Some(8192), &b) == Some(4096)`,
+     and `effective == 8192 - 4096` — the core 8192→4096 rewrite, proven.
+  2. `clamp_max_tokens_leaves_fitting_value_unchanged` — window=131072,
+     max_output=Some(1000) (reserve=1000, under window/2) stays
+     `Some(1000)`; a second case confirms a smaller caller value (1000)
+     is never inflated toward a larger reserve (4096) — additive/safe,
+     not just non-regressive.
+  3. `clamp_max_tokens_none_stays_none` — max_output=None → reserve stays
+     `MIN_OUTPUT_RESERVE` (512), `clamp_max_tokens_to_reserve(None, &b)
+     == None` — no artificial cap invented.
+  All three independently re-verified by the supervisor by hand
+  (arithmetic matches) and confirmed passing: `kitsu-core` 119/119 (116
+  pre-existing + 3 new).
+- **kitsu weakness observed (not a code defect, a turn-outcome defect):**
+  the run's early rounds tried `fs_scan_file` on the bare directory
+  `crates/kitsu-core/src` (not a file) and correctly got `PolicyDenied`
+  twice, self-corrected immediately, then produced fully correct, tested,
+  in-scope edits and a clean final summary — yet the CLI still reported
+  the whole turn as failed and DISCARDED the (correct) final assistant
+  text: `provisional assistant output was DISCARDED and was not
+  committed: 3 tool call(s) failed during the turn (2 local policy
+  denial(s))`. The two file edits survived on disk only because kitsu
+  separately retains file changes from a "rolled-back" turn
+  (`2 file change(s) from the rolled-back turn remain on disk (checkpoint
+  #1)`) — the supervisor had to read the raw checkpoint diff and the
+  worktree files directly to recover Kimi's actual (correct) work rather
+  than trusting the turn's own status line. Recent commit 07b7b59 ("chat:
+  policy-denied turns commit their truthful answer as partial") does not
+  appear to cover this shape: an early, SELF-RECOVERED tool failure still
+  poisons the entire turn's outcome even though every subsequent action
+  (including the final answer) succeeded cleanly. Worth a follow-up: a
+  turn whose LAST N rounds are clean and whose final answer text exists
+  should not be blanket-discarded because of an earlier recovered
+  failure.
+- **False-positive debris warning observed:** three `Edit(orchestrator.rs)`
+  calls printed `warning: content contains a raw model chat-template
+  control marker — the model likely emitted protocol text instead of real
+  file content`. Verified NOT real debris — `orchestrator.rs` itself
+  contains the literal `<|im_start|>`/`<|im_end|>`/etc. marker strings as
+  DATA inside its own debris-detector constant list (~line 2139-2143), so
+  any edit near that region trips the detector on pre-existing file
+  content, not injected garbage. Confirmed via `git diff` and grep: no
+  actual `<|...|>` tokens were introduced by Kimi's edits. Low-priority
+  but worth noting for whichever cycle next touches that detector: it
+  should probably exclude its own constant-definition site from the scan,
+  or the warning should name the offending line so a false positive is
+  distinguishable from a real one without a manual diff.
+- **Grade A.** Both required files edited directly (no journal-cap
+  issues, no supervisor mechanical fixes to the design), clamp-down-only
+  semantics correctly reasoned (never inflates, never invents a cap for
+  `None`), the primary send-site and the measurement path now share one
+  `ContextBudget` instance so they cannot drift apart again structurally,
+  all 3 required tests present and correct, `cargo build/clippy
+  --workspace` clean, `cargo fmt --all -- --check` clean (no reformat
+  needed), `cargo test --workspace --no-fail-fast` green except the
+  pre-known PTY flake (`test_query_only_interactive_session_does_not_
+  create_a_snapshot`, unrelated, reproducing per cycles 10-15). No value
+  assertions elsewhere in the suite needed changing — the fix is purely
+  additive to the send path.
+
+**Backlog status: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅ P6 ✅ P7 ✅ P8 ✅ P9 ✅. Kimi
+is 10-for-10 on code work since the ramp (cycles 7–16).** Remaining open
+items: P10 (model-context caching, GLM's item — do not duplicate), P11
+(cache serialized schema size — pairs naturally with P7's schema
+fingerprint), and the newly filed turn-outcome weakness above (an early
+self-recovered tool failure should not discard a clean final answer).
