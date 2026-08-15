@@ -472,3 +472,39 @@ about to cross the cap and block GLM's P10 cycle).**
 P7 anchor schema fingerprint (context.rs, under cap), P11, or another
 context.rs-scoped item — AVOID orchestrator.rs direct edits until the
 journal-cap fix lands in the built binary.
+
+### Cycle 14 — 2026-08-14 — P7 anchor schema fingerprint (grade A-)
+
+Kimi implemented P7: a fifth anchor-tuple field, `schema_fingerprint(schema_json)
+-> u64` (a `DefaultHasher` over the full serialized schema — reasoned as
+still cheap since schema JSON is small and built once/round, and catches
+same-length tool swaps a length-only hash would miss). `record()` gained
+a `schema_json: &str` param; `anchor_includes_schema()` now requires the
+stored fingerprint to match the current schema's before treating the
+anchor as schema-covered — closing the count-vs-identity gap for tools,
+the same flaw P2 fixed for message content. Committed `9a6b8b5` (Kate
+verified), pushed. cap-1 held, zero spawns. kitsu-core 113/113.
+
+- **SECOND production validation of the journal-cap fix (R1.6):** Kimi
+  edited `orchestrator.rs` (129 KiB) DIRECTLY — the file no model could
+  touch through cycle 13 — with NO journal-limit error. (GLM validated it
+  on the 63 KiB openai_compat.rs the same hour; this confirms it on the
+  largest file.)
+- 3 genuine tests (unchanged schema keeps the fast path; a changed tool
+  set via distinct SCHEMA_A/SCHEMA_B fixtures forces schema re-estimation;
+  no-schema anchor unaffected) + 3 pre-existing record() call-site updates.
+- Docked to A- for one mechanical completion (see below) + hashing the
+  full schema string vs the brief's suggested length-only style (a
+  documented, defensible departure — catches more).
+- **Supervisor-tooling lesson (not Kimi's fault):** the corrected `kitsu
+  chat` run was killed by the SUPERVISOR'S OWN Bash-tool 2-minute default
+  timeout, NOT kitsu's `--timeout-secs 300`. Kimi had already located the
+  one remaining old call site (context.rs:622) and was about to fix it
+  when killed; the supervisor applied that one arg. **Standing fix:
+  supervisors must run the kitsu invocation with an explicit Bash timeout
+  >= kitsu's --timeout-secs (e.g. 330000 ms for --timeout-secs 300), so a
+  healthy long run is not cut off at the Bash default.**
+
+**Backlog: P1-P7 ✅. Kimi is 8-for-8 on code work (cycles 7-14).** Next:
+P8 trim-buffer scaling, P11 tool-schema re-serialization, or P9 — all now
+freely editable (orchestrator.rs direct edits work post-R1.6).
