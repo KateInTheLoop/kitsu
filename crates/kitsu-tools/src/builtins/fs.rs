@@ -6131,7 +6131,8 @@ UseDNS no
         let output = read_file_run(&policy, &args).await.unwrap();
 
         // cap_output's generic marker is replaced by the served-of-total
-        // disclosure appended after capping (cycle 31).
+        // disclosure appended after capping (cycle 31); the ~90-byte overflow
+        // past the cap is deliberate — the disclosure is the point.
         assert!(
             output.contains("...[truncated: output exceeded byte cap"),
             "missing truncation marker: ...{}",

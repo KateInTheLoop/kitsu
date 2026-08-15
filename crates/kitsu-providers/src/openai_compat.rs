@@ -125,6 +125,8 @@ struct WireRequest<'a> {
     max_tokens: Option<u32>,
     #[serde(skip_serializing_if = "Option::is_none")]
     response_format: Option<WireResponseFormat<'a>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    prompt_cache_key: Option<&'a str>,
 }
 
 #[derive(Serialize)]
@@ -263,6 +265,7 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
                     schema: &format.schema,
                 },
             }),
+        prompt_cache_key: req.prompt_cache_key.as_deref(),
     }
 }
 
@@ -1804,5 +1807,41 @@ impl Provider for OpenAICompatProvider {
         let parsed: ModelsResponse = serde_json::from_str(&text)
             .map_err(|e| ProviderError::InvalidResponse(format!("malformed /models JSON: {e}")))?;
         Ok(Some(parsed.data.into_iter().map(|m| m.id).collect()))
+    }
+}
+
+#[cfg(test)]
+mod prompt_cache_key_tests {
+    use super::build_body;
+    use crate::types::{ChatMessage, ChatRequest};
+
+    fn base_request() -> ChatRequest {
+        ChatRequest {
+            model: "m".to_string(),
+            messages: vec![ChatMessage::user("hi")],
+            tools: None,
+            stream: false,
+            temperature: None,
+            reasoning_effort: None,
+            max_tokens: None,
+            response_format: None,
+            prompt_cache_key: None,
+        }
+    }
+
+    #[test]
+    fn prompt_cache_key_serializes_when_some() {
+        let mut req = base_request();
+        req.prompt_cache_key = Some("some-key".to_string());
+        let json = serde_json::to_string(&build_body(&req)).unwrap();
+        assert!(json.contains("prompt_cache_key"), "body: {json}");
+        assert!(json.contains("some-key"), "body: {json}");
+    }
+
+    #[test]
+    fn prompt_cache_key_omitted_when_none() {
+        let req = base_request();
+        let json = serde_json::to_string(&build_body(&req)).unwrap();
+        assert!(!json.contains("prompt_cache_key"), "body: {json}");
     }
 }

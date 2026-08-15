@@ -79,6 +79,7 @@ fn simple_request() -> ChatRequest {
         reasoning_effort: None,
         max_tokens: None,
         response_format: None,
+        prompt_cache_key: None,
     }
 }
 

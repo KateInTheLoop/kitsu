@@ -27,7 +27,9 @@ use rustyline::ExternalPrinter as _;
 
 use cli::{AuthCommand, Cli, Command, SessionCommand};
 use config::{Config, ConfigError, Gateway};
-use kitsu_core::context::{estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
+use kitsu_core::context::{
+    clamp_window_for_shortfall, estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW,
+};
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
@@ -3108,6 +3110,7 @@ async fn minimal_inference_probe(
         reasoning_effort: None,
         max_tokens: Some(1),
         response_format: None,
+        prompt_cache_key: None,
     };
     let mut response = provider.chat_stream(request).await?;
     let mut finished = false;
@@ -4072,6 +4075,7 @@ fn compaction_outcome_name(outcome: kitsu_core::CompactionOutcome) -> &'static s
         kitsu_core::CompactionOutcome::Trimmed => "trimmed",
         kitsu_core::CompactionOutcome::Summarized => "summarized",
         kitsu_core::CompactionOutcome::SummaryFallbackTrim => "summary_fallback_trim",
+        kitsu_core::CompactionOutcome::SummaryFallbackNoOp => "summary_fallback_no_op",
     }
 }
 
@@ -4080,6 +4084,7 @@ fn compaction_fallback_name(reason: kitsu_core::SummaryFallbackReason) -> &'stat
         kitsu_core::SummaryFallbackReason::CircuitBreaker => "circuit_breaker",
         kitsu_core::SummaryFallbackReason::RequestTooLarge => "request_too_large",
         kitsu_core::SummaryFallbackReason::ProviderFailure => "provider_failure",
+        kitsu_core::SummaryFallbackReason::EmptyCompletion => "empty_completion",
         kitsu_core::SummaryFallbackReason::IncompleteResponse => "incomplete_response",
         kitsu_core::SummaryFallbackReason::ResponseTooLarge => "response_too_large",
         kitsu_core::SummaryFallbackReason::ContextWindowUnknown => "context_window_unknown",
@@ -7373,6 +7378,21 @@ fn render_context_command(
             evidence.estimated_sent_tokens,
             evidence.resolved_window
         );
+        // P6: once 2+ shortfalls have been observed for this SAME resolved
+        // window, the session's effective budget is clamped toward the
+        // reported size for the rest of the session. Surface it here as
+        // provenance, never silently: the resolved window above is unchanged.
+        let budgeted = clamp_window_for_shortfall(
+            evidence.resolved_window,
+            evidence.reported_prompt_tokens,
+            evidence.shortfall_count,
+        );
+        if budgeted < evidence.resolved_window {
+            eprintln!(
+                "context window budget clamp: {} shortfall report(s) for this resolved window; session budget now clamped to {} tokens (resolved window {} unchanged)",
+                evidence.shortfall_count, budgeted, evidence.resolved_window
+            );
+        }
     }
     let ledger = &state.compaction_ledger;
     if ledger.total_compactions > 0 {
@@ -7413,7 +7433,21 @@ fn context_command_payload(
     let breakdown = ContextMeter::new().breakdown(messages);
     let reported_window = session.window.get();
     let window = reported_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
-    let budget = ContextBudget::new(window, session.max_tokens);
+    // P6: once 2+ shortfalls have been observed for this SAME resolved window,
+    // the reported effective budget reflects the clamp — the window above
+    // (and any config) is never rewritten, only this derived number.
+    let budgeted_window = state.window_evidence.map_or(window, |evidence| {
+        if evidence.resolved_window == window {
+            clamp_window_for_shortfall(
+                window,
+                evidence.reported_prompt_tokens,
+                evidence.shortfall_count,
+            )
+        } else {
+            window
+        }
+    });
+    let budget = ContextBudget::new(budgeted_window, session.max_tokens);
     let provenance = session.provenance.borrow();
     let provenance_tokens: u64 = provenance.iter().map(|entry| entry.tokens).sum();
     let estimated = provenance_tokens
@@ -7451,6 +7485,8 @@ fn context_command_payload(
             "reported_prompt_tokens": evidence.reported_prompt_tokens,
             "estimated_sent_tokens": evidence.estimated_sent_tokens,
             "resolved_window": evidence.resolved_window,
+            "shortfall_count": evidence.shortfall_count,
+            "budget_clamped": budgeted_window < window,
         })),
         "roles": {
             "user": breakdown.user,
