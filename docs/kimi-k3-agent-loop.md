@@ -1552,7 +1552,7 @@ matches and found exactly the one predicted: `compaction_fallback_name`
 in `crates/kitsu/src/main.rs` (~line 2387), a JSONL string map — added
 `EmptyCompletion => "empty_completion"`. Purely additive: no function
 signature changed, `Failed`/`IncompleteResponse` arms untouched.
-Committed `<SHA filled below>` (Kate verified), pushed.
+Committed `7efc9a0` (Kate verified), pushed.
 
 - **Diff: +130/-2 across 3 files** (`orchestrator.rs` +6/-2,
   `orchestrator_tests.rs` +125, `main.rs` +1). Genuinely small —
