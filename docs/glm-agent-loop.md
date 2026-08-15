@@ -1705,3 +1705,139 @@ P3 (raw-body negative-cache text) as smaller candidates.
 
 **Ramp status:** GLM holds a perfect grade record across 13 cycles (6
 reviews, 7 code). Top-tier standing unchanged.
+
+### Cycle 14 — 2026-08-15 — eighth review, the non-streaming completion parser (grade B+) — first confirmed citation-numbering slip
+
+Fresh review target per the alternation (cycle 13 was code): the pure
+parse function `parse_completion` in
+`crates/kitsu-providers/src/openai_compat.rs` (lines 599–660, ~62 lines,
+confirmed on disk immediately before the run) — turns a non-streaming
+chat-completion JSON body into `Vec<ChatDelta>`: choice/message
+extraction, tool-call reconstruction, usage surfacing, finish-reason
+mapping. Distinct from every prior review target (SSE streaming path
+cycle 5, `auth.rs` cycle 8, catalog parse cycle 10, catalog fetch+cache
+cycle 12/13). Driver rebuilt fresh from main immediately before the run.
+Success on `:together` attempt 1 — no transport failure, no retry, no
+provider fallback, no spawn attempted (cap 1 unexercised, prompt's
+"do NOT spawn sub-agents" honored).
+
+**Read discipline: 5 `Read` calls plus 2 `find_symbol` + 1 `List`** ("1
+turn(s) ok, 5 file(s) read, 1 file(s) written (1 change(s)), session not
+saved" — clean exit, no `PolicyDenied`, no discard). Wrote early (the
+review file was the sole write). Scope ran wide: the four `Read` calls on
+`openai_compat.rs` (595–675, 1–200, 400–595, 280–400) cover almost the
+entire 675-line file, well past "~5 ranged reads max" in spirit even
+though the literal read count matched. Justified in part — it needed the
+wire-type structs, `finish_from_str`, and the SSE decoder for cross-path
+comparison — but it means GLM held far more line-numbered context in
+view at once than the target function, which is the most plausible
+proximate cause of this cycle's citation slips (see below).
+
+**Citation spot-check: substantive/textual quotes all verbatim-correct,
+but four confirmed line-number mislabelings — the first citation defect
+in 14 cycles.** Every *quoted code text* matches the source exactly,
+character-for-character, at some real line in the file — GLM did not
+fabricate or paraphrase any line. But several of the *line numbers
+attached to those quotes* are wrong, i.e. GLM cited a number adjacent to
+the correct one rather than the one the read-tool prefix actually
+carried:
+- The P1 code-quote block (`for tc in choice.message.tool_calls {`
+  through `}));`) is labeled 628–637; the identical text is actually at
+  629–638 in the source — every one of the 10 quoted lines is
+  mislabeled by exactly −1. The accompanying prose ("the loop at lines
+  628–637") repeats the same shift and additionally undercounts the
+  loop's true span (629–639, since the for-loop's own closing `}` at
+  639 falls outside the cited range).
+- The "Notes" section states `choice.message.tool_calls` "is moved at
+  line 628" — line 628 in the actual source is `}` (closing the prior
+  `if let Some(text) = ...` block); the move happens at line 629.
+- Prose states `parse_completion` "calls it [`finish_from_str`] at line
+  641" — line 641 is `.finish_reason` (mid-chain); the actual call
+  `.map(finish_from_str)` is at line 643 (off by −2). The paired
+  claim about the streaming path calling it "at line 541" is exactly
+  correct (verified: `self.finish = Some(finish_from_str(&fr));`).
+- The "Notes" section cites "the `None` arm at lines 644–648"; the
+  actual `None => { ... }` arm is lines 646–650 (off by −2 at both
+  ends — 644–645 are actually the tail of the `Some` arm's match
+  expression).
+- A P2 aside claims `arguments: Option<String>`'s optionality is "legal
+  under `#[serde(default)]` at line 302/304"; those are the *field*
+  lines (`name: Option<String>,` / `arguments: Option<String>,`); the
+  actual `#[serde(default)]` attributes sit one line above each, at 301
+  and 303.
+
+All other citations verified exactly: P0's 602/603–605 quote block, the
+streaming-path null-filter at 466 and its comment at 470, the semantic-
+choice line 617, the streaming tool-call-skip guard at 566–570, the
+argument-accumulation line 536, `finish_from_str` itself at 339–345, the
+four wire-type struct ranges (307–313/315–321/323–329/331–337, all
+exact), `Usage::is_empty` at types.rs 148–150, and the SSE usage-capture
+block at 488–491. The review's own closing line — "Each proposal quotes
+the exact lines verbatim with their absolute line numbers" — is
+therefore not fully accurate; supervisor is flagging this explicitly per
+instruction, since the CRITICAL prompt clause was "copy it from the
+prefix," and five instances (one entire 10-line block plus three isolated
+mislabels) did not.
+
+**Four ranked, line-cited proposals — substantively sound and honestly
+hedged despite the numbering slip:**
+1. **(P0, highest) `"error": null` is a hard failure here but explicitly
+   ignored (with a code comment calling out the exact gateway behavior)
+   by the streaming path.** A genuine, verifiable divergence between two
+   code paths sharing one wire shape (per the module doc comment, lines
+   1–3, also verified exact) — the strongest finding this cycle, no
+   hedge needed since both sides were read.
+2. **(P1) Degenerate all-empty tool calls (`{}`) pass the semantic-
+   choice check and are emitted unconditionally**, unlike the streaming
+   path's non-empty-name-or-id guard. Correctly hedged on the
+   downstream tool-dispatch consumer, which GLM did not read.
+3. **(P2) `arguments` defaults to `""` rather than `"{}"`** — correctly
+   self-downgraded: GLM noticed the streaming path shares the exact same
+   default, so this is not a divergence, and it explicitly hedged the
+   downstream JSON-parsing assumption.
+4. **(P3) `finish_from_str`'s wildcard silently collapses
+   `"content_filter"` (and anything else unrecognized) to `Stop`.**
+   Strongly and correctly hedged: GLM explicitly states it did not read
+   the `FinishReason` enum and cannot confirm a better variant exists,
+   making the whole proposal conditional.
+
+**Grade: B+.** Downgraded from the run of A's specifically for the
+citation-numbering defects above — a real, confirmed break of the
+established "quote it, don't recall it" discipline that Cycles 1–13 held
+perfectly, including the closing summary's now-inaccurate self-claim of
+verbatim line fidelity. Everything else in the review is strong: all
+four proposals are technically correct where checked, ranked sensibly
+(the one unhedgeable-and-true divergence is P0, the ones needing
+downstream context are properly caveated), and no claim was asserted as
+fact beyond what GLM actually read — this is a numbering-precision
+lapse, not a hedging lapse or a substantive-correctness lapse. No
+misquoted *text* was found anywhere in the review.
+
+**Observed kitsu weaknesses / notes:** no new transport, `PolicyDenied`,
+or discard weaknesses this cycle. Read/token usage was efficient
+(`kitsu-usage: {"prompt_tokens":73051,"completion_tokens":12371,
+"total_tokens":85422}`, `kitsu-context: {"used":15088,"effective":107072,
+"window":131072}` — well below cycle 13's outlier). The read-tool line-
+number prefixes are the ground truth kitsu hands the model; nothing in
+kitsu itself appears to have corrupted them (this supervisor's
+independent reads confirm the *source* line numbers are exactly what the
+review should have cited) — the slip looks like a model-side transcription
+error made while holding ~4 large overlapping ranged reads of the same
+file in context at once, not a kitsu tooling defect. Worth watching
+whether wide, overlapping ranged-read sessions correlate with future
+citation drift.
+
+**GLM is now 7-for-7 A on code and 6-for-7 on reviews (13-for-14
+overall, one B+).** Remaining unreviewed surface for future review
+cycles: `fetch_models_response`, `StaticAuth`/`NoAuth` `header()` impls,
+`expiry_status()`, and the retry/backoff paths. Remaining backlog for
+future code cycles: this cycle's P0 (`"error": null` parity fix) is a
+strong, small, well-verified next code-cycle candidate; also cycle-10
+findings 2-4, cycle-8 finding 2, cycle-5 findings 5/6, P8/P11, and
+cycle-12's P2/P3.
+
+**Ramp status:** GLM's perfect-grade streak ends at 13 cycles; cycle 14
+is graded B+ for confirmed citation-numbering errors (not substantive or
+hedging errors). Standing remains strong — top-tier contributor — but no
+longer flawless; this is the first mark on the record and worth
+monitoring for recurrence rather than treating as noise.
