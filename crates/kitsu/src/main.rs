@@ -57,6 +57,10 @@ static RUN_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 /// Set only by inference-capable commands, keeping management/help output free
 /// of an unrelated timing footer.
 static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Set only when `--allow-turn-errors` converts a scripted run with both a
+/// success and a failure into an accepted partial result. The process-level
+/// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
+static SCRIPT_ACCEPTED_PARTIAL: AtomicBool = AtomicBool::new(false);
 static OUTPUT_SCHEMA: OnceLock<structured_output::OutputSchema> = OnceLock::new();
 /// Terminal durability state mirrored into `final_summary`. A fresh session has
 /// a planned id before its first snapshot exists; exposing that id as resumable
@@ -1111,6 +1115,9 @@ fn main() {
     }
     if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
         let status = match code {
+            0 if SCRIPT_ACCEPTED_PARTIAL.load(Ordering::Acquire) => {
+                kitsu_render::RunTimingStatus::Partial
+            }
             0 => kitsu_render::RunTimingStatus::Ok,
             EXIT_CANCELLED => kitsu_render::RunTimingStatus::Cancelled,
             _ => kitsu_render::RunTimingStatus::Error,
@@ -10391,6 +10398,14 @@ impl ScriptRunStatus {
     }
 }
 
+fn failure_count_phrase(failures: usize) -> String {
+    if failures == 1 {
+        "1 failure".to_string()
+    } else {
+        format!("{failures} failures")
+    }
+}
+
 /// The single shutdown boundary for scripted chat. Every body exit reaches
 /// this function, including parse/persistence errors, cancellation, and a
 /// terminal JSONL sink. Detached tasks are JOINED (bounded by
@@ -10427,10 +10442,8 @@ fn emit_run_receipt(
     };
     let progress = if failures == 0 {
         operations
-    } else if failures == 1 {
-        format!("{operations} / 1 failure")
     } else {
-        format!("{operations} / {failures} failures")
+        format!("{operations} / {}", failure_count_phrase(failures))
     };
     let agent_progress = registry.progress_snapshot();
     let mut agents = String::new();
@@ -10572,6 +10585,8 @@ async fn finalize_scripted_run(
     }
 
     let aggregate_failure = primary_error.is_none() && status.failures > 0;
+    let accepted_partial =
+        aggregate_failure && allow_turn_errors && status.successful_operations > 0;
     if aggregate_failure && !allow_turn_errors {
         let message = format!(
             "script failed: {} turn(s) or command(s) failed (use --allow-turn-errors to accept partial success)",
@@ -10600,8 +10615,12 @@ async fn finalize_scripted_run(
         status.primary_error_framed = true;
     }
 
+    if accepted_partial && primary_error.is_none() {
+        SCRIPT_ACCEPTED_PARTIAL.store(true, Ordering::Release);
+    }
+
     if body_completed && status.failures > 0 && !jsonl {
-        eprintln!("script summary: {} failure(s)", status.failures);
+        eprintln!("script summary: {}", failure_count_phrase(status.failures));
     }
     if !jsonl {
         emit_run_receipt(
@@ -16392,6 +16411,12 @@ fn map_provider_error_with_diagnostics(
 mod tests {
     use super::*;
     use serial_test::serial;
+
+    #[test]
+    fn failure_count_phrase_pluralizes_naturally() {
+        assert_eq!(failure_count_phrase(1), "1 failure");
+        assert_eq!(failure_count_phrase(2), "2 failures");
+    }
 
     fn chat_helper() -> ChatHelper {
         ChatHelper {
