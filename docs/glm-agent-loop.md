@@ -377,3 +377,123 @@ after one failed and one successful tick. Cycle 2 should move to a
 fresh backlog item (implementation or a different file), per the
 recipe's "never assign the same item to two contributors in the same
 hour" rule — this slot is now spent for `context.rs`.
+
+### Cycle 2 (2026-08-14) — second file, grade A holds, citations still perfect
+
+New file, same recipe: `crates/kitsu-providers/src/openai_compat.rs`
+(1694 lines total), scoped to four named ranges (`build_body` ~180-260,
+`parse_completion` ~562-680, `models_cache` usage ~1190-1240,
+`model_context_length`/`validate_models_catalog` ~1271-1360) instead of
+a whole-file read, to test citation discipline under a tighter,
+multi-range brief.
+
+**Build**: `CARGO_TARGET_DIR=/home/mmpg/.cache/glm-worktree-target
+cargo build -p kitsu` from the main checkout — clean, ~11s.
+
+**Phase B — attempt 1 succeeded, no retry, no provider fallback.**
+`:together` healthy again (three ticks in a row now — cycle-1's
+transport failure reads more clearly as a one-off blip than a pattern).
+Tool sequence: 4 `List` calls to locate the file, then 5 ranged `Read`s
+of `openai_compat.rs` — 170-270, 555-690, 1180-1245, 1265-1365, then a
+self-directed 5th read of 1-175 to pull the `Usage`/`CompletionResponse`
+definitions needed to ground the cached-tokens proposal — followed by 2
+reads of `types.rs` (a stray 1-line read, then 1-200) for the `Usage`
+struct. That's 7 files read total (matches the run summary), one more
+range than the "at most ~5 ranged reads" instruction strictly named,
+but the deviation was disclosed in-transcript ("I have my 5 reads of
+`openai_compat.rs` ... I need the `Usage` struct definition... I'll
+read just that part of `types.rs`") rather than silently exceeding
+budget — judged a reasonable interpretation of "~5", not overreach.
+Each of the four ranges GLM read is a superset of the requested range
+(e.g. 170-270 covers the requested 180-260 with margin on both sides),
+so it stayed within scope. Wrote `reviews/glm-cycle-2.md` early (created
+12334 bytes), then made two disclosed refinement edits without
+re-reading source — both were self-corrections of claims GLM flagged as
+uncertain (a `ProviderError` variant it hadn't verified, and an `Option`
+semantics nuance in the empty-choice check), not re-citations, so the
+"re-read before citing" rule wasn't violated. Final file: 12669 bytes,
+267 lines. **No sub-agent spawn was attempted** — cap 1 unexercised
+again.
+
+`kitsu-usage: {"prompt_tokens":79732,"completion_tokens":12228,
+"total_tokens":91960}`. `kitsu-context: {"used":14216,
+"effective":107072,"window":131072}`. Run summary: "1 turn(s) ok, 7
+file(s) read, 1 file(s) written (1 change(s))".
+
+**Grade: A.** 4 ranked proposals (fewer than cycle 1's 12, but the
+brief was 4 named ranges vs. a whole 378-line file, so this is
+comparable density, not a quality drop):
+- **P1** — `Usage` silently drops `prompt_tokens_details.cached_tokens`
+  / `completion_tokens_details.reasoning_tokens` via serde's
+  fields-only deserialization; concrete `#[serde(default)]` field
+  additions, `is_empty()` left unchanged, `Usage::add` updated, with a
+  correctly out-of-scope note that `kitsu-core`'s budget math should
+  charge `prompt - cached`.
+- **P2** — `model_context_length` re-parses + linear-scans the whole
+  models catalog on every call even though `get_models_response`
+  already caches the raw bytes (60s TTL); proposes caching the parsed
+  `serde_json::Value` in `ModelsCacheEntry` or a per-model memo, with an
+  explicit warning not to give the memo a longer TTL than the raw cache.
+- **P3** — `build_body` forwards `t.parameters` to the wire verbatim
+  with no validation; proposes a fast-fail on non-object schemas,
+  explicitly flags "I did not read `error.rs` this cycle and cannot
+  confirm which variants exist" rather than guessing — correctly
+  cautious hedging (verified below: `InvalidResponse` does exist).
+- **P4** (minor) — `parse_completion`'s empty-choice guard is fine as
+  written but under-documented; doc-only proposal.
+- Cross-cutting notes correctly praise the negative-cache TTL split
+  (401/403 uncached, transient failures cached 5s) and the loose-match
+  tie-break comment as sound design, without inventing problems to pad
+  the count.
+
+**Citation spot-check: 5/5 exact**, spread across the deliverable:
+- `Usage` struct body (P1, lines 16-23 of the review) — verbatim match
+  to `types.rs:137-144` (`pub struct Usage { #[serde(default)] pub
+  prompt_tokens: u64, ... }`), including the exact `#[serde(default)]`
+  placement.
+- `if let Some(usage) = resp.usage { if !usage.is_empty() { ... } }`
+  (P1, lines 28-32) — verbatim match to `openai_compat.rs:616-619`.
+- `// One provider instance serves startup discovery, ...` cache
+  comment (P2, lines 102-104) — verbatim match to
+  `openai_compat.rs:39-41`.
+- `build_body`'s tool-mapping closure (P3, lines 148-159) — verbatim
+  match to `openai_compat.rs:210-219` (`ts.iter().map(|t:
+  &ToolDescriptor| WireTool { ... })`).
+- `parse_completion`'s `semantic_choice` guard (P4, lines 220-229) —
+  verbatim match to `openai_compat.rs:575-584`.
+
+**5/5 exact, zero drift — citation discipline held from cycle 1's 9/9.**
+Two cycles in a row with a perfect spot-check record now, the first
+model of the four contributors to do so.
+
+**Independent convergence (third instance of this pattern for GLM):**
+both P1 and P2 already sit unclaimed in Kimi's backlog
+(`docs/kimi-k3-agent-loop.md`) — "Surface `cached_tokens`... `Usage`
+(types.rs:136-144)" (near-identical line range to GLM's own citation)
+and "Cache parsed `model_context_length` across runs". GLM reached both
+findings independently, on a different file, from a much narrower
+4-range brief — reinforcing cycle 1's pattern of independently
+rediscovering real, still-open issues rather than inventing filler.
+
+**Observed kitsu weaknesses / notes:**
+- No new weaknesses this cycle; confirms the standing `--allow-path`/
+  `--allow-write` chat-subcommand-only friction did not recur (this
+  supervisor built the invocation correctly from the prior cycles'
+  notes) and no transport failures occurred.
+- Mild recipe-tuning note (not a kitsu bug): "at most ~5 ranged reads"
+  for a 4-range brief left GLM needing a judgment call to pull one more
+  grounding read (`Usage`/`types.rs`); GLM's choice was reasonable and
+  disclosed, but a future scoped-review prompt could explicitly
+  pre-authorize "+1 read of a struct definition if needed for grounding"
+  to remove the ambiguity.
+
+**Ramp status: GLM GRADUATES to the implementation ramp.** Two clean
+review cycles at grade A (cycle 1: 9/9 citations on `context.rs`; cycle
+2: 5/5 citations on `openai_compat.rs`), zero substantively-wrong
+proposals across both, two independent findings that duplicate
+still-open Kimi backlog items — GLM has demonstrated review reliability
+at Kimi-cycle-4 level twice running. Next cycle: implementation, not
+another review — **P10 model-context-length caching in
+`openai_compat.rs`** (the item GLM's own P2 this cycle independently
+re-derived, and a fresh slot Kimi hasn't taken), widening
+`--allow-write` to the `kitsu-providers` crate for that cycle only.
