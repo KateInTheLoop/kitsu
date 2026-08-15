@@ -1354,6 +1354,8 @@ enum DocType {
     Image(&'static str),
     /// Zip-based Office document (xlsx/docx/pptx); no extractor yet.
     Office(&'static str),
+    /// Jupyter notebook (`.ipynb`) — JSON with a `cells` array.
+    Notebook,
 }
 
 /// Detect the document class from magic bytes first (authoritative for binary
@@ -1393,6 +1395,7 @@ fn detect_doc_type(path: &Path, magic: &[u8]) -> DocType {
     }
     match ext.as_deref() {
         Some("csv") | Some("tsv") => DocType::Csv,
+        Some("ipynb") => DocType::Notebook,
         Some("pdf") => DocType::Pdf, // extensionless-magic already handled above
         // Extension-only image hints (e.g. a truncated header) still classify.
         Some("png") => DocType::Image("PNG"),
@@ -1411,11 +1414,11 @@ pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerF
         name: "read_document".to_string(),
         description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
                       to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
-                      → text, XLSX → spreadsheet cells, DOCX → paragraph text, PPTX → slide text. \
-                      Always discloses the detected type and which reader ran. Images report \
-                      metadata only; unknown zip-based Office types are detected and disclosed but \
-                      not text-extracted. Unknown types fall back to a UTF-8 text read. For paging \
-                      a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+                      → text, XLSX → spreadsheet cells, DOCX → paragraph text, PPTX → slide text, \
+                      .ipynb → notebook cells. Always discloses the detected type and which reader \
+                      ran. Images report metadata only; unknown zip-based Office types are detected \
+                      and disclosed but not text-extracted. Unknown types fall back to a UTF-8 text \
+                      read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1477,6 +1480,10 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
         DocType::Office("PPTX") => (
             "PPTX → fs_read_pptx",
             read_pptx_run(policy, &path_args).await?,
+        ),
+        DocType::Notebook => (
+            "notebook → fs_read_notebook",
+            read_notebook_run(policy, &path_args).await?,
         ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
@@ -1710,6 +1717,224 @@ async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolE
         .await
         .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
         .map_err(|e| ToolError::ExecError(format!("docx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_notebook (Jupyter .ipynb cell extraction) ----------------------
+
+const NOTEBOOK_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const NOTEBOOK_DEFAULT_MAX_CELLS: usize = 100;
+const NOTEBOOK_MAX_CELLS_CEILING: usize = 1000;
+/// Source lines shown per cell before eliding.
+const NOTEBOOK_MAX_SOURCE_LINES: usize = 60;
+/// Output summaries shown per code cell.
+const NOTEBOOK_MAX_OUTPUTS: usize = 12;
+
+#[derive(Deserialize)]
+struct ReadNotebookArgs {
+    path: String,
+    /// Cells shown (default 100, max 1000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_cells: Option<usize>,
+}
+
+/// A notebook `source`/`text` field: a JSON string, or an array of line strings.
+fn notebook_value_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|v| v.as_str()).collect::<String>()
+        }
+        _ => String::new(),
+    }
+}
+
+/// One-line summary of a code-cell output (never the full payload).
+fn notebook_output_summary(output: &serde_json::Value) -> Option<String> {
+    let kind = output.get("output_type").and_then(|v| v.as_str())?;
+    match kind {
+        "stream" => {
+            let name = output
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stream");
+            let text = notebook_value_text(output.get("text"));
+            let lines = text.lines().count().max(usize::from(!text.is_empty()));
+            Some(format!(
+                "{name} ({lines} line{})",
+                if lines == 1 { "" } else { "s" }
+            ))
+        }
+        "execute_result" | "display_data" => {
+            let data = output.get("data");
+            if let Some(plain) = data.and_then(|d| d.get("text/plain")) {
+                let text = notebook_value_text(Some(plain));
+                let first = text.lines().next().unwrap_or("").trim();
+                let shown: String = first.chars().take(120).collect();
+                Some(format!("result: {shown}"))
+            } else {
+                let mut mimes: Vec<&str> = data
+                    .and_then(|d| d.as_object())
+                    .map(|o| o.keys().map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                mimes.sort();
+                Some(format!("result: {}", mimes.join(", ")))
+            }
+        }
+        "error" => {
+            let ename = output
+                .get("ename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Error");
+            let evalue = output.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
+            let evalue: String = evalue.chars().take(120).collect();
+            Some(format!("error: {ename}: {evalue}"))
+        }
+        _ => None,
+    }
+}
+
+fn render_notebook(display: &str, json_text: &str, max_cells: usize) -> String {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => return format!("notebook> {display}: could not parse notebook JSON — {e}\n"),
+    };
+    let Some(cells) = value.get("cells").and_then(|c| c.as_array()) else {
+        return format!(
+            "notebook> {display}: not a Jupyter notebook (no top-level `cells` array; \
+             nbformat 4 expected)\n"
+        );
+    };
+
+    let language = value
+        .get("metadata")
+        .and_then(|m| m.get("kernelspec"))
+        .and_then(|k| k.get("language"))
+        .and_then(|l| l.as_str());
+    let code_count = cells
+        .iter()
+        .filter(|c| c.get("cell_type").and_then(|t| t.as_str()) == Some("code"))
+        .count();
+    let md_count = cells
+        .iter()
+        .filter(|c| c.get("cell_type").and_then(|t| t.as_str()) == Some("markdown"))
+        .count();
+
+    let lang_note = match language {
+        Some(l) => format!(" [language: {l}]"),
+        None => String::new(),
+    };
+    let mut out = format!(
+        "notebook> {display}: {} cell(s) ({code_count} code, {md_count} markdown){lang_note}\n",
+        cells.len()
+    );
+
+    let shown = cells.len().min(max_cells);
+    for (idx, cell) in cells.iter().take(shown).enumerate() {
+        let cell_type = cell
+            .get("cell_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown");
+        let exec = cell
+            .get("execution_count")
+            .and_then(|v| v.as_u64())
+            .map(|n| format!(" (exec {n})"))
+            .unwrap_or_default();
+        out.push_str(&format!("[{}] {cell_type}{exec}:\n", idx + 1));
+
+        let source = notebook_value_text(cell.get("source"));
+        let src_lines: Vec<&str> = source.lines().collect();
+        for line in src_lines.iter().take(NOTEBOOK_MAX_SOURCE_LINES) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if src_lines.len() > NOTEBOOK_MAX_SOURCE_LINES {
+            out.push_str(&format!(
+                "    …[{} more source line(s)]\n",
+                src_lines.len() - NOTEBOOK_MAX_SOURCE_LINES
+            ));
+        }
+
+        if let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array()) {
+            let summaries: Vec<String> =
+                outputs.iter().filter_map(notebook_output_summary).collect();
+            for summary in summaries.iter().take(NOTEBOOK_MAX_OUTPUTS) {
+                out.push_str(&format!("  → {summary}\n"));
+            }
+            if summaries.len() > NOTEBOOK_MAX_OUTPUTS {
+                out.push_str(&format!(
+                    "  → …[{} more output(s)]\n",
+                    summaries.len() - NOTEBOOK_MAX_OUTPUTS
+                ));
+            }
+        }
+    }
+    if cells.len() > shown {
+        out.push_str(&format!(
+            "[showing {shown} of {} cells; raise max_cells for more]\n",
+            cells.len()
+        ));
+    }
+    out
+}
+
+pub fn read_notebook_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_notebook".to_string(),
+        description: "Extract the cells of a Jupyter notebook (.ipynb): each cell's type \
+                      (code/markdown/raw), its source, and a one-line summary of each code cell's \
+                      outputs (stream line counts, result mime/text, errors) — never the full \
+                      output payload. Reads the notebook as structure instead of dumping raw JSON. \
+                      Dep-free (serde_json); same allowlist as fs_read_file; a non-notebook or \
+                      malformed file is disclosed honestly."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .ipynb notebook"},
+                "max_cells": {"type": "integer", "description": "Cells shown (optional, default 100, max 1000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_notebook_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_notebook_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadNotebookArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > NOTEBOOK_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "notebook is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            NOTEBOOK_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let display = a.path.clone();
+    let max_cells = a
+        .max_cells
+        .unwrap_or(NOTEBOOK_DEFAULT_MAX_CELLS)
+        .clamp(1, NOTEBOOK_MAX_CELLS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, NOTEBOOK_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+        Ok(render_notebook(&display, &text, max_cells))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
     Ok(policy.cap_output(rendered))
 }
 
@@ -7417,6 +7642,93 @@ mod tests {
         std::fs::write(&bad, SAMPLE_AUDIT_JSON).unwrap();
         assert!(matches!(
             audit_summary_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    const SAMPLE_NOTEBOOK: &str = r##"{
+      "cells": [
+        {"cell_type": "markdown", "source": ["# Title\n", "Some **text**\n"]},
+        {"cell_type": "code", "execution_count": 1,
+         "source": ["import numpy as np\n", "np.arange(3)\n"],
+         "outputs": [
+           {"output_type": "stream", "name": "stdout", "text": ["loading\n", "done\n"]},
+           {"output_type": "execute_result", "data": {"text/plain": ["array([0, 1, 2])"]}},
+           {"output_type": "error", "ename": "ValueError", "evalue": "bad input", "traceback": []}
+         ]}
+      ],
+      "metadata": {"kernelspec": {"language": "python", "name": "python3"}},
+      "nbformat": 4, "nbformat_minor": 5
+    }"##;
+
+    #[test]
+    fn notebook_renders_cells_types_and_output_summaries() {
+        let out = render_notebook("nb.ipynb", SAMPLE_NOTEBOOK, 100);
+        assert!(out.contains("2 cell(s) (1 code, 1 markdown)"), "{out}");
+        assert!(out.contains("[language: python]"), "{out}");
+        assert!(out.contains("[1] markdown:"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+        assert!(out.contains("[2] code (exec 1):"), "{out}");
+        assert!(out.contains("import numpy as np"), "{out}");
+        // Output summaries — never the full payload.
+        assert!(out.contains("→ stdout (2 lines)"), "{out}");
+        assert!(out.contains("→ result: array([0, 1, 2])"), "{out}");
+        assert!(out.contains("→ error: ValueError: bad input"), "{out}");
+    }
+
+    #[test]
+    fn notebook_non_notebook_and_malformed_are_honest() {
+        // Valid JSON but not a notebook (no cells array).
+        let out = render_notebook("x.ipynb", r#"{"foo": 1}"#, 100);
+        assert!(out.contains("not a Jupyter notebook"), "{out}");
+        // Malformed JSON.
+        let out = render_notebook("x.ipynb", "not json {{{", 100);
+        assert!(out.contains("could not parse"), "{out}");
+        // A cell whose `source` is a plain string (not an array) is handled.
+        let one = r#"{"cells":[{"cell_type":"code","source":"print(1)\n"}]}"#;
+        let out = render_notebook("x.ipynb", one, 100);
+        assert!(out.contains("print(1)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_notebook_end_to_end_dispatch_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("analysis.ipynb");
+        std::fs::write(&path, SAMPLE_NOTEBOOK).unwrap();
+
+        let out = read_notebook_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("nb ok");
+        assert!(
+            out.contains("2 cell(s)") && out.contains("import numpy"),
+            "{out}"
+        );
+
+        // read_document routes an .ipynb to fs_read_notebook.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("notebook → fs_read_notebook"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.ipynb");
+        std::fs::write(&bad, SAMPLE_NOTEBOOK).unwrap();
+        assert!(matches!(
+            read_notebook_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
             )
