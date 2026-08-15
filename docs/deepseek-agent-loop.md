@@ -1,16 +1,19 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 5 was DeepSeek's first IMPLEMENTATION cycle
-> (grade C+, partial).** The tiny-scope discipline that held for 2
-> review cycles (3, 4 — both A-) did NOT transfer to an
-> implementation-plus-test task: DeepSeek made ~36 read/scan calls
-> against a 2-read cap, timed out before writing its test, and the turn
-> was discarded — but its file-edit checkpoints persisted anyway, and
-> the code change itself (proposal #1 from its own cycle-4 review) was
-> correct and shipped after the supervisor trimmed two out-of-scope
-> touches. See the Cycle 5 entry for the full account, including proof
-> that the test DeepSeek was asked to write is not constructible with
-> today's types. See the Cycle log below.
+> **LIVE 2026-08-14: cycle 6 returned to the review lane (grade B+).**
+> Tiny single-function scope discipline held a third clean time (1
+> read, 1 write, no over-reading, no spawn) on `compact_context`, and
+> quoted citation TEXT was letter-perfect again — but this cycle
+> shipped its first non-top-ranked proposal stated as unhedged fact
+> that was objectively wrong on in-scope information (a false "usage
+> is discarded" claim; `compact_context` returns the callee's result
+> directly, so nothing is discarded). Proposal 1 independently
+> re-derived the same `unwrap_or_default()`-swallows-schema-errors bug
+> class that cycle 5 fixed in a sibling function. See the Cycle 6 entry
+> for the full citation spot-check. Cycle 5 (DeepSeek's first
+> IMPLEMENTATION attempt, grade C+) showed tiny-scope discipline does
+> NOT transfer to implementation — DeepSeek made ~36 read/scan calls
+> against a 2-read cap there; see that entry for the full account.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -749,3 +752,84 @@ reproduction is achievable BEFORE briefing DeepSeek, not after — and
 (c) consider a longer `--timeout-secs` for implementation-plus-test
 turns, since this one needed real exploration budget that a review-only
 turn doesn't.
+
+### Cycle 6 — 2026-08-14 — back on review lane, tiny scope holds again (grade B+)
+
+Per the cycle-5 verdict (implementation reignites over-reading; keep
+DeepSeek on tiny-scope reviews until R4.10), cycle 6 returned to the
+review lane on a fresh single function: `compact_context`
+(`crates/kitsu-core/src/orchestrator.rs`, ground truth lines 2041-2072,
+doc comment 2038-2040). Prompt mandated exactly one ranged read
+(2038-2077) then an immediate write. `--agent-spawn-cap 1` kept as a
+safety net; no spawn was attempted. Commit `<see below>` on
+`dogfood/deepseek-v4`.
+
+**Process — discipline held perfectly:** exactly **1 read** (single
+ranged read 2038-2077) and **1 write**, first attempt, no re-reads, no
+spawn. kitsu-usage 14,204 / 2,338 / 16,542 (prompt/completion/total) —
+the cheapest cycle yet. This is the third consecutive tiny-scope review
+with clean 1-read/1-write execution (cycles 3, 4, 6), confirming the
+scope-sizing lever again.
+
+**Deliverable** (`reviews/deepseek-cycle-6.md`): 4 ranked proposals.
+
+**Citation spot-check:** all 4 quoted code blocks are **letter-perfect**
+against ground truth (exact text, whitespace included). Line-number
+*labels* drifted as expected from the known ranged-read issue (R1.7,
+filed cycle 4) — 3 of 4 labels off by exactly one line (mixed direction:
+proposals 1/2/4-body cited one line high, proposal 4's parameter
+citation one line low), one label (proposal 3) exactly correct. This
+continues the pattern: DeepSeek's quoted TEXT is trustworthy, its
+self-counted labels are not.
+
+**Substantive correctness — mixed, the first review cycle with a real
+non-top-ranked error:**
+- **Proposal 1 (high, correct and valuable):** flags
+  `serde_json::to_string(tools.descriptors()).unwrap_or_default()`
+  silently swallowing a serialization failure into an empty schema
+  string. This is the *same bug class* DeepSeek's own cycle-4 proposal
+  found and cycle-5 fixed in the sibling function
+  `ensure_chat_request_fits` — DeepSeek (no memory of prior cycles)
+  independently re-derived the pattern in a second call site. Confirms
+  it's a real, recurring anti-pattern in this file, not a one-off.
+- **Proposal 2 (medium, substantively WRONG, unhedged):** claims the
+  `usage` local is "discarded when the function returns the
+  `CompactionReport`." Supervisor verified this is false and was
+  verifiable from the assigned scope alone: `compact_context`'s body
+  ends with `enforce_context_budget_recording(...).await` as its own
+  tail expression — there is no post-processing step that could discard
+  anything, the callee's result *is* the function's return value.
+  (Confirmed further out-of-scope: `CompactionReport` has a `pub usage`
+  field populated from `*turn_usage` — the same `usage` local — on
+  every return path of the callee.) Unlike cycle 3's wrong proposal,
+  this one was stated as fact rather than conditionally hedged.
+- **Proposal 3 (medium, partially wrong):** calls the literal `1`
+  (positional arg to `enforce_context_budget_recording`) an ambiguous
+  "retry count." It is actually the `round: u32` parameter (a call-site
+  detail outside the assigned range, so the mislabel is understandable)
+  — but the underlying code-smell observation (an unlabeled positional
+  literal in a 12-argument call) remains valid regardless of what it
+  turns out to represent.
+- **Proposal 4 (low, correct):** narrowing `tools: &Registry` to
+  `&[ToolDescriptor]` since only `.descriptors()` is used — accurate
+  within scope, reasonable, low-risk.
+
+**Grade: B+.** Process (scope discipline, quote fidelity) matches
+cycles 3-4's best showing, but this is the first review cycle with a
+non-top-ranked proposal stated as unhedged fact and objectively wrong
+on information fully inside the assigned scope — a step down from
+cycle 4's "citations perfect, zero wrong proposals" and closer to (but
+better-grounded than) cycle 1's citation-drift-driven B.
+
+**Ramp verdict CONFIRMED further (n=3 clean review cycles: 3, 4, 6, all
+1-read/1-write):** tiny single-function scope remains DeepSeek's
+reliable lever for shipping *something* on review tasks, but "ships
+cleanly" and "every proposal is correct" are separable axes — cycle 6
+shows a clean-process cycle can still carry a confidently wrong claim.
+Recommendation for cycle 7: add an explicit "for each proposal, state
+what you verified from the read text vs. what you're inferring about
+code you didn't read" instruction, to convert unhedged inferences (like
+proposal 2 here) into flagged hedges (like cycle 3's hedged wrong
+proposal, which the grading rubric treated more leniently). Role
+decision unchanged: stay on tiny-scope reviews until R4.10 (technical
+read cap) lands and an implementation retry is warranted.
