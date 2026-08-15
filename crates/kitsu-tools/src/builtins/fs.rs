@@ -3873,7 +3873,10 @@ async fn write_file_run_with_journal(
     let written = target.clone();
     let blocking_journal = journal.cloned();
     let tracked_mutation = journal.map(WriteJournal::begin_mutation);
-    let max_bytes = policy.max_bytes();
+    // The journal pre-image is part of a WRITE, so bound it by the write cap
+    // (1 MiB), not the 64 KiB read cap — otherwise any file over the read cap
+    // is uneditable (orchestrator.rs at 129 KiB could never be written).
+    let max_bytes = policy.max_write_bytes();
     let outcome =
         tokio::task::spawn_blocking(move || -> std::io::Result<(&'static str, Option<usize>)> {
             let (_mutation_lease, attribution) = match tracked_mutation {
@@ -4036,7 +4039,11 @@ async fn edit_file_run_with_journal(
     }
     let display = target.display().to_string();
     let read_target = target.clone();
-    let max_bytes = policy.max_bytes();
+    // fs_edit_file reads the whole existing file to apply the replacement and
+    // snapshot the pre-image; both are part of a write, so bound by the write
+    // cap (1 MiB), not the 64 KiB read cap — a large source file must remain
+    // editable even though a bare read of it would be capped.
+    let max_bytes = policy.max_write_bytes();
     let (mutation_target, original, original_snapshot) = tokio::task::spawn_blocking(move || {
         let mutation_target = MutationTarget::pin(&read_target)?;
         read_existing_text(mutation_target, max_bytes)
@@ -5437,6 +5444,53 @@ mod tests {
             std::fs::read_to_string(&target).unwrap(),
             "alpha\nBETA\ngamma\n"
         );
+    }
+
+    #[tokio::test]
+    async fn edit_and_write_handle_files_larger_than_the_read_cap() {
+        // Regression: the journal pre-image used the 64 KiB READ cap, so any
+        // file above it (e.g. orchestrator.rs at 129 KiB) was uneditable. The
+        // write cap (1 MiB) is the correct bound. Build a ~200 KiB file — well
+        // over the read cap, under the write cap — and edit + rewrite it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let policy =
+            Permissions::for_roots(std::slice::from_ref(&root), std::slice::from_ref(&root))
+                .unwrap();
+        // The 200 KiB fixture straddles the caps: over the 64 KiB read cap,
+        // under the 1 MiB write cap (DEFAULT_MAX_BYTES .. DEFAULT_MAX_WRITE_BYTES).
+        let target = dir.path().join("big.rs");
+        let mut body = "x".repeat(200 * 1024);
+        body.push_str("\nOLD_MARKER\n");
+        std::fs::write(&target, &body).unwrap();
+
+        // fs_edit_file on a file over the read cap now succeeds.
+        let args = serde_json::json!({
+            "path": target,
+            "old_text": "OLD_MARKER",
+            "new_text": "NEW_MARKER"
+        })
+        .to_string();
+        let result: serde_json::Value =
+            serde_json::from_str(&edit_file_run(&policy, &args).await.unwrap()).unwrap();
+        assert_eq!(result["change"], "updated", "edit result: {result}");
+        assert!(std::fs::read_to_string(&target)
+            .unwrap()
+            .contains("NEW_MARKER"));
+
+        // fs_write_file creating a fresh file larger than the read cap
+        // succeeds (the write cap governs, not the read cap).
+        let fresh = dir.path().join("fresh_big.rs");
+        let content = "y".repeat(150 * 1024);
+        let wargs = serde_json::json!({ "path": fresh, "content": content }).to_string();
+        let wout = write_file_run(&policy, &wargs)
+            .await
+            .expect("write over-cap ok");
+        assert!(
+            wout.contains("created") || wout.contains("\"change\""),
+            "{wout}"
+        );
+        assert_eq!(std::fs::read_to_string(&fresh).unwrap().len(), 150 * 1024);
     }
 
     #[tokio::test]

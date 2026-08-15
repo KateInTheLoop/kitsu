@@ -612,6 +612,15 @@ impl Permissions {
         self.max_bytes
     }
 
+    /// Byte ceiling for write/edit operations, including the pre-image snapshot
+    /// the journal reads before a mutation. Larger than [`Self::max_bytes`] (the
+    /// read cap) so that editing a source file is not bounded by the much
+    /// smaller read window — a 64 KiB read cap must not make a 129 KiB file
+    /// uneditable.
+    pub fn max_write_bytes(&self) -> usize {
+        self.max_write_bytes
+    }
+
     /// Current fallback policy for paths not already covered by a session root.
     pub fn mode(&self) -> Mode {
         self.mode
