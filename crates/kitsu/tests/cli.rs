@@ -1998,6 +1998,66 @@ fn test_sessions_missing_namespace_is_provider_free_and_friendly() {
 }
 
 #[test]
+#[serial]
+fn test_scripted_sessions_filter_handles_missing_namespace_provider_free() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("filtered-empty-sessions.script");
+    fs::write(&script, "/sessions Needle-That-Is-Not-Saved\n/quit\n").unwrap();
+
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "--no-stream",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("filter sessions in a fresh namespace");
+    assert!(
+        output.status.success(),
+        "stderr: {}\nstdout: {}",
+        String::from_utf8_lossy(&output.stderr),
+        String::from_utf8_lossy(&output.stdout)
+    );
+    assert!(output.stderr.is_empty());
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let results = events
+        .iter()
+        .filter(|event| event["type"] == "command_result")
+        .collect::<Vec<_>>();
+    assert_eq!(results.len(), 1, "{events:?}");
+    let result = &results[0]["result"];
+    assert_eq!(result["kind"], "sessions");
+    assert_eq!(result["count"], 0);
+    assert_eq!(result["filtered_count"], 0);
+    assert!(result["current_session_id"].is_null());
+    assert_eq!(result["sessions"], serde_json::json!([]));
+    assert!(result["text"]
+        .as_str()
+        .unwrap()
+        .contains("no sessions matched 'Needle-That-Is-Not-Saved'"));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "ok");
+    assert_eq!(summary["failures"], 0);
+    assert_eq!(summary["successful_operations"], 1);
+    assert!(
+        !home.path().join(".kitsu/sessions").exists(),
+        "a read-only empty search created the session namespace"
+    );
+}
+
+#[test]
 fn test_script_session_flags_reject_ambiguous_no_session() {
     let home = TempDir::new().expect("temp home");
     let script = home.path().join("empty.txt");
@@ -2279,6 +2339,201 @@ async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_re
             "named --no-tools request advertised merged tool schemas: {body}"
         );
     }
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
+async fn test_scripted_sessions_filter_matches_named_session_in_human_and_jsonl_modes() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "searchable saved answer"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let first = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--session",
+                "--name",
+                "Searchable-Demo",
+                "first saved turn",
+            ])
+            .output()
+            .expect("create searchable named session");
+        assert!(
+            first.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&first.stderr)
+        );
+
+        let listed = base_cmd(&home_path)
+            .args(["sessions", "--json"])
+            .output()
+            .expect("list searchable session");
+        assert!(listed.status.success(), "{listed:?}");
+        let listed: serde_json::Value = serde_json::from_slice(&listed.stdout).unwrap();
+        assert_eq!(listed.as_array().unwrap().len(), 1);
+        let session_id = listed[0]["id"].as_str().unwrap().to_string();
+        assert_eq!(listed[0]["name"], "Searchable-Demo");
+        assert_eq!(listed[0]["turns"], 1);
+
+        let jsonl_script = home_path.join("filtered-sessions-jsonl.script");
+        fs::write(
+            &jsonl_script,
+            "/sessions sEaRcHaBlE-dEmO\n/sessions no-such-session\n/quit\n",
+        )
+        .unwrap();
+        let jsonl = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--resume",
+                "Searchable-Demo",
+                "--script",
+                &jsonl_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("filter a named session in JSONL mode");
+        assert!(
+            jsonl.status.success(),
+            "stderr: {}\nstdout: {}",
+            String::from_utf8_lossy(&jsonl.stderr),
+            String::from_utf8_lossy(&jsonl.stdout)
+        );
+        assert!(jsonl.stderr.is_empty());
+        let events = String::from_utf8(jsonl.stdout)
+            .unwrap()
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        let results = events
+            .iter()
+            .filter(|event| event["type"] == "command_result")
+            .collect::<Vec<_>>();
+        assert_eq!(results.len(), 2, "{events:?}");
+
+        let hit = &results[0]["result"];
+        assert_eq!(hit["kind"], "sessions");
+        assert_eq!(hit["count"], 1);
+        assert_eq!(hit["filtered_count"], 1);
+        assert_eq!(hit["current_session_id"], session_id);
+        assert_eq!(hit["sessions"].as_array().unwrap().len(), 1);
+        assert_eq!(hit["sessions"][0]["id"], session_id);
+        assert_eq!(hit["sessions"][0]["name"], "Searchable-Demo");
+        assert!(hit["text"]
+            .as_str()
+            .unwrap()
+            .contains(" * Searchable-Demo ("));
+
+        let miss = &results[1]["result"];
+        assert_eq!(miss["kind"], "sessions");
+        assert_eq!(miss["count"], 1);
+        assert_eq!(miss["filtered_count"], 0);
+        assert_eq!(miss["current_session_id"], session_id);
+        assert_eq!(miss["sessions"], serde_json::json!([]));
+        assert!(miss["text"]
+            .as_str()
+            .unwrap()
+            .contains("no sessions matched 'no-such-session'"));
+
+        let summary = events.last().expect("final summary");
+        assert_eq!(summary["type"], "final_summary");
+        assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["failures"], 0);
+        assert_eq!(summary["successful_operations"], 2);
+        assert_eq!(summary["session_id"], session_id);
+
+        let human_script = home_path.join("filtered-sessions-human.script");
+        fs::write(
+            &human_script,
+            "/help\n/sessions SEARCHABLE-demo\n/sessions absent-human\n/quit\n",
+        )
+        .unwrap();
+        let human = base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "chat",
+                "--no-tools",
+                "--resume",
+                "Searchable-Demo",
+                "--script",
+                &human_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("filter a named session in human mode");
+        assert!(human.status.success(), "{human:?}");
+        let human_stderr = String::from_utf8_lossy(&human.stderr);
+        assert!(
+            human_stderr.contains("/sessions [filter]"),
+            "{human_stderr}"
+        );
+        assert!(
+            human_stderr.contains(" * Searchable-Demo ("),
+            "{human_stderr}"
+        );
+        assert!(
+            human_stderr.contains("no sessions matched 'absent-human'"),
+            "{human_stderr}"
+        );
+
+        let shown = base_cmd(&home_path)
+            .args(["sessions", "--json", "show", &session_id])
+            .output()
+            .expect("show session after provider-free filters");
+        assert!(shown.status.success(), "{shown:?}");
+        let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+        assert_eq!(
+            shown["messages"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .filter(|message| message["role"] == "user")
+                .count(),
+            1
+        );
+        let transcript = shown["messages"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .filter_map(|message| message["content"].as_str())
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(transcript.contains("first saved turn"), "{transcript}");
+        assert!(
+            transcript.contains("searchable saved answer"),
+            "{transcript}"
+        );
+        assert!(!transcript.contains("/sessions"), "{transcript}");
+        assert!(!transcript.contains("no-such-session"), "{transcript}");
+    })
+    .await
+    .expect("scripted session filters should join");
+
+    let requests = server.received_requests().await.expect("record requests");
+    assert_eq!(requests.len(), 1, "filters must remain provider-free");
     server.verify().await;
 }
 

@@ -821,7 +821,7 @@ Slash commands inside the REPL:
 | `/steer <correction>` | While a response is running on Unix, cancel its partial turn, keep/report completed file effects, and restart it immediately with the correction before queued follow-ups. |
 | `/retry` | Retry the last failed or cancelled prompt. Failed turns are removed from conversation history first. |
 | `/new` | Autosave the current conversation and start a fresh session. |
-| `/sessions [filter]` | List saved sessions, optionally filtered by a case-insensitive substring over id and preview. |
+| `/sessions [filter]` | List saved sessions, optionally filtered by a case-insensitive substring over ID, name, or preview. |
 | `/resume <id\|last>` | Resume a saved session without restoring its old permissions. |
 | `/fork [id]` | Clone a saved session to a fresh ID, then switch with fresh runtime permissions. |
 | `/export <file> [markdown\|json]` | Export the active session without overwriting. If it has artifacts, also create `<file>.artifacts` and rewrite exact pointers to that sidecar. |
