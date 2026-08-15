@@ -89,7 +89,8 @@ The implemented chat controls include:
 
 - Inspection: `/status`, `/context [refresh]`, `/permissions`, `/tools`, scoped
   `/diff`, `/checkpoints`, `/checkpoint <id>`, `/jobs`, `/agent`, `/profiles`,
-  `/artifacts`, and `/sessions`.
+  `/artifacts`, and `/sessions [filter]`; session filters match IDs, names, and
+  previews case-insensitively.
 - Model/context: `/model`, `/models`, `/reasoning`, `/compact`, `/clear`, and
   `/retry`.
 - Files/workflow: `/allow`, `/allow-write`, `/allow-read-write`,
