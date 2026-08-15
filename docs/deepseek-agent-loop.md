@@ -983,3 +983,108 @@ here is directly load-bearing for which messages get dropped, and no
 substantively-wrong claim was found. DeepSeek remains a STRONG,
 reliable tiny-scope reviewer — still review-only until R4.10
 (implementation type-chasing, per cycle 5, remains unaddressed).
+
+### Cycle 16 — 2026-08-15 — turn-execution wrapper review, first explicitly callee-heavy target (grade A-)
+
+Target: `run_agent_turn_with_state`
+(`crates/kitsu-core/src/orchestrator.rs`), the public async wrapper that
+sets up and executes one agent turn over a generic `P: Provider`,
+threading `AgentSessionState` through, emitting event-log and
+render/telemetry side effects, and returning the turn's result. Unlike
+prior targets (formatters, parsers, the compaction trimmer), this
+function's own body is short but almost entirely composed of calls out
+to helpers it does not define (`run_agent_turn_inner`,
+`kitsu_render::*`, `log.record`, `ContextBudget::new`,
+`state.meter.estimate`) and is generic over the provider — making it
+the loop's first target explicitly selected to stress-test hedging
+discipline on a callee-heavy function rather than scope discipline
+alone. Pre-dispatch check confirmed the assigned range (865-928) was
+exact: `fn run_agent_turn_with_state` opens at line 865, its own
+closing brace is at line 928 (64 lines total) — no correction needed.
+
+- **Process: 13th clean review cycle running.** Rebuilt the kitsu
+  driver fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build in 7.4s, no
+  errors — dependency graph already warm in the shared target dir).
+  Exactly **1 ranged read** (865-928, 64 lines, matching the assigned
+  range exactly — transcript shows a single `Read(…/orchestrator.rs)`
+  call and nothing else) → **1 write** (`reviews/deepseek-cycle-16.md`,
+  4459 bytes, 71 lines, 4 proposals), no re-read, no spawn attempt (cap
+  1 unexercised), first attempt succeeded, clean exit (`1 turn(s) ok, 1
+  file(s) read, 1 file(s) written`). kitsu-usage
+  `{"prompt_tokens":21152,"completion_tokens":2785,"total_tokens":23937}`.
+- **Citations 4/4 letter-perfect on both quoted text and line-number
+  labels.** Every quoted block (876-879 and 885 in proposal 1; 887-897
+  in proposal 2; 875 and 885 in proposal 3; 901-908 and 909/919/925 in
+  proposal 4) was diffed against the source on disk and matches
+  exactly, including whitespace — zero-drift streak continues.
+- **Proposal 1 (state reset before the fallible inner call risks
+  losing prior turn status/spawn budget on error, mostly hedged but one
+  sub-claim slips through unhedged):** correctly observes
+  `state.last_turn = AgentTurnStatus::default()` (876) and
+  `budget.reset()` (878) both execute unconditionally before
+  `run_agent_turn_inner` (885) can fail. The central claim about
+  `state.last_turn` is explicitly hedged ("I cannot assert whether
+  `run_agent_turn_inner` itself overwrites `state.last_turn`... from
+  this range alone the ordering is risky"). **Flagged:** the adjacent
+  sentence — "on error the budget is zeroed with no recovery path" —
+  asserts a specific effect of `budget.reset()` (a callee this range
+  does not define) as fact, with no hedge attached to that particular
+  sub-claim; the umbrella hedge at the paragraph's end covers only the
+  `state.last_turn` half of the argument. A real instance of the
+  callee-behavior-unhedged pattern the brief asked to watch for, though
+  narrow (one clause in one of four proposals) and low-stakes (the
+  broader point — resets precede a fallible call — is sound and
+  in-range).
+- **Proposal 2 (event-log may record stale default fields if the inner
+  call errors before populating them, correctly hedged):** reasons from
+  visible control flow — nothing between line 876 and line 887 writes
+  `state.last_turn` except the call at line 885, so any field value at
+  887 traces to either the line-876 default or whatever
+  `run_agent_turn_inner` did — and explicitly declines to assert which,
+  closing with "(which I cannot verify from this range — hedge)". Sound
+  reasoning from in-range structure, correctly hedged on the one part
+  that depends on the callee.
+- **Proposal 3 (accumulated `turn_usage` token counts are rendered but
+  omitted from the structured `TurnFinished` log event, correctly
+  hedged):** accurate in-range observation — `turn_usage` reaches
+  `kitsu_render::emit_turn_stats`/`emit_failed_turn_stats` (920/922) but
+  never reaches `log.record` (892-897). Hedges the one out-of-range
+  unknown directly: "the `AgentRuntimeEvent` enum is not visible here;
+  it may already carry optional usage fields."
+- **Proposal 4 (two consecutive identical `!cfg.quiet` guards invite
+  drift, correct, no hedge needed):** pure in-range structural
+  observation with no callee dependency; correctly left unhedged.
+  Low-severity maintainability note.
+
+**Grade: A-.** Process is clean (13th in a row) and citations are
+letter-perfect on quotes and labels. Docked half a grade for the one
+unhedged callee-behavior clause in proposal 1 ("the budget is zeroed
+with no recovery path") — asserting a specific effect of
+`spawn_budget.reset()`, a callee this range doesn't define, without the
+sentence-level hedge the surrounding paragraph otherwise applies. This
+is exactly the failure mode the cycle brief flagged as the crux for a
+callee-heavy target; DeepSeek avoided it everywhere else (3 of 4
+proposals hedge every callee-dependent claim cleanly, including
+correctly leaving the callee-free proposal 4 unhedged), so the
+calibration is good but not flawless. No substantively-wrong claims
+found on spot-check.
+
+**Kitsu weaknesses observed:** none new. The main-checkout read-only
+verification build (`cargo build -p kitsu` in
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu`) was also clean; the main
+checkout was left untouched (no git mutations), consistent with another
+session's concurrent work there.
+
+**Ramp status:** process discipline now **13-for-13 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16); citation fidelity now
+**8-for-10 fully clean on quotes+labels** (cycles 7, 8, 9, 11, 12, 14,
+15, 16 clean; cycles 10 and 13 each showing one prior minor drift).
+This is the first cycle explicitly targeting a callee-heavy,
+provider-generic function to stress-test hedging discipline rather than
+scope discipline; DeepSeek hedged the large majority of callee-dependent
+claims correctly but let one clause (proposal 1's budget-zeroing
+assertion) through unhedged — the first concrete data point on where
+the hedging discipline's edge sits. DeepSeek remains a STRONG,
+reliable tiny-scope reviewer — still review-only until R4.10
+(implementation type-chasing, per cycle 5, remains unaddressed).
