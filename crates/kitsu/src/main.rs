@@ -11,6 +11,7 @@ mod prompt_queue;
 mod session;
 mod skills;
 mod subagent;
+mod typeahead_editor;
 mod workspace;
 
 use std::cell::{Cell, RefCell};
@@ -1583,12 +1584,29 @@ fn print_doctor_human(report: &serde_json::Value) {
         doctor_text(report, "/runtime_state/path_display"),
         doctor_text(report, "/runtime_state/status"),
     );
+    let online_status = doctor_text(report, "/online/status");
+    let online_scope_note = if online_status == "reachable"
+        && report
+            .pointer("/online/chat_route_probed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+    {
+        // The probe validates the MODEL CATALOG route only. Claiming more
+        // told a user with an invalid credential "you're ready" (cycle-23
+        // audit): say exactly what was and was not checked.
+        let models = report
+            .pointer("/online/models")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or(0);
+        format!(
+            "reachable ({models} models in catalog) — catalog route only; credentials and the chat route are NOT validated until a real turn"
+        )
+    } else {
+        online_status
+    };
+    println!("[info] provider check: {online_scope_note}");
     println!(
-        "[info] provider check: {}",
-        doctor_text(report, "/online/status"),
-    );
-    println!(
-        "[info] tools: filesystem={} commands={}",
+        "[info] tools: filesystem={}; commands={}",
         doctor_text(report, "/tool_policy/filesystem"),
         doctor_text(report, "/tool_policy/commands"),
     );
@@ -1601,7 +1619,18 @@ fn print_doctor_human(report: &serde_json::Value) {
         // Terminal state must name the next step (cycle-14 config audit #4):
         // "healthy" without "now what" strands exactly the new user doctor
         // exists to help.
-        println!("doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`)");
+        let credential_caveat = if report
+            .pointer("/online/chat_route_probed")
+            .and_then(serde_json::Value::as_bool)
+            == Some(false)
+        {
+            " (config checks passed; the first real turn is what validates credentials)"
+        } else {
+            ""
+        };
+        println!(
+            "doctor: no blocking issues found — you're ready: run `kitsu chat` (or `kitsu ask \"…\"`){credential_caveat}"
+        );
     } else {
         println!("doctor: {} blocking issue(s)", issues.len());
         for issue in issues {
@@ -1890,7 +1919,9 @@ async fn run_doctor(cli: &Cli, online: bool, json: bool) -> Result<(), CliError>
         }
     }
 
-    let filesystem_policy = if cli.dangerously_allow_all_filesystem {
+    let filesystem_policy = if cli.dangerously_skip_permissions {
+        "DANGER: unattended bypass — global non-protected filesystem access AND auto-approved commands inside their roots"
+    } else if cli.dangerously_allow_all_filesystem {
         "DANGER: global non-protected filesystem bypass when tools are enabled"
     } else if cli.yes {
         "non-prompting and confined to explicit/current roots when tools are enabled"
@@ -2425,6 +2456,7 @@ fn build_agent_config(
         quiet: cli.jsonl,
         event_log: None,
         skill_names: Vec::new(),
+        run_tallies: None,
         spawn_budget: None,
     }
 }
@@ -2587,6 +2619,9 @@ struct SlashCommandSpec {
     name: &'static str,
     args: &'static str,
     description: &'static str,
+    /// Longer explanation for `/help <command>`: behavior, constraints, and
+    /// an example where one helps. Empty falls back to `description`.
+    details: &'static str,
     group: CommandGroup,
     /// A backward-compatible alias folds into its parent's `/help` row while
     /// remaining a first-class registry entry for completion and dispatch.
@@ -2610,6 +2645,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "agent",
         args: "[list|show <id>|steer <id> <text>|stop <id>|close <id>]",
         description: "inspect and control one background agent thread",
+        details: "Per-thread control of one background agent: `show` streams its bounded transcript, `steer` injects a correction, `stop` cancels, `close` acknowledges a finished thread. Ids come from /jobs.",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -2617,6 +2653,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "agents",
         args: "[id]",
         description: "backward-compatible alias for /jobs",
+        details: "",
         group: CommandGroup::AgentsJobs,
         alias_of: Some("jobs"),
     },
@@ -2624,6 +2661,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow",
         args: "<path>",
         description: "grant read access for this session",
+        details: "Grants READ access to a path for this session only. Runtime grants are dropped on /new, /resume, and /fork; invocation-flag roots persist. Example: /allow ../other-crate",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2631,6 +2669,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow-read-write",
         args: "<path>",
         description: "grant read and write access for this session",
+        details: "Grants read AND write access to a path for this session. Writes are journaled into checkpoints (/checkpoints, /undo).",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2638,6 +2677,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "allow-write",
         args: "<path>",
         description: "grant write access for this session",
+        details: "Grants WRITE-ONLY access — the model can create/replace files there but cannot read them back; use /allow-read-write when edits need readback.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2645,6 +2685,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "archive",
         args: "<id>",
         description: "archive an inactive saved conversation",
+        details: "Moves an inactive saved session into recoverable archive storage. Restore later with /restore <id>; archived sessions leave /sessions listings.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2652,6 +2693,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "artifacts",
         args: "[list|prune <id|all>]",
         description: "inspect or prune retained command-output artifacts",
+        details: "",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2659,6 +2701,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "checkpoint",
         args: "<id>",
         description: "preview one recoverable verified file checkpoint",
+        details: "Previews one write checkpoint: its files, sizes, and a bounded verified diff. Restore it with /undo <id>.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2666,6 +2709,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "checkpoints",
         args: "",
         description: "list recoverable verified file checkpoints",
+        details: "Lists write checkpoints (grouped successful model writes) with ids — each is restorable via /undo <id> while its files still match.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2673,6 +2717,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "clear",
         args: "",
         description: "clear conversation history",
+        details: "",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2680,6 +2725,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "compact",
         args: "",
         description: "compact older conversation context now",
+        details: "Reclaims context: trim drops the oldest exchanges; summarize replaces them with an LLM-written summary (falls back to trim on failure). /context shows the savings ledger afterwards.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2687,6 +2733,15 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "context",
         args: "[refresh]",
         description: "show context utilization or refresh discovered window metadata",
+        details: "Source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `refresh` re-discovers window metadata from the gateway.",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "cost",
+        args: "",
+        description: "cumulative session token usage across all turns",
+        details: "Cumulative session usage: prompt + completion = total tokens across all completed turns, plus the live context-window position. Kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2694,6 +2749,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "delete",
         args: "<id>",
         description: "permanently delete an inactive live session",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2701,13 +2757,23 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "diff",
         args: "[scope] [path]",
         description: "show a verified working/staged/unstaged/base/commit/checkpoint diff",
+        details: "Host-owned bounded diff evidence from Git and the write journal: working/staged/unstaged/base/commit/checkpoint scopes. Renders to the terminal only — nothing is sent to the provider (that is /review's job) and no filesystem grant is created or needed.",
         group: CommandGroup::FilesDiffsCheckpoints,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "doctor",
+        args: "[online]",
+        description: "read-only config/auth/context/state diagnostics without leaving chat",
+        details: "Runs the same diagnostics as `kitsu doctor` in-session: config validity, gateway/auth status (credential PRESENCE only, never values), context-window provenance and cache, runtime state, project context, and tool policy. `online` adds the opt-in network probes (endpoint reachability, model catalog). Always read-only.",
+        group: CommandGroup::Session,
         alias_of: None,
     },
     SlashCommandSpec {
         name: "exit",
         args: "[wait|cancel]",
         description: "exit chat with an explicit background-job policy",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2715,6 +2781,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "export",
         args: "<file> [markdown|json]",
         description: "export the active session without overwriting",
+        details: "Writes the session transcript to a new file (never overwrites): markdown for humans, JSON for automation; artifact sidecars may be created next to it.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2722,6 +2789,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "fork",
         args: "[id]",
         description: "clone and switch to a fresh session",
+        details: "Clones a saved session under a fresh id and switches to it. Permission grants are deliberately NOT carried — a fork starts with invocation roots only.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2729,6 +2797,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "help",
         args: "",
         description: "show command help",
+        details: "Grouped command list. `/help <command>` shows that command's syntax, explanation, and aliases.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2736,13 +2805,23 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "jobs",
         args: "[list|show <id>|steer <id> <text>|stop <id>|stop-all|prune <id|all>|close-steering <id>|close <id>]",
         description: "inspect, steer, stop, prune, and close background agent threads",
+        details: "The agent deck: every background agent thread with state glyphs (filled = running, hollow = spent, half = result awaiting pickup), token/tool telemetry, and ids for /agent.",
         group: CommandGroup::AgentsJobs,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "loop",
+        args: "<count> <prompt>",
+        description: "queue a prompt to run <count> times in sequence (2-20)",
+        details: "Queues <count> copies (2-20) of a plain prompt onto the bounded prompt queue; they run in sequence after the current turn. Inspect with /queue, abort with /queue clear. Interactive chat only — scripted runs repeat lines natively. Example: /loop 3 run the tests and fix one failure",
+        group: CommandGroup::Session,
         alias_of: None,
     },
     SlashCommandSpec {
         name: "model",
         args: "<name>",
         description: "switch model while keeping history",
+        details: "Shows or switches the model. Switching re-discovers the context window (unless pinned by --context-window) and applies to subagents spawned afterwards.",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2750,6 +2829,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "models",
         args: "[filter]",
         description: "list gateway models",
+        details: "",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2757,13 +2837,15 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "new",
         args: "",
         description: "start and autosave a fresh conversation",
+        details: "Starts a fresh session: clean history, runtime grants dropped, invocation roots restored, background registry reset. The old session stays resumable if it was durable.",
         group: CommandGroup::Session,
         alias_of: None,
     },
     SlashCommandSpec {
         name: "permissions",
-        args: "",
-        description: "show filesystem access policy",
+        args: "[protect <path>]",
+        description: "show access policy; protect paths for the session",
+        details: "Full authority disclosure: read/write roots split by invocation vs runtime, protected kitsu-private paths, exact command grants (numbered, revocable), containment status, and the workspace-evidence tool's standing disclosure. `/permissions protect <path>` marks a path Kitsu-private (read+write) for the rest of the session — a hard guard that survives every bypass, including --dangerously-skip-permissions, and cannot be revoked in-session.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2771,6 +2853,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "profiles",
         args: "",
         description: "show available specialist background-agent profiles",
+        details: "",
         group: CommandGroup::AgentsJobs,
         alias_of: None,
     },
@@ -2778,6 +2861,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "queue",
         args: "[list|add|remove|edit|move|promote|clear]",
         description: "inspect or edit the bounded prompt queue",
+        details: "Bounded 8-slot FIFO of upcoming prompts: list/add/remove/edit/move/promote/clear. On Unix, complete lines typed during a running turn are collected here automatically.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2785,6 +2869,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "quit",
         args: "[wait|cancel]",
         description: "exit, wait for jobs, or cancel and join them",
+        details: "",
         group: CommandGroup::Session,
         alias_of: Some("exit"),
     },
@@ -2792,6 +2877,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "reasoning",
         args: "[default|none|minimal|low|medium|high|xhigh]",
         description: "show or change reasoning effort for subsequent turns",
+        details: "Sets the reasoning-effort hint (none..xhigh) sent to compatible gateways; `default` omits the field entirely so strict endpoints never see it. Applies to later turns and spawned subagents.",
         group: CommandGroup::ModelsReasoning,
         alias_of: None,
     },
@@ -2799,6 +2885,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "restore",
         args: "<id>",
         description: "restore an archived session",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2806,6 +2893,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "resume",
         args: "<id|last>",
         description: "resume a saved conversation",
+        details: "Bare /resume on a TTY opens a numbered picker over saved sessions (Enter = last, q = cancel). With an argument: id or NAME; `last` picks the newest anywhere, `auto` the newest recorded in this directory. Saved permission grants are never restored; the saved gateway and working directory must match.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2813,6 +2901,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "retry",
         args: "",
         description: "retry the last failed or cancelled prompt",
+        details: "Resubmits the last failed or cancelled prompt exactly as typed.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2820,6 +2909,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "review",
         args: "[scope] [path]",
         description: "review a verified working/staged/unstaged/base/commit/checkpoint diff",
+        details: "Sends host-verified diff evidence (same scopes as /diff) to the model in a tool-free turn and prints its review. One bounded disclosure, clearly announced; no filesystem grant involved.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2827,6 +2917,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-command",
         args: "<number>",
         description: "revoke a numbered exact command grant",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2834,6 +2925,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-read",
         args: "<exact-root>",
         description: "revoke an exact read root for this session",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2841,6 +2933,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "revoke-write",
         args: "<exact-root>",
         description: "revoke an exact write root for this session",
+        details: "",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2848,6 +2941,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "save",
         args: "<file>",
         description: "save the latest response",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2855,6 +2949,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "sessions",
         args: "",
         description: "list locally saved conversations",
+        details: "",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2862,6 +2957,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "skill",
         args: "<name>",
         description: "load a skill into context",
+        details: "Loads one named skill's instructions into context (granting no filesystem access); its body then guides the model. Subagents inherit loaded skills.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2869,6 +2965,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "skills",
         args: "[filter]",
         description: "list available skills",
+        details: "Lists discovered skills with descriptions and provenance hashes; project skill metadata is untrusted until explicitly loaded.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -2876,6 +2973,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "status",
         args: "",
         description: "show model, context, tools, and session state",
+        details: "One-screen session health: session id/name, endpoint, model, window + provenance, directory and Git state, project context source, tool/permission state, command roots, background agents, compaction totals.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2883,6 +2981,15 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "steer",
         args: "<correction>",
         description: "redirect the active response and restart that turn",
+        details: "Mid-turn correction: rolls the partial turn back (completed file effects are kept and reported), injects your correction, and restarts the turn ahead of queued prompts.",
+        group: CommandGroup::Session,
+        alias_of: None,
+    },
+    SlashCommandSpec {
+        name: "theme",
+        args: "[name]",
+        description: "list color themes or switch the live theme",
+        details: "Restyles every styled surface immediately (prompt, banner, receipts, notices); structural glyphs stay put. Bare /theme lists themes with the active one marked. Persist a choice with `theme = \"<name>\"` in the config or --theme. --plain disables styling entirely and wins over any theme.",
         group: CommandGroup::Session,
         alias_of: None,
     },
@@ -2890,6 +2997,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "tools",
         args: "",
         description: "show enabled tools and effective access",
+        details: "Lists the tools advertised to the model this session, with the permission state that gates each.",
         group: CommandGroup::Permissions,
         alias_of: None,
     },
@@ -2897,6 +3005,7 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         name: "undo",
         args: "[id]",
         description: "undo the latest or selected conflict-free file checkpoint",
+        details: "Restores a write checkpoint (default: the latest) after verifying its files still match the recorded state; refuses while background agents run. /checkpoints lists candidates.",
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
@@ -2953,7 +3062,9 @@ fn slash_help(model: &str, styled: bool) -> String {
             }
         }
     }
-    out.push_str(&format!("current model: {model}"));
+    out.push_str(&format!(
+        "current model: {model} — /help <command> explains one command in detail"
+    ));
     out
 }
 
@@ -3035,6 +3146,7 @@ fn read_chat_line(
     editor: &mut rustyline::Editor<ChatHelper, rustyline::history::DefaultHistory>,
     prompt: &str,
     assistive: bool,
+    initial: &str,
 ) -> ChatReadline {
     if assistive {
         #[cfg(unix)]
@@ -3054,7 +3166,14 @@ fn read_chat_line(
             Err(error) => ChatReadline::Error(error.to_string()),
         };
     }
-    match editor.readline(prompt) {
+    // A draft carried over from the during-turn live editor pre-fills the
+    // prompt (cursor at the end) instead of being silently dropped.
+    let result = if initial.is_empty() {
+        editor.readline(prompt)
+    } else {
+        editor.readline_with_initial(prompt, (initial, ""))
+    };
+    match result {
         Ok(line) => ChatReadline::Line(line),
         Err(rustyline::error::ReadlineError::Eof) => ChatReadline::Eof,
         Err(rustyline::error::ReadlineError::Interrupted) => ChatReadline::Interrupted,
@@ -3154,6 +3273,8 @@ struct SessionInfo {
     session_id: Rc<RefCell<Option<String>>>,
     /// Per-turn subagent spawn budget shared with the spawn tools (G3).
     spawn_budget: Arc<kitsu_core::SpawnBudget>,
+    /// Run-wide shared tallies (parent + subagents) for receipts.
+    run_tallies: Arc<kitsu_core::RunTallies>,
     tool_names: Vec<String>,
     command_roots: Vec<std::path::PathBuf>,
     command_mode: Option<&'static str>,
@@ -4194,6 +4315,69 @@ fn session_catalog_payload(
     }))
 }
 
+/// Interactive chooser for bare `/resume`: numbered list of saved sessions
+/// (name-first), then one line of input — a number, a name, an id, `last`,
+/// `auto`, or Enter for `last`. Empty list or read failure cancels quietly.
+fn resume_picker(session: &SessionInfo) -> Option<String> {
+    let sessions_dir = session.state_dir.join("sessions");
+    let summaries = match session::SessionStore::list(&sessions_dir) {
+        Ok(summaries) if !summaries.is_empty() => summaries,
+        Ok(_) => {
+            eprintln!(
+                "no saved sessions — start one with kitsu chat --session (add --name <name> for a memorable handle) or /new"
+            );
+            return None;
+        }
+        Err(error) => {
+            eprintln!("{error}");
+            return None;
+        }
+    };
+    let active = session.session_id.borrow().clone();
+    eprintln!("saved sessions:");
+    for (index, saved) in summaries.iter().enumerate().take(9) {
+        let marker = if active.as_deref() == Some(saved.id.as_str()) {
+            "*"
+        } else {
+            " "
+        };
+        let label = match &saved.name {
+            Some(name) => format!("{} ({})", terminal_inline(name), terminal_inline(&saved.id)),
+            None => terminal_inline(&saved.id),
+        };
+        eprintln!(
+            " {marker}[{}] {label}  {}  {} turn(s)\n      {}",
+            index + 1,
+            terminal_inline(&saved.updated_at),
+            saved.turns,
+            terminal_inline(&saved.preview),
+        );
+    }
+    if summaries.len() > 9 {
+        eprintln!("  … {} more — /sessions lists all", summaries.len() - 9);
+    }
+    let line = match read_assistive_stdin_line(
+        "resume which? [1-9, name, id, last, auto; Enter = last, q = cancel] ",
+    ) {
+        Ok(Some(line)) => line.trim().to_string(),
+        _ => return None,
+    };
+    match line.as_str() {
+        "" => Some("last".to_string()),
+        "q" | "quit" | "cancel" => None,
+        choice => match choice.parse::<usize>() {
+            Ok(number) if (1..=summaries.len().min(9)).contains(&number) => {
+                Some(summaries[number - 1].id.clone())
+            }
+            Ok(_) => {
+                eprintln!("no session numbered {choice}");
+                None
+            }
+            Err(_) => Some(choice.to_string()),
+        },
+    }
+}
+
 fn format_session_summaries(
     sessions: &[session::SessionSummary],
     current: Option<&str>,
@@ -4946,6 +5130,27 @@ fn permissions_payload(
 /// Render `/context`: the static provenance rows (what loaded and why) plus the
 /// live conversation, with token cost and policy per source. The per-turn
 /// `kitsu-context:` line carries the usage-anchored number; this is an estimate.
+/// The ONE context-used figure both `/context` and `/cost` report: the
+/// meter's provider-anchored estimate when available, else the sum of the
+/// provenance rows (system sources + tool schemas) and the live
+/// conversation breakdown. Cycle-23 audit: the two commands disagreed by
+/// exactly the tool-schema size because /cost read the bare meter.
+fn session_context_used(
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) -> (u64, u64) {
+    let b = ContextMeter::new().breakdown(messages);
+    let prov_total: u64 = session.provenance.borrow().iter().map(|e| e.tokens).sum();
+    let estimated = prov_total + b.user + b.assistant + b.tool_results;
+    let used = if state.meter.anchored(messages) {
+        state.meter.estimate(messages)
+    } else {
+        estimated
+    };
+    (used, estimated)
+}
+
 fn render_context_command(
     model: &str,
     messages: &[ChatMessage],
@@ -4961,6 +5166,9 @@ fn render_context_command(
     } else {
         "default - set context_window or --context-window"
     };
+    // One accounting truth, computed before the provenance borrow below
+    // (session_context_used takes its own borrow).
+    let (used, estimated) = session_context_used(messages, session, state);
     // Static provenance (system prompt sources + tool schemas) then the live
     // conversation. breakdown.system is already covered by the provenance rows.
     let provenance = session.provenance.borrow();
@@ -4978,14 +5186,20 @@ fn render_context_command(
             ),
         ])
         .collect();
-    let prov_total: u64 = provenance.iter().map(|e| e.tokens).sum();
-    let estimated = prov_total + b.user + b.assistant + b.tool_results;
-    let used = if state.meter.anchored(messages) {
-        state.meter.estimate(messages)
-    } else {
-        estimated
-    };
     kitsu_render::render_context(model, window, note, budget.effective, used, &rows);
+    if used != estimated {
+        // Rows are chars/4 estimates; the total is anchored to the
+        // provider's reported prompt tokens. Say so instead of letting the
+        // arithmetic silently disagree (cycle-23 audit).
+        let (sign, diff) = if used >= estimated {
+            ("+", used - estimated)
+        } else {
+            ("-", estimated - used)
+        };
+        eprintln!(
+            "rows sum to {estimated} (chars/4 estimates); used total is provider-anchored ({sign}{diff} adjustment)"
+        );
+    }
     let window_provenance = context_window_provenance(&session.window_provenance);
     eprintln!(
         "context window source: {}",
@@ -5609,6 +5823,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
                 provenance.discovery = discovery;
             }
         });
+    }
+
+    if let Some(name) = cli.theme.as_deref().or(config.theme.as_deref()) {
+        kitsu_render::set_theme(name).map_err(CliError::user)?;
     }
 
     Ok(ChatSetup {
@@ -6683,6 +6901,32 @@ fn agent_deck_state(
     }
 }
 
+/// The Running-row activity child line (ui-parity item 13): the most recent
+/// bounded activity label with its age, so a stalled agent shows at a
+/// glance. Terminal rows carry no child — their story is complete.
+fn agent_activity_child_row(activity: Option<&str>, ms_ago: Option<u64>, plain: bool) -> String {
+    let arrow = if plain { "->" } else { "\u{21b3}" };
+    match activity {
+        None => format!("{arrow} no activity yet"),
+        Some(activity) => {
+            let age = ms_ago
+                .map(|ms| {
+                    format!(
+                        " \u{b7} {} ago",
+                        kitsu_render::format_wait_elapsed(std::time::Duration::from_millis(ms))
+                    )
+                })
+                .unwrap_or_default();
+            let age = if plain {
+                age.replace('\u{b7}', "|")
+            } else {
+                age
+            };
+            format!("{arrow} {}{age}", terminal_inline(activity))
+        }
+    }
+}
+
 /// Human `/jobs list`. Rendered from the same progress snapshot the JSONL
 /// `command_result` payload is built from, using the DTO's own status spellings
 /// — no `{:?}` reaches the terminal.
@@ -6772,6 +7016,14 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             ));
         }
         if matches!(agent.status, subagent::AgentProgressStatus::Running) {
+            output.push_str(&format!(
+                "\n      {}",
+                agent_activity_child_row(
+                    agent.telemetry.last_activity.as_deref(),
+                    agent.last_activity_ms_ago,
+                    kitsu_render::plain_mode(),
+                )
+            ));
             output.push_str("\n      partial response text withheld until the job is terminal");
         }
     }
@@ -7462,10 +7714,13 @@ async fn join_background_agents_at_exit(
                 } else {
                     String::new()
                 };
-                eprintln!(
-                    "~ still waiting {} — {live} background agent(s) running, {finished} finished{failures}",
+                let message = format!(
+                    "still waiting {} — {live} background agent(s) running, {finished} finished{failures}",
                     kitsu_render::format_wait_elapsed(join_started.elapsed())
                 );
+                kitsu_render::PromptSafeAsyncNotice::info(message)
+                    .write_line(&mut std::io::stderr())
+                    .ok();
                 beat += 1;
                 heartbeat
                     .as_mut()
@@ -7848,6 +8103,11 @@ fn note_rollback_retained_changes(
 
 #[derive(Default)]
 struct ScriptRunStatus {
+    /// Run-wide tallies mirrored from the shared `RunTallies` for the
+    /// end-of-run receipt.
+    file_reads: u64,
+    denied_calls: u64,
+    failed_calls: u64,
     /// Turns and commands that completed successfully. `--allow-turn-errors`
     /// accepts PARTIAL success; a run where nothing succeeded stays an error.
     successes: usize,
@@ -7886,12 +8146,16 @@ impl ScriptRunStatus {
 /// silence reading as success cost a full audit run before anyone noticed the
 /// task was a no-op. Human stderr only: JSONL consumers already receive
 /// `turn_finished` and `run_summary` frames.
+#[allow(clippy::too_many_arguments)]
 fn emit_run_receipt(
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     registry: &Arc<subagent::AgentRegistry>,
     session_id: Option<&str>,
     turns_ok: usize,
     turns_failed: usize,
+    file_reads: u64,
+    denied_calls: u64,
+    failed_calls: u64,
 ) {
     let checkpoints = journal.checkpoint_summaries();
     let files: std::collections::BTreeSet<&std::path::PathBuf> = checkpoints
@@ -7920,8 +8184,20 @@ fn emit_run_receipt(
             agents.push_str(&format!(" ({} cancelled)", progress.cancelled));
         }
     }
+    // Reads render unconditionally: "1 file written, 0 files read" is the
+    // visible signature of a model summarizing sources it never opened
+    // (cycle-16 M1). Denied/failed calls render only when non-zero — but
+    // then always (cycle-19 #5: "1 turn(s) ok" was hiding denials).
+    let mut trouble = String::new();
+    if denied_calls > 0 {
+        trouble.push_str(&format!(", {denied_calls} denied tool call(s)"));
+    }
+    let plain_failures = failed_calls.saturating_sub(denied_calls);
+    if plain_failures > 0 {
+        trouble.push_str(&format!(", {plain_failures} failed tool call(s)"));
+    }
     eprintln!(
-        "~ run summary: {turns}, {} file(s) written ({} change(s)){agents}, session {}",
+        "~ run summary: {turns}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}{trouble}, session {}",
         files.len(),
         changes,
         session_id.unwrap_or("not saved"),
@@ -8030,6 +8306,9 @@ async fn finalize_scripted_run(
             session_id.as_deref(),
             status.successes,
             status.failures,
+            status.file_reads,
+            status.denied_calls,
+            status.failed_calls,
         );
     }
     // Cycle-10 G1: retained-on-disk effects of rolled-back turns are part of
@@ -8245,6 +8524,7 @@ async fn run_scripted_body(
                 context_window,
                 &session.reasoning_effort,
                 &session.spawn_budget,
+                &session.run_tallies,
                 &scripted_skill_names,
                 registry,
                 &format!("{path}:{line_number}"),
@@ -8449,6 +8729,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8502,6 +8783,7 @@ async fn run_scripted_body(
                         context_window,
                         &session.reasoning_effort,
                         &session.spawn_budget,
+                        &session.run_tallies,
                         &scripted_skill_names,
                         registry,
                         &format!("{path}:{line_number}"),
@@ -8600,11 +8882,18 @@ async fn run_scripted_body(
             context_window,
             &session.reasoning_effort,
             &session.spawn_budget,
+            &session.run_tallies,
             &scripted_skill_names,
             registry,
             &format!("{path}:{line_number}"),
         )
         .await;
+        // Mirror after every turn (not just at the end) so cancelled or
+        // failing scripts still report the reads that actually happened —
+        // from the SHARED counter, so delegated subagent reads count too.
+        status.file_reads = session.run_tallies.reads.load(Ordering::Acquire);
+        status.denied_calls = session.run_tallies.denied.load(Ordering::Acquire);
+        status.failed_calls = session.run_tallies.failed.load(Ordering::Acquire);
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
@@ -8618,6 +8907,9 @@ async fn run_scripted_body(
             }
         }
     }
+    status.file_reads = session.run_tallies.reads.load(Ordering::Acquire);
+    status.denied_calls = session.run_tallies.denied.load(Ordering::Acquire);
+    status.failed_calls = session.run_tallies.failed.load(Ordering::Acquire);
     Ok(())
 }
 
@@ -8639,6 +8931,7 @@ async fn run_scripted_turn(
     context_window: &Rc<Cell<Option<u64>>>,
     reasoning_effort: &Rc<Cell<Option<kitsu_providers::ReasoningEffort>>>,
     spawn_budget: &Arc<kitsu_core::SpawnBudget>,
+    run_tallies: &Arc<kitsu_core::RunTallies>,
     skill_names: &[String],
     registry: &Arc<subagent::AgentRegistry>,
     location: &str,
@@ -8723,6 +9016,7 @@ async fn run_scripted_turn(
     );
     cfg.reasoning_effort = reasoning_effort.get();
     cfg.spawn_budget = Some(spawn_budget.clone());
+    cfg.run_tallies = Some(run_tallies.clone());
     cfg.skill_names = skill_names.to_vec();
     let event_log = live_agent_event_log(cli.jsonl, location);
     cfg.event_log = Some(event_log.clone());
@@ -9032,6 +9326,210 @@ struct TypeaheadCaptureResult {
     captured: usize,
     outcomes: Vec<TypeaheadOutcome>,
     eof: bool,
+    /// Text the user was still composing on the live input row when the turn
+    /// ended. Carried into the next prompt so mid-turn typing is never lost.
+    pending_draft: String,
+    /// Whether the live raw-mode editor ran (its receipts print immediately,
+    /// so the post-turn bookkeeping summary is skipped).
+    live: bool,
+}
+
+/// Routing shared by both type-ahead loops: active-turn controls (`/steer`,
+/// `/jobs`, `/queue`, `/quit cancel`) execute immediately; everything else
+/// queues as a future prompt. Live (raw-mode) sessions narrate outcomes as
+/// they happen; canonical sessions defer them to the post-turn flush.
+#[cfg(unix)]
+struct TypeaheadDispatcher {
+    queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
+    steering: prompt_queue::SteeringChannel,
+    registry: Arc<subagent::AgentRegistry>,
+    runtime: tokio::runtime::Handle,
+    live: bool,
+}
+
+#[cfg(unix)]
+impl TypeaheadDispatcher {
+    fn deliver(&self, outcome: TypeaheadOutcome, result: &mut TypeaheadCaptureResult) {
+        if !self.live {
+            result.outcomes.push(outcome);
+            return;
+        }
+        kitsu_render::live::with_live_row_suspended(|| match &outcome {
+            TypeaheadOutcome::Notice(notice) => {
+                eprintln!("~ {}", kitsu_render::sanitize_terminal_text(notice));
+            }
+            TypeaheadOutcome::SteeringError(error) => {
+                eprintln!("steering refused: {}", terminal_inline(error));
+            }
+            TypeaheadOutcome::QueueError(error) => {
+                eprintln!("queue refused: {}", terminal_inline(error));
+            }
+        });
+    }
+
+    fn dispatch(&self, line: &str, result: &mut TypeaheadCaptureResult) {
+        if line == "/steer" || line.starts_with("/steer ") {
+            let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
+            if correction.is_empty() {
+                self.deliver(
+                    TypeaheadOutcome::SteeringError(
+                        "steering correction cannot be empty".to_string(),
+                    ),
+                    result,
+                );
+                return;
+            }
+            let Some(turn) = self.steering.active_turn() else {
+                self.deliver(
+                    TypeaheadOutcome::SteeringError(
+                        "steering arrived after the foreground turn ended; it was not queued as a new prompt"
+                            .to_string(),
+                    ),
+                    result,
+                );
+                return;
+            };
+            match self.steering.steer(turn, correction) {
+                Ok(_) => {
+                    if self.live {
+                        let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
+                            "steering the current turn: {correction}"
+                        ))
+                        .write_line(&mut std::io::stderr());
+                    }
+                }
+                Err(error) => self.deliver(
+                    TypeaheadOutcome::SteeringError(format!(
+                        "{error} ({}-character correction was not converted into a future prompt)",
+                        error.correction().text().chars().count()
+                    )),
+                    result,
+                ),
+            }
+            return;
+        }
+        if line == "/jobs" || line.starts_with("/jobs ") {
+            let argument = line.strip_prefix("/jobs").unwrap_or_default().trim();
+            match handle_active_jobs_command(&self.registry, &self.runtime, argument) {
+                Ok(message) => self.deliver(TypeaheadOutcome::Notice(message), result),
+                Err(error) => self.deliver(TypeaheadOutcome::QueueError(error), result),
+            }
+            return;
+        }
+        if line == "/quit cancel" || line == "/exit cancel" {
+            ACTIVE_QUIT_CANCEL.store(true, Ordering::Release);
+            self.deliver(
+                TypeaheadOutcome::Notice(
+                    "exit cancellation accepted; stopping the foreground turn and all background agents".to_string(),
+                ),
+                result,
+            );
+            return;
+        }
+        if line == "/queue" || line.starts_with("/queue ") {
+            let argument = line.strip_prefix("/queue").unwrap_or_default();
+            match parse_queue_command(argument).and_then(|command| {
+                execute_queue_command(&mut self.queue.lock().expect("prompt queue"), command)
+            }) {
+                Ok(message) => self.deliver(TypeaheadOutcome::Notice(message), result),
+                Err(error) => self.deliver(TypeaheadOutcome::QueueError(error), result),
+            }
+            return;
+        }
+        match self
+            .queue
+            .lock()
+            .expect("prompt queue")
+            .enqueue(line.to_string())
+        {
+            Ok(status) => {
+                result.captured += 1;
+                if self.live {
+                    // The draft row is ephemeral; a queue receipt keeps the
+                    // submitted text visible in the transcript.
+                    let message = if status.queued > 1 {
+                        format!("queued ({} waiting): {line}", status.queued)
+                    } else {
+                        format!("queued: {line}")
+                    };
+                    let _ = kitsu_render::PromptSafeAsyncNotice::info(message)
+                        .write_line(&mut std::io::stderr());
+                }
+            }
+            Err(error) => self.deliver(
+                TypeaheadOutcome::QueueError(format!(
+                    "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
+                    error.capacity(),
+                    error.prompt().chars().count(),
+                )),
+                result,
+            ),
+        }
+    }
+}
+
+/// Non-canonical stdin for the live type-ahead editor: byte-at-a-time reads
+/// with no kernel echo (the editor repaints the draft itself). `ISIG` is left
+/// on so Ctrl+C still cancels the foreground turn through the signal path.
+#[cfg(unix)]
+struct RawStdinGuard {
+    original: libc::termios,
+}
+
+#[cfg(unix)]
+impl RawStdinGuard {
+    fn engage() -> Option<Self> {
+        // SAFETY: tcgetattr/tcsetattr write through a valid pointer to one
+        // termios struct; stdin's fd is process-owned and stays open.
+        let original = unsafe {
+            let mut modes: libc::termios = std::mem::zeroed();
+            if libc::tcgetattr(libc::STDIN_FILENO, &mut modes) != 0 {
+                return None;
+            }
+            let original = modes;
+            // ISIG is cleared so Ctrl+C reaches the editor as a byte: with a
+            // non-empty draft it clears the draft (Claude-style), and only on
+            // an empty draft does the collector raise(SIGINT) itself — the
+            // exact signal the kernel would have sent, so turn cancellation
+            // is unchanged. Approval handoffs restore the original termios
+            // (ISIG on), so approval prompts keep kernel Ctrl+C.
+            modes.c_lflag &= !(libc::ICANON | libc::ECHO | libc::ISIG);
+            modes.c_cc[libc::VMIN] = 1;
+            modes.c_cc[libc::VTIME] = 0;
+            if libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &modes) != 0 {
+                return None;
+            }
+            original
+        };
+        // Bracketed paste on: a mid-turn paste arrives as one `ESC[200~`
+        // delimited block instead of loose lines, so the editor can keep it
+        // as a single draft. Terminals without support ignore the sequence.
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"\x1b[?2004h");
+            let _ = err.flush();
+        }
+        Some(Self { original })
+    }
+}
+
+#[cfg(unix)]
+impl Drop for RawStdinGuard {
+    fn drop(&mut self) {
+        // Bracketed paste off before handing stdin back: rustyline and the
+        // approval reader manage their own paste mode expectations.
+        {
+            use std::io::Write;
+            let mut err = std::io::stderr();
+            let _ = err.write_all(b"\x1b[?2004l");
+            let _ = err.flush();
+        }
+        // SAFETY: restores the termios snapshot captured in `engage`.
+        unsafe {
+            libc::tcsetattr(libc::STDIN_FILENO, libc::TCSANOW, &self.original);
+        }
+    }
 }
 
 /// Own complete lines submitted while a foreground turn is running. Rustyline
@@ -9046,137 +9544,44 @@ struct TypeaheadCollector {
 
 #[cfg(unix)]
 impl TypeaheadCollector {
+    /// `live_prompt`: when `Some`, stdin is a styled interactive TTY and the
+    /// collector runs the raw-mode live editor (visible draft, cursor, and
+    /// history on the shared status row). `None` keeps the canonical
+    /// line-at-a-time loop for scripted/plain/assistive sessions. `history`
+    /// seeds ↑/↓ recall; `initial_draft` restores typing carried across turns.
     fn start(
         queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         steering: prompt_queue::SteeringChannel,
         registry: Arc<subagent::AgentRegistry>,
+        live_prompt: Option<String>,
+        history: Vec<String>,
+        initial_draft: String,
     ) -> Self {
         let stop = Arc::new(AtomicBool::new(false));
         let thread_stop = stop.clone();
         let runtime = tokio::runtime::Handle::current();
         let handle = std::thread::spawn(move || {
-            let mut result = TypeaheadCaptureResult::default();
-            while !thread_stop.load(Ordering::Acquire) {
-                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                }
-                // Serialize ownership of canonical stdin with permission and
-                // command prompts. Holding this lock from poll through
-                // read_line closes the check-to-read race where one submitted
-                // line could otherwise become either type-ahead or approval.
-                let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
-                    std::thread::sleep(Duration::from_millis(25));
-                    continue;
-                };
-                if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
-                    continue;
-                }
-
-                let mut descriptor = libc::pollfd {
-                    fd: libc::STDIN_FILENO,
-                    events: libc::POLLIN,
-                    revents: 0,
-                };
-                // SAFETY: `descriptor` points to one initialized pollfd for the
-                // duration of the call, and stdin's process fd is not owned or
-                // closed by this collector.
-                let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
-                if ready < 0 {
-                    if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
-                        continue;
-                    }
-                    break;
-                }
-                if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
-                    continue;
-                }
-
-                let mut line = String::new();
-                match std::io::stdin().read_line(&mut line) {
-                    Ok(0) => {
-                        result.eof = true;
-                        break;
-                    }
-                    Ok(_) => {
-                        let line = line.trim().to_string();
-                        if line.is_empty() {
-                            continue;
-                        }
-                        if line == "/steer" || line.starts_with("/steer ") {
-                            let correction = line.strip_prefix("/steer").unwrap_or_default().trim();
-                            if correction.is_empty() {
-                                result.outcomes.push(TypeaheadOutcome::SteeringError(
-                                    "steering correction cannot be empty".to_string(),
-                                ));
-                                continue;
-                            }
-                            let Some(turn) = steering.active_turn() else {
-                                result.outcomes.push(TypeaheadOutcome::SteeringError(
-                                    "steering arrived after the foreground turn ended; it was not queued as a new prompt"
-                                        .to_string(),
-                                ));
-                                continue;
-                            };
-                            match steering.steer(turn, correction) {
-                                Ok(_) => {}
-                                Err(error) => result.outcomes.push(TypeaheadOutcome::SteeringError(format!(
-                                    "{error} ({}-character correction was not converted into a future prompt)",
-                                    error.correction().text().chars().count()
-                                ))),
-                            }
-                            continue;
-                        }
-                        if line == "/jobs" || line.starts_with("/jobs ") {
-                            let argument = line.strip_prefix("/jobs").unwrap_or_default().trim();
-                            match handle_active_jobs_command(&registry, &runtime, argument) {
-                                Ok(message) => {
-                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
-                                }
-                                Err(error) => {
-                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
-                                }
-                            }
-                            continue;
-                        }
-                        if line == "/quit cancel" || line == "/exit cancel" {
-                            ACTIVE_QUIT_CANCEL.store(true, Ordering::Release);
-                            result.outcomes.push(TypeaheadOutcome::Notice(
-                                "exit cancellation accepted; stopping the foreground turn and all background agents".to_string(),
-                            ));
-                            continue;
-                        }
-                        if line == "/queue" || line.starts_with("/queue ") {
-                            let argument = line.strip_prefix("/queue").unwrap_or_default();
-                            match parse_queue_command(argument).and_then(|command| {
-                                execute_queue_command(
-                                    &mut queue.lock().expect("prompt queue"),
-                                    command,
-                                )
-                            }) {
-                                Ok(message) => {
-                                    result.outcomes.push(TypeaheadOutcome::Notice(message))
-                                }
-                                Err(error) => {
-                                    result.outcomes.push(TypeaheadOutcome::QueueError(error))
-                                }
-                            }
-                            continue;
-                        }
-                        match queue.lock().expect("prompt queue").enqueue(line) {
-                            Ok(_) => result.captured += 1,
-                            Err(error) => result.outcomes.push(TypeaheadOutcome::QueueError(format!(
-                                "prompt queue is full (capacity {}); {}-character submitted prompt was refused and will not run later",
-                                error.capacity(),
-                                error.prompt().chars().count(),
-                            ))),
-                        }
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
-                    Err(_) => break,
+            let mut dispatcher = TypeaheadDispatcher {
+                queue,
+                steering,
+                registry,
+                runtime,
+                live: false,
+            };
+            if let Some(prompt) = live_prompt {
+                if let Some(raw) = RawStdinGuard::engage() {
+                    dispatcher.live = true;
+                    return run_live_typeahead(
+                        raw,
+                        &thread_stop,
+                        &dispatcher,
+                        prompt,
+                        history,
+                        initial_draft,
+                    );
                 }
             }
-            result
+            run_canonical_typeahead(&thread_stop, &dispatcher)
         });
         Self {
             stop,
@@ -9193,6 +9598,395 @@ impl TypeaheadCollector {
     }
 }
 
+/// The pre-live collector loop: canonical stdin, complete submitted lines
+/// only. Kept for sessions where the raw-mode editor must not run (piped
+/// stdin, `--plain`, assistive input, or a terminal that refuses raw mode).
+#[cfg(unix)]
+fn run_canonical_typeahead(
+    stop: &AtomicBool,
+    dispatcher: &TypeaheadDispatcher,
+) -> TypeaheadCaptureResult {
+    let mut result = TypeaheadCaptureResult::default();
+    while !stop.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        // Serialize ownership of canonical stdin with permission and
+        // command prompts. Holding this lock from poll through
+        // read_line closes the check-to-read race where one submitted
+        // line could otherwise become either type-ahead or approval.
+        let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: `descriptor` points to one initialized pollfd for the
+        // duration of the call, and stdin's process fd is not owned or
+        // closed by this collector.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 || descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+
+        let mut line = String::new();
+        match std::io::stdin().read_line(&mut line) {
+            Ok(0) => {
+                result.eof = true;
+                break;
+            }
+            Ok(_) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                dispatcher.dispatch(&line, &mut result);
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(_) => break,
+        }
+    }
+    result
+}
+
+/// What one batch of editor actions asks the collector's I/O loop to do.
+/// Terminal writes, queue-depth syncs, notices, and signal raises are all
+/// returned as data so the resolution logic is unit-testable without a
+/// thread, raw stdin, or a live terminal (the collector-side counterpart of
+/// the renderer's render_region seam).
+#[cfg(unix)]
+#[derive(Debug, Default, PartialEq, Eq)]
+struct ActionEffects {
+    /// The visible draft changed (keystrokes, hint acceptance, recall).
+    needs_redraw: bool,
+    /// A submission or recall may have moved the pending-queue depth.
+    queue_touched: bool,
+    /// A queued prompt was pulled into the draft; the caller prints the
+    /// notice with this remaining count.
+    recalled_remaining: Option<usize>,
+    /// Raise this signal after the batch (SIGINT keeps raw mode; job-control
+    /// and quit signals restore canonical termios first). Batching means the
+    /// LAST signal-producing action wins — e.g. ^C then ^\ in one read
+    /// quits rather than raising both, which matches what separate
+    /// keystrokes would leave the user with.
+    raise_signal: Option<i32>,
+}
+
+/// Resolve one feed batch's editor actions. `dispatch` routes a submitted
+/// line (active-turn controls or enqueue); `recall_pop` removes and returns
+/// the newest queued prompt plus the remaining count, if any.
+#[cfg(unix)]
+fn resolve_editor_actions(
+    editor: &mut typeahead_editor::TypeaheadEditor,
+    outcome: typeahead_editor::FeedOutcome,
+    result: &mut TypeaheadCaptureResult,
+    mut dispatch: impl FnMut(&str, &mut TypeaheadCaptureResult),
+    mut recall_pop: impl FnMut() -> Option<(String, usize)>,
+) -> ActionEffects {
+    let mut effects = ActionEffects {
+        needs_redraw: outcome.changed,
+        ..ActionEffects::default()
+    };
+    for action in outcome.actions {
+        match action {
+            typeahead_editor::EditorAction::Submit(line) => {
+                let line = line.trim().to_string();
+                if line.is_empty() {
+                    continue;
+                }
+                dispatch(&line, result);
+                // Enqueues and /queue edits both move the pending count.
+                effects.queue_touched = true;
+            }
+            typeahead_editor::EditorAction::Eof => {
+                result.eof = true;
+            }
+            typeahead_editor::EditorAction::Interrupt => {
+                effects.raise_signal = Some(libc::SIGINT);
+            }
+            typeahead_editor::EditorAction::Suspend => {
+                effects.raise_signal = Some(libc::SIGTSTP);
+            }
+            typeahead_editor::EditorAction::Quit => {
+                effects.raise_signal = Some(libc::SIGQUIT);
+            }
+            typeahead_editor::EditorAction::CompleteRequest => {
+                // Tab accepts the inline slash hint, if one is showing.
+                let buffer = editor.buffer_string();
+                let hint = typeahead_slash_hint(&buffer);
+                if !hint.is_empty() {
+                    editor.replace_buffer(&format!("{buffer}{hint}"));
+                    effects.needs_redraw = true;
+                }
+            }
+            typeahead_editor::EditorAction::RecallRequest => {
+                // ↑ on an empty draft: pull the newest queued prompt back
+                // into the editor (it leaves the queue — the draft is now
+                // its only copy; submitting re-enqueues it at the back,
+                // which for the newest prompt is its original position).
+                // Recall applies only to a still-empty draft: if other
+                // bytes in the same batch already typed something, the
+                // request is dropped and the queue stays intact — a
+                // recall must never clobber text the user just typed.
+                if !editor.buffer_string().is_empty() {
+                    continue;
+                }
+                match recall_pop() {
+                    Some((prompt, remaining)) => {
+                        editor.replace_buffer(&prompt);
+                        effects.recalled_remaining = Some(remaining);
+                        effects.queue_touched = true;
+                    }
+                    None => {
+                        // Queue empty: plain history walk, as before.
+                        let mut forced = typeahead_editor::FeedOutcome::default();
+                        editor.history_prev_forced(&mut forced);
+                    }
+                }
+                effects.needs_redraw = true;
+            }
+        }
+    }
+    effects
+}
+
+/// Repaint the live row from editor state. The hint slot carries the
+/// reverse-search status while Ctrl+R is active, the inline slash hint
+/// otherwise.
+#[cfg(unix)]
+fn update_live_row(editor: &typeahead_editor::TypeaheadEditor) {
+    let buffer = editor.buffer_string();
+    let search_status = editor.search_status();
+    let hint_reserved = search_status.is_some();
+    let hint = search_status.unwrap_or_else(|| typeahead_slash_hint(&buffer));
+    kitsu_render::live::live_input_update(buffer, editor.cursor(), hint, hint_reserved);
+}
+
+/// Commands that act on the RUNNING turn, in preference order. While a turn
+/// is live these outrank plain registry order in the inline hint: `/s`
+/// should suggest `steer` (usable now), not `save` (queued for later).
+const MID_TURN_HINT_PRIORITY: [&str; 5] = ["steer", "queue", "jobs", "quit", "exit"];
+
+/// Inline completion hint for the live editor: the remainder of the best
+/// registry slash command matching the typed `/prefix` — mid-turn-actionable
+/// commands first, then registry order (empty when the buffer is not a bare
+/// slash prefix or nothing matches).
+fn typeahead_slash_hint(buffer: &str) -> String {
+    let Some(rest) = buffer.strip_prefix('/') else {
+        return String::new();
+    };
+    if rest.is_empty() || rest.contains(char::is_whitespace) {
+        return String::new();
+    }
+    let prioritized = MID_TURN_HINT_PRIORITY
+        .iter()
+        .copied()
+        .find(|name| name.starts_with(rest) && name.len() > rest.len());
+    prioritized
+        .or_else(|| {
+            matching_slash_commands(rest)
+                .iter()
+                .map(|spec| spec.name)
+                .find(|name| name.len() > rest.len())
+        })
+        .map(|name| name[rest.len()..].to_string())
+        .unwrap_or_default()
+}
+
+/// The live during-turn editor: raw stdin bytes feed the pure
+/// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
+/// status row with a real cursor, ↑/↓ history, and editable text — while
+/// streamed output and tool receipts keep flowing above it. Approval prompts
+/// take stdin back by flipping `APPROVAL_INPUT_ACTIVE`: raw mode is released
+/// and the draft row hidden until the approval completes.
+#[cfg(unix)]
+fn run_live_typeahead(
+    raw: RawStdinGuard,
+    stop: &AtomicBool,
+    dispatcher: &TypeaheadDispatcher,
+    prompt: String,
+    history: Vec<String>,
+    initial_draft: String,
+) -> TypeaheadCaptureResult {
+    use kitsu_render::live;
+
+    let mut result = TypeaheadCaptureResult {
+        live: true,
+        ..TypeaheadCaptureResult::default()
+    };
+    let mut editor = typeahead_editor::TypeaheadEditor::with_draft(history, initial_draft);
+    let mut raw = Some(raw);
+    // Consecutive no-data poll timeouts; the lone-Esc resolver requires two.
+    let mut quiet_ticks = 0u32;
+    let sync_queue_depth = |dispatcher: &TypeaheadDispatcher| {
+        let queue = dispatcher.queue.lock().expect("prompt queue");
+        let queued = queue.status().queued;
+        let previews: Vec<String> = queue.iter().take(3).map(str::to_string).collect();
+        drop(queue);
+        live::live_queue_state(queued, previews);
+    };
+    // Depth first, paint second: the row's first frame must reflect the
+    // real queue, not the previous turn's persisted count (the main loop
+    // dequeues between turns, so the stored value can be stale here).
+    sync_queue_depth(dispatcher);
+    live::live_input_begin(prompt.clone());
+    update_live_row(&editor);
+    while !stop.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            if let Some(guard) = raw.take() {
+                // Canonical mode (with echo) back on for the approval reader;
+                // the draft row is already hidden by the approval guard.
+                drop(guard);
+                live::live_input_end();
+                // The approval reader may consume the rest of an in-flight
+                // paste (terminator included); dropping transient input state
+                // prevents a latched paste mode from eating every later Enter.
+                editor.reset_pending_input();
+            }
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        }
+        if raw.is_none() {
+            match RawStdinGuard::engage() {
+                Some(guard) => {
+                    raw = Some(guard);
+                    live::live_input_begin(prompt.clone());
+                    update_live_row(&editor);
+                }
+                None => break,
+            }
+        }
+        let Ok(_input_owner) = APPROVAL_INPUT_LOCK.try_lock() else {
+            std::thread::sleep(Duration::from_millis(25));
+            continue;
+        };
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            continue;
+        }
+
+        let mut descriptor = libc::pollfd {
+            fd: libc::STDIN_FILENO,
+            events: libc::POLLIN,
+            revents: 0,
+        };
+        // SAFETY: one initialized pollfd for the duration of the call; stdin
+        // stays process-owned.
+        let ready = unsafe { libc::poll(&mut descriptor, 1, 50) };
+        if ready < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if ready == 0 {
+            // Two consecutive true timeouts (~100ms) after a bare ESC byte
+            // mean the user pressed the Esc key itself — real escape
+            // sequences arrive atomically, and the double tick tolerates a
+            // slow link splitting ESC from its tail across reads. Error
+            // revents deliberately don't count as quiet: only a timeout is
+            // evidence that no bytes are inbound.
+            quiet_ticks += 1;
+            if quiet_ticks >= 2 && editor.resolve_lone_escape() {
+                update_live_row(&editor);
+            }
+            continue;
+        }
+        if descriptor.revents & (libc::POLLIN | libc::POLLHUP) == 0 {
+            continue;
+        }
+        quiet_ticks = 0;
+
+        let mut buffer = [0u8; 1024];
+        // SAFETY: reads into a stack buffer of the stated length from the
+        // process-owned stdin descriptor. VMIN=1 and a successful poll mean
+        // a zero return is end-of-input, not an empty raw read.
+        let count = unsafe {
+            libc::read(
+                libc::STDIN_FILENO,
+                buffer.as_mut_ptr().cast::<libc::c_void>(),
+                buffer.len(),
+            )
+        };
+        if count < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+        if count == 0 {
+            result.eof = true;
+            break;
+        }
+        let outcome = editor.feed(&buffer[..count as usize]);
+        let effects = resolve_editor_actions(
+            &mut editor,
+            outcome,
+            &mut result,
+            |line, result| dispatcher.dispatch(line, result),
+            || {
+                let mut queue = dispatcher.queue.lock().expect("prompt queue");
+                let queued = queue.status().queued;
+                queued
+                    .checked_sub(1)
+                    .and_then(|newest| queue.remove(newest))
+                    .map(|prompt| (prompt, queued - 1))
+            },
+        );
+        if effects.queue_touched {
+            sync_queue_depth(dispatcher);
+        }
+        if let Some(remaining) = effects.recalled_remaining {
+            let _ = kitsu_render::PromptSafeAsyncNotice::info(format!(
+                "recalled queued prompt for editing ({remaining} still queued)"
+            ))
+            .write_line(&mut std::io::stderr());
+        }
+        if let Some(signal) = effects.raise_signal {
+            // Job-control and quit signals need canonical termios back
+            // first (a suspended or dying process must not hold the
+            // terminal raw); SIGINT keeps raw mode — the turn cancels and
+            // this collector winds down via the stop flag, restoring
+            // termios on guard drop.
+            if signal != libc::SIGINT {
+                if let Some(guard) = raw.take() {
+                    drop(guard);
+                    live::live_input_end();
+                }
+            }
+            // SAFETY: raising a handled or default-disposition signal
+            // in-process; for SIGTSTP the loop's re-engage branch restores
+            // raw mode and repaints after fg/SIGCONT.
+            unsafe {
+                libc::raise(signal);
+            }
+        }
+        if result.eof {
+            break;
+        }
+        if effects.needs_redraw {
+            update_live_row(&editor);
+        }
+    }
+    live::live_input_end();
+    drop(raw);
+    result.pending_draft = editor.take_draft();
+    result
+}
+
 #[cfg(not(unix))]
 struct TypeaheadCollector;
 
@@ -9202,6 +9996,9 @@ impl TypeaheadCollector {
         _queue: Arc<std::sync::Mutex<prompt_queue::PromptQueue>>,
         _steering: prompt_queue::SteeringChannel,
         _registry: Arc<subagent::AgentRegistry>,
+        _live_prompt: Option<String>,
+        _history: Vec<String>,
+        _initial_draft: String,
     ) -> Self {
         Self
     }
@@ -9474,7 +10271,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         store.set_name(Some(requested_name.to_string()));
         eprintln!("~ session name: {}", terminal_inline(requested_name));
     }
-    let mode = if cli.dangerously_allow_all_filesystem {
+    let mode = if cli.dangerously_skip_permissions || cli.dangerously_allow_all_filesystem {
         Mode::AutoAllow
     } else if cli.yes {
         Mode::Scoped
@@ -9483,6 +10280,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     } else {
         Mode::Deny
     };
+    if cli.dangerously_skip_permissions {
+        // The unattended bypass must never start silently: name exactly what
+        // is off and which guards remain, once, before any tool runs.
+        kitsu_render::PromptSafeAsyncNotice::warning(
+            "DANGEROUSLY SKIPPING PERMISSIONS: filesystem prompts bypassed for all \
+             non-protected paths; developer commands auto-approved inside their roots. \
+             Remaining guards: Kitsu config/state protection, command-root confinement \
+             + containment, and /permissions protect <path>",
+        )
+        .write_line(&mut std::io::stderr())
+        .ok();
+    }
     let mut read_roots: Vec<String> = allow_paths.to_vec();
     read_roots.extend(allow_read_write.iter().cloned());
     let mut write_roots: Vec<String> = allow_write.to_vec();
@@ -9521,9 +10330,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // flags are deliberately excluded: they change fallback policy but never
     // create capabilities. --allow-write is genuinely write-only; callers who
     // want edit/readback workflows opt into --allow-read-write explicitly.
+    // The unattended bypass exists so loop automation runs with no human;
+    // unlike the filesystem-only bypass it therefore does register fs tools
+    // in non-interactive runs (documented on the flag).
     let can_read = !forced_one_shot
-        && (interactive || !allow_paths.is_empty() || !allow_read_write.is_empty());
-    let can_write = interactive || !allow_write.is_empty() || !allow_read_write.is_empty();
+        && (interactive
+            || cli.dangerously_skip_permissions
+            || !allow_paths.is_empty()
+            || !allow_read_write.is_empty());
+    let can_write = interactive
+        || cli.dangerously_skip_permissions
+        || !allow_write.is_empty()
+        || !allow_read_write.is_empty();
     let write_journal = kitsu_tools::builtins::fs::WriteJournal::new();
     let command_artifact_sink = command_requested.then(|| {
         let quota = command_artifact::CommandArtifactQuota::new(
@@ -9548,7 +10366,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         } else {
             command_roots.to_vec()
         };
-        let command_mode = if interactive {
+        let command_mode = if cli.dangerously_skip_permissions {
+            kitsu_tools::CommandMode::AutoAllow
+        } else if interactive {
             kitsu_tools::CommandMode::Ask
         } else {
             kitsu_tools::CommandMode::Deny
@@ -9603,6 +10423,37 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     CliError::user(pregrant_error(grant, &roots, &error.to_string()))
                 })?;
             grant.cwd = canonical;
+            // Cycle-19 audit #2: a path-form executable outside every command
+            // and runtime root can never actually launch under containment —
+            // catch it here, not after the model has burned rounds on it.
+            if let Some(executable) = grant.argv.first().filter(|arg| arg.contains('/')) {
+                let resolved = grant.cwd.join(executable);
+                if let Ok(resolved) = std::fs::canonicalize(&resolved) {
+                    // Containment always binds the standard system prefixes
+                    // read-only (see runtime_mount_paths), so system binaries
+                    // are inherently visible.
+                    let system_visible = ["/usr", "/bin", "/lib", "/lib64", "/sbin"]
+                        .iter()
+                        .any(|prefix| resolved.starts_with(prefix));
+                    let visible = system_visible
+                        || policy
+                            .command_roots()
+                            .iter()
+                            .any(|root| resolved.starts_with(root))
+                        || policy
+                            .containment_config()
+                            .readonly_runtime_roots()
+                            .iter()
+                            .any(|root| resolved.starts_with(root));
+                    if !visible {
+                        return Err(CliError::user(format!(
+                            "--allow-command executable '{}' is outside every command/runtime root and can never run under containment — add its directory with --command-root or --command-runtime-root {}",
+                            resolved.display(),
+                            shorten_home(resolved.parent().unwrap_or(&resolved)),
+                        )));
+                    }
+                }
+            }
         }
         Some(policy)
     } else {
@@ -9726,6 +10577,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             SPAWN_CAP_SCRIPTED_DEFAULT
         });
     let spawn_budget = Arc::new(kitsu_core::SpawnBudget::new(spawn_cap));
+    // Run-wide tallies (reads/denied/failed) shared by the main conversation
+    // and every spawned subagent, feeding the end-of-run receipt.
+    let run_tallies = Arc::new(kitsu_core::RunTallies::default());
 
     // The main tool set: base tools + the spawn/agent tools, which delegate to
     // subagents running the base `sub_tools` in their own isolated context.
@@ -9741,7 +10595,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     );
     let mut sub_cfg = build_agent_config(setup.model.clone(), cli, setup.context_window, None);
     sub_cfg.stream = false; // the subagent's output is a returned result, not streamed
+                            // Foreground subagents run QUIET (cycle-15 audit #3 / cycle-27 double
+                            // print): their inner narration corrupted the answer channel and their
+                            // final text arrived twice — streamed by the child, then repeated by the
+                            // parent. The ◆ Agent(...) header and ◇ result receipt remain the
+                            // progress surface; the answer arrives once, through the parent.
+    sub_cfg.quiet = true;
     sub_cfg.skill_names = skillset.names().into_iter().map(str::to_string).collect();
+    sub_cfg.run_tallies = Some(run_tallies.clone());
     let sub_system = if skillset.is_empty() {
         String::new()
     } else {
@@ -9868,6 +10729,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let reasoning_effort = reasoning_effort.clone();
         let offload_state = offload_state.clone();
         let spawn_budget = spawn_budget.clone();
+        let run_tallies = run_tallies.clone();
         let skill_names: Vec<String> = skillset.names().into_iter().map(str::to_string).collect();
         move |model: String, cli: &Cli| {
             let mut config = build_agent_config(
@@ -9880,6 +10742,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             );
             config.reasoning_effort = reasoning_effort.get();
             config.skill_names = skill_names.clone();
+            config.run_tallies = Some(run_tallies.clone());
             // Main-conversation turns carry the spawn budget so the
             // orchestrator resets it at each turn start (subagent configs
             // stay `None`).
@@ -10085,6 +10948,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         offload_dir: offload_state.clone(),
         session_id,
         spawn_budget: spawn_budget.clone(),
+        run_tallies: run_tallies.clone(),
         tool_names: tool_names.clone(),
         command_roots: command_policy
             .as_ref()
@@ -10093,6 +10957,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         command_mode: command_policy.as_ref().map(|policy| match policy.mode() {
             kitsu_tools::CommandMode::Ask => "ask",
             kitsu_tools::CommandMode::Deny => "deny unless pre-granted",
+            kitsu_tools::CommandMode::AutoAllow => "DANGEROUS auto-allow (no prompts)",
         }),
         command_policy: command_policy.clone(),
         command_artifact_sink: command_artifact_sink.clone(),
@@ -10440,6 +11305,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         AssistantDisposition::Discarded,
                         Some("background agents did not complete, so the turn is incomplete"),
                     )?;
+                    if !cli.jsonl {
+                        emit_run_receipt(
+                            &write_journal,
+                            &agent_registry,
+                            session.session_id.borrow().as_deref(),
+                            0,
+                            1,
+                            session.run_tallies.reads.load(Ordering::Acquire),
+                            session.run_tallies.denied.load(Ordering::Acquire),
+                            session.run_tallies.failed.load(Ordering::Acquire),
+                        );
+                    }
                     let mapped = CliError::provider(format!(
                         "piped turn ended with {unfinished_agents} unfinished or failed background agent(s)"
                     ));
@@ -10462,28 +11339,77 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     return Err(mapped);
                 }
                 if let Some((kind, issue)) = strict_turn_failure(&session_state.last_turn) {
-                    finish_assistant_disposition(
-                        cli,
-                        "piped:1",
-                        AssistantDisposition::Discarded,
-                        Some(&issue),
-                    )?;
-                    let mut retained = turn_reports;
-                    retained.extend(
-                        cancel_agents_and_report_writes(
-                            &agent_registry,
-                            agent_watermark,
+                    // Cycle-30 (queued since the cycle-19 audit): a POLICY
+                    // strict failure whose turn still completed a real final
+                    // answer commits that answer as PARTIAL — the model was
+                    // refused, adapted, and answered truthfully; destroying
+                    // the answer punished honesty. The run still FAILS
+                    // exactly as before: same exit code, same JSONL error
+                    // and turn_finished frames — automation contracts are
+                    // unchanged. Provider-kind failures (incomplete turns)
+                    // keep the full rollback: there is no real answer to
+                    // keep.
+                    let commit_partial = kind == ScriptFailureKind::Policy;
+                    if commit_partial {
+                        finish_assistant_disposition(
+                            cli,
+                            "piped:1",
+                            AssistantDisposition::CommittedPartial,
+                            Some(&issue),
+                        )?;
+                        if let Err(persist_error) =
+                            persist_session_required(&session_store, &session, &model, &messages)
+                        {
+                            if !cli.jsonl {
+                                eprintln!(
+                                    "~ warning: could not save the partial turn: {}",
+                                    terminal_inline(&persist_error.to_string())
+                                );
+                            }
+                        }
+                        if !cli.jsonl {
+                            eprintln!(
+                                "~ the answer above is COMMITTED AS PARTIAL: {issue}; the run still fails so automation notices"
+                            );
+                        }
+                    } else {
+                        finish_assistant_disposition(
+                            cli,
+                            "piped:1",
+                            AssistantDisposition::Discarded,
+                            Some(&issue),
+                        )?;
+                        let mut retained = turn_reports;
+                        retained.extend(
+                            cancel_agents_and_report_writes(
+                                &agent_registry,
+                                agent_watermark,
+                                &write_journal,
+                            )
+                            .await,
+                        );
+                        note_rollback_retained_changes(
+                            cli,
+                            Some("piped:1"),
+                            &mut messages,
+                            &retained,
+                            tools.is_registered("workspace_diff"),
+                        )?;
+                    }
+                    if !cli.jsonl {
+                        // Cycle-20 audit: a failing exit still owes the run
+                        // receipt — denied/failed tallies especially.
+                        emit_run_receipt(
                             &write_journal,
-                        )
-                        .await,
-                    );
-                    note_rollback_retained_changes(
-                        cli,
-                        Some("piped:1"),
-                        &mut messages,
-                        &retained,
-                        tools.is_registered("workspace_diff"),
-                    )?;
+                            &agent_registry,
+                            session.session_id.borrow().as_deref(),
+                            0,
+                            1,
+                            session.run_tallies.reads.load(Ordering::Acquire),
+                            session.run_tallies.denied.load(Ordering::Acquire),
+                            session.run_tallies.failed.load(Ordering::Acquire),
+                        );
+                    }
                     let mapped = if kind == ScriptFailureKind::Provider {
                         CliError::provider(format!("incomplete turn: {issue}"))
                     } else {
@@ -10566,6 +11492,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         session.session_id.borrow().as_deref(),
                         1,
                         0,
+                        session.run_tallies.reads.load(Ordering::Acquire),
+                        session.run_tallies.denied.load(Ordering::Acquire),
+                        session.run_tallies.failed.load(Ordering::Acquire),
                     );
                 }
                 if cli.jsonl {
@@ -10697,22 +11626,43 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // A prompt cannot be redrawn without cursor-control sequences. In
     // assistive mode, defer notices until the submitted line returns instead
     // of letting an asynchronous printer split partially typed input.
-    let agent_notification_task = (!assistive_input)
-        .then(|| rl.create_external_printer().ok())
-        .flatten()
-        .map(|mut printer| {
-            let mut changes = agent_registry.subscribe();
-            let notification_journal = write_journal.clone();
-            let typeahead_active = foreground_typeahead_active.clone();
-            let deferred = deferred_notice_sender.clone();
-            tokio::spawn(async move {
-                let mut previous = *changes.borrow_and_update();
-                while changes.changed().await.is_ok() {
-                    let current = *changes.borrow_and_update();
-                    if let Some(message) = background_agent_notice(previous, current) {
-                        let notice = kitsu_render::PromptSafeAsyncNotice::new(
-                            background_agent_notice_level(previous, current),
-                            message,
+    // DEFAULT: no rustyline ExternalPrinter. Registering one degrades the
+    // idle prompt's input processing to ~1 byte per event-loop wakeup on
+    // this rustyline (14 through 18, empirically bisected cycle 14 —
+    // burst input like pastes crawls; the fox's founding complaint). The
+    // printer-less fallback below prints agent notices between prompt
+    // cycles instead of live at idle; automation-first kitsu prefers
+    // sacred input latency. KITSU_LIVE_NOTICES=1 opts back into the
+    // printer for sessions that want live idle notices and accept the
+    // input cost.
+    let agent_notification_task = (!assistive_input
+        && std::env::var_os("KITSU_LIVE_NOTICES").is_some())
+    .then(|| rl.create_external_printer().ok())
+    .flatten()
+    .map(|mut printer| {
+        let mut changes = agent_registry.subscribe();
+        let notification_journal = write_journal.clone();
+        let typeahead_active = foreground_typeahead_active.clone();
+        let deferred = deferred_notice_sender.clone();
+        tokio::spawn(async move {
+            let mut previous = *changes.borrow_and_update();
+            while changes.changed().await.is_ok() {
+                let current = *changes.borrow_and_update();
+                if let Some(message) = background_agent_notice(previous, current) {
+                    let notice = kitsu_render::PromptSafeAsyncNotice::new(
+                        background_agent_notice_level(previous, current),
+                        message,
+                    );
+                    if typeahead_active.load(Ordering::Acquire)
+                        || notice.publish_with(|frame| printer.print(frame)).is_err()
+                    {
+                        let _ = deferred.send(notice.line());
+                    }
+                }
+                if current.terminal > previous.terminal {
+                    for report in notification_journal.drain_and_take_reports().await {
+                        let notice = kitsu_render::PromptSafeAsyncNotice::info(
+                            format_write_checkpoint(&report, undo_hint_actionable()),
                         );
                         if typeahead_active.load(Ordering::Acquire)
                             || notice.publish_with(|frame| printer.print(frame)).is_err()
@@ -10720,22 +11670,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             let _ = deferred.send(notice.line());
                         }
                     }
-                    if current.terminal > previous.terminal {
-                        for report in notification_journal.drain_and_take_reports().await {
-                            let notice = kitsu_render::PromptSafeAsyncNotice::info(
-                                format_write_checkpoint(&report, undo_hint_actionable()),
-                            );
-                            if typeahead_active.load(Ordering::Acquire)
-                                || notice.publish_with(|frame| printer.print(frame)).is_err()
-                            {
-                                let _ = deferred.send(notice.line());
-                            }
-                        }
-                    }
-                    previous = current;
                 }
-            })
-        });
+                previous = current;
+            }
+        })
+    });
     let agent_notifications_live = agent_notification_task.is_some();
     let history_path = setup.state_dir.join("history");
     if !no_session {
@@ -10773,6 +11712,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // Fallback for terminals where Rustyline cannot create an external printer.
     let mut last_agent_snapshot = agent_registry.snapshot();
     let mut last_failed: Option<SubmittedPrompt> = None;
+    // Type-ahead the user was still composing when a turn ended; pre-filled
+    // into the next live editor or idle prompt so typing is never dropped.
+    let mut pending_draft = String::new();
     let no_tools = Registry::new();
 
     loop {
@@ -10825,7 +11767,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 .await;
                 break;
             }
-            (None, None) => match read_chat_line(&mut rl, &visible_prompt, assistive_input) {
+            (None, None) => match read_chat_line(
+                &mut rl,
+                &visible_prompt,
+                assistive_input,
+                &std::mem::take(&mut pending_draft),
+            ) {
                 ChatReadline::Line(line) => line,
                 ChatReadline::Eof => {
                     let running = agent_registry.running();
@@ -11258,10 +12205,20 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .begin_turn()
             .expect("interactive turns open steering sequentially");
         foreground_typeahead_active.store(true, Ordering::Release);
+        // A styled interactive session gets the live raw-mode editor (visible
+        // draft + history on the status row); scripted/plain/assistive
+        // sessions keep the canonical line collector.
+        let typeahead_live_prompt =
+            (!assistive_input && kitsu_render::stdin_is_tty() && kitsu_render::stderr_styled())
+                .then(kitsu_render::prompt_string);
+        let typeahead_history: Vec<String> = rl.history().iter().cloned().collect();
         let typeahead = TypeaheadCollector::start(
             prompt_queue.clone(),
             steering.clone(),
             agent_registry.clone(),
+            typeahead_live_prompt,
+            typeahead_history,
+            std::mem::take(&mut pending_draft),
         );
         let turn_outcome = write_journal
             .scope_turn(
@@ -11280,12 +12237,14 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .await;
         let captured = typeahead.finish();
         foreground_typeahead_active.store(false, Ordering::Release);
+        pending_draft = captured.pending_draft;
         while let Ok(notice) = deferred_notice_receiver.try_recv() {
             eprintln!("{notice}");
         }
-        if captured.captured > 0 {
+        if captured.captured > 0 && !captured.live {
             // Only narrate type-ahead that is still waiting: input that was
             // consumed immediately (e.g. an /exit) needs no bookkeeping line.
+            // The live editor already printed a per-prompt queue receipt.
             let status = prompt_queue.lock().expect("prompt queue").status();
             if status.queued > 0 {
                 eprintln!("~ captured type-ahead: {status}");
@@ -11567,9 +12526,17 @@ enum SlashResult {
 enum QueueCommand {
     List,
     Add(String),
+    /// `/loop`: enqueue the same prompt several times in sequence.
+    AddCopies {
+        prompt: String,
+        count: usize,
+    },
     Remove(usize),
     Edit(usize, String),
-    Move { from: usize, to: usize },
+    Move {
+        from: usize,
+        to: usize,
+    },
     Promote(usize),
     Clear,
 }
@@ -11697,6 +12664,30 @@ fn execute_queue_command(
             }
             Ok(output)
         }
+        QueueCommand::AddCopies { prompt, count } => {
+            let mut queued = 0usize;
+            for _ in 0..count {
+                if queue.enqueue(prompt.clone()).is_err() {
+                    break;
+                }
+                queued += 1;
+            }
+            if queued == 0 {
+                Err(format!(
+                    "queue is at capacity {}; finish or remove a queued turn and try again",
+                    queue.status().capacity
+                ))
+            } else if queued < count {
+                Ok(format!(
+                    "queued {queued} of {count} copies (queue reached capacity {}); they run in sequence after the current turn",
+                    queue.status().capacity
+                ))
+            } else {
+                Ok(format!(
+                    "queued {count} copies; they run in sequence after the current turn — /queue to inspect, /queue clear to abort"
+                ))
+            }
+        }
         QueueCommand::Add(prompt) => match queue.enqueue(prompt) {
             Ok(status) => Ok(status.to_string()),
             Err(error) => Err(format!(
@@ -11796,6 +12787,62 @@ fn closest_jobs_subcommand(name: &str) -> Option<&'static str> {
         .min()
         .filter(|(distance, _)| *distance <= 3)
         .map(|(_, cmd)| cmd)
+}
+
+/// `/help <command>`: syntax, explanation, and aliases for one command.
+/// Aliases resolve to their parent; unknown names get a nearest-help nudge.
+fn slash_command_help(query: &str) -> String {
+    let query = query.trim_start_matches('/');
+    let Some(spec) = SLASH_COMMANDS.iter().find(|spec| spec.name == query) else {
+        return format!(
+            "no command named /{} — /help lists every command",
+            terminal_inline(query)
+        );
+    };
+    // An alias explains its parent (and says so).
+    let (spec, alias_note) = match spec.alias_of {
+        Some(parent) => (
+            SLASH_COMMANDS
+                .iter()
+                .find(|candidate| candidate.name == parent)
+                .unwrap_or(spec),
+            Some(format!("/{} is an alias of /{parent}.", spec.name)),
+        ),
+        None => (spec, None),
+    };
+    let mut out = spec.syntax();
+    out.push_str(
+        "
+  ",
+    );
+    out.push_str(spec.description);
+    let details = spec.details.trim();
+    if !details.is_empty() {
+        out.push_str(
+            "
+  ",
+        );
+        out.push_str(details);
+    }
+    let aliases: Vec<&str> = SLASH_COMMANDS
+        .iter()
+        .filter(|candidate| candidate.alias_of == Some(spec.name))
+        .map(|candidate| candidate.name)
+        .collect();
+    if !aliases.is_empty() {
+        out.push_str(&format!(
+            "
+  aliases: /{}",
+            aliases.join(", /")
+        ));
+    }
+    if let Some(note) = alias_note {
+        out.push_str(&format!(
+            "
+  {note}"
+        ));
+    }
+    out
 }
 
 fn slash_syntax(name: &str) -> String {
@@ -11985,9 +13032,8 @@ async fn handle_slash(
             "clear"
                 | "checkpoints"
                 | "compact"
-                | "help"
+                | "cost"
                 | "new"
-                | "permissions"
                 | "profiles"
                 | "retry"
                 | "sessions"
@@ -12025,6 +13071,15 @@ async fn handle_slash(
             return SlashResult::Quit;
         }
         "" | "help" => {
+            if !arg.is_empty() {
+                let text = slash_command_help(arg);
+                eprintln!("{text}");
+                return SlashResult::Continue(Some(serde_json::json!({
+                    "kind": "help",
+                    "command": arg,
+                    "text": text,
+                })));
+            }
             // The JSONL payload always carries the unstyled text; only the
             // live terminal gets bold group headings.
             let text = slash_help(model, false);
@@ -12054,6 +13109,58 @@ async fn handle_slash(
             )));
         }
         "permissions" => {
+            let protect_request = match arg.trim() {
+                "protect" => Some(""),
+                trimmed => trimmed.strip_prefix("protect "),
+            };
+            if let Some(path) = protect_request {
+                let path = path.trim();
+                if path.is_empty() {
+                    eprintln!("usage: /permissions protect <path> (session-wide read+write guard; irrevocable in-session)");
+                    return SlashResult::Error;
+                }
+                // Order matters for atomicity of the message: attempt both
+                // protections; a failure on either leaves an honest error and
+                // whatever protection did land (protections only ever narrow
+                // authority, so a partial application is safe).
+                let read = perms.protect_read_path(path);
+                let write = perms.protect_write_path(path);
+                match (read, write) {
+                    (Ok(canon), Ok(_)) => {
+                        eprintln!(
+                            "~ protected for this session (read+write, survives all bypass flags): {}",
+                            shorten_home(&canon)
+                        );
+                        let text = format_permissions(perms, session);
+                        return SlashResult::Continue(Some(permissions_payload(
+                            perms, session, text,
+                        )));
+                    }
+                    // Protections only ever narrow authority, so a half-landed
+                    // protection is safe — but it must be disclosed honestly,
+                    // not reported as if nothing changed.
+                    (Ok(_), Err(error)) => {
+                        eprintln!(
+                            "partial: READ protection applied, write protection failed for '{path}': {error}"
+                        );
+                        return SlashResult::Error;
+                    }
+                    (Err(error), Ok(_)) => {
+                        eprintln!(
+                            "partial: WRITE protection applied, read protection failed for '{path}': {error}"
+                        );
+                        return SlashResult::Error;
+                    }
+                    (Err(error), Err(_)) => {
+                        eprintln!("cannot protect '{path}': {error}");
+                        return SlashResult::Error;
+                    }
+                }
+            }
+            if !arg.trim().is_empty() {
+                eprintln!("usage: {}", slash_syntax("permissions"));
+                return SlashResult::Error;
+            }
             let text = format_permissions(perms, session);
             if !cli.jsonl {
                 eprintln!("{text}");
@@ -12352,11 +13459,124 @@ async fn handle_slash(
         "restore" => return SlashResult::RestoreSession(arg.to_string()),
         "delete" => return SlashResult::DeleteSession(arg.to_string()),
         "resume" => {
+            // Bare /resume on a TTY opens the picker (cycle-13 parity item:
+            // claude's bare `--resume` offers a chooser; ids are unmemorable).
+            if arg.is_empty() && kitsu_render::stdin_is_tty() {
+                return match resume_picker(session) {
+                    Some(selector) => SlashResult::ResumeSession(selector),
+                    None => SlashResult::Continue(None),
+                };
+            }
             return SlashResult::ResumeSession(if arg.is_empty() {
                 "last".to_string()
             } else {
                 arg.to_string()
             });
+        }
+        "doctor" => {
+            if !arg.is_empty() && arg != "online" {
+                eprintln!("usage: {}", slash_syntax("doctor"));
+                return SlashResult::Error;
+            }
+            return match run_doctor(cli, arg == "online", false).await {
+                Ok(()) => SlashResult::Continue(None),
+                Err(error) => {
+                    eprintln!("{error}");
+                    SlashResult::Error
+                }
+            };
+        }
+        "cost" => {
+            // Billed truth lives in the shared tallies: they survive turn
+            // rollback and include subagent spend (cycle-23 audit #3).
+            let tallies = &session.run_tallies;
+            eprintln!(
+                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s), subagent spend included ({} via {})",
+                tallies.prompt_tokens.load(Ordering::Acquire),
+                tallies.completion_tokens.load(Ordering::Acquire),
+                tallies.total_tokens.load(Ordering::Acquire),
+                tallies.turns.load(Ordering::Acquire),
+                terminal_inline(model),
+                terminal_inline(&session.gateway),
+            );
+            {
+                let per_model = tallies
+                    .per_model
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner);
+                if per_model.len() > 1 {
+                    for (bin_model, (prompt, completion, total)) in per_model.iter() {
+                        eprintln!(
+                            "  {}: {prompt} prompt + {completion} completion = {total} total",
+                            terminal_inline(bin_model)
+                        );
+                    }
+                }
+            }
+            if let Some(window) = context_window.get() {
+                let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
+                let (used, _) = session_context_used(messages, session, state);
+                let percent = (used.saturating_mul(100)) / budget.effective.max(1);
+                eprintln!(
+                    "context window: {used} of {} effective token(s) used ({percent}%), window {window} — /context for provenance",
+                    budget.effective,
+                );
+            }
+            eprintln!(
+                "~ kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire"
+            );
+            return SlashResult::Continue(None);
+        }
+        "loop" => {
+            let mut parts = arg.splitn(2, char::is_whitespace);
+            let count = parts.next().unwrap_or("").parse::<usize>().ok();
+            let prompt = parts.next().unwrap_or("").trim().to_string();
+            let Some(count) = count.filter(|count| (2..=20).contains(count)) else {
+                eprintln!("usage: {} (count 2-20)", slash_syntax("loop"));
+                return SlashResult::Error;
+            };
+            if prompt.is_empty() || prompt.starts_with('/') {
+                eprintln!(
+                    "usage: {} — the prompt must be a plain model turn, not a slash command",
+                    slash_syntax("loop")
+                );
+                return SlashResult::Error;
+            }
+            return SlashResult::QueueAction(QueueCommand::AddCopies { prompt, count });
+        }
+        "theme" => {
+            if arg.is_empty() {
+                let active = kitsu_render::theme().name;
+                eprintln!("themes (active marked *):");
+                for theme in kitsu_render::THEMES {
+                    let active_mark = theme.name == active;
+                    let row = kitsu_render::theme_row(
+                        theme,
+                        active_mark,
+                        kitsu_render::stderr_styled(),
+                        kitsu_render::plain_mode(),
+                    );
+                    eprintln!("{}", row);
+                }
+                eprintln!("switch with /theme <name>; persist via `theme = \"<name>\"` in the config or --theme");
+                return SlashResult::Continue(None);
+            }
+            return match kitsu_render::set_theme(arg) {
+                Ok(theme) => {
+                    eprintln!(
+                        "{}",
+                        kitsu_render::milestone_line(&format!(
+                            "theme: {} — {}",
+                            theme.name, theme.description
+                        ))
+                    );
+                    SlashResult::Continue(None)
+                }
+                Err(error) => {
+                    eprintln!("{error}");
+                    SlashResult::Error
+                }
+            };
         }
         "queue" => {
             return match parse_queue_command(arg) {
@@ -12757,7 +13977,16 @@ async fn handle_slash(
                 let catalog_validated = match catalog {
                     Ok(Some(models)) => {
                         let models = filter_model_catalog(models, "");
-                        if !models.iter().any(|candidate| candidate == arg) {
+                        // Provider-pin / policy suffixes (HF router:
+                        // `model:fastest`, `model:cheapest`, `model:provider`)
+                        // are legitimate ids the catalog never lists — the
+                        // config's own recipes document them. Validate the
+                        // BASE id and accept the suffix (cycle-27 audit #3).
+                        let base = arg.split_once(':').map_or(arg, |(base, _)| base);
+                        if !models
+                            .iter()
+                            .any(|candidate| candidate == arg || candidate == base)
+                        {
                             eprintln!(
                                 "model '{}' is not in the gateway catalog - run /models",
                                 terminal_inline(arg)
@@ -12976,6 +14205,10 @@ impl ApprovalInputGuard {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         let previous_active = APPROVAL_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
+        // Take the live type-ahead draft row off the terminal before the
+        // approval prompt prints; the collector re-shows it (draft intact)
+        // once the approval releases stdin.
+        kitsu_render::live::live_input_end();
         Self {
             _owner: owner,
             previous_active,
@@ -13272,6 +14505,132 @@ mod tests {
         }
     }
 
+    #[cfg(unix)]
+    fn resolve(
+        editor: &mut typeahead_editor::TypeaheadEditor,
+        bytes: &[u8],
+        queue: &mut prompt_queue::PromptQueue,
+        dispatched: &mut Vec<String>,
+    ) -> (ActionEffects, TypeaheadCaptureResult) {
+        let outcome = editor.feed(bytes);
+        let mut result = TypeaheadCaptureResult::default();
+        let effects = resolve_editor_actions(
+            editor,
+            outcome,
+            &mut result,
+            |line, _| dispatched.push(line.to_string()),
+            || {
+                let queued = queue.status().queued;
+                queued
+                    .checked_sub(1)
+                    .and_then(|newest| queue.remove(newest))
+                    .map(|prompt| (prompt, queued - 1))
+            },
+        );
+        (effects, result)
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_dispatches_trimmed_submissions_and_touches_the_queue() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        let (effects, result) = resolve(&mut editor, b"  hello  \r\r", &mut queue, &mut dispatched);
+        // Trimmed once, empty second Enter skipped entirely.
+        assert_eq!(dispatched, vec!["hello"]);
+        assert!(effects.queue_touched);
+        assert!(effects.needs_redraw);
+        assert!(!result.eof);
+        assert_eq!(effects.raise_signal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_recall_pops_newest_and_falls_back_to_history() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        queue.enqueue("older").unwrap();
+        queue.enqueue("newest").unwrap();
+        let mut dispatched = Vec::new();
+        let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "newest");
+        assert_eq!(effects.recalled_remaining, Some(1));
+        assert!(effects.queue_touched && effects.needs_redraw);
+        assert_eq!(queue.status().queued, 1);
+        // Empty queue: the same ↑ falls back to the plain history walk.
+        let mut editor = typeahead_editor::TypeaheadEditor::new(vec!["from history".to_string()]);
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let (effects, _) = resolve(&mut editor, b"\x1b[A", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "from history");
+        assert_eq!(effects.recalled_remaining, None);
+        assert!(!effects.queue_touched);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_maps_control_actions_to_signals_and_eof() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        // Ctrl+C on empty draft → SIGINT effect (raise happens in the caller).
+        let (effects, _) = resolve(&mut editor, &[0x03], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGINT));
+        // Ctrl+Z → SIGTSTP (a swapped mapping must fail this).
+        let (effects, _) = resolve(&mut editor, &[0x1a], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGTSTP));
+        // ^C then ^\ in one batch: the LAST signal wins.
+        let (effects, _) = resolve(&mut editor, &[0x03, 0x1c], &mut queue, &mut dispatched);
+        assert_eq!(effects.raise_signal, Some(libc::SIGQUIT));
+        // Ctrl+D on empty draft → EOF, no signal.
+        let (effects, result) = resolve(&mut editor, &[0x04], &mut queue, &mut dispatched);
+        assert!(result.eof);
+        assert_eq!(effects.raise_signal, None);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn action_resolution_tab_accepts_the_slash_hint() {
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let mut queue = prompt_queue::PromptQueue::new(4);
+        let mut dispatched = Vec::new();
+        let (effects, _) = resolve(&mut editor, b"/ste\t", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "/steer");
+        assert!(effects.needs_redraw);
+        // Tab with no matching hint leaves the draft alone.
+        let mut editor = typeahead_editor::TypeaheadEditor::new(Vec::new());
+        let (_, _) = resolve(&mut editor, b"/zzz\t", &mut queue, &mut dispatched);
+        assert_eq!(editor.buffer_string(), "/zzz");
+    }
+
+    #[test]
+    fn typeahead_slash_hint_prefers_mid_turn_actionable_commands() {
+        // While a turn runs, /s must suggest steer (usable now), not save
+        // (registry order), and /st must beat status.
+        assert_eq!(typeahead_slash_hint("/s"), "teer");
+        assert_eq!(typeahead_slash_hint("/st"), "eer");
+        assert_eq!(typeahead_slash_hint("/q"), "ueue");
+        assert_eq!(typeahead_slash_hint("/j"), "obs");
+        // Outside the priority set, registry order still decides.
+        assert_eq!(typeahead_slash_hint("/sa"), "ve");
+        // Exact names, non-slash text, arguments, and no-match: no hint.
+        assert_eq!(typeahead_slash_hint("/steer"), "");
+        assert_eq!(typeahead_slash_hint("steer"), "");
+        assert_eq!(typeahead_slash_hint("/queue add x"), "");
+        assert_eq!(typeahead_slash_hint("/zzz"), "");
+        assert_eq!(typeahead_slash_hint("/"), "");
+    }
+
+    #[test]
+    fn mid_turn_hint_priority_names_exist_in_the_registry() {
+        for name in MID_TURN_HINT_PRIORITY {
+            assert!(
+                SLASH_COMMANDS.iter().any(|spec| spec.name == name),
+                "priority hint '{name}' is not a registered command"
+            );
+        }
+    }
+
     #[test]
     fn multiline_highlighting_preserves_buffer_geometry() {
         use rustyline::highlight::Highlighter;
@@ -13431,6 +14790,39 @@ mod tests {
     }
 
     #[test]
+    fn running_deck_rows_carry_an_activity_child_and_finished_rows_do_not() {
+        let registry = subagent::AgentRegistry::default();
+        let running = registry.start("still working".to_string()).unwrap();
+        let done = registry.start("finished cleanly".to_string()).unwrap();
+        registry.finish(done, Ok("collected".to_string()));
+
+        let deck = format_jobs(&registry);
+        // Exactly one running row → exactly one ↳ child line, with an age.
+        assert_eq!(deck.matches('↳').count(), 1, "{deck}");
+        assert!(deck.contains("↳ started · 0s ago"), "{deck}");
+        let _ = running;
+
+        // Formatter tiers: plain uses ASCII arrow and separator; no-activity
+        // and no-age cases degrade gracefully.
+        assert_eq!(
+            agent_activity_child_row(Some("started tool Read"), Some(4_200), false),
+            "↳ started tool Read · 4s ago"
+        );
+        assert_eq!(
+            agent_activity_child_row(Some("usage updated"), Some(65_000), true),
+            "-> usage updated | 1m05s ago"
+        );
+        assert_eq!(
+            agent_activity_child_row(Some("started"), None, false),
+            "↳ started"
+        );
+        assert_eq!(
+            agent_activity_child_row(None, Some(10), false),
+            "↳ no activity yet"
+        );
+    }
+
+    #[test]
     fn a_broken_output_pipe_is_not_a_crash() {
         assert!(panic_payload_is_broken_pipe(
             "failed printing to stdout: Broken pipe (os error 32)"
@@ -13555,7 +14947,9 @@ mod tests {
                 }
             }
         }
-        assert!(help.ends_with("current model: test-model"));
+        assert!(help.ends_with(
+            "current model: test-model — /help <command> explains one command in detail"
+        ));
     }
 
     #[test]

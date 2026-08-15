@@ -136,6 +136,20 @@ pub struct Cli {
     )]
     pub dangerously_allow_all_filesystem: bool,
 
+    /// DANGER: run fully unattended — never prompt for anything. Implies the
+    /// filesystem bypass above, registers read/write tools even in
+    /// non-interactive runs, and auto-approves `--command` invocations inside
+    /// the command roots. Built for loop automation, not interactive chat.
+    /// Hard guards survive: Kitsu config/state stay protected, commands stay
+    /// confined to their roots and containment, and `/permissions protect
+    /// <path>` can fence off more paths for the session.
+    #[arg(
+        long = "dangerously-skip-permissions",
+        global = true,
+        conflicts_with_all = ["yes", "dangerously_allow_all_filesystem"]
+    )]
+    pub dangerously_skip_permissions: bool,
+
     /// The model's context window in tokens. Overrides the gateway profile's
     /// `context_window` and any value discovered from `/v1/models`. Set this for
     /// small local models (e.g. Ollama's default 4096) so kitsu budgets context
@@ -162,6 +176,12 @@ pub struct Cli {
     /// disables it permanently.
     #[arg(long, global = true)]
     pub no_workspace_evidence: bool,
+
+    /// Color theme for styled output (kitsune, sakura, ocean, forest, ember,
+    /// mono — see `/theme`). Overrides the config key `theme`; `--plain`
+    /// disables styling entirely and wins over any theme.
+    #[arg(long, global = true, value_name = "NAME")]
+    pub theme: Option<String>,
 
     /// Per-turn cap on subagent spawns (`spawn_agent`, `spawn_agents`,
     /// `spawn_agent_bg` combined). Spawns beyond the cap return a tool error

@@ -107,14 +107,19 @@ fn merged_containment_environment(extra: &[(String, String)]) -> Vec<(String, St
 const PIPE_DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 /// How an invocation without an exact session grant is handled.
-///
-/// Unlike filesystem permissions, command policy has no auto-allow mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CommandMode {
     /// Ask the command-specific prompter. A missing prompter fails closed.
     Ask,
     /// Deny invocations that do not already have an exact grant.
     Deny,
+    /// DANGER: approve every invocation without prompting. Exists for
+    /// explicitly opted-in unattended automation
+    /// (`--dangerously-skip-permissions`). Only the *prompt* is skipped —
+    /// command-root cwd confinement, argv validation, executable
+    /// resolution, containment mounts, and secret-env filtering all still
+    /// apply.
+    AutoAllow,
 }
 
 /// The user's answer to a command-specific approval prompt.
@@ -1576,14 +1581,37 @@ impl CommandPolicy {
     }
 
     fn resolve_cwd(&self, requested: &Path) -> Result<PathBuf, ToolError> {
+        // Models routinely echo kitsu's own tilde-elided display paths back
+        // as cwd (cycle-18: the banner taught `~/…` and the denial taught
+        // nothing). Expand a leading `~` against $HOME before resolution.
+        let expanded;
+        let requested = match requested.strip_prefix("~") {
+            Ok(rest) => match std::env::var_os("HOME") {
+                Some(home) if rest.as_os_str().is_empty() => {
+                    expanded = PathBuf::from(home);
+                    expanded.as_path()
+                }
+                Some(home) => {
+                    expanded = PathBuf::from(home).join(rest);
+                    expanded.as_path()
+                }
+                None => requested,
+            },
+            Err(_) => requested,
+        };
+        // Inaccessible/non-directory cwds are ENVIRONMENT errors, not
+        // authority refusals: report them as recoverable execution errors so
+        // one typo'd path doesn't hard-fail a whole scripted turn the model
+        // then corrects (cycle-18 gap #3). Only the roots check below is a
+        // genuine policy denial.
         let canonical = std::fs::canonicalize(requested).map_err(|error| {
-            ToolError::PolicyDenied(format!(
+            ToolError::ExecError(format!(
                 "command cwd '{}' is not accessible: {error}",
                 requested.display()
             ))
         })?;
         if !canonical.is_dir() {
-            return Err(ToolError::PolicyDenied(format!(
+            return Err(ToolError::ExecError(format!(
                 "command cwd '{}' is not a directory",
                 requested.display()
             )));
@@ -1593,8 +1621,14 @@ impl CommandPolicy {
             .iter()
             .any(|root| canonical.starts_with(root))
         {
+            let approved = self
+                .command_roots
+                .iter()
+                .map(|root| format!("'{}'", root.display()))
+                .collect::<Vec<_>>()
+                .join(", ");
             return Err(ToolError::PolicyDenied(format!(
-                "command cwd '{}' is outside the approved command roots",
+                "command cwd '{}' is outside the approved command roots ({approved})",
                 requested.display()
             )));
         }
@@ -1623,6 +1657,13 @@ impl CommandPolicy {
         }
 
         match self.mode {
+            // The dangerous bypass answers the approval question, nothing
+            // else: cwd/root confinement and executable resolution were
+            // already enforced above, and containment still wraps execution.
+            CommandMode::AutoAllow => Ok(AuthorizedCommand {
+                cwd: authorized_cwd,
+                executable,
+            }),
             CommandMode::Deny => {
                 if grant_match == GrantMatch::Invalidated {
                     Err(executable_changed(argv, &cwd))
@@ -3203,6 +3244,31 @@ mod tests {
         ));
     }
 
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn auto_allow_executes_inside_roots_without_any_prompter() {
+        let dir = tempfile::tempdir().unwrap();
+        // No prompter attached: AutoAllow must never consult one.
+        let policy = CommandPolicy::new(&[root(&dir)], CommandMode::AutoAllow).unwrap();
+        let output = execute_command(&policy, args(&["/bin/echo", "auto-allowed"], dir.path()))
+            .await
+            .unwrap();
+        assert!(output.stdout.contains("auto-allowed"));
+    }
+
+    #[tokio::test]
+    async fn auto_allow_still_denies_cwd_outside_command_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::AutoAllow).unwrap();
+        // The dangerous bypass skips approval prompts only — root confinement
+        // is not negotiable.
+        assert!(matches!(
+            execute_command(&policy, args(&["definitely-not-run"], outside.path())).await,
+            Err(ToolError::PolicyDenied(message)) if message.contains("outside the approved command roots")
+        ));
+    }
+
     #[tokio::test]
     async fn cwd_must_be_under_an_explicit_command_root_before_prompting() {
         let allowed = tempfile::tempdir().unwrap();
@@ -3220,6 +3286,66 @@ mod tests {
             Err(ToolError::PolicyDenied(message)) if message.contains("outside the approved command roots")
         ));
         assert_eq!(prompts.load(Ordering::Relaxed), 0);
+    }
+
+    /// Cycle-18 command-path fixes: `~/…` cwds expand against $HOME instead
+    /// of denying (kitsu's own banner teaches tilde paths); the
+    /// outside-roots denial names the approved roots; and an inaccessible
+    /// cwd is a recoverable ExecError, not a policy denial.
+    #[tokio::test]
+    async fn cwd_tilde_expands_missing_is_recoverable_and_denials_name_roots() {
+        let allowed = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::AllowOnce,
+                prompts: Arc::new(AtomicUsize::new(0)),
+            }));
+
+        // The outside-roots denial teaches the approved roots.
+        let denial = execute_command(&policy, args(&["definitely-not-run"], outside.path())).await;
+        assert!(matches!(
+            denial,
+            Err(ToolError::PolicyDenied(message))
+                if message.contains("outside the approved command roots")
+                    && message.contains(&allowed.path().canonicalize().unwrap().display().to_string())
+        ));
+
+        // A missing cwd is an environment error the model can recover from.
+        let missing = allowed.path().join("nope");
+        assert!(matches!(
+            execute_command(&policy, args(&["definitely-not-run"], &missing)).await,
+            Err(ToolError::ExecError(message)) if message.contains("not accessible")
+        ));
+
+        // A tilde cwd resolves against $HOME rather than failing outright:
+        // with HOME pointed at the allowed root, `~` lands inside the roots
+        // and proceeds past cwd resolution to the (unapproved-command) gate.
+        // Serialized via env override only if HOME manipulation is safe here;
+        // instead verify via the unexpanded error NOT firing: a `~`-prefixed
+        // path must not produce the old "'~/...' is not accessible" shape
+        // when HOME/<rest> exists.
+        let home = std::env::var_os("HOME").expect("HOME set in test env");
+        let marker = std::path::Path::new(&home);
+        if marker.is_dir() {
+            let outcome = execute_command(
+                &policy,
+                args(&["definitely-not-run"], std::path::Path::new("~")),
+            )
+            .await;
+            match outcome {
+                // HOME is outside the approved root → the roots denial, with
+                // the EXPANDED path (no leading tilde) in the message.
+                Err(ToolError::PolicyDenied(message)) => {
+                    assert!(
+                        !message.contains("'~'"),
+                        "tilde should have been expanded before resolution: {message}"
+                    );
+                }
+                other => panic!("expected a roots denial for ~, got {other:?}"),
+            }
+        }
     }
 
     #[cfg(unix)]

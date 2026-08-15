@@ -13,5 +13,5 @@ pub use orchestrator::{
     AgentEventLog, AgentRuntimeEvent, AgentSessionState, AgentTurnStatus, CommandRuntimeInvocation,
     CommandRuntimeResult, CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason,
     CompactionRecord, CompactionReport, ContextUnit, ContextWindowEvidence, ProviderRequestPurpose,
-    SpawnBudget, SummaryFallbackReason, TurnCompletion,
+    RunTallies, SpawnBudget, SummaryFallbackReason, TurnCompletion,
 };
