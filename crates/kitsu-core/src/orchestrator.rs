@@ -675,6 +675,14 @@ struct PreparedToolOutput {
     artifact_path: Option<std::path::PathBuf>,
 }
 
+#[derive(Clone, Copy)]
+struct ToolOutputRequest<'a> {
+    call_id: &'a str,
+    tool_name: &'a str,
+    is_err: bool,
+    window_evidence: Option<ContextWindowEvidence>,
+}
+
 impl ToolOutputRetention {
     fn complete(value: &str) -> Self {
         let bytes = u64::try_from(value.len()).unwrap_or(u64::MAX);
@@ -2099,13 +2107,15 @@ where
             // mode.
             let prepared = prepare_tool_output(
                 content,
-                &tc.call_id,
-                &tc.tool_name,
-                is_err,
+                ToolOutputRequest {
+                    call_id: &tc.call_id,
+                    tool_name: &tc.tool_name,
+                    is_err,
+                    window_evidence: *window_evidence,
+                },
                 tools,
                 messages,
                 cfg,
-                *window_evidence,
             );
             if let Some(mut summary) = summary {
                 if let Some(path) = &prepared.artifact_path {
@@ -3857,17 +3867,14 @@ fn offload_pressure(
 
 fn prepare_tool_output(
     content: String,
-    call_id: &str,
-    tool_name: &str,
-    is_err: bool,
+    request: ToolOutputRequest<'_>,
     tools: &Registry,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
-    window_evidence: Option<ContextWindowEvidence>,
 ) -> PreparedToolOutput {
     // Native command results are already bounded per stream and must remain
     // valid JSON so the event layer can parse their authoritative counters.
-    if tool_name == "command_exec" {
+    if request.tool_name == "command_exec" {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,
@@ -3897,7 +3904,7 @@ fn prepare_tool_output(
 
     // Preserve the existing default: errors remain inline, while successful
     // oversized results may be offloaded if the model can recover the pointer.
-    if is_err {
+    if request.is_err {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,
@@ -3907,12 +3914,12 @@ fn prepare_tool_output(
     }
     maybe_offload_for_tools_detailed(
         content,
-        call_id,
+        request.call_id,
         cfg.offload_dir.as_deref(),
         tools,
         messages,
         cfg,
-        window_evidence,
+        request.window_evidence,
     )
 }
 

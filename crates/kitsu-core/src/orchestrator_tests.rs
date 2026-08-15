@@ -2678,7 +2678,9 @@ fn offload_pressure_requires_real_window_pressure() {
 
 #[test]
 fn artifact_policy_and_context_pressure_select_one_retention_path() {
-    use crate::orchestrator::{prepare_tool_output, ArtifactStoragePolicy, ToolArtifactStatus};
+    use crate::orchestrator::{
+        prepare_tool_output, ArtifactStoragePolicy, ToolArtifactStatus, ToolOutputRequest,
+    };
     use kitsu_providers::ToolDescriptor;
 
     let dir = tempfile::tempdir().unwrap();
@@ -2699,13 +2701,15 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     roomy.offload_dir = Some(dir.path().to_path_buf());
     let inline = prepare_tool_output(
         content.clone(),
-        "roomy",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "roomy",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &roomy,
-        None,
     );
     assert_eq!(inline.content, content);
     assert_eq!(
@@ -2720,13 +2724,15 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     tight.offload_dir = Some(dir.path().to_path_buf());
     let retained = prepare_tool_output(
         content.clone(),
-        "tight",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "tight",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &tight,
-        None,
     );
     assert_eq!(
         retained.retention.artifact_status,
@@ -2742,13 +2748,15 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     tight.artifact_policy = ArtifactStoragePolicy::InlineOnly;
     let suppressed = prepare_tool_output(
         content,
-        "suppressed",
-        "repo_grep",
-        false,
+        ToolOutputRequest {
+            call_id: "suppressed",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: None,
+        },
         &tools,
         &messages,
         &tight,
-        None,
     );
     assert_eq!(
         suppressed.retention.artifact_status,
@@ -2763,6 +2771,105 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         std::fs::read_dir(dir.path()).unwrap().count(),
         1,
         "artifact-free retention must not create a second file"
+    );
+}
+
+#[test]
+fn repeated_window_shortfall_drives_retention_without_bypassing_artifact_policy() {
+    use crate::orchestrator::{
+        prepare_tool_output, ArtifactStoragePolicy, ContextWindowEvidence, ToolArtifactStatus,
+        ToolOutputRequest,
+    };
+    use kitsu_providers::ToolDescriptor;
+
+    let dir = tempfile::tempdir().unwrap();
+    let content = format!("HEAD{}TAIL", "x".repeat(20_000));
+    let messages = initial_messages();
+    let mut tools = Registry::new();
+    tools.register_with_descriptor(
+        ToolDescriptor {
+            name: "fs_read_file".to_string(),
+            description: "read a file".to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        },
+        ok_handler("{}"),
+    );
+
+    let mut config = cfg(10);
+    config.context_window = Some(32_768);
+    config.offload_dir = Some(dir.path().to_path_buf());
+
+    let one_strike = ContextWindowEvidence {
+        reported_prompt_tokens: 8_192,
+        estimated_sent_tokens: 12_000,
+        resolved_window: 32_768,
+        warned: false,
+        shortfall_count: 1,
+    };
+    let still_inline = prepare_tool_output(
+        content.clone(),
+        ToolOutputRequest {
+            call_id: "one-strike",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(one_strike),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        still_inline.retention.artifact_status,
+        ToolArtifactStatus::NotNeeded,
+        "one shortfall must not clamp the offload threshold"
+    );
+
+    let two_strikes = ContextWindowEvidence {
+        shortfall_count: 2,
+        ..one_strike
+    };
+    let retained = prepare_tool_output(
+        content.clone(),
+        ToolOutputRequest {
+            call_id: "two-strikes",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(two_strikes),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        retained.retention.artifact_status,
+        ToolArtifactStatus::Retained,
+        "two plausible shortfalls must apply the smaller effective window"
+    );
+    assert!(retained.artifact_path.as_ref().is_some_and(|p| p.is_file()));
+    assert_eq!(std::fs::read_dir(dir.path()).unwrap().count(), 1);
+
+    config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
+    let suppressed = prepare_tool_output(
+        content,
+        ToolOutputRequest {
+            call_id: "policy-wins",
+            tool_name: "repo_grep",
+            is_err: false,
+            window_evidence: Some(two_strikes),
+        },
+        &tools,
+        &messages,
+        &config,
+    );
+    assert_eq!(
+        suppressed.retention.artifact_status,
+        ToolArtifactStatus::SuppressedByPolicy
+    );
+    assert!(suppressed.artifact_path.is_none());
+    assert_eq!(
+        std::fs::read_dir(dir.path()).unwrap().count(),
+        1,
+        "artifact-free policy must not create another retained file"
     );
 }
 
@@ -4842,4 +4949,70 @@ fn test_cached_schema_estimate_correctness_matches_fresh_estimate() {
     let second = cached_schema_estimate(&mut cache, &schema_json);
     assert_eq!(second, estimate_str(&schema_json));
     assert_eq!(first, second);
+}
+
+#[test]
+fn response_schema_participates_in_session_cache_identity() {
+    use crate::context::{estimate_str, schema_fingerprint, ContextMeter};
+    use crate::orchestrator::{ensure_chat_request_fits, serialized_request_constraints};
+    use kitsu_providers::{ChatRequest, JsonSchemaFormat};
+
+    fn response_format(expected: &str) -> JsonSchemaFormat {
+        JsonSchemaFormat {
+            name: "result".to_string(),
+            strict: true,
+            schema: serde_json::json!({
+                "type": "object",
+                "properties": {"status": {"const": expected}},
+                "required": ["status"]
+            }),
+        }
+    }
+
+    let format_a = response_format("alpha");
+    let format_b = response_format("bravo");
+    let serialized_a = serialized_request_constraints(None, Some(&format_a));
+    let serialized_b = serialized_request_constraints(None, Some(&format_b));
+    assert_eq!(
+        serialized_a.len(),
+        serialized_b.len(),
+        "fixtures must prove identity, rather than length, drives invalidation"
+    );
+    assert_ne!(
+        schema_fingerprint(&serialized_a),
+        schema_fingerprint(&serialized_b)
+    );
+
+    let mut config = cfg(2);
+    config.context_window = Some(131_072);
+    let meter = ContextMeter::new();
+    let mut request = ChatRequest {
+        model: config.model.clone(),
+        messages: vec![],
+        tools: None,
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: Some(format_a),
+        prompt_cache_key: None,
+    };
+
+    const SENTINEL_ESTIMATE: u64 = 50_000;
+    let mut cache = Some((
+        schema_fingerprint(&serialized_a),
+        serialized_a,
+        SENTINEL_ESTIMATE,
+    ));
+    let cached = ensure_chat_request_fits(&request, &config, &meter, None, &mut cache).unwrap();
+    assert_eq!(cached.used, SENTINEL_ESTIMATE);
+
+    request.response_format = Some(format_b);
+    let refreshed = ensure_chat_request_fits(&request, &config, &meter, None, &mut cache).unwrap();
+    let expected = estimate_str(&serialized_b);
+    assert_eq!(refreshed.used, expected);
+    assert_eq!(
+        cache,
+        Some((schema_fingerprint(&serialized_b), serialized_b, expected))
+    );
 }
