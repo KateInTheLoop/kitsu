@@ -871,14 +871,17 @@ Use `--allow-turn-errors` only when partial success is intentional; it accepts
 partial success, so a script where everything failed still exits nonzero.
 The human run receipt calls completed model turns and slash commands
 "successful operations" and reports failures separately, so a query-only
-script is never mislabeled as having completed a model turn.
+script is never mislabeled as having completed a model turn. JSONL repeats the
+exact count in `final_summary.successful_operations`; `/quit` remains control
+flow rather than a successful operation, and older summaries without the
+additive field mean that the count is unknown.
 
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
 output, typed errors, and exactly one `final_summary`. Human stderr is not needed
 to determine the outcome. Unknown scripted slash commands keep the safe
 host-authored closest-command or `/help` hint in their typed error message.
-The final summary includes `duration_ms`, measured
+The final summary includes `successful_operations` and `duration_ms`, measured
 monotonically from process entry through summary emission, on success, error,
 and cancellation. Its `*_failures` fields count failed turns/operations, while
 `tool_errors`/`policy_errors` count individual calls and the corresponding
