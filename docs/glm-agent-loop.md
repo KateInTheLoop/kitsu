@@ -530,3 +530,117 @@ known OpenAI-specific-assumption limitation) — either is a candidate
 fresh P-item alongside P8/P11 for the next code cycle; alternatively, a
 fresh review of the retry/backoff or model-discovery paths continues the
 review-portfolio side of the alternation.
+
+### Cycle 8 — 2026-08-15 — fourth review, portfolio expands to auth (grade A)
+
+Fresh review target per the alternation (cycle 7 was code): the PRIMARY
+`header()` method — `impl AuthProvider for EnvBearerAuth` in
+`crates/kitsu-providers/src/auth.rs` (lines 59–95), the code that turns
+an env-var bearer token into the HTTP `Authorization` header. Confirmed
+unreviewed before the run (only an incidental cross-reference to
+`auth.rs`'s `set_sensitive`/redaction guard in cycle 6's finding, not a
+review of it). Driver rebuilt fresh from the main checkout immediately
+before the run. Success on `:together` attempt 1 — no transport
+failure, no retry, no provider fallback needed.
+
+**Read/edit discipline: 2 `Read` calls — a single ranged read of
+`auth.rs` lines 1–96 (covering the trait, struct, `new()`, and
+`header()` in one shot) plus one ranged read of `error.rs` lines 55–80
+(the `AuthError` enum). Well under the ~5-read guidance, the tightest
+read count of any review cycle so far. No spawn attempted, cap 1
+unexercised.** `kitsu-usage: {"prompt_tokens":17861,
+"completion_tokens":8986,"total_tokens":26847}` — the smallest total
+spend of any cycle logged so far. `kitsu-context: {"used":8006,
+"effective":107072,"window":131072}`. Run summary: "1 turn(s) ok, 2
+file(s) read, 1 file(s) written (1 change(s)), session not saved" —
+clean exit 0, no transport issue, no recovered tool error, no
+PolicyDenied.
+
+**Citation spot-check: every citation verified exact against the
+worktree source, quotes and line numbers both.** Checked line-by-line
+against `auth.rs` and `error.rs`: auth.rs:62 (`let token = match
+std::env::var(&self.env) {`), :63 (`Ok(v) if !v.is_empty() => v,`),
+:64–69 (the `_` arm returning `AuthError::Missing`), :73 (`HeaderName::
+from_bytes(...)`), :74–76 (`Malformed { env: self.env.clone() }`), :81
+(`format!("{} {}", self.scheme, token)`), :82–86 (the `trim_start`/
+`as_str` branch), :88–90 (`HeaderValue::from_str(trimmed).map_err(...)`),
+:92 (`value.set_sensitive(true)`) all match verbatim. error.rs:64 and
+:70 (the `Missing`/`Malformed` `#[error(...)]` Display strings) and
+:65/:71 (their field shapes) also match verbatim. Supporting citations
+(auth.rs:1–2 module doc, :17 trait contract, :33–37 pub struct fields,
+:51–52 `new()` defaults, :60–61 and :72 comments) all check out too. No
+misquote, no wrong line number found anywhere in the review.
+
+**Four ranked, line-cited proposals, all technically sound:**
+
+1. **`VarError::NotUnicode` misreported as `Missing` (highest
+   priority).** auth.rs:62's `match` wildcards both `VarError::
+   NotPresent` and `VarError::NotUnicode(_)` into `AuthError::Missing`
+   (auth.rs:64–69), whose Display (error.rs:64) says "is not set" —
+   false when the var is present but non-UTF-8. Verified correct: this
+   is a genuine diagnostic-accuracy bug, exactly GLM's demonstrated
+   strength (cycle 6's finding was the same class — opaque vs.
+   diagnosable error text). Properly hedged: notes it did not read any
+   caller matching on `AuthError::Missing` specifically, so the
+   downstream effect of reclassifying the branch is not fully verified,
+   only that the message becomes more accurate.
+2. **`Malformed { env }` misattributes non-token failures.** auth.rs:
+   73–77 fails on `self.header` (not the token) but reports "token in
+   ${env} is malformed"; auth.rs:88–90 can fail on `self.scheme`, same
+   mislabel. Verified correct against the code and against error.rs:70's
+   literal Display string. Hedge is precise and self-aware: notes `new()`
+   (auth.rs:51–52) only ever sets valid defaults so neither site fires
+   in the default-config path — only affects callers customizing the
+   `pub` fields (auth.rs:33–37), which it did not read.
+3. **Token whitespace not trimmed → silent 401s.** Claims trailing
+   SP/TAB in an env value passes `is_empty` and `HeaderValue::from_str`
+   (auth.rs:88), producing an invisible-to-the-user malformed header.
+   Verified true against the actual `http`-crate `HeaderValue`
+   byte-validator (SP=0x20 and TAB=0x09 are permitted anywhere in the
+   value, no leading/trailing restriction) — **but this is a claim about
+   an external dependency's behavior that GLM did not read this
+   session**, stated as fact ("HeaderValue::from_str ... which permits
+   SP and TAB") rather than hedged per the CRITICAL instruction. The
+   claim happens to be correct, so nothing is wrong in the review, but
+   it is the one place this cycle where the hedge discipline slipped —
+   worth naming so it doesn't compound if future cycles reason about
+   unread dependency internals more speculatively.
+4. **(low, correctly ranked and hedged) Secret strings not zeroized.**
+   Explicitly flagged as hardening only, explicitly notes it did not
+   read `Cargo.toml` to confirm a `zeroize` dependency exists.
+
+Two non-proposal notes (redundant `to_lowercase()`, `set_sensitive`
+correctly satisfies the trait contract) are both accurate and correctly
+kept out of the ranked list.
+
+**Grade: A.** Scope discipline was the tightest of any review cycle (2
+reads, one already covering the whole target file); every citation
+checks out verbatim; all four proposals are technically sound and
+ranked sensibly (diagnostic-accuracy bug > error-attribution bug >
+robustness gap > hardening nice-to-have), matching the security/
+correctness judgment GLM has shown since cycle 1. The one flaw — an
+unhedged claim about `HeaderValue::from_str`'s unread internals in
+finding 3 — is minor (the claim is independently verifiable and
+correct) but is a real, if small, breach of the CRITICAL hedging
+instruction, so this cycle is not a flawless A on process, only on
+substance.
+
+**GLM is now 4-for-4 A on reviews and 4-for-4 on code (B→A→A→A code;
+A→A→A→A reviews) — the auth path is now the fourth distinct area
+reviewed (env/HTTP setup, an OpenAI-compat file, the SSE streaming
+path, now `auth.rs`'s header construction), continuing the
+review-portfolio expansion the recipe calls for.** No new kitsu
+weaknesses filed (W1–W5 from prior cycles still open, none re-triggered
+this cycle — no recovered tool errors, no discard, no PolicyDenied).
+Open candidates for future cycles: implement finding 1 or 2 from this
+review (both are small, well-scoped, security-relevant fixes suitable
+for a code cycle) alongside the still-open cycle-5 findings 5/6 and
+P8/P11; on the review side, `auth.rs`'s two other `header()` impls
+(`StaticAuth` at ~141, `NoAuth` at ~168) and `expiry_status()` remain
+unreviewed, as do the retry/backoff and model-discovery paths.
+
+**Ramp status:** GLM holds a perfect grade record across 8 cycles (4
+reviews, 4 code) with a demonstrated pattern of tight scope discipline,
+accurate citations, and now a first (minor) hedging-discipline lapse to
+watch in future review cycles — otherwise no change to its top-tier
+standing.
