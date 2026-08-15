@@ -10,12 +10,15 @@
 > the spec-creation spot-check implied), and
 > `prompt_tokens_details.cached_tokens` present (key always present,
 > value 0 in every sample so far — no cache hits observed).
-> **Cycle 1 status: probes green, kitsu run RED.** Two straight
-> `:together` transport failures (HTTP 503 after 3 internal retries,
-> then a retry that got HTTP 200 with an unparseable body) burned the
-> run and its one permitted retry before any file review completed.
-> No `reviews/glm-cycle-1.md` was produced this tick — ramp is still at
-> zero banked reviews. Phase B must be re-attempted next tick.
+> **Cycle 1 status: probes green, kitsu run RED (transport), then
+> RETRIED GREEN.** Cycle 1 burned both attempts on two straight
+> `:together` transport failures before any file review completed.
+> The retry tick found `:together` healthy, produced
+> `reviews/glm-cycle-1.md` on attempt 1 with zero transport errors, and
+> banked it at **grade A** with a perfect 5/5 (spot-checked further to
+> 9/9) citation-accuracy record — the cleanest citation discipline of
+> the three non-Anthropic contributors so far on this exact
+> `context.rs` task. Ramp: 1 review banked for GLM-5.2.
 
 Fourth contributor in the collaboration (2026-08-14, user direction):
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -233,3 +236,144 @@ spec's observed-providers list: novita, fireworks-ai, zai-org.
 DeepSeek: 1 at grade B). Cycle 2 should retry Phase B with the same
 scope; if `:together` fails a third consecutive time across cycles,
 switch the pin per the recipe's re-evaluation clause.
+
+### Cycle 1-retry (2026-08-14) — GLM debut BANKED, grade A, citations perfect
+
+**Phase A — router probes re-confirmed (curl, same endpoint, same
+model):**
+
+1. **Reasoning key + shrink.** `reasoning` key confirmed again (both
+   with and without `reasoning_effort`). On a "17 * 24, think step by
+   step" prompt: uncapped → 205 reasoning tokens (300-token budget
+   fully consumed, `finish_reason: "length"`, empty visible answer);
+   `reasoning_effort: "low"` → 166 reasoning tokens (finishes normally,
+   content present). ~19% shrink — a moderate lever, consistent with
+   cycle 1's "10-30%, not dramatic" finding; the earlier "26 reasoning
+   tokens" spec-creation figure still does not reproduce. Confirms the
+   recipe's tight-budget warning again: an uncapped reasoning stream
+   can eat the whole `max_tokens` and return nothing.
+2. **Forced tool call.** `tool_choice` pinned to `get_weather` returned
+   a clean `finish_reason: "tool_calls"`, one well-formed call
+   (`id: call_01a0031bfea17351a3903ba3`, valid JSON args
+   `{"city":"Paris"}`). `:together` tool-call shape intact, second
+   confirmation.
+3. **Usage shape.** `prompt_tokens_details.cached_tokens` present on
+   every response; tested a cold/warm repeat of an identical 75-token
+   prompt 2s apart — still `0` both times (second call's
+   `reasoning_tokens` dropped 150→32, suggesting the *model* varies
+   effort a little between runs even at a fixed `reasoning_effort`,
+   but no provider-side prompt cache hit was observed at this length).
+
+**Phase B — kitsu run, attempt 1 succeeded, no retry needed.** Build
+clean (`CARGO_TARGET_DIR=/home/mmpg/.cache/glm-worktree-target cargo
+build -p kitsu`, ~9s, cached). Repeated the same CLI-surface fix noted
+in cycle 1 (the flags live on `kitsu chat`, not the top-level binary).
+`:together` was healthy this tick — **zero transport errors**, so the
+provider-switch fallback (`fireworks-ai`) was never needed and the pin
+stays at `:together`.
+
+Tool sequence: `Read` (full 378-line file) → `Write`
+`reviews/glm-cycle-1.md` (created, 6875 bytes — **kitsu flagged a
+warning**: "content contains a raw model chat-template control marker
+— the model likely emitted protocol text instead of real file
+content") → `Read` (ranged 29-185, targeted re-verification pass) →
+`Write` `reviews/glm-cycle-1.md` (updated, 10745 bytes, clean). GLM
+noticed the flagged marker itself, said so in its own narration ("I
+literally wrote `<|...|>`... I'll fix that"), re-read its citations,
+and overwrote with a clean version — the final on-disk file is 10745
+bytes with no control-token leakage. **This is kitsu's disclosure
+mechanism working as designed**: it didn't silently accept a corrupted
+write, and the model used the warning to self-correct within the same
+turn rather than needing a retry.
+
+`kitsu-usage: {"prompt_tokens":44501,"completion_tokens":22370,
+"total_tokens":66871}` (completion tokens ran close to the 24000 cap
+but did not truncate — finished cleanly). `kitsu-context:
+{"used":15363,"effective":107072,"window":131072}`. Run summary: "1
+turn(s) ok, 2 file(s) read, 1 file(s) written (1 change(s))". **No
+sub-agent spawn was attempted** (`agent-spawn-cap 1` unexercised — GLM
+never called a spawn tool; the prose "do NOT spawn sub-agents" was
+followed without needing the cap as a backstop).
+
+**Grade: A.** `reviews/glm-cycle-1.md` delivers 12 ranked proposals
+(P0-1..P2-4) cleanly organized under the three requested axes —
+estimate accuracy (P0-1 byte-vs-char undercounting on CJK, P0-2 missing
+per-message overhead, P1-3 `tool_call_id` billed at the wrong rate,
+P2-4 tail omits schema tokens), budget policy (P1-4 buffer decoupled
+from reserve, P2-1 `None` max_output under-reserves, P2-2 zero-buffer
+on tiny windows), and the compaction breaker (P0-3 length-only anchor
+validity relying on caller `invalidate()` discipline, P1-1
+`anchor_includes_schema` inherits the same fragility, P1-2 `estimate`
+discards `had_schema` so schema asymmetry is invisible to it, P2-3
+`record` accepts an unbounded `sent_len`). Each proposal names root
+cause, exact line(s), and a concrete fix — matches the prompt's
+required structure precisely.
+
+**Citation spot-check (headline result): 5/5 exact**, deliberately
+spread front-to-back including the back half:
+- Line 16 cited as `` const CHARS_PER_TOKEN: usize = 4; `` — exact.
+- Line 36 cited as `` let text = m.content.len() + m.tool_call_id.as_ref().map_or(0, String::len); `` — exact.
+- Line 102 (middle) cited as `` Some((tokens, sent_len, _)) if sent_len <= messages.len() => { `` — exact.
+- Line 123 (back half) cited as `` matches!(self.anchor, Some((_, sent_len, had_schema)) if had_schema && sent_len <= messages.len()) `` — exact.
+- Line 166 (back half) cited as `` let buffer = (window / 10).min(2_048); `` — exact.
+
+Beyond the mandated 5, spot-checking further citations (lines 68, 80,
+86-87, 163, 167) found the same result: every quote matched the file
+verbatim, no drift anywhere including the back half. This is the
+strongest citation discipline observed across all three non-Anthropic
+contributors so far on this exact task.
+
+**Three-way comparison** (same file, same task, all three deliverables
+now read in full):
+- **Kimi cycle 4 (`reviews/kimi-cycle-4.md`, grade A, 5 proposals).**
+  Tighter and more architectural — leads with the same core finding GLM
+  found independently (P0-3: length-only anchor validity is the
+  file's central weakness) but goes further, proposing a concrete
+  fingerprint/generation-counter fix with an explicit risk/cost
+  trade-off per proposal (a "Why it wins" + "Risk" structure GLM's
+  review lacks). Kimi's citations, spot-checked in its own cycle,
+  were accurate.
+- **DeepSeek cycle 1 (`reviews/deepseek-cycle-1.md`, grade B, 8
+  proposals).** Broader surface area (8 items vs GLM's 12, but
+  DeepSeek's are coarser-grained) and one genuinely sharp catch GLM
+  missed (Rank 5: `message_tokens` ignores `reasoning_content`/thinking
+  tokens entirely — a real gap neither GLM nor Kimi's review flagged).
+  But DeepSeek's back-half citations drift badly: "Lines 173-205" for
+  `ContextBudget` when the struct+impl actually span 143-174 (~30-line
+  drift), "line 203-204" for the buffer computation that is actually
+  at line 166 (~38-line drift). Re-verified those two here directly
+  against the file — confirmed drifted, matching the spec's prior note
+  that DeepSeek cycle 1 drifted 30-40 lines in the back half.
+- **GLM cycle 1-retry: most granular breakdown (12 items), and the
+  cleanest citation record of the three** — a genuine strength on the
+  exact axis the recipe's "citation discipline" rule was written to
+  fix. Depth of insight sits between the two: GLM independently found
+  the same P0 anchor-fragility issue Kimi led with, plus a distinct,
+  well-reasoned CJK/byte-vs-char estimate bug neither Kimi nor
+  DeepSeek raised. It did not catch DeepSeek's `reasoning_content`
+  omission or match Kimi's per-proposal risk/cost framing — so on pure
+  insight depth this reads as strong-A/comparable-to-Kimi rather than
+  clearly superior, but on citation accuracy specifically it is the
+  best of the three banked reviews.
+
+**Observed kitsu weaknesses / notes:**
+- Confirms cycle 1's non-bug note: the CLI puts `--allow-path` /
+  `--allow-write` / the prompt positional on `kitsu chat`, not the
+  top-level `kitsu` binary; a supervisor building the invocation from
+  the top level fails fast with a clear `unexpected argument` error.
+  Worth promoting from a cycle-1 footnote into the Rules section's
+  gateway-flag line so future supervisors don't re-pay this cost.
+- The chat-template-marker disclosure (described above) is worth
+  filing as a positive pattern, not a weakness: kitsu could have
+  silently accepted the corrupted write; instead it surfaced a
+  specific, actionable warning inline in the tool-result stream, and
+  the model used it productively in the same turn. No roadmap item
+  needed — flagging so it isn't lost.
+
+**Ramp status:** 1 review banked for GLM-5.2 at grade A
+(`reviews/glm-cycle-1.md`) — GLM has now matched Kimi's day-one outcome
+(banked at grade A) and exceeded DeepSeek's day-one outcome (grade B),
+after one failed and one successful tick. Cycle 2 should move to a
+fresh backlog item (implementation or a different file), per the
+recipe's "never assign the same item to two contributors in the same
+hour" rule — this slot is now spent for `context.rs`.
