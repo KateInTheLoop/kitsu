@@ -10588,9 +10588,10 @@ struct ScriptRunStatus {
     file_reads: u64,
     denied_calls: u64,
     failed_calls: u64,
-    /// Turns and commands that completed successfully. `--allow-turn-errors`
-    /// accepts PARTIAL success; a run where nothing succeeded stays an error.
-    successes: usize,
+    /// User turns and slash commands that completed successfully.
+    /// `--allow-turn-errors` accepts PARTIAL success; a run where no operation
+    /// succeeded stays an error.
+    successful_operations: usize,
     failures: usize,
     provider_failures: usize,
     output_schema_failures: usize,
@@ -10608,8 +10609,8 @@ struct ScriptRunStatus {
 }
 
 impl ScriptRunStatus {
-    fn record_success(&mut self) {
-        self.successes += 1;
+    fn record_successful_operation(&mut self) {
+        self.successful_operations += 1;
     }
 
     fn record_turn_failure(&mut self, kind: ScriptFailureKind) {
@@ -10643,8 +10644,8 @@ fn emit_run_receipt(
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     registry: &Arc<subagent::AgentRegistry>,
     session_id: Option<&str>,
-    turns_ok: usize,
-    turns_failed: usize,
+    successful_operations: usize,
+    failures: usize,
     file_reads: u64,
     denied_calls: u64,
     failed_calls: u64,
@@ -10658,22 +10659,29 @@ fn emit_run_receipt(
         .iter()
         .map(|checkpoint| checkpoint.change_count)
         .sum();
-    let turns = if turns_failed > 0 {
-        format!("{turns_ok} turn(s) ok / {turns_failed} failed")
+    let operations = if successful_operations == 1 {
+        "1 successful operation".to_string()
     } else {
-        format!("{turns_ok} turn(s) ok")
+        format!("{successful_operations} successful operations")
     };
-    let progress = registry.progress_snapshot();
+    let progress = if failures == 0 {
+        operations
+    } else if failures == 1 {
+        format!("{operations} / 1 failure")
+    } else {
+        format!("{operations} / {failures} failures")
+    };
+    let agent_progress = registry.progress_snapshot();
     let mut agents = String::new();
-    if progress.total > 0 {
+    if agent_progress.total > 0 {
         // Zero-count qualifiers stay silent: "0 cancelled" on a clean exit
         // reads as an incident that never happened.
-        agents = format!(", {} background agent(s)", progress.total);
-        if progress.failed > 0 {
-            agents.push_str(&format!(" ({} failed)", progress.failed));
+        agents = format!(", {} background agent(s)", agent_progress.total);
+        if agent_progress.failed > 0 {
+            agents.push_str(&format!(" ({} failed)", agent_progress.failed));
         }
-        if progress.cancelled > 0 {
-            agents.push_str(&format!(" ({} cancelled)", progress.cancelled));
+        if agent_progress.cancelled > 0 {
+            agents.push_str(&format!(" ({} cancelled)", agent_progress.cancelled));
         }
     }
     // Reads render unconditionally: "1 file written, 0 files read" is the
@@ -10689,7 +10697,7 @@ fn emit_run_receipt(
         trouble.push_str(&format!(", {plain_failures} failed tool call(s)"));
     }
     eprintln!(
-        "~ run summary: {turns}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}{trouble}, session {}",
+        "~ run summary: {progress}, {file_reads} file(s) read, {} file(s) written ({} change(s)){agents}{trouble}, session {}",
         files.len(),
         changes,
         session_id.unwrap_or("not saved"),
@@ -10827,7 +10835,7 @@ async fn finalize_scripted_run(
         });
         // Aggregate turn/command failures already have their own framed events.
         status.primary_error_framed = true;
-    } else if aggregate_failure && status.successes == 0 {
+    } else if aggregate_failure && status.successful_operations == 0 {
         // --allow-turn-errors accepts PARTIAL success. When every turn and
         // command failed there is no success to accept, so a zero exit would
         // mislabel a total failure.
@@ -10851,7 +10859,7 @@ async fn finalize_scripted_run(
             journal,
             registry,
             session_id.as_deref(),
-            status.successes,
+            status.successful_operations,
             status.failures,
             status.file_reads,
             status.denied_calls,
@@ -11090,7 +11098,7 @@ async fn run_scripted_body(
             match result {
                 Ok(()) => {
                     persist_session_required(session_store, session, model, messages)?;
-                    status.record_success();
+                    status.record_successful_operation();
                     last_failed = None;
                 }
                 Err(kind) => {
@@ -11199,7 +11207,7 @@ async fn run_scripted_body(
                             )?;
                         }
                     }
-                    status.record_success();
+                    status.record_successful_operation();
                     finish_command("ok", None, EXIT_USER)?;
                     continue;
                 }
@@ -11257,7 +11265,7 @@ async fn run_scripted_body(
                                     );
                                 }
                             }
-                            status.record_success();
+                            status.record_successful_operation();
                             last_failed = None;
                             finish_command("ok", None, EXIT_USER)?;
                         }
@@ -11364,7 +11372,7 @@ async fn run_scripted_body(
                     match result {
                         Ok(()) => {
                             persist_command_session!();
-                            status.record_success();
+                            status.record_successful_operation();
                             last_failed = None;
                             finish_command("ok", None, EXIT_USER)?;
                         }
@@ -11416,7 +11424,7 @@ async fn run_scripted_body(
                     match result {
                         Ok(()) => {
                             persist_command_session!();
-                            status.record_success();
+                            status.record_successful_operation();
                             last_failed = None;
                             finish_command("ok", None, EXIT_USER)?;
                         }
@@ -11454,7 +11462,7 @@ async fn run_scripted_body(
                                     }),
                                 )?;
                             }
-                            status.record_success();
+                            status.record_successful_operation();
                             finish_command("ok", None, EXIT_USER)?;
                         }
                         Err(error) => {
@@ -11519,7 +11527,7 @@ async fn run_scripted_body(
         match result {
             Ok(()) => {
                 persist_session_required(session_store, session, model, messages)?;
-                status.record_success();
+                status.record_successful_operation();
                 last_failed = None;
             }
             Err(kind) => {

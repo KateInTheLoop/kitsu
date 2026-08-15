@@ -869,6 +869,9 @@ success, while interactive chat rolls the turn back and keeps `/retry`
 available. Completed file effects remain inspectable after either rollback.
 Use `--allow-turn-errors` only when partial success is intentional; it accepts
 partial success, so a script where everything failed still exits nonzero.
+The human run receipt calls completed model turns and slash commands
+"successful operations" and reports failures separately, so a query-only
+script is never mislabeled as having completed a model turn.
 
 For automation, `--jsonl` emits one `kitsu.chat.v1` object per stdout line:
 `run_started`, framed turn/command events, provider/tool/usage events, assistant
