@@ -340,10 +340,12 @@ as data. `content_quality_warning` now flags a marker only when it is
 UNQUOTED (a leaked completion is bare; source quotes it), via
 `has_unquoted_chat_template_marker`. Advisory, never blocks. 3 tests +
 an e2e through write_file_run (commit dad6882). Another dogfooding
-finding (Kimi cycle 16) fixed. Haiku review pending (key checks: loop
-advance / byte-boundary safety, still-advisory). Next lane-1: R1.3 symbol
-nav or R1.4 grouped edit receipts; or the high-value R4.10 (technical
-read cap, doubly-motivated by DeepSeek).
+finding (Kimi cycle 16) fixed. Haiku review: SHIP-AS-IS — all 10 cases
+traced (loop advance, byte-boundary safety on multibyte-adjacent markers,
+mixed quoted/bare, and confirmed still-advisory — the write commits
+regardless of the warning), no findings. Next lane-1: R1.3 symbol nav or
+R1.4 grouped edit receipts; or the high-value R4.10 (technical read cap,
+doubly-motivated by DeepSeek).
 
 ### Cycle 7 — 2026-08-14 — R3.3 verified done + R1.7 shipped (line-number prefixes)
 
