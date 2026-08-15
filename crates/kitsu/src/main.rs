@@ -307,9 +307,8 @@ fn emit_jsonl_summary_with_postcondition_failures(
         "session_id": session_id,
         "session_snapshot_state": session_snapshot_state,
     });
-    if output_last_message_preserved_without_commit() {
-        payload["output_last_message_state"] =
-            serde_json::json!("preserved_no_committed_assistant");
+    if let Some(state) = output_last_message_summary_state(postcondition_failures) {
+        payload["output_last_message_state"] = serde_json::json!(state);
     }
     emit_jsonl("final_summary", payload)?;
     JSONL_SUMMARY_EMITTED.store(true, Ordering::Release);
@@ -319,6 +318,18 @@ fn emit_jsonl_summary_with_postcondition_failures(
 fn output_last_message_preserved_without_commit() -> bool {
     OUTPUT_LAST_MESSAGE_REQUESTED.load(Ordering::Acquire)
         && !FULLY_COMMITTED_ASSISTANT_SEEN.load(Ordering::Acquire)
+}
+
+fn output_last_message_summary_state(postcondition_failures: usize) -> Option<&'static str> {
+    if !OUTPUT_LAST_MESSAGE_REQUESTED.load(Ordering::Acquire) {
+        None
+    } else if !FULLY_COMMITTED_ASSISTANT_SEEN.load(Ordering::Acquire) {
+        Some("preserved_no_committed_assistant")
+    } else if postcondition_failures > 0 {
+        Some("preserved_postcondition_failure")
+    } else {
+        None
+    }
 }
 
 fn set_jsonl_session_receipt(planned_id: Option<String>, snapshot_state: SessionSnapshotState) {
