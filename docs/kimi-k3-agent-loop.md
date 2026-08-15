@@ -1655,3 +1655,76 @@ dictate the orchestrator.rs diff in prose" workaround this cycle used.
 Remaining open items: P7 (schema fingerprint), P8–P11, and the
 `kitsu-tools` read-cap flake (now fixed, so retired from the standing
 watch-list).
+
+### Cycle 14 — 2026-08-14 — P7 anchor schema fingerprint (grade A-)
+
+Kimi implemented P7 correctly and essentially completely: `ContextMeter`'s
+anchor tuple grew a fifth field, `schema_fingerprint(schema_json) -> u64`
+(a `DefaultHasher` pass over the full serialized schema string — a
+deliberate, documented departure from P2's length-only `prefix_fingerprint`
+style, justified in its own doc comment: schema JSON is small (KBs) and
+built once per turn, so a full hash pass stays near-free, while a
+length-only fingerprint would miss the realistic case of one tool
+description swapped for another same-length one). `record()` gained a
+`schema_json: &str` parameter; `anchor_includes_schema()` gained the same
+and now additionally requires the stored fingerprint to match the current
+schema's before reporting the anchor as schema-covered. 6 tests total in
+context.rs (3 new P7 tests + 3 pre-existing `anchor_includes_schema_*`
+tests updated to the new signature): unchanged-schema keeps the fast path
+(a), a changed tool set (different `SCHEMA_A`/`SCHEMA_B` fixtures) forces
+`anchor_includes_schema` back to `false` so schema tokens are re-estimated
+(b), and a no-schema (`had_schema: false`) anchor is unaffected regardless
+of fingerprint (c). **This also validates the journal-cap fix from
+cycle 13: Kimi edited `orchestrator.rs` directly** (the sole
+`meter.record(...)` call site at line 1206, plus the `anchor_includes_schema`
+call in `request_measurement` at line 2237) — no "journal limit" error,
+confirming the fix holds on a real model run. Committed on `dogfood/kimi-k3`
+(Kate verified author), pushed.
+
+- Single attempt, `--agent-spawn-cap 1` — **zero spawn attempts** (the
+  prompt's explicit "edit orchestrator.rs yourself" instruction combined
+  with a genuinely editable file may be why; contrast cycles 9/13 where
+  spawns were attempted despite prohibition/blockers).
+- **Supervisor-side incident, not Kimi's fault:** the first invocation
+  used `kitsu ask --allow-path/--allow-write`, which errored immediately
+  (those flags belong to `kitsu chat`, not `ask` — the same CLI-surface
+  friction the GLM loop already filed, R4.7). Corrected to `kitsu chat`
+  piped-stdin at zero token cost. The corrected run was then killed by
+  the *supervisor's* Bash tool default 2-minute timeout (kitsu's own
+  `--timeout-secs 300` budget was never exhausted) while Kimi was
+  mid-edit — this is a supervisor tooling gap (forgot to raise the Bash
+  timeout to match `--timeout-secs`), not a Kimi retry. Kimi's
+  in-flight work was inspected and found essentially complete: of ~30
+  `.record()`/`anchor_includes_schema()` call sites across context.rs,
+  orchestrator.rs, and orchestrator_tests.rs, exactly ONE
+  (`context.rs`, the `anchor_includes_schema_is_false_when_recorded_without_tools`
+  test) still had the old 1-arg call — Kimi's own stdout transcript
+  showed it had already found this exact line ("Line 622 still has an
+  old call:") and was about to fix it when the process was killed. The
+  supervisor applied that one missing argument verbatim, matching
+  Kimi's already-demonstrated fix pattern; no other repair was needed.
+- Docked to A- (not A) for that single mechanical completion the
+  supervisor had to apply, and because the design choice to hash the
+  full schema string (not schema length) is a legitimate justified
+  choice but drifts from the exact "mirror the length-only P2 style"
+  suggestion in the brief — the model reasoned about the tradeoff
+  explicitly rather than defaulting, which is good judgment, but this
+  cycle keeps it from a clean A.
+- Gates: `cargo build --workspace` clean; `cargo clippy --workspace
+  --all-targets` warning-free; `cargo fmt --all -- --check` needed one
+  auto-format pass (a single long `const SCHEMA_B` line Kimi wrote
+  un-wrapped — cosmetic only, applied and reverified clean); `cargo test
+  --workspace` 744/745 passed, the one failure being the pre-known PTY
+  flake `test_query_only_interactive_session_does_not_create_a_snapshot`
+  (unrelated, allowed). kitsu-core: 113/113 (110 + 3 new).
+- No debris events, no truncation, no other kitsu weaknesses beyond the
+  `ask`/`chat` flag-scoping friction already on file.
+
+**Backlog status: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅ P6 ✅ P7 ✅. Kimi is 8-for-8
+on code work since the ramp (cycles 7–14), and the journal-cap fix is now
+validated on a real model editing `orchestrator.rs` directly.** Remaining
+open items: P8 (trim buffer scaling), P9 (unlisted in this doc — verify
+against reviews/kimi-cycle-6.md if picked up), P10 (model-context caching,
+GLM's item — do not duplicate), P11 (cache serialized schema size — a
+natural pairing with P7's now-per-round schema fingerprint, since both
+touch the same `schema_json` construction site).

@@ -1203,7 +1203,7 @@ where
                     // included the schema, so a later round can tell whether the
                     // anchor already accounts for it (see
                     // ContextMeter::anchor_includes_schema).
-                    meter.record(u.prompt_tokens, messages, tools_were_offered);
+                    meter.record(u.prompt_tokens, messages, tools_were_offered, &schema_json);
                     turn_usage.add(u);
                     // Cross-check the resolved window against runtime truth:
                     // a usage report far below the sent estimate (and below
@@ -2234,7 +2234,7 @@ fn request_measurement(
         // Add schemas only if that exact anchored request did not already carry
         // them. Any mutation of covered messages invalidates the anchor first.
         let used = meter.estimate(messages)
-            + if meter.anchor_includes_schema(messages) {
+            + if meter.anchor_includes_schema(messages, schema_json) {
                 0
             } else {
                 schema_tokens
