@@ -15,9 +15,22 @@ use std::hash::{Hash, Hasher};
 use kitsu_providers::{ChatMessage, Role};
 
 /// Rough chars-per-token for prose/code.
-const CHARS_PER_TOKEN: usize = 4;
+///
+/// `pub(crate)` so callers that convert a remaining *token* budget back into a
+/// *byte* budget for ASCII-ish content (e.g. the compaction summarizer sizing
+/// its transcript input) use the same rate `estimate_str`/`message_tokens` do.
+pub(crate) const CHARS_PER_TOKEN: usize = 4;
 /// Tool-call JSON args tokenize denser than prose.
 const CHARS_PER_TOKEN_JSON: usize = 3;
+/// Per-message role/separator overhead real chat tokenizers add. Deliberately
+/// at the low end of the true ~3–4 so the bias stays conservative (over-fill
+/// is safer than overflow, design §3.2).
+///
+/// `pub(crate)` so callers that hand-construct a single-message request against
+/// a byte budget (e.g. the compaction summarizer's bounded request) can reserve
+/// headroom for this overhead up front, instead of discovering the request is
+/// already over budget only after estimating it.
+pub(crate) const PER_MESSAGE_TOKENS: u64 = 3;
 
 /// Context window assumed when a gateway reports none. Deliberately small so an
 /// unknown model is under-filled rather than overflowed (design §3.2).
@@ -26,22 +39,54 @@ pub const DEFAULT_CONTEXT_WINDOW: u64 = 8_192;
 /// Always leave at least this many tokens for the model's reply.
 pub const MIN_OUTPUT_RESERVE: u64 = 512;
 
-/// Estimate tokens of an arbitrary string (e.g. serialized tool schemas) at the
-/// prose rate.
+/// Token estimate for a string with `ascii` ASCII chars and `non_ascii`
+/// multibyte chars at the given ASCII chars-per-token rate. Non-ASCII text
+/// (CJK etc.) tokenizes at roughly one token per char, so it is counted
+/// directly — a flat bytes/rate or chars/rate computation would undercount it
+/// by ~3x against real tokenizers.
+fn estimate_mixed(ascii: usize, non_ascii: usize, rate: usize) -> u64 {
+    (ascii.div_ceil(rate) + non_ascii) as u64
+}
+
+/// Split a string into (ASCII chars, non-ASCII chars).
+fn ascii_split(s: &str) -> (usize, usize) {
+    s.chars().fold(
+        (0, 0),
+        |(a, n), c| {
+            if c.is_ascii() {
+                (a + 1, n)
+            } else {
+                (a, n + 1)
+            }
+        },
+    )
+}
+
+/// Estimate tokens of an arbitrary string (e.g. serialized tool schemas).
+/// Two-rate heuristic: ASCII at the prose rate, non-ASCII at ~1 token/char,
+/// so multibyte text is no longer undercounted (a raw byte count confuses
+/// CJK's ~3 bytes/char with the 4-bytes/token rate).
 pub fn estimate_str(s: &str) -> u64 {
-    s.len().div_ceil(CHARS_PER_TOKEN) as u64
+    let (ascii, non_ascii) = ascii_split(s);
+    estimate_mixed(ascii, non_ascii, CHARS_PER_TOKEN)
 }
 
 /// Rough token estimate of one message: text at the prose rate, tool-call args
-/// at the denser JSON rate.
+/// at the denser JSON rate (both via the two-rate ASCII/non-ASCII heuristic),
+/// plus a small per-message overhead for the role/separator tokens real chat
+/// tokenizers add.
 pub fn message_tokens(m: &ChatMessage) -> u64 {
-    let text = m.content.len() + m.tool_call_id.as_ref().map_or(0, String::len);
-    let json: usize = m
-        .tool_calls
-        .iter()
-        .map(|c| c.tool_name.len() + c.args.len() + c.call_id.len())
-        .sum();
-    (text.div_ceil(CHARS_PER_TOKEN) + json.div_ceil(CHARS_PER_TOKEN_JSON)) as u64
+    let (text_a, text_n) = ascii_split(&m.content);
+    let (id_a, id_n) = m.tool_call_id.as_deref().map_or((0, 0), ascii_split);
+    let (json_a, json_n) = m.tool_calls.iter().fold((0, 0), |(a, n), c| {
+        let (a1, n1) = ascii_split(&c.tool_name);
+        let (a2, n2) = ascii_split(&c.args);
+        let (a3, n3) = ascii_split(&c.call_id);
+        (a + a1 + a2 + a3, n + n1 + n2 + n3)
+    });
+    estimate_mixed(text_a + id_a, text_n + id_n, CHARS_PER_TOKEN)
+        + estimate_mixed(json_a, json_n, CHARS_PER_TOKEN_JSON)
+        + PER_MESSAGE_TOKENS
 }
 
 /// Per-role token breakdown for `/context` (design §3.4).
@@ -237,8 +282,8 @@ mod tests {
     #[test]
     fn full_estimate_without_anchor() {
         let meter = ContextMeter::new();
-        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")]; // 1 + 1
-        assert_eq!(meter.estimate(&msgs), 2);
+        let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")]; // (1+3) + (1+3)
+        assert_eq!(meter.estimate(&msgs), 8);
     }
 
     #[test]
@@ -247,9 +292,9 @@ mod tests {
         let mut msgs = vec![msg(Role::System, "x".repeat(40).as_str())];
         // Pretend the last request sent these 1 message(s) and cost 1000 tokens.
         meter.record(1000, &msgs, false);
-        // Append an 8-char user turn: +2 tokens estimated on top of the anchor.
+        // Append an 8-char user turn: +2 text tokens + 3 per-message overhead.
         msgs.push(msg(Role::User, "abcdefgh"));
-        assert_eq!(meter.estimate(&msgs), 1002);
+        assert_eq!(meter.estimate(&msgs), 1005);
     }
 
     #[test]
@@ -265,24 +310,24 @@ mod tests {
         // ...but history was trimmed to 1 message: anchor no longer describes a
         // prefix, so estimate ignores it and estimates the whole set.
         let msgs = vec![msg(Role::User, "abcd")];
-        assert_eq!(meter.estimate(&msgs), 1);
+        assert_eq!(meter.estimate(&msgs), 4); // 1 text + 3 per-message
     }
 
     #[test]
     fn breakdown_by_role_totals_match() {
         let meter = ContextMeter::new();
         let msgs = vec![
-            msg(Role::System, "abcd"),       // 1
-            msg(Role::User, "abcdefgh"),     // 2
-            msg(Role::Assistant, "abcd"),    // 1
-            msg(Role::Tool, "abcdefghijkl"), // 3
+            msg(Role::System, "abcd"),       // 1 + 3
+            msg(Role::User, "abcdefgh"),     // 2 + 3
+            msg(Role::Assistant, "abcd"),    // 1 + 3
+            msg(Role::Tool, "abcdefghijkl"), // 3 + 3
         ];
         let b = meter.breakdown(&msgs);
-        assert_eq!(b.system, 1);
-        assert_eq!(b.user, 2);
-        assert_eq!(b.assistant, 1);
-        assert_eq!(b.tool_results, 3);
-        assert_eq!(b.total(), 7);
+        assert_eq!(b.system, 4);
+        assert_eq!(b.user, 5);
+        assert_eq!(b.assistant, 4);
+        assert_eq!(b.tool_results, 6);
+        assert_eq!(b.total(), 19);
     }
 
     #[test]
@@ -322,10 +367,10 @@ mod tests {
                 args: "abcdef".to_string(),
             }],
         };
-        assert_eq!(message_tokens(&m), 4);
-        // The same bytes as plain content would be ceil(10/4)=3 — JSON is denser.
+        assert_eq!(message_tokens(&m), 7); // 4 + PER_MESSAGE_TOKENS
+                                           // The same bytes as plain content would be ceil(10/4)=3 — JSON is denser.
         let as_text = msg(Role::Assistant, "abababcdef"); // 10 chars
-        assert_eq!(message_tokens(&as_text), 3);
+        assert_eq!(message_tokens(&as_text), 6); // 3 + PER_MESSAGE_TOKENS
     }
 
     #[test]
@@ -383,10 +428,10 @@ mod tests {
             !meter.anchored(&msgs),
             "an invalidated anchor must never report itself as anchored"
         );
-        // Full recompute: 5 messages * 1 token each ("abcd" = 4 chars = 1 token) = 5.
+        // Full recompute: 5 messages * (1 text + 3 per-message) = 20.
         assert_eq!(
             meter.estimate(&msgs),
-            5,
+            20,
             "must fall back to a full recompute, not the stale 1000-token anchor"
         );
     }
@@ -431,9 +476,9 @@ mod tests {
             msg(Role::User, "abcd"),
         ];
         meter.record(1000, &msgs, false);
-        msgs.push(msg(Role::User, "abcdefgh")); // identical prefix + 8-char tail (+2)
+        msgs.push(msg(Role::User, "abcdefgh")); // identical prefix + 8-char tail (+2+3)
         assert!(meter.anchored(&msgs));
-        assert_eq!(meter.estimate(&msgs), 1002);
+        assert_eq!(meter.estimate(&msgs), 1005);
     }
 
     /// (b) THE bug from reviews/kimi-cycle-6.md P2: an in-place content edit
@@ -488,11 +533,11 @@ mod tests {
             msg(Role::User, "abcd"),
         ];
         meter.record(800, &msgs, true);
-        msgs.push(msg(Role::Assistant, "abcdefgh")); // +2
-        msgs.push(msg(Role::Tool, "abcd")); // +1
+        msgs.push(msg(Role::Assistant, "abcdefgh")); // +2+3
+        msgs.push(msg(Role::Tool, "abcd")); // +1+3
         assert!(meter.anchored(&msgs));
         assert!(meter.anchor_includes_schema(&msgs));
-        assert_eq!(meter.estimate(&msgs), 803);
+        assert_eq!(meter.estimate(&msgs), 809);
     }
 
     #[test]
@@ -503,5 +548,59 @@ mod tests {
         assert_eq!(b.effective, 50);
         assert_eq!(b.target, 40);
         assert!(b.target <= b.effective && b.effective <= b.window);
+    }
+
+    /// P4(a): a history of N short messages must include N * PER_MESSAGE_TOKENS
+    /// of role/separator overhead on top of the old byte-only, no-overhead
+    /// computation.
+    #[test]
+    fn short_message_history_includes_per_message_overhead() {
+        const N: usize = 10;
+        let msgs: Vec<ChatMessage> = (0..N).map(|_| msg(Role::User, "abcd")).collect();
+        // Old computation: bytes-only, no overhead -> N * ceil(4/4) = 10.
+        let old: u64 = msgs
+            .iter()
+            .map(|m| (m.content.len().div_ceil(CHARS_PER_TOKEN)) as u64)
+            .sum();
+        let new: u64 = msgs.iter().map(message_tokens).sum();
+        assert_eq!(old, N as u64);
+        assert_eq!(
+            new,
+            old + N as u64 * PER_MESSAGE_TOKENS,
+            "estimate must add N * PER_MESSAGE_TOKENS over the old no-overhead math"
+        );
+    }
+
+    /// P4(b): CJK text is ~3 bytes per char and tokenizes at roughly one token
+    /// per char, so the old byte-based `s.len()/CHARS_PER_TOKEN` undercounted
+    /// it by ~3x. The new estimate must be HIGHER and close to the true count.
+    #[test]
+    fn multibyte_text_is_not_undercounted() {
+        let s = "你好世界，这是测试文本。"; // 12 chars, 36 bytes, ~12 real tokens
+        assert_eq!(s.chars().count(), 12);
+        assert_eq!(s.len(), 36);
+        let old = (s.len().div_ceil(CHARS_PER_TOKEN)) as u64; // 9 -> underestimate
+        let new = estimate_str(s); // 12 (one token per non-ASCII char)
+        assert_eq!(new, 12);
+        assert!(
+            new > old,
+            "new estimate ({new}) must exceed the old byte-based one ({old})"
+        );
+    }
+
+    /// P4(c): plain ASCII is 1 byte per char, so the estimate must be
+    /// unchanged versus the old byte-based computation (no regression).
+    #[test]
+    fn ascii_estimate_unchanged() {
+        let s = "The quick brown fox jumps over the lazy dog.";
+        let old = (s.len().div_ceil(CHARS_PER_TOKEN)) as u64;
+        assert_eq!(estimate_str(s), old);
+        // Per-message overhead aside, the text portion is identical too.
+        let m = msg(Role::User, s);
+        assert_eq!(
+            message_tokens(&m),
+            old + PER_MESSAGE_TOKENS,
+            "ASCII text estimate must match the old rate plus only the new overhead"
+        );
     }
 }

@@ -2,7 +2,9 @@
 //! docs/architecture.md §5: call model → parse tool calls → run tools →
 //! append results → repeat until the model stops or a cap is hit.
 
-use crate::context::{estimate_str, message_tokens, ContextBudget, ContextMeter};
+use crate::context::{
+    estimate_str, message_tokens, ContextBudget, ContextMeter, CHARS_PER_TOKEN, PER_MESSAGE_TOKENS,
+};
 use futures::StreamExt;
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, Provider, ProviderAttemptCategory,
@@ -2683,14 +2685,29 @@ fn bounded_summary_request(
     let window = cfg.context_window?;
     let max_tokens = summary_max_tokens(window, cfg.max_tokens)?;
     let target = ContextBudget::new(window, Some(max_tokens)).target;
-    let max_prompt_bytes = usize::try_from(target.saturating_mul(4)).unwrap_or(usize::MAX);
-    let fixed_bytes =
-        SUMMARY_INPUT_PREFIX.len() + SUMMARY_INPUT_SUFFIX.len() + SUMMARY_PROMPT.len();
-    if fixed_bytes >= max_prompt_bytes {
+    // Budget the request in TOKEN space, not a flat bytes/CHARS_PER_TOKEN
+    // guess, so the request this function hands back is actually estimated at
+    // or under `target` once built (message_tokens is what `ensure_chat_-
+    // request_fits` measures it with just after). Reserve PER_MESSAGE_TOKENS
+    // for the single wrapping message's own overhead, and the fixed prefix/
+    // suffix/prompt text's REAL estimate (not its byte length — the prompt
+    // text contains non-ASCII punctuation that costs a full token each under
+    // the two-rate estimator, not a byte-len/4 fraction of one). Only the
+    // remaining token headroom is converted back to a byte budget, and only
+    // for the variable transcript, which is ASCII-dominated conversation
+    // text in the common case.
+    let fixed_tokens = estimate_str(SUMMARY_INPUT_PREFIX)
+        + estimate_str(SUMMARY_INPUT_SUFFIX)
+        + estimate_str(SUMMARY_PROMPT);
+    let transcript_token_budget = target
+        .saturating_sub(PER_MESSAGE_TOKENS)
+        .saturating_sub(fixed_tokens);
+    if transcript_token_budget == 0 {
         return None;
     }
+    let available = usize::try_from(transcript_token_budget.saturating_mul(CHARS_PER_TOKEN as u64))
+        .unwrap_or(usize::MAX);
     let transcript = summary_transcript(old_messages);
-    let available = max_prompt_bytes - fixed_bytes;
     let bounded = truncate_middle_to_bytes(&transcript, available);
     if bounded.trim().is_empty() {
         return None;

@@ -1337,3 +1337,114 @@ New backlog item: the `kitsu` crate's test target needs the same
 "exercise every crate's test target every cycle" discipline that fixed
 `kitsu-core`'s in cycle 9 — this cycle shows it can still drift crate
 by crate.
+
+### Cycle 11 — 2026-08-14 — P4 estimator overhead (grade A-)
+
+Kimi implemented P4 correctly and completely in one attempt, first try
+using the CORRECT invocation (`kitsu chat`, not `kitsu ask` — `ask` has
+no `--allow-path`/`--allow-write`; the supervisor's first attempt used
+the wrong subcommand and failed fast with a clap usage error before any
+tokens were spent, then succeeded on the corrected `chat` invocation
+inside the same one-retry budget). `crates/kitsu-core/src/context.rs`
+(+158/-42): added `PER_MESSAGE_TOKENS: u64 = 3` (low end of the true
+~3–4, per the spec's "err low, over-fill is safer than overflow"); fixed
+`estimate_str`/`message_tokens` with a genuine two-rate ASCII/non-ASCII
+heuristic (`ascii_split` + `estimate_mixed`: ASCII chars at
+`ceil(n/CHARS_PER_TOKEN)`, non-ASCII chars at a flat 1 token each) rather
+than either a shallow `chars()`-only swap or a superficial patch — this
+correctly fixes the CJK-undercount defect without changing the ASCII
+common case at all. Added exactly the three required tests
+(`short_message_history_includes_per_message_overhead`,
+`multibyte_text_is_not_undercounted`, `ascii_estimate_unchanged`) plus
+honestly recomputed 8 pre-existing exact-value tests in the same file
+(`full_estimate_without_anchor`, `anchor_plus_tail_when_prefix_intact`,
+`falls_back_to_full_estimate_when_trimmed_below_anchor`,
+`breakdown_by_role_totals_match`,
+`tool_call_args_estimated_at_denser_json_rate`,
+`invalidate_forces_full_recompute_even_after_regrowth_past_old_sent_len`,
+`unchanged_prefix_still_uses_the_anchor`,
+`appending_to_the_tail_still_uses_the_anchor`) — every new value checked
+by hand against the new formula, not just adjusted until green (spot
+verified by the supervisor; all correct).
+
+- Single attempt, 19 tool calls (3 ranged `Read`s of context.rs + 15
+  incremental `Edit`s), 60s wall, completion 7,085/24,000 (30%), zero
+  debris/truncation. `--agent-spawn-cap 1` held — zero spawn attempts in
+  the receipts (the model never needed to fall back to a spawn on this
+  narrowly-scoped, single-file task).
+- **Cross-crate churn, exactly as the brief warned it would.**
+  `cargo test --workspace` surfaced two classes of breakage beyond
+  Kimi's context.rs-only scope, both fixed by the supervisor (not
+  Kimi's fault — its `--allow-write` was scoped to context.rs only):
+  1. **4 exact-behavior failures in `orchestrator_tests.rs`**
+     (`compaction_summarize_rebuilds_history_with_summary`,
+     `compaction_falls_back_to_drop_on_empty_summary`,
+     `compact_conversation_folds_summarizer_usage_into_turn_usage`,
+     `summary_request_and_rebuilt_history_are_bounded_and_disclosed`).
+     These were NOT simple "update the expected number" fixes — root
+     cause was a genuine latent zero-margin bug in
+     `orchestrator.rs::bounded_summary_request`: it sized its
+     summarization request's byte budget as `target * 4` bytes with NO
+     headroom for the per-message overhead the resulting single-message
+     request would itself cost once measured, so a request built right
+     up to the byte cap landed exactly `PER_MESSAGE_TOKENS` (then, after
+     a first fix attempt, one MORE token from a hardcoded em-dash "—" in
+     `SUMMARY_PROMPT` — a non-ASCII char that the new two-rate estimator
+     correctly counts as a full token instead of a fraction of one)
+     over its own `target`, so the summarizer's own bounded request was
+     rejected as `RequestTooLarge` before ever reaching the provider,
+     silently downgrading every summarize-mode compaction to
+     drop-fallback. This bug was latent before P4 too (zero margin by
+     construction) but P4's more accurate/conservative estimate is what
+     tipped it over. Fixed by rewriting `bounded_summary_request` to
+     budget in TOKEN space using the real `estimate_str` cost of the
+     fixed prompt text (not a byte-length guess) plus
+     `PER_MESSAGE_TOKENS`, converting only the remaining headroom back
+     to a byte budget for the variable transcript — `CHARS_PER_TOKEN`
+     and `PER_MESSAGE_TOKENS` were widened to `pub(crate)` in context.rs
+     to support this. All 80 orchestrator tests pass after the fix, and
+     the fix was verified numerically (debug-traced the actual
+     `message_tokens` output against the byte budget before settling on
+     the token-space rewrite, not guessed-and-checked).
+  2. **`cargo fmt --check` failures** in both Kimi's context.rs diff
+     (`ascii_split`'s closure formatting) and the supervisor's own
+     orchestrator.rs fix; resolved with `cargo fmt --all`, no logic
+     change.
+- **Two pre-existing flakes, both independently confirmed unrelated to
+  P4 via `git stash` against the untouched worktree tip (`e3bc6d4`):**
+  the standing `test_query_only_interactive_session_does_not_create_a_snapshot`
+  PTY flake (per the loop's standing exception), and
+  `kitsu-tools::builtins::fs::tests::read_file_caps_input_before_allocating_the_whole_file`
+  — the SAME flake cycle 10 recorded ("load/environment-sensitive"),
+  now reproducing consistently (3/3 runs) on the unmodified tip in this
+  session's environment; still unrelated to context.rs/orchestrator.rs
+  (kitsu-tools has no dependency on kitsu-core's estimator). Left
+  unfixed as out of scope; flagged for a future cycle to actually
+  investigate root cause rather than re-note as "revisit if it
+  recurs" a second time.
+- `cargo build --workspace`, `cargo clippy --workspace --all-targets`
+  (zero warnings), and `cargo fmt --all -- --check` all clean after the
+  supervisor's orchestrator.rs fix and fmt pass.
+
+**Grade: A-.** Kimi's own context.rs work is a genuine A: correct
+constant choice, a real (not superficial) fix for the byte-vs-char
+defect, honest recomputation of every downstream exact-value assertion
+in its own file, zero spawn violations, single attempt. Docked to A-
+because the fix surfaced a real cross-file latent bug requiring
+non-mechanical supervisor engineering (not just plugging in new
+numbers) to resolve safely — outside Kimi's task scope by design, so
+not a mark against Kimi's delivery, but the fourth consecutive cycle
+(after 9, 10, and now 11) where full `cargo test --workspace` was
+required to catch a cross-crate/cross-file regression a crate-scoped
+run would have missed entirely.
+
+**Actionable finding for next supervisor:** `kitsu ask` does NOT support
+`--allow-path`/`--allow-write` (those flags exist only on `kitsu chat`);
+this doc's flag lists should say `kitsu chat`, not imply `ask` — the
+gateway/model/reasoning flags are common to both subcommands but the
+filesystem grant flags are chat-only. Confirmed by `kitsu ask --help`
+vs `kitsu chat --help` this cycle.
+
+**Backlog status:** P4 ✅. Remaining open items: P6
+(evidence-clamps-budget), P7 (schema fingerprint), the still-open half
+of P3, P5 (anchor sanity clamp), P8-P11.
