@@ -665,3 +665,74 @@ off-by-one, now with a demonstrated fix holding for a full cycle). Still
 review-only until R4.10 (implementation type-chasing, per cycle 5, is
 unaddressed). No range-overshoot this cycle — the cron's pre-measured
 1796-1850 range was exact on the first check.
+
+### Cycle 12 — 2026-08-15 — first parsing/recovery function; second zero-drift citation cycle in a row (grade A)
+
+Target: `parse_text_tool_calls` (`crates/kitsu-core/src/orchestrator.rs`),
+a 62-line fallback parser (`fn parse_text_tool_calls(text: &str, tools:
+&Registry, skill_names: &[String]) -> TextToolRecovery`) that recovers
+tool calls a model emitted as inline text instead of structured
+`tool_calls` — the first cycle on genuine string-scanning/JSON-extraction
+logic with adversarial-input edge cases, rather than a predicate,
+formatter, or ledger helper. Pre-dispatch check confirmed the assigned
+range (1443-1504) was exact: the function's own closing brace is at line
+1504 and the next function (`extract_json_objects`) starts at line 1510,
+so no correction was needed.
+
+- **Process: 9th clean review cycle running.** Exactly 1 ranged read
+  (1443-1504, 62 lines, matching the assigned range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised), exit 0, no transport
+  retry needed — the run succeeded on the first attempt. kitsu-usage
+  `{"prompt_tokens":19312,"completion_tokens":2850,"total_tokens":22162}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))".
+- **Citations 4/4 letter-perfect — second consecutive zero-drift cycle.**
+  Spot-checked every quoted block against the source: lines 1464-1467
+  (the substring-match malformed-detection guard), lines 1487-1491 (the
+  `arguments`/`parameters` match arm producing `args`), line 1487 again
+  (the `or_else` shadowing point), and lines 1455-1458 (the top of the
+  candidate loop with the two-step `serde_json::from_str` parse attempt)
+  all match the source verbatim, on both text and line-number labels.
+  Every quoted block was reproduced as a complete contiguous span with no
+  ellipsis or line-dropping — the cycle-10 prompt fix continues to hold
+  for a second straight cycle.
+- **Hedging correctly calibrated on all 4 proposals.** Proposal 1
+  (substring-match false positives on tool names appearing inside value
+  strings or as substrings of longer words, e.g. a tool named `"ask"`
+  matching inside `"task"`) stays entirely within the read range and
+  needed no hedge — correct. Proposal 2 (`serde_json::Value::Null` or
+  other non-string scalars stringify via `v.to_string()` on line 1489 to
+  the literal `"null"` rather than falling back to `"{}"` like the `None`
+  arm) is a claim about `serde_json`'s own `Display` impl, not about any
+  unread project type — supervisor confirms this is accurate serde_json
+  behavior (`Value`'s `Display` serializes to JSON text, so `Null` →
+  `"null"`), and the proposal correctly used softened framing ("can cause
+  callers to trip") rather than asserting unread caller behavior as fact.
+  Proposal 3 (silent `arguments`-over-`parameters` shadowing) explicitly
+  hedged with "I cannot see whether callers or telemetry elsewhere
+  surface this." Proposal 4 (no early bailout when zero registered tool
+  names appear in `text`, forcing every extracted `{…}` through serde
+  even for prose-only answers) explicitly hedged with "I cannot see the
+  implementation of `extract_json_objects` — it may already filter
+  aggressively." Both hedges are exactly the pattern the prompt asked
+  for: real, substantive proposals that stop short of asserting unread
+  callee behavior as fact. No unhedged out-of-scope claims and no
+  substantively-wrong claims this cycle.
+
+**Grade: A.** Perfect process, perfect citations, and hedging correctly
+distinguished between claims resting on read-range code (proposals 1 and
+3's core observation), well-known crate semantics that don't need project
+hedging (proposal 2's `serde_json::Value::to_string()` behavior), and
+claims that genuinely depend on unread callee code (proposals 3's caller
+question and 4's `extract_json_objects` filtering). First cycle on true
+parsing/recovery logic with adversarial-input framing (vs. formatters,
+predicates, or ledger helpers in cycles 7-11), and both process discipline
+and citation fidelity held without any degradation.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 9-for-9 clean (cycles 3, 4, 6, 7, 8, 9, 10, 11, 12), and
+citation fidelity is 5-for-6 (cycles 7, 8, 9, 11, 12 clean; cycle 10 the
+lone off-by-one, now with the fix holding for two full cycles in a row).
+Still review-only until R4.10 (implementation type-chasing, per cycle 5,
+is unaddressed). No range-overshoot this cycle — the cron's pre-measured
+1443-1504 range was exact on the first check.
