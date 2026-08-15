@@ -571,3 +571,46 @@ pushed. First attempt, cap-1 held, zero spawns.
 P11 (schema re-serialization cache — synergizes with Kimi's own P7), or
 the unwrap_or_default() serialization-swallow sweep (4 sites in
 orchestrator.rs, DeepSeek-flagged; defensive), or a fresh item.
+
+### Cycle 17 — 2026-08-15 — P11 schema-estimate cache (grade C+) — BACKLOG COMPLETE
+
+Kimi implemented P11: `AgentSessionState.schema_cache: Option<(u64,
+String, u64)>` (fingerprint, schema_json, estimate) keyed by its OWN P7
+`schema_fingerprint()` — reuse on a match, recompute+overwrite on a miss;
+wired into `ensure_chat_request_fits` + `compact_context`. Bonus refactor:
+`request_measurement`/`structural_request_tokens` take a precomputed
+`schema_tokens`, cutting `enforce_context_budget_recording`'s
+`estimate_str` calls up to 8x→1x. Commit `ac77340` (Kate verified),
+pushed. cap-1 held, zero spawns. **This completes Kimi's original P1-P11
+backlog.**
+
+- **Grade C+ — first INCOMPLETE delivery.** The bonus refactor expanded
+  scope; Kimi hit 59 tool calls and ran OUT OF BUDGET mid-edit, leaving a
+  compile-breaking ordering bug (`schema_tokens` used before its `let`) —
+  which its own trailing reasoning had JUST self-diagnosed
+  ("Wait — the token_before is computed before schema_tokens is
+  defined...") but had no budget left to fix. Supervisor did the largest
+  repair of the ramp: the ordering bug + 2 missed call sites + 5 stale
+  test sites + a clippy allow, and AUTHORED all 3 tests (Kimi wrote none
+  before cutoff). Credit retained: the cache design is entirely Kimi's,
+  correctly reuses P7, and the bug was an interrupted turn, not a wrong
+  design. kitsu-core 122/122 after repair.
+- **Lesson:** P11-as-scoped (cache + the 8x→1x refactor) was too big for
+  one cycle — the refactor rippled to ~7 call sites. A cache-only P11
+  would have fit; the refactor should have been a separate cycle.
+
+**kitsu weaknesses:** (1) **R4.12 THIRD sighting this loop** (14, 16, 17):
+two early self-recovered `PolicyDenied` errors poisoned exit status again
+— and this time the supervisor suspects it may correlate with TRUNCATED
+completion, not just discard of a complete answer. Escalating — worth a
+dedicated fix. (2) No receipt signal distinguishes "policy-poisoned but
+COMPLETE" from "policy-poisoned and INCOMPLETE" — the supervisor had to
+read the raw transcript to tell Kimi ran out of budget.
+
+**BACKLOG COMPLETE: P1-P11 ✅ (P10 was GLM's). Kimi is 10-for-11 on code
+(cycles 7-17), the sole non-A the interrupted P11.** Kimi has cleared its
+entire original backlog. **Next: pivot to cross-model work** — implement
+the strongest findings from GLM's and DeepSeek's reviews (e.g. DeepSeek
+cycle-7 finding: an empty completion mislabeled `ProviderFailure` in
+`summarize_or_fallback`), or a fresh kitsu bug. Keep the next cycle SMALL
+after this over-budget one.
