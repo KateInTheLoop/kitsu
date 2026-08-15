@@ -354,8 +354,11 @@ ollama: reported PNG 120x80. Picked over the higher-value-but-riskier
 R4.10 (CLI+config+orchestrator plumbing) and R4.12 (main.rs, UI-loop-
 owned) as the clean low-cost slice, and it completes lane 2's document
 types (CSV/PDF/xlsx/image + dispatch). Vision passthrough deferred (a
-gateway-integration follow-up). Haiku review pending. Next: R4.10 or
-R4.12 (both need a bigger, deliberate cycle) or lane-1 R1.4/R1.5.
+gateway-integration follow-up). Haiku review: SHIP-AS-IS — all 10 cases
+traced (64 KiB memory bound, authorized path, double-Result no-panic
+handling, graceful non-image degradation, never decodes pixels), no
+findings. Next: R4.10 or R4.12 (both need a bigger, deliberate cycle) or
+lane-1 R1.4/R1.5.
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
