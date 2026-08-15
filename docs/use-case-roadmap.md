@@ -584,6 +584,37 @@ orchestrator, concurrently-edited) or already-covered lane 6. The loop
 needs a repointed/gen-2 mandate — flagged repeatedly; the next self-
 contained tick would have to invent non-roadmap tool hardening.
 
+### Cycle 16 — 2026-08-15 — fs_read_notebook (.ipynb, extends doc review / lane 6)
+
+Shipped `fs_read_notebook` (commit a647e6a): reads a Jupyter notebook as
+STRUCTURE (per-cell type/source + one-line output summaries) instead of
+the raw-JSON dump `read_document` previously produced. Output summaries
+never emit the full payload — stream→line count, execute_result→text/
+plain first line (120 chars) or mime keys, error→`ename: evalue` — so a
+notebook full of base64 plots or long tracebacks stays legible. New
+`DocType::Notebook` (`.ipynb`) wired through the dispatcher; nbformat 4;
+non-notebook/malformed disclosed honestly; source as string OR line
+array. Dep-free (serde_json), 32 MiB guard, cells/source-lines/outputs
+all bounded + cap_output backstop. Notebooks are a very common
+data-science/ML document that was previously opaque — this brings them
+into the document-review lane and directly serves the deprioritized
+lane 6 (scientific/data-doc review) as a sub-case of lane 2, no
+domain-specific tooling needed. Functional check: e2e builds a real
+.ipynb through read_notebook_run + the read_document dispatch + allowlist.
+Security-focused haiku review: SHIP-AS-IS — 8 areas traced (no
+full-payload leak, panic-freedom on adversarial JSON, real bounds,
+honest degradation, additive), no findings.
+
+**Runway note (unchanged, now firmer):** this and the recent
+audit_summary / scan_secrets / pptx / notebook cycles are all
+document-review/security-lane extensions at the self-contained margin —
+genuinely valuable but beyond the numbered roadmap requirements, which
+for the remaining lanes (1 R1.4/R1.5-wiring, 3 R3.4, all of lane 4) live
+in the concurrently-edited run layer. The capability loop keeps
+delivering self-contained tool value, but the numbered roadmap needs the
+run-layer surfaces — a gen-2 repoint (a coordinated lane-4 mandate, or a
+fresh backlog) is the standing recommendation.
+
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
 Lane 3 is done for this loop (R3.1/R3.2/R3.3; R3.4 is the UI loop's).
