@@ -1,8 +1,10 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 1 ran and banked (grade B).** A fresh HF token
-> was present at cycle-1 spawn time (the earlier birth-blocking rotation
-> is no longer in effect for this token). See the Cycle log below.
+> **LIVE 2026-08-14: cycle 1 banked (grade B); cycle 2 produced no
+> deliverable (both attempts failed before writing the review file).**
+> A fresh HF token was present at cycle-1 spawn time (the earlier
+> birth-blocking rotation is no longer in effect for this token). See
+> the Cycle log below.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -197,3 +199,115 @@ future review cycles should ask the model to re-verify its own line
 citations against the tool-provided line numbers explicitly (not just
 "re-read the draft") since the unprompted self-check this cycle was
 insufficient.
+
+### Cycle 2 — 2026-08-14 — citation-discipline fix attempt (no deliverable, grade F/incomplete)
+
+Goal: re-run the review lane on a fresh scope (the
+TRIM/SUMMARIZE/COMPACTION path in `crates/kitsu-core/src/orchestrator.rs`
+— `enforce_context_budget_recording`, `summarize_or_fallback`,
+`request_measurement`/`ensure_chat_request_fits`, `compact_context`,
+`trim_tool_results[_counted]`) with a mandatory re-read-before-cite
+discipline added to the prompt, specifically to test whether cycle 1's
+back-half citation drift is fixable with process. Same flags as cycle 1
+(`--gateway huggingface --model deepseek-ai/DeepSeek-V4-Pro:together
+--context-window 131072 --timeout-secs 300 --max-output-tokens 24000
+--reasoning-effort low --max-rounds 30 --agent-spawn-cap 0`), prompt told
+the model to use ranged reads only over the named function line ranges,
+write `reviews/deepseek-cycle-2.md` early, and re-read every line range
+immediately before citing it.
+
+**Neither attempt produced a deliverable file.** `reviews/deepseek-cycle-2.md`
+was never created; only `deepseek-cycle-1.md` exists in `reviews/`.
+**The citation-accuracy question this cycle set out to answer is
+therefore unanswered — there was nothing to spot-check.**
+
+- **Attempt 1:** the model tried to spawn 6 parallel read subagents
+  against `--agent-spawn-cap 0`, got the expected denial, retried
+  spawning again on a later tool call, and kitsu withheld the spawn
+  tools for the rest of the turn after repeated refusals ("spawn cap
+  refusals ignored — spawn tools withheld for the rest of this turn").
+  The very next provider call then came back `HTTP 400 client error;
+  request rejected; terminal=true` and the turn ended.
+  `kitsu-usage: {"prompt_tokens":43772,"completion_tokens":1626,"total_tokens":45398}`,
+  `kitsu-context: {"used":13360,"effective":107072,"window":131072}`. 11
+  ranged `Read` tool calls happened before the rejection, all inside or
+  near the requested function ranges.
+- **Retry (after a 60s cooldown, the one retry the loop's rules allow):**
+  no spawn attempts this time, but the model abandoned the "named
+  function ranges only" instruction entirely — 35 `Read` tool calls,
+  many duplicating the same ranges (e.g. `2153–2200` and `2190–2220`
+  read twice each), plus two full sequential passes over roughly
+  lines 1–2970 of the 2957-line file, and even one read of
+  `crates/kitsu-core/src/context.rs` (explicitly out of scope, already
+  reviewed in cycle 1). It never called a write tool. At the 300s
+  `--timeout-secs` deadline the in-flight provider call was cancelled
+  (`inference provider attempt 1/3: cancelled; HTTP 200; cancelled;
+  terminal=true`) and kitsu correctly discarded the uncommitted
+  provisional turn rather than saving a truncated answer. No
+  `kitsu-usage` line was ever emitted for this attempt (the turn never
+  reached a billed completion).
+
+Per the loop's cost-bound rule ("one retry only on transport failure"),
+no third attempt was made.
+
+**Grade: incomplete / F on this cycle's own terms** — not because the
+model produced a bad review, but because it never produced one. This is
+a different failure mode than cycle 1 (which shipped genuine but
+imperfectly-cited content); cycle 2 shipped nothing, so the citation
+question is open, not resolved either way.
+
+**Comparison to cycle 1:** cycle 1 succeeded on a single, moderately
+sized function-dense file read mostly forward-to-back. Cycle 2 handed
+DeepSeek a *spec* of several disjoint function ranges scattered across
+~1000 lines, and the model's response — in both attempts — was to try
+to parallelize the reads (blocked by the spawn cap) and then, when
+forced to go serial, over-collect far past the requested ranges instead
+of trusting the ranges it was given. The "write early" instruction from
+the prompt was not followed in either attempt.
+
+**kitsu weaknesses observed / follow-ups:**
+
+- **W3 (new, priority):** after kitsu withholds spawn tools mid-turn
+  (following repeated cap-0 refusals), the very next provider request in
+  the same turn was rejected with a terminal `HTTP 400`. This reads like
+  a request-shape bug introduced by the tool-list mutation mid-turn (the
+  provider may be rejecting a `tool_choice`/message referencing a tool
+  the withheld-tools request no longer declares, or a malformed followup
+  after the synthetic tool-error message). Needs a kitsu-side repro:
+  drive a scripted turn with `--agent-spawn-cap 0` and force ≥2 spawn
+  attempts in one turn against `:together`, then inspect the outgoing
+  request body on the call immediately after tool withholding kicks in.
+  This is a correctness bug, not just a UX rough edge — it silently
+  killed the entire cycle-2 first attempt.
+- **W4 (new):** no incremental/partial-credit path for a turn that runs
+  many tool rounds without ever calling a write tool. The prompt
+  explicitly said "write the deliverable file EARLY... do not wait until
+  the end," and the model ignored it under both attempts; kitsu has no
+  mechanism (e.g. a round-count nudge like "you have used 20 of 30
+  rounds and have not yet written output") to correct this mid-turn. A
+  cheap version: inject a system reminder after N rounds with zero write
+  tool calls, reminding the model of any explicit "write early"
+  instruction in its own prompt.
+- **W5 (new, minor):** `--timeout-secs 300` is tight for a many-small-
+  ranged-read review turn once the model over-reads; the failure mode
+  (full turn discarded, zero salvageable output, zero usage billed) is
+  clean and honest but wastes the entire budget. Not a bug — the
+  provisional-output discard on timeout is correct behavior — but the
+  retry-cooldown rule combined with a hard per-cycle "one kitsu run"
+  budget means an over-reading model can burn the whole cycle without a
+  single scored deliverable, as happened here.
+- W1 and W2 from cycle 1 (top-level-vs-`chat`-subcommand flag hinting;
+  silent-truncation-on-reasoning-budget warning) remain open and are not
+  restated in full here.
+
+**Ramp status update:** cycle 2 does not move DeepSeek's ramp forward —
+it is a regression in reliability (0 deliverables from 2 attempts) even
+though the citation-discipline *prompt* itself was never actually
+exercised. Next cycle should shrink scope further (fewer named function
+ranges, or one function at a time) rather than repeat the same
+multi-range ask, and should keep `--agent-spawn-cap 0` but consider
+whether a single, calmer up-front instruction ("do not attempt to spawn
+subagents; this run has none available") reduces the spawn-retry
+behavior that preceded the W3 HTTP 400. The citation-discipline
+hypothesis from this cycle's brief remains untested and should be
+retried once a deliverable actually ships.
