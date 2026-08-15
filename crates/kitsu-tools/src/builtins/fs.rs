@@ -1404,10 +1404,11 @@ pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerF
         name: "read_document".to_string(),
         description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
                       to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
-                      → text. Always discloses the detected type and which reader ran. Images and \
-                      Office (xlsx/docx) files are detected and disclosed but not yet text-extracted \
-                      (use a dedicated tool or convert first). Unknown types fall back to a UTF-8 \
-                      text read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+                      → text, XLSX → spreadsheet cells, DOCX → paragraph text. Always discloses \
+                      the detected type and which reader ran. Images report metadata only; other \
+                      Office types (e.g. pptx) are detected and disclosed but not text-extracted. \
+                      Unknown types fall back to a UTF-8 text read. For paging a large CSV/PDF, \
+                      call fs_read_csv/fs_read_pdf directly."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1462,6 +1463,10 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
             "XLSX → fs_read_xlsx",
             read_xlsx_run(policy, &path_args).await?,
         ),
+        DocType::Office("DOCX") => (
+            "DOCX → fs_read_docx",
+            read_docx_run(policy, &path_args).await?,
+        ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
             format!(
@@ -1475,6 +1480,203 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
     // The delegate readers already cap their own output; the disclosure line
     // is a small fixed prefix, so no additional cap is needed here.
     Ok(format!("{disclosure}{body}"))
+}
+
+// --- fs.read_docx (Word paragraph-text extraction) --------------------------
+
+const DOCX_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Decompressed `word/document.xml` cap — bounds a zip-bomb regardless of the
+/// (compressed) file-size guard above.
+const DOCX_MAX_XML_BYTES: u64 = 64 * 1024 * 1024;
+const DOCX_DEFAULT_MAX_PARAGRAPHS: usize = 500;
+const DOCX_MAX_PARAGRAPHS_CEILING: usize = 5000;
+/// Hard ceiling on paragraphs collected while parsing (bounds memory even
+/// before the display cap applies).
+const DOCX_MAX_COLLECT: usize = 50_000;
+
+#[derive(Deserialize)]
+struct ReadDocxArgs {
+    path: String,
+    /// Paragraphs shown (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_paragraphs: Option<usize>,
+}
+
+/// Parse `word/document.xml` text: concatenate `<w:t>` runs into paragraphs
+/// (`<w:p>`), turning `<w:tab/>` into a tab and `<w:br/>`/`<w:cr/>` into a
+/// newline. Returns the collected paragraphs and whether the collect ceiling
+/// was hit. Malformed XML stops parsing and returns what was gathered.
+fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_text = false;
+    let mut collect_capped = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == b"w:t" => in_text = true,
+            Ok(Event::End(e)) => match e.name().as_ref() {
+                b"w:t" => in_text = false,
+                b"w:p" => {
+                    paragraphs.push(std::mem::take(&mut current));
+                    if paragraphs.len() >= DOCX_MAX_COLLECT {
+                        collect_capped = true;
+                        break;
+                    }
+                }
+                _ => {}
+            },
+            Ok(Event::Empty(e)) => match e.name().as_ref() {
+                b"w:tab" => current.push('\t'),
+                b"w:br" | b"w:cr" => current.push('\n'),
+                _ => {}
+            },
+            Ok(Event::Text(e)) if in_text => {
+                if let Ok(decoded) = e.decode() {
+                    match quick_xml::escape::unescape(&decoded) {
+                        Ok(text) => current.push_str(&text),
+                        Err(_) => current.push_str(&decoded),
+                    }
+                }
+            }
+            // 0.41 surfaces `&ref;` / `&#n;` as their own event, not inside Text.
+            Ok(Event::GeneralRef(e)) if in_text => {
+                if let Ok(Some(c)) = e.resolve_char_ref() {
+                    current.push(c);
+                } else if let Ok(name) = e.decode() {
+                    match name.as_ref() {
+                        "amp" => current.push('&'),
+                        "lt" => current.push('<'),
+                        "gt" => current.push('>'),
+                        "quot" => current.push('"'),
+                        "apos" => current.push('\''),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            // Malformed XML: stop and keep what we have (honest partial).
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    // A trailing run not closed by </w:p>.
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    (paragraphs, collect_capped)
+}
+
+fn render_docx(display: &str, xml: &str, max_paragraphs: usize, xml_truncated: bool) -> String {
+    let (paragraphs, collect_capped) = parse_docx_paragraphs(xml);
+    // Empty <w:p> are spacing; report and display only paragraphs with text.
+    let with_text: Vec<&String> = paragraphs.iter().filter(|p| !p.trim().is_empty()).collect();
+    let total = with_text.len();
+
+    let mut notes = String::new();
+    if xml_truncated {
+        notes.push_str(&format!(
+            ", document.xml truncated at {} MiB",
+            DOCX_MAX_XML_BYTES / (1024 * 1024)
+        ));
+    }
+    if collect_capped {
+        notes.push_str(&format!(", stopped at {DOCX_MAX_COLLECT} paragraphs"));
+    }
+
+    let mut out = format!(
+        "docx> {display}: {total} paragraph(s) with text \
+         [text only — no formatting, tables, or images]{notes}\n"
+    );
+    if total == 0 {
+        out.push_str(
+            "(no extractable text — the document may be empty, image-only, or use an \
+             unsupported structure)\n",
+        );
+        return out;
+    }
+    let shown = total.min(max_paragraphs);
+    for para in &with_text[..shown] {
+        out.push_str(para);
+        out.push('\n');
+    }
+    if total > shown {
+        out.push_str(&format!(
+            "[showing {shown} of {total} paragraphs; raise max_paragraphs for more]\n"
+        ));
+    }
+    out
+}
+
+fn extract_docx(path: &Path, display: &str, max_paragraphs: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| std::io::Error::other(format!("not a valid .docx (zip) file: {e}")))?;
+    let entry = archive.by_name("word/document.xml").map_err(|_| {
+        std::io::Error::other("not a Word .docx document (no word/document.xml inside)")
+    })?;
+    let mut buf = Vec::new();
+    Read::take(entry, DOCX_MAX_XML_BYTES).read_to_end(&mut buf)?;
+    let xml_truncated = buf.len() as u64 >= DOCX_MAX_XML_BYTES;
+    let xml = String::from_utf8_lossy(&buf);
+    Ok(render_docx(display, &xml, max_paragraphs, xml_truncated))
+}
+
+pub fn read_docx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_docx".to_string(),
+        description: "Extract the paragraph text of a Word .docx document (text only — no \
+                      formatting, tables, or images), bounded and paginated by paragraph. \
+                      Pure-Rust zip + XML; same allowlist as fs_read_file; a non-.docx or \
+                      corrupt file is disclosed honestly, never emitted as binary garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .docx file"},
+                "max_paragraphs": {"type": "integer", "description": "Paragraphs shown (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_docx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadDocxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > DOCX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            DOCX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let display = a.path.clone();
+    let max = a
+        .max_paragraphs
+        .unwrap_or(DOCX_DEFAULT_MAX_PARAGRAPHS)
+        .clamp(1, DOCX_MAX_PARAGRAPHS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || extract_docx(&path, &display, max))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("docx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
 }
 
 // --- fs.read_manifest (dependency / build manifest summary) -----------------
@@ -5454,6 +5656,114 @@ mod tests {
         ));
     }
 
+    /// Build a minimal real `.docx` (a zip carrying `word/document.xml`).
+    fn write_min_docx(path: &std::path::Path, document_xml: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "word/document.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn docx_paragraph_extraction_and_entities() {
+        let xml = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:r><w:t>Hello world</w:t></w:r></w:p>\
+            <w:p><w:r><w:t xml:space=\"preserve\">Second </w:t><w:t>paragraph &amp; more</w:t></w:r></w:p>\
+            <w:p></w:p>\
+            <w:p><w:r><w:t>Tab</w:t><w:tab/><w:t>after</w:t></w:r></w:p>\
+            </w:body></w:document>";
+        let out = render_docx("memo.docx", xml, 500, false);
+        // Empty <w:p> skipped → 3 with text.
+        assert!(out.contains("3 paragraph(s) with text"), "{out}");
+        assert!(out.contains("Hello world"), "{out}");
+        // Adjacent runs joined; &amp; decoded.
+        assert!(out.contains("Second paragraph & more"), "{out}");
+        // <w:tab/> becomes a tab.
+        assert!(out.contains("Tab\tafter"), "{out}");
+    }
+
+    #[test]
+    fn docx_empty_and_malformed_are_honest() {
+        let out = render_docx(
+            "x.docx",
+            "<w:document><w:body></w:body></w:document>",
+            500,
+            false,
+        );
+        assert!(out.contains("no extractable text"), "{out}");
+        // Unclosed tags must not panic; whatever text was gathered is surfaced.
+        let out = render_docx("x.docx", "<w:p><w:t>partial", 500, false);
+        assert!(
+            out.contains("partial") || out.contains("no extractable text"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_docx_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("report.docx");
+        write_min_docx(
+            &path,
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+             <w:p><w:r><w:t>First para</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Second para</w:t></w:r></w:p></w:body></w:document>",
+        );
+        let out = read_docx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("docx ok");
+        assert!(out.contains("2 paragraph(s) with text"), "{out}");
+        assert!(
+            out.contains("First para") && out.contains("Second para"),
+            "{out}"
+        );
+
+        // A zip WITHOUT word/document.xml → honest error, not a panic or garbage.
+        let notdocx = dir.path().join("weird.docx");
+        {
+            let f = std::fs::File::create(&notdocx).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("other.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"not a word doc").unwrap();
+            z.finish().unwrap();
+        }
+        assert!(matches!(
+            read_docx_run(
+                &policy,
+                &serde_json::json!({"path": notdocx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.docx");
+        write_min_docx(
+            &bad,
+            "<w:document><w:body><w:p><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>",
+        );
+        assert!(matches!(
+            read_docx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
     #[test]
     fn manifest_cargo_summary() {
         let content = r#"
@@ -6193,17 +6503,21 @@ UseDNS no
         assert!(out.contains("XLSX → fs_read_xlsx"), "{out}");
         assert!(out.contains("Ada"), "extracted cell: {out}");
 
-        // docx (zip magic + extension, no extractor) → detected, declined.
+        // docx (a real minimal zip) → routed to fs_read_docx and text-extracted.
         let docx = dir.path().join("memo.docx");
-        std::fs::write(&docx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        write_min_docx(
+            &docx,
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+             <w:p><w:r><w:t>Routed body text</w:t></w:r></w:p></w:body></w:document>",
+        );
         let out = read_document_run(
             &policy,
             &serde_json::json!({"path": docx.to_string_lossy()}).to_string(),
         )
         .await
         .expect("docx route");
-        assert!(out.contains("detected DOCX"), "{out}");
-        assert!(out.contains("no structured extractor"), "{out}");
+        assert!(out.contains("DOCX → fs_read_docx"), "{out}");
+        assert!(out.contains("Routed body text"), "{out}");
 
         // Outside the allowlist → PolicyDenied before any routing.
         let other = tempfile::tempdir().unwrap();

@@ -1107,6 +1107,7 @@ dependencies = [
  "kitsu-providers",
  "libc",
  "lopdf",
+ "quick-xml 0.41.0",
  "serde",
  "serde_json",
  "tempfile",
@@ -1114,6 +1115,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "zip",
 ]
 
 [[package]]

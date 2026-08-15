@@ -35,6 +35,9 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_xlsx_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
+    let (d, h) = fs::read_docx_tool(policy.clone());
+    registry.register_with_descriptor(d, h);
+
     let (d, h) = fs::read_image_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
@@ -124,6 +127,7 @@ mod tests {
         assert!(registry.is_registered("fs_read_pdf"));
         assert!(registry.is_registered("read_document"));
         assert!(registry.is_registered("fs_read_xlsx"));
+        assert!(registry.is_registered("fs_read_docx"));
         assert!(registry.is_registered("fs_read_image"));
         assert!(registry.is_registered("fs_scan_file"));
         assert!(registry.is_registered("find_symbol"));
