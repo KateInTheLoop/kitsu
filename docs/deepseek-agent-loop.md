@@ -736,3 +736,95 @@ lone off-by-one, now with the fix holding for two full cycles in a row).
 Still review-only until R4.10 (implementation type-chasing, per cycle 5,
 is unaddressed). No range-overshoot this cycle — the cron's pre-measured
 1443-1504 range was exact on the first check.
+
+### Cycle 13 — 2026-08-15 — display/sanitization formatter; 10th consecutive clean process cycle, minor prose citation slip (grade A-)
+
+Target: `format_tool_result` (`crates/kitsu-core/src/orchestrator.rs`), a
+65-line display formatter (`fn format_tool_result(name: &str, content:
+&str, is_err: bool) -> String`) that renders a tool-call *result* summary
+for display — error-vs-success branching, per-tool-name summary
+formatting (`command_exec`, `fs_write_file`/`fs_edit_file`, `repo_grep`,
+`spawn_agent_bg`/`agent_result`, and a default line-count arm), and a
+180-char/first-line-only truncation of error `detail`. Distinct from
+cycle 11's `format_command_result` (which formats a *command's* exit/
+elapsed/output, not a generic tool result) — this is a fresh function no
+prior cycle had touched. Pre-dispatch check confirmed the assigned range
+(1730-1794) was exact: `fn format_tool_result` starts at line 1730, its
+own closing brace is at line 1794, the doc comment precedes it at
+1728-1729, and the next function (`format_command_result`, cycle 11's
+target) starts at line 1796 — no correction needed.
+
+- **Process: 10th clean review cycle running.** Rebuilt the kitsu driver
+  fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build, no errors).
+  Exactly **1 ranged read** (1730-1794, 65 lines, matching the assigned
+  range exactly) → **1 write**, no re-read, no spawn attempt (cap 1
+  unexercised), first attempt succeeded — no retry needed. kitsu-usage
+  `{"prompt_tokens":19947,"completion_tokens":3048,"total_tokens":22995}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s)), session not saved" — clean exit, no discard.
+- **Citations 3/4 fully clean; proposal 4 has one minor prose-only
+  off-by-one, distinct in kind from cycle 10's drift.** Spot-checked
+  every quoted block against the source (`awk 'NR>=1730 && NR<=1794'`):
+  proposal 1's block (lines 1738-1741, the `.lines().next().unwrap_or("")`
+  chain and the 180-char `.take(180).collect()` truncation) is
+  letter-perfect on text and labels; proposal 2's block (1776-1782, the
+  full `"repo_grep"` match arm) is letter-perfect; proposal 3's block
+  (1789-1792, the default `_ =>` arm) is letter-perfect. Proposal 4's own
+  quoted block (1756, 1757, 1758, 1775 — a deliberately non-contiguous
+  span with an inline `…` marking the elided 1759-1774 body) is also
+  correctly labeled, including line 1757 shown correctly as `.ok()` — but
+  two lines later, the proposal's **prose** says "the `.ok()` on line
+  1756 yields `None`," misattributing `.ok()` to line 1756 (actually the
+  `serde_json::from_str::<serde_json::Value>(content)` match-arm head)
+  when its own quoted block two lines above had already labeled `.ok()`
+  correctly as line 1757. This is a self-contradicting one-line slip
+  confined to prose, not a compressed/dropped quoted line, and it doesn't
+  shift any other citation or affect the substantive finding's validity
+  — a materially smaller failure than cycle 10's drift, but it does end
+  the 2-cycle (11, 12) zero-drift streak the supervisor brief called out.
+- **Hedging correctly calibrated on all 4 proposals; no unhedged
+  out-of-scope claims, no substantively wrong claims.** Proposal 1
+  (`detail` truncated to first-line + 180 chars with no ellipsis/marker)
+  and proposal 3 (`_` default arm renders empty content as `"0 lines"`
+  rather than a clearer `"empty"`) stay entirely within the read range
+  and needed no hedge — correct, neither hedges. Proposal 2 (`repo_grep`
+  would produce a misleading `"0 matches"` if the grep tool ever returns
+  `""` instead of the sentinel `"(no matches)"`) explicitly hedges "I
+  cannot verify what the actual grep tool returns for a no-hit case
+  without reading its implementation" — correctly conditional, and
+  plausible given only the in-range code. Proposal 4 (`fs_write_file`/
+  `fs_edit_file`'s `.unwrap_or_else(|| "written")` fallback reports
+  success even when the result JSON fails to parse) explicitly hedges "I
+  cannot verify what guarantees the write/edit tool makes about its
+  result format" — again correctly conditional on unread callee
+  behavior. All four proposals are genuine, non-overlapping, and
+  actionable; each includes a concrete suggested-fix snippet.
+
+**Grade: A-.** Process matches the best cycles to date — 1 read, 1
+write, first attempt, no spawn, clean exit — and hedging discipline is
+perfect (every claim resting on unread caller/callee code is explicitly
+flagged as conditional, every in-range claim is asserted plainly). Docked
+half a grade below cycles 7/8/9/11/12's clean-A bar solely for the
+proposal-4 prose citation slip (`.ok()` mislabeled as line 1756 vs. its
+own correctly-labeled 1757 two lines above) — a small, self-contained,
+substance-neutral error, but real, and it ends the immediate zero-drift
+streak.
+
+**Kitsu weaknesses observed:** none new. The R1.7 line-number-prefix fix
+continues to hold for quoted code blocks (3 of 4 fully clean, the 4th
+clean within its own quote); this cycle's drift lives entirely in
+free-text prose restating a citation already given correctly in a code
+block moments earlier — a model-attention lapse, not a tooling gap.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now **10-for-10 clean** (cycles 3, 4, 6, 7, 8, 9, 10, 11,
+12, 13), and citation fidelity is **5-for-7 fully clean** (cycles 7, 8,
+9, 11, 12 clean; cycles 10 and 13 each showing one minor drift — cycle
+10's inside a quoted block, cycle 13's confined to restating prose). Still
+review-only until R4.10 (implementation type-chasing, per cycle 5, is
+unaddressed). No range-overshoot this cycle — the pre-measured 1730-1794
+range was exact on the first check, and this is the first cycle to
+target a function whose neighbor (`format_command_result`, cycle 11) was
+itself a prior review target, confirming adjacent-function scoping
+doesn't blur DeepSeek's read boundary.
