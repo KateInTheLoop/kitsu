@@ -958,21 +958,24 @@ async fn test_done_terminates_without_waiting_for_wire_eof() {
 fn test_sse_decoder_rejects_malformed_error_and_empty_success_payloads() {
     use super::SseDecoder;
 
-    for (record, expected) in [
-        ("data: not-json\n", "malformed JSON"),
-        (
-            "data: {\"error\":{\"message\":\"secret provider detail\"}}\n",
-            "error object",
-        ),
-    ] {
-        let mut decoder = SseDecoder::default();
-        let error = decoder
-            .push_bytes(record.as_bytes())
-            .expect_err("invalid data records must fail the response");
-        assert!(matches!(error, ProviderError::InvalidResponse(_)));
-        assert!(error.to_string().contains(expected));
-        assert!(!error.to_string().contains("secret provider detail"));
-    }
+    let mut decoder = SseDecoder::default();
+    let error = decoder
+        .push_bytes(b"data: not-json\n")
+        .expect_err("invalid data records must fail the response");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert!(error.to_string().contains("malformed JSON"));
+
+    // A genuine (non-null) `error` object in an otherwise-200 SSE response must
+    // still fail the response. Unlike the old fixed-string behavior, the fix for
+    // the cycle-5 false-positive/discarded-detail bug now surfaces the gateway's
+    // own message text here (see test_process_line_real_error_surfaces_gateway_message_text
+    // for the direct process_line-level coverage of that contract).
+    let mut decoder = SseDecoder::default();
+    let error = decoder
+        .push_bytes(b"data: {\"error\":{\"message\":\"provider detail\"}}\n")
+        .expect_err("invalid data records must fail the response");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert!(error.to_string().contains("provider detail"));
 
     let mut decoder = SseDecoder::default();
     decoder.push_bytes(b"data: [DONE]\n").unwrap();
@@ -1138,6 +1141,88 @@ fn test_sse_decoder_bounds_fragmented_tool_arguments() {
             limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
         })
     ));
+}
+
+#[test]
+fn test_process_line_null_error_alongside_valid_data_parses_successfully() {
+    // Regression for a false positive: the OLD code did
+    // `value.get("error").is_some()` and returned Err, which wrongly rejected a
+    // chunk carrying `"error": null` next to otherwise-valid data because
+    // `get("error")` returns `Some(&Value::Null)`, not `None`. The fix ignores a
+    // null error and parses the chunk normally. This test would FAIL against the
+    // unfixed code (it would receive an InvalidResponse instead of a Text delta).
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "error": null,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "hello" },
+            "finish_reason": null,
+        }]
+    });
+    let line = format!("data: {chunk}");
+    dec.process_line(&line, &mut deltas).expect(
+        "a chunk carrying `\"error\": null` alongside valid data must parse, not be rejected",
+    );
+    assert!(
+        matches!(deltas.as_slice(), [ChatDelta::Text(t)] if t == "hello"),
+        "expected the content delta to be emitted; got {deltas:?}"
+    );
+}
+
+#[test]
+fn test_process_line_real_error_surfaces_gateway_message_text() {
+    // Regression for discarded detail: the OLD code threw away the gateway's
+    // message and returned only the fixed generic string. The fix surfaces the
+    // gateway's own `error.message` text inside the InvalidResponse. This test
+    // asserts the formatted error CONTAINS the gateway's actual text
+    // ("rate limited"), which would FAIL against the unfixed code.
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "error": { "message": "rate limited", "type": "requests", "code": "429" }
+    });
+    let line = format!("data: {chunk}");
+    let err = dec
+        .process_line(&line, &mut deltas)
+        .expect_err("a real (non-null) error object must still cause process_line to return Err");
+    let message = match err {
+        ProviderError::InvalidResponse(m) => m,
+        other => panic!("expected InvalidResponse, got {other:?}"),
+    };
+    assert!(
+        message.contains("rate limited"),
+        "error message must surface the gateway's own text; got: {message}"
+    );
+}
+
+#[test]
+fn test_process_line_no_error_field_still_parses_successfully() {
+    // Happy-path regression guard: a normal chunk with NO error field at all
+    // must continue to parse successfully. This already passed before the fix
+    // and is kept to prove the happy path was not broken.
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "ok" }
+        }]
+    });
+    let line = format!("data: {chunk}");
+    dec.process_line(&line, &mut deltas)
+        .expect("a normal chunk with no error field must parse successfully");
+    assert!(
+        matches!(deltas.as_slice(), [ChatDelta::Text(t)] if t == "ok"),
+        "expected the content delta to be emitted; got {deltas:?}"
+    );
 }
 
 #[tokio::test]
