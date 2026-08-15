@@ -356,7 +356,16 @@ const MAX_STREAMED_TOOL_CALLS: usize = 64;
 const MAX_COMPLETION_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_CATALOG_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
+// Per-line ceiling for an SSE record. It must be large enough that a single
+// `data:` line carrying a full-size tool-call argument delta can reach the
+// argument budget below (`MAX_STREAMED_TOOL_ARGUMENT_BYTES`) rather than being
+// rejected here first: such a line is `data: {"choices":[{"delta":{"tool_calls"
+// ...[{"function":{"arguments":"<args>"}}]...}}]}`, so the line is the raw
+// argument bytes plus the JSON envelope, the `data:` prefix, and JSON-string
+// escaping (each escapable char doubles). 4 MiB comfortably exceeds the 1 MiB
+// argument budget + envelope + worst-case escaping margin while staying well
+// under the 16 MiB aggregate stream ceiling.
+const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 

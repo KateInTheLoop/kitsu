@@ -907,3 +907,108 @@ review (build portfolio further, e.g. the retry/backoff or
 model-discovery paths not yet covered) or a fresh P-item implementation
 (P8 trim-buffer scaling, P11 tool-schema re-serialization) — either
 continues the established alternation.
+
+### Cycle 7 — 2026-08-15 — implements its own cycle-5 finding 4 (grade A) — argument cap now reachable
+
+Implemented cycle-5's finding 4: `MAX_SSE_LINE_BYTES` (256 KiB) was
+*smaller* than `MAX_STREAMED_TOOL_ARGUMENT_BYTES` (1 MiB), so a gateway
+emitting a full tool-call argument delta on a single SSE `data:` line
+was always rejected by the line ceiling (`ResponseTooLarge{part:
+SseLine}`) before the 1 MiB argument budget was ever consulted — the
+argument cap was unreachable for single-line deltas, and the failure
+carried the wrong part label. Driver rebuilt fresh from the main
+checkout immediately before the run. Success on `:together` attempt 1 —
+no transport failure, no retry, no provider fallback needed.
+
+**The fix matches GLM's own cycle-5 proposal exactly:** `MAX_SSE_LINE_BYTES`
+raised from `256 * 1024` to `4 * 1024 * 1024` (only that one constant
+changed — `MAX_SSE_STREAM_BYTES` and `MAX_STREAMED_TOOL_ARGUMENT_BYTES`
+both untouched). GLM's own reasoning trace (visible in the transcript)
+derived the margin correctly: worst-case JSON-string escaping can double
+a raw argument's bytes (~2 MiB for a 1 MiB argument), plus ~150 bytes of
+envelope/prefix overhead, so 4 MiB clears the true worst case with
+headroom while staying well under the 16 MiB stream ceiling — sound,
+shown-work engineering judgment, not a round-number guess.
+
+**THE HEADLINE — all three mandated tests, independently verified
+fail-without-impl.** GLM wrote exactly the three required tests: (a)
+`test_sse_decoder_accepts_large_single_line_tool_argument_within_budget`
+— a 320 KiB single-line argument (over the old 256 KiB line cap, under
+the 1 MiB budget) now parses and the tool call surfaces at `finalize`;
+(b) `test_sse_decoder_still_rejects_line_above_raised_ceiling` — a line
+over the new 4 MiB cap is still rejected as `SseLine`, and — the
+clever part — the assertion pins the literal `4 * 1024 * 1024` rather
+than the `MAX_SSE_LINE_BYTES` symbol specifically so the test cannot
+trivially pass against both old and new code; (c)
+`test_sse_decoder_oversized_single_line_argument_hits_argument_cap` — an
+argument 1 KiB over the 1 MiB budget, wrapped in a line that fits the
+raised cap, is now rejected with `ToolArguments` (not `SseLine`) — the
+argument cap is REACHABLE. The supervisor `git stash`ed ONLY the impl
+constant change (kept GLM's tests), re-ran each of the three tests
+individually, and confirmed **all three fail against the unfixed 256
+KiB constant**: (a) fails its own setup assertion (`the full line must
+fit the new raised line cap`); (b) fails on `left: 262144, right:
+4194304`; (c) fails its own setup assertion (`oversized-argument line
+must fit the line cap so the argument cap fires`) — none of the three
+could pass by accident against old code. Implementation was then
+restored (`git apply` of the saved impl-only patch) and the full
+`kitsu-providers` suite re-verified green (73/73, including the 3 new
+tests). This is the fourth cycle running (3, 4, 6, 7 — B→A→A→A) holding
+the test-rigor bar the recipe demands.
+
+**Read/edit discipline: 14 `Read` calls (well over the ~5 guidance) + 4
+`Edit` calls across 2 files.** The overrun was for a disclosed, honest
+reason visible in the transcript: GLM initially wrote its three new
+tests calling `push_bytes` with an incorrect two-argument signature
+(mirroring `process_line`'s `&mut out` pattern instead of `push_bytes`'s
+actual `fn push_bytes(&mut self, bytes: &[u8]) -> Result<Vec<ChatDelta>,
+ProviderError>`), caught the mismatch itself by re-reading the real
+signature, and re-read the inserted block twice more to apply and
+verify the fix — genuine self-correction, not aimless re-reading, but
+real overrun nonetheless (worth flagging: this is the second-highest
+read count of the cycles logged so far, only under cycle 5's 7). No
+spawn attempted, cap 1 unexercised. `kitsu-usage:
+{"prompt_tokens":280944,"completion_tokens":21865,"total_tokens":302809}`
+— by far the largest completion-token spend of any GLM cycle so far
+(prior largest was cycle 5's 13,927), consistent with the extra
+reasoning-and-fix-up reads. `kitsu-context: {"used":26229,
+"effective":107072,"window":131072}`. Run summary: "1 turn(s) ok, 14
+file(s) read, 2 file(s) written (2 change(s))" — clean exit 0, no
+transport issue, no recovered tool error, no PolicyDenied (unlike cycle
+5's W5).
+
+**Workspace-wide verification:** `cargo build --workspace` clean;
+`cargo clippy --workspace --all-targets` clean, zero warnings; `cargo
+test -p kitsu-providers` 73/73 (all 3 new tests included); `cargo fmt
+--all -- --check` found one whitespace-only diff in GLM's new test
+block (a multi-line `.expect()`/`.finalize()` chain kept on fewer lines
+than rustfmt wants) — `cargo fmt --all` applied it, zero semantic
+change, re-verified clean after. `cargo test --workspace` — only the
+one known PTY flake
+(`test_query_only_interactive_session_does_not_create_a_snapshot`,
+`crates/kitsu/tests/cli.rs`) red; re-run in isolation, fails identically,
+confirmed unrelated to this diff (interactive-session PTY test, nowhere
+near `openai_compat.rs`).
+
+**Grade: A.** All three grading criteria hold: (1) the raised line cap
+makes the 1 MiB argument cap reachable for single-line deltas — test
+(c) proves it fires with the correct `ToolArguments` label; (2) the line
+cap remains a real, bounded ceiling — test (b) proves it still rejects,
+now at 4 MiB; (3) the margin is reasoned and reasonable (>= 1 MiB +
+worst-case escaping + envelope, well under the 16 MiB stream cap — the
+supervisor's own arithmetic matches GLM's). Tests are genuine and
+independently verified fail-without-impl for all three required cases,
+individually confirmed one at a time (not just as a batch).
+
+**GLM is now 3-for-3 A on reviews and 4-for-4 on code (B→A→A→A) — this
+is the third cycle in a row (4, 6, 7) with an independently-verified
+fail-without-impl test suite, and the second cycle in a row implementing
+its own graded-A review finding end-to-end cleanly on the first
+attempt.** No new kitsu weaknesses filed (W1-W5 from prior cycles still
+open, none re-triggered this cycle). Remaining open cycle-5 findings not
+yet implemented: finding 5 (extra `choices` silently dropped via
+`.next()`) and finding 6 (multi-line `data:` fields not accumulated,
+known OpenAI-specific-assumption limitation) — either is a candidate
+fresh P-item alongside P8/P11 for the next code cycle; alternatively, a
+fresh review of the retry/backoff or model-discovery paths continues the
+review-portfolio side of the alternation.

@@ -1088,6 +1088,147 @@ fn test_sse_decoder_bounds_fragmented_tool_arguments() {
     ));
 }
 
+/// Regression for the cycle-5 finding: a single SSE `data:` line carrying a
+/// tool-argument delta LARGER than the old 256 KiB line cap but within the 1 MiB
+/// argument budget must parse successfully. Under the old `MAX_SSE_LINE_BYTES`
+/// (256 KiB) this exact line was rejected by the line ceiling with
+/// `ResponseTooLarge { part: SseLine }` at `push_bytes` — before the argument
+/// budget was ever consulted — so this test fails against the unfixed code.
+#[test]
+fn test_sse_decoder_accepts_large_single_line_tool_argument_within_budget() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES, MAX_STREAMED_TOOL_ARGUMENT_BYTES};
+
+    // Pick an argument just above the OLD 256 KiB line cap and well within the
+    // 1 MiB argument budget. 320 KiB < 1 MiB, and the line wrapping it is larger
+    // still (envelope + escaping), so it always exceeded the old 256 KiB line.
+    let arg_len = 320 * 1024;
+    assert!(
+        arg_len > 256 * 1024 && arg_len < MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        "fixture must straddle the old line cap and the argument budget"
+    );
+    let arguments = "x".repeat(arg_len);
+
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "fs.write_file",
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let line = format!("data: {chunk}\n\n");
+    assert!(
+        line.len() > 256 * 1024,
+        "the full line must exceed the old 256 KiB line cap"
+    );
+    assert!(
+        line.len() <= MAX_SSE_LINE_BYTES,
+        "the full line must fit the new raised line cap"
+    );
+
+    let mut dec = SseDecoder::default();
+    dec.push_bytes(line.as_bytes())
+        .expect("a single-line argument delta within the 1 MiB budget must parse");
+    // Tool calls accumulate and flush at finalize; supply a terminal finish + DONE.
+    let tail = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    dec.push_bytes(tail).expect("terminal chunk must parse");
+    let out = dec
+        .finalize()
+        .expect("finalize must succeed for a valid stream");
+    assert!(
+        out.iter()
+            .any(|d| matches!(d, ChatDelta::ToolCall(tc) if tc.tool_name == "fs.write_file")),
+        "the large single-line tool call must be surfaced"
+    );
+}
+
+/// Guard that the line ceiling still exists after being raised: a line that
+/// genuinely exceeds the NEW `MAX_SSE_LINE_BYTES` is rejected with the `SseLine`
+/// part. The asserted limit is hardcoded to the raised 4 MiB value (NOT the
+/// `MAX_SSE_LINE_BYTES` symbol) on purpose: under the old code this same payload
+/// was rejected as `SseLine` too, but with `limit_bytes = 256 KiB`, so a symbolic
+/// `== MAX_SSE_LINE_BYTES` check would pass against both versions. Pinning the
+/// literal makes this fail against the unfixed 256 KiB constant.
+#[test]
+fn test_sse_decoder_still_rejects_line_above_raised_ceiling() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES};
+
+    // Sanity: the constant under test is the raised value this guard pins.
+    assert_eq!(MAX_SSE_LINE_BYTES, 4 * 1024 * 1024);
+
+    let mut dec = SseDecoder::default();
+    let error = dec
+        .push_bytes(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
+        .expect_err("a line above the raised ceiling must still be rejected");
+    assert!(
+        matches!(error, ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseLine,
+            limit_bytes,
+        } if limit_bytes == 4 * 1024 * 1024),
+        "must be rejected as SseLine reporting the raised 4 MiB limit (not the old 256 KiB)"
+    );
+}
+
+/// Regression for the cycle-5 finding: a single SSE line whose tool-call
+/// argument exceeds the 1 MiB argument budget must be rejected with the
+/// `ToolArguments` part label, not `SseLine`. Under the old 256 KiB line cap the
+/// ~1.2 MiB line was rejected by the line ceiling first (`SseLine`), so the
+/// argument budget was unreachable for single-line deltas; this test fails
+/// against the unfixed code (it gets `SseLine` instead of `ToolArguments`).
+#[test]
+fn test_sse_decoder_oversized_single_line_argument_hits_argument_cap() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES, MAX_STREAMED_TOOL_ARGUMENT_BYTES};
+
+    let arg_len = MAX_STREAMED_TOOL_ARGUMENT_BYTES + 1024;
+    let arguments = "x".repeat(arg_len);
+
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "fs.write_file",
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let line = format!("data: {chunk}\n\n");
+    // The line must clear the (raised) line cap so the line ceiling does NOT fire
+    // first, letting the argument budget be the one that rejects it.
+    assert!(
+        line.len() <= MAX_SSE_LINE_BYTES,
+        "oversized-argument line must fit the line cap so the argument cap fires"
+    );
+
+    let mut dec = SseDecoder::default();
+    let error = dec
+        .push_bytes(line.as_bytes())
+        .expect_err("an argument over the 1 MiB budget must be rejected");
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ToolArguments,
+            limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        }
+    ));
+}
+
 #[test]
 fn test_process_line_null_error_alongside_valid_data_parses_successfully() {
     // Regression for a false positive: the OLD code did
