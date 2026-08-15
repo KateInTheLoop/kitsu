@@ -49,6 +49,11 @@ guarantees requires a new schema identifier.
   explicit model filesystem operations. Historical v1 records may omit it.
 - A turn begins with `turn_started` and ends with exactly one `turn_finished`.
 - `provider_request` represents one logical model request in an agent round.
+  Inference and compaction requests include `model`, the exact model selected
+  for that logical request. This stays authoritative across an in-session
+  `/model` switch. Model-catalog requests omit it because a catalog lookup is
+  not routed to a model. The field is additive in v1: omission in an older
+  inference or compaction record means unknown.
   New producers include `structured_output`; it is true only when that request
   carried a provider-native strict JSON Schema response format. The schema body
   is never duplicated in this event. CLI producers also include
