@@ -29,6 +29,9 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_csv_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
+    let (d, h) = fs::read_pdf_tool(policy.clone());
+    registry.register_with_descriptor(d, h);
+
     if rg_available() {
         let (d, h) = fs::grep_tool(policy);
         registry.register_with_descriptor(d, h);
@@ -97,10 +100,15 @@ mod tests {
         let mut registry = Registry::new();
         register_fs_tools(&mut registry, policy);
         assert!(registry.is_registered("fs_read_csv"));
+        assert!(registry.is_registered("fs_read_pdf"));
         assert!(registry
             .descriptors()
             .iter()
             .any(|d| d.name == "fs_read_csv"));
+        assert!(registry
+            .descriptors()
+            .iter()
+            .any(|d| d.name == "fs_read_pdf"));
     }
 
     #[test]
