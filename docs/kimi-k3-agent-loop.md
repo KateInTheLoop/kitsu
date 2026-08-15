@@ -434,3 +434,41 @@ held — zero spawn attempts.
 **Backlog: P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅. Kimi is 6-for-6 on code work
 (cycles 7-12).** Next: P6 evidence-clamps-budget, P7 anchor schema
 fingerprint, P10 model-context caching, or P11 tool-schema re-serialization.
+
+### Cycle 13 — 2026-08-14 — P6 evidence-clamps-budget (grade B+)
+
+Kimi implemented P6: after a two-strike shortfall for the same resolved
+window, clamp the EFFECTIVE SESSION BUDGET toward the reported size —
+never rewriting config or the resolved window. Pure
+`clamp_window_for_shortfall(resolved, reported, count)` with
+`MIN_VIABLE_WINDOW_FLOOR = 2048`, exact reuse of the `reported*4 >=
+resolved` plausible_clamp guard, two-strike gate. 6 tests (4 Kimi + 2
+supervisor integration). Committed `366dfc3` (Kate verified), pushed.
+Never-rewrite contract verified by reading (cfg.context_window /
+resolved_window are only read/compared, never assigned). kitsu-core
+110/110, all crates green (cycle-12's flake fix held).
+
+**MAJOR kitsu bug uncovered (root cause of cycles 9-12's "supervisor
+mechanical fixes"):** the journaled Edit/Write snapshots the WHOLE
+existing file before editing, hard-capped at `DEFAULT_MAX_BYTES = 64 KiB`
+(`kitsu-tools/src/permissions.rs:28`), with no CLI override. `orchestrator.rs`
+is 129 KiB — **over 2x the cap — so NO model can Edit/Write that file at
+all**, regardless of diff size; every edit fails `existing file exceeds
+the 65536-byte journal limit`. This silently forced the supervisor to
+hand-apply every orchestrator.rs change in cycles 9-13. Attempt 1 died on
+it (round budget burned + timeout); the retry had Kimi edit only
+context.rs (36 KiB, under cap) while the supervisor applied the
+orchestrator wiring. **Filed as a top-priority fix — being fixed on main
+this turn so all loops can edit large files (openai_compat.rs is 63 KiB,
+about to cross the cap and block GLM's P10 cycle).**
+
+- Docked to B+ (from A-) for the larger-than-usual supervisor wiring
+  share — but that was forced by the journal-cap blocker, not a Kimi
+  shortfall; the design and the clamp function are Kimi's and correct.
+  cap-1 absorbed one attempt-1 spawn attempt (errored on its own
+  preflight, no crash) and zero on the retry.
+
+**Backlog: P1-P6 ✅. Kimi is 7-for-7 on code work (cycles 7-13).** Next:
+P7 anchor schema fingerprint (context.rs, under cap), P11, or another
+context.rs-scoped item — AVOID orchestrator.rs direct edits until the
+journal-cap fix lands in the built binary.

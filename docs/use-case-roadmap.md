@@ -62,6 +62,14 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   `package.json` / `pyproject.toml` for the model on request without it
   guessing. *Accept:* project-context discovery includes the manifest
   summary; `--no-project-context` still suppresses it.
+- [x] (2026-08-14) R1.6 **Edit files larger than the read cap** (found by
+  the Kimi loop, cycle 13) — the journaled edit/write snapshotted the
+  existing file at the 64 KiB *read* cap, so any file above it (e.g.
+  `orchestrator.rs` at 129 KiB) was uneditable, failing "existing file
+  exceeds the 65536-byte journal limit". Silently forced supervisor
+  hand-fixes for cycles 9-13. Fixed (commit 333e97b): the pre-image is
+  bound by the *write* cap (1 MiB) via a new `max_write_bytes()`
+  accessor; a 200 KiB file is now edit/write-able (regression-tested).
 
 ## 2. Document reviewer (PDF / CSV / spreadsheets / images / docs) — *biggest gap*
 
