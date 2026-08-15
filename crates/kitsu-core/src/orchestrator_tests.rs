@@ -5349,8 +5349,8 @@ fn response_schema_participates_in_session_cache_identity() {
 
     let format_a = response_format("alpha");
     let format_b = response_format("bravo");
-    let serialized_a = serialized_request_constraints(None, Some(&format_a));
-    let serialized_b = serialized_request_constraints(None, Some(&format_b));
+    let serialized_a = serialized_request_constraints(None, Some(&format_a)).unwrap();
+    let serialized_b = serialized_request_constraints(None, Some(&format_b)).unwrap();
     assert_eq!(
         serialized_a.len(),
         serialized_b.len(),
