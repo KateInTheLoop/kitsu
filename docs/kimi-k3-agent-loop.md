@@ -1448,3 +1448,101 @@ vs `kitsu chat --help` this cycle.
 **Backlog status:** P4 ✅. Remaining open items: P6
 (evidence-clamps-budget), P7 (schema fingerprint), the still-open half
 of P3, P5 (anchor sanity clamp), P8-P11.
+
+### Cycle 12 — 2026-08-14 — P5 anchor sanity clamp (grade A-)
+
+Kimi implemented P5 correctly and completely in `context.rs` (+166/-14,
+single file, `kitsu chat` used from the start per cycle 11's finding):
+a private `anchor_plausible(anchor, full)` compares the recorded anchor
+against the anchor-free full estimate using exact `u128` integer ratios
+(`anchor*10 >= full*4 && anchor*10 <= full*25`, i.e. an inclusive
+[0.4x, 2.5x] band — no floats, no overflow risk, boundary-exact). A new
+`Cell<u64> anchor_rejections` field on `ContextMeter` (Cell because
+`estimate` takes `&self`) plus an `anchor_rejection_count()` accessor
+give the required telemetry counter. `estimate()` now computes the
+anchor-free full estimate unconditionally, and — only when the anchor
+is structurally valid (count + fingerprint intact) but implausible —
+discards it FOR THAT CALL ONLY: the stored anchor is left untouched (a
+later `record` can still replace it; `anchored()`/`anchor_includes_schema()`
+still report structural validity, matching the brief's "advisory, never
+mutates" requirement), the counter increments, and the anchor-free
+`full` is returned. Never panics, never errors — pure fallback.
+
+Exactly the 3 required tests, all genuine:
+(a) `plausible_anchor_is_still_trusted` — anchor 30 vs full 17 (well
+inside [6.8, 42.5]) still returns `anchor + tail`; counter stays 0.
+(b) `implausible_anchor_is_rejected_and_counted` — anchor 0 against real
+content, and anchor = 100× the full estimate, both fall back to the
+anchor-free full estimate (not the poisoned value); the counter
+increments once per rejecting `estimate()` call, and the stored anchor
+is confirmed still `anchored()` (advisory, not cleared).
+(c) `anchor_band_boundaries_are_inclusive` — full estimate rigged to an
+exact 40 so the boundaries are integers (0.4×=16, 2.5×=100): anchors 16,
+17, 99, 100 trusted; 15 and 101 rejected. Directly exercises the
+inclusive-boundary arithmetic, not just interior/exterior cases.
+
+- Single attempt, 15 tool calls (2 reads, 10 `Edit`s, 3 ranged re-reads
+  after one recovered `Edit` conflict — old_text not found, self-corrected
+  by re-reading the current byte ranges before retrying), 8,311/24,000
+  completion tokens (35%), zero debris/truncation. `--agent-spawn-cap 1`
+  held — zero `Agent(...)` spawn attempts anywhere in the receipts.
+- Kimi also honestly recomputed 5 pre-existing exact-value tests whose
+  anchors fell outside the new band purely because the old test fixtures
+  used stylized round numbers (1000, 500, 100/200, 800) far larger than
+  their tiny fixture content's full estimate — each fix is commented
+  in-line explaining the old value, the new value, and why the old one
+  now trips the clamp (`anchor_plus_tail_when_prefix_intact`,
+  `record_overwrites_the_previous_anchor`, `anchor_only_when_no_new_messages`,
+  `unchanged_prefix_still_uses_the_anchor`, `appending_to_the_tail_still_uses_the_anchor`).
+  Spot-checked: all five recomputations are correct.
+- **Supervisor-side cross-file breakage, exactly the class the last three
+  cycles predicted.** `cargo test --workspace` (kitsu-core scope) surfaced
+  one real failure outside Kimi's actual edits (context.rs only; Kimi never
+  touched orchestrator_tests.rs):
+  `orchestrator_tests.rs::enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable`
+  recorded an anchor of 500 against two tiny fixture messages ("sys", "q")
+  whose full estimate is only 8 tokens — a trick that relied on the
+  anchor being trusted unconditionally (pre-P5) to force a synthetic
+  over-target overflow even though the real content was trivially small.
+  Under P5 that anchor is now (correctly) rejected as implausible
+  (500 ≫ 2.5×8 = 20), the meter falls back to the tiny full estimate, no
+  overflow is detected, and the test's `.unwrap_err()` panicked. Fixed by
+  padding the fixture's system message to a real ~37-token cost and using
+  a plausible anchor of 90 (within [16.4, 102.5] = [0.4×41, 2.5×41] and
+  still comfortably over the ~80-token target) — this is a genuine test
+  fix, not a tolerance widening: the test's actual intent (an anchor over
+  target, with nothing droppable) is preserved with numbers that are
+  honest about the new plausibility rule. All 104 kitsu-core tests pass
+  after the fix (251 + 2 + 104 total non-flaky pass counts across the
+  workspace's other suites, unchanged).
+- **Two pre-existing flakes, both confirmed unrelated via `git stash`
+  against the untouched worktree tip:** the standing
+  `test_query_only_interactive_session_does_not_create_a_snapshot` PTY
+  flake (per the loop's standing exception), and
+  `kitsu-tools::builtins::fs::tests::read_file_caps_input_before_allocating_the_whole_file`
+  — reproduces identically with the cycle-12 diff stashed out, same
+  assertion, same panic site; the standing "revisit if it recurs" item
+  from cycles 10-11 is now 3-for-3 reproducing and still unowned.
+- `cargo build --workspace`, `cargo clippy --workspace --all-targets`
+  (zero warnings), and `cargo fmt --all -- --check` all clean (no fmt
+  pass needed this cycle — Kimi's diff was already correctly formatted).
+
+**Grade: A-.** Kimi's own P5 design and all three tests are a genuine A:
+the band is real and wide (not a token gesture — verified boundary-exact
+via integer math), the telemetry counter is real and tested, the
+fallback is per-call and advisory as specified (never mutates the stored
+anchor, never errors), and the five pre-existing test recomputations are
+honest, not rubber-stamped. Docked to A- for the same standing pattern
+as cycles 9-11: a context.rs semantic change broke an orchestrator-level
+test relying on an implicit pre-change invariant, requiring supervisor
+judgment (not a mechanical number swap) to fix correctly. This is now
+the fourth of five cycles (9, 10, 11, 12) where full workspace
+verification — not crate-scoped — caught a real cross-file regression;
+the standing lesson holds.
+
+**Backlog status:** P1 ✅ P2 ✅ P3 ✅ P4 ✅ P5 ✅. Kimi is 6-for-6 on code
+work since the ramp (cycles 7-12). Remaining open items: P6
+(evidence-clamps-budget), P7 (schema fingerprint), P8-P11, and the
+still-unowned `kitsu-tools` read-cap flake (now reproducing 3/3 cycles
+running — worth a dedicated investigation rather than another "revisit"
+note).

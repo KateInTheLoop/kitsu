@@ -10,6 +10,7 @@
 //! Neither performs trimming — that is the cascade (Stage 2+). These are the
 //! measurement primitives the trimming and `/context` command build on.
 
+use std::cell::Cell;
 use std::hash::{Hash, Hasher};
 
 use kitsu_providers::{ChatMessage, Role};
@@ -115,6 +116,32 @@ pub struct ContextMeter {
     /// not assume it's already covered. The fingerprint detects in-place edits
     /// inside the anchored prefix that keep the message COUNT unchanged.
     anchor: Option<(u64, usize, bool, u64)>,
+    /// Telemetry: how many times [`Self::estimate`] rejected a recorded anchor
+    /// as implausible (outside the wide 0.4x–2.5x band around the anchor-free
+    /// full estimate) and fell back to a full recompute. Advisory only; a
+    /// nonzero count points at a buggy/proxying gateway's `usage` numbers.
+    /// `Cell` because `estimate` takes `&self`.
+    anchor_rejections: Cell<u64>,
+}
+
+/// Plausibility band for a recorded anchor versus the anchor-free full
+/// estimate. Deliberately WIDE: real API tokenizers legitimately differ from
+/// our chars/token heuristic by up to ~2x, so only absurd values (a gateway
+/// reporting 0, or an aggregate many times the conversation) trip it.
+/// Compared as exact integer ratios to avoid float rounding at the boundary.
+const ANCHOR_BAND_LOW_NUM: u128 = 4; // anchor >= 0.4 * full
+const ANCHOR_BAND_LOW_DEN: u128 = 10;
+const ANCHOR_BAND_HIGH_NUM: u128 = 25; // anchor <= 2.5 * full
+const ANCHOR_BAND_HIGH_DEN: u128 = 10;
+
+/// True when `anchor` is within the generous [0.4x, 2.5x] band of the
+/// anchor-free `full` estimate. Never panics; u128 math cannot overflow for
+/// any realistic token count.
+fn anchor_plausible(anchor: u64, full: u64) -> bool {
+    let a = u128::from(anchor);
+    let f = u128::from(full);
+    a * ANCHOR_BAND_LOW_DEN >= f * ANCHOR_BAND_LOW_NUM
+        && a * ANCHOR_BAND_HIGH_DEN <= f * ANCHOR_BAND_HIGH_NUM
 }
 
 /// Cheap content-identity fingerprint over a message prefix: role discriminant
@@ -175,16 +202,35 @@ impl ContextMeter {
     /// if the anchored leading messages are still intact (same count AND same
     /// content fingerprint). If the history was trimmed below the anchor, or
     /// edited in place inside the anchored prefix, fall back to a full estimate.
+    ///
+    /// Even a structurally valid anchor is sanity-checked against the
+    /// anchor-free full estimate: outside a generous 0.4x–2.5x band the anchor
+    /// is treated as a buggy/proxying gateway number and ignored FOR THIS CALL
+    /// ONLY (the stored anchor is left untouched; each rejection increments
+    /// [`Self::anchor_rejection_count`]). This is advisory — it can never error.
     pub fn estimate(&self, messages: &[ChatMessage]) -> u64 {
+        let full: u64 = messages.iter().map(message_tokens).sum();
         match self.anchor {
             Some((tokens, sent_len, _, fingerprint))
                 if sent_len <= messages.len()
                     && prefix_fingerprint(&messages[..sent_len]) == fingerprint =>
             {
-                tokens + messages[sent_len..].iter().map(message_tokens).sum::<u64>()
+                if anchor_plausible(tokens, full) {
+                    tokens + messages[sent_len..].iter().map(message_tokens).sum::<u64>()
+                } else {
+                    self.anchor_rejections.set(self.anchor_rejections.get() + 1);
+                    full
+                }
             }
-            _ => messages.iter().map(message_tokens).sum(),
+            _ => full,
         }
+    }
+
+    /// Number of times [`Self::estimate`] has rejected a recorded anchor as
+    /// implausible (outside the 0.4x–2.5x band of the anchor-free estimate)
+    /// and fallen back to a full recompute. Telemetry only.
+    pub fn anchor_rejection_count(&self) -> u64 {
+        self.anchor_rejections.get()
     }
 
     /// True when [`Self::estimate`] would use the real-usage anchor (rather than
@@ -290,11 +336,14 @@ mod tests {
     fn anchor_plus_tail_when_prefix_intact() {
         let mut meter = ContextMeter::new();
         let mut msgs = vec![msg(Role::System, "x".repeat(40).as_str())];
-        // Pretend the last request sent these 1 message(s) and cost 1000 tokens.
-        meter.record(1000, &msgs, false);
+        // Pretend the last request sent these 1 message(s) and cost 20 tokens.
+        // (Anchor updated from 1000 to 20 for P5: 1000 is outside the 0.4x–2.5x
+        // plausibility band of the ~18-token full estimate and would now be
+        // rejected; 20 is a plausible anchor and exercises the same path.)
+        meter.record(20, &msgs, false);
         // Append an 8-char user turn: +2 text tokens + 3 per-message overhead.
         msgs.push(msg(Role::User, "abcdefgh"));
-        assert_eq!(meter.estimate(&msgs), 1005);
+        assert_eq!(meter.estimate(&msgs), 25);
     }
 
     #[test]
@@ -376,19 +425,24 @@ mod tests {
     #[test]
     fn record_overwrites_the_previous_anchor() {
         let mut meter = ContextMeter::new();
-        meter.record(100, &[msg(Role::System, "abcd")], false);
+        // (Anchors updated from 100/200 to 6/12 for P5: the full estimate of
+        // these two messages is 8, so 100/200 are outside the 0.4x–2.5x
+        // plausibility band and would now be rejected; 6 and 12 are inside it.)
+        meter.record(6, &[msg(Role::System, "abcd")], false);
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(200, &msgs, false);
+        meter.record(12, &msgs, false);
         // Two messages, anchor covers both, no tail -> exactly the latest anchor.
-        assert_eq!(meter.estimate(&msgs), 200);
+        assert_eq!(meter.estimate(&msgs), 12);
     }
 
     #[test]
     fn anchor_only_when_no_new_messages() {
         let mut meter = ContextMeter::new();
         let msgs = vec![msg(Role::System, "abcd"), msg(Role::User, "abcd")];
-        meter.record(500, &msgs, false);
-        assert_eq!(meter.estimate(&msgs), 500);
+        // (Anchor updated from 500 to 12 for P5: 500 is outside the
+        // 0.4x–2.5x band of the 8-token full estimate and would be rejected.)
+        meter.record(12, &msgs, false);
+        assert_eq!(meter.estimate(&msgs), 12);
     }
 
     /// Regression: a structural reshape (drop/summarize) can shrink the
@@ -475,10 +529,12 @@ mod tests {
             msg(Role::System, "x".repeat(40).as_str()),
             msg(Role::User, "abcd"),
         ];
-        meter.record(1000, &msgs, false);
+        // (Anchor updated from 1000 to 30 for P5: 1000 is outside the
+        // 0.4x–2.5x band of the ~22-token full estimate and would be rejected.)
+        meter.record(30, &msgs, false);
         msgs.push(msg(Role::User, "abcdefgh")); // identical prefix + 8-char tail (+2+3)
         assert!(meter.anchored(&msgs));
-        assert_eq!(meter.estimate(&msgs), 1005);
+        assert_eq!(meter.estimate(&msgs), 35);
     }
 
     /// (b) THE bug from reviews/kimi-cycle-6.md P2: an in-place content edit
@@ -532,12 +588,108 @@ mod tests {
             msg(Role::System, "x".repeat(40).as_str()),
             msg(Role::User, "abcd"),
         ];
-        meter.record(800, &msgs, true);
+        // (Anchor updated from 800 to 40 for P5: 800 is outside the 0.4x–2.5x
+        // band of the ~31-token full estimate and would now be rejected.)
+        meter.record(40, &msgs, true);
         msgs.push(msg(Role::Assistant, "abcdefgh")); // +2+3
         msgs.push(msg(Role::Tool, "abcd")); // +1+3
         assert!(meter.anchored(&msgs));
         assert!(meter.anchor_includes_schema(&msgs));
-        assert_eq!(meter.estimate(&msgs), 809);
+        assert_eq!(meter.estimate(&msgs), 49);
+    }
+
+    /// P5(a): a PLAUSIBLE anchor — within the 0.4x–2.5x band of the anchor-free
+    /// full estimate — is still trusted exactly as before (anchor + tail).
+    #[test]
+    fn plausible_anchor_is_still_trusted() {
+        let mut meter = ContextMeter::new();
+        let mut msgs = vec![
+            msg(Role::System, "x".repeat(40).as_str()), // 10 + 3
+            msg(Role::User, "abcd"),                    // 1 + 3
+        ];
+        // Full estimate of the prefix is 17; 30 is well inside [6.8, 42.5].
+        meter.record(30, &msgs, false);
+        msgs.push(msg(Role::User, "abcdefgh")); // +2+3
+        assert_eq!(meter.estimate(&msgs), 35, "plausible anchor must be used");
+        assert_eq!(
+            meter.anchor_rejection_count(),
+            0,
+            "a plausible anchor must never trip the clamp"
+        );
+    }
+
+    /// P5(b): an IMPLAUSIBLE anchor (gateway reports 0, or 100x the real
+    /// content) is rejected per-call: estimate() returns the anchor-free full
+    /// estimate, and the stored anchor is NOT mutated (a later record can
+    /// still replace it, and the rejection is counted for telemetry).
+    #[test]
+    fn implausible_anchor_is_rejected_and_counted() {
+        let msgs = vec![
+            msg(Role::System, "x".repeat(40).as_str()),
+            msg(Role::User, "abcd"),
+        ];
+        let full: u64 = msgs.iter().map(message_tokens).sum();
+        assert_eq!(full, 17);
+
+        // Case 1: gateway reports 0 prompt tokens for real content.
+        let mut meter = ContextMeter::new();
+        meter.record(0, &msgs, false);
+        assert_eq!(
+            meter.estimate(&msgs),
+            full,
+            "a zero anchor must fall back to the full estimate"
+        );
+        assert_eq!(meter.anchor_rejection_count(), 1);
+        // Advisory only: the stored anchor is untouched and still structurally
+        // valid (anchored() reports prefix identity, not plausibility).
+        assert!(meter.anchored(&msgs));
+        // Each rejecting estimate call counts.
+        let _ = meter.estimate(&msgs);
+        assert_eq!(meter.anchor_rejection_count(), 2);
+
+        // Case 2: gateway reports ~100x the real content (aggregate usage).
+        let mut meter = ContextMeter::new();
+        meter.record(100 * full, &msgs, false);
+        assert_eq!(
+            meter.estimate(&msgs),
+            full,
+            "a 100x anchor must fall back to the full estimate"
+        );
+        assert_eq!(meter.anchor_rejection_count(), 1);
+    }
+
+    /// P5(c): band boundary behavior — an anchor exactly at 0.4x or 2.5x of
+    /// the full estimate is trusted (inclusive band); just outside either edge
+    /// is rejected. Uses a full estimate of 40 so the boundaries are exact
+    /// integers: 0.4x = 16, 2.5x = 100.
+    #[test]
+    fn anchor_band_boundaries_are_inclusive() {
+        let msgs = vec![
+            msg(Role::System, "x".repeat(148).as_str()), // 37 + 3 = 40
+        ];
+        let full: u64 = msgs.iter().map(message_tokens).sum();
+        assert_eq!(full, 40);
+
+        for anchor in [16_u64, 17, 100, 99] {
+            let mut meter = ContextMeter::new();
+            meter.record(anchor, &msgs, false);
+            assert_eq!(
+                meter.estimate(&msgs),
+                anchor,
+                "anchor {anchor} is inside/at the band edge and must be trusted"
+            );
+            assert_eq!(meter.anchor_rejection_count(), 0);
+        }
+        for anchor in [15_u64, 101] {
+            let mut meter = ContextMeter::new();
+            meter.record(anchor, &msgs, false);
+            assert_eq!(
+                meter.estimate(&msgs),
+                full,
+                "anchor {anchor} is just outside the band and must be rejected"
+            );
+            assert_eq!(meter.anchor_rejection_count(), 1);
+        }
     }
 
     #[test]
