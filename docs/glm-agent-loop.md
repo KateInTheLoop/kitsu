@@ -133,3 +133,41 @@ cycle 2 ALSO fails on transport, switch the pin to `fireworks-ai`.
 **Ramp status:** 0 banked for GLM after cycle 1 (Kimi many, DeepSeek 1@B).
 Cycle 2 retries Phase B on the same file; if `:together` flakes again,
 switch to `fireworks-ai`.
+
+### Cycle 1 RETRY — 2026-08-14 — GLM banks its first deliverable (grade A)
+
+`:together` was healthy this time — SUCCESS on attempt 1, no retry, no
+provider fallback needed. `reviews/glm-cycle-1.md`: 12 ranked, line-cited
+proposals across estimate accuracy, budget policy, compaction. Commit
+`4feb13c` (Kate verified), pushed. Probes reconfirmed: reasoning on
+`message.reasoning`, `reasoning_effort low` ~19% shrink + tight-budget
+hazard real, tool calls intact, `cached_tokens` present.
+
+- **Citation accuracy: 9/9 EXACT (spot-checked, incl. back half — lines
+  16/36/102/123/166 all verbatim). Zero drift — the CLEANEST of the three
+  models.** (DeepSeek cycle 1 drifted 30-40 lines in its back half; this
+  is the discipline DeepSeek lacks.)
+- kitsu-usage 44,501 / 22,370 / 66,871. cap-1 unexercised — no spawn
+  attempted. GLM self-corrected a flagged "raw chat-template control
+  marker" write within the same turn (a positive kitsu disclosure
+  pattern, not a weakness).
+
+**Three-way comparison on the identical context.rs task:**
+- Kimi cycle 4 (A): 5 items, tighter/architectural, explicit per-proposal
+  risk framing.
+- DeepSeek cycle 1 (B): 8 items, caught a real gap the others missed
+  (`reasoning_content` ignored) but citations drifted badly.
+- **GLM cycle 1 (A): 12 items, cleanest citations (9/9), independently
+  converged on Kimi's P0 anchor-fragility finding PLUS a distinct
+  CJK/byte-vs-char estimate bug (which is exactly what Kimi later shipped
+  as P4).** GLM matches Kimi's grade on its first banked cycle.
+
+**kitsu weakness filed:** CLI-surface friction — `--allow-path`/`--allow-write`
+belong to the `chat` subcommand only; three supervisors have now tripped
+on placing them top-level (already roadmap R4.7).
+
+**Ramp status:** GLM 1-for-1 once transport cooperated (F on the
+transport-killed first attempt doesn't count against the model). **Grade
+A debut — GLM has reached Kimi-cycle-4 review level.** Next cycle: a
+second review OR begin the implementation ramp (a fresh P-item Kimi
+hasn't taken — P7/P10/P11), applying the same recipe.
