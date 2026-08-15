@@ -641,6 +641,27 @@ unchanged: numbered-roadmap work now lives in the run layer / needs a
 gen-2 repoint; the recent cycles are self-contained doc-review
 extensions beyond the numbered requirements.
 
+### Cycle 18 — 2026-08-15 — outline_file (code-nav, lane 1)
+
+Shipped `outline_file` (commit 7ce605e): lists a source file's structural
+definitions (fn/struct/class/enum/trait/type/impl/const/mod/…) with line
+numbers — a quick file map so the model needn't read the whole thing.
+Complements `find_symbol` (locate ONE symbol) by listing them ALL, then
+find_symbol jumps to one. Heuristic + language-agnostic, reusing
+find_symbol's `identifier_tokens`; narrower keyword set than find_symbol
+(local let/var/val excluded), comment lines skipped, bounded (500/5000,
+2 MiB scan + disclosure, cap_output). Dep-free. A genuine lane-1 code-
+analysis primitive rather than another document reader.
+
+Haiku review found ONE valid MEDIUM false-positive (a definition keyword
+INSIDE a string or call arg — `describe("fn fake", …)`, `let s = "fn x"`
+— was flagged), verified and FIXED in a follow-up (commit b7970c6):
+`line_defines` now requires the keyword at the statement start, preceded
+only by modifier tokens (pub/async/… + the `pub(crate)`/`pub(super)`
+tokens so those are still detected). Regression test added. All other
+checks passed (UTF-8/panic-safety, bounds, truncation disclosure,
+sandbox, additive).
+
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
 Lane 3 is done for this loop (R3.1/R3.2/R3.3; R3.4 is the UI loop's).
