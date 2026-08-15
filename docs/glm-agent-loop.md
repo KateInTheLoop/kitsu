@@ -306,3 +306,122 @@ was produced.
 **GLM is 3-for-3 A on reviews, 2-for-2 on code — a fully proven
 contributor.** Next code cycle: implement cycle-5 finding 1 (the
 error:null false positive) with the proven test-rigor discipline.
+
+### Cycle 6 — 2026-08-14 — implements its own cycle-5 finding 1 (grade A) — also advances R4.9
+
+Implemented cycle-5's finding 1: `process_line`'s SSE mid-stream `error`
+check had a false positive (`"error": null` wrongly rejected, since
+`value.get("error")` returns `Some(&Value::Null)` for JSON `null`) and
+discarded the gateway's real error detail on a genuine error, surfacing
+only a fixed string. Driver rebuilt fresh from the main checkout
+immediately before the run. Success on `:together` attempt 1 — no
+transport failure, no retry, no provider fallback needed.
+
+**The implementation is correct and matches the endorsed fix exactly:**
+`value.get("error").filter(|e| !e.is_null())` ignores a null error;
+when a real error is present, `err.get("message").and_then(|m|
+m.as_str()).or_else(|| err.as_str()).unwrap_or(<fixed fallback>)`
+extracts the gateway's own text, and the error is now
+`ProviderError::InvalidResponse(format!("provider error in SSE stream:
+{detail}"))` — a genuine non-null error object still returns `Err`, so
+the fail-closed contract is fully preserved.
+
+**THE HEADLINE — tests-fail-without-impl independently verified.** GLM
+wrote 3 tests exactly per the mandate: (a) `"error": null` alongside a
+valid content delta now parses and emits the delta; (b) `{"error":
+{"message":"rate limited"}}` returns an `Err` whose text contains "rate
+limited"; (c) a normal chunk with no `error` field still parses
+(regression guard). The supervisor `git stash`ed ONLY the implementation
+file (`openai_compat.rs`), kept GLM's tests, and re-ran them against the
+old code: **(a) and (b) both FAIL** — (a) with the old fixed
+`InvalidResponse("provider returned an error object...")`, (b) with the
+same fixed string (no "rate limited" substring) — while (c) passes as
+expected (pre-existing happy path, unaffected either way). Implementation
+was then restored and the full suite re-verified green. This is
+structurally the same rigor bar cycle 4 set (a claim a test cannot pass
+by accident), now on a fresh corner of `openai_compat.rs`.
+
+**A genuine workspace-wide regression was caught and required a
+non-mechanical supervisor judgment call (new territory — prior cycles'
+supervisor fixes were purely mechanical: unused imports, missing
+`Debug` derives, `cargo fmt`).** `cargo test --workspace` turned up ONE
+unexpected red beyond the known PTY flake:
+`test_sse_decoder_rejects_malformed_error_and_empty_success_payloads`,
+a pre-existing test (from the `af20c26` "fourth Codex-style UX cycle"
+commit, predating GLM entirely) that fed
+`{"error":{"message":"secret provider detail"}}` through the decoder and
+asserted the *old* fixed string appeared AND that
+`"secret provider detail"` did **not** appear in the error text — i.e.
+it encoded the exact opposite of what this cycle's task asked GLM to
+build. The supervisor did not blindly "fix the test to pass": it first
+checked whether this was a deliberate secret-redaction boundary being
+crossed. Findings: (1) the codebase already discloses full provider
+response-body text for diagnostics on any non-2xx HTTP status
+(`openai_compat.rs`, the `!status.is_success()` branch reads and returns
+the body verbatim, with an explicit "never contains the (sensitive)
+token" comment scoped to the auth token specifically, not to provider
+text in general); (2) actual token/credential redaction is a separate,
+untouched, still-passing guard
+(`test_token_never_in_error_display` + `EnvBearerAuth`/`set_sensitive`
+in `auth.rs`). So surfacing `error.message` on the 200-with-embedded-
+error path is consistent with, not a departure from, the codebase's
+existing diagnostic-disclosure posture — the stale test encoded the
+*old*, now-intentionally-changed behavior, not a security invariant.
+The supervisor updated only that one assertion (kept the "malformed
+JSON" case as-is; changed the error-object case to assert the message
+text now surfaces, with a comment cross-referencing GLM's new
+`process_line`-level test for the same contract). Re-verified: same
+old-vs-new stash procedure applied to this test too — it also fails
+against the unfixed implementation, confirming it is now coupled to the
+real behavior, not a stale proxy. **Lesson for future GLM code cycles:**
+a task-scoped read of only the target function can miss an existing
+test elsewhere in the same test module that encodes contrary intent
+about the very behavior being changed — worth a `grep`-for-related-
+assertions pass (e.g. search the test file for the literal error string
+being replaced) before finalizing, or leaving this as an explicit
+supervisor-side workspace-test check going forward (as done here).
+
+**Read/edit discipline: 6 `Read` calls (1 over the ~5 guidance, the 6th
+a disclosed post-edit verification re-read of lines 454-476) + 1
+`fs_scan_file`, 2 edits (`openai_compat.rs` impl, `openai_compat_tests.rs`
+tests).** No re-reading loops. No spawn attempted, cap 1 unexercised.
+`kitsu-usage: {"prompt_tokens":70673,"completion_tokens":2320,
+"total_tokens":72993}`. `kitsu-context: {"used":10905,
+"effective":107072,"window":131072}`. Run summary: "1 turn(s) ok, 6
+file(s) read, 2 file(s) written (2 change(s))" — clean exit 0, no
+transport issue, no recovered tool error (unlike cycle 5's W5).
+
+**Workspace-wide verification (after the supervisor's test fix):**
+`cargo build --workspace` clean; `cargo clippy --workspace --all-targets`
+clean, zero warnings; `cargo test -p kitsu-providers` 70/70 (was 69/70
+before the stale-test fix); `cargo test --workspace` — only the one
+known PTY flake (`test_query_only_interactive_session_does_not_create_a_snapshot`)
+red, re-confirmed via `git stash` to fail identically on the pre-change
+tip (pre-existing sandbox limitation, unrelated to this diff); `cargo
+fmt --all -- --check` clean, no reformatting needed.
+
+**This also advances roadmap R4.9** (disclosing response-parse errors):
+the SSE-embedded-error path now tells the caller *why* a mid-stream
+error occurred instead of only that one occurred, the same class of
+improvement R4.9 calls for on the HTTP-level parse-failure path.
+
+**Grade: A.** All three grading criteria hold: (1) the null-error false
+positive is fixed; (2) the gateway's real detail now surfaces
+(opaque → diagnosable); (3) a genuine non-null error object still fails
+the stream. Tests are genuine and independently verified fail-without-
+impl for both required cases. The one wrinkle — a pre-existing test
+encoding the old behavior — was caught by workspace-wide verification
+exactly as the recipe's own "workspace-wide verification" rule
+anticipates, and resolved with a documented, non-mechanical judgment
+call rather than silently overridden.
+
+**GLM is now 3-for-3 A on reviews and 3-for-3 on code (B → A → A) — the
+test-rigor discipline holds for a second cycle running, and this cycle
+additionally demonstrates GLM implementing its own reviewed, graded-A
+finding end-to-end cleanly on the first attempt.** No new kitsu
+weaknesses filed (W1-W5 from prior cycles still open, none re-triggered
+this cycle — no recovered tool errors, no discard). Next cycle: a fresh
+review (build portfolio further, e.g. the retry/backoff or
+model-discovery paths not yet covered) or a fresh P-item implementation
+(P8 trim-buffer scaling, P11 tool-schema re-serialization) — either
+continues the established alternation.
