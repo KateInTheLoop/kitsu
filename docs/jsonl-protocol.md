@@ -244,6 +244,10 @@ guarantees requires a new schema identifier.
   stderr. Status, permissions, and session inventory retain a compatibility
   `text` field alongside typed fields. Job mutations report both whether state
   changed and the resulting bounded registry/thread snapshot.
+  Failed commands instead emit a typed `error` before `command_finished`.
+  Unknown slash commands retain Kitsu's host-authored recovery in `message`:
+  either the bounded closest-command suggestion or `(try /help)`. The message
+  is terminal-safe and never contains provider-controlled error detail.
   The `permissions` result carries `commands.exact_grants[].cwd_source`
   (`"explicit"`, `"launch_directory"`, or `null` for a grant created at runtime
   through the approval prompt) and a `host_evidence` object describing the
