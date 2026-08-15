@@ -2657,21 +2657,21 @@ fn offload_pressure_requires_real_window_pressure() {
     let mut roomy = cfg(10);
     roomy.context_window = Some(131_072);
     assert!(
-        !offload_pressure(&messages, &big, &roomy),
+        !offload_pressure(&messages, &big, &roomy, None),
         "1.5k used + 5k added in a 131k window is not pressure"
     );
 
     let mut tight = cfg(10);
     tight.context_window = Some(8_192);
     assert!(
-        offload_pressure(&messages, &big, &tight),
+        offload_pressure(&messages, &big, &tight, None),
         "the same result in an 8k window is pressure"
     );
 
     let mut unknown = cfg(10);
     unknown.context_window = None;
     assert!(
-        offload_pressure(&messages, &big, &unknown),
+        offload_pressure(&messages, &big, &unknown, None),
         "unknown window keeps the conservative old behavior"
     );
 }
@@ -2705,6 +2705,7 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         &tools,
         &messages,
         &roomy,
+        None,
     );
     assert_eq!(inline.content, content);
     assert_eq!(
@@ -2725,6 +2726,7 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         &tools,
         &messages,
         &tight,
+        None,
     );
     assert_eq!(
         retained.retention.artifact_status,
@@ -2746,6 +2748,7 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         &tools,
         &messages,
         &tight,
+        None,
     );
     assert_eq!(
         suppressed.retention.artifact_status,
@@ -2790,6 +2793,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         &tools,
         &msgs,
         &tight,
+        None,
     );
     assert_eq!(inline, (big.clone(), None));
     assert!(
@@ -2805,8 +2809,15 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
-    let (pointer, offloaded_to) =
-        maybe_offload_for_tools(big, "readable", Some(dir.path()), &tools, &msgs, &tight);
+    let (pointer, offloaded_to) = maybe_offload_for_tools(
+        big,
+        "readable",
+        Some(dir.path()),
+        &tools,
+        &msgs,
+        &tight,
+        None,
+    );
     assert!(pointer.contains("full result saved to"));
     assert!(pointer.contains("fs_read_file"));
     assert!(offloaded_to.is_some());
@@ -4611,4 +4622,77 @@ fn template_control_debris_detector_fires_on_tails_not_quotes() {
     assert!(!template_control_debris_in_tail(
         "a perfectly normal answer."
     ));
+}
+
+/// P6: a single shortfall strike (`shortfall_count == 1`) must NOT clamp the
+/// effective session budget that gates outgoing requests — the two-strike
+/// rule holds end-to-end through `request_measurement`, not just in the pure
+/// `clamp_window_for_shortfall` helper.
+#[test]
+fn test_single_shortfall_does_not_clamp_request_measurement() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{request_measurement, ContextWindowEvidence};
+
+    let mut c = cfg(2);
+    c.context_window = Some(8_192);
+    let meter = ContextMeter::new();
+    let unclamped = request_measurement(&[], &c, "", false, None, &meter, None);
+
+    let one_strike = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 4_096,
+        estimated_sent_tokens: 5_000,
+        resolved_window: 8_192,
+        warned: false,
+        shortfall_count: 1,
+    });
+    let still_unclamped = request_measurement(&[], &c, "", false, None, &meter, one_strike);
+    assert_eq!(unclamped.effective, still_unclamped.effective);
+    assert_eq!(unclamped.target, still_unclamped.target);
+    // The resolved window reported alongside the budget is never rewritten.
+    assert_eq!(still_unclamped.window, Some(8_192));
+}
+
+/// P6: two shortfall strikes for the SAME resolved window DO clamp the
+/// effective session budget toward the reported size, end-to-end through
+/// `request_measurement` (the function that actually gates outgoing
+/// requests) — while `window` (the resolved window) is still reported
+/// unchanged, proving only the derived budget adapted.
+#[test]
+fn test_two_shortfalls_clamp_request_measurement_effective_budget() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{request_measurement, ContextWindowEvidence};
+
+    let mut c = cfg(2);
+    c.context_window = Some(8_192);
+    let meter = ContextMeter::new();
+    let unclamped = request_measurement(&[], &c, "", false, None, &meter, None);
+
+    let two_strikes = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 4_096,
+        estimated_sent_tokens: 5_000,
+        resolved_window: 8_192,
+        warned: false,
+        shortfall_count: 2,
+    });
+    let clamped = request_measurement(&[], &c, "", false, None, &meter, two_strikes);
+    assert!(
+        clamped.effective.unwrap() < unclamped.effective.unwrap(),
+        "two strikes must shrink the effective budget below the unclamped one"
+    );
+    assert!(clamped.target < unclamped.target);
+    // Resolved window is STILL reported as 8192 — never rewritten, only the
+    // derived effective/target budget changed.
+    assert_eq!(clamped.window, Some(8_192));
+
+    // Evidence for a DIFFERENT resolved window (a stale carry-over from a
+    // previous `--context-window`/model) must not clamp against the current one.
+    let stale = Some(ContextWindowEvidence {
+        reported_prompt_tokens: 2_048,
+        estimated_sent_tokens: 3_000,
+        resolved_window: 4_096,
+        warned: false,
+        shortfall_count: 5,
+    });
+    let ignored_stale = request_measurement(&[], &c, "", false, None, &meter, stale);
+    assert_eq!(unclamped.effective, ignored_stale.effective);
 }
