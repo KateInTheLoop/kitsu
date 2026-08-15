@@ -61,6 +61,12 @@ static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
 static SCRIPT_ACCEPTED_PARTIAL: AtomicBool = AtomicBool::new(false);
+/// Exact count of semantically successful requested operations mirrored into
+/// JSONL's terminal summary. Scripted execution owns its authoritative local
+/// count (notably, `/quit` is control flow rather than a successful operation)
+/// and stores it at finalization. Single-operation commands record a success
+/// only after accepting a catalog result or committing a model answer.
+static SUCCESSFUL_OPERATIONS: AtomicUsize = AtomicUsize::new(0);
 static OUTPUT_SCHEMA: OnceLock<structured_output::OutputSchema> = OnceLock::new();
 /// Terminal durability state mirrored into `final_summary`. A fresh session has
 /// a planned id before its first snapshot exists; exposing that id as resumable
@@ -154,6 +160,10 @@ fn run_elapsed() -> Duration {
 
 fn run_elapsed_ms() -> u64 {
     u64::try_from(run_elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
+fn record_successful_operation() {
+    SUCCESSFUL_OPERATIONS.fetch_add(1, Ordering::AcqRel);
 }
 
 fn jsonl_emitter() -> &'static Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::Stdout>> {
@@ -291,6 +301,7 @@ fn emit_jsonl_summary_with_postcondition_failures(
         "recovered_policy_errors": tool_error_totals.recovered_policy_errors,
         "user_failures": user_failures,
         "cancelled_failures": cancelled_failures,
+        "successful_operations": SUCCESSFUL_OPERATIONS.load(Ordering::Acquire),
         "duration_ms": run_elapsed_ms(),
         "session_id": session_id,
         "session_snapshot_state": session_snapshot_state,
@@ -8025,6 +8036,7 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         ));
     };
     let matched = filter_model_catalog(models, filter);
+    record_successful_operation();
     if cli.jsonl {
         let count = matched.len();
         emit_jsonl(
@@ -8191,6 +8203,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             }
             let recovered_tool_errors = ToolErrorTotals::from_turn(&state.last_turn, true);
             finish_assistant_disposition(cli, "ask:1", AssistantDisposition::Committed, None)?;
+            record_successful_operation();
             if cli.jsonl {
                 emit_jsonl(
                     "turn_finished",
@@ -10480,6 +10493,7 @@ async fn finalize_scripted_run(
     body_result: Result<(), CliError>,
 ) -> Result<(), CliError> {
     let jsonl = cli.jsonl;
+    SUCCESSFUL_OPERATIONS.store(status.successful_operations, Ordering::Release);
     let body_completed = body_result.is_ok();
     let mut primary_error = body_result.err();
     if let Some(error) = &primary_error {
@@ -13413,6 +13427,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         AssistantDisposition::Committed,
                         None,
                     )?;
+                    record_successful_operation();
                     if cli.jsonl {
                         emit_jsonl(
                             "error",
@@ -13445,6 +13460,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     AssistantDisposition::Committed,
                     None,
                 )?;
+                record_successful_operation();
                 if !cli.jsonl && session_state.last_turn.tool_errors > 0 {
                     eprintln!(
                         "~ {} earlier tool error(s) were recovered within the turn; final state committed",

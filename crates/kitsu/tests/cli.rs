@@ -3192,6 +3192,7 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         assert_eq!(fs::read(&last_message_for_run).unwrap(), b"json answer");
         assert_eq!(events.last().unwrap()["type"], "final_summary");
         assert_eq!(events.last().unwrap()["status"], "ok");
+        assert_eq!(events.last().unwrap()["successful_operations"], 1);
         assert!(!stdout.lines().any(|line| !line.starts_with('{')));
         assert!(
             output.stderr.is_empty(),
@@ -3309,6 +3310,7 @@ async fn test_output_schema_is_forwarded_validated_and_framed_before_commit() {
     assert!(index("turn_finished") < index("output_last_message"));
     assert_eq!(events.last().unwrap()["type"], "final_summary");
     assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(events.last().unwrap()["successful_operations"], 1);
     assert_eq!(events.last().unwrap()["output_schema_failures"], 0);
 
     let requests = server.received_requests().await.unwrap();
@@ -5185,6 +5187,7 @@ async fn test_required_write_script_failure_is_typed_and_preserves_output() {
     assert_eq!(summary["output_schema_failures"], 0);
     assert_eq!(summary["postcondition_failures"], 1);
     assert_eq!(summary["user_failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
     server.verify().await;
 }
 
@@ -5575,6 +5578,7 @@ async fn test_jsonl_script_happy_path_has_no_transcript_or_routine_stderr() {
         .any(|event| { event["type"] == "assistant" && event["text"] == "quiet answer" }));
     assert_eq!(events.last().unwrap()["type"], "final_summary");
     assert_eq!(events.last().unwrap()["status"], "ok");
+    assert_eq!(events.last().unwrap()["successful_operations"], 2);
 }
 
 #[tokio::test]
@@ -5905,6 +5909,7 @@ async fn test_output_last_message_install_failure_is_typed_and_nonzero() {
     assert_eq!(summary["type"], "final_summary");
     assert_eq!(summary["status"], "error");
     assert_eq!(summary["failures"], 1);
+    assert_eq!(summary["successful_operations"], 1);
     server.verify().await;
 }
 
@@ -6765,6 +6770,7 @@ auth = {{ method = "none" }}
         assert_eq!(events[2]["status"], 200);
         assert_eq!(events[2]["outcome"], "body_completed");
         assert_eq!(events[2]["terminal"], true);
+        assert_eq!(events.last().unwrap()["successful_operations"], 1);
     })
     .await
     .unwrap();
@@ -10896,6 +10902,39 @@ fn test_jsonl_unknown_script_commands_keep_actionable_host_hints() {
     assert_eq!(summary["status"], "error");
     assert_eq!(summary["failures"], 2);
     assert_eq!(summary["user_failures"], 2);
+    assert_eq!(summary["successful_operations"], 0);
+
+    // A summary-only consumer must not count `/quit` merely because its
+    // command frame finished `ok`: only `/status` is a successful operation.
+    let partial_script = home.path().join("jsonl-partial-typo.txt");
+    fs::write(&partial_script, "/status\n/statsu\n/quit\n").unwrap();
+    let partial = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--script",
+            &partial_script.to_string_lossy(),
+            "--allow-turn-errors",
+            "--no-session",
+        ])
+        .output()
+        .expect("run accepted-partial JSONL typo script");
+    assert!(partial.status.success(), "{partial:?}");
+    assert!(partial.stderr.is_empty(), "{partial:?}");
+    let partial_events = String::from_utf8(partial.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let partial_summary = partial_events.last().expect("partial final summary");
+    assert_eq!(partial_summary["type"], "final_summary");
+    assert_eq!(partial_summary["status"], "partial");
+    assert_eq!(partial_summary["failures"], 1);
+    assert_eq!(partial_summary["user_failures"], 1);
+    assert_eq!(partial_summary["successful_operations"], 1);
 }
 
 /// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is

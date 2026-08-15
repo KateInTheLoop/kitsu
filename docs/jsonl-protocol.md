@@ -302,6 +302,13 @@ and at least one turn or command succeeded, `error` for an unsuccessful run,
 and `cancelled` after interruption. `--allow-turn-errors` accepts partial
 success only: a script where every turn and command failed still ends with a
 run-level error and a nonzero exit.
+New producers also emit `final_summary.successful_operations`, the exact count
+of completed model turns and successful query/action commands. Control flow
+such as `/quit` is deliberately not counted even though its own
+`command_finished.status` is `ok`. A committed operation remains counted when
+a later host-side output, session, or completion-postcondition step makes the
+run fail. The field is additive in v1: absence in an older stream means
+unknown, never zero.
 A terminal assistant payload containing no non-whitespace text is an
 `incomplete_turn`: its provisional `assistant` event is closed by a
 `discarded` disposition, its conversation state is rolled back, and strict
