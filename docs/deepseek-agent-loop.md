@@ -1,12 +1,13 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14 — cycle 1 banked (grade B).** A working HF token
-> (Inference-Providers scope) is at `~/.cache/kitsu-hf-token`; each tick
-> reads it there and probes once — on 401/402/403 or missing file the
-> tick ends silently. DeepSeek-V4-Pro reaches the `:together` provider,
-> tool calls come back intact, and `--reasoning-effort low` is
-> load-bearing (see cycle 1). See the Cycle log for the standing
-> weakness backlog this loop has produced.
+> **LIVE 2026-08-15: cycle 8 — grade A, 2nd zero-drift citation cycle,
+> and a scope-range bug in the cron assignment caught before dispatch.**
+> The cron-supplied range for `enforce_context_budget` was wrong and was
+> corrected to the function's real span (2074-2106) before handoff.
+> Process held a 5th clean cycle (1 read, 1 write, no over-read, no
+> spawn); citations were exact on quotes and labels for the 2nd cycle
+> running. Cycle 5 still shows that tiny-scope review discipline does
+> not automatically transfer to implementation work.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -378,3 +379,40 @@ It remains review-only until R4.10 (implementation type-chasing unchanged),
 but as a reviewer it now matches GLM's discipline. (Minor: `--prompt`
 isn't a flag on `kitsu chat` — prompt is positional; same CLI-friction
 family as R4.7.)
+
+### Cycle 8 — 2026-08-15 — scope-range bug caught pre-dispatch; review still A
+
+**Supervisor scope correction before dispatch:** the cron-assigned range
+(`enforce_context_budget` @ 2078-2122) was wrong. Verified against the
+worktree source: `enforce_context_budget` actually spans lines
+**2074-2106** (doc comment `2074-2075`, `#[cfg(test)]` `2076`,
+`#[allow(...)]` `2077`, signature `2078`, body through closing brace
+`2106`) — a `#[cfg(test)]`-only test wrapper, not production logic. The
+cron's 2108-2122 tail is not part of this function at all: 2108-2116 is
+an unrelated struct `CompactionProgress`, and 2118-2122 are doc comments
+belonging to the next function, `enforce_context_budget_recording`.
+
+Process: 5th clean cycle running — exactly 1 ranged read (33 lines,
+matches assignment exactly, zero over-read) → 1 write, no spawn
+attempted, exit 0. kitsu-usage 15,034 / 2,295 / 17,329 — cheapest cycle
+yet.
+
+- **Citations letter-perfect again — quotes and labels, 2nd flawless
+  cycle after cycle 7.** All 4 citations (lines 2103, 2102, 2078+2091,
+  2077) verified byte-for-byte against the source.
+- **Hedging correctly calibrated.** Proposals 1 and 2 properly hedge on
+  unread callee behavior. Proposals 3 and 4 rely only on directly
+  visible, in-range facts, including the 12 positional arguments at the
+  call site.
+- **Minor flaw:** the review file self-reports `2025-07-15`, a wrong
+  date. It does not affect the proposals' substance.
+- Content is necessarily thinner than cycles 6-7 because the corrected
+  target is a small test shim, but all four proposals are legitimate,
+  scoped test-coverage or design observations.
+
+**Ramp status:** unchanged — DeepSeek remains a strong tiny-scope
+reviewer, now 5-for-5 on clean process (cycles 3, 4, 6, 7, 8) and
+2-for-2 on zero-drift citations (cycles 7, 8). It remains review-only
+until R4.10 addresses implementation type-chasing. Future cron authors
+should verify function ranges against the live worktree before dispatch;
+this is the second stale-range assignment after cycle 4.
