@@ -1,19 +1,22 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14: cycle 6 returned to the review lane (grade B+).**
-> Tiny single-function scope discipline held a third clean time (1
-> read, 1 write, no over-reading, no spawn) on `compact_context`, and
-> quoted citation TEXT was letter-perfect again — but this cycle
-> shipped its first non-top-ranked proposal stated as unhedged fact
-> that was objectively wrong on in-scope information (a false "usage
-> is discarded" claim; `compact_context` returns the callee's result
-> directly, so nothing is discarded). Proposal 1 independently
-> re-derived the same `unwrap_or_default()`-swallows-schema-errors bug
-> class that cycle 5 fixed in a sibling function. See the Cycle 6 entry
-> for the full citation spot-check. Cycle 5 (DeepSeek's first
-> IMPLEMENTATION attempt, grade C+) showed tiny-scope discipline does
-> NOT transfer to implementation — DeepSeek made ~36 read/scan calls
-> against a 2-read cap there; see that entry for the full account.
+> **LIVE 2026-08-15: cycle 8 — grade A, 2nd zero-drift citation cycle,
+> and a scope-range bug in the cron assignment caught before dispatch.**
+> The cron-supplied range for `enforce_context_budget` was wrong (it
+> spanned into an unrelated struct and the next function's doc comment);
+> supervisor verified against source and corrected to the function's
+> real span (2074-2106) before handing off — same error class cycle 4
+> caught. Process held a 5th clean cycle (1 read, 1 write, no over-read,
+> no spawn); citations letter-perfect on quotes AND labels for the 2nd
+> cycle running (R1.7 holding). One unhedged claim ("callee has ≥12
+> params") checked out as correct because it was directly countable from
+> the read range, not an assumption. See the Cycle 8 entry for the full
+> account. Cycle 7 (grade A) first combined clean process + zero
+> citation drift + correct hedging on `summarize_or_fallback`. Cycle 5
+> (DeepSeek's first IMPLEMENTATION attempt, grade C+) showed tiny-scope
+> discipline does NOT transfer to implementation — DeepSeek made ~36
+> read/scan calls against a 2-read cap there; see that entry for the
+> full account.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -897,3 +900,58 @@ with `unexpected argument` before reaching the model. Low severity
 (clear error message, no cost incurred), but worth a one-line mention
 in the CLI's `--help` epilogue or docs since it is an easy trap for
 scripted invocations like this loop's.
+
+### Cycle 8 — 2026-08-15 — scope-range bug caught pre-dispatch; review still A
+
+**Supervisor scope correction before dispatch:** the cron-assigned range
+(`enforce_context_budget` @ 2078-2122) was wrong. Verified against the
+worktree source: `enforce_context_budget` actually spans lines
+**2074-2106** (doc comment `2074-2075`, `#[cfg(test)]` `2076`,
+`#[allow(...)]` `2077`, signature `2078`, body through closing brace
+`2106`) — a `#[cfg(test)]`-only test wrapper, not production logic. The
+cron's 2108-2122 tail is not part of this function at all: 2108-2116 is
+an unrelated struct `CompactionProgress`, and 2118-2122 are doc comments
+belonging to the *next* function, `enforce_context_budget_recording`
+(whose signature does start at 2123, matching the one part of the cron
+note that was right). Same error class cycle 4 caught and self-corrected
+in its own assignment. Corrected range dispatched: **2074-2106** (33
+lines, one complete self-contained unit); DeepSeek was also told the
+function is test-only so it could calibrate severity accordingly.
+
+Process: 5th clean cycle running — exactly 1 ranged read (33 lines, matches
+assignment exactly, zero over-read) → 1 write, no spawn attempted, exit 0
+(no discard). kitsu-usage 15,034 / 2,295 / 17,329 — cheapest cycle yet.
+Commit `<pending>` (Kate verified), pushed.
+
+- **Citations letter-perfect again — quotes AND labels, 2nd flawless
+  cycle after cycle 7.** All 4 citations (lines 2103, 2102, 2078+2091,
+  2077) verified byte-for-byte against the source, both the quoted text
+  and the line-number labels exact. R1.7 holding.
+- **Hedging correctly calibrated.** Proposals 1 and 2 (hardcoded `false`
+  and hardcoded `CompactionReason::ContextTargetExceeded` passed to the
+  callee) properly hedge with "if the callee uses/branches on X" since
+  callee behavior is out of the read range. Proposal 3 (naming
+  discoverability — wrapper name is one suffix away from
+  `enforce_context_budget_recording`) needs no hedge and has none — it's
+  pure in-range observation. Proposal 4 claims "the callee has at least
+  12 [parameters]" **unhedged, and this is correct, not overreach** — the
+  call site at 2091-2103 visibly passes exactly 12 positional arguments,
+  so the count is directly verifiable from the assigned range alone, not
+  an assumption about unread code.
+- **Minor flaw (cosmetic, not a citation error):** the review file
+  self-reports "Reviewed: 2025-07-15" — a hallucinated/wrong date (today
+  is 2026-08-15). Doesn't affect any proposal's substance.
+- Content thinner than cycles 6-7 by necessity — the corrected target is
+  a trivial 15-line test shim, not meaty production logic — but all 4
+  proposals are legitimate, well-scoped test-coverage/design observations
+  appropriate to what the function actually is.
+
+**Ramp status:** unchanged — DeepSeek remains a STRONG tiny-scope
+reviewer, now 5-for-5 on clean process (cycles 3, 4, 6, 7, 8) and 2-for-2
+on zero-drift citations (cycles 7, 8). Still review-only until R4.10
+(implementation type-chasing, per cycle 5, is unaddressed). **Process
+note for future cron authors:** verify function line ranges against the
+actual worktree source before dispatch, not just against a prior
+supervisor's note — ranges drift as the file changes across cycles (this
+is the 2nd time a cron-provided range has been wrong; cycle 4 was the
+1st).
