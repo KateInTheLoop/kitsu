@@ -1260,11 +1260,33 @@ impl OpenAICompatProvider {
             ) => Some(Self::MODELS_NEGATIVE_CACHE_TTL),
             _ => None,
         };
+        // Preserve the warm per-model context-length memo across a refresh ONLY
+        // when the new catalog text EXACTLY equals the previous successful
+        // catalog text — carrying the memo across a CHANGED catalog would serve
+        // stale context lengths (a correctness bug). Otherwise start fresh.
+        // Extract the carried map before the assignment below, which drops the
+        // old entry wholesale.
+        let carried_context_lengths = {
+            let prev = cache.as_ref();
+            match (&outcome, prev) {
+                (Ok((new_status, new_text)), Some(prev_entry))
+                    if new_status.is_success()
+                        && matches!(
+                            &prev_entry.outcome,
+                            Ok((prev_status, prev_text))
+                                if prev_status.is_success() && prev_text == new_text
+                        ) =>
+                {
+                    prev_entry.context_lengths.lock().unwrap().clone()
+                }
+                _ => HashMap::new(),
+            }
+        };
         *cache = ttl.map(|ttl| ModelsCacheEntry {
             stored_at: tokio::time::Instant::now(),
             ttl,
             outcome: outcome.clone(),
-            context_lengths: std::sync::Mutex::new(HashMap::new()),
+            context_lengths: std::sync::Mutex::new(carried_context_lengths),
         });
         outcome
     }
@@ -1316,11 +1338,12 @@ impl OpenAICompatProvider {
         }
         // Memoize the parsed per-model lookup inside the cache entry so repeat
         // calls skip re-parsing the catalog JSON. The memo lives in
-        // ModelsCacheEntry, so it is fresh on every cache invalidation — a
-        // refreshed catalog starts with an empty memo, and an expired entry is
-        // replaced wholesale. This preserves the existing TTL/invalidation
-        // contract: the memo never outlives the cached catalog it was derived
-        // from.
+        // ModelsCacheEntry and is carried across a refresh only when the new
+        // catalog text exactly equals the previous one (see `get_models_response`);
+        // a CHANGED catalog starts fresh so the memo never serves lengths
+        // derived from a stale catalog. This preserves the existing
+        // TTL/invalidation contract: the memo never outlives the cached catalog
+        // it was derived from.
         let cache = self.models_cache.lock().await;
         if let Some(entry) = cache.as_ref() {
             let mut memo = entry.context_lengths.lock().unwrap();

@@ -1566,3 +1566,142 @@ unreviewed surface: `fetch_models_response`, `StaticAuth`/`NoAuth`
 
 **Ramp status:** GLM holds a perfect grade record across 12 cycles (6
 reviews, 6 code). Top-tier standing unchanged.
+
+### Cycle 13 — 2026-08-15 — seventh code cycle, implements GLM's own cycle-12 P1 (grade A)
+
+Alternation held (cycle 12 was a review): implements GLM's own highest-
+ranked cycle-12 proposal — the `get_models_response` cache write
+(`crates/kitsu-providers/src/openai_compat.rs`, lines 1263-1268)
+unconditionally reset `context_lengths` to an empty `HashMap` on every
+refresh, discarding the warm per-model memo even on a positive→positive
+refresh returning the identical catalog. The prompt supplied the crux
+constraint explicitly, since GLM's own cycle-12 illustrative snippet for
+this exact idea had a bug (referenced a consumed binding across a
+`.and_then`): the memo may be carried across a refresh **only** when the
+new catalog text exactly equals the previous entry's catalog text (both
+`Ok`/successful) — otherwise it must be cleared, because carrying it across
+a *changed* catalog would serve stale context lengths. Driver rebuilt fresh
+from main immediately before the run
+(`CARGO_TARGET_DIR=/home/mmpg/.cache/glm-worktree-target cargo build -p
+kitsu`). Ran from inside the worktree. Success on `:together` attempt 1 —
+no transport failure, no retry, no fallback provider needed, no spawn
+attempted (cap 1 unexercised).
+
+**The fix**, applied exactly where specified — a `carried_context_lengths`
+value extracted *before* the `*cache = ...` reassignment so the immutable
+borrow of `cache` ends first:
+```rust
+let carried_context_lengths = {
+    let prev = cache.as_ref();
+    match (&outcome, prev) {
+        (Ok((new_status, new_text)), Some(prev_entry))
+            if new_status.is_success()
+                && matches!(
+                    &prev_entry.outcome,
+                    Ok((prev_status, prev_text))
+                        if prev_status.is_success() && prev_text == new_text
+                ) =>
+        {
+            prev_entry.context_lengths.lock().unwrap().clone()
+        }
+        _ => HashMap::new(),
+    }
+};
+*cache = ttl.map(|ttl| ModelsCacheEntry {
+    stored_at: tokio::time::Instant::now(),
+    ttl,
+    outcome: outcome.clone(),
+    context_lengths: std::sync::Mutex::new(carried_context_lengths),
+});
+```
+Both sides of the comparison require `is_success()`, so a success↔failure
+flip also starts fresh, not just a text change. No struct, signature, or
+call-site changes — the diff is confined to this one function, plus an
+in-place update to a now-stale doc comment in `model_context_length`
+(the old comment claimed the memo is "fresh on every cache invalidation,"
+no longer accurate; GLM updated it to describe the conditional carry
+without being asked, since the prompt's "do not change struct/signature/
+call sites" left this comment fair game).
+
+**Read discipline: 14 `Read`/probe calls** (find_symbol x3, fs_scan_file x3,
+Read x8) — over the "~5 ranged reads" guidance, though several were sub-10-
+line visibility/import checks (private-method reachability from the child
+test module, `HashMap` import, module declaration) rather than re-reads of
+already-seen content; no redundant full-function re-reads. Wrote early — the
+edit landed after the first batch of context reads, then two additional
+narrow reads to sanity-check test-module visibility before adding tests.
+`kitsu-usage: {"prompt_tokens":291165,"completion_tokens":74787,"total_tokens":365952}`
+— prompt tokens ~5.3x cycle 12's 54568, likely from loading both source and
+test-file context plus the longer, more constrained prompt; worth watching
+if this becomes a pattern. `kitsu-context: {"used":21666,"effective":107072,"window":131072}`.
+Run summary: "1 turn(s) ok, 14 file(s) read, 2 file(s) written (2
+change(s)), session not saved" — clean exit, no `PolicyDenied`, no discard.
+
+**Tests: 2 new unit tests, both genuinely proving the targeted behavior —
+independently verified by this supervisor, not just GLM's self-report.**
+- `test_context_length_memo_preserved_on_same_catalog_refresh` — memoizes
+  `{"m": Some(8192)}`, forces TTL expiry, refreshes via `get_models_response`
+  directly against an *identical* catalog, then asserts the memo directly
+  (not a proxy return value) still holds `Some(Some(8192))`.
+  **Independently confirmed to FAIL without the fix**: supervisor ran
+  `git stash push -- crates/kitsu-providers/src/openai_compat.rs` (isolating
+  the source edit from the test file), reran this test, and observed the
+  exact predicted failure — `assertion left == right failed: ... left: None,
+  right: Some(Some(8192))` — then restored the stash and reconfirmed it
+  passes with the fix applied. This is the test that proves the actual
+  behavior change.
+- `test_context_length_memo_cleared_on_different_catalog_refresh` — same
+  setup but the refresh returns a *different* catalog (`context_length`
+  16384 vs 8192); asserts the memo is empty post-refresh and that a
+  follow-up `model_context_length` call returns the new 16384, not a stale
+  8192. GLM explicitly and correctly flagged, unprompted, that this test
+  **cannot fail against the pre-edit code** — the old code clears the memo
+  unconditionally on every refresh, so it incidentally also satisfies
+  "cleared on a changed catalog." It is a regression guard against a naive
+  "always carry" fix (which would serve the stale 8192), not a fail-before/
+  pass-after test. Supervisor independently confirmed this: rerunning it
+  against the stashed (pre-fix) source, it also passed — matching GLM's own
+  disclosure exactly, no misrepresentation.
+
+Both tests pass with the fix in place (independently reran after `git
+stash pop`). `cargo build --workspace`, `cargo clippy --workspace
+--all-targets` (zero warnings — no borrow/lifetime issue from the
+borrow-then-reassign pattern, no unused-import), and `cargo test --workspace`
+(121/122 in `cli.rs` + all else green; the one failure,
+`test_query_only_interactive_session_does_not_create_a_snapshot`, is the
+known PTY flake — reproduced in isolation on a solo rerun, unrelated to this
+diff) all pass. `cargo fmt --all -- --check` initially flagged two
+call-chain wrapping diffs in the new test file (GLM's manual formatting of
+a 3-segment method chain didn't match rustfmt's line-length rule);
+supervisor ran `cargo fmt --all` to fix, then reconfirmed `--check` clean.
+
+**Grade: A.** Correct fix, precisely matching the assigned crux (staleness
+guard confirmed via spot-check: the carry condition requires both outcomes
+`Ok`/successful AND exact text match — a changed catalog unconditionally
+falls through to `HashMap::new()`, no regression), confined to the single
+function plus one comment, no struct/signature/call-site drift, genuine
+tests with an independently-verified fail-before/pass-after result for the
+primary case and an honest, correct disclosure of the regression-guard
+nature of the secondary case. Read count ran over guidance but stayed
+purposeful (visibility/reachability checks, not re-reads).
+
+**Observed kitsu weaknesses / notes:** prompt-token usage this cycle
+(291165) is well above the recent baseline (cycle 12: 54568) despite a
+similarly-scoped single-function fix — plausibly the two-file context (impl
++ pre-existing test file) plus a longer, more detailed prompt; not yet
+established as a trend. No `fmt` gate is wired into the kitsu run itself,
+so GLM's output needed a manual `cargo fmt --all` pass by the supervisor —
+consistent with prior cycles' W-series notes that formatting isn't
+self-enforced. No transport issue, no `PolicyDenied`, no discard, no spawn
+attempt this cycle.
+
+**GLM is now 7-for-7 A on code and 6-for-6 A on reviews (13-for-13
+overall).** Remaining unreviewed surface for future review cycles:
+`fetch_models_response`, `StaticAuth`/`NoAuth` `header()` impls,
+`expiry_status()`, and the retry/backoff paths. Remaining backlog for
+future code cycles: cycle-10 findings 2-4, cycle-8 finding 2, cycle-5
+findings 5/6, P8/P11, and cycle-12's P2 (bind `auth.header()`'s result) and
+P3 (raw-body negative-cache text) as smaller candidates.
+
+**Ramp status:** GLM holds a perfect grade record across 13 cycles (6
+reviews, 7 code). Top-tier standing unchanged.
