@@ -70,6 +70,17 @@ diff), `review` subcommand, syntect highlighting for 16 languages.
   hand-fixes for cycles 9-13. Fixed (commit 333e97b): the pre-image is
   bound by the *write* cap (1 MiB) via a new `max_write_bytes()`
   accessor; a 200 KiB file is now edit/write-able (regression-tested).
+- R1.7 **Line-number prefixes on ranged reads** (found by the DeepSeek
+  loop, cycle 4) — `fs_read_file`'s ranged read returns raw joined text
+  with no line numbers, so a model citing a range must self-count from
+  `start_line` and drifts ~1 line (esp. when the first line is blank).
+  Whole-file readers (count from 1) don't drift; ranged readers do — a
+  systematic citation-accuracy loss. *Accept:* ranged reads prefix each
+  line with its absolute number (cat -n style) so citations land exactly.
+  **Tradeoff to handle:** `fs_edit_file` matches `old_text` verbatim, so a
+  model may copy the number prefix into `old_text` and fail — either strip
+  prefixes on the edit path, scope the prefix to ranged reads only, or
+  document it. Evaluate before shipping.
 
 ## 2. Document reviewer (PDF / CSV / spreadsheets / images / docs) — *biggest gap*
 
