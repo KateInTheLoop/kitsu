@@ -53,6 +53,9 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_manifest_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
+    let (d, h) = fs::audit_summary_tool(policy.clone());
+    registry.register_with_descriptor(d, h);
+
     let (d, h) = fs::diff_config_tool(policy.clone());
     registry.register_with_descriptor(d, h);
 
@@ -141,6 +144,7 @@ mod tests {
         assert!(registry.is_registered("fs_scan_file"));
         assert!(registry.is_registered("find_symbol"));
         assert!(registry.is_registered("read_manifest"));
+        assert!(registry.is_registered("audit_summary"));
         assert!(registry.is_registered("fs_diff_config"));
         assert!(registry
             .descriptors()
