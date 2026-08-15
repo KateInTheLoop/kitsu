@@ -202,3 +202,37 @@ tell whether DeepSeek's failure is scope-sizing or a deeper
 exploration-discipline problem. If it fails on a single 60-line function
 too, DeepSeek may not be viable as a contributor under the current kitsu
 levers until R4.10 (technical read cap) lands.
+
+### Cycle 3 — 2026-08-14 — SUCCESS on tiny scope (grade A-)
+
+**The experiment answered the question: over-reading VANISHED at tiny
+scope.** Scoped to one ~60-line unit (`request_measurement` 1954-1999 +
+`check_measurement` 2001-2012), DeepSeek did **exactly 1 read (the single
+1950-2012 ranged read) then 1 write, shipped first attempt** — a complete
+reversal from cycles 2/retry's 15-28 reads and 4-for-4 shipless runs,
+with materially the SAME prose read-cap wording. The only variable that
+changed was scope size (plus a more mechanical "read exactly once"
+phrasing). Commit `3568249` (Kate verified), pushed. kitsu-usage 12,985 /
+3,536 / 16,521 — fast and cheap. cap-1 unexercised (no spawn attempted).
+
+- **Deliverable grade A-.** 4 ranked proposals in reviews/deepseek-cycle-3.md.
+  Citation spot-check: every direct quote LETTER-PERFECT against ground
+  truth (a sharp reversal from cycle 1's drift). Docked half a grade
+  because the top-ranked proposal was substantively wrong (it hypothesized
+  a bug in `check_measurement`'s budget enforcement that doesn't exist —
+  `target = effective − buffer` is always the stricter bound) — but it was
+  honestly HEDGED as conditional ("If X, then Y") about an out-of-scope
+  dependency it correctly did not read. Proposals 2-4 correct.
+
+**Verdict: scope-sizing is (at least) the dominant lever — DeepSeek IS
+viable when given a tiny, single-function scope.** n=1, so not conclusive;
+next cycle should replicate at the same tiny scope on a DIFFERENT function
+before widening. R4.10 (technical read cap) still worth building — it
+would let DeepSeek self-recover on larger scopes instead of needing the
+scope hand-shrunk each time.
+
+**Ramp status:** DeepSeek 2-for-6 (cycle 1 B, cycle 3 A-), but 2-for-2
+once the scope is single-function-tight. The path to contribution is
+narrow-scope tasks. Cycle 4: replicate on another ~60-line function
+(e.g. `ensure_chat_request_fits`) to confirm the pattern, then consider a
+tiny single-function IMPLEMENTATION task.
