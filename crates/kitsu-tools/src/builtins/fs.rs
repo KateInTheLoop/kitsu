@@ -1686,6 +1686,197 @@ async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolE
     Ok(policy.cap_output(rendered))
 }
 
+// --- fs.audit_summary (cargo-audit advisory summary) ------------------------
+
+const AUDIT_DEFAULT_MAX_ITEMS: usize = 100;
+const AUDIT_MAX_ITEMS_CEILING: usize = 1000;
+
+#[derive(Deserialize)]
+struct AuditSummaryArgs {
+    path: String,
+    /// Items shown per section (default 100, max 1000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_items: Option<usize>,
+}
+
+fn json_field_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+/// `"name version"` for a cargo-audit package object.
+fn audit_package_label(pkg: &serde_json::Value) -> String {
+    let name = json_field_str(pkg, "name").unwrap_or("<unknown>");
+    match json_field_str(pkg, "version") {
+        Some(ver) => format!("{name} {ver}"),
+        None => name.to_string(),
+    }
+}
+
+/// A cargo-audit array-of-strings field (`versions.patched`, `advisory.aliases`).
+fn json_str_array(v: Option<&serde_json::Value>) -> Vec<&str> {
+    v.and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default()
+}
+
+fn render_audit_summary(display: &str, json_text: &str, max_items: usize) -> String {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => return format!("audit> {display}: could not parse cargo-audit JSON — {e}\n"),
+    };
+
+    let vulns = value.get("vulnerabilities");
+    let vuln_list: Vec<&serde_json::Value> = vulns
+        .and_then(|v| v.get("list"))
+        .and_then(|l| l.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let vuln_count = vulns
+        .and_then(|v| v.get("count"))
+        .and_then(|c| c.as_u64())
+        .map(|c| c as usize)
+        .unwrap_or(vuln_list.len());
+
+    // warnings: { "<kind>": [ { package, advisory, kind }, … ], … }
+    let warnings_obj = value.get("warnings").and_then(|w| w.as_object());
+    let warning_total: usize = warnings_obj
+        .map(|o| {
+            o.values()
+                .filter_map(|v| v.as_array())
+                .map(|a| a.len())
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let vuln_word = if vuln_count == 1 {
+        "vulnerability"
+    } else {
+        "vulnerabilities"
+    };
+    let mut out =
+        format!("audit> {display}: {vuln_count} {vuln_word}, {warning_total} warning(s)\n");
+    if vuln_count == 0 && warning_total == 0 {
+        out.push_str("no known vulnerabilities or advisory warnings\n");
+        return out;
+    }
+
+    // Vulnerabilities first (the real risk), each with its fix.
+    if !vuln_list.is_empty() {
+        out.push_str("vulnerabilities:\n");
+        let mut shown = 0usize;
+        for v in &vuln_list {
+            if shown >= max_items {
+                break;
+            }
+            let adv = v.get("advisory");
+            let id = adv
+                .and_then(|a| json_field_str(a, "id"))
+                .unwrap_or("<no id>");
+            let title = adv.and_then(|a| json_field_str(a, "title")).unwrap_or("");
+            let pkg = v
+                .get("package")
+                .map(audit_package_label)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            out.push_str(&format!("  [{id}] {pkg} — {title}\n"));
+            let patched = json_str_array(v.get("versions").and_then(|ver| ver.get("patched")));
+            if patched.is_empty() {
+                out.push_str("    fix: no patched release available\n");
+            } else {
+                out.push_str(&format!("    fix: upgrade to {}\n", patched.join(" or ")));
+            }
+            let aliases = json_str_array(adv.and_then(|a| a.get("aliases")));
+            if !aliases.is_empty() {
+                out.push_str(&format!("    aka: {}\n", aliases.join(", ")));
+            }
+            shown += 1;
+        }
+        if vuln_list.len() > shown {
+            out.push_str(&format!(
+                "  [showing {shown} of {} vulnerabilities]\n",
+                vuln_list.len()
+            ));
+        }
+    }
+
+    // Advisory warnings (unmaintained / yanked / unsound …) grouped by kind.
+    if let Some(warnings) = warnings_obj {
+        if warning_total > 0 {
+            out.push_str("warnings:\n");
+            let mut kinds: Vec<&String> = warnings.keys().collect();
+            kinds.sort();
+            let mut wshown = 0usize;
+            'kinds: for kind in kinds {
+                let Some(items) = warnings.get(kind).and_then(|x| x.as_array()) else {
+                    continue;
+                };
+                for w in items {
+                    if wshown >= max_items {
+                        break 'kinds;
+                    }
+                    let pkg = w
+                        .get("package")
+                        .map(audit_package_label)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let title = w
+                        .get("advisory")
+                        .and_then(|a| json_field_str(a, "title"))
+                        .unwrap_or("");
+                    if title.is_empty() {
+                        out.push_str(&format!("  [{kind}] {pkg}\n"));
+                    } else {
+                        out.push_str(&format!("  [{kind}] {pkg} — {title}\n"));
+                    }
+                    wshown += 1;
+                }
+            }
+            if warning_total > wshown {
+                out.push_str(&format!(
+                    "  [showing {wshown} of {warning_total} warnings]\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
+pub fn audit_summary_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "audit_summary".to_string(),
+        description: "Summarize a `cargo audit --json` report into a ranked risk view: each \
+                      vulnerability with its advisory id, affected package + version, title, CVE \
+                      aliases, and the patched version to upgrade to; then advisory warnings \
+                      (unmaintained/yanked/unsound) grouped by kind. Give it a JSON file you \
+                      produced with `cargo audit --json`. Read-only; same allowlist as \
+                      fs_read_file; malformed JSON is disclosed, never guessed."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a `cargo audit --json` output file"},
+                "max_items": {"type": "integer", "description": "Items shown per section (optional, default 100, max 1000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { audit_summary_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn audit_summary_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: AuditSummaryArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let max = a
+        .max_items
+        .unwrap_or(AUDIT_DEFAULT_MAX_ITEMS)
+        .clamp(1, AUDIT_MAX_ITEMS_CEILING);
+    let content = read_config_text(policy, &a.path).await?;
+    let rendered = render_audit_summary(&a.path, &content, max);
+    Ok(policy.cap_output(rendered))
+}
+
 // --- fs.read_manifest (dependency / build manifest summary) -----------------
 
 /// Dependency names shown per section by default / at most before eliding.
@@ -6405,6 +6596,96 @@ mod tests {
         );
         assert!(matches!(
             read_docx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    const SAMPLE_AUDIT_JSON: &str = r#"{
+      "vulnerabilities": {
+        "found": true,
+        "count": 1,
+        "list": [
+          {
+            "advisory": {
+              "id": "RUSTSEC-2021-0001",
+              "title": "flate2 miscompilation",
+              "aliases": ["CVE-2021-0001"]
+            },
+            "versions": { "patched": [">=1.0.14"], "unaffected": [] },
+            "package": { "name": "flate2", "version": "1.0.13" }
+          }
+        ]
+      },
+      "warnings": {
+        "unmaintained": [
+          {
+            "kind": "unmaintained",
+            "package": { "name": "ansi_term", "version": "0.12.1" },
+            "advisory": { "id": "RUSTSEC-2021-0139", "title": "ansi_term is unmaintained" }
+          }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn audit_summary_ranked_view() {
+        let out = render_audit_summary("audit.json", SAMPLE_AUDIT_JSON, 100);
+        assert!(out.contains("1 vulnerability, 1 warning(s)"), "{out}");
+        assert!(
+            out.contains("[RUSTSEC-2021-0001] flate2 1.0.13 — flate2 miscompilation"),
+            "{out}"
+        );
+        assert!(out.contains("fix: upgrade to >=1.0.14"), "{out}");
+        assert!(out.contains("aka: CVE-2021-0001"), "{out}");
+        assert!(
+            out.contains("[unmaintained] ansi_term 0.12.1 — ansi_term is unmaintained"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn audit_summary_clean_no_patch_and_malformed() {
+        // Clean report.
+        let clean = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}"#;
+        let out = render_audit_summary("a.json", clean, 100);
+        assert!(out.contains("0 vulnerabilities, 0 warning(s)"), "{out}");
+        assert!(out.contains("no known vulnerabilities"), "{out}");
+        // A vuln with no patched release is disclosed honestly.
+        let no_patch = r#"{"vulnerabilities":{"count":1,"list":[{"advisory":{"id":"RUSTSEC-2020-0002","title":"unfixed"},"versions":{"patched":[]},"package":{"name":"foo","version":"0.1.0"}}]},"warnings":{}}"#;
+        let out = render_audit_summary("a.json", no_patch, 100);
+        assert!(out.contains("fix: no patched release available"), "{out}");
+        // Malformed JSON → disclosed, not guessed or panicked on.
+        let out = render_audit_summary("a.json", "not json {{{", 100);
+        assert!(out.contains("could not parse"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn audit_summary_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("audit.json");
+        std::fs::write(&path, SAMPLE_AUDIT_JSON).unwrap();
+
+        let out = audit_summary_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("audit ok");
+        assert!(out.contains("1 vulnerability, 1 warning(s)"), "{out}");
+        assert!(out.contains("[RUSTSEC-2021-0001]"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("audit.json");
+        std::fs::write(&bad, SAMPLE_AUDIT_JSON).unwrap();
+        assert!(matches!(
+            audit_summary_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
             )
