@@ -3365,10 +3365,22 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
 
     // Only ONE user exchange (<= KEEP_RECENT_EXCHANGES) — nothing is safely
     // droppable, so drop_old_exchanges is a guaranteed no-op on `messages`.
-    let mut msgs = vec![ChatMessage::system("sys"), ChatMessage::user("q")];
+    //
+    // P5 (context.rs): estimate() now sanity-checks a recorded anchor against
+    // the anchor-free full estimate and ignores it outside a 0.4x-2.5x band.
+    // The old anchor here (500 against a ~8-token full estimate for "sys"/"q")
+    // is far outside that band and would now be rejected, silently defeating
+    // the overflow this test forces. Padded content raises the full estimate
+    // to 41 so a still-over-target anchor of 90 stays plausible (90 <= 2.5*41
+    // = 102.5, 90 >= 0.4*41 = 16.4) while remaining well above the ~80 target.
+    let mut msgs = vec![
+        ChatMessage::system("x".repeat(136).as_str()),
+        ChatMessage::user("q"),
+    ];
     let mut meter = ContextMeter::new();
-    // A real anchor that's over target, forcing the compaction match to run.
-    meter.record(500, &msgs, true);
+    // A real, plausible anchor that's over target, forcing the compaction
+    // match to run.
+    meter.record(90, &msgs, true);
 
     let mut failures = 0u32;
     let mut turn_usage = kitsu_providers::Usage::default();
