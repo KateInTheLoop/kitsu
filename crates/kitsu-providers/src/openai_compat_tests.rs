@@ -948,6 +948,57 @@ fn test_nonstream_completion_rejects_error_and_empty_choice_objects() {
     assert!(matches!(error, ProviderError::InvalidResponse(_)));
 }
 
+/// Regression for a false positive diverging from the streaming path: the OLD
+/// non-streaming code did `value.get("error").is_some()` and returned Err, which
+/// wrongly rejected a valid completion body carrying `"error": null` alongside
+/// real choices, because `get("error")` returns `Some(&Value::Null)`, not
+/// `None`. The streaming path already ignored a null error
+/// (`get("error").filter(|e| !e.is_null())`); the fix aligns the non-streaming
+/// path to do the same. This test would FAIL against the unfixed code (it would
+/// receive InvalidResponse instead of the content delta + Done(Stop)).
+#[test]
+fn test_parse_completion_null_error_alongside_valid_choice_parses_ok() {
+    use super::parse_completion;
+    use crate::types::ChatDelta;
+
+    let body = r#"{
+        "error": null,
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+    }"#;
+    let deltas = parse_completion(body).expect(
+        "a completion body carrying `\"error\": null` alongside a valid choice must parse, \
+         not be rejected",
+    );
+    assert!(
+        matches!(deltas.last(), Some(ChatDelta::Done(FinishReason::Stop))),
+        "expected the terminal Done(Stop); got {deltas:?}"
+    );
+    let text = deltas
+        .iter()
+        .find_map(|d| match d {
+            ChatDelta::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .expect("expected a content Text delta");
+    assert_eq!(text, "hi");
+}
+
+/// A real (non-null) `error` object in a successful completion body must STILL
+/// be rejected with InvalidResponse — the null-tolerance fix must not swallow a
+/// genuine error. This guards against over-correcting the false-positive fix.
+#[test]
+fn test_parse_completion_real_error_object_still_rejected() {
+    use super::parse_completion;
+
+    let body = r#"{
+        "error": {"message": "rate limited", "type": "requests", "code": "429"},
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+    }"#;
+    let error =
+        parse_completion(body).expect_err("a real (non-null) error object must still be rejected");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
 #[tokio::test]
 async fn test_clean_eof_without_semantic_terminal_is_body_failure() {
     let server = MockServer::start().await;

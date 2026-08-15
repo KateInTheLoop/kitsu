@@ -599,7 +599,7 @@ enum SseState {
 fn parse_completion(body: &str) -> Result<Vec<ChatDelta>, ProviderError> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| ProviderError::InvalidResponse(format!("malformed completion JSON: {e}")))?;
-    if value.get("error").is_some() {
+    if value.get("error").is_some_and(|e| !e.is_null()) {
         return Err(ProviderError::InvalidResponse(
             "provider returned an error object in a successful completion response".to_string(),
         ));
