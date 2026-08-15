@@ -165,10 +165,15 @@ richest greenfield lane.
   `fs_read_xlsx` (commit 63a139a): pure-Rust `calamine`, lists sheet
   names + a bounded cell window (sheet by name/index, start_row/max_rows,
   500 ceiling), wired into `read_document`'s XLSX branch (real extraction
-  now, not a decline). Same allowlist guard; 32 MiB cap. `.docx`
-  paragraph text is NOT yet done (calamine covers spreadsheets, not Word)
-  — docx remains detected-and-declined by the dispatcher; a small
-  zip+XML docx reader can follow if needed.
+  now, not a decline). Same allowlist guard; 32 MiB cap. **`.docx`
+  paragraph text now DONE** (2026-08-15, commit a30464e): `fs_read_docx`
+  extracts Word paragraph text via pure-Rust `zip` (deflate-only) +
+  `quick-xml` — `<w:t>` runs into `<w:p>` paragraphs, `<w:tab/>`→tab,
+  `<w:br/>`→newline, entity/char-ref decoding, empty paragraphs skipped;
+  32 MiB file guard + 64 MiB decompressed zip-bomb cap + paragraph
+  pagination; wired into `read_document`'s DOCX branch (real extraction
+  now). So lane 2 covers CSV/PDF/XLSX/DOCX + image metadata + dispatch —
+  the common document types. pptx remains detect-and-disclose.
 - [x] (2026-08-14) R2.5 **Type-aware dispatch** — shipped as the
   `read_document` tool (commit 1d01628): detects type by magic bytes
   then extension, routes `.csv/.tsv`→fs_read_csv, `.pdf`/%PDF→fs_read_pdf,
@@ -443,6 +448,32 @@ surfaces. **Sequencing advanced to lane 4** (automation trust — R4.3
 budget ceiling, R4.4 run report) for the next capability cycle, mindful
 those touch the run layer; the fully self-contained wins are now in lane
 4's tool-shaped items or opportunistic lane-5/6.
+
+### Cycle 12 — 2026-08-15 — R2.4 docx text extraction (completes lane-2 doc types)
+
+Shipped `fs_read_docx` (commit a30464e), closing the last common
+document type left open in lane 2 (R2.4's docx follow-up). Pure-Rust
+`zip` (default-features off + deflate only) + `quick-xml` 0.41 —
+`word/document.xml` parsed into `<w:p>` paragraphs from `<w:t>` runs,
+`<w:tab/>`→tab / `<w:br/>`→newline, the 5 predefined entities + numeric
+char-refs decoded (0.41 surfaces `&ref;` as its own `GeneralRef` event),
+empty paragraphs skipped, text-only disclosed. Wired into
+`read_document` (DOCX now extracts, was "no extractor yet"). Bounded:
+32 MiB file guard, 64 MiB decompressed zip-bomb cap on the entry stream,
+paragraph pagination (default 500, max 5000, 50k collect ceiling). Zero
+new crates in the lock — both deps were already transitive via calamine
+— kept cheap by slimming zip to deflate-only. Functional check: e2e
+builds a REAL .docx (zip writer) through read_docx_run + the
+read_document dispatch, plus zip-without-document.xml honest error and
+allowlist denial. Chosen over the collision-prone lane-4 run-layer items
+(R4.3/R4.4/R4.10-12 all live in main.rs/orchestrator, UI/model-loop
+territory) as the clean self-contained slice still on the board. Haiku
+review: SHIP-AS-IS — 8 areas traced (zip-bomb bound on the decompressed
+stream, panic-freedom, honest degradation, dispatch ordering, additive-
+only, genuine real-zip tests), no findings. **Lane 2 is now fully
+complete for common document types.** Next capability cycle: lane 4
+(automation trust) needs a self-contained angle, or opportunistic
+lane-5 R5.1 (cargo-audit summary — dep-free, tool-shaped).
 
 ### Cycle 8 — 2026-08-14 — R1.8 debris warning made quote-aware (lane 1)
 
