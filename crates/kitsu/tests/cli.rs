@@ -11567,6 +11567,93 @@ fn test_jsonl_unknown_script_commands_keep_actionable_host_hints() {
     assert_eq!(partial_summary["successful_operations"], 1);
 }
 
+#[test]
+fn test_missing_checkpoint_keeps_actionable_host_hint_in_jsonl_and_human_scripts() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script_path = home.path().join("missing-checkpoint.txt");
+    fs::write(&script_path, "/checkpoints\n/checkpoint 54007\n/quit\n").unwrap();
+    let message =
+        "checkpoint #54007 is not available; run /checkpoints to list recoverable checkpoints";
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run missing-checkpoint JSONL script");
+    assert_eq!(jsonl.status.code(), Some(1), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(
+        events
+            .iter()
+            .map(|event| event["type"].as_str().unwrap())
+            .collect::<Vec<_>>(),
+        [
+            "run_started",
+            "command_started",
+            "command_result",
+            "command_finished",
+            "command_started",
+            "error",
+            "command_finished",
+            "command_started",
+            "command_finished",
+            "final_summary",
+        ]
+    );
+    assert_eq!(events[2]["result"]["kind"], "checkpoints");
+    assert_eq!(events[2]["result"]["count"], 0);
+    assert_eq!(events[5]["line"], 2);
+    assert_eq!(events[5]["command"], "/checkpoint 54007");
+    assert_eq!(events[5]["kind"], "user");
+    assert_eq!(events[5]["message"], message);
+    assert_eq!(events[5]["exit_code"], 1);
+    assert_eq!(events[6]["status"], "error");
+    assert_eq!(events[9]["status"], "error");
+    assert_eq!(events[9]["failures"], 1);
+    assert_eq!(events[9]["user_failures"], 1);
+    assert_eq!(events[9]["successful_operations"], 1);
+    assert!(!events
+        .iter()
+        .any(|event| event["type"] == "provider_request"));
+
+    let human = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--no-tools",
+            "--script",
+            &script_path.to_string_lossy(),
+        ])
+        .output()
+        .expect("run missing-checkpoint human script");
+    assert_eq!(human.status.code(), Some(1), "{human:?}");
+    let stderr = String::from_utf8(human.stderr).unwrap();
+    assert_eq!(stderr.matches(message).count(), 1, "{stderr}");
+    assert!(
+        stderr.contains(&format!("{}:2: {message}", script_path.display())),
+        "{stderr}"
+    );
+    assert!(!stderr.contains("command failed: /checkpoint 54007"));
+}
+
 /// Cycle-9 finding 4, completed for `/queue`: a one-word subaction typo is
 /// intercepted with a close-match suggestion and an escape hatch, instead of
 /// being silently queued as a prompt.
