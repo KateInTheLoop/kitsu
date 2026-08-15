@@ -18,6 +18,7 @@ lopdf = "0.34"
 imagesize = "0.13"
 calamine = "0.26"
 libc = "0.2"
+toml = { workspace = true }
 
 [dev-dependencies]
 tempfile = { workspace = true }

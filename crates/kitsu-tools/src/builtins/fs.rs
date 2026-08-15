@@ -1477,6 +1477,288 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
     Ok(format!("{disclosure}{body}"))
 }
 
+// --- fs.read_manifest (dependency / build manifest summary) -----------------
+
+/// Dependency names shown per section by default / at most before eliding.
+const MANIFEST_DEFAULT_MAX_DEPS: usize = 50;
+const MANIFEST_MAX_DEPS_CEILING: usize = 500;
+
+#[derive(Deserialize)]
+struct ReadManifestArgs {
+    path: String,
+    /// Dependency names listed per section (default 50, max 500).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_deps: Option<usize>,
+}
+
+enum ManifestKind {
+    Cargo,
+    PackageJson,
+    Pyproject,
+    Unknown,
+}
+
+fn detect_manifest_kind(path: &str, content: &str) -> ManifestKind {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "cargo.toml" => return ManifestKind::Cargo,
+        "package.json" => return ManifestKind::PackageJson,
+        "pyproject.toml" => return ManifestKind::Pyproject,
+        _ => {}
+    }
+    // Non-standard filename: fall back to extension + a content-shape hint.
+    if name.ends_with(".json") {
+        return ManifestKind::PackageJson;
+    }
+    if name.ends_with(".toml") {
+        // pyproject uses [project] / [tool.poetry]; Cargo uses [package].
+        if content.contains("[project]") || content.contains("[tool.poetry") {
+            return ManifestKind::Pyproject;
+        }
+        return ManifestKind::Cargo;
+    }
+    ManifestKind::Unknown
+}
+
+/// One bounded, sorted, de-duplicated dependency section line.
+fn format_dep_section(label: &str, mut names: Vec<String>, max: usize) -> String {
+    names.sort();
+    names.dedup();
+    let total = names.len();
+    if total == 0 {
+        return format!("  {label}: 0\n");
+    }
+    let shown = total.min(max);
+    let listed = names[..shown].join(", ");
+    let more = if total > shown {
+        format!(", +{} more", total - shown)
+    } else {
+        String::new()
+    };
+    format!("  {label} ({total}): {listed}{more}\n")
+}
+
+fn toml_table_keys(v: &toml::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `section[key]` as a string slice, borrowing from `section`.
+fn toml_str<'a>(section: Option<&'a toml::Value>, key: &str) -> Option<&'a str> {
+    section.and_then(|s| s.get(key)).and_then(|x| x.as_str())
+}
+
+/// Extract the distribution name from a PEP 508 requirement string:
+/// `requests>=2.0` → `requests`, `ruff (==0.1); python_version>'3.7'` → `ruff`.
+fn requirement_name(req: &str) -> String {
+    let req = req.trim();
+    let end = req
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
+        .unwrap_or(req.len());
+    req[..end].to_string()
+}
+
+fn render_cargo_manifest(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let pkg = v.get("package");
+    let pkg_str = |k: &str| {
+        pkg.and_then(|p| p.get(k))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    };
+    let name = pkg_str("name");
+    let version = pkg_str("version");
+    let edition = pkg_str("edition");
+    let is_workspace = v.get("workspace").is_some();
+
+    let mut out = String::from("manifest> ");
+    let header = match (&name, &version) {
+        (Some(n), Some(ver)) => format!("{display}: Cargo (Rust) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: Cargo (Rust) — {n}"),
+        _ if is_workspace => format!("{display}: Cargo (Rust) — virtual workspace manifest"),
+        _ => format!("{display}: Cargo (Rust)"),
+    };
+    out.push_str(&header);
+    if let Some(e) = edition {
+        out.push_str(&format!(" (edition {e})"));
+    }
+    out.push('\n');
+    out.push_str(&format_dep_section(
+        "dependencies",
+        toml_table_keys(&v, "dependencies"),
+        max,
+    ));
+    out.push_str(&format_dep_section(
+        "dev-dependencies",
+        toml_table_keys(&v, "dev-dependencies"),
+        max,
+    ));
+    let build = toml_table_keys(&v, "build-dependencies");
+    if !build.is_empty() {
+        out.push_str(&format_dep_section("build-dependencies", build, max));
+    }
+    let features = v
+        .get("features")
+        .and_then(|x| x.as_table())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    if features > 0 {
+        out.push_str(&format!("  features: {features}\n"));
+    }
+    Ok(out)
+}
+
+fn render_package_json(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    let obj_keys = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|x| x.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let name = v.get("name").and_then(|x| x.as_str());
+    let version = v.get("version").and_then(|x| x.as_str());
+
+    let mut out = String::from("manifest> ");
+    let header = match (name, version) {
+        (Some(n), Some(ver)) => format!("{display}: package.json (Node) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: package.json (Node) — {n}"),
+        _ => format!("{display}: package.json (Node)"),
+    };
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&format_dep_section(
+        "dependencies",
+        obj_keys("dependencies"),
+        max,
+    ));
+    out.push_str(&format_dep_section(
+        "devDependencies",
+        obj_keys("devDependencies"),
+        max,
+    ));
+    let peer = obj_keys("peerDependencies");
+    if !peer.is_empty() {
+        out.push_str(&format_dep_section("peerDependencies", peer, max));
+    }
+    let scripts = obj_keys("scripts");
+    if !scripts.is_empty() {
+        out.push_str(&format_dep_section("scripts", scripts, max));
+    }
+    Ok(out)
+}
+
+fn render_pyproject(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let project = v.get("project");
+    let poetry = v.get("tool").and_then(|t| t.get("poetry"));
+    // PEP 621 [project] is canonical; fall back to [tool.poetry] for name/version.
+    let name = toml_str(project, "name").or_else(|| toml_str(poetry, "name"));
+    let version = toml_str(project, "version").or_else(|| toml_str(poetry, "version"));
+
+    // PEP 621: [project].dependencies is an array of requirement strings.
+    let mut deps: Vec<String> = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_str().map(requirement_name))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Poetry: [tool.poetry.dependencies] is a table (skip the `python` pin).
+    if deps.is_empty() {
+        if let Some(table) = poetry
+            .and_then(|p| p.get("dependencies"))
+            .and_then(|x| x.as_table())
+        {
+            deps = table
+                .keys()
+                .filter(|k| k.as_str() != "python")
+                .cloned()
+                .collect();
+        }
+    }
+    let backend = v
+        .get("build-system")
+        .and_then(|b| b.get("build-backend"))
+        .and_then(|x| x.as_str());
+
+    let mut out = String::from("manifest> ");
+    let header = match (name, version) {
+        (Some(n), Some(ver)) => format!("{display}: pyproject.toml (Python) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: pyproject.toml (Python) — {n}"),
+        _ => format!("{display}: pyproject.toml (Python)"),
+    };
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&format_dep_section("dependencies", deps, max));
+    if let Some(b) = backend {
+        out.push_str(&format!("  build-backend: {b}\n"));
+    }
+    Ok(out)
+}
+
+fn render_manifest(display: &str, path: &str, content: &str, max: usize) -> String {
+    let result = match detect_manifest_kind(path, content) {
+        ManifestKind::Cargo => render_cargo_manifest(display, content, max),
+        ManifestKind::PackageJson => render_package_json(display, content, max),
+        ManifestKind::Pyproject => render_pyproject(display, content, max),
+        ManifestKind::Unknown => Err(
+            "unrecognized manifest (expected Cargo.toml, package.json, or pyproject.toml)"
+                .to_string(),
+        ),
+    };
+    match result {
+        Ok(s) => s,
+        Err(e) => format!("manifest> {display}: could not parse — {e}\n"),
+    }
+}
+
+pub fn read_manifest_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "read_manifest".to_string(),
+        description: "Summarize a project manifest (Cargo.toml, package.json, or pyproject.toml): \
+                      package name/version, edition/build-backend, and dependency names by section \
+                      (bounded + de-duplicated), so the model reads a project's real dependencies \
+                      and build shape instead of guessing. Read-only; same allowlist as \
+                      fs_read_file; a malformed manifest is disclosed honestly, not guessed."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a Cargo.toml, package.json, or pyproject.toml"},
+                "max_deps": {"type": "integer", "description": "Dependency names listed per section (optional, default 50, max 500)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_manifest_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_manifest_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadManifestArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let max = a
+        .max_deps
+        .unwrap_or(MANIFEST_DEFAULT_MAX_DEPS)
+        .clamp(1, MANIFEST_MAX_DEPS_CEILING);
+    let content = read_config_text(policy, &a.path).await?;
+    let rendered = render_manifest(&a.path, &a.path, &content, max);
+    Ok(policy.cap_output(rendered))
+}
+
 // --- fs.find_symbol (heuristic symbol navigation) ---------------------------
 
 /// Never scan more than this many files in one call (bounds a huge tree).
@@ -5164,6 +5446,138 @@ mod tests {
         std::fs::write(&bad, SAMPLE_PNG).unwrap();
         assert!(matches!(
             read_image_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn manifest_cargo_summary() {
+        let content = r#"
+[package]
+name = "kitsu-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = "1"
+serde = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+extra = []
+"#;
+        let out = render_manifest("Cargo.toml", "Cargo.toml", content, 50);
+        assert!(out.contains("Cargo (Rust) — kitsu-tools v0.1.0"), "{out}");
+        assert!(out.contains("edition 2021"), "{out}");
+        // Sorted + counted.
+        assert!(out.contains("dependencies (2): serde, tokio"), "{out}");
+        assert!(out.contains("dev-dependencies (1): tempfile"), "{out}");
+        assert!(out.contains("features: 1"), "{out}");
+    }
+
+    #[test]
+    fn manifest_package_json_summary() {
+        let content = r#"{
+  "name": "webapp",
+  "version": "2.3.0",
+  "dependencies": { "react": "^18", "zod": "^3" },
+  "devDependencies": { "vitest": "^1" },
+  "scripts": { "build": "vite build", "test": "vitest" }
+}"#;
+        let out = render_manifest("package.json", "package.json", content, 50);
+        assert!(out.contains("package.json (Node) — webapp v2.3.0"), "{out}");
+        assert!(out.contains("dependencies (2): react, zod"), "{out}");
+        assert!(out.contains("devDependencies (1): vitest"), "{out}");
+        assert!(out.contains("scripts (2): build, test"), "{out}");
+    }
+
+    #[test]
+    fn manifest_pyproject_pep621_and_poetry() {
+        let pep621 = r#"
+[project]
+name = "svc"
+version = "0.4.1"
+dependencies = ["requests>=2.0", "flask (==3.0)", "pydantic"]
+
+[build-system]
+build-backend = "hatchling.build"
+"#;
+        let out = render_manifest("pyproject.toml", "pyproject.toml", pep621, 50);
+        assert!(
+            out.contains("pyproject.toml (Python) — svc v0.4.1"),
+            "{out}"
+        );
+        // Requirement names extracted from PEP 508 strings, sorted.
+        assert!(
+            out.contains("dependencies (3): flask, pydantic, requests"),
+            "{out}"
+        );
+        assert!(out.contains("build-backend: hatchling.build"), "{out}");
+
+        let poetry = r#"
+[tool.poetry]
+name = "svc2"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = "^0.27"
+"#;
+        let out = render_manifest("pyproject.toml", "pyproject.toml", poetry, 50);
+        assert!(
+            out.contains("pyproject.toml (Python) — svc2 v1.0.0"),
+            "{out}"
+        );
+        // The `python` pin is not a dependency; httpx is.
+        assert!(out.contains("dependencies (1): httpx"), "{out}");
+    }
+
+    #[test]
+    fn manifest_requirement_name_and_bad_input() {
+        assert_eq!(requirement_name("requests>=2.0"), "requests");
+        assert_eq!(
+            requirement_name("ruff (==0.1); python_version>'3.7'"),
+            "ruff"
+        );
+        assert_eq!(requirement_name("  numpy  "), "numpy");
+        // A malformed manifest is disclosed, not guessed or panicked on.
+        let out = render_manifest("Cargo.toml", "Cargo.toml", "this is not = [valid toml", 50);
+        assert!(out.contains("could not parse"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_manifest_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &path,
+            "[package]\nname = \"demo\"\nversion = \"9.9.9\"\n\n[dependencies]\nanyhow = \"1\"\n",
+        )
+        .unwrap();
+
+        let out = read_manifest_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("manifest ok");
+        assert!(out.contains("demo v9.9.9"), "{out}");
+        assert!(out.contains("dependencies (1): anyhow"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("Cargo.toml");
+        std::fs::write(&bad, "[package]\nname = \"x\"\n").unwrap();
+        assert!(matches!(
+            read_manifest_run(
                 &policy,
                 &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
             )
