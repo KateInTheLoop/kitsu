@@ -1065,3 +1065,84 @@ function's start is not sufficient to confirm the range matches the
 comments, unrelated structs) can sit between a function's closing brace
 and the next `fn`. Verify the target function's own closing brace
 directly, not just its neighbor's opening line.
+
+### Cycle 10 — 2026-08-15 — clean process, but the zero-drift citation streak breaks (one off-by-one, twice)
+
+Target: `context_window_shortfall` (`crates/kitsu-core/src/orchestrator.rs`),
+a small pure predicate (`fn(reported: u64, estimated_sent: u64, window: u64)
+-> bool`) no prior cycle had touched — arithmetic-heavy (overflow/underflow,
+threshold logic) and reviewable in isolation, matching DeepSeek's strength.
+Pre-dispatch check (3rd instance of this exact gap, per the process note
+above) found the assigned 791-835 range again overshot the true function:
+the function's own closing brace is at line **806**, not 835 — lines 808-835
+are the unrelated `TurnCompletion`/`AgentTurnStatus` definitions and
+`run_agent_turn`'s doc comment. Corrected the range to **785-806** (the
+function's own doc comment plus body, 22 lines) before dispatch, so DeepSeek
+was never handed the oversized range this time.
+
+- **Process: 7th clean review cycle running.** Exactly 1 ranged read
+  (785-806, 22 lines, matching the corrected range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised). kitsu-usage (successful
+  run) `{"prompt_tokens":16876,"completion_tokens":3755,"total_tokens":20631}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))". No transport retry needed.
+- **Citation drift found — streak ends at 3 (cycles 7, 8, 9).** Spot-checked
+  all citations against ground truth. Proposals 1, 2 and the standalone
+  quote of line 805 (`clamped_boundary || (wide_margin && plausible_clamp)`)
+  are letter-perfect. Proposals 3 and 4 both cite `let plausible_clamp =
+  reported.saturating_mul(4) >= window;` as **line 803**; the true line is
+  **804**. Root cause is visible in Proposal 3's own quoted block: DeepSeek
+  compressed the three-line comment spanning true lines 801-803 (`//
+  estimator overshooting an accurate tokenizer (hosted routers report` /
+  `// exact counts) — cycle-14's HF audit saw this warning on nearly
+  every` / `// turn. Stay quiet rather than crying wolf.`) into two
+  ellipsis-joined display lines (`// estimator overshooting an accurate
+  tokenizer … Stay quiet rather than` / `// crying wolf.`), which silently
+  drops one line of verbatim quoting and shifts every subsequent line
+  number in that block down by one. Proposal 3's own header still states
+  the correct overall range ("lines 798-804"), so the drift is confined to
+  the in-body per-line labels on the elided quote, not the citation's
+  bounding claim.
+- **Proposal 3's core claim is also doubtful, independent of the citation
+  drift.** It asserts `plausible_clamp` "computes the opposite condition"
+  from what the comment describes, i.e. that the name is inverted. Working
+  the boolean algebra from the read range alone: the comment's "stay quiet"
+  case is `reported < window/4` (implied clamp window under a quarter of
+  resolved); `plausible_clamp = reported.saturating_mul(4) >= window` is
+  exactly `reported >= window/4` — the *negation* of the stay-quiet case,
+  which is precisely what a variable named "the clamp hypothesis is
+  plausible" should mean, and precisely what the final `wide_margin &&
+  plausible_clamp` conjunct needs to correctly gate on. There is no
+  inversion; the naming and the boolean algebra agree. This claim was
+  fully checkable from the 22-line range alone (no hedge was owed or
+  given), so it counts as a soft-wrong claim, not an under-hedged one.
+  Proposals 1, 2, and 4 hold up: 1 (wide_margin dead zone below
+  estimated_sent=256, line 796) is correct arithmetic, appropriately
+  hedged on real-world plausibility of tiny estimates; 2 (doc comment at
+  788-790 omits the `plausible_clamp` quarter-window conjunct entirely) is
+  correct and directly verifiable in-range; 4 (`saturating_mul(4)` at 804
+  silently absorbs a `reported > u64::MAX/4` overflow into "plausible")
+  is correct and correctly hedged on whether callers bound `reported`
+  upstream.
+
+**Grade: B+.** Process discipline stayed perfect — one ranged read
+covering exactly the corrected range, one write, no spawning, clean
+run — and 3 of 4 proposals (1, 2, 4) are accurate, well-hedged, and
+useful. Docked from the A/A- band because this is the first cycle with
+an actual citation-line drift (803 vs. 804, twice) rather than an
+imprecise-but-hedged framing, and because Proposal 3's central claim is
+a checkable-in-range misread of the boolean logic, not merely loosely
+worded. Root cause for both: compressing multi-line source text with an
+ellipsis before re-numbering is risky — future prompts could add "quote
+each source line verbatim on its own labeled line; do not elide or merge
+lines even when shortening the surrounding prose" to close this off.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 7-for-7 clean (cycles 3, 4, 6, 7, 8, 9, 10) — but the
+citation-fidelity streak drops to 3-for-4 (cycles 7, 8, 9 clean; cycle 10
+one repeated off-by-one). Still review-only until R4.10 (implementation
+type-chasing, per cycle 5, is unaddressed). The range-overshoot gap (now
+hit on cycles 4, 8, 9) continues to require supervisor pre-dispatch
+verification of the target function's own closing brace, not just its
+neighbor's opening line; cycle 10's pre-check caught it before dispatch,
+so DeepSeek was not exposed to the oversized range this time.
