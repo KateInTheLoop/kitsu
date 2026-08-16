@@ -15660,11 +15660,14 @@ async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session
 
     // A positional prompt over a non-tty stdin drives the piped/session path
     // (the automation surface the fix targets), not scripted or interactive.
+    // JSONL is intentional here: the regression must prove that a synthetic
+    // deadline marker is attributed to the request round that timed out.
     let home_path = home.path().to_path_buf();
     let output = tokio::task::spawn_blocking(move || {
         let mut cmd = base_cmd(&home_path);
         cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
             .args([
+                "--jsonl",
                 "--no-stream",
                 "--timeout-secs",
                 "3",
@@ -15704,5 +15707,82 @@ async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session
         persisted,
         "a piped turn that times out after a completed tool round must persist it as a \
          resumable session (none found under {sessions_dir:?})"
+    );
+
+    let events = String::from_utf8(output.stdout)
+        .expect("JSONL stdout must be UTF-8")
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("invalid JSONL line ({error}): {line}"))
+        })
+        .collect::<Vec<_>>();
+    let marker_delta = events
+        .iter()
+        .find(|event| event["type"] == "assistant_delta")
+        .expect("deadline marker delta");
+    assert_eq!(
+        marker_delta["round"], 2,
+        "marker belongs to timed-out round"
+    );
+    assert_eq!(
+        marker_delta["text"],
+        "\n[stopped: deadline expired - completed tool results were preserved; no final answer was produced]"
+    );
+    let marker_assistant = events
+        .iter()
+        .find(|event| event["type"] == "assistant")
+        .expect("synthetic resumable assistant marker");
+    assert_eq!(marker_assistant["text"], marker_delta["text"]);
+    let disposition = events
+        .iter()
+        .find(|event| event["type"] == "assistant_disposition")
+        .expect("partial disposition");
+    assert_eq!(disposition["status"], "committed_partial");
+    assert!(disposition["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("no final answer was produced")));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["session_snapshot_state"], "resumable");
+    let session_id = summary["session_id"]
+        .as_str()
+        .expect("resumable session id")
+        .to_string();
+
+    let mut show = base_cmd(home.path());
+    let shown = show
+        .args(["sessions", "--json", "show", &session_id])
+        .output()
+        .expect("show preserved session");
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let messages = shown["messages"].as_array().expect("saved transcript");
+    let tool_ids = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["tool_call_id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        messages.iter().all(|message| {
+            message["role"] != "assistant"
+                || message["tool_calls"].as_array().map_or(true, |calls| {
+                    calls.iter().all(|call| {
+                        call["call_id"]
+                            .as_str()
+                            .is_some_and(|call_id| tool_ids.contains(call_id))
+                    })
+                })
+        }),
+        "preserved transcript contains a dangling tool call: {messages:?}"
+    );
+    assert_eq!(messages.last().unwrap()["content"], marker_delta["text"]);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one request per completed/timed-out round"
     );
 }
