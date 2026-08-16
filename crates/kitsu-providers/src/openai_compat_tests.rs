@@ -450,6 +450,64 @@ async fn test_physical_attempt_telemetry_reports_retry_and_terminal_success() {
 }
 
 #[tokio::test]
+async fn test_transient_gateway_504_is_retried_end_to_end() {
+    // A 504 Gateway Timeout (no Retry-After header) must now drive the send
+    // loop to retry on local backoff and then succeed — the whole point of
+    // widening the retryable set beyond 429/503. Without the fix this returned
+    // terminally on the first 504 and the turn was lost.
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            if responder_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                ResponseTemplate::new(504)
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(sse_two_text_deltas())
+            }
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 1;
+    provider.timeout = Duration::from_secs(3);
+    let events = Arc::new(std::sync::Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+
+    let stream = provider
+        .chat_stream_with_telemetry(simple_request(), Some(sink))
+        .await
+        .expect("a 504 then 200 should retry once and then succeed");
+    let _ = collect_stream(stream).await;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2, "the 504 must be retried");
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    let retry = &events[0];
+    assert_eq!(retry.attempt, 1);
+    assert_eq!(retry.category, ProviderAttemptCategory::ServerError);
+    assert_eq!(retry.status, Some(504));
+    assert_eq!(retry.outcome, ProviderAttemptOutcome::RetryScheduled);
+    assert!(!retry.terminal);
+    // No Retry-After header → local backoff floor is used, not an advertised delay.
+    assert!(retry.retry_delay_ms.is_some());
+    assert!(!retry.retry_after_used);
+
+    let completed = &events[1];
+    assert_eq!(completed.attempt, 2);
+    assert_eq!(completed.category, ProviderAttemptCategory::Success);
+    assert_eq!(completed.status, Some(200));
+    assert!(completed.terminal);
+}
+
+#[tokio::test]
 async fn test_cancelling_during_retry_backoff_records_one_terminal_disposition() {
     let server = MockServer::start().await;
     let calls = Arc::new(AtomicUsize::new(0));
