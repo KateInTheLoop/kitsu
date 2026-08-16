@@ -9103,12 +9103,9 @@ fn deadline_partial_answer(
     error: &kitsu_core::AgentError,
     partial: &PartialAnswerBuffer,
 ) -> Option<PartialAnswer> {
-    matches!(
-        error,
-        kitsu_core::AgentError::Provider(ProviderError::Timeout)
-    )
-    .then(|| snapshot_partial_answer(partial))
-    .filter(|partial| !partial.text.is_empty())
+    is_deadline_timeout(error)
+        .then(|| snapshot_partial_answer(partial))
+        .filter(|partial| !partial.text.is_empty())
 }
 
 /// Did this turn fail on the inference deadline (as opposed to a provider or
