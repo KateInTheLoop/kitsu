@@ -108,10 +108,18 @@ guarantees requires a new schema identifier.
   output was already delivered, the one-shot paths (`ask`, piped chat, review)
   do not destroy it: a final marker delta (`[stopped: deadline expired …]`) and
   an `assistant` payload are emitted, and the disposition closes as
-  `committed_partial` with a reason. The turn still ends with an `error` event
-  and exit code 2 — `committed_partial` changes only how the delivered text is
-  classified, never the failure status. Scripted (`--script`) turns keep strict
-  `discarded` rollback so later turns continue from consistent history.
+  `committed_partial` with a reason. If the deadline arrives after one or more
+  tool rounds completed but before the next assistant text, the same
+  `committed_partial` status preserves those completed tool results and emits
+  the explicit marker `[stopped: deadline expired - completed tool results were
+  preserved; no final answer was produced]`; the `assistant` payload in that
+  case is host-authored resumable framing, not model-authored answer text. Its
+  `assistant_delta.round` is the active provider-request round, even when no
+  assistant delta arrived in that round. The turn still ends with an `error`
+  event and exit code 2 — `committed_partial` changes only how the delivered
+  text or completed work is classified, never the failure status. Scripted
+  (`--script`) turns keep strict `discarded` rollback so later turns continue
+  from consistent history.
 - `rollback_retained_changes` is emitted after a turn's `turn_finished` when
   that turn failed (or was cancelled) and was rolled back out of conversation
   state while completed file changes it made remain on disk. It carries the

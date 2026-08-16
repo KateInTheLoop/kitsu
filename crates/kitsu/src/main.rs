@@ -8949,14 +8949,21 @@ fn live_agent_event_log_capturing(
 ) -> kitsu_core::AgentEventLog {
     let turn_id = turn_id.to_string();
     kitsu_core::AgentEventLog::with_fallible_observer(move |event| {
-        if let (Some(partial), kitsu_core::AgentRuntimeEvent::AssistantDelta { round, text }) =
-            (partial.as_ref(), event)
-        {
+        let observed_round = match event {
+            kitsu_core::AgentRuntimeEvent::ProviderRequest { round, .. }
+            | kitsu_core::AgentRuntimeEvent::AssistantDelta { round, .. } => Some(*round),
+            _ => None,
+        };
+        if let Some(partial) = partial.as_ref() {
             let mut partial = partial
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner());
-            partial.text.push_str(text);
-            partial.last_round = partial.last_round.max(*round);
+            if let Some(round) = observed_round {
+                partial.last_round = partial.last_round.max(round);
+            }
+            if let kitsu_core::AgentRuntimeEvent::AssistantDelta { text, .. } = event {
+                partial.text.push_str(text);
+            }
         }
         if jsonl {
             // The process-long emitter retains a terminal write failure. The
@@ -9050,6 +9057,7 @@ impl AssistantDisposition {
 /// orchestrator's `[stopped: …]`/`[truncated: …]` stream markers so piped
 /// consumers can detect the truncation in-band.
 const DEADLINE_PARTIAL_MARKER: &str = "\n[stopped: deadline expired - answer is partial]";
+const DEADLINE_TOOL_ROUNDS_MARKER: &str = "\n[stopped: deadline expired - completed tool results were preserved; no final answer was produced]";
 
 /// Close a deadline-expired turn that already streamed real output: keep the
 /// delivered partial answer and label it honestly (human notice / JSONL
@@ -9063,7 +9071,12 @@ fn emit_partial_deadline_answer(
     turn_id: &str,
     partial: &PartialAnswer,
 ) -> Result<String, CliError> {
-    let partial_text = format!("{}{}", partial.text, DEADLINE_PARTIAL_MARKER);
+    let marker = if partial.text.is_empty() {
+        DEADLINE_TOOL_ROUNDS_MARKER
+    } else {
+        DEADLINE_PARTIAL_MARKER
+    };
+    let partial_text = format!("{}{}", partial.text, marker);
     if cli.jsonl {
         // Keep the deltas-concatenate-to-assistant contract: the marker is
         // emitted as a delta before the assistant payload that includes it.
@@ -9072,7 +9085,7 @@ fn emit_partial_deadline_answer(
             serde_json::json!({
                 "turn_id": turn_id,
                 "round": partial.last_round.max(1),
-                "text": DEADLINE_PARTIAL_MARKER,
+                "text": marker,
             }),
         )?;
         emit_jsonl(
@@ -9082,16 +9095,24 @@ fn emit_partial_deadline_answer(
     } else {
         // The partial bytes are already on stdout; append the marker there so
         // a piped consumer can detect the truncation without parsing stderr.
-        kitsu_render::print_message(DEADLINE_PARTIAL_MARKER);
+        kitsu_render::print_message(marker);
     }
+    let reason = if partial.text.is_empty() {
+        format!(
+            "timed out after {}s - completed tool results and file changes were kept; no final answer was produced",
+            cli.timeout_secs
+        )
+    } else {
+        format!(
+            "timed out after {}s - the answer above is partial; completed tool results and file changes were kept",
+            cli.timeout_secs
+        )
+    };
     finish_assistant_disposition(
         cli,
         turn_id,
         AssistantDisposition::CommittedPartial,
-        Some(&format!(
-            "timed out after {}s - the answer above is partial; completed tool results and file changes were kept",
-            cli.timeout_secs
-        )),
+        Some(&reason),
     )?;
     Ok(partial_text)
 }
