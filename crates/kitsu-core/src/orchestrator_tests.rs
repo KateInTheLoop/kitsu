@@ -242,6 +242,7 @@ fn cfg(max_rounds: u32) -> AgentConfig {
         max_context_bytes: 128 * 1024,
         context_window: None,
         offload_dir: None,
+        offload_char_cap: None,
         artifact_policy: crate::orchestrator::ArtifactStoragePolicy::Automatic,
         stream: false,
         temperature: None,
@@ -2642,6 +2643,37 @@ fn maybe_offload_is_noop_without_a_dir() {
     use crate::orchestrator::maybe_offload;
     let big = "x".repeat(20_000);
     assert_eq!(maybe_offload(big.clone(), "c", None), (big, None));
+}
+
+/// "Recall mode": a lower offload cap makes a moderate result retrievable.
+/// The same result that the default 8K cap keeps inline is, under a small cap,
+/// offloaded to a re-readable `fs_read_file` pointer — so trimming it later
+/// leaves a recoverable handle instead of losing the evidence (the failure that
+/// made a small-window model hallucinate `find_cli_tables` output).
+#[test]
+fn offload_cap_makes_moderate_results_retrievable() {
+    use crate::orchestrator::maybe_offload_with_cap;
+    let dir = tempfile::tempdir().unwrap();
+    let moderate = "d".repeat(2_000);
+
+    // Under the default ~8K cap: kept inline, no artifact.
+    let (out, path) = maybe_offload_with_cap(moderate.clone(), "c", Some(dir.path()), 8 * 1024);
+    assert_eq!(out, moderate);
+    assert!(path.is_none(), "under the default cap it stays inline");
+
+    // Under a small recall cap: offloaded to a re-readable pointer.
+    let (out, path) = maybe_offload_with_cap(moderate.clone(), "c", Some(dir.path()), 1_024);
+    assert!(path.is_some(), "over the recall cap it is offloaded");
+    assert!(
+        out.contains("fs_read_file"),
+        "pointer tells the model how to recall"
+    );
+    assert!(
+        out.len() < moderate.len(),
+        "context keeps only the compact pointer"
+    );
+    // Full content is intact on disk for recall.
+    assert_eq!(std::fs::read_to_string(path.unwrap()).unwrap(), moderate);
 }
 
 /// The cycle-15 headline regression: with a huge window and a nearly empty

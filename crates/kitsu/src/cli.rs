@@ -147,6 +147,17 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub max_output_tokens: Option<u32>,
 
+    /// "Recall mode": size (chars) above which a successful tool result is
+    /// offloaded to a file and shown as a re-readable pointer instead of kept
+    /// inline. Defaults to ~8192. LOWERING it (e.g. 1024) keeps the working
+    /// context lean and — crucially — makes trimming lossless: an evicted result
+    /// leaves an `fs_read_file` pointer the model can recall, instead of a
+    /// dead "[older tool output elided]". Best for small-window models and long,
+    /// tool-heavy runs where early evidence would otherwise be trimmed and
+    /// hallucinated over.
+    #[arg(long, value_name = "CHARS", global = true)]
+    pub offload_cap: Option<u32>,
+
     /// Never prompt for filesystem access. Enabled filesystem tools remain
     /// confined to explicit/current read and write roots; requests outside
     /// those roots are denied. This never registers a tool or approves a
