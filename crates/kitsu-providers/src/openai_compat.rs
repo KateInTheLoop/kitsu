@@ -856,7 +856,8 @@ fn status_category(status: StatusCode) -> ProviderAttemptCategory {
 /// Is an HTTP response status a transient failure worth retrying within the
 /// inference budget? Rate limiting (429) and the transient gateway/proxy
 /// failures — 408 Request Timeout, 502 Bad Gateway, 503 Service Unavailable,
-/// 504 Gateway Timeout, and Cloudflare's non-standard 520-524 — are the ones a
+/// 504 Gateway Timeout, Cloudflare's non-standard 520-524, and 529 Overloaded
+/// (used by some routers) — are the ones a
 /// hosted router raises when an upstream is momentarily slow or overloaded; a
 /// second attempt commonly succeeds. Everything else (a genuine 500 from bad
 /// input, any 4xx, an auth failure) is deterministic and must not be retried.
@@ -865,7 +866,7 @@ fn status_category(status: StatusCode) -> ProviderAttemptCategory {
 fn is_retryable_status(status: StatusCode) -> bool {
     matches!(
         status.as_u16(),
-        408 | 429 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524
+        408 | 429 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524 | 529
     )
 }
 
@@ -1957,7 +1958,7 @@ mod prompt_cache_key_tests {
     fn transient_gateway_statuses_are_retryable() {
         // The transient failures a hosted router raises when an upstream is
         // momentarily slow/overloaded — a second attempt commonly succeeds.
-        for code in [408u16, 429, 502, 503, 504, 520, 521, 522, 523, 524] {
+        for code in [408u16, 429, 502, 503, 504, 520, 521, 522, 523, 524, 529] {
             assert!(
                 is_retryable_status(StatusCode::from_u16(code).unwrap()),
                 "status {code} should be retryable"
