@@ -1181,6 +1181,17 @@ fn runtime_mount_paths(
             mounts.push(path);
         }
     }
+    // The Debian/Fedora "alternatives" symlink farm: `/usr/bin/awk`,
+    // `/usr/bin/editor`, `/usr/bin/pager`, `cc`, and friends are symlinks into
+    // `/etc/alternatives`, which in turn points back under `/usr/bin`. `/usr` is
+    // already mounted above, but without the intermediate `/etc/alternatives`
+    // directory the chain dead-ends inside the sandbox and the tool resolves to
+    // "command not found". Mounting the farm read-only restores those tools
+    // without exposing anything writable.
+    let alternatives = PathBuf::from("/etc/alternatives");
+    if alternatives.exists() {
+        mounts.push(alternatives);
+    }
     for configured in &config.readonly_runtime_roots {
         let current = std::fs::canonicalize(configured).map_err(|error| {
             CommandContainmentError::new(
@@ -4810,5 +4821,30 @@ mod tests {
         assert_eq!(output["termination"], "exited");
         assert_eq!(output["exit_code"], 0);
         assert_eq!(output["stdout"], "ok");
+    }
+
+    // The alternatives symlink farm (`/usr/bin/awk -> /etc/alternatives/awk ->
+    // /usr/bin/mawk`) only resolves inside the sandbox when `/etc/alternatives`
+    // is mounted alongside `/usr`. Assert the invariant against the real host:
+    // wherever the farm exists, the default containment must mount it. On hosts
+    // without it (the directory is absent), the check is vacuous by design,
+    // matching the function's own `.exists()` guard.
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn default_containment_mounts_alternatives_farm_when_present() {
+        let mounts = runtime_mount_paths(&CommandContainmentConfig::default()).unwrap();
+        let farm = PathBuf::from("/etc/alternatives");
+        if farm.exists() {
+            assert!(
+                mounts.contains(&farm),
+                "/etc/alternatives exists on host but was not mounted into the sandbox; \
+                 alternatives-managed tools (awk, editor, pager) would fail to resolve"
+            );
+        }
+        // `/usr` is unconditionally mounted where present, so the farm can never
+        // be the *only* mount — a sanity check that the base set is intact.
+        if PathBuf::from("/usr").exists() {
+            assert!(mounts.contains(&PathBuf::from("/usr")));
+        }
     }
 }
