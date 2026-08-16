@@ -121,6 +121,19 @@ fn rg_available() -> bool {
 mod tests {
     use super::*;
 
+    const CODEX_READ_CAPABILITIES: [&str; 10] = [
+        "fs_read_image",
+        "find_symbol",
+        "read_manifest",
+        "fs_read_docx",
+        "audit_summary",
+        "scan_secrets",
+        "fs_read_pptx",
+        "fs_read_notebook",
+        "fs_read_html",
+        "outline_file",
+    ];
+
     #[test]
     fn write_registration_advertises_write_and_edit_tools() {
         let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
@@ -169,6 +182,73 @@ mod tests {
             .descriptors()
             .iter()
             .any(|d| d.name == "read_document"));
+    }
+
+    /// Rebase guard: every capability added by the Codex UX branch must retain
+    /// exactly one advertised handler and a valid path-based object schema.
+    /// A conflict that keeps a descriptor but drops its handler (or vice versa)
+    /// would otherwise compile while leaving the model-facing registry broken.
+    #[test]
+    fn codex_read_capabilities_have_unique_path_schemas() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools(&mut registry, policy);
+
+        let mut all_names = std::collections::HashSet::new();
+        for descriptor in registry.descriptors() {
+            assert!(
+                all_names.insert(descriptor.name.as_str()),
+                "duplicate advertised tool descriptor: {}",
+                descriptor.name
+            );
+        }
+
+        for name in CODEX_READ_CAPABILITIES {
+            assert!(registry.is_registered(name), "missing handler for {name}");
+            let descriptor = registry
+                .descriptors()
+                .iter()
+                .find(|descriptor| descriptor.name == name)
+                .unwrap_or_else(|| panic!("missing descriptor for {name}"));
+            assert_eq!(descriptor.parameters["type"], "object", "{name}");
+            assert_eq!(
+                descriptor.parameters["properties"]["path"]["type"], "string",
+                "{name} must expose a string path"
+            );
+            assert!(
+                descriptor.parameters["required"]
+                    .as_array()
+                    .is_some_and(|required| required.iter().any(|field| field == "path")),
+                "{name} must require path"
+            );
+        }
+    }
+
+    /// All Codex-added filesystem capabilities share the same read authority.
+    /// Verify the registry integration cannot accidentally bypass that boundary
+    /// for one format or analysis helper during conflict resolution.
+    #[tokio::test]
+    async fn codex_read_capabilities_fail_closed_without_read_authority() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools(&mut registry, policy);
+        let denied_path = "/kitsu-rebase-guard/not-authorized";
+
+        for name in CODEX_READ_CAPABILITIES {
+            let args = if name == "find_symbol" {
+                serde_json::json!({"path": denied_path, "symbol": "needle"})
+            } else {
+                serde_json::json!({"path": denied_path})
+            };
+            let error = match registry.run(name, args.to_string()).await {
+                Err(error) => error,
+                Ok(output) => panic!("{name} bypassed read policy: {output}"),
+            };
+            assert!(
+                matches!(error, crate::ToolError::PolicyDenied(_)),
+                "{name} returned the wrong denial: {error}"
+            );
+        }
     }
 
     #[test]
