@@ -1258,6 +1258,82 @@ fn extract_xlsx(
     Ok(out)
 }
 
+// --- fs.read_image (metadata only) ------------------------------------------
+
+/// Bytes read from an image for header/metadata parsing. Every format keeps
+/// its dimensions in the leading bytes, so this bounds memory regardless of
+/// the image's on-disk size.
+const IMAGE_HEADER_BYTES: u64 = 64 * 1024;
+
+#[derive(Deserialize)]
+struct ReadImageArgs {
+    path: String,
+}
+
+pub fn read_image_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_image".to_string(),
+        description: "Report an image's format and pixel dimensions (PNG/JPEG/GIF/WEBP/BMP and \
+                      more) from its header — metadata only. This is a TEXT tool: it does NOT \
+                      interpret the picture's content; understanding what an image depicts \
+                      requires a vision-capable model/gateway. Use it to confirm a file is a \
+                      valid image and learn its size without hallucinating its contents."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Image file path"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_image_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_image_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadImageArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        let mut header = Vec::new();
+        Read::take(file, IMAGE_HEADER_BYTES)
+            .read_to_end(&mut header)
+            .map_err(|e| format!("read failed: {e}"))?;
+        Ok::<_, String>(render_image_metadata(&display, &header))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(ToolError::ExecError)?;
+    Ok(policy.cap_output(rendered))
+}
+
+/// Pure formatter: derive format + dimensions from an image header. IO-free so
+/// it is unit-testable from a byte slice.
+fn render_image_metadata(path: &str, header: &[u8]) -> String {
+    let fmt = imagesize::image_type(header)
+        .map(|t| format!("{t:?}"))
+        .unwrap_or_else(|_| "unrecognized".to_string());
+    match imagesize::blob_size(header) {
+        Ok(sz) => format!(
+            "image> {path}: {fmt}, {}x{} px (metadata only — this text tool does not interpret \
+             image content; a vision-capable model is required to see what it depicts)\n",
+            sz.width, sz.height
+        ),
+        Err(_) => format!(
+            "image> {path}: detected {fmt} but could not read dimensions from the header \
+             (truncated or unsupported variant); not an interpretable image for a text tool\n"
+        ),
+    }
+}
+
 // --- fs.read_document (type-aware dispatch) ---------------------------------
 
 #[derive(Deserialize)]
@@ -1278,6 +1354,10 @@ enum DocType {
     Image(&'static str),
     /// Zip-based Office document (xlsx/docx/pptx); no extractor yet.
     Office(&'static str),
+    /// Jupyter notebook (`.ipynb`) — JSON with a `cells` array.
+    Notebook,
+    /// HTML document (`.html`/`.htm`) — extracted to plain text.
+    Html,
 }
 
 /// Detect the document class from magic bytes first (authoritative for binary
@@ -1317,6 +1397,8 @@ fn detect_doc_type(path: &Path, magic: &[u8]) -> DocType {
     }
     match ext.as_deref() {
         Some("csv") | Some("tsv") => DocType::Csv,
+        Some("ipynb") => DocType::Notebook,
+        Some("html") | Some("htm") => DocType::Html,
         Some("pdf") => DocType::Pdf, // extensionless-magic already handled above
         // Extension-only image hints (e.g. a truncated header) still classify.
         Some("png") => DocType::Image("PNG"),
@@ -1335,10 +1417,12 @@ pub fn read_document_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerF
         name: "read_document".to_string(),
         description: "Read a file by auto-detecting its type (extension + magic bytes) and routing \
                       to the right reader: CSV/TSV → structured table, PDF → text layer, plain text \
-                      → text. Always discloses the detected type and which reader ran. Images and \
-                      Office (xlsx/docx) files are detected and disclosed but not yet text-extracted \
-                      (use a dedicated tool or convert first). Unknown types fall back to a UTF-8 \
-                      text read. For paging a large CSV/PDF, call fs_read_csv/fs_read_pdf directly."
+                      → text, XLSX → spreadsheet cells, DOCX → paragraph text, PPTX → slide text, \
+                      .ipynb → notebook cells, .html/.htm → readable text. Always discloses the \
+                      detected type and which reader ran. Images report metadata only; unknown \
+                      zip-based Office types are detected and disclosed but not text-extracted. \
+                      Unknown types fall back to a UTF-8 text read. For paging a large CSV/PDF, \
+                      call fs_read_csv/fs_read_pdf directly."
             .to_string(),
         parameters: serde_json::json!({
             "type": "object",
@@ -1385,17 +1469,29 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
             "text → fs_read_file",
             read_file_run(policy, &path_args).await?,
         ),
-        DocType::Image(fmt) => (
-            "image (no text extraction)",
-            format!(
-                "detected {fmt} image. This is a text-oriented reader — image content is not \
-                 extracted here; a vision-capable model/gateway is required to interpret the \
-                 picture."
-            ),
+        DocType::Image(_) => (
+            "image → fs_read_image (metadata)",
+            read_image_run(policy, &path_args).await?,
         ),
         DocType::Office("XLSX") => (
             "XLSX → fs_read_xlsx",
             read_xlsx_run(policy, &path_args).await?,
+        ),
+        DocType::Office("DOCX") => (
+            "DOCX → fs_read_docx",
+            read_docx_run(policy, &path_args).await?,
+        ),
+        DocType::Office("PPTX") => (
+            "PPTX → fs_read_pptx",
+            read_pptx_run(policy, &path_args).await?,
+        ),
+        DocType::Notebook => (
+            "notebook → fs_read_notebook",
+            read_notebook_run(policy, &path_args).await?,
+        ),
+        DocType::Html => (
+            "HTML → fs_read_html",
+            read_html_run(policy, &path_args).await?,
         ),
         DocType::Office(fmt) => (
             "office (no extractor yet)",
@@ -1410,6 +1506,2311 @@ async fn read_document_run(policy: &Permissions, args: &str) -> Result<String, T
     // The delegate readers already cap their own output; the disclosure line
     // is a small fixed prefix, so no additional cap is needed here.
     Ok(format!("{disclosure}{body}"))
+}
+
+// --- fs.read_docx (Word paragraph-text extraction) --------------------------
+
+const DOCX_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+/// Decompressed `word/document.xml` cap — bounds a zip-bomb regardless of the
+/// (compressed) file-size guard above.
+const DOCX_MAX_XML_BYTES: u64 = 64 * 1024 * 1024;
+const DOCX_DEFAULT_MAX_PARAGRAPHS: usize = 500;
+const DOCX_MAX_PARAGRAPHS_CEILING: usize = 5000;
+/// Hard ceiling on paragraphs collected while parsing (bounds memory even
+/// before the display cap applies).
+const DOCX_MAX_COLLECT: usize = 50_000;
+
+#[derive(Deserialize)]
+struct ReadDocxArgs {
+    path: String,
+    /// Paragraphs shown (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_paragraphs: Option<usize>,
+}
+
+/// Parse `word/document.xml` text: concatenate `<w:t>` runs into paragraphs
+/// (`<w:p>`), turning `<w:tab/>` into a tab and `<w:br/>`/`<w:cr/>` into a
+/// newline. Returns the collected paragraphs and whether the collect ceiling
+/// was hit. Malformed XML stops parsing and returns what was gathered.
+/// Shared OOXML text extraction: concatenate `text_tag` runs into paragraphs
+/// delimited by `para_tag`, mapping `tab_tag` → tab and any `break_tags` →
+/// newline. Used by both docx (`w:t`/`w:p`) and pptx (`a:t`/`a:p`). Malformed
+/// XML stops parsing and returns what was gathered (honest partial).
+fn parse_ooxml_paragraphs(
+    xml: &str,
+    text_tag: &[u8],
+    para_tag: &[u8],
+    tab_tag: Option<&[u8]>,
+    break_tags: &[&[u8]],
+) -> (Vec<String>, bool) {
+    use quick_xml::events::Event;
+    use quick_xml::Reader;
+
+    let mut reader = Reader::from_str(xml);
+    let mut paragraphs: Vec<String> = Vec::new();
+    let mut current = String::new();
+    let mut in_text = false;
+    let mut collect_capped = false;
+    loop {
+        match reader.read_event() {
+            Ok(Event::Start(e)) if e.name().as_ref() == text_tag => in_text = true,
+            Ok(Event::End(e)) => {
+                let name = e.name();
+                if name.as_ref() == text_tag {
+                    in_text = false;
+                } else if name.as_ref() == para_tag {
+                    paragraphs.push(std::mem::take(&mut current));
+                    if paragraphs.len() >= DOCX_MAX_COLLECT {
+                        collect_capped = true;
+                        break;
+                    }
+                }
+            }
+            Ok(Event::Empty(e)) => {
+                let name = e.name();
+                if tab_tag == Some(name.as_ref()) {
+                    current.push('\t');
+                } else if break_tags.contains(&name.as_ref()) {
+                    current.push('\n');
+                }
+            }
+            Ok(Event::Text(e)) if in_text => {
+                if let Ok(decoded) = e.decode() {
+                    match quick_xml::escape::unescape(&decoded) {
+                        Ok(text) => current.push_str(&text),
+                        Err(_) => current.push_str(&decoded),
+                    }
+                }
+            }
+            // 0.41 surfaces `&ref;` / `&#n;` as their own event, not inside Text.
+            Ok(Event::GeneralRef(e)) if in_text => {
+                if let Ok(Some(c)) = e.resolve_char_ref() {
+                    current.push(c);
+                } else if let Ok(name) = e.decode() {
+                    match name.as_ref() {
+                        "amp" => current.push('&'),
+                        "lt" => current.push('<'),
+                        "gt" => current.push('>'),
+                        "quot" => current.push('"'),
+                        "apos" => current.push('\''),
+                        _ => {}
+                    }
+                }
+            }
+            Ok(Event::Eof) => break,
+            Err(_) => break,
+            _ => {}
+        }
+    }
+    // A trailing run not closed by the paragraph tag.
+    if !current.is_empty() {
+        paragraphs.push(current);
+    }
+    (paragraphs, collect_capped)
+}
+
+fn parse_docx_paragraphs(xml: &str) -> (Vec<String>, bool) {
+    parse_ooxml_paragraphs(
+        xml,
+        b"w:t",
+        b"w:p",
+        Some(b"w:tab".as_slice()),
+        &[b"w:br".as_slice(), b"w:cr".as_slice()],
+    )
+}
+
+fn render_docx(display: &str, xml: &str, max_paragraphs: usize, xml_truncated: bool) -> String {
+    let (paragraphs, collect_capped) = parse_docx_paragraphs(xml);
+    // Empty <w:p> are spacing; report and display only paragraphs with text.
+    let with_text: Vec<&String> = paragraphs.iter().filter(|p| !p.trim().is_empty()).collect();
+    let total = with_text.len();
+
+    let mut notes = String::new();
+    if xml_truncated {
+        notes.push_str(&format!(
+            ", document.xml truncated at {} MiB",
+            DOCX_MAX_XML_BYTES / (1024 * 1024)
+        ));
+    }
+    if collect_capped {
+        notes.push_str(&format!(", stopped at {DOCX_MAX_COLLECT} paragraphs"));
+    }
+
+    let mut out = format!(
+        "docx> {display}: {total} paragraph(s) with text \
+         [text only — no formatting, tables, or images]{notes}\n"
+    );
+    if total == 0 {
+        out.push_str(
+            "(no extractable text — the document may be empty, image-only, or use an \
+             unsupported structure)\n",
+        );
+        return out;
+    }
+    let shown = total.min(max_paragraphs);
+    for para in &with_text[..shown] {
+        out.push_str(para);
+        out.push('\n');
+    }
+    if total > shown {
+        out.push_str(&format!(
+            "[showing {shown} of {total} paragraphs; raise max_paragraphs for more]\n"
+        ));
+    }
+    out
+}
+
+fn extract_docx(path: &Path, display: &str, max_paragraphs: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| std::io::Error::other(format!("not a valid .docx (zip) file: {e}")))?;
+    let entry = archive.by_name("word/document.xml").map_err(|_| {
+        std::io::Error::other("not a Word .docx document (no word/document.xml inside)")
+    })?;
+    let mut buf = Vec::new();
+    Read::take(entry, DOCX_MAX_XML_BYTES).read_to_end(&mut buf)?;
+    let xml_truncated = buf.len() as u64 >= DOCX_MAX_XML_BYTES;
+    let xml = String::from_utf8_lossy(&buf);
+    Ok(render_docx(display, &xml, max_paragraphs, xml_truncated))
+}
+
+pub fn read_docx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_docx".to_string(),
+        description: "Extract the paragraph text of a Word .docx document (text only — no \
+                      formatting, tables, or images), bounded and paginated by paragraph. \
+                      Pure-Rust zip + XML; same allowlist as fs_read_file; a non-.docx or \
+                      corrupt file is disclosed honestly, never emitted as binary garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .docx file"},
+                "max_paragraphs": {"type": "integer", "description": "Paragraphs shown (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_docx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_docx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadDocxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > DOCX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            DOCX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let display = a.path.clone();
+    let max = a
+        .max_paragraphs
+        .unwrap_or(DOCX_DEFAULT_MAX_PARAGRAPHS)
+        .clamp(1, DOCX_MAX_PARAGRAPHS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || extract_docx(&path, &display, max))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("docx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_html (best-effort HTML → text) ---------------------------------
+
+const HTML_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadHtmlArgs {
+    path: String,
+}
+
+/// Common HTML named entities beyond the XML five (which quick_xml decodes).
+fn html_named_entity(name: &str) -> Option<&'static str> {
+    Some(match name {
+        "nbsp" => " ",
+        "copy" => "(c)",
+        "reg" => "(r)",
+        "trade" => "(tm)",
+        "mdash" => "—",
+        "ndash" => "–",
+        "hellip" => "…",
+        "lsquo" | "rsquo" | "sbquo" => "'",
+        "ldquo" | "rdquo" | "bdquo" => "\"",
+        "laquo" => "«",
+        "raquo" => "»",
+        "bull" => "•",
+        "middot" => "·",
+        "deg" => "°",
+        _ => return None,
+    })
+}
+
+/// Decode one entity body (the text between `&` and `;`). Falls back to the
+/// literal `&body;` when unknown.
+fn decode_html_entity(body: &str) -> String {
+    if let Some(mapped) = html_named_entity(body) {
+        return mapped.to_string();
+    }
+    if let Some(rest) = body.strip_prefix('#') {
+        let code = if let Some(hex) = rest.strip_prefix(['x', 'X']) {
+            u32::from_str_radix(hex, 16).ok()
+        } else {
+            rest.parse::<u32>().ok()
+        };
+        if let Some(c) = code.and_then(char::from_u32) {
+            return c.to_string();
+        }
+    }
+    match quick_xml::escape::unescape(&format!("&{body};")) {
+        Ok(s) => s.into_owned(),
+        Err(_) => format!("&{body};"),
+    }
+}
+
+/// A block-level tag whose presence should become a line break in the text.
+fn is_html_block_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "p" | "div"
+            | "br"
+            | "hr"
+            | "li"
+            | "tr"
+            | "table"
+            | "blockquote"
+            | "section"
+            | "article"
+            | "header"
+            | "footer"
+            | "nav"
+            | "aside"
+            | "main"
+            | "h1"
+            | "h2"
+            | "h3"
+            | "h4"
+            | "h5"
+            | "h6"
+            | "ul"
+            | "ol"
+            | "pre"
+            | "figure"
+            | "figcaption"
+            | "dl"
+            | "dt"
+            | "dd"
+            | "form"
+            | "title"
+    )
+}
+
+/// Collapse each line's internal whitespace to single spaces and cap runs of
+/// blank lines at one.
+fn collapse_html_whitespace(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut pending_blank = false;
+    for line in text.lines() {
+        let collapsed = line.split_whitespace().collect::<Vec<_>>().join(" ");
+        if collapsed.is_empty() {
+            pending_blank = true;
+            continue;
+        }
+        if !out.is_empty() && pending_blank {
+            out.push('\n');
+        }
+        pending_blank = false;
+        out.push_str(&collapsed);
+        out.push('\n');
+    }
+    out.trim().to_string()
+}
+
+/// Best-effort HTML → text: drop `<script>`/`<style>`/comments wholesale (so
+/// `a<b` inside a script never derails tag parsing), strip remaining tags,
+/// emit a newline at block-level tags, and decode entities.
+fn html_to_text(html: &str) -> String {
+    let lower = html.to_ascii_lowercase();
+    let hb = html.as_bytes();
+    let n = hb.len();
+    let mut out = String::with_capacity(html.len() / 2);
+    let mut i = 0;
+    while i < n {
+        match hb[i] {
+            b'<' => {
+                if lower[i..].starts_with("<!--") {
+                    i = lower[i..].find("-->").map_or(n, |e| i + e + 3);
+                    continue;
+                }
+                // Skip <script>…</script> and <style>…</style> as raw blocks.
+                let mut skipped = false;
+                for tag in ["script", "style"] {
+                    let open = format!("<{tag}");
+                    if lower[i..].starts_with(&open)
+                        && matches!(
+                            hb.get(i + open.len()),
+                            Some(b' ' | b'\t' | b'\r' | b'\n' | b'>' | b'/')
+                        )
+                    {
+                        let close = format!("</{tag}>");
+                        i = lower[i..].find(&close).map_or(n, |e| i + e + close.len());
+                        skipped = true;
+                        break;
+                    }
+                }
+                if skipped {
+                    continue;
+                }
+                let Some(rel_end) = lower[i..].find('>') else {
+                    break; // unterminated tag — drop the rest
+                };
+                let inner = &lower[i + 1..i + rel_end];
+                let name_part = inner.strip_prefix('/').unwrap_or(inner);
+                let name: String = name_part
+                    .chars()
+                    .take_while(|c| c.is_ascii_alphanumeric())
+                    .collect();
+                if is_html_block_tag(&name) && !out.ends_with('\n') {
+                    out.push('\n');
+                }
+                i += rel_end + 1;
+            }
+            b'&' => {
+                // Bounded lookahead for the entity terminator.
+                if let Some(rel) = lower[i + 1..].find(';') {
+                    if rel <= 32 {
+                        out.push_str(&decode_html_entity(&html[i + 1..i + 1 + rel]));
+                        i += 1 + rel + 1;
+                        continue;
+                    }
+                }
+                out.push('&');
+                i += 1;
+            }
+            _ => {
+                // Append the whole run of text up to the next '<' or '&'.
+                let rest = &html[i..];
+                let stop = rest.find(['<', '&']).unwrap_or(rest.len());
+                out.push_str(&rest[..stop]);
+                i += stop;
+            }
+        }
+    }
+    collapse_html_whitespace(&out)
+}
+
+fn render_html(display: &str, html: &str) -> String {
+    let text = html_to_text(html);
+    let mut out = format!(
+        "html> {display}: text extracted (tags stripped, scripts/styles removed, \
+         whitespace collapsed — layout and formatting are not preserved)\n"
+    );
+    if text.is_empty() {
+        out.push_str("(no extractable text)\n");
+    } else {
+        out.push_str(&text);
+        out.push('\n');
+    }
+    out
+}
+
+pub fn read_html_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_html".to_string(),
+        description: "Extract readable text from an HTML file (tags stripped, <script>/<style>/\
+                      comments removed, entities decoded, block tags become line breaks). \
+                      Best-effort — layout, tables, and formatting are NOT preserved. Dep-free; \
+                      same allowlist as fs_read_file."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to an .html/.htm file"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_html_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_html_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadHtmlArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > HTML_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            HTML_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, HTML_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let html = String::from_utf8_lossy(&buf);
+        Ok(render_html(&display, &html))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_notebook (Jupyter .ipynb cell extraction) ----------------------
+
+const NOTEBOOK_MAX_FILE_BYTES: u64 = 32 * 1024 * 1024;
+const NOTEBOOK_DEFAULT_MAX_CELLS: usize = 100;
+const NOTEBOOK_MAX_CELLS_CEILING: usize = 1000;
+/// Source lines shown per cell before eliding.
+const NOTEBOOK_MAX_SOURCE_LINES: usize = 60;
+/// Output summaries shown per code cell.
+const NOTEBOOK_MAX_OUTPUTS: usize = 12;
+
+#[derive(Deserialize)]
+struct ReadNotebookArgs {
+    path: String,
+    /// Cells shown (default 100, max 1000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_cells: Option<usize>,
+}
+
+/// A notebook `source`/`text` field: a JSON string, or an array of line strings.
+fn notebook_value_text(value: Option<&serde_json::Value>) -> String {
+    match value {
+        Some(serde_json::Value::String(s)) => s.clone(),
+        Some(serde_json::Value::Array(a)) => {
+            a.iter().filter_map(|v| v.as_str()).collect::<String>()
+        }
+        _ => String::new(),
+    }
+}
+
+/// One-line summary of a code-cell output (never the full payload).
+fn notebook_output_summary(output: &serde_json::Value) -> Option<String> {
+    let kind = output.get("output_type").and_then(|v| v.as_str())?;
+    match kind {
+        "stream" => {
+            let name = output
+                .get("name")
+                .and_then(|v| v.as_str())
+                .unwrap_or("stream");
+            let text = notebook_value_text(output.get("text"));
+            let lines = text.lines().count().max(usize::from(!text.is_empty()));
+            Some(format!(
+                "{name} ({lines} line{})",
+                if lines == 1 { "" } else { "s" }
+            ))
+        }
+        "execute_result" | "display_data" => {
+            let data = output.get("data");
+            if let Some(plain) = data.and_then(|d| d.get("text/plain")) {
+                let text = notebook_value_text(Some(plain));
+                let first = text.lines().next().unwrap_or("").trim();
+                let shown: String = first.chars().take(120).collect();
+                Some(format!("result: {shown}"))
+            } else {
+                let mut mimes: Vec<&str> = data
+                    .and_then(|d| d.as_object())
+                    .map(|o| o.keys().map(|k| k.as_str()).collect())
+                    .unwrap_or_default();
+                mimes.sort();
+                Some(format!("result: {}", mimes.join(", ")))
+            }
+        }
+        "error" => {
+            let ename = output
+                .get("ename")
+                .and_then(|v| v.as_str())
+                .unwrap_or("Error");
+            let evalue = output.get("evalue").and_then(|v| v.as_str()).unwrap_or("");
+            let evalue: String = evalue.chars().take(120).collect();
+            Some(format!("error: {ename}: {evalue}"))
+        }
+        _ => None,
+    }
+}
+
+fn render_notebook(display: &str, json_text: &str, max_cells: usize) -> String {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => return format!("notebook> {display}: could not parse notebook JSON — {e}\n"),
+    };
+    let Some(cells) = value.get("cells").and_then(|c| c.as_array()) else {
+        return format!(
+            "notebook> {display}: not a Jupyter notebook (no top-level `cells` array; \
+             nbformat 4 expected)\n"
+        );
+    };
+
+    let language = value
+        .get("metadata")
+        .and_then(|m| m.get("kernelspec"))
+        .and_then(|k| k.get("language"))
+        .and_then(|l| l.as_str());
+    let code_count = cells
+        .iter()
+        .filter(|c| c.get("cell_type").and_then(|t| t.as_str()) == Some("code"))
+        .count();
+    let md_count = cells
+        .iter()
+        .filter(|c| c.get("cell_type").and_then(|t| t.as_str()) == Some("markdown"))
+        .count();
+
+    let lang_note = match language {
+        Some(l) => format!(" [language: {l}]"),
+        None => String::new(),
+    };
+    let mut out = format!(
+        "notebook> {display}: {} cell(s) ({code_count} code, {md_count} markdown){lang_note}\n",
+        cells.len()
+    );
+
+    let shown = cells.len().min(max_cells);
+    for (idx, cell) in cells.iter().take(shown).enumerate() {
+        let cell_type = cell
+            .get("cell_type")
+            .and_then(|t| t.as_str())
+            .unwrap_or("unknown");
+        let exec = cell
+            .get("execution_count")
+            .and_then(|v| v.as_u64())
+            .map(|n| format!(" (exec {n})"))
+            .unwrap_or_default();
+        out.push_str(&format!("[{}] {cell_type}{exec}:\n", idx + 1));
+
+        let source = notebook_value_text(cell.get("source"));
+        let src_lines: Vec<&str> = source.lines().collect();
+        for line in src_lines.iter().take(NOTEBOOK_MAX_SOURCE_LINES) {
+            out.push_str(line);
+            out.push('\n');
+        }
+        if src_lines.len() > NOTEBOOK_MAX_SOURCE_LINES {
+            out.push_str(&format!(
+                "    …[{} more source line(s)]\n",
+                src_lines.len() - NOTEBOOK_MAX_SOURCE_LINES
+            ));
+        }
+
+        if let Some(outputs) = cell.get("outputs").and_then(|o| o.as_array()) {
+            let summaries: Vec<String> =
+                outputs.iter().filter_map(notebook_output_summary).collect();
+            for summary in summaries.iter().take(NOTEBOOK_MAX_OUTPUTS) {
+                out.push_str(&format!("  → {summary}\n"));
+            }
+            if summaries.len() > NOTEBOOK_MAX_OUTPUTS {
+                out.push_str(&format!(
+                    "  → …[{} more output(s)]\n",
+                    summaries.len() - NOTEBOOK_MAX_OUTPUTS
+                ));
+            }
+        }
+    }
+    if cells.len() > shown {
+        out.push_str(&format!(
+            "[showing {shown} of {} cells; raise max_cells for more]\n",
+            cells.len()
+        ));
+    }
+    out
+}
+
+pub fn read_notebook_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_notebook".to_string(),
+        description: "Extract the cells of a Jupyter notebook (.ipynb): each cell's type \
+                      (code/markdown/raw), its source, and a one-line summary of each code cell's \
+                      outputs (stream line counts, result mime/text, errors) — never the full \
+                      output payload. Reads the notebook as structure instead of dumping raw JSON. \
+                      Dep-free (serde_json); same allowlist as fs_read_file; a non-notebook or \
+                      malformed file is disclosed honestly."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .ipynb notebook"},
+                "max_cells": {"type": "integer", "description": "Cells shown (optional, default 100, max 1000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_notebook_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_notebook_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadNotebookArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > NOTEBOOK_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "notebook is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            NOTEBOOK_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let display = a.path.clone();
+    let max_cells = a
+        .max_cells
+        .unwrap_or(NOTEBOOK_DEFAULT_MAX_CELLS)
+        .clamp(1, NOTEBOOK_MAX_CELLS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, NOTEBOOK_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let text = String::from_utf8_lossy(&buf);
+        Ok(render_notebook(&display, &text, max_cells))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_pptx (PowerPoint slide-text extraction) ------------------------
+
+const PPTX_MAX_TOTAL_XML_BYTES: u64 = 64 * 1024 * 1024;
+
+#[derive(Deserialize)]
+struct ReadPptxArgs {
+    path: String,
+    /// Paragraphs shown across all slides (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_paragraphs: Option<usize>,
+}
+
+/// pptx text runs are `<a:t>`, paragraphs `<a:p>`, line breaks `<a:br/>`.
+fn parse_pptx_paragraphs(xml: &str) -> Vec<String> {
+    let (paras, _capped) = parse_ooxml_paragraphs(xml, b"a:t", b"a:p", None, &[b"a:br".as_slice()]);
+    paras
+}
+
+/// `ppt/slides/slideN.xml` → N. Excludes layouts, masters, notes, and rels.
+fn pptx_slide_number(name: &str) -> Option<u32> {
+    name.strip_prefix("ppt/slides/slide")?
+        .strip_suffix(".xml")?
+        .parse::<u32>()
+        .ok()
+}
+
+fn extract_pptx(path: &Path, display: &str, max_paragraphs: usize) -> std::io::Result<String> {
+    let file = std::fs::File::open(path)?;
+    let mut archive = zip::ZipArchive::new(file)
+        .map_err(|e| std::io::Error::other(format!("not a valid .pptx (zip) file: {e}")))?;
+    // Collect slide entry names (owned) so the archive can be re-borrowed mutably.
+    let mut slides: Vec<(u32, String)> = archive
+        .file_names()
+        .filter_map(|n| pptx_slide_number(n).map(|num| (num, n.to_string())))
+        .collect();
+    if slides.is_empty() {
+        return Err(std::io::Error::other(
+            "not a PowerPoint .pptx document (no ppt/slides/slideN.xml inside)",
+        ));
+    }
+    // Numeric order — lexical would put slide10 before slide2.
+    slides.sort_by_key(|(num, _)| *num);
+
+    let mut body = String::new();
+    let mut total_paras = 0usize;
+    let mut shown = 0usize;
+    let mut budget = 0u64;
+    let mut byte_capped = false;
+    for (num, name) in &slides {
+        if budget >= PPTX_MAX_TOTAL_XML_BYTES {
+            byte_capped = true;
+            break;
+        }
+        let Ok(entry) = archive.by_name(name) else {
+            continue;
+        };
+        let mut buf = Vec::new();
+        if Read::take(entry, DOCX_MAX_XML_BYTES)
+            .read_to_end(&mut buf)
+            .is_err()
+        {
+            continue;
+        }
+        budget += buf.len() as u64;
+        let xml = String::from_utf8_lossy(&buf);
+        let paras = parse_pptx_paragraphs(&xml);
+        let with_text: Vec<&String> = paras.iter().filter(|p| !p.trim().is_empty()).collect();
+        total_paras += with_text.len();
+        if with_text.is_empty() || shown >= max_paragraphs {
+            continue;
+        }
+        body.push_str(&format!("--- slide {num} ---\n"));
+        for para in with_text {
+            if shown >= max_paragraphs {
+                break;
+            }
+            body.push_str(para);
+            body.push('\n');
+            shown += 1;
+        }
+    }
+
+    let note = if byte_capped {
+        format!(
+            ", stopped at {} MiB of slide XML",
+            PPTX_MAX_TOTAL_XML_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "pptx> {display}: {} slide(s), {total_paras} paragraph(s) with text \
+         [text only — no speaker notes, formatting, or images]{note}\n",
+        slides.len()
+    );
+    if total_paras == 0 {
+        out.push_str(
+            "(no extractable text — the slides may be image-only or use an unsupported structure)\n",
+        );
+        return Ok(out);
+    }
+    out.push_str(&body);
+    if shown < total_paras {
+        out.push_str(&format!(
+            "[showing {shown} of {total_paras} paragraphs; raise max_paragraphs for more]\n"
+        ));
+    }
+    Ok(out)
+}
+
+pub fn read_pptx_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "fs_read_pptx".to_string(),
+        description: "Extract the slide text of a PowerPoint .pptx (text only — no speaker notes, \
+                      formatting, or images), grouped per slide and bounded by paragraph. \
+                      Pure-Rust zip + XML; same allowlist as fs_read_file; a non-.pptx or corrupt \
+                      file is disclosed honestly, never emitted as binary garbage."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a .pptx file"},
+                "max_paragraphs": {"type": "integer", "description": "Paragraphs shown across all slides (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_pptx_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_pptx_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadPptxArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let metadata = file
+        .metadata()
+        .map_err(|e| ToolError::ExecError(format!("stat failed: {e}")))?;
+    if metadata.len() > DOCX_MAX_FILE_BYTES {
+        return Err(ToolError::InvalidArgs(format!(
+            "document is {} MiB, over the {} MiB read limit",
+            metadata.len() / (1024 * 1024),
+            DOCX_MAX_FILE_BYTES / (1024 * 1024),
+        )));
+    }
+    let path = authorization.path().to_path_buf();
+    let display = a.path.clone();
+    let max = a
+        .max_paragraphs
+        .unwrap_or(DOCX_DEFAULT_MAX_PARAGRAPHS)
+        .clamp(1, DOCX_MAX_PARAGRAPHS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || extract_pptx(&path, &display, max))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("pptx parse failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.scan_secrets (apparent-credential guard for diffs/files) ------------
+//
+// Detection mirrors the kitsu binary's credential filter
+// (subagent::thread::sanitize_and_redact_text). Kept as a self-contained copy
+// because kitsu-tools cannot depend on the binary crate; a future refactor
+// could hoist these into a shared module the binary also adopts. A line is
+// "flagged" iff redacting it changes it, and only the REDACTED line is ever
+// emitted — the tool never echoes the raw secret it found.
+
+const SECRET_DEFAULT_MAX_FINDINGS: usize = 200;
+const SECRET_MAX_FINDINGS_CEILING: usize = 2000;
+const SECRET_PREFIXES: &[&str] = &[
+    "github_pat_",
+    "hf_",
+    "sk-",
+    "ghp_",
+    "gho_",
+    "glpat-",
+    "npm_",
+    "xoxb-",
+    "xoxp-",
+    "AKIA",
+    "AIza",
+];
+const SECRET_ASSIGN_KEYWORDS: &[&str] = &[
+    "api_key",
+    "apikey",
+    "access_token",
+    "auth_token",
+    "authorization",
+    "password",
+    "secret",
+    "token",
+];
+
+#[derive(Deserialize)]
+struct ScanSecretsArgs {
+    path: String,
+    /// Flagged lines shown (default 200, max 2000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_findings: Option<usize>,
+}
+
+fn redact_known_prefixes(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut index = 0;
+    while index < value.len() {
+        let tail = &value[index..];
+        let Some(prefix) = SECRET_PREFIXES
+            .iter()
+            .find(|prefix| tail.starts_with(**prefix))
+        else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+            continue;
+        };
+        let mut end = index + prefix.len();
+        while end < value.len() {
+            let character = value[end..].chars().next().expect("non-empty tail");
+            if !(character.is_ascii_alphanumeric() || matches!(character, '_' | '-' | '.')) {
+                break;
+            }
+            end += character.len_utf8();
+        }
+        // Short words such as "hf_model" are ordinary identifiers; a credential
+        // prefix is redacted only when followed by a plausible secret body.
+        if end.saturating_sub(index + prefix.len()) >= 8 {
+            output.push_str("<redacted>");
+            index = end;
+        } else {
+            let character = tail.chars().next().expect("non-empty tail");
+            output.push(character);
+            index += character.len_utf8();
+        }
+    }
+    output
+}
+
+fn redact_url_userinfo(value: &str) -> String {
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = value[search..].find("://") {
+        let authority_start = search + relative + 3;
+        let authority_end = value[authority_start..]
+            .char_indices()
+            .find_map(|(offset, character)| {
+                matches!(character, '/' | '?' | '#' | ' ' | '\n' | '\t')
+                    .then_some(authority_start + offset)
+            })
+            .unwrap_or(value.len());
+        if let Some(relative_at) = value[authority_start..authority_end].rfind('@') {
+            let at = authority_start + relative_at;
+            output.push_str(&value[copied..authority_start]);
+            output.push_str("<redacted>");
+            output.push_str(&value[at..authority_end]);
+            copied = authority_end;
+        }
+        search = authority_end;
+        if search == value.len() {
+            break;
+        }
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_assignment(value: &str, keyword: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find(keyword) {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let after_keyword = start + keyword.len();
+        let after_ok = after_keyword == lowercase.len()
+            || !lowercase.as_bytes()[after_keyword].is_ascii_alphanumeric();
+        if !before_ok || !after_ok {
+            search = after_keyword;
+            continue;
+        }
+        let mut delimiter = after_keyword;
+        while delimiter < value.len() && value.as_bytes()[delimiter].is_ascii_whitespace() {
+            delimiter += 1;
+        }
+        if delimiter == value.len() || !matches!(value.as_bytes()[delimiter], b'=' | b':') {
+            search = after_keyword;
+            continue;
+        }
+        let mut secret_start = delimiter + 1;
+        while secret_start < value.len()
+            && (value.as_bytes()[secret_start].is_ascii_whitespace()
+                || matches!(value.as_bytes()[secret_start], b'\'' | b'"'))
+        {
+            secret_start += 1;
+        }
+        let mut end = secret_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(
+                value.as_bytes()[end],
+                b',' | b';' | b'&' | b'\'' | b'"' | b'}' | b']'
+            )
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..secret_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+fn redact_bearer(value: &str) -> String {
+    let lowercase = value.to_ascii_lowercase();
+    let mut output = String::with_capacity(value.len());
+    let mut copied = 0;
+    let mut search = 0;
+    while let Some(relative) = lowercase[search..].find("bearer") {
+        let start = search + relative;
+        let before_ok = start == 0 || !lowercase.as_bytes()[start - 1].is_ascii_alphanumeric();
+        let mut token_start = start + "bearer".len();
+        if !before_ok
+            || token_start == value.len()
+            || !value.as_bytes()[token_start].is_ascii_whitespace()
+        {
+            search = token_start;
+            continue;
+        }
+        while token_start < value.len() && value.as_bytes()[token_start].is_ascii_whitespace() {
+            token_start += 1;
+        }
+        let mut end = token_start;
+        while end < value.len()
+            && !value.as_bytes()[end].is_ascii_whitespace()
+            && !matches!(value.as_bytes()[end], b',' | b';' | b'\'' | b'"')
+        {
+            end += 1;
+        }
+        output.push_str(&value[copied..token_start]);
+        output.push_str("<redacted>");
+        copied = end;
+        search = end;
+    }
+    output.push_str(&value[copied..]);
+    output
+}
+
+/// The full redaction pipeline (no terminal sanitize — the scanner works on
+/// raw file bytes already). A line is a "finding" iff this changes it.
+///
+/// Bearer runs FIRST: on `Authorization: Bearer <token>` the `authorization:`
+/// assignment rule would otherwise redact the literal word "Bearer" as its
+/// value and leave the real token exposed — unacceptable for a tool whose
+/// output must never echo a secret. Redacting the bearer token up front closes
+/// that leak; assignments then run last over the already-scrubbed line.
+fn redact_secrets_line(value: &str) -> String {
+    let mut output = redact_url_userinfo(&redact_known_prefixes(&redact_bearer(value)));
+    for keyword in SECRET_ASSIGN_KEYWORDS {
+        output = redact_assignment(&output, keyword);
+    }
+    output
+}
+
+/// Which detector(s) fired on this line — for the human-facing label.
+fn detect_secret_kinds(value: &str) -> Vec<&'static str> {
+    let mut kinds = Vec::new();
+    if redact_known_prefixes(value) != value {
+        kinds.push("token-prefix");
+    }
+    if redact_url_userinfo(value) != value {
+        kinds.push("url-credentials");
+    }
+    if SECRET_ASSIGN_KEYWORDS
+        .iter()
+        .any(|kw| redact_assignment(value, kw) != value)
+    {
+        kinds.push("secret-assignment");
+    }
+    if redact_bearer(value) != value {
+        kinds.push("bearer-token");
+    }
+    kinds
+}
+
+pub fn scan_secrets_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "scan_secrets".to_string(),
+        description: "Flag lines that appear to contain a credential — known API-key/token \
+                      prefixes (hf_/sk-/ghp_/AKIA/AIza/…), URL user:pass@host, secret \
+                      assignments (api_key=/password:/token=/…), and Bearer tokens. Point it at a \
+                      file — e.g. a `git diff` written to disk before commit — and it reports each \
+                      flagged line number with the matched kind and the line REDACTED (it never \
+                      echoes the raw secret). Same allowlist as fs_read_file. Advisory: it can miss \
+                      novel formats and may flag placeholders, so it never blocks."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "File to scan (e.g. a saved git diff)"},
+                "max_findings": {"type": "integer", "description": "Flagged lines shown (optional, default 200, max 2000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { scan_secrets_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn scan_secrets_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ScanSecretsArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let cap = a
+        .max_findings
+        .unwrap_or(SECRET_DEFAULT_MAX_FINDINGS)
+        .min(SECRET_MAX_FINDINGS_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || scan_secrets_blocking(file, &display, cap))
+        .await
+        .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+        .map_err(|e| ToolError::ExecError(format!("scan failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn scan_secrets_blocking(
+    file: std::fs::File,
+    display: &str,
+    cap: usize,
+) -> std::io::Result<String> {
+    use std::io::BufRead;
+
+    let metadata = file.metadata()?;
+    if !metadata.is_file() {
+        return Err(std::io::Error::other("scan target is not a regular file"));
+    }
+    let mut reader = std::io::BufReader::new(Read::take(file, SCAN_MAX_SCAN_BYTES + 1));
+    let mut line = String::new();
+    let mut line_no = 0usize;
+    let mut total = 0usize;
+    let mut bytes_read = 0u64;
+    let mut scan_truncated = false;
+    let mut shown: Vec<(usize, Vec<&'static str>, String)> = Vec::new();
+    loop {
+        line.clear();
+        let n = reader.read_line(&mut line)?;
+        if n == 0 {
+            break;
+        }
+        bytes_read += n as u64;
+        if bytes_read > SCAN_MAX_SCAN_BYTES {
+            scan_truncated = true;
+            break;
+        }
+        line_no += 1;
+        let redacted = redact_secrets_line(&line);
+        if redacted != line {
+            total += 1;
+            if shown.len() < cap {
+                let kinds = detect_secret_kinds(&line);
+                shown.push((line_no, kinds, truncate_line(&redacted)));
+            }
+        }
+    }
+
+    let scanned_note = if scan_truncated {
+        format!(
+            " — stopped after scanning {} MiB (refine or split the file)",
+            SCAN_MAX_SCAN_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "scan_secrets> {display}: {total} line(s) with apparent credentials in {line_no} lines \
+         scanned{scanned_note}\n"
+    );
+    if total == 0 {
+        out.push_str(
+            "no apparent credentials found (checked known token prefixes, url user:pass, secret \
+             assignments, and bearer tokens)\n",
+        );
+        return Ok(out);
+    }
+    for (no, kinds, redacted) in &shown {
+        let label = if kinds.is_empty() {
+            String::new()
+        } else {
+            format!("[{}] ", kinds.join(", "))
+        };
+        out.push_str(&format!("{no}: {label}{redacted}\n"));
+    }
+    if total > shown.len() {
+        out.push_str(&format!(
+            "[showing {} of {} flagged lines; raise max_findings for more]\n",
+            shown.len(),
+            total
+        ));
+    }
+    Ok(out)
+}
+
+// --- fs.audit_summary (cargo-audit advisory summary) ------------------------
+
+const AUDIT_DEFAULT_MAX_ITEMS: usize = 100;
+const AUDIT_MAX_ITEMS_CEILING: usize = 1000;
+
+#[derive(Deserialize)]
+struct AuditSummaryArgs {
+    path: String,
+    /// Items shown per section (default 100, max 1000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_items: Option<usize>,
+}
+
+fn json_field_str<'a>(v: &'a serde_json::Value, key: &str) -> Option<&'a str> {
+    v.get(key).and_then(|x| x.as_str())
+}
+
+/// `"name version"` for a cargo-audit package object.
+fn audit_package_label(pkg: &serde_json::Value) -> String {
+    let name = json_field_str(pkg, "name").unwrap_or("<unknown>");
+    match json_field_str(pkg, "version") {
+        Some(ver) => format!("{name} {ver}"),
+        None => name.to_string(),
+    }
+}
+
+/// A cargo-audit array-of-strings field (`versions.patched`, `advisory.aliases`).
+fn json_str_array(v: Option<&serde_json::Value>) -> Vec<&str> {
+    v.and_then(|x| x.as_array())
+        .map(|a| a.iter().filter_map(|x| x.as_str()).collect())
+        .unwrap_or_default()
+}
+
+fn render_audit_summary(display: &str, json_text: &str, max_items: usize) -> String {
+    let value: serde_json::Value = match serde_json::from_str(json_text) {
+        Ok(v) => v,
+        Err(e) => return format!("audit> {display}: could not parse cargo-audit JSON — {e}\n"),
+    };
+
+    let vulns = value.get("vulnerabilities");
+    let vuln_list: Vec<&serde_json::Value> = vulns
+        .and_then(|v| v.get("list"))
+        .and_then(|l| l.as_array())
+        .map(|a| a.iter().collect())
+        .unwrap_or_default();
+    let vuln_count = vulns
+        .and_then(|v| v.get("count"))
+        .and_then(|c| c.as_u64())
+        .map(|c| c as usize)
+        .unwrap_or(vuln_list.len());
+
+    // warnings: { "<kind>": [ { package, advisory, kind }, … ], … }
+    let warnings_obj = value.get("warnings").and_then(|w| w.as_object());
+    let warning_total: usize = warnings_obj
+        .map(|o| {
+            o.values()
+                .filter_map(|v| v.as_array())
+                .map(|a| a.len())
+                .sum()
+        })
+        .unwrap_or(0);
+
+    let vuln_word = if vuln_count == 1 {
+        "vulnerability"
+    } else {
+        "vulnerabilities"
+    };
+    let mut out =
+        format!("audit> {display}: {vuln_count} {vuln_word}, {warning_total} warning(s)\n");
+    if vuln_count == 0 && warning_total == 0 {
+        out.push_str("no known vulnerabilities or advisory warnings\n");
+        return out;
+    }
+
+    // Vulnerabilities first (the real risk), each with its fix.
+    if !vuln_list.is_empty() {
+        out.push_str("vulnerabilities:\n");
+        let mut shown = 0usize;
+        for v in &vuln_list {
+            if shown >= max_items {
+                break;
+            }
+            let adv = v.get("advisory");
+            let id = adv
+                .and_then(|a| json_field_str(a, "id"))
+                .unwrap_or("<no id>");
+            let title = adv.and_then(|a| json_field_str(a, "title")).unwrap_or("");
+            let pkg = v
+                .get("package")
+                .map(audit_package_label)
+                .unwrap_or_else(|| "<unknown>".to_string());
+            out.push_str(&format!("  [{id}] {pkg} — {title}\n"));
+            let patched = json_str_array(v.get("versions").and_then(|ver| ver.get("patched")));
+            if patched.is_empty() {
+                out.push_str("    fix: no patched release available\n");
+            } else {
+                out.push_str(&format!("    fix: upgrade to {}\n", patched.join(" or ")));
+            }
+            let aliases = json_str_array(adv.and_then(|a| a.get("aliases")));
+            if !aliases.is_empty() {
+                out.push_str(&format!("    aka: {}\n", aliases.join(", ")));
+            }
+            shown += 1;
+        }
+        if vuln_list.len() > shown {
+            out.push_str(&format!(
+                "  [showing {shown} of {} vulnerabilities]\n",
+                vuln_list.len()
+            ));
+        }
+    }
+
+    // Advisory warnings (unmaintained / yanked / unsound …) grouped by kind.
+    if let Some(warnings) = warnings_obj {
+        if warning_total > 0 {
+            out.push_str("warnings:\n");
+            let mut kinds: Vec<&String> = warnings.keys().collect();
+            kinds.sort();
+            let mut wshown = 0usize;
+            'kinds: for kind in kinds {
+                let Some(items) = warnings.get(kind).and_then(|x| x.as_array()) else {
+                    continue;
+                };
+                for w in items {
+                    if wshown >= max_items {
+                        break 'kinds;
+                    }
+                    let pkg = w
+                        .get("package")
+                        .map(audit_package_label)
+                        .unwrap_or_else(|| "<unknown>".to_string());
+                    let title = w
+                        .get("advisory")
+                        .and_then(|a| json_field_str(a, "title"))
+                        .unwrap_or("");
+                    if title.is_empty() {
+                        out.push_str(&format!("  [{kind}] {pkg}\n"));
+                    } else {
+                        out.push_str(&format!("  [{kind}] {pkg} — {title}\n"));
+                    }
+                    wshown += 1;
+                }
+            }
+            if warning_total > wshown {
+                out.push_str(&format!(
+                    "  [showing {wshown} of {warning_total} warnings]\n"
+                ));
+            }
+        }
+    }
+    out
+}
+
+pub fn audit_summary_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "audit_summary".to_string(),
+        description: "Summarize a `cargo audit --json` report into a ranked risk view: each \
+                      vulnerability with its advisory id, affected package + version, title, CVE \
+                      aliases, and the patched version to upgrade to; then advisory warnings \
+                      (unmaintained/yanked/unsound) grouped by kind. Give it a JSON file you \
+                      produced with `cargo audit --json`. Read-only; same allowlist as \
+                      fs_read_file; malformed JSON is disclosed, never guessed."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a `cargo audit --json` output file"},
+                "max_items": {"type": "integer", "description": "Items shown per section (optional, default 100, max 1000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { audit_summary_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn audit_summary_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: AuditSummaryArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let max = a
+        .max_items
+        .unwrap_or(AUDIT_DEFAULT_MAX_ITEMS)
+        .clamp(1, AUDIT_MAX_ITEMS_CEILING);
+    let content = read_config_text(policy, &a.path).await?;
+    let rendered = render_audit_summary(&a.path, &content, max);
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.read_manifest (dependency / build manifest summary) -----------------
+
+/// Dependency names shown per section by default / at most before eliding.
+const MANIFEST_DEFAULT_MAX_DEPS: usize = 50;
+const MANIFEST_MAX_DEPS_CEILING: usize = 500;
+
+#[derive(Deserialize)]
+struct ReadManifestArgs {
+    path: String,
+    /// Dependency names listed per section (default 50, max 500).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_deps: Option<usize>,
+}
+
+enum ManifestKind {
+    Cargo,
+    PackageJson,
+    Pyproject,
+    Unknown,
+}
+
+fn detect_manifest_kind(path: &str, content: &str) -> ManifestKind {
+    let name = Path::new(path)
+        .file_name()
+        .and_then(|n| n.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match name.as_str() {
+        "cargo.toml" => return ManifestKind::Cargo,
+        "package.json" => return ManifestKind::PackageJson,
+        "pyproject.toml" => return ManifestKind::Pyproject,
+        _ => {}
+    }
+    // Non-standard filename: fall back to extension + a content-shape hint.
+    if name.ends_with(".json") {
+        return ManifestKind::PackageJson;
+    }
+    if name.ends_with(".toml") {
+        // pyproject uses [project] / [tool.poetry]; Cargo uses [package].
+        if content.contains("[project]") || content.contains("[tool.poetry") {
+            return ManifestKind::Pyproject;
+        }
+        return ManifestKind::Cargo;
+    }
+    ManifestKind::Unknown
+}
+
+/// One bounded, sorted, de-duplicated dependency section line.
+fn format_dep_section(label: &str, mut names: Vec<String>, max: usize) -> String {
+    names.sort();
+    names.dedup();
+    let total = names.len();
+    if total == 0 {
+        return format!("  {label}: 0\n");
+    }
+    let shown = total.min(max);
+    let listed = names[..shown].join(", ");
+    let more = if total > shown {
+        format!(", +{} more", total - shown)
+    } else {
+        String::new()
+    };
+    format!("  {label} ({total}): {listed}{more}\n")
+}
+
+fn toml_table_keys(v: &toml::Value, key: &str) -> Vec<String> {
+    v.get(key)
+        .and_then(|x| x.as_table())
+        .map(|t| t.keys().cloned().collect())
+        .unwrap_or_default()
+}
+
+/// `section[key]` as a string slice, borrowing from `section`.
+fn toml_str<'a>(section: Option<&'a toml::Value>, key: &str) -> Option<&'a str> {
+    section.and_then(|s| s.get(key)).and_then(|x| x.as_str())
+}
+
+/// Extract the distribution name from a PEP 508 requirement string:
+/// `requests>=2.0` → `requests`, `ruff (==0.1); python_version>'3.7'` → `ruff`.
+fn requirement_name(req: &str) -> String {
+    let req = req.trim();
+    let end = req
+        .find(|c: char| !(c.is_ascii_alphanumeric() || c == '_' || c == '-' || c == '.'))
+        .unwrap_or(req.len());
+    req[..end].to_string()
+}
+
+fn render_cargo_manifest(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let pkg = v.get("package");
+    let pkg_str = |k: &str| {
+        pkg.and_then(|p| p.get(k))
+            .and_then(|x| x.as_str())
+            .map(|s| s.to_string())
+    };
+    let name = pkg_str("name");
+    let version = pkg_str("version");
+    let edition = pkg_str("edition");
+    let is_workspace = v.get("workspace").is_some();
+
+    let mut out = String::from("manifest> ");
+    let header = match (&name, &version) {
+        (Some(n), Some(ver)) => format!("{display}: Cargo (Rust) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: Cargo (Rust) — {n}"),
+        _ if is_workspace => format!("{display}: Cargo (Rust) — virtual workspace manifest"),
+        _ => format!("{display}: Cargo (Rust)"),
+    };
+    out.push_str(&header);
+    if let Some(e) = edition {
+        out.push_str(&format!(" (edition {e})"));
+    }
+    out.push('\n');
+    out.push_str(&format_dep_section(
+        "dependencies",
+        toml_table_keys(&v, "dependencies"),
+        max,
+    ));
+    out.push_str(&format_dep_section(
+        "dev-dependencies",
+        toml_table_keys(&v, "dev-dependencies"),
+        max,
+    ));
+    let build = toml_table_keys(&v, "build-dependencies");
+    if !build.is_empty() {
+        out.push_str(&format_dep_section("build-dependencies", build, max));
+    }
+    let features = v
+        .get("features")
+        .and_then(|x| x.as_table())
+        .map(|t| t.len())
+        .unwrap_or(0);
+    if features > 0 {
+        out.push_str(&format!("  features: {features}\n"));
+    }
+    Ok(out)
+}
+
+fn render_package_json(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: serde_json::Value = serde_json::from_str(content).map_err(|e| e.to_string())?;
+    let obj_keys = |k: &str| -> Vec<String> {
+        v.get(k)
+            .and_then(|x| x.as_object())
+            .map(|o| o.keys().cloned().collect())
+            .unwrap_or_default()
+    };
+    let name = v.get("name").and_then(|x| x.as_str());
+    let version = v.get("version").and_then(|x| x.as_str());
+
+    let mut out = String::from("manifest> ");
+    let header = match (name, version) {
+        (Some(n), Some(ver)) => format!("{display}: package.json (Node) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: package.json (Node) — {n}"),
+        _ => format!("{display}: package.json (Node)"),
+    };
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&format_dep_section(
+        "dependencies",
+        obj_keys("dependencies"),
+        max,
+    ));
+    out.push_str(&format_dep_section(
+        "devDependencies",
+        obj_keys("devDependencies"),
+        max,
+    ));
+    let peer = obj_keys("peerDependencies");
+    if !peer.is_empty() {
+        out.push_str(&format_dep_section("peerDependencies", peer, max));
+    }
+    let scripts = obj_keys("scripts");
+    if !scripts.is_empty() {
+        out.push_str(&format_dep_section("scripts", scripts, max));
+    }
+    Ok(out)
+}
+
+fn render_pyproject(display: &str, content: &str, max: usize) -> Result<String, String> {
+    let v: toml::Value = toml::from_str(content).map_err(|e| e.to_string())?;
+    let project = v.get("project");
+    let poetry = v.get("tool").and_then(|t| t.get("poetry"));
+    // PEP 621 [project] is canonical; fall back to [tool.poetry] for name/version.
+    let name = toml_str(project, "name").or_else(|| toml_str(poetry, "name"));
+    let version = toml_str(project, "version").or_else(|| toml_str(poetry, "version"));
+
+    // PEP 621: [project].dependencies is an array of requirement strings.
+    let mut deps: Vec<String> = project
+        .and_then(|p| p.get("dependencies"))
+        .and_then(|x| x.as_array())
+        .map(|a| {
+            a.iter()
+                .filter_map(|d| d.as_str().map(requirement_name))
+                .filter(|s| !s.is_empty())
+                .collect()
+        })
+        .unwrap_or_default();
+    // Poetry: [tool.poetry.dependencies] is a table (skip the `python` pin).
+    if deps.is_empty() {
+        if let Some(table) = poetry
+            .and_then(|p| p.get("dependencies"))
+            .and_then(|x| x.as_table())
+        {
+            deps = table
+                .keys()
+                .filter(|k| k.as_str() != "python")
+                .cloned()
+                .collect();
+        }
+    }
+    let backend = v
+        .get("build-system")
+        .and_then(|b| b.get("build-backend"))
+        .and_then(|x| x.as_str());
+
+    let mut out = String::from("manifest> ");
+    let header = match (name, version) {
+        (Some(n), Some(ver)) => format!("{display}: pyproject.toml (Python) — {n} v{ver}"),
+        (Some(n), None) => format!("{display}: pyproject.toml (Python) — {n}"),
+        _ => format!("{display}: pyproject.toml (Python)"),
+    };
+    out.push_str(&header);
+    out.push('\n');
+    out.push_str(&format_dep_section("dependencies", deps, max));
+    if let Some(b) = backend {
+        out.push_str(&format!("  build-backend: {b}\n"));
+    }
+    Ok(out)
+}
+
+fn render_manifest(display: &str, path: &str, content: &str, max: usize) -> String {
+    let result = match detect_manifest_kind(path, content) {
+        ManifestKind::Cargo => render_cargo_manifest(display, content, max),
+        ManifestKind::PackageJson => render_package_json(display, content, max),
+        ManifestKind::Pyproject => render_pyproject(display, content, max),
+        ManifestKind::Unknown => Err(
+            "unrecognized manifest (expected Cargo.toml, package.json, or pyproject.toml)"
+                .to_string(),
+        ),
+    };
+    match result {
+        Ok(s) => s,
+        Err(e) => format!("manifest> {display}: could not parse — {e}\n"),
+    }
+}
+
+pub fn read_manifest_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "read_manifest".to_string(),
+        description: "Summarize a project manifest (Cargo.toml, package.json, or pyproject.toml): \
+                      package name/version, edition/build-backend, and dependency names by section \
+                      (bounded + de-duplicated), so the model reads a project's real dependencies \
+                      and build shape instead of guessing. Read-only; same allowlist as \
+                      fs_read_file; a malformed manifest is disclosed honestly, not guessed."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a Cargo.toml, package.json, or pyproject.toml"},
+                "max_deps": {"type": "integer", "description": "Dependency names listed per section (optional, default 50, max 500)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { read_manifest_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn read_manifest_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: ReadManifestArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let max = a
+        .max_deps
+        .unwrap_or(MANIFEST_DEFAULT_MAX_DEPS)
+        .clamp(1, MANIFEST_MAX_DEPS_CEILING);
+    let content = read_config_text(policy, &a.path).await?;
+    let rendered = render_manifest(&a.path, &a.path, &content, max);
+    Ok(policy.cap_output(rendered))
+}
+
+// --- fs.find_symbol (heuristic symbol navigation) ---------------------------
+
+/// Never scan more than this many files in one call (bounds a huge tree).
+const SYMBOL_MAX_FILES: usize = 5000;
+/// Stop after scanning this many total bytes across all files (disclosed).
+const SYMBOL_MAX_TOTAL_BYTES: u64 = 64 * 1024 * 1024;
+/// Read at most this many bytes from any single file (bounds memory).
+const SYMBOL_MAX_FILE_BYTES: u64 = 2 * 1024 * 1024;
+/// Definition sites shown — there are rarely many; references are the long list.
+const SYMBOL_MAX_DEFS_SHOWN: usize = 50;
+/// Reference lines shown by default and at most.
+const SYMBOL_DEFAULT_MAX_REFS: usize = 100;
+const SYMBOL_MAX_REFS_CEILING: usize = 1000;
+/// Reject absurdly long "symbols" — they are identifiers.
+const SYMBOL_MAX_LEN: usize = 128;
+/// Per-line display cap so one very long line cannot blow the output budget.
+const SYMBOL_LINE_DISPLAY_CAP: usize = 400;
+
+/// Directory names never descended into during a symbol walk.
+const SYMBOL_SKIP_DIRS: &[&str] = &[
+    ".git",
+    ".hg",
+    ".svn",
+    "target",
+    "node_modules",
+    "dist",
+    "build",
+    ".venv",
+    "venv",
+    "__pycache__",
+    ".mypy_cache",
+    ".pytest_cache",
+];
+
+/// A keyword that, appearing immediately before a whole-word occurrence of the
+/// symbol, marks that line as a *definition* site rather than a use. Kept
+/// language-agnostic: Rust/Go/JS/TS/Python/Java/Kotlin/C-family forms.
+const SYMBOL_DEF_KEYWORDS: &[&str] = &[
+    "fn",
+    "func",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "interface",
+    "impl",
+    "mod",
+    "module",
+    "namespace",
+    "package",
+    "union",
+    "const",
+    "static",
+    "let",
+    "var",
+    "val",
+    "function",
+];
+
+#[derive(Deserialize)]
+struct FindSymbolArgs {
+    /// The identifier to locate.
+    symbol: String,
+    /// File or directory to search (must be allowed). A directory is walked
+    /// recursively; a single file is scanned alone.
+    path: String,
+    /// Reference lines shown (default 100, max 1000). Definitions always shown.
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_results: Option<usize>,
+}
+
+#[derive(Default)]
+struct SymbolScanBudget {
+    files: usize,
+    bytes: u64,
+}
+
+#[derive(Default)]
+struct SymbolHits {
+    defs: Vec<(String, usize, String)>,
+    refs: Vec<(String, usize, String)>,
+    total_defs: usize,
+    total_refs: usize,
+    files_scanned: usize,
+    skipped_unreadable: usize,
+    files_capped: bool,
+}
+
+fn is_symbol_char(c: char) -> bool {
+    c.is_ascii_alphanumeric() || c == '_'
+}
+
+/// True when `c` is a word boundary for identifier matching (a non-identifier
+/// char, or the start/end of the line).
+fn is_boundary(c: Option<char>) -> bool {
+    match c {
+        Some(ch) => !is_symbol_char(ch),
+        None => true,
+    }
+}
+
+/// Does `line` contain `symbol` as a whole word (not a fragment of a larger
+/// identifier)? `symbol` is assumed non-empty.
+fn line_mentions_symbol(line: &str, symbol: &str) -> bool {
+    let mut from = 0;
+    while let Some(rel) = line[from..].find(symbol) {
+        let start = from + rel;
+        let end = start + symbol.len();
+        if is_boundary(line[..start].chars().next_back()) && is_boundary(line[end..].chars().next())
+        {
+            return true;
+        }
+        from = end;
+    }
+    false
+}
+
+/// The maximal identifier tokens of a line, in order.
+fn identifier_tokens(line: &str) -> Vec<&str> {
+    let mut tokens = Vec::new();
+    let mut start: Option<usize> = None;
+    for (idx, c) in line.char_indices() {
+        if is_symbol_char(c) {
+            start.get_or_insert(idx);
+        } else if let Some(s) = start.take() {
+            tokens.push(&line[s..idx]);
+        }
+    }
+    if let Some(s) = start {
+        tokens.push(&line[s..]);
+    }
+    tokens
+}
+
+/// Heuristic: is this line a *definition* of `symbol`? True when a definition
+/// keyword immediately precedes a whole-word occurrence (incl. `let mut <sym>`).
+fn is_definition_line(line: &str, symbol: &str) -> bool {
+    let tokens = identifier_tokens(line);
+    for (i, tok) in tokens.iter().enumerate() {
+        if *tok != symbol || i == 0 {
+            continue;
+        }
+        let prev = tokens[i - 1];
+        if SYMBOL_DEF_KEYWORDS.contains(&prev) {
+            return true;
+        }
+        // `let mut <sym>` / `var mut <sym>` — skip the mutability qualifier.
+        if prev == "mut" && i >= 2 && matches!(tokens[i - 2], "let" | "var") {
+            return true;
+        }
+    }
+    false
+}
+
+fn truncate_symbol_line(line: &str) -> String {
+    let trimmed = line.trim();
+    if trimmed.chars().count() > SYMBOL_LINE_DISPLAY_CAP {
+        let cut: String = trimmed.chars().take(SYMBOL_LINE_DISPLAY_CAP).collect();
+        format!("{cut}…")
+    } else {
+        trimmed.to_string()
+    }
+}
+
+// --- fs.outline_file (definitions/structure of a source file) ---------------
+
+/// Structural definition keywords — `SYMBOL_DEF_KEYWORDS` minus local bindings
+/// (`let`/`var`/`val`), which are far too noisy for a file outline.
+const OUTLINE_KEYWORDS: &[&str] = &[
+    "fn",
+    "func",
+    "def",
+    "class",
+    "struct",
+    "enum",
+    "trait",
+    "type",
+    "interface",
+    "impl",
+    "mod",
+    "module",
+    "namespace",
+    "package",
+    "union",
+    "const",
+    "static",
+    "function",
+];
+
+const OUTLINE_DEFAULT_MAX: usize = 500;
+const OUTLINE_MAX_CEILING: usize = 5000;
+
+#[derive(Deserialize)]
+struct OutlineArgs {
+    path: String,
+    /// Definitions shown (default 500, max 5000).
+    #[serde(default, deserialize_with = "lenient_opt_usize")]
+    max_items: Option<usize>,
+}
+
+/// Visibility/qualifier tokens that may precede a definition keyword (incl. the
+/// `pub(crate)` / `pub(super)` tokens). Requiring the keyword to sit at the
+/// statement START — after only these — keeps a keyword INSIDE a string or a
+/// call (`describe("fn fake", …)`, `let s = "fn x"`) from being flagged.
+const OUTLINE_MODIFIERS: &[&str] = &[
+    "pub",
+    "async",
+    "unsafe",
+    "extern",
+    "default",
+    "public",
+    "private",
+    "protected",
+    "export",
+    "final",
+    "abstract",
+    "crate",
+    "super",
+    "self",
+    "in",
+];
+
+/// True when a structural keyword is at the statement start (after only
+/// modifiers) AND followed by an identifier — a real definition, not a use.
+/// Comment lines are filtered by the caller.
+fn line_defines(line: &str) -> bool {
+    let tokens = identifier_tokens(line);
+    tokens.iter().enumerate().any(|(i, tok)| {
+        OUTLINE_KEYWORDS.contains(tok)
+            && tokens.get(i + 1).is_some()
+            && tokens[..i].iter().all(|t| OUTLINE_MODIFIERS.contains(t))
+    })
+}
+
+/// Skip obvious comment lines to cut false positives (`// fn foo does …`).
+fn is_comment_line(trimmed: &str) -> bool {
+    trimmed.starts_with("//")
+        || trimmed.starts_with("/*")
+        || trimmed.starts_with('*')
+        || trimmed.starts_with('#')
+        || trimmed.starts_with("--")
+        || trimmed.starts_with("<!--")
+}
+
+fn render_outline(display: &str, text: &str, max_items: usize, truncated: bool) -> String {
+    let mut hits: Vec<(usize, String)> = Vec::new();
+    let mut total = 0usize;
+    for (idx, line) in text.lines().enumerate() {
+        let trimmed = line.trim_start();
+        if is_comment_line(trimmed) || !line_defines(line) {
+            continue;
+        }
+        total += 1;
+        if hits.len() < max_items {
+            hits.push((idx + 1, truncate_symbol_line(line)));
+        }
+    }
+    let scanned = if truncated {
+        format!(
+            ", scanned first {} MiB",
+            SYMBOL_MAX_FILE_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "outline> {display}: {total} definition(s) \
+         [heuristic — fn/struct/class/def/type/impl/const/…{scanned}]\n"
+    );
+    if total == 0 {
+        out.push_str("(no top-level definitions detected)\n");
+        return out;
+    }
+    for (no, line) in &hits {
+        out.push_str(&format!("  {no}: {line}\n"));
+    }
+    if total > hits.len() {
+        out.push_str(&format!(
+            "  [showing {} of {total}; raise max_items for more]\n",
+            hits.len()
+        ));
+    }
+    out
+}
+
+pub fn outline_file_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "outline_file".to_string(),
+        description: "List the definitions in a source file (functions, structs/classes, enums, \
+                      traits, types, impls, consts, modules) with line numbers — a quick \
+                      structural map so you don't have to read the whole file. Heuristic + \
+                      language-agnostic; comment lines and local let/var bindings are excluded. \
+                      Same allowlist as fs_read_file. Use find_symbol to then jump to one."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "path": {"type": "string", "description": "Path to a source file"},
+                "max_items": {"type": "integer", "description": "Definitions shown (optional, default 500, max 5000)"}
+            },
+            "required": ["path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { outline_file_run(&policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn outline_file_run(policy: &Permissions, args: &str) -> Result<String, ToolError> {
+    let a: OutlineArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let authorization = policy.authorize_read_file(Path::new(&a.path)).await?;
+    let file = open_read_file(authorization.path())
+        .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    authorization.validate_opened_file(&file, policy)?;
+    let display = a.path.clone();
+    let max = a
+        .max_items
+        .unwrap_or(OUTLINE_DEFAULT_MAX)
+        .clamp(1, OUTLINE_MAX_CEILING);
+    let rendered = tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+        let mut buf = Vec::new();
+        Read::take(file, SYMBOL_MAX_FILE_BYTES).read_to_end(&mut buf)?;
+        let truncated = buf.len() as u64 >= SYMBOL_MAX_FILE_BYTES;
+        let text = String::from_utf8_lossy(&buf);
+        Ok(render_outline(&display, &text, max, truncated))
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("read failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+pub fn find_symbol_tool(policy: Arc<Permissions>) -> (ToolDescriptor, HandlerFn) {
+    let descriptor = ToolDescriptor {
+        name: "find_symbol".to_string(),
+        description: "Locate where an identifier is DEFINED and USED without a full grep sweep. \
+                      Recursively scans an allowed file or directory (skipping VCS/build dirs and \
+                      binary files) and returns definition sites (fn/struct/class/def/type/const/\
+                      let …) first, then references, each as path:line. A heuristic textual scan — \
+                      no language server or index required, so it works anywhere and degrades to an \
+                      honest 'not found' when the symbol is absent."
+            .to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "symbol": {"type": "string", "description": "Identifier to locate (letters, digits, underscore)"},
+                "path": {"type": "string", "description": "Allowed file or directory to search (directories are walked recursively)"},
+                "max_results": {"type": "integer", "description": "Max reference lines shown (optional, default 100, max 1000); definitions are always shown"}
+            },
+            "required": ["symbol", "path"]
+        }),
+    };
+    let handler: HandlerFn = Box::new(move |args: String| {
+        let policy = policy.clone();
+        Box::pin(async move { find_symbol_run(policy, &args).await })
+    });
+    (descriptor, handler)
+}
+
+async fn find_symbol_run(policy: Arc<Permissions>, args: &str) -> Result<String, ToolError> {
+    let a: FindSymbolArgs =
+        serde_json::from_str(args).map_err(|e| ToolError::InvalidArgs(e.to_string()))?;
+    let symbol = a.symbol.trim().to_string();
+    if symbol.is_empty() {
+        return Err(ToolError::InvalidArgs("symbol must not be empty".into()));
+    }
+    if symbol.chars().count() > SYMBOL_MAX_LEN {
+        return Err(ToolError::InvalidArgs(format!(
+            "symbol too long (max {SYMBOL_MAX_LEN} chars)"
+        )));
+    }
+    if !symbol.chars().all(is_symbol_char) {
+        return Err(ToolError::InvalidArgs(
+            "symbol must be an identifier (letters, digits, underscore)".into(),
+        ));
+    }
+    let refs_cap = a
+        .max_results
+        .unwrap_or(SYMBOL_DEFAULT_MAX_REFS)
+        .clamp(1, SYMBOL_MAX_REFS_CEILING);
+    // Authorizes the root (file or dir), enforces protected-path denial, and
+    // pins the canonical path under an allowed read root.
+    let canon = policy.check_read(Path::new(&a.path)).await?;
+    let policy2 = policy.clone();
+    let display = a.path.clone();
+    let rendered = tokio::task::spawn_blocking(move || {
+        find_symbol_blocking(&policy2, &canon, &display, &symbol, refs_cap)
+    })
+    .await
+    .map_err(|e| ToolError::ExecError(format!("join error: {e}")))?
+    .map_err(|e| ToolError::ExecError(format!("find_symbol failed: {e}")))?;
+    Ok(policy.cap_output(rendered))
+}
+
+fn find_symbol_blocking(
+    policy: &Permissions,
+    root: &Path,
+    display: &str,
+    symbol: &str,
+    refs_cap: usize,
+) -> std::io::Result<String> {
+    let meta = std::fs::symlink_metadata(root)?;
+    let mut hits = SymbolHits::default();
+    let mut budget = SymbolScanBudget::default();
+    if meta.is_file() {
+        scan_one_file(
+            policy,
+            root,
+            root,
+            display,
+            &mut hits,
+            symbol,
+            refs_cap,
+            &mut budget,
+        );
+    } else if meta.is_dir() {
+        // Iterative DFS; entries sorted so output is deterministic.
+        let mut stack = vec![root.to_path_buf()];
+        'walk: while let Some(dir) = stack.pop() {
+            let Ok(reader) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            let mut paths: Vec<PathBuf> = reader.filter_map(|e| e.ok().map(|e| e.path())).collect();
+            paths.sort();
+            for path in paths {
+                if budget.files >= SYMBOL_MAX_FILES || budget.bytes >= SYMBOL_MAX_TOTAL_BYTES {
+                    hits.files_capped = true;
+                    break 'walk;
+                }
+                let Ok(entry_meta) = std::fs::symlink_metadata(&path) else {
+                    continue;
+                };
+                // Never follow symlinks — keeps the walk inside the authorized root.
+                if entry_meta.file_type().is_symlink() {
+                    continue;
+                }
+                if entry_meta.is_dir() {
+                    let name = path.file_name().and_then(|n| n.to_str()).unwrap_or("");
+                    if name.starts_with('.') || SYMBOL_SKIP_DIRS.contains(&name) {
+                        continue;
+                    }
+                    stack.push(path);
+                } else if entry_meta.is_file() {
+                    scan_one_file(
+                        policy,
+                        root,
+                        &path,
+                        display,
+                        &mut hits,
+                        symbol,
+                        refs_cap,
+                        &mut budget,
+                    );
+                }
+            }
+        }
+    } else {
+        return Err(std::io::Error::other(
+            "find_symbol target is not a file or directory",
+        ));
+    }
+    Ok(render_symbol_hits(display, symbol, &hits))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_one_file(
+    policy: &Permissions,
+    root: &Path,
+    path: &Path,
+    display: &str,
+    hits: &mut SymbolHits,
+    symbol: &str,
+    refs_cap: usize,
+    budget: &mut SymbolScanBudget,
+) {
+    scan_one_file_with_hook(
+        policy,
+        root,
+        path,
+        display,
+        hits,
+        symbol,
+        refs_cap,
+        budget,
+        || {},
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_one_file_with_hook<F>(
+    policy: &Permissions,
+    root: &Path,
+    path: &Path,
+    display: &str,
+    hits: &mut SymbolHits,
+    symbol: &str,
+    refs_cap: usize,
+    budget: &mut SymbolScanBudget,
+    before_open: F,
+) where
+    F: FnOnce(),
+{
+    if policy.is_read_protected(path) {
+        return;
+    }
+    before_open();
+    let Ok(file) = open_read_file(path) else {
+        hits.skipped_unreadable += 1;
+        return;
+    };
+    if policy
+        .validate_opened_model_read(path, path, &file)
+        .is_err()
+    {
+        hits.skipped_unreadable += 1;
+        return;
+    }
+    let mut buf = Vec::new();
+    if Read::take(file, SYMBOL_MAX_FILE_BYTES)
+        .read_to_end(&mut buf)
+        .is_err()
+    {
+        hits.skipped_unreadable += 1;
+        return;
+    }
+    // Count the IO we actually performed, so the walk budget bounds real work.
+    budget.files += 1;
+    budget.bytes += buf.len() as u64;
+    let Ok(text) = std::str::from_utf8(&buf) else {
+        // Binary (or invalid UTF-8) file — not a source text; skip honestly.
+        hits.skipped_unreadable += 1;
+        return;
+    };
+    hits.files_scanned += 1;
+    let rel = if path == root {
+        display.to_string()
+    } else {
+        path.strip_prefix(root)
+            .ok()
+            .map(|p| p.to_string_lossy().into_owned())
+            .unwrap_or_else(|| path.to_string_lossy().into_owned())
+    };
+    for (idx, line) in text.lines().enumerate() {
+        if !line_mentions_symbol(line, symbol) {
+            continue;
+        }
+        let line_no = idx + 1;
+        if is_definition_line(line, symbol) {
+            hits.total_defs += 1;
+            if hits.defs.len() < SYMBOL_MAX_DEFS_SHOWN {
+                hits.defs
+                    .push((rel.clone(), line_no, truncate_symbol_line(line)));
+            }
+        } else {
+            hits.total_refs += 1;
+            if hits.refs.len() < refs_cap {
+                hits.refs
+                    .push((rel.clone(), line_no, truncate_symbol_line(line)));
+            }
+        }
+    }
+}
+
+fn render_symbol_hits(display: &str, symbol: &str, hits: &SymbolHits) -> String {
+    let capped_note = if hits.files_capped {
+        format!(
+            ", stopped at the {}-file / {} MiB scan cap",
+            SYMBOL_MAX_FILES,
+            SYMBOL_MAX_TOTAL_BYTES / (1024 * 1024)
+        )
+    } else {
+        String::new()
+    };
+    let skip_note = if hits.skipped_unreadable > 0 {
+        format!(", {} binary/unreadable skipped", hits.skipped_unreadable)
+    } else {
+        String::new()
+    };
+    let mut out = format!(
+        "find_symbol> \"{symbol}\" in {display} — {} definition(s), {} reference(s) \
+         [heuristic text scan; not a semantic index] (scanned {} file(s){capped_note}{skip_note})\n",
+        hits.total_defs, hits.total_refs, hits.files_scanned
+    );
+    if hits.total_defs == 0 && hits.total_refs == 0 {
+        out.push_str(&format!(
+            "(no definitions or usages of \"{symbol}\" found)\n"
+        ));
+        return out;
+    }
+    if hits.defs.is_empty() {
+        out.push_str(
+            "definitions: (none found here — may be defined elsewhere, imported, or built-in)\n",
+        );
+    } else {
+        out.push_str("definitions:\n");
+        for (p, n, t) in &hits.defs {
+            out.push_str(&format!("  {p}:{n}: {t}\n"));
+        }
+        if hits.total_defs > hits.defs.len() {
+            out.push_str(&format!(
+                "  [showing {} of {} definitions]\n",
+                hits.defs.len(),
+                hits.total_defs
+            ));
+        }
+    }
+    if !hits.refs.is_empty() {
+        out.push_str("references:\n");
+        for (p, n, t) in &hits.refs {
+            out.push_str(&format!("  {p}:{n}: {t}\n"));
+        }
+        if hits.total_refs > hits.refs.len() {
+            out.push_str(&format!(
+                "  [showing {} of {} references; raise max_results for more]\n",
+                hits.refs.len(),
+                hits.total_refs
+            ));
+        }
+    }
+    out
 }
 
 // --- fs.scan_file (bounded log tail / grep) ---------------------------------
@@ -5270,6 +7671,988 @@ mod tests {
     /// A real 3-row, 3-column spreadsheet (id,name,score) generated once with
     /// LibreOffice, embedded so the xlsx tests need no writer dependency.
     const SAMPLE_XLSX: &[u8] = include_bytes!("testdata/sample.xlsx");
+    /// A real 120x80 8-bit RGB PNG, generated once and embedded.
+    const SAMPLE_PNG: &[u8] = include_bytes!("testdata/sample.png");
+
+    #[test]
+    fn image_metadata_reports_format_and_dimensions() {
+        let out = render_image_metadata("pic.png", SAMPLE_PNG);
+        assert!(out.contains("Png"), "format: {out}");
+        assert!(out.contains("120x80 px"), "dimensions: {out}");
+        assert!(out.contains("metadata only"), "disclosure: {out}");
+        // A non-image header does not panic and discloses it can't read dims.
+        let out = render_image_metadata("x.png", b"this is not an image");
+        assert!(
+            out.contains("could not read dimensions") || out.contains("unrecognized"),
+            "non-image: {out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_image_end_to_end_and_via_dispatch() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("photo.png");
+        std::fs::write(&path, SAMPLE_PNG).unwrap();
+
+        // Direct fs_read_image.
+        let out = read_image_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("image ok");
+        assert!(out.contains("Png") && out.contains("120x80 px"), "{out}");
+
+        // read_document routes an image to fs_read_image (real metadata now).
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("image → fs_read_image"), "route label: {out}");
+        assert!(out.contains("120x80 px"), "dispatch metadata: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.png");
+        std::fs::write(&bad, SAMPLE_PNG).unwrap();
+        assert!(matches!(
+            read_image_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    /// Build a minimal real `.docx` (a zip carrying `word/document.xml`).
+    fn write_min_docx(path: &std::path::Path, document_xml: &str) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        zip.start_file(
+            "word/document.xml",
+            zip::write::SimpleFileOptions::default(),
+        )
+        .unwrap();
+        zip.write_all(document_xml.as_bytes()).unwrap();
+        zip.finish().unwrap();
+    }
+
+    /// Build a minimal real `.pptx` (a zip carrying `ppt/slides/slideN.xml`).
+    fn write_min_pptx(path: &std::path::Path, slides: &[(u32, &str)]) {
+        let file = std::fs::File::create(path).unwrap();
+        let mut zip = zip::ZipWriter::new(file);
+        for (n, sp_tree_body) in slides {
+            zip.start_file(
+                format!("ppt/slides/slide{n}.xml"),
+                zip::write::SimpleFileOptions::default(),
+            )
+            .unwrap();
+            let xml = format!(
+                "<?xml version=\"1.0\"?><p:sld xmlns:a=\"x\"><p:cSld><p:spTree>{sp_tree_body}\
+                 </p:spTree></p:cSld></p:sld>"
+            );
+            zip.write_all(xml.as_bytes()).unwrap();
+        }
+        zip.finish().unwrap();
+    }
+
+    #[test]
+    fn pptx_paragraph_extraction_and_entities() {
+        let xml = "<p:sld xmlns:a=\"x\">\
+            <a:p><a:r><a:t>Hello</a:t></a:r></a:p>\
+            <a:p><a:r><a:t>World &amp; co</a:t></a:r></a:p>\
+            <a:p></a:p></p:sld>";
+        let paras = parse_pptx_paragraphs(xml);
+        let with_text: Vec<&String> = paras.iter().filter(|p| !p.trim().is_empty()).collect();
+        assert_eq!(with_text.len(), 2, "{paras:?}");
+        assert_eq!(with_text[0], "Hello");
+        assert_eq!(with_text[1], "World & co"); // entity decoded
+    }
+
+    #[tokio::test]
+    async fn read_pptx_end_to_end_ordering_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("deck.pptx");
+        // Slides added out of lexical order to exercise the numeric sort
+        // (lexically "slide10" precedes "slide2").
+        write_min_pptx(
+            &path,
+            &[
+                (2, "<a:p><a:r><a:t>Second slide</a:t></a:r></a:p>"),
+                (10, "<a:p><a:r><a:t>Tenth slide</a:t></a:r></a:p>"),
+                (1, "<a:p><a:r><a:t>First slide</a:t></a:r></a:p>"),
+            ],
+        );
+        let out = read_pptx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("pptx ok");
+        assert!(out.contains("3 slide(s)"), "{out}");
+        let (i1, i2, i10) = (
+            out.find("--- slide 1 ---").expect("slide 1"),
+            out.find("--- slide 2 ---").expect("slide 2"),
+            out.find("--- slide 10 ---").expect("slide 10"),
+        );
+        assert!(i1 < i2 && i2 < i10, "numeric slide order: {out}");
+        assert!(
+            out.contains("First slide") && out.contains("Tenth slide"),
+            "{out}"
+        );
+
+        // read_document routes a pptx to fs_read_pptx.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("PPTX → fs_read_pptx"), "{out}");
+        assert!(out.contains("First slide"), "{out}");
+
+        // A zip WITHOUT ppt/slides/slideN.xml → honest error, not garbage.
+        let notpptx = dir.path().join("weird.pptx");
+        {
+            let f = std::fs::File::create(&notpptx).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("other.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"not a slide deck").unwrap();
+            z.finish().unwrap();
+        }
+        assert!(matches!(
+            read_pptx_run(
+                &policy,
+                &serde_json::json!({"path": notpptx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.pptx");
+        write_min_pptx(&bad, &[(1, "<a:p><a:r><a:t>x</a:t></a:r></a:p>")]);
+        assert!(matches!(
+            read_pptx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn docx_paragraph_extraction_and_entities() {
+        let xml = "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+            <w:p><w:r><w:t>Hello world</w:t></w:r></w:p>\
+            <w:p><w:r><w:t xml:space=\"preserve\">Second </w:t><w:t>paragraph &amp; more</w:t></w:r></w:p>\
+            <w:p></w:p>\
+            <w:p><w:r><w:t>Tab</w:t><w:tab/><w:t>after</w:t></w:r></w:p>\
+            </w:body></w:document>";
+        let out = render_docx("memo.docx", xml, 500, false);
+        // Empty <w:p> skipped → 3 with text.
+        assert!(out.contains("3 paragraph(s) with text"), "{out}");
+        assert!(out.contains("Hello world"), "{out}");
+        // Adjacent runs joined; &amp; decoded.
+        assert!(out.contains("Second paragraph & more"), "{out}");
+        // <w:tab/> becomes a tab.
+        assert!(out.contains("Tab\tafter"), "{out}");
+    }
+
+    #[test]
+    fn docx_empty_and_malformed_are_honest() {
+        let out = render_docx(
+            "x.docx",
+            "<w:document><w:body></w:body></w:document>",
+            500,
+            false,
+        );
+        assert!(out.contains("no extractable text"), "{out}");
+        // Unclosed tags must not panic; whatever text was gathered is surfaced.
+        let out = render_docx("x.docx", "<w:p><w:t>partial", 500, false);
+        assert!(
+            out.contains("partial") || out.contains("no extractable text"),
+            "{out}"
+        );
+    }
+
+    #[tokio::test]
+    async fn read_docx_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("report.docx");
+        write_min_docx(
+            &path,
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+             <w:p><w:r><w:t>First para</w:t></w:r></w:p>\
+             <w:p><w:r><w:t>Second para</w:t></w:r></w:p></w:body></w:document>",
+        );
+        let out = read_docx_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("docx ok");
+        assert!(out.contains("2 paragraph(s) with text"), "{out}");
+        assert!(
+            out.contains("First para") && out.contains("Second para"),
+            "{out}"
+        );
+
+        // A zip WITHOUT word/document.xml → honest error, not a panic or garbage.
+        let notdocx = dir.path().join("weird.docx");
+        {
+            let f = std::fs::File::create(&notdocx).unwrap();
+            let mut z = zip::ZipWriter::new(f);
+            z.start_file("other.txt", zip::write::SimpleFileOptions::default())
+                .unwrap();
+            z.write_all(b"not a word doc").unwrap();
+            z.finish().unwrap();
+        }
+        assert!(matches!(
+            read_docx_run(
+                &policy,
+                &serde_json::json!({"path": notdocx.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::ExecError(_))
+        ));
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.docx");
+        write_min_docx(
+            &bad,
+            "<w:document><w:body><w:p><w:r><w:t>x</w:t></w:r></w:p></w:body></w:document>",
+        );
+        assert!(matches!(
+            read_docx_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    const SAMPLE_AUDIT_JSON: &str = r#"{
+      "vulnerabilities": {
+        "found": true,
+        "count": 1,
+        "list": [
+          {
+            "advisory": {
+              "id": "RUSTSEC-2021-0001",
+              "title": "flate2 miscompilation",
+              "aliases": ["CVE-2021-0001"]
+            },
+            "versions": { "patched": [">=1.0.14"], "unaffected": [] },
+            "package": { "name": "flate2", "version": "1.0.13" }
+          }
+        ]
+      },
+      "warnings": {
+        "unmaintained": [
+          {
+            "kind": "unmaintained",
+            "package": { "name": "ansi_term", "version": "0.12.1" },
+            "advisory": { "id": "RUSTSEC-2021-0139", "title": "ansi_term is unmaintained" }
+          }
+        ]
+      }
+    }"#;
+
+    #[test]
+    fn scan_secrets_detects_and_redacts_known_forms() {
+        // Known token prefix with a long body.
+        let line = "let key = \"sk-abcdefgh12345678\";";
+        assert!(
+            detect_secret_kinds(line).contains(&"token-prefix"),
+            "{line}"
+        );
+        let red = redact_secrets_line(line);
+        assert!(
+            red.contains("<redacted>") && !red.contains("abcdefgh12345678"),
+            "{red}"
+        );
+        // Bearer token.
+        let line = "Authorization: Bearer abcdef.ghijkl.mnopqr";
+        assert!(detect_secret_kinds(line).contains(&"bearer-token"));
+        assert!(!redact_secrets_line(line).contains("abcdef.ghijkl.mnopqr"));
+        // Secret assignment.
+        let line = "password = hunter2hunter2";
+        assert!(detect_secret_kinds(line).contains(&"secret-assignment"));
+        assert!(!redact_secrets_line(line).contains("hunter2hunter2"));
+        // URL user:pass@host.
+        let line = "clone https://user:s3cr3tpass@example.com/repo.git";
+        assert!(detect_secret_kinds(line).contains(&"url-credentials"));
+        assert!(!redact_secrets_line(line).contains("s3cr3tpass"));
+        // Benign: a short hf_ identifier and ordinary code are NOT flagged.
+        assert!(detect_secret_kinds("let hf_model = load();").is_empty());
+        assert!(detect_secret_kinds("let total = count + 1;").is_empty());
+    }
+
+    #[tokio::test]
+    async fn scan_secrets_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("changes.diff");
+        std::fs::write(
+            &path,
+            "+const A = 1;\n+let token = \"ghp_0123456789abcdefghij\";\n+normal line\n",
+        )
+        .unwrap();
+        let out = scan_secrets_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("scan ok");
+        assert!(out.contains("1 line(s) with apparent credentials"), "{out}");
+        assert!(out.contains("2: ") && out.contains("token-prefix"), "{out}");
+        assert!(
+            out.contains("<redacted>") && !out.contains("0123456789abcdefghij"),
+            "secret leaked: {out}"
+        );
+
+        // A clean file → honest "no apparent credentials".
+        let clean = dir.path().join("clean.txt");
+        std::fs::write(&clean, "just some code\nno secrets here\n").unwrap();
+        let out = scan_secrets_run(
+            &policy,
+            &serde_json::json!({"path": clean.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("scan ok");
+        assert!(out.contains("no apparent credentials found"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.diff");
+        std::fs::write(&bad, "token = ghp_0123456789abcdefghij\n").unwrap();
+        assert!(matches!(
+            scan_secrets_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn audit_summary_ranked_view() {
+        let out = render_audit_summary("audit.json", SAMPLE_AUDIT_JSON, 100);
+        assert!(out.contains("1 vulnerability, 1 warning(s)"), "{out}");
+        assert!(
+            out.contains("[RUSTSEC-2021-0001] flate2 1.0.13 — flate2 miscompilation"),
+            "{out}"
+        );
+        assert!(out.contains("fix: upgrade to >=1.0.14"), "{out}");
+        assert!(out.contains("aka: CVE-2021-0001"), "{out}");
+        assert!(
+            out.contains("[unmaintained] ansi_term 0.12.1 — ansi_term is unmaintained"),
+            "{out}"
+        );
+    }
+
+    #[test]
+    fn audit_summary_clean_no_patch_and_malformed() {
+        // Clean report.
+        let clean = r#"{"vulnerabilities":{"found":false,"count":0,"list":[]},"warnings":{}}"#;
+        let out = render_audit_summary("a.json", clean, 100);
+        assert!(out.contains("0 vulnerabilities, 0 warning(s)"), "{out}");
+        assert!(out.contains("no known vulnerabilities"), "{out}");
+        // A vuln with no patched release is disclosed honestly.
+        let no_patch = r#"{"vulnerabilities":{"count":1,"list":[{"advisory":{"id":"RUSTSEC-2020-0002","title":"unfixed"},"versions":{"patched":[]},"package":{"name":"foo","version":"0.1.0"}}]},"warnings":{}}"#;
+        let out = render_audit_summary("a.json", no_patch, 100);
+        assert!(out.contains("fix: no patched release available"), "{out}");
+        // Malformed JSON → disclosed, not guessed or panicked on.
+        let out = render_audit_summary("a.json", "not json {{{", 100);
+        assert!(out.contains("could not parse"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn audit_summary_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("audit.json");
+        std::fs::write(&path, SAMPLE_AUDIT_JSON).unwrap();
+
+        let out = audit_summary_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("audit ok");
+        assert!(out.contains("1 vulnerability, 1 warning(s)"), "{out}");
+        assert!(out.contains("[RUSTSEC-2021-0001]"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("audit.json");
+        std::fs::write(&bad, SAMPLE_AUDIT_JSON).unwrap();
+        assert!(matches!(
+            audit_summary_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    const SAMPLE_NOTEBOOK: &str = r##"{
+      "cells": [
+        {"cell_type": "markdown", "source": ["# Title\n", "Some **text**\n"]},
+        {"cell_type": "code", "execution_count": 1,
+         "source": ["import numpy as np\n", "np.arange(3)\n"],
+         "outputs": [
+           {"output_type": "stream", "name": "stdout", "text": ["loading\n", "done\n"]},
+           {"output_type": "execute_result", "data": {"text/plain": ["array([0, 1, 2])"]}},
+           {"output_type": "error", "ename": "ValueError", "evalue": "bad input", "traceback": []}
+         ]}
+      ],
+      "metadata": {"kernelspec": {"language": "python", "name": "python3"}},
+      "nbformat": 4, "nbformat_minor": 5
+    }"##;
+
+    #[test]
+    fn notebook_renders_cells_types_and_output_summaries() {
+        let out = render_notebook("nb.ipynb", SAMPLE_NOTEBOOK, 100);
+        assert!(out.contains("2 cell(s) (1 code, 1 markdown)"), "{out}");
+        assert!(out.contains("[language: python]"), "{out}");
+        assert!(out.contains("[1] markdown:"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+        assert!(out.contains("[2] code (exec 1):"), "{out}");
+        assert!(out.contains("import numpy as np"), "{out}");
+        // Output summaries — never the full payload.
+        assert!(out.contains("→ stdout (2 lines)"), "{out}");
+        assert!(out.contains("→ result: array([0, 1, 2])"), "{out}");
+        assert!(out.contains("→ error: ValueError: bad input"), "{out}");
+    }
+
+    #[test]
+    fn notebook_non_notebook_and_malformed_are_honest() {
+        // Valid JSON but not a notebook (no cells array).
+        let out = render_notebook("x.ipynb", r#"{"foo": 1}"#, 100);
+        assert!(out.contains("not a Jupyter notebook"), "{out}");
+        // Malformed JSON.
+        let out = render_notebook("x.ipynb", "not json {{{", 100);
+        assert!(out.contains("could not parse"), "{out}");
+        // A cell whose `source` is a plain string (not an array) is handled.
+        let one = r#"{"cells":[{"cell_type":"code","source":"print(1)\n"}]}"#;
+        let out = render_notebook("x.ipynb", one, 100);
+        assert!(out.contains("print(1)"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_notebook_end_to_end_dispatch_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("analysis.ipynb");
+        std::fs::write(&path, SAMPLE_NOTEBOOK).unwrap();
+
+        let out = read_notebook_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("nb ok");
+        assert!(
+            out.contains("2 cell(s)") && out.contains("import numpy"),
+            "{out}"
+        );
+
+        // read_document routes an .ipynb to fs_read_notebook.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("notebook → fs_read_notebook"), "{out}");
+        assert!(out.contains("# Title"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.ipynb");
+        std::fs::write(&bad, SAMPLE_NOTEBOOK).unwrap();
+        assert!(matches!(
+            read_notebook_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn html_to_text_strips_tags_scripts_and_decodes_entities() {
+        let html = "<!DOCTYPE html><html><head><title>Doc</title>\
+            <style>.c{color:red}</style></head><body>\
+            <h1>Heading</h1><p>Hello &amp; <b>world</b> — 5 &lt; 6</p>\
+            <script>var secret = a < b && c > d;</script>\
+            <!-- a comment --><ul><li>one</li><li>two</li></ul>\
+            <p>&#65; &#x42; &nbsp;end</p></body></html>";
+        let text = html_to_text(html);
+        assert!(text.contains("Heading"), "{text}");
+        assert!(text.contains("Hello & world — 5 < 6"), "{text}");
+        // <script>/<style> content removed wholesale (incl. the `a < b` that
+        // would derail a naive tag parser).
+        assert!(!text.contains("var secret"), "script leaked: {text}");
+        assert!(!text.contains("color:red"), "style leaked: {text}");
+        assert!(!text.contains("a comment"), "comment leaked: {text}");
+        // Block tags become line breaks; list items land on their own lines.
+        assert!(text.contains("one") && text.contains("two"), "{text}");
+        // Entities: &#65;=A, &#x42;=B, &nbsp;=space.
+        assert!(text.contains("A B end"), "entities: {text}");
+    }
+
+    #[tokio::test]
+    async fn read_html_end_to_end_dispatch_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("page.html");
+        std::fs::write(
+            &path,
+            "<html><body><h1>Report</h1><p>Body &amp; text</p>\
+             <script>x<y</script></body></html>",
+        )
+        .unwrap();
+
+        let out = read_html_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("html ok");
+        assert!(
+            out.contains("Report") && out.contains("Body & text"),
+            "{out}"
+        );
+        assert!(!out.contains("x<y"), "script leaked: {out}");
+
+        // read_document routes .html to fs_read_html.
+        let out = read_document_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("dispatch ok");
+        assert!(out.contains("HTML → fs_read_html"), "{out}");
+        assert!(out.contains("Report"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.html");
+        std::fs::write(&bad, "<p>hi</p>").unwrap();
+        assert!(matches!(
+            read_html_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn outline_lists_definitions_and_skips_noise() {
+        let src = r#"// fn commented_out does nothing
+use std::fmt;
+
+pub struct Config {
+    name: String,
+}
+
+const MAX: usize = 10;
+
+impl Config {
+    pub fn new(name: String) -> Self {
+        let mut count = 0;
+        Self { name }
+    }
+}
+
+fn helper(x: u32) -> u32 { x + MAX as u32 }
+"#;
+        let out = render_outline("lib.rs", src, 500, false);
+        assert!(out.contains("struct Config"), "{out}");
+        assert!(out.contains("const MAX"), "{out}");
+        assert!(out.contains("impl Config"), "{out}");
+        assert!(out.contains("fn new"), "{out}");
+        assert!(out.contains("fn helper"), "{out}");
+        assert!(out.contains("5 definition(s)"), "{out}");
+        // The commented `fn commented_out` is not a definition.
+        assert!(!out.contains("commented_out"), "comment leaked: {out}");
+        // A local `let mut count` binding is excluded.
+        assert!(
+            !out.contains("let mut count"),
+            "local binding leaked: {out}"
+        );
+        // `use` is not a definition.
+        assert!(!out.contains("use std::fmt"), "{out}");
+    }
+
+    #[test]
+    fn outline_no_defs_is_honest() {
+        let out = render_outline("x.txt", "just some prose\nno code here\n", 500, false);
+        assert!(out.contains("(no top-level definitions detected)"), "{out}");
+    }
+
+    #[test]
+    fn outline_rejects_keywords_in_strings_and_calls() {
+        // A keyword mid-line (inside a string or a call argument) is NOT a
+        // definition; only a keyword at the statement start (after modifiers) is.
+        let src = "fn real_definition() {}\n\
+                   describe(\"fn fake\", || {});\n\
+                   let code = \"fn also_fake\";\n\
+                   pub(crate) fn visible_helper() {}\n";
+        let out = render_outline("t.rs", src, 500, false);
+        assert!(out.contains("2 definition(s)"), "{out}");
+        assert!(out.contains("fn real_definition"), "{out}");
+        assert!(
+            out.contains("fn visible_helper"),
+            "pub(crate) missed: {out}"
+        );
+        assert!(!out.contains("fake"), "string/call keyword leaked: {out}");
+    }
+
+    #[tokio::test]
+    async fn outline_file_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("mod.rs");
+        std::fs::write(&path, "pub fn alpha() {}\nstruct Beta;\nfn gamma() {}\n").unwrap();
+
+        let out = outline_file_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("outline ok");
+        assert!(out.contains("3 definition(s)"), "{out}");
+        assert!(
+            out.contains("fn alpha") && out.contains("struct Beta") && out.contains("fn gamma"),
+            "{out}"
+        );
+        assert!(out.contains("1: pub fn alpha"), "line numbers: {out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("x.rs");
+        std::fs::write(&bad, "fn z() {}\n").unwrap();
+        assert!(matches!(
+            outline_file_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn manifest_cargo_summary() {
+        let content = r#"
+[package]
+name = "kitsu-tools"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+tokio = "1"
+serde = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[features]
+extra = []
+"#;
+        let out = render_manifest("Cargo.toml", "Cargo.toml", content, 50);
+        assert!(out.contains("Cargo (Rust) — kitsu-tools v0.1.0"), "{out}");
+        assert!(out.contains("edition 2021"), "{out}");
+        // Sorted + counted.
+        assert!(out.contains("dependencies (2): serde, tokio"), "{out}");
+        assert!(out.contains("dev-dependencies (1): tempfile"), "{out}");
+        assert!(out.contains("features: 1"), "{out}");
+    }
+
+    #[test]
+    fn manifest_package_json_summary() {
+        let content = r#"{
+  "name": "webapp",
+  "version": "2.3.0",
+  "dependencies": { "react": "^18", "zod": "^3" },
+  "devDependencies": { "vitest": "^1" },
+  "scripts": { "build": "vite build", "test": "vitest" }
+}"#;
+        let out = render_manifest("package.json", "package.json", content, 50);
+        assert!(out.contains("package.json (Node) — webapp v2.3.0"), "{out}");
+        assert!(out.contains("dependencies (2): react, zod"), "{out}");
+        assert!(out.contains("devDependencies (1): vitest"), "{out}");
+        assert!(out.contains("scripts (2): build, test"), "{out}");
+    }
+
+    #[test]
+    fn manifest_pyproject_pep621_and_poetry() {
+        let pep621 = r#"
+[project]
+name = "svc"
+version = "0.4.1"
+dependencies = ["requests>=2.0", "flask (==3.0)", "pydantic"]
+
+[build-system]
+build-backend = "hatchling.build"
+"#;
+        let out = render_manifest("pyproject.toml", "pyproject.toml", pep621, 50);
+        assert!(
+            out.contains("pyproject.toml (Python) — svc v0.4.1"),
+            "{out}"
+        );
+        // Requirement names extracted from PEP 508 strings, sorted.
+        assert!(
+            out.contains("dependencies (3): flask, pydantic, requests"),
+            "{out}"
+        );
+        assert!(out.contains("build-backend: hatchling.build"), "{out}");
+
+        let poetry = r#"
+[tool.poetry]
+name = "svc2"
+version = "1.0.0"
+
+[tool.poetry.dependencies]
+python = "^3.11"
+httpx = "^0.27"
+"#;
+        let out = render_manifest("pyproject.toml", "pyproject.toml", poetry, 50);
+        assert!(
+            out.contains("pyproject.toml (Python) — svc2 v1.0.0"),
+            "{out}"
+        );
+        // The `python` pin is not a dependency; httpx is.
+        assert!(out.contains("dependencies (1): httpx"), "{out}");
+    }
+
+    #[test]
+    fn manifest_requirement_name_and_bad_input() {
+        assert_eq!(requirement_name("requests>=2.0"), "requests");
+        assert_eq!(
+            requirement_name("ruff (==0.1); python_version>'3.7'"),
+            "ruff"
+        );
+        assert_eq!(requirement_name("  numpy  "), "numpy");
+        // A malformed manifest is disclosed, not guessed or panicked on.
+        let out = render_manifest("Cargo.toml", "Cargo.toml", "this is not = [valid toml", 50);
+        assert!(out.contains("could not parse"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn read_manifest_end_to_end_and_allowlist() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(&[root], &[]).expect("perms");
+        let path = dir.path().join("Cargo.toml");
+        std::fs::write(
+            &path,
+            "[package]\nname = \"demo\"\nversion = \"9.9.9\"\n\n[dependencies]\nanyhow = \"1\"\n",
+        )
+        .unwrap();
+
+        let out = read_manifest_run(
+            &policy,
+            &serde_json::json!({"path": path.to_string_lossy()}).to_string(),
+        )
+        .await
+        .expect("manifest ok");
+        assert!(out.contains("demo v9.9.9"), "{out}");
+        assert!(out.contains("dependencies (1): anyhow"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        let bad = other.path().join("Cargo.toml");
+        std::fs::write(&bad, "[package]\nname = \"x\"\n").unwrap();
+        assert!(matches!(
+            read_manifest_run(
+                &policy,
+                &serde_json::json!({"path": bad.to_string_lossy()}).to_string()
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[test]
+    fn symbol_whole_word_matching() {
+        assert!(line_mentions_symbol("let foo = 1;", "foo"));
+        assert!(line_mentions_symbol("a.foo()", "foo"));
+        assert!(line_mentions_symbol("foo", "foo"));
+        // Fragments of a larger identifier are NOT whole-word matches.
+        assert!(!line_mentions_symbol("foobar", "foo"));
+        assert!(!line_mentions_symbol("barfoo", "foo"));
+        assert!(!line_mentions_symbol("foo_bar", "foo"));
+        assert!(!line_mentions_symbol("nothing here", "foo"));
+    }
+
+    #[test]
+    fn symbol_definition_classification() {
+        // Definition forms across languages.
+        assert!(is_definition_line("fn parse(input: &str) {", "parse"));
+        assert!(is_definition_line("    pub struct Config {", "Config"));
+        assert!(is_definition_line("def parse(self):", "parse"));
+        assert!(is_definition_line("class Config:", "Config"));
+        assert!(is_definition_line("let count = 0;", "count"));
+        assert!(is_definition_line("let mut total = 0;", "total"));
+        assert!(is_definition_line("type Alias = u32;", "Alias"));
+        // Uses are NOT definitions.
+        assert!(!is_definition_line("self.parse();", "parse"));
+        assert!(!is_definition_line("use crate::parse;", "parse"));
+        assert!(!is_definition_line("return parse(x)", "parse"));
+        assert!(!is_definition_line("let n = count + 1;", "count"));
+    }
+
+    #[test]
+    fn symbol_render_reports_not_found_cleanly() {
+        let hits = SymbolHits::default();
+        let out = render_symbol_hits("src", "missing", &hits);
+        assert!(out.contains("0 definition(s), 0 reference(s)"), "{out}");
+        assert!(out.contains("no definitions or usages"), "{out}");
+        assert!(out.contains("heuristic text scan"), "{out}");
+    }
+
+    #[tokio::test]
+    async fn find_symbol_locates_definition_and_references_across_a_tree() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let root = dir.path().to_string_lossy().into_owned();
+        let policy = Arc::new(Permissions::for_roots(&[root], &[]).expect("perms"));
+
+        // A small "repo": a definition in one file, two uses in a nested file.
+        std::fs::write(
+            dir.path().join("lib.rs"),
+            "pub fn widget() -> u32 { 42 }\nfn other() {}\n",
+        )
+        .unwrap();
+        let sub = dir.path().join("src");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(
+            sub.join("main.rs"),
+            "fn main() {\n    let n = widget();\n    println!(\"{}\", widget());\n}\n",
+        )
+        .unwrap();
+        // A binary file must be skipped honestly, not garbled.
+        std::fs::write(dir.path().join("blob.bin"), [0u8, 159, 146, 150]).unwrap();
+        // A build dir must not be descended (else its generated def is counted).
+        let target = dir.path().join("target");
+        std::fs::create_dir(&target).unwrap();
+        std::fs::write(target.join("gen.rs"), "fn widget() { /* generated */ }\n").unwrap();
+
+        let out = find_symbol_run(
+            policy.clone(),
+            &serde_json::json!({"symbol": "widget", "path": dir.path().to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("find ok");
+
+        assert!(out.contains("definitions:"), "{out}");
+        assert!(out.contains("lib.rs:1"), "def site: {out}");
+        assert!(out.contains("references:"), "{out}");
+        assert!(
+            out.contains("1 definition(s), 2 reference(s)"),
+            "counts: {out}"
+        );
+        // The build dir was skipped: the generated def is NOT counted.
+        assert!(!out.contains("gen.rs"), "should skip build dirs: {out}");
+        // The binary blob was skipped and disclosed.
+        assert!(
+            out.contains("binary/unreadable skipped"),
+            "binary disclosure: {out}"
+        );
+
+        // Degrades cleanly for an absent symbol.
+        let out = find_symbol_run(
+            policy.clone(),
+            &serde_json::json!({"symbol": "nonexistent", "path": dir.path().to_string_lossy()})
+                .to_string(),
+        )
+        .await
+        .expect("find ok");
+        assert!(out.contains("no definitions or usages"), "{out}");
+
+        // Outside the allowlist → PolicyDenied.
+        let other = tempfile::tempdir().unwrap();
+        assert!(matches!(
+            find_symbol_run(
+                policy,
+                &serde_json::json!({"symbol": "widget", "path": other.path().to_string_lossy()})
+                    .to_string(),
+            )
+            .await,
+            Err(ToolError::PolicyDenied(_))
+        ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_symbol_revalidates_a_file_replaced_after_the_path_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let private = dir.path().join("private");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let visible = allowed.join("visible.rs");
+        let secret = private.join("session.rs");
+        std::fs::write(&visible, "fn harmless() {}\n").unwrap();
+        std::fs::write(&secret, "fn private_symbol() {}\n").unwrap();
+
+        let root = allowed.to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        policy
+            .protect_read_path(&private.to_string_lossy())
+            .unwrap();
+
+        let mut hits = SymbolHits::default();
+        let mut budget = SymbolScanBudget::default();
+        scan_one_file_with_hook(
+            &policy,
+            &allowed,
+            &visible,
+            "allowed",
+            &mut hits,
+            "private_symbol",
+            SYMBOL_DEFAULT_MAX_REFS,
+            &mut budget,
+            || {
+                std::fs::remove_file(&visible).unwrap();
+                std::fs::hard_link(&secret, &visible).unwrap();
+            },
+        );
+
+        assert_eq!(hits.total_defs, 0);
+        assert_eq!(hits.total_refs, 0);
+        assert_eq!(hits.files_scanned, 0);
+        assert_eq!(hits.skipped_unreadable, 1);
+    }
 
     #[test]
     fn config_diff_reports_added_removed_changed_on_sshd_shaped_files() {
@@ -5743,17 +9126,18 @@ UseDNS no
         assert!(out.contains("PDF → fs_read_pdf"), "{out}");
         assert!(out.contains("routed via read_document"), "extracted: {out}");
 
-        // PNG magic → detected image, no extraction, no garbage.
+        // PNG → routed to fs_read_image for real metadata (format + dims), no
+        // garbage. Use a real PNG so dimensions come through.
         let png = dir.path().join("pic.png");
-        std::fs::write(&png, [0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]).unwrap();
+        std::fs::write(&png, SAMPLE_PNG).unwrap();
         let out = read_document_run(
             &policy,
             &serde_json::json!({"path": png.to_string_lossy()}).to_string(),
         )
         .await
         .expect("png route");
-        assert!(out.contains("detected PNG image"), "{out}");
-        assert!(out.contains("not extracted"), "{out}");
+        assert!(out.contains("image → fs_read_image"), "{out}");
+        assert!(out.contains("120x80 px"), "{out}");
 
         // xlsx (zip magic + extension) → routed to the real extractor.
         let xlsx = dir.path().join("book.xlsx");
@@ -5767,17 +9151,21 @@ UseDNS no
         assert!(out.contains("XLSX → fs_read_xlsx"), "{out}");
         assert!(out.contains("Ada"), "extracted cell: {out}");
 
-        // docx (zip magic + extension, no extractor) → detected, declined.
+        // docx (a real minimal zip) → routed to fs_read_docx and text-extracted.
         let docx = dir.path().join("memo.docx");
-        std::fs::write(&docx, [b'P', b'K', 0x03, 0x04, 0, 0, 0, 0]).unwrap();
+        write_min_docx(
+            &docx,
+            "<?xml version=\"1.0\"?><w:document xmlns:w=\"x\"><w:body>\
+             <w:p><w:r><w:t>Routed body text</w:t></w:r></w:p></w:body></w:document>",
+        );
         let out = read_document_run(
             &policy,
             &serde_json::json!({"path": docx.to_string_lossy()}).to_string(),
         )
         .await
         .expect("docx route");
-        assert!(out.contains("detected DOCX"), "{out}");
-        assert!(out.contains("no structured extractor"), "{out}");
+        assert!(out.contains("DOCX → fs_read_docx"), "{out}");
+        assert!(out.contains("Routed body text"), "{out}");
 
         // Outside the allowlist → PolicyDenied before any routing.
         let other = tempfile::tempdir().unwrap();
