@@ -2,6 +2,7 @@
 //! AI gateway — they share one wire shape; only base_url/path/auth differ
 //! (design §1, §4).
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime};
@@ -15,9 +16,7 @@ use crate::error::{ProviderError, ProviderResponsePart};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
-use crate::types::{
-    ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, ToolDescriptor, Usage,
-};
+use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason, Role, ToolCall, Usage};
 use crate::{ChatStream, Provider};
 
 #[cfg(test)]
@@ -46,6 +45,11 @@ struct ModelsCacheEntry {
     stored_at: tokio::time::Instant,
     ttl: Duration,
     outcome: Result<(StatusCode, String), ProviderError>,
+    /// Memoized per-model context-length lookups parsed from the catalog JSON
+    /// on first miss; reused for the cache's lifetime (which is the catalog's
+    /// own TTL), so repeat `model_context_length` calls don't re-parse. Fresh on
+    /// every cache invalidation, so it inherits the existing TTL contract.
+    context_lengths: std::sync::Mutex<HashMap<String, Option<u64>>>,
 }
 
 /// Builder inputs for constructing a gateway-backed provider.
@@ -106,7 +110,7 @@ impl OpenAICompatProvider {
 
 // --- wire types (internal to this module) -----------------------------------
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireRequest<'a> {
     model: &'a str,
     messages: Vec<WireMessage<'a>>,
@@ -129,26 +133,26 @@ struct WireRequest<'a> {
     prompt_cache_key: Option<&'a str>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireResponseFormat<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     json_schema: WireJsonSchema<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireJsonSchema<'a> {
     name: &'a str,
     strict: bool,
     schema: &'a serde_json::Value,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct StreamOptions {
     include_usage: bool,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireMessage<'a> {
     role: &'a str,
     content: &'a str,
@@ -158,7 +162,7 @@ struct WireMessage<'a> {
     tool_calls: Option<Vec<WireToolCall<'a>>>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolCall<'a> {
     id: &'a str,
     #[serde(rename = "type")]
@@ -166,20 +170,20 @@ struct WireToolCall<'a> {
     function: WireToolCallFn<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolCallFn<'a> {
     name: &'a str,
     arguments: &'a str,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireTool<'a> {
     #[serde(rename = "type")]
     kind: &'static str,
     function: WireToolFn<'a>,
 }
 
-#[derive(Serialize)]
+#[derive(Serialize, Debug)]
 struct WireToolFn<'a> {
     name: &'a str,
     description: &'a str,
@@ -195,7 +199,7 @@ fn role_str(role: Role) -> &'static str {
     }
 }
 
-fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
+fn build_body<'a>(req: &'a ChatRequest) -> Result<WireRequest<'a>, ProviderError> {
     let messages = req
         .messages
         .iter()
@@ -226,20 +230,34 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
         })
         .collect();
 
-    let tools = req.tools.as_ref().map(|ts| {
-        ts.iter()
-            .map(|t: &ToolDescriptor| WireTool {
-                kind: "function",
-                function: WireToolFn {
-                    name: &t.name,
-                    description: &t.description,
-                    parameters: &t.parameters,
-                },
-            })
-            .collect()
-    });
+    let tools = match req.tools.as_ref() {
+        Some(ts) => {
+            let mut wire_tools = Vec::with_capacity(ts.len());
+            for t in ts {
+                // Fast-fail: shipping a non-object `parameters` to the gateway
+                // fails opaquely downstream. A valid tool schema must be a JSON
+                // object; reject anything else before serialization.
+                if !t.parameters.is_object() {
+                    return Err(ProviderError::InvalidResponse(format!(
+                        "tool {}: parameters must be a JSON Schema object",
+                        t.name
+                    )));
+                }
+                wire_tools.push(WireTool {
+                    kind: "function",
+                    function: WireToolFn {
+                        name: &t.name,
+                        description: &t.description,
+                        parameters: &t.parameters,
+                    },
+                });
+            }
+            Some(wire_tools)
+        }
+        None => None,
+    };
 
-    WireRequest {
+    Ok(WireRequest {
         model: &req.model,
         messages,
         tools,
@@ -266,7 +284,7 @@ fn build_body<'a>(req: &'a ChatRequest) -> WireRequest<'a> {
                 },
             }),
         prompt_cache_key: req.prompt_cache_key.as_deref(),
-    }
+    })
 }
 
 // --- streaming/non-streaming response wire types ----------------------------
@@ -368,7 +386,16 @@ const MAX_STREAMED_TOOL_CALLS: usize = 64;
 const MAX_COMPLETION_BODY_BYTES: usize = 8 * 1024 * 1024;
 const MAX_MODEL_CATALOG_BODY_BYTES: usize = 2 * 1024 * 1024;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
-const MAX_SSE_LINE_BYTES: usize = 256 * 1024;
+// Per-line ceiling for an SSE record. It must be large enough that a single
+// `data:` line carrying a full-size tool-call argument delta can reach the
+// argument budget below (`MAX_STREAMED_TOOL_ARGUMENT_BYTES`) rather than being
+// rejected here first: such a line is `data: {"choices":[{"delta":{"tool_calls"
+// ...[{"function":{"arguments":"<args>"}}]...}}]}`, so the line is the raw
+// argument bytes plus the JSON envelope, the `data:` prefix, and JSON-string
+// escaping (each escapable char doubles). 4 MiB comfortably exceeds the 1 MiB
+// argument budget + envelope + worst-case escaping margin while staying well
+// under the 16 MiB aggregate stream ceiling.
+const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_STREAM_BYTES: usize = 16 * 1024 * 1024;
 const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
 
@@ -466,10 +493,20 @@ impl SseDecoder {
         let value: serde_json::Value = serde_json::from_str(data).map_err(|_| {
             ProviderError::InvalidResponse("malformed JSON in SSE data record".to_string())
         })?;
-        if value.get("error").is_some() {
-            return Err(ProviderError::InvalidResponse(
-                "provider returned an error object in a successful SSE response".to_string(),
-            ));
+        if let Some(err) = value.get("error").filter(|e| !e.is_null()) {
+            // A real (non-null) error object in a "successful" SSE response means the
+            // gateway failed mid-stream. Surface the gateway's own message text so the
+            // caller can see *why* (e.g. "rate limited"); fall back to a sane fixed
+            // string only when no message/string form is present. A JSON `null` error
+            // is NOT an error and must be ignored (some gateways emit `"error": null`).
+            let detail = err
+                .get("message")
+                .and_then(|m| m.as_str())
+                .or_else(|| err.as_str())
+                .unwrap_or("provider returned an error object in a successful SSE response");
+            return Err(ProviderError::InvalidResponse(format!(
+                "provider error in SSE stream: {detail}"
+            )));
         }
         let chunk: StreamChunk = serde_json::from_value(value).map_err(|_| {
             ProviderError::InvalidResponse(
@@ -592,7 +629,7 @@ enum SseState {
 fn parse_completion(body: &str) -> Result<Vec<ChatDelta>, ProviderError> {
     let value: serde_json::Value = serde_json::from_str(body)
         .map_err(|e| ProviderError::InvalidResponse(format!("malformed completion JSON: {e}")))?;
-    if value.get("error").is_some() {
+    if value.get("error").is_some_and(|e| !e.is_null()) {
         return Err(ProviderError::InvalidResponse(
             "provider returned an error object in a successful completion response".to_string(),
         ));
@@ -1251,10 +1288,33 @@ impl OpenAICompatProvider {
             ) => Some(Self::MODELS_NEGATIVE_CACHE_TTL),
             _ => None,
         };
+        // Preserve the warm per-model context-length memo across a refresh ONLY
+        // when the new catalog text EXACTLY equals the previous successful
+        // catalog text — carrying the memo across a CHANGED catalog would serve
+        // stale context lengths (a correctness bug). Otherwise start fresh.
+        // Extract the carried map before the assignment below, which drops the
+        // old entry wholesale.
+        let carried_context_lengths = {
+            let prev = cache.as_ref();
+            match (&outcome, prev) {
+                (Ok((new_status, new_text)), Some(prev_entry))
+                    if new_status.is_success()
+                        && matches!(
+                            &prev_entry.outcome,
+                            Ok((prev_status, prev_text))
+                                if prev_status.is_success() && prev_text == new_text
+                        ) =>
+                {
+                    prev_entry.context_lengths.lock().unwrap().clone()
+                }
+                _ => HashMap::new(),
+            }
+        };
         *cache = ttl.map(|ttl| ModelsCacheEntry {
             stored_at: tokio::time::Instant::now(),
             ttl,
             outcome: outcome.clone(),
+            context_lengths: std::sync::Mutex::new(carried_context_lengths),
         });
         outcome
     }
@@ -1385,43 +1445,78 @@ impl OpenAICompatProvider {
         if !status.is_success() {
             return None;
         }
-        let json: serde_json::Value = serde_json::from_str(&text).ok()?;
-        let entries = json.get("data")?.as_array()?;
-        // Prefer an exact id match; then a loose match, but ONLY if it's unique —
-        // an ambiguous loose match (e.g. "gpt-4" loosely matching both
-        // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
-        // to the wrong entry silently budgets against the wrong window. Finally
-        // fall back to a lone entry, whatever its id.
-        let exact = entries
-            .iter()
-            .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
-        let entry = if let Some(e) = exact {
-            e
+        // Memoize the parsed per-model lookup inside the cache entry so repeat
+        // calls skip re-parsing the catalog JSON. The memo lives in
+        // ModelsCacheEntry and is carried across a refresh only when the new
+        // catalog text exactly equals the previous one (see `get_models_response`);
+        // a CHANGED catalog starts fresh so the memo never serves lengths
+        // derived from a stale catalog. This preserves the existing
+        // TTL/invalidation contract: the memo never outlives the cached catalog
+        // it was derived from.
+        let cache = self.models_cache.lock().await;
+        if let Some(entry) = cache.as_ref() {
+            let mut memo = entry.context_lengths.lock().unwrap();
+            if let Some(cached) = memo.get(model) {
+                return *cached;
+            }
+            let parsed = context_length_from_catalog(&text, model);
+            memo.insert(model.to_string(), parsed);
+            parsed
         } else {
-            let mut loose = entries.iter().filter(|e| {
-                e.get("id")
-                    .and_then(serde_json::Value::as_str)
-                    .is_some_and(|id| loosely_matches(id, model))
-            });
-            match (loose.next(), loose.next()) {
-                (Some(only), None) => only,
-                _ => (entries.len() == 1).then(|| &entries[0])?,
-            }
-        };
-        for key in [
-            "max_model_len",
-            "context_length",
-            "context_window",
-            "max_context_length",
-            "max_input_tokens",
-        ] {
-            match entry.get(key).and_then(serde_json::Value::as_u64) {
-                Some(n) if n > 0 => return Some(n),
-                _ => {}
-            }
+            // The entry was evicted between get_models_response and now (e.g. a
+            // concurrent invalidation). Parse directly from the text we already
+            // hold — correctness is unaffected, just not memoized.
+            context_length_from_catalog(&text, model)
         }
-        None
     }
+}
+
+/// Pure parse: extract a model's advisory context length from a catalog JSON
+/// body. Prefers an exact id match, then a unique loose match (ambiguous loose
+/// matches give up rather than binding to the wrong window). There is no lone
+/// entry fallback: a sole entry that matches neither exactly nor loosely must
+/// not bind a window, since it would silently budget against the wrong one.
+/// Checks `max_model_len`, `context_length`, `context_window`,
+/// `max_context_length`, and `max_input_tokens` in that order. Returns `None`
+/// on any parse error or when no usable field is present.
+fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let entries = json.get("data")?.as_array()?;
+    // Prefer an exact id match; then a loose match, but ONLY if it's unique —
+    // an ambiguous loose match (e.g. "gpt-4" loosely matching both
+    // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
+    // to the wrong entry silently budgets against the wrong window. There is
+    // NO lone-entry fallback: a sole entry that matches neither exactly nor
+    // loosely would silently budget against the wrong window.
+    let exact = entries
+        .iter()
+        .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
+    let entry = if let Some(e) = exact {
+        e
+    } else {
+        let mut loose = entries.iter().filter(|e| {
+            e.get("id")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|id| loosely_matches(id, model))
+        });
+        match (loose.next(), loose.next()) {
+            (Some(only), None) => only,
+            _ => return None,
+        }
+    };
+    for key in [
+        "max_model_len",
+        "context_length",
+        "context_window",
+        "max_context_length",
+        "max_input_tokens",
+    ] {
+        match entry.get(key).and_then(serde_json::Value::as_u64) {
+            Some(n) if n > 0 => return Some(n),
+            _ => {}
+        }
+    }
+    None
 }
 
 /// Validate the common catalog envelope before assigning the positive cache
@@ -1476,7 +1571,7 @@ impl Provider for OpenAICompatProvider {
         telemetry: Option<ProviderTelemetrySink>,
     ) -> Result<ChatStream, ProviderError> {
         let url = format!("{}{}", self.base_url, self.chat_path);
-        let body = build_body(&req);
+        let body = build_body(&req)?;
 
         // Retry transient 429/503 responses within one end-to-end deadline.
         // Each attempt receives only the remaining budget; reqwest keeps that
@@ -1833,7 +1928,7 @@ mod prompt_cache_key_tests {
     fn prompt_cache_key_serializes_when_some() {
         let mut req = base_request();
         req.prompt_cache_key = Some("some-key".to_string());
-        let json = serde_json::to_string(&build_body(&req)).unwrap();
+        let json = serde_json::to_string(&build_body(&req).unwrap()).unwrap();
         assert!(json.contains("prompt_cache_key"), "body: {json}");
         assert!(json.contains("some-key"), "body: {json}");
     }
@@ -1841,7 +1936,7 @@ mod prompt_cache_key_tests {
     #[test]
     fn prompt_cache_key_omitted_when_none() {
         let req = base_request();
-        let json = serde_json::to_string(&build_body(&req)).unwrap();
+        let json = serde_json::to_string(&build_body(&req).unwrap()).unwrap();
         assert!(!json.contains("prompt_cache_key"), "body: {json}");
     }
 }
