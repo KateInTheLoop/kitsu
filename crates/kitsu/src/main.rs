@@ -9111,6 +9111,54 @@ fn deadline_partial_answer(
     .filter(|partial| !partial.text.is_empty())
 }
 
+/// Did this turn fail on the inference deadline (as opposed to a provider or
+/// tool error)? A deadline expiry leaves the completed tool rounds in the
+/// message history worth preserving; other failures do not carry that promise.
+fn is_deadline_timeout(error: &kitsu_core::AgentError) -> bool {
+    matches!(
+        error,
+        kitsu_core::AgentError::Provider(ProviderError::Timeout)
+    )
+}
+
+/// Drop an incomplete trailing tool round so `messages` is safe to persist and
+/// resume. The orchestrator pushes an assistant `tool_calls` message and only
+/// later pushes the matching tool results; if the turn deadline fires between
+/// those, the tail is an assistant call with no (or partial) answers — a shape
+/// most providers reject on the next request. Truncate back to the last point
+/// where every requested tool call is answered, so the saved transcript always
+/// ends on a complete round (or a plain user/assistant turn).
+///
+/// Returns the number of messages removed.
+fn truncate_to_resumable_tail(messages: &mut Vec<ChatMessage>) -> usize {
+    use kitsu_providers::Role;
+    let original = messages.len();
+    loop {
+        let Some(call_idx) = messages
+            .iter()
+            .rposition(|m| m.role == Role::Assistant && !m.tool_calls.is_empty())
+        else {
+            break;
+        };
+        let answered: std::collections::HashSet<&str> = messages[call_idx + 1..]
+            .iter()
+            .filter(|m| m.role == Role::Tool)
+            .filter_map(|m| m.tool_call_id.as_deref())
+            .collect();
+        let all_answered = messages[call_idx]
+            .tool_calls
+            .iter()
+            .all(|call| answered.contains(call.call_id.as_str()));
+        if all_answered {
+            break;
+        }
+        // The most recent tool round is incomplete: drop it and any partial
+        // answers that followed, then re-check the now-exposed tail.
+        messages.truncate(call_idx);
+    }
+    original - messages.len()
+}
+
 /// Close the provisional assistant-output transaction after local strictness
 /// checks. Streamed deltas remain useful for live UIs, but this terminal record
 /// makes it impossible for automation to mistake rolled-back text for a
@@ -14154,6 +14202,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             report_write_checkpoint(previous);
         }
         messages.push(ChatMessage::user(expanded_text));
+        // Baseline for detecting tool progress if the turn later times out: any
+        // completed round appends messages past this length.
+        let committed_len = messages.len();
         let mut cfg = base_cfg(model.clone(), cli);
         cfg.turn_deadline = Some(one_shot_deadline);
         let partial_answer: PartialAnswerBuffer = Arc::default();
@@ -14512,6 +14563,41 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 terminal_inline(&persist_error.to_string())
                             );
                         }
+                    }
+                } else if is_deadline_timeout(&error) {
+                    // The turn hit the deadline. Trim any dangling final round
+                    // (assistant tool_calls whose results never landed) so the
+                    // transcript is safe to persist and resume, then decide
+                    // whether completed tool work survived worth preserving.
+                    truncate_to_resumable_tail(&mut messages);
+                    if messages.len() > committed_len {
+                        // Completed tool rounds remain: preserve them as a
+                        // resumable partial instead of discarding the whole
+                        // exploration. Automation (the piped path) has no human
+                        // to /retry, so a total-loss discard silently throws away
+                        // real work for slow models that pace past the deadline.
+                        let empty = snapshot_partial_answer(&partial_answer);
+                        let marker = emit_partial_deadline_answer(cli, "piped:1", &empty)?;
+                        messages.push(ChatMessage::assistant(marker, Vec::new()));
+                        if let Err(persist_error) =
+                            persist_session_required(&session_store, &session, &model, &messages)
+                        {
+                            if !cli.jsonl {
+                                eprintln!(
+                                    "~ warning: could not save the partial turn: {}",
+                                    terminal_inline(&persist_error.to_string())
+                                );
+                            }
+                        }
+                    } else {
+                        // The deadline fired before any tool round completed:
+                        // nothing durable to resume from, so discard as before.
+                        finish_assistant_disposition(
+                            cli,
+                            "piped:1",
+                            AssistantDisposition::Discarded,
+                            Some("the model turn failed before commit"),
+                        )?;
                     }
                 } else {
                     finish_assistant_disposition(
@@ -17713,6 +17799,74 @@ mod tests {
     fn failure_count_phrase_pluralizes_naturally() {
         assert_eq!(failure_count_phrase(1), "1 failure");
         assert_eq!(failure_count_phrase(2), "2 failures");
+    }
+
+    fn call(id: &str) -> kitsu_providers::ToolCall {
+        kitsu_providers::ToolCall {
+            tool_name: "read_file".to_string(),
+            args: "{}".to_string(),
+            call_id: id.to_string(),
+        }
+    }
+
+    #[test]
+    fn resumable_tail_keeps_clean_and_complete_transcripts() {
+        // Ends on assistant prose: nothing to trim.
+        let mut prose = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("done", Vec::new()),
+        ];
+        assert_eq!(truncate_to_resumable_tail(&mut prose), 0);
+        assert_eq!(prose.len(), 2);
+
+        // A fully answered tool round is a valid resume point: keep it intact.
+        let mut complete = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("", vec![call("a")]),
+            ChatMessage::tool("a", "result-a"),
+        ];
+        assert_eq!(truncate_to_resumable_tail(&mut complete), 0);
+        assert_eq!(complete.len(), 3);
+    }
+
+    #[test]
+    fn resumable_tail_drops_dangling_and_partial_rounds() {
+        // Deadline fired after the tool_calls message but before any result:
+        // drop the unanswered assistant call so the tail is resumable.
+        let mut dangling = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("", vec![call("a")]),
+        ];
+        assert_eq!(truncate_to_resumable_tail(&mut dangling), 1);
+        assert_eq!(dangling.len(), 1);
+        assert_eq!(dangling[0].role, kitsu_providers::Role::User);
+
+        // Two calls requested, only one answered: drop the whole incomplete
+        // round (the assistant message and its partial answer).
+        let mut partial = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("", vec![call("a"), call("b")]),
+            ChatMessage::tool("a", "result-a"),
+        ];
+        assert_eq!(truncate_to_resumable_tail(&mut partial), 2);
+        assert_eq!(partial.len(), 1);
+    }
+
+    #[test]
+    fn resumable_tail_preserves_earlier_complete_round() {
+        // First round complete, second round dangling: keep the first, drop the
+        // second — a slow model that finished one round still keeps that work.
+        let mut messages = vec![
+            ChatMessage::user("q"),
+            ChatMessage::assistant("", vec![call("a")]),
+            ChatMessage::tool("a", "result-a"),
+            ChatMessage::assistant("", vec![call("b")]),
+        ];
+        assert_eq!(truncate_to_resumable_tail(&mut messages), 1);
+        assert_eq!(messages.len(), 3);
+        // The surviving tail is the complete first round.
+        assert_eq!(messages[2].role, kitsu_providers::Role::Tool);
+        assert_eq!(messages[2].tool_call_id.as_deref(), Some("a"));
     }
 
     fn chat_helper() -> ChatHelper {
