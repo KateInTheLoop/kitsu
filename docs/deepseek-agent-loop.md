@@ -1,12 +1,12 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-14 — cycle 1 banked (grade B).** A working HF token
-> (Inference-Providers scope) is at `~/.cache/kitsu-hf-token`; each tick
-> reads it there and probes once — on 401/402/403 or missing file the
-> tick ends silently. DeepSeek-V4-Pro reaches the `:together` provider,
-> tool calls come back intact, and `--reasoning-effort low` is
-> load-bearing (see cycle 1). See the Cycle log for the standing
-> weakness backlog this loop has produced.
+> **LIVE 2026-08-15: cycle 16 — grade A-, 13th clean review cycle.**
+> The first explicitly callee-heavy target, `run_agent_turn_with_state`,
+> kept exact scope and letter-perfect citations. Hedging was correct in
+> nearly every callee-dependent claim, with one narrow unhedged clause
+> about `spawn_budget.reset()` accounting for the grade dock. DeepSeek
+> remains a strong tiny-scope reviewer and stays review-only until R4.10
+> addresses implementation type-chasing.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3
@@ -378,3 +378,712 @@ It remains review-only until R4.10 (implementation type-chasing unchanged),
 but as a reviewer it now matches GLM's discipline. (Minor: `--prompt`
 isn't a flag on `kitsu chat` — prompt is positional; same CLI-friction
 family as R4.7.)
+
+### Cycle 8 — 2026-08-15 — scope-range bug caught pre-dispatch; review still A
+
+**Supervisor scope correction before dispatch:** the cron-assigned range
+(`enforce_context_budget` @ 2078-2122) was wrong. Verified against the
+worktree source: `enforce_context_budget` actually spans lines
+**2074-2106** (doc comment `2074-2075`, `#[cfg(test)]` `2076`,
+`#[allow(...)]` `2077`, signature `2078`, body through closing brace
+`2106`) — a `#[cfg(test)]`-only test wrapper, not production logic. The
+cron's 2108-2122 tail is not part of this function at all: 2108-2116 is
+an unrelated struct `CompactionProgress`, and 2118-2122 are doc comments
+belonging to the next function, `enforce_context_budget_recording`.
+
+Process: 5th clean cycle running — exactly 1 ranged read (33 lines,
+matches assignment exactly, zero over-read) → 1 write, no spawn
+attempted, exit 0. kitsu-usage 15,034 / 2,295 / 17,329 — cheapest cycle
+yet.
+
+- **Citations letter-perfect again — quotes and labels, 2nd flawless
+  cycle after cycle 7.** All 4 citations (lines 2103, 2102, 2078+2091,
+  2077) verified byte-for-byte against the source.
+- **Hedging correctly calibrated.** Proposals 1 and 2 properly hedge on
+  unread callee behavior. Proposals 3 and 4 rely only on directly
+  visible, in-range facts, including the 12 positional arguments at the
+  call site.
+- **Minor flaw:** the review file self-reports `2025-07-15`, a wrong
+  date. It does not affect the proposals' substance.
+- Content is necessarily thinner than cycles 6-7 because the corrected
+  target is a small test shim, but all four proposals are legitimate,
+  scoped test-coverage or design observations.
+
+**Ramp status:** unchanged — DeepSeek remains a strong tiny-scope
+reviewer, now 5-for-5 on clean process (cycles 3, 4, 6, 7, 8) and
+2-for-2 on zero-drift citations (cycles 7, 8). It remains review-only
+until R4.10 addresses implementation type-chasing. Future cron authors
+should verify function ranges against the live worktree before dispatch;
+this is the second stale-range assignment after cycle 4.
+
+### Cycle 9 — 2026-08-15 — 3rd zero-drift citation cycle; assigned range overshot the function, DeepSeek self-corrected
+
+Target: `record_progress` (`crates/kitsu-core/src/orchestrator.rs`),
+a fresh 27-line ledger-recording function no prior cycle had touched.
+Pre-dispatch check confirmed the *start* of the assigned range (2336)
+and that the *next function*, `compaction_span`, starts at 2385 — but
+did not confirm the assigned range's *end* actually tracked
+`record_progress`'s own closing brace. It didn't: `record_progress`
+closes at line **2362**; lines 2363-2384 are unrelated trailing content
+(a doc comment + four `const` declarations + the `CompactionSpan`
+struct) that happen to sit between it and `compaction_span`. The
+assigned 2336-2384 read range was therefore ~22 lines wider than the
+actual function — the same class of pre-dispatch verification gap
+cycles 4 and 8 hit, this time on the *end* boundary rather than the
+start. DeepSeek was not told about the extra trailing content and was
+not misled by it: its own review header cites the function's true span
+(`2336-2362`), and all four proposals' citations land inside 2338-2361
+— it implicitly self-corrected the oversized range without comment.
+
+**Setup hiccup (supervisor-side, not billed against DeepSeek's
+process):** the first invocation was run from the main checkout's
+default cwd, so the prompt's relative path
+`crates/kitsu-core/src/orchestrator.rs` resolved against
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu` instead of the worktree,
+tripping `PolicyDenied` (that root isn't in `--allow-path`) before any
+read happened — a supervisor cwd mistake, not a transport failure or a
+DeepSeek scope violation, so it did not consume the cycle's one
+transport retry. It did burn a small real API call (usage
+9,589/493/10,082 prompt/completion/total) that produced no output file
+before failing closed — filed below as a kitsu-usage weakness. Re-run
+with `cd` into the worktree first: exit 0, no discard.
+
+- **Process: 6th clean review cycle running.** Exactly 1 ranged read
+  (2336-2384, 49 lines, matching the assigned — if overshot — range
+  exactly) → 1 write, no re-read, no spawn attempt (cap 1 unexercised).
+  kitsu-usage (successful run) `{"prompt_tokens":16322,"completion_tokens":1814,"total_tokens":18136}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))".
+- **Citations letter-perfect — 3rd zero-drift cycle (after 7, 8).**
+  Spot-checked all citations against ground truth: line 2348
+  (`sequence: 0,`), lines 2346-2347 (`let outcome = progress.outcome?;`
+  / `Some(ledger.push(CompactionRecord {`), lines 2347-2361 (the
+  13-field struct literal, open-to-close), line 2338
+  (`cfg: &AgentConfig,`), and line 2350 (`configured_mode:
+  cfg.compaction,`) — every quote and every line-number label matches
+  the source exactly. R1.7 holding, third cycle running.
+- **Hedging correctly calibrated, no unhedged wrong claims.** Proposal
+  1 (high — hardcoded `sequence: 0` at 2348 may be a latent ledger bug)
+  hedges appropriately on `CompactionLedger::push`'s unread behavior.
+  Proposal 2 (high — `progress.outcome?` at 2346 silently drops the
+  whole compaction attempt with no ledger entry, log, or telemetry when
+  `outcome` is `None`) is stated as fact and is directly verifiable
+  from the read range alone — correctly unhedged. Proposal 4 (low —
+  `cfg: &AgentConfig` is threaded through solely to read
+  `cfg.compaction` at line 2350) is also correctly unhedged for the
+  same reason: the single usage is fully visible in-range. Proposal 3
+  (medium — the 13-field struct literal at 2347-2361 lists every field
+  positionally with no `..` update syntax, brittle to struct
+  evolution) is the one soft spot: it frames this as "every field of
+  `CompactionProgress` is individually splatted into `CompactionRecord`,"
+  which overstates the 1:1-ness — several `CompactionRecord` fields
+  (`tokens_before`, `tokens_after`, `messages_before`,
+  `messages_after`, `sequence`, `reason`, `configured_mode`) come from
+  other function parameters, not from `progress` at all, and whether
+  `CompactionProgress` has additional unused fields is unverifiable
+  from this range. The proposal does hedge this ("I have not read
+  either struct definition. If they are intended to stay 1:1, this is
+  cosmetic; if they already have diverged fields...") — imprecise
+  framing but not an unhedged false-fact claim like cycle 6's proposal
+  2, so not flagged as a correctness dock, only as a precision note.
+
+**Grade: A-.** Matches cycles 7-8's clean-process, zero-citation-drift
+bar, and adds a new positive data point: DeepSeek stayed inside the
+*true* function boundary even when handed a read range ~75% wider than
+the function itself, rather than treating the extra trailing consts/
+struct as fair game for citations. Docked half a grade from straight A
+only for proposal 3's loose "every field" framing (adequately hedged,
+not wrong, just imprecise) — otherwise indistinguishable in quality
+from cycle 7/8's best work.
+
+**kitsu weakness noted (not yet filed to roadmap):** a `PolicyDenied`
+read failure that occurs before any file is touched still bills a real,
+non-trivial API call (9,589 prompt tokens here) with zero useful
+output — the turn fails closed correctly, but the cost isn't free. A
+caller who mis-scopes `--allow-path` relative to their invocation cwd
+pays for it in tokens, not just wall-clock. Low severity (this was a
+supervisor error, not a kitsu bug), but a candidate for a future
+R-item: resolve/validate policy-denied paths pre-flight so a doomed
+turn can fail before the first model call rather than after.
+
+**Ramp status:** unchanged — DeepSeek remains a STRONG tiny-scope
+reviewer, now 6-for-6 on clean process (cycles 3, 4, 6, 7, 8, 9) and
+3-for-3 on zero-drift citations (cycles 7, 8, 9). Still review-only
+until R4.10 (implementation type-chasing, per cycle 5, is unaddressed).
+**Process note for future cron/supervisor authors (2nd instance of this
+specific gap):** confirming a range's start and confirming the *next*
+function's start is not sufficient to confirm the range matches the
+*target* function's actual end — non-function content (consts, doc
+comments, unrelated structs) can sit between a function's closing brace
+and the next `fn`. Verify the target function's own closing brace
+directly, not just its neighbor's opening line.
+
+### Cycle 10 — 2026-08-15 — clean process, but the zero-drift citation streak breaks (one off-by-one, twice)
+
+Target: `context_window_shortfall` (`crates/kitsu-core/src/orchestrator.rs`),
+a small pure predicate (`fn(reported: u64, estimated_sent: u64, window: u64)
+-> bool`) no prior cycle had touched — arithmetic-heavy (overflow/underflow,
+threshold logic) and reviewable in isolation, matching DeepSeek's strength.
+Pre-dispatch check (3rd instance of this exact gap, per the process note
+above) found the assigned 791-835 range again overshot the true function:
+the function's own closing brace is at line **806**, not 835 — lines 808-835
+are the unrelated `TurnCompletion`/`AgentTurnStatus` definitions and
+`run_agent_turn`'s doc comment. Corrected the range to **785-806** (the
+function's own doc comment plus body, 22 lines) before dispatch, so DeepSeek
+was never handed the oversized range this time.
+
+- **Process: 7th clean review cycle running.** Exactly 1 ranged read
+  (785-806, 22 lines, matching the corrected range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised). kitsu-usage (successful
+  run) `{"prompt_tokens":16876,"completion_tokens":3755,"total_tokens":20631}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))". No transport retry needed.
+- **Citation drift found — streak ends at 3 (cycles 7, 8, 9).** Spot-checked
+  all citations against ground truth. Proposals 1, 2 and the standalone
+  quote of line 805 (`clamped_boundary || (wide_margin && plausible_clamp)`)
+  are letter-perfect. Proposals 3 and 4 both cite `let plausible_clamp =
+  reported.saturating_mul(4) >= window;` as **line 803**; the true line is
+  **804**. Root cause is visible in Proposal 3's own quoted block: DeepSeek
+  compressed the three-line comment spanning true lines 801-803 (`//
+  estimator overshooting an accurate tokenizer (hosted routers report` /
+  `// exact counts) — cycle-14's HF audit saw this warning on nearly
+  every` / `// turn. Stay quiet rather than crying wolf.`) into two
+  ellipsis-joined display lines (`// estimator overshooting an accurate
+  tokenizer … Stay quiet rather than` / `// crying wolf.`), which silently
+  drops one line of verbatim quoting and shifts every subsequent line
+  number in that block down by one. Proposal 3's own header still states
+  the correct overall range ("lines 798-804"), so the drift is confined to
+  the in-body per-line labels on the elided quote, not the citation's
+  bounding claim.
+- **Proposal 3's core claim is also doubtful, independent of the citation
+  drift.** It asserts `plausible_clamp` "computes the opposite condition"
+  from what the comment describes, i.e. that the name is inverted. Working
+  the boolean algebra from the read range alone: the comment's "stay quiet"
+  case is `reported < window/4` (implied clamp window under a quarter of
+  resolved); `plausible_clamp = reported.saturating_mul(4) >= window` is
+  exactly `reported >= window/4` — the *negation* of the stay-quiet case,
+  which is precisely what a variable named "the clamp hypothesis is
+  plausible" should mean, and precisely what the final `wide_margin &&
+  plausible_clamp` conjunct needs to correctly gate on. There is no
+  inversion; the naming and the boolean algebra agree. This claim was
+  fully checkable from the 22-line range alone (no hedge was owed or
+  given), so it counts as a soft-wrong claim, not an under-hedged one.
+  Proposals 1, 2, and 4 hold up: 1 (wide_margin dead zone below
+  estimated_sent=256, line 796) is correct arithmetic, appropriately
+  hedged on real-world plausibility of tiny estimates; 2 (doc comment at
+  788-790 omits the `plausible_clamp` quarter-window conjunct entirely) is
+  correct and directly verifiable in-range; 4 (`saturating_mul(4)` at 804
+  silently absorbs a `reported > u64::MAX/4` overflow into "plausible")
+  is correct and correctly hedged on whether callers bound `reported`
+  upstream.
+
+**Grade: B+.** Process discipline stayed perfect — one ranged read
+covering exactly the corrected range, one write, no spawning, clean
+run — and 3 of 4 proposals (1, 2, 4) are accurate, well-hedged, and
+useful. Docked from the A/A- band because this is the first cycle with
+an actual citation-line drift (803 vs. 804, twice) rather than an
+imprecise-but-hedged framing, and because Proposal 3's central claim is
+a checkable-in-range misread of the boolean logic, not merely loosely
+worded. Root cause for both: compressing multi-line source text with an
+ellipsis before re-numbering is risky — future prompts could add "quote
+each source line verbatim on its own labeled line; do not elide or merge
+lines even when shortening the surrounding prose" to close this off.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 7-for-7 clean (cycles 3, 4, 6, 7, 8, 9, 10) — but the
+citation-fidelity streak drops to 3-for-4 (cycles 7, 8, 9 clean; cycle 10
+one repeated off-by-one). Still review-only until R4.10 (implementation
+type-chasing, per cycle 5, is unaddressed). The range-overshoot gap (now
+hit on cycles 4, 8, 9) continues to require supervisor pre-dispatch
+verification of the target function's own closing brace, not just its
+neighbor's opening line; cycle 10's pre-check caught it before dispatch,
+so DeepSeek was not exposed to the oversized range this time.
+
+### Cycle 11 — 2026-08-15 — first PRODUCTION formatting function; zero-drift streak restored (grade A)
+
+Target: `format_command_result` (`crates/kitsu-core/src/orchestrator.rs`),
+a 55-line production formatter (`fn format_command_result(output:
+&CommandOutput) -> String`) that renders exit status, elapsed time, and
+stdout/stderr truncation-disclosure flags for display — the first cycle to
+review a genuinely production display/formatting function rather than a
+predicate, wrapper, or ledger-recording helper. Pre-dispatch check confirmed
+the cron-supplied range (1796-1850) was exact: the function's own closing
+brace is at line 1850 and the next function (`append_command_stream_summary`)
+starts at line 1852, so no correction was needed this time.
+
+- **Process: 8th clean review cycle running.** Exactly 1 ranged read
+  (1796-1850, 55 lines, matching the assigned range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised), exit 0, no transport retry
+  needed. kitsu-usage `{"prompt_tokens":17710,"completion_tokens":3274,
+  "total_tokens":20984}`. Run summary: "1 turn(s) ok, 1 file(s) read, 1
+  file(s) written (1 change(s))".
+- **Citations 4/4 letter-perfect — zero-drift streak restored after cycle
+  10's off-by-one.** Spot-checked every quoted block against the source:
+  lines 1806-1809 (the `TimedOut => match output.signal` arm), line 1812
+  (`let mut fields = vec![completion, format!("{} ms", output.elapsed_ms)];`),
+  lines 1832-1834 and 1844-1847 (the two `{:?}`-formatted `fields.push`
+  calls), and lines 1840-1842 (the artifact-path design comment) all match
+  the source verbatim, on both text and line-number labels. Every quoted
+  block was reproduced as a complete contiguous span with no ellipsis or
+  line-dropping — the cycle-10 prompt fix ("quote each source line
+  verbatim... do not elide or merge lines") held.
+- **Hedging correctly calibrated on all 4 proposals, and the hedged claims
+  checked out.** Supervisor spot-verified the out-of-range facts DeepSeek
+  hedged on (not required for grading, but done here for calibration
+  data): (1) `output.signal` is `Option<i32>` and is genuinely the same
+  field read by both the `Signaled` and `TimedOut` arms (line 212 in the
+  `CommandOutput` struct) — proposal 1's copy-paste suspicion is a
+  legitimate, correctly-hedged catch ("I have not read the definitions of
+  `CommandOutput`... cannot confirm whether reuse is intentional"); (2)
+  `elapsed_ms` is `u64` (line 213) — proposal 2 correctly hedged that "if
+  it is a plain integer... the practical risk is low," which is exactly
+  right; (3) both `bounded_human_value` (line 1642) and
+  `terminal_safe_inline` (line 1616) return `String` — proposal 3's claim
+  that `{:?}` on a `String`-returning helper adds spurious quote
+  characters is **substantively correct**, and was appropriately hedged
+  ("I have not read the signatures of either helper"). No unhedged
+  out-of-scope claims, and no substantively-wrong claims of any kind this
+  cycle. Proposal 4 (documentation nit on the join-contract comment,
+  lines 1840-1842) needed no hedge and got none, correctly.
+
+**Grade: A.** Matches cycles 7 and 9's best-cycle bar: perfect process,
+perfect citations, well-calibrated hedging, and — uniquely this cycle —
+every hedged claim was independently verified to be factually correct
+once the supervisor checked the out-of-range code, showing DeepSeek's
+hedged inferences about unread callee/struct behavior are not just
+cautious but actually well-reasoned from the visible call-site evidence
+(e.g. inferring `String`-typed returns from `format!`/string-building
+usage patterns in-range). First cycle on a true production
+formatting/display function (vs. predicates, test wrappers, or
+ledger-recording helpers in cycles 8-10), and the discipline held.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 8-for-8 clean (cycles 3, 4, 6, 7, 8, 9, 10, 11), and
+citation fidelity is 4-for-5 (cycles 7, 8, 9, 11 clean; cycle 10 the lone
+off-by-one, now with a demonstrated fix holding for a full cycle). Still
+review-only until R4.10 (implementation type-chasing, per cycle 5, is
+unaddressed). No range-overshoot this cycle — the cron's pre-measured
+1796-1850 range was exact on the first check.
+
+### Cycle 12 — 2026-08-15 — first parsing/recovery function; second zero-drift citation cycle in a row (grade A)
+
+Target: `parse_text_tool_calls` (`crates/kitsu-core/src/orchestrator.rs`),
+a 62-line fallback parser (`fn parse_text_tool_calls(text: &str, tools:
+&Registry, skill_names: &[String]) -> TextToolRecovery`) that recovers
+tool calls a model emitted as inline text instead of structured
+`tool_calls` — the first cycle on genuine string-scanning/JSON-extraction
+logic with adversarial-input edge cases, rather than a predicate,
+formatter, or ledger helper. Pre-dispatch check confirmed the assigned
+range (1443-1504) was exact: the function's own closing brace is at line
+1504 and the next function (`extract_json_objects`) starts at line 1510,
+so no correction was needed.
+
+- **Process: 9th clean review cycle running.** Exactly 1 ranged read
+  (1443-1504, 62 lines, matching the assigned range exactly) → 1 write, no
+  re-read, no spawn attempt (cap 1 unexercised), exit 0, no transport
+  retry needed — the run succeeded on the first attempt. kitsu-usage
+  `{"prompt_tokens":19312,"completion_tokens":2850,"total_tokens":22162}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s))".
+- **Citations 4/4 letter-perfect — second consecutive zero-drift cycle.**
+  Spot-checked every quoted block against the source: lines 1464-1467
+  (the substring-match malformed-detection guard), lines 1487-1491 (the
+  `arguments`/`parameters` match arm producing `args`), line 1487 again
+  (the `or_else` shadowing point), and lines 1455-1458 (the top of the
+  candidate loop with the two-step `serde_json::from_str` parse attempt)
+  all match the source verbatim, on both text and line-number labels.
+  Every quoted block was reproduced as a complete contiguous span with no
+  ellipsis or line-dropping — the cycle-10 prompt fix continues to hold
+  for a second straight cycle.
+- **Hedging correctly calibrated on all 4 proposals.** Proposal 1
+  (substring-match false positives on tool names appearing inside value
+  strings or as substrings of longer words, e.g. a tool named `"ask"`
+  matching inside `"task"`) stays entirely within the read range and
+  needed no hedge — correct. Proposal 2 (`serde_json::Value::Null` or
+  other non-string scalars stringify via `v.to_string()` on line 1489 to
+  the literal `"null"` rather than falling back to `"{}"` like the `None`
+  arm) is a claim about `serde_json`'s own `Display` impl, not about any
+  unread project type — supervisor confirms this is accurate serde_json
+  behavior (`Value`'s `Display` serializes to JSON text, so `Null` →
+  `"null"`), and the proposal correctly used softened framing ("can cause
+  callers to trip") rather than asserting unread caller behavior as fact.
+  Proposal 3 (silent `arguments`-over-`parameters` shadowing) explicitly
+  hedged with "I cannot see whether callers or telemetry elsewhere
+  surface this." Proposal 4 (no early bailout when zero registered tool
+  names appear in `text`, forcing every extracted `{…}` through serde
+  even for prose-only answers) explicitly hedged with "I cannot see the
+  implementation of `extract_json_objects` — it may already filter
+  aggressively." Both hedges are exactly the pattern the prompt asked
+  for: real, substantive proposals that stop short of asserting unread
+  callee behavior as fact. No unhedged out-of-scope claims and no
+  substantively-wrong claims this cycle.
+
+**Grade: A.** Perfect process, perfect citations, and hedging correctly
+distinguished between claims resting on read-range code (proposals 1 and
+3's core observation), well-known crate semantics that don't need project
+hedging (proposal 2's `serde_json::Value::to_string()` behavior), and
+claims that genuinely depend on unread callee code (proposals 3's caller
+question and 4's `extract_json_objects` filtering). First cycle on true
+parsing/recovery logic with adversarial-input framing (vs. formatters,
+predicates, or ledger helpers in cycles 7-11), and both process discipline
+and citation fidelity held without any degradation.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now 9-for-9 clean (cycles 3, 4, 6, 7, 8, 9, 10, 11, 12), and
+citation fidelity is 5-for-6 (cycles 7, 8, 9, 11, 12 clean; cycle 10 the
+lone off-by-one, now with the fix holding for two full cycles in a row).
+Still review-only until R4.10 (implementation type-chasing, per cycle 5,
+is unaddressed). No range-overshoot this cycle — the cron's pre-measured
+1443-1504 range was exact on the first check.
+
+### Cycle 13 — 2026-08-15 — display/sanitization formatter; 10th consecutive clean process cycle, minor prose citation slip (grade A-)
+
+Target: `format_tool_result` (`crates/kitsu-core/src/orchestrator.rs`), a
+65-line display formatter (`fn format_tool_result(name: &str, content:
+&str, is_err: bool) -> String`) that renders a tool-call *result* summary
+for display — error-vs-success branching, per-tool-name summary
+formatting (`command_exec`, `fs_write_file`/`fs_edit_file`, `repo_grep`,
+`spawn_agent_bg`/`agent_result`, and a default line-count arm), and a
+180-char/first-line-only truncation of error `detail`. Distinct from
+cycle 11's `format_command_result` (which formats a *command's* exit/
+elapsed/output, not a generic tool result) — this is a fresh function no
+prior cycle had touched. Pre-dispatch check confirmed the assigned range
+(1730-1794) was exact: `fn format_tool_result` starts at line 1730, its
+own closing brace is at line 1794, the doc comment precedes it at
+1728-1729, and the next function (`format_command_result`, cycle 11's
+target) starts at line 1796 — no correction needed.
+
+- **Process: 10th clean review cycle running.** Rebuilt the kitsu driver
+  fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build, no errors).
+  Exactly **1 ranged read** (1730-1794, 65 lines, matching the assigned
+  range exactly) → **1 write**, no re-read, no spawn attempt (cap 1
+  unexercised), first attempt succeeded — no retry needed. kitsu-usage
+  `{"prompt_tokens":19947,"completion_tokens":3048,"total_tokens":22995}`.
+  Run summary: "1 turn(s) ok, 1 file(s) read, 1 file(s) written (1
+  change(s)), session not saved" — clean exit, no discard.
+- **Citations 3/4 fully clean; proposal 4 has one minor prose-only
+  off-by-one, distinct in kind from cycle 10's drift.** Spot-checked
+  every quoted block against the source (`awk 'NR>=1730 && NR<=1794'`):
+  proposal 1's block (lines 1738-1741, the `.lines().next().unwrap_or("")`
+  chain and the 180-char `.take(180).collect()` truncation) is
+  letter-perfect on text and labels; proposal 2's block (1776-1782, the
+  full `"repo_grep"` match arm) is letter-perfect; proposal 3's block
+  (1789-1792, the default `_ =>` arm) is letter-perfect. Proposal 4's own
+  quoted block (1756, 1757, 1758, 1775 — a deliberately non-contiguous
+  span with an inline `…` marking the elided 1759-1774 body) is also
+  correctly labeled, including line 1757 shown correctly as `.ok()` — but
+  two lines later, the proposal's **prose** says "the `.ok()` on line
+  1756 yields `None`," misattributing `.ok()` to line 1756 (actually the
+  `serde_json::from_str::<serde_json::Value>(content)` match-arm head)
+  when its own quoted block two lines above had already labeled `.ok()`
+  correctly as line 1757. This is a self-contradicting one-line slip
+  confined to prose, not a compressed/dropped quoted line, and it doesn't
+  shift any other citation or affect the substantive finding's validity
+  — a materially smaller failure than cycle 10's drift, but it does end
+  the 2-cycle (11, 12) zero-drift streak the supervisor brief called out.
+- **Hedging correctly calibrated on all 4 proposals; no unhedged
+  out-of-scope claims, no substantively wrong claims.** Proposal 1
+  (`detail` truncated to first-line + 180 chars with no ellipsis/marker)
+  and proposal 3 (`_` default arm renders empty content as `"0 lines"`
+  rather than a clearer `"empty"`) stay entirely within the read range
+  and needed no hedge — correct, neither hedges. Proposal 2 (`repo_grep`
+  would produce a misleading `"0 matches"` if the grep tool ever returns
+  `""` instead of the sentinel `"(no matches)"`) explicitly hedges "I
+  cannot verify what the actual grep tool returns for a no-hit case
+  without reading its implementation" — correctly conditional, and
+  plausible given only the in-range code. Proposal 4 (`fs_write_file`/
+  `fs_edit_file`'s `.unwrap_or_else(|| "written")` fallback reports
+  success even when the result JSON fails to parse) explicitly hedges "I
+  cannot verify what guarantees the write/edit tool makes about its
+  result format" — again correctly conditional on unread callee
+  behavior. All four proposals are genuine, non-overlapping, and
+  actionable; each includes a concrete suggested-fix snippet.
+
+**Grade: A-.** Process matches the best cycles to date — 1 read, 1
+write, first attempt, no spawn, clean exit — and hedging discipline is
+perfect (every claim resting on unread caller/callee code is explicitly
+flagged as conditional, every in-range claim is asserted plainly). Docked
+half a grade below cycles 7/8/9/11/12's clean-A bar solely for the
+proposal-4 prose citation slip (`.ok()` mislabeled as line 1756 vs. its
+own correctly-labeled 1757 two lines above) — a small, self-contained,
+substance-neutral error, but real, and it ends the immediate zero-drift
+streak.
+
+**Kitsu weaknesses observed:** none new. The R1.7 line-number-prefix fix
+continues to hold for quoted code blocks (3 of 4 fully clean, the 4th
+clean within its own quote); this cycle's drift lives entirely in
+free-text prose restating a citation already given correctly in a code
+block moments earlier — a model-attention lapse, not a tooling gap.
+
+**Ramp status:** DeepSeek remains a STRONG tiny-scope reviewer — process
+discipline is now **10-for-10 clean** (cycles 3, 4, 6, 7, 8, 9, 10, 11,
+12, 13), and citation fidelity is **5-for-7 fully clean** (cycles 7, 8,
+9, 11, 12 clean; cycles 10 and 13 each showing one minor drift — cycle
+10's inside a quoted block, cycle 13's confined to restating prose). Still
+review-only until R4.10 (implementation type-chasing, per cycle 5, is
+unaddressed). No range-overshoot this cycle — the pre-measured 1730-1794
+range was exact on the first check, and this is the first cycle to
+target a function whose neighbor (`format_command_result`, cycle 11) was
+itself a prior review target, confirming adjacent-function scoping
+doesn't blur DeepSeek's read boundary.
+
+### Cycle 14 — 2026-08-15 — format_tool_header review, grade A (flawless, 6th clean citation cycle)
+
+Reviewed `format_tool_header` (1653-1726, confirmed on disk before dispatch
+— pre-measured range was exact, no shift). Process perfect for the
+**11th cycle running**: exactly 1 ranged read (the single 1653-1726 read,
+confirmed via full transcript grep — zero other Read/Write/spawn_agent
+calls), 1 write, first attempt, no spawn attempt, clean exit (`1 turn(s)
+ok, 1 file(s) read, 1 file(s) written`). kitsu-usage 20,635 / 2,888 /
+23,523. Commit pending below, pushed after this entry.
+
+**Citations 4/4 letter-perfect on BOTH quoted text AND line-number
+labels** — every code block was diffed line-by-line against the file on
+disk (lines 1691-1710 spot-checked in full) and matched exactly,
+including whitespace/indentation. No prose citation restated a line
+number from memory either (the cycle-13 failure mode) — every number in
+free text matches a number that also appears, correctly, in an adjacent
+quoted block.
+
+- **Proposal 1 (medium, correct, unhedged):** `spawn_agents`'s `count`
+  (line 1692, `tasks.map_or(0, Vec::len)`) counts raw array length while
+  `labels` (1693-1702) drops non-string elements via `filter_map` —
+  a mixed-type `tasks` array (e.g. `["alpha", 42, "beta"]`) renders
+  `Agent(x3: "alpha", "beta")`, a count that overstates the visible
+  labels. Verified correct by inspection; the claim rests entirely on
+  the read range, so correctly left unhedged.
+- **Proposal 2 (low, correct, unhedged):** per-task strings are bounded
+  to 48 chars (line 1698) but the joined `labels` aggregate (1700-1703)
+  has no overall cap — a large batch produces an unbounded header.
+  Correct and in-range.
+- **Proposal 3 (low, correct, unhedged):** a non-array `tasks` value
+  (`tasks` JSON key present but not an array) makes `count` 0 and
+  `labels` empty, rendering the silent-looking `Agent(x0: )` instead of
+  an explicit invalid-payload marker like `command_exec`'s fallback at
+  line 1662. Correct, in-range, correctly unhedged.
+- **Proposal 4 (info, correct, correctly HEDGED):** `agent_result`'s
+  `id` field uses `as_u64` (line 1708), which returns `None` for a JSON
+  float, silently degrading to `AgentResult(#?)`. DeepSeek explicitly
+  flags "I cannot verify the callers from this range alone" — the
+  textbook-correct hedge for a claim whose real-world likelihood depends
+  on unread caller behavior.
+
+**Grade: A.** Matches cycles 7 and 8 as a fully flawless cycle: perfect
+process, perfect citations (quotes and labels), correctly calibrated
+hedging (hedged exactly the one claim resting on unread caller code,
+left the three purely in-range claims unhedged), and zero substantively
+wrong claims. No new kitsu weaknesses observed this cycle.
+
+**Ramp status:** process discipline now **11-for-11 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14); citation fidelity now **6-for-8 fully
+clean** (cycles 7, 8, 9, 11, 12, 14 clean; cycles 10 and 13 each showing
+one prior minor drift). DeepSeek continues to be a STRONG, reliable
+tiny-scope reviewer — still review-only until R4.10 (implementation
+type-chasing, per cycle 5, remains unaddressed). This is the third
+adjacent-function cycle in a row (11 `format_command_result`, 13
+`format_tool_result`, 14 `format_tool_header`) with no boundary bleed
+into neighboring functions, further confirming tight scoping holds even
+when review targets sit back-to-back in the file.
+
+### Cycle 15 — 2026-08-15 — compaction trimmer review, grade A- (12th clean process cycle, one hedge-phrasing slip)
+
+Target: `drop_old_exchanges_detailed`
+(`crates/kitsu-core/src/orchestrator.rs`), the compaction TRIMMER that
+removes old conversation exchanges to fit the token budget and returns
+how many were dropped — the first cycle to review the trimmer itself
+rather than a function that calls it (cycle 7's `summarize_or_fallback`
+calls into this compaction path but never touched this function).
+Pre-dispatch check confirmed the assigned range (2915-2957) was exact:
+`fn drop_old_exchanges_detailed` opens at line 2915, its own closing
+brace is at line 2957 (43 lines total) — no correction needed, a clean
+range measurement on the first try.
+
+- **Process: 12th clean review cycle running.** Rebuilt the kitsu
+  driver fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build in 6.6s, no
+  errors — most of the dependency graph was already warm in the shared
+  target dir). Exactly **1 ranged read** (2915-2957, 43 lines, matching
+  the assigned range exactly — transcript shows a single `Read(…/orchestrator.rs)`
+  call and nothing else) → **1 write**
+  (`reviews/deepseek-cycle-15.md`, 5174 bytes, 4 proposals), no re-read,
+  no spawn attempt (cap 1 unexercised), first attempt succeeded, clean
+  exit (`1 turn(s) ok, 1 file(s) read, 1 file(s) written`). kitsu-usage
+  `{"prompt_tokens":20923,"completion_tokens":6111,"total_tokens":27034}`.
+- **Citations 4/4 letter-perfect on both quoted text and line-number
+  labels.** Every quoted block (2939-2940 and 2950-2951 in proposal 1;
+  2956, 2931, 2938 in proposal 2; 2941-2944 in proposal 3; the full
+  2937-2946 loop body in proposal 4) was diffed against the source on
+  disk and matches exactly, including whitespace — the R1.7 line-prefix
+  fix continues to hold.
+- **Proposal 1 (out-of-bounds panic risk if `KEEP_RECENT_EXCHANGES`
+  were ever 0, correctly hedged):** reasons that if the line-2928-2930
+  guard's threshold constant were 0, `max_drop` would equal `actual`
+  and the loop's last iteration would read `user_idxs[first_actual + e
+  + 1]` at index `user_idxs.len()` — out of bounds. Explicitly hedged
+  ("I cannot see the definition of `KEEP_RECENT_EXCHANGES`. If it is
+  always ≥ 1 ... no panic occurs today"). Supervisor verified out of
+  scope: `KEEP_RECENT_EXCHANGES` is a hardcoded `const ... = 2` (line
+  2876, not configurable), so the hedge's own stated condition resolves
+  to "no live bug today" — same treatment as cycle 3's honestly-hedged
+  wrong-but-plausible proposal: correct reasoning about the code shape,
+  hedge appropriately gated the claim, and it happens to resolve inert.
+- **Proposal 2 (force_all's return value can't distinguish
+  "budget met" from "ran out of droppable exchanges," correctly
+  hedged):** accurate close reading of line 2956's `u32::try_from(e)`
+  return — the count alone doesn't tell a caller which case occurred.
+  Hedged correctly on caller behavior it didn't read.
+- **Proposal 3 (marker-cost adjustment to `total` is dead computation
+  on a force_all-only pass, correct core claim but a minor
+  hedge-phrasing inaccuracy):** correctly observes `total` is never
+  read again after the loop within the visible range. **Flagged:** the
+  hedge itself says "if callers... re-read `total` from the mutable
+  reference after the call" — but `total` is passed **by value**
+  (`mut total: u64`, line 2917, itself inside the assigned range and
+  part of the same read), not by reference, so no caller can ever
+  re-read it this way; the premise of the hedge is impossible given
+  information from the same read. This makes the claim actually
+  *stronger* than DeepSeek framed it (the computation is unconditionally
+  dead within this function, not conditionally dead pending caller
+  behavior) rather than wrong, but it is a real in-scope inaccuracy in
+  how the hedge was worded — the first "hedged against a scenario the
+  same read range already rules out" instance in the loop's history.
+- **Proposal 4 (loop-counter dual-role clarity note, correct, no
+  hedge needed):** accurate, low-risk maintainability observation,
+  entirely in-range, no defect claimed.
+
+**Grade: A-.** Process matches the best cycles (12th clean, exact range,
+first-attempt, no spawn), and citations are fully clean on both quotes
+and labels. Docked half a grade below cycles 7/8/9/11/12/14's flawless-A
+bar for proposal 3's hedge-phrasing slip — a small, non-invalidating
+inaccuracy (misdescribing a by-value parameter as passed by mutable
+reference, when the parameter's own declaration was inside the read
+range) rather than a wrong core finding. All four proposals covered the
+brief's requested angles (boundary/off-by-one, returned-count accuracy,
+the force_all path, clarity); no proposal touched anchor/system-message
+preservation specifically since the read range's only anchor-adjacent
+logic is the `KEEP_RECENT_EXCHANGES`-gated recent-exchange floor, which
+proposal 1 did address via the boundary angle.
+
+**Kitsu weaknesses observed:** none new. The main-checkout read-only
+verification build (`cargo build -p kitsu` in
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu`) was also clean; the main
+checkout was left untouched (no git mutations), consistent with another
+session's concurrent work there.
+
+**Ramp status:** process discipline now **12-for-12 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15); citation fidelity now **7-for-9
+fully clean on quotes+labels** (cycles 7, 8, 9, 11, 12, 14, 15 clean;
+cycles 10 and 13 each showing one prior minor drift). This is the first
+cycle to review the compaction TRIMMER itself (prior cycles reviewed
+callers/siblings in the same compaction path: 6 `compact_context`, 7
+`summarize_or_fallback`, 10 `context_window_shortfall`) — correctness
+here is directly load-bearing for which messages get dropped, and no
+substantively-wrong claim was found. DeepSeek remains a STRONG,
+reliable tiny-scope reviewer — still review-only until R4.10
+(implementation type-chasing, per cycle 5, remains unaddressed).
+
+### Cycle 16 — 2026-08-15 — turn-execution wrapper review, first explicitly callee-heavy target (grade A-)
+
+Target: `run_agent_turn_with_state`
+(`crates/kitsu-core/src/orchestrator.rs`), the public async wrapper that
+sets up and executes one agent turn over a generic `P: Provider`,
+threading `AgentSessionState` through, emitting event-log and
+render/telemetry side effects, and returning the turn's result. Unlike
+prior targets (formatters, parsers, the compaction trimmer), this
+function's own body is short but almost entirely composed of calls out
+to helpers it does not define (`run_agent_turn_inner`,
+`kitsu_render::*`, `log.record`, `ContextBudget::new`,
+`state.meter.estimate`) and is generic over the provider — making it
+the loop's first target explicitly selected to stress-test hedging
+discipline on a callee-heavy function rather than scope discipline
+alone. Pre-dispatch check confirmed the assigned range (865-928) was
+exact: `fn run_agent_turn_with_state` opens at line 865, its own
+closing brace is at line 928 (64 lines total) — no correction needed.
+
+- **Process: 13th clean review cycle running.** Rebuilt the kitsu
+  driver fresh from `main` (`cargo build -p kitsu`, `CARGO_TARGET_DIR=
+  /home/mmpg/.cache/deepseek-worktree-target`, clean build in 7.4s, no
+  errors — dependency graph already warm in the shared target dir).
+  Exactly **1 ranged read** (865-928, 64 lines, matching the assigned
+  range exactly — transcript shows a single `Read(…/orchestrator.rs)`
+  call and nothing else) → **1 write** (`reviews/deepseek-cycle-16.md`,
+  4459 bytes, 71 lines, 4 proposals), no re-read, no spawn attempt (cap
+  1 unexercised), first attempt succeeded, clean exit (`1 turn(s) ok, 1
+  file(s) read, 1 file(s) written`). kitsu-usage
+  `{"prompt_tokens":21152,"completion_tokens":2785,"total_tokens":23937}`.
+- **Citations 4/4 letter-perfect on both quoted text and line-number
+  labels.** Every quoted block (876-879 and 885 in proposal 1; 887-897
+  in proposal 2; 875 and 885 in proposal 3; 901-908 and 909/919/925 in
+  proposal 4) was diffed against the source on disk and matches
+  exactly, including whitespace — zero-drift streak continues.
+- **Proposal 1 (state reset before the fallible inner call risks
+  losing prior turn status/spawn budget on error, mostly hedged but one
+  sub-claim slips through unhedged):** correctly observes
+  `state.last_turn = AgentTurnStatus::default()` (876) and
+  `budget.reset()` (878) both execute unconditionally before
+  `run_agent_turn_inner` (885) can fail. The central claim about
+  `state.last_turn` is explicitly hedged ("I cannot assert whether
+  `run_agent_turn_inner` itself overwrites `state.last_turn`... from
+  this range alone the ordering is risky"). **Flagged:** the adjacent
+  sentence — "on error the budget is zeroed with no recovery path" —
+  asserts a specific effect of `budget.reset()` (a callee this range
+  does not define) as fact, with no hedge attached to that particular
+  sub-claim; the umbrella hedge at the paragraph's end covers only the
+  `state.last_turn` half of the argument. A real instance of the
+  callee-behavior-unhedged pattern the brief asked to watch for, though
+  narrow (one clause in one of four proposals) and low-stakes (the
+  broader point — resets precede a fallible call — is sound and
+  in-range).
+- **Proposal 2 (event-log may record stale default fields if the inner
+  call errors before populating them, correctly hedged):** reasons from
+  visible control flow — nothing between line 876 and line 887 writes
+  `state.last_turn` except the call at line 885, so any field value at
+  887 traces to either the line-876 default or whatever
+  `run_agent_turn_inner` did — and explicitly declines to assert which,
+  closing with "(which I cannot verify from this range — hedge)". Sound
+  reasoning from in-range structure, correctly hedged on the one part
+  that depends on the callee.
+- **Proposal 3 (accumulated `turn_usage` token counts are rendered but
+  omitted from the structured `TurnFinished` log event, correctly
+  hedged):** accurate in-range observation — `turn_usage` reaches
+  `kitsu_render::emit_turn_stats`/`emit_failed_turn_stats` (920/922) but
+  never reaches `log.record` (892-897). Hedges the one out-of-range
+  unknown directly: "the `AgentRuntimeEvent` enum is not visible here;
+  it may already carry optional usage fields."
+- **Proposal 4 (two consecutive identical `!cfg.quiet` guards invite
+  drift, correct, no hedge needed):** pure in-range structural
+  observation with no callee dependency; correctly left unhedged.
+  Low-severity maintainability note.
+
+**Grade: A-.** Process is clean (13th in a row) and citations are
+letter-perfect on quotes and labels. Docked half a grade for the one
+unhedged callee-behavior clause in proposal 1 ("the budget is zeroed
+with no recovery path") — asserting a specific effect of
+`spawn_budget.reset()`, a callee this range doesn't define, without the
+sentence-level hedge the surrounding paragraph otherwise applies. This
+is exactly the failure mode the cycle brief flagged as the crux for a
+callee-heavy target; DeepSeek avoided it everywhere else (3 of 4
+proposals hedge every callee-dependent claim cleanly, including
+correctly leaving the callee-free proposal 4 unhedged), so the
+calibration is good but not flawless. No substantively-wrong claims
+found on spot-check.
+
+**Kitsu weaknesses observed:** none new. The main-checkout read-only
+verification build (`cargo build -p kitsu` in
+`/home/mmpg/workspace/kitsu/kitsu2/kitsu`) was also clean; the main
+checkout was left untouched (no git mutations), consistent with another
+session's concurrent work there.
+
+**Ramp status:** process discipline now **13-for-13 clean** (cycles 3,
+4, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16); citation fidelity now
+**8-for-10 fully clean on quotes+labels** (cycles 7, 8, 9, 11, 12, 14,
+15, 16 clean; cycles 10 and 13 each showing one prior minor drift).
+This is the first cycle explicitly targeting a callee-heavy,
+provider-generic function to stress-test hedging discipline rather than
+scope discipline; DeepSeek hedged the large majority of callee-dependent
+claims correctly but let one clause (proposal 1's budget-zeroing
+assertion) through unhedged — the first concrete data point on where
+the hedging discipline's edge sits. DeepSeek remains a STRONG,
+reliable tiny-scope reviewer — still review-only until R4.10
+(implementation type-chasing, per cycle 5, remains unaddressed).
