@@ -23,4 +23,7 @@ jobs:
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      run: cargo test --verbose
+      # Bubblewrap's loopback setup requires the runner's namespace capability;
+      # the command-containment integration tests are intentionally run with the
+      # hosted runner's passwordless sudo rather than silently weakening them.
+      run: sudo -E env "PATH=$PATH" cargo test --verbose
