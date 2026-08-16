@@ -3525,6 +3525,77 @@ async fn enforce_budget_trim_keeps_a_valid_anchor_when_nothing_is_droppable() {
 
 // --- checked context invariant + manual compaction --------------------------
 
+/// Rebase guard: the provider-boundary preflight must meter the exact valid
+/// tool descriptor serialization. A serialization-path regression must never
+/// make an advertised schema disappear from the byte budget.
+#[test]
+fn request_preflight_counts_exact_serialized_tool_schema_bytes() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::{ensure_chat_request_fits, ContextUnit};
+    use kitsu_providers::{ChatMessage, ToolDescriptor};
+
+    let tools = vec![ToolDescriptor {
+        name: "lookup".to_string(),
+        description: "look up a value".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {"key": {"type": "string"}},
+            "required": ["key"]
+        }),
+    }];
+    let messages = vec![ChatMessage::user("payload")];
+    let request = ChatRequest {
+        model: "rebase-guard".to_string(),
+        messages: messages.clone(),
+        tools: Some(tools.clone()),
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
+    };
+    let expected = messages.iter().map(ChatMessage::byte_size).sum::<usize>()
+        + serde_json::to_string(&tools).unwrap().len();
+
+    let measurement =
+        ensure_chat_request_fits(&request, &cfg(1), &ContextMeter::new(), None, &mut None).unwrap();
+    assert_eq!(measurement.unit, ContextUnit::Bytes);
+    assert_eq!(measurement.used, expected as u64);
+}
+
+/// `Some([])` and `None` both mean that no tool schema crosses the provider
+/// boundary. They must therefore consume the same budget and must not count
+/// the JSON representation `[]` as request overhead.
+#[test]
+fn request_preflight_treats_empty_tool_list_as_no_schema() {
+    use crate::context::ContextMeter;
+    use crate::orchestrator::ensure_chat_request_fits;
+    use kitsu_providers::ChatMessage;
+
+    let messages = vec![ChatMessage::user("payload")];
+    let request = |tools| ChatRequest {
+        model: "rebase-guard".to_string(),
+        messages: messages.clone(),
+        tools,
+        stream: false,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
+    };
+    let meter = ContextMeter::new();
+    let absent =
+        ensure_chat_request_fits(&request(None), &cfg(1), &meter, None, &mut None).unwrap();
+    let empty =
+        ensure_chat_request_fits(&request(Some(Vec::new())), &cfg(1), &meter, None, &mut None)
+            .unwrap();
+
+    assert_eq!(empty.used, absent.used);
+    assert_eq!(empty.used, messages[0].byte_size() as u64);
+}
+
 #[tokio::test]
 async fn protected_token_overflow_fails_locally_without_calling_provider() {
     use crate::orchestrator::{AgentError, ContextUnit};
@@ -5349,8 +5420,8 @@ fn response_schema_participates_in_session_cache_identity() {
 
     let format_a = response_format("alpha");
     let format_b = response_format("bravo");
-    let serialized_a = serialized_request_constraints(None, Some(&format_a));
-    let serialized_b = serialized_request_constraints(None, Some(&format_b));
+    let serialized_a = serialized_request_constraints(None, Some(&format_a)).unwrap();
+    let serialized_b = serialized_request_constraints(None, Some(&format_b)).unwrap();
     assert_eq!(
         serialized_a.len(),
         serialized_b.len(),

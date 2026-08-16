@@ -1518,7 +1518,7 @@ where
             meter.invalidate();
         }
         let schema_json =
-            serialized_request_constraints(offered_tools.as_deref(), response_format.as_ref());
+            serialized_request_constraints(offered_tools.as_deref(), response_format.as_ref())?;
         let request_constraints_present = tools_were_offered || response_format.is_some();
 
         // Budget only after every request-visible mutation (notably the final
@@ -2913,7 +2913,7 @@ fn ensure_chat_request_fits(
     let has_schema =
         req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) || req.response_format.is_some();
     let schema_json =
-        serialized_request_constraints(req.tools.as_deref(), req.response_format.as_ref());
+        serialized_request_constraints(req.tools.as_deref(), req.response_format.as_ref())?;
     let schema_tokens = if has_schema {
         cached_schema_estimate(schema_cache, &schema_json)
     } else {
@@ -2934,10 +2934,12 @@ fn ensure_chat_request_fits(
 fn serialized_request_constraints(
     tools: Option<&[ToolDescriptor]>,
     response_format: Option<&JsonSchemaFormat>,
-) -> String {
+) -> Result<String, AgentError> {
     let mut serialized = String::new();
     if let Some(tools) = tools.filter(|tools| !tools.is_empty()) {
-        serialized.push_str(&serde_json::to_string(tools).unwrap_or_default());
+        serialized.push_str(&serde_json::to_string(tools).map_err(|error| {
+            AgentError::Loop(format!("failed to serialise tools schema: {error}"))
+        })?);
     }
     if let Some(response_format) = response_format {
         if !serialized.is_empty() {
@@ -2955,10 +2957,12 @@ fn serialized_request_constraints(
                     "schema": &response_format.schema,
                 }
             }))
-            .unwrap_or_default(),
+            .map_err(|error| {
+                AgentError::Loop(format!("failed to serialise response schema: {error}"))
+            })?,
         );
     }
-    serialized
+    Ok(serialized)
 }
 
 /// P11 helper: return the cached token estimate for `schema_json` when the
@@ -2999,7 +3003,7 @@ where
     let schema_json = serialized_request_constraints(
         (!tools.descriptors().is_empty()).then_some(tools.descriptors()),
         cfg.response_format.as_ref(),
-    );
+    )?;
     let mut usage = kitsu_providers::Usage::default();
     enforce_context_budget_recording(
         provider,
