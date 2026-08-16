@@ -1487,13 +1487,9 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
     // remember the pinned provider so the nested lookup below can prefer that
     // provider's window. Only the last `:` segment is a pin; a bare tag like
     // ollama's "qwen2.5-coder:latest" still matches its full id first.
-    let base = match model.rsplit_once(':') {
-        Some((base, _)) if !base.is_empty() => base,
-        _ => model,
-    };
-    let pinned_provider = match model.rsplit_once(':') {
-        Some((base, prov)) if !base.is_empty() && !prov.is_empty() => Some(prov),
-        _ => None,
+    let (base, pinned_provider) = match model.rsplit_once(':') {
+        Some((base, prov)) if !base.is_empty() => (base, (!prov.is_empty()).then_some(prov)),
+        _ => (model, None),
     };
     // Prefer an exact id match; then a loose match, but ONLY if it's unique —
     // an ambiguous loose match (e.g. "gpt-4" loosely matching both
@@ -1532,10 +1528,11 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
         }
     }
     // Some routers (e.g. the Hugging Face router) advertise no top-level window
-    // and instead nest one per serving provider under `providers[]`. Prefer the
-    // pinned provider's window; otherwise take the MIN across live providers — a
-    // safe lower bound, since an unpinned request may be dispatched to any of
-    // them and Kitsu must never budget above the smallest one it could hit.
+    // and instead nest one per serving provider under `providers[]`. A `:provider`
+    // pin selects that provider's window verbatim (it is the accurate window for
+    // an explicit route). Unpinned, take the MIN across usable providers — a safe
+    // lower bound, since the request may be dispatched to any of them and Kitsu
+    // must never budget above the smallest one it could hit.
     let providers = entry.get("providers")?.as_array()?;
     let provider_window = |p: &serde_json::Value| -> Option<u64> {
         p.get("context_length")
@@ -1550,11 +1547,26 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
             return provider_window(p);
         }
     }
-    providers
+    // Allowlist rather than denylist: only `"live"` (or an unreported status, for
+    // routers that omit it) counts. A MIN is maximally sensitive to one small
+    // entry, so a provider that is down under any other label ("staging",
+    // "offline", ...) must not drag the whole budget down.
+    let min = providers
         .iter()
-        .filter(|p| p.get("status").and_then(serde_json::Value::as_str) != Some("error"))
+        .filter(|p| {
+            matches!(
+                p.get("status").and_then(serde_json::Value::as_str),
+                None | Some("live")
+            )
+        })
         .filter_map(provider_window)
-        .min()
+        .min()?;
+    // The unpinned MIN is a heuristic lower bound, so never report BELOW the
+    // window Kitsu would use with no discovery at all (kitsu-core's
+    // DEFAULT_CONTEXT_WINDOW). Otherwise one provider advertising a tiny window
+    // would make discovery strictly worse than the fallback it replaces.
+    const NO_DISCOVERY_FLOOR: u64 = 8_192;
+    Some(min.max(NO_DISCOVERY_FLOOR))
 }
 
 /// Validate the common catalog envelope before assigning the positive cache
