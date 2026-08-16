@@ -15601,3 +15601,108 @@ fn test_no_workspace_evidence_flag_and_config_unregister_the_tool() {
         .success()
         .stderr(predicate::str::contains("workspace_diff").not());
 }
+
+#[tokio::test]
+#[serial]
+async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session() {
+    use std::time::Duration;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+
+    // The model's first (and only completed) round reads this file; its marker
+    // proves the tool round completed and was persisted rather than discarded.
+    let evidence = home.path().join("evidence.txt");
+    fs::write(&evidence, "TOOL_ROUND_EVIDENCE_MARKER").unwrap();
+    let read_args = serde_json::json!({ "path": evidence.to_string_lossy() }).to_string();
+
+    // Round 2 (the request that carries the tool result back) stalls far past
+    // the turn deadline, forcing a mid-turn timeout after one complete round.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "arrived after the deadline"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Round 1: the model asks to read the evidence file (a complete tool round).
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read_evidence",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    // A positional prompt over a non-tty stdin drives the piped/session path
+    // (the automation surface the fix targets), not scripted or interactive.
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--no-stream",
+                "--timeout-secs",
+                "3",
+                "chat",
+                "--session",
+                "--allow-path",
+                &home_path.to_string_lossy(),
+                "read the evidence file",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    // The turn times out mid-second-round and exits nonzero...
+    assert!(
+        !output.status.success(),
+        "expected a deadline timeout: {output:?}"
+    );
+
+    // ...but the completed tool round is preserved to a resumable session
+    // instead of being discarded. The persisted transcript must carry both the
+    // tool result and the honest deadline marker.
+    let sessions_dir = home.path().join(".kitsu").join("sessions");
+    let persisted = fs::read_dir(&sessions_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "json").unwrap_or(false))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|body| {
+            body.contains("TOOL_ROUND_EVIDENCE_MARKER") && body.contains("deadline expired")
+        });
+    assert!(
+        persisted,
+        "a piped turn that times out after a completed tool round must persist it as a \
+         resumable session (none found under {sessions_dir:?})"
+    );
+}
