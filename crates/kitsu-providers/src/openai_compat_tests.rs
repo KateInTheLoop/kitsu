@@ -1847,6 +1847,70 @@ async fn test_model_context_length_from_max_model_len() {
     assert_eq!(provider.model_context_length("my-model").await, Some(32768));
 }
 
+/// The Hugging Face router advertises no top-level window and nests one per
+/// serving provider under `providers[]`. A `:provider` routing pin selects that
+/// provider's window (base id matches the un-pinned catalog id).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_from_pinned_nested_provider() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"deepseek-ai/DeepSeek-V4-Pro","providers":[{"provider":"novita","status":"live","context_length":1048576},{"provider":"together","status":"live","context_length":512000}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(
+        provider
+            .model_context_length("deepseek-ai/DeepSeek-V4-Pro:together")
+            .await,
+        Some(512000)
+    );
+}
+
+/// Unpinned: take the MIN across live nested providers — a safe lower bound,
+/// since an unpinned request may be dispatched to any of them. An error-status
+/// provider is excluded even if it advertises a (tiny) window.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_nested_provider_min_excludes_errored() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"Qwen/Qwen3.5-27B","providers":[{"provider":"deepinfra","status":"live","context_length":262144},{"provider":"novita","status":"live","context_length":131072},{"provider":"broken","status":"error","context_length":4096}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // min(262144, 131072) — the errored 4096 is skipped.
+    assert_eq!(
+        provider.model_context_length("Qwen/Qwen3.5-27B").await,
+        Some(131072)
+    );
+}
+
+/// A top-level window still wins over `providers[]` (unchanged precedence).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_top_level_beats_nested() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"m","context_length":200000,"providers":[{"provider":"x","status":"live","context_length":8192}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("m").await, Some(200000));
+}
+
 /// No context-length field (e.g. Ollama's OpenAI-compat route) → None.
 #[tokio::test]
 #[serial]
