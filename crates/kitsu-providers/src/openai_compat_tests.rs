@@ -2202,7 +2202,7 @@ async fn test_context_length_memo_preserved_on_same_catalog_refresh() {
     // going through `model_context_length`, so the memo is NOT re-populated
     // by a parse — letting us inspect the carried-over memo in isolation.
     provider
-        .get_models_response()
+        .get_models_response(None)
         .await
         .expect("refresh succeeds");
 
@@ -2260,7 +2260,7 @@ async fn test_context_length_memo_cleared_on_different_catalog_refresh() {
 
     // Refresh with a DIFFERENT catalog (catalog B, context_length 16384).
     provider
-        .get_models_response()
+        .get_models_response(None)
         .await
         .expect("refresh succeeds");
 
@@ -2451,7 +2451,7 @@ async fn test_same_catalog_refresh_preserves_positive_and_negative_memo_entries(
         entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
     }
     provider
-        .get_models_response()
+        .get_models_response(None)
         .await
         .expect("identical catalog refresh succeeds");
 
