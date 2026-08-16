@@ -853,6 +853,22 @@ fn status_category(status: StatusCode) -> ProviderAttemptCategory {
     }
 }
 
+/// Is an HTTP response status a transient failure worth retrying within the
+/// inference budget? Rate limiting (429) and the transient gateway/proxy
+/// failures — 408 Request Timeout, 502 Bad Gateway, 503 Service Unavailable,
+/// 504 Gateway Timeout, and Cloudflare's non-standard 520-524 — are the ones a
+/// hosted router raises when an upstream is momentarily slow or overloaded; a
+/// second attempt commonly succeeds. Everything else (a genuine 500 from bad
+/// input, any 4xx, an auth failure) is deterministic and must not be retried.
+/// A tool-heavy multi-round run through a busy router hits these often enough
+/// that treating them as terminal silently discards a long, productive turn.
+fn is_retryable_status(status: StatusCode) -> bool {
+    matches!(
+        status.as_u16(),
+        408 | 429 | 502 | 503 | 504 | 520 | 521 | 522 | 523 | 524
+    )
+}
+
 fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) -> bool {
     telemetry.map_or(true, |telemetry| telemetry.record(event))
 }
@@ -1607,10 +1623,7 @@ impl Provider for OpenAICompatProvider {
             match send_result {
                 Ok(resp) => {
                     let status = resp.status();
-                    if (status == StatusCode::TOO_MANY_REQUESTS
-                        || status == StatusCode::SERVICE_UNAVAILABLE)
-                        && attempt < self.retries
-                    {
+                    if is_retryable_status(status) && attempt < self.retries {
                         let retry_number = attempt.saturating_add(1);
                         let decision = retry_delay_decision(
                             retry_number,
@@ -1907,7 +1920,7 @@ impl Provider for OpenAICompatProvider {
 
 #[cfg(test)]
 mod prompt_cache_key_tests {
-    use super::build_body;
+    use super::{build_body, is_retryable_status, StatusCode};
     use crate::types::{ChatMessage, ChatRequest};
 
     fn base_request() -> ChatRequest {
@@ -1938,5 +1951,29 @@ mod prompt_cache_key_tests {
         let req = base_request();
         let json = serde_json::to_string(&build_body(&req).unwrap()).unwrap();
         assert!(!json.contains("prompt_cache_key"), "body: {json}");
+    }
+
+    #[test]
+    fn transient_gateway_statuses_are_retryable() {
+        // The transient failures a hosted router raises when an upstream is
+        // momentarily slow/overloaded — a second attempt commonly succeeds.
+        for code in [408u16, 429, 502, 503, 504, 520, 521, 522, 523, 524] {
+            assert!(
+                is_retryable_status(StatusCode::from_u16(code).unwrap()),
+                "status {code} should be retryable"
+            );
+        }
+    }
+
+    #[test]
+    fn deterministic_failures_are_not_retryable() {
+        // 4xx (bad request/auth/not found) and a genuine 500 are deterministic:
+        // retrying re-sends the same doomed request. 2xx is not a failure.
+        for code in [200u16, 201, 400, 401, 403, 404, 409, 422, 500, 501, 505] {
+            assert!(
+                !is_retryable_status(StatusCode::from_u16(code).unwrap()),
+                "status {code} must not be retryable"
+            );
+        }
     }
 }
