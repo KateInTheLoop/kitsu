@@ -1,13 +1,12 @@
 # DeepSeek-V4 worker loop — kitsu drives a second hosted frontier model
 
-> **LIVE 2026-08-15: cycle 8 — grade A, 2nd zero-drift citation cycle,
-> and a scope-range bug in the cron assignment caught before dispatch.**
-> The cron-supplied range for `enforce_context_budget` was wrong and was
-> corrected to the function's real span (2074-2106) before handoff.
-> Process held a 5th clean cycle (1 read, 1 write, no over-read, no
-> spawn); citations were exact on quotes and labels for the 2nd cycle
-> running. Cycle 5 still shows that tiny-scope review discipline does
-> not automatically transfer to implementation work.
+> **LIVE 2026-08-15: cycle 16 — grade A-, 13th clean review cycle.**
+> The first explicitly callee-heavy target, `run_agent_turn_with_state`,
+> kept exact scope and letter-perfect citations. Hedging was correct in
+> nearly every callee-dependent claim, with one narrow unhedged clause
+> about `spawn_budget.reset()` accounting for the grade dock. DeepSeek
+> remains a strong tiny-scope reviewer and stays review-only until R4.10
+> addresses implementation type-chasing.
 
 Started 2026-08-14 at user direction: three-contributor collaboration —
 Claude (main session, orchestrator + reviewer), Kimi-K3

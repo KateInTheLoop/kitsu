@@ -1,6 +1,6 @@
 # Cycle 15 review: `drop_old_exchanges_detailed` (lines 2915–2957)
 
-**Scope**: `crates/kitsu-core/src/orchestrator.rs` lines 2915–2957 only.  
+**Scope**: `crates/kitsu-core/src/orchestrator.rs` lines 2915–2957 only.
 **Caveat**: I have NOT read any caller, callee, or constant definition (`KEEP_RECENT_EXCHANGES`,
 `user_message_indices`, `TRIM_MARKER`, `ChatMessage`, `size` closure origin, the
 anchor/span helpers, or `force_all`'s callers). Proposals that depend on those are
@@ -20,7 +20,7 @@ explicitly hedged.
 2951	    let drop_end = user_idxs[first_actual + e];
 ```
 
-The guard at lines 2928–2930 returns `0` when `actual <= KEEP_RECENT_EXCHANGES`.  
+The guard at lines 2928–2930 returns `0` when `actual <= KEEP_RECENT_EXCHANGES`.
 If `KEEP_RECENT_EXCHANGES == 0` and `actual > 0`, that guard does **not** trigger,
 so `max_drop = actual`. On the last loop iteration (`e = actual - 1`):
 

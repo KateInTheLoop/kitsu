@@ -1,7 +1,7 @@
 # Review: `enforce_context_budget` (test wrapper)
 
-**Scope:** `crates/kitsu-core/src/orchestrator.rs` lines 2074–2106.  
-**Reviewed:** 2025-07-15, single ranged read of the cited lines only.  
+**Scope:** `crates/kitsu-core/src/orchestrator.rs` lines 2074–2106.
+**Reviewed:** 2025-07-15, single ranged read of the cited lines only.
 **Status:** `#[cfg(test)]` — compiles only in test builds, not production.
 
 ---
@@ -54,7 +54,7 @@ general-purpose test entry point.
 
 ### 3. Name is one suffix away from the callee — discoverability hazard
 
-> Line 2078: `async fn enforce_context_budget<P>(`  
+> Line 2078: `async fn enforce_context_budget<P>(`
 > Line 2091: `enforce_context_budget_recording(`
 
 The wrapper name drops the `_recording` suffix. In a codebase search,

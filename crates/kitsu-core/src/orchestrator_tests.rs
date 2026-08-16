@@ -3552,11 +3552,14 @@ fn request_preflight_counts_exact_serialized_tool_schema_bytes() {
         temperature: None,
         reasoning_effort: None,
         max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
     };
     let expected = messages.iter().map(ChatMessage::byte_size).sum::<usize>()
         + serde_json::to_string(&tools).unwrap().len();
 
-    let measurement = ensure_chat_request_fits(&request, &cfg(1), &ContextMeter::new()).unwrap();
+    let measurement =
+        ensure_chat_request_fits(&request, &cfg(1), &ContextMeter::new(), None, &mut None).unwrap();
     assert_eq!(measurement.unit, ContextUnit::Bytes);
     assert_eq!(measurement.used, expected as u64);
 }
@@ -3579,10 +3582,15 @@ fn request_preflight_treats_empty_tool_list_as_no_schema() {
         temperature: None,
         reasoning_effort: None,
         max_tokens: None,
+        response_format: None,
+        prompt_cache_key: None,
     };
     let meter = ContextMeter::new();
-    let absent = ensure_chat_request_fits(&request(None), &cfg(1), &meter).unwrap();
-    let empty = ensure_chat_request_fits(&request(Some(Vec::new())), &cfg(1), &meter).unwrap();
+    let absent =
+        ensure_chat_request_fits(&request(None), &cfg(1), &meter, None, &mut None).unwrap();
+    let empty =
+        ensure_chat_request_fits(&request(Some(Vec::new())), &cfg(1), &meter, None, &mut None)
+            .unwrap();
 
     assert_eq!(empty.used, absent.used);
     assert_eq!(empty.used, messages[0].byte_size() as u64);
