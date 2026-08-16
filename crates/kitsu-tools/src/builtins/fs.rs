@@ -3666,13 +3666,48 @@ fn scan_one_file(
     refs_cap: usize,
     budget: &mut SymbolScanBudget,
 ) {
+    scan_one_file_with_hook(
+        policy,
+        root,
+        path,
+        display,
+        hits,
+        symbol,
+        refs_cap,
+        budget,
+        || {},
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+fn scan_one_file_with_hook<F>(
+    policy: &Permissions,
+    root: &Path,
+    path: &Path,
+    display: &str,
+    hits: &mut SymbolHits,
+    symbol: &str,
+    refs_cap: usize,
+    budget: &mut SymbolScanBudget,
+    before_open: F,
+) where
+    F: FnOnce(),
+{
     if policy.is_read_protected(path) {
         return;
     }
+    before_open();
     let Ok(file) = open_read_file(path) else {
         hits.skipped_unreadable += 1;
         return;
     };
+    if policy
+        .validate_opened_model_read(path, path, &file)
+        .is_err()
+    {
+        hits.skipped_unreadable += 1;
+        return;
+    }
     let mut buf = Vec::new();
     if Read::take(file, SYMBOL_MAX_FILE_BYTES)
         .read_to_end(&mut buf)
@@ -8575,6 +8610,48 @@ httpx = "^0.27"
             .await,
             Err(ToolError::PolicyDenied(_))
         ));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn find_symbol_revalidates_a_file_replaced_after_the_path_check() {
+        let dir = tempfile::tempdir().unwrap();
+        let allowed = dir.path().join("allowed");
+        let private = dir.path().join("private");
+        std::fs::create_dir_all(&allowed).unwrap();
+        std::fs::create_dir_all(&private).unwrap();
+        let visible = allowed.join("visible.rs");
+        let secret = private.join("session.rs");
+        std::fs::write(&visible, "fn harmless() {}\n").unwrap();
+        std::fs::write(&secret, "fn private_symbol() {}\n").unwrap();
+
+        let root = allowed.to_string_lossy().into_owned();
+        let policy = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+        policy
+            .protect_read_path(&private.to_string_lossy())
+            .unwrap();
+
+        let mut hits = SymbolHits::default();
+        let mut budget = SymbolScanBudget::default();
+        scan_one_file_with_hook(
+            &policy,
+            &allowed,
+            &visible,
+            "allowed",
+            &mut hits,
+            "private_symbol",
+            SYMBOL_DEFAULT_MAX_REFS,
+            &mut budget,
+            || {
+                std::fs::remove_file(&visible).unwrap();
+                std::fs::hard_link(&secret, &visible).unwrap();
+            },
+        );
+
+        assert_eq!(hits.total_defs, 0);
+        assert_eq!(hits.total_refs, 0);
+        assert_eq!(hits.files_scanned, 0);
+        assert_eq!(hits.skipped_unreadable, 1);
     }
 
     #[test]
