@@ -958,21 +958,24 @@ async fn test_done_terminates_without_waiting_for_wire_eof() {
 fn test_sse_decoder_rejects_malformed_error_and_empty_success_payloads() {
     use super::SseDecoder;
 
-    for (record, expected) in [
-        ("data: not-json\n", "malformed JSON"),
-        (
-            "data: {\"error\":{\"message\":\"secret provider detail\"}}\n",
-            "error object",
-        ),
-    ] {
-        let mut decoder = SseDecoder::default();
-        let error = decoder
-            .push_bytes(record.as_bytes())
-            .expect_err("invalid data records must fail the response");
-        assert!(matches!(error, ProviderError::InvalidResponse(_)));
-        assert!(error.to_string().contains(expected));
-        assert!(!error.to_string().contains("secret provider detail"));
-    }
+    let mut decoder = SseDecoder::default();
+    let error = decoder
+        .push_bytes(b"data: not-json\n")
+        .expect_err("invalid data records must fail the response");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert!(error.to_string().contains("malformed JSON"));
+
+    // A genuine (non-null) `error` object in an otherwise-200 SSE response must
+    // still fail the response. Unlike the old fixed-string behavior, the fix for
+    // the cycle-5 false-positive/discarded-detail bug now surfaces the gateway's
+    // own message text here (see test_process_line_real_error_surfaces_gateway_message_text
+    // for the direct process_line-level coverage of that contract).
+    let mut decoder = SseDecoder::default();
+    let error = decoder
+        .push_bytes(b"data: {\"error\":{\"message\":\"provider detail\"}}\n")
+        .expect_err("invalid data records must fail the response");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert!(error.to_string().contains("provider detail"));
 
     let mut decoder = SseDecoder::default();
     decoder.push_bytes(b"data: [DONE]\n").unwrap();
@@ -997,6 +1000,57 @@ fn test_nonstream_completion_rejects_error_and_empty_choice_objects() {
 
     let error = parse_completion(r#"{"choices":[{}]}"#)
         .expect_err("a defaulted choice without content or a terminal reason is not an answer");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
+/// Regression for a false positive diverging from the streaming path: the OLD
+/// non-streaming code did `value.get("error").is_some()` and returned Err, which
+/// wrongly rejected a valid completion body carrying `"error": null` alongside
+/// real choices, because `get("error")` returns `Some(&Value::Null)`, not
+/// `None`. The streaming path already ignored a null error
+/// (`get("error").filter(|e| !e.is_null())`); the fix aligns the non-streaming
+/// path to do the same. This test would FAIL against the unfixed code (it would
+/// receive InvalidResponse instead of the content delta + Done(Stop)).
+#[test]
+fn test_parse_completion_null_error_alongside_valid_choice_parses_ok() {
+    use super::parse_completion;
+    use crate::types::ChatDelta;
+
+    let body = r#"{
+        "error": null,
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+    }"#;
+    let deltas = parse_completion(body).expect(
+        "a completion body carrying `\"error\": null` alongside a valid choice must parse, \
+         not be rejected",
+    );
+    assert!(
+        matches!(deltas.last(), Some(ChatDelta::Done(FinishReason::Stop))),
+        "expected the terminal Done(Stop); got {deltas:?}"
+    );
+    let text = deltas
+        .iter()
+        .find_map(|d| match d {
+            ChatDelta::Text(t) => Some(t.as_str()),
+            _ => None,
+        })
+        .expect("expected a content Text delta");
+    assert_eq!(text, "hi");
+}
+
+/// A real (non-null) `error` object in a successful completion body must STILL
+/// be rejected with InvalidResponse — the null-tolerance fix must not swallow a
+/// genuine error. This guards against over-correcting the false-positive fix.
+#[test]
+fn test_parse_completion_real_error_object_still_rejected() {
+    use super::parse_completion;
+
+    let body = r#"{
+        "error": {"message": "rate limited", "type": "requests", "code": "429"},
+        "choices": [{"message": {"content": "hi"}, "finish_reason": "stop"}]
+    }"#;
+    let error =
+        parse_completion(body).expect_err("a real (non-null) error object must still be rejected");
     assert!(matches!(error, ProviderError::InvalidResponse(_)));
 }
 
@@ -1138,6 +1192,229 @@ fn test_sse_decoder_bounds_fragmented_tool_arguments() {
             limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
         })
     ));
+}
+
+/// Regression for the cycle-5 finding: a single SSE `data:` line carrying a
+/// tool-argument delta LARGER than the old 256 KiB line cap but within the 1 MiB
+/// argument budget must parse successfully. Under the old `MAX_SSE_LINE_BYTES`
+/// (256 KiB) this exact line was rejected by the line ceiling with
+/// `ResponseTooLarge { part: SseLine }` at `push_bytes` — before the argument
+/// budget was ever consulted — so this test fails against the unfixed code.
+#[test]
+fn test_sse_decoder_accepts_large_single_line_tool_argument_within_budget() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES, MAX_STREAMED_TOOL_ARGUMENT_BYTES};
+
+    // Pick an argument just above the OLD 256 KiB line cap and well within the
+    // 1 MiB argument budget. 320 KiB < 1 MiB, and the line wrapping it is larger
+    // still (envelope + escaping), so it always exceeded the old 256 KiB line.
+    let arg_len = 320 * 1024;
+    assert!(
+        arg_len > 256 * 1024 && arg_len < MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        "fixture must straddle the old line cap and the argument budget"
+    );
+    let arguments = "x".repeat(arg_len);
+
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "fs.write_file",
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let line = format!("data: {chunk}\n\n");
+    assert!(
+        line.len() > 256 * 1024,
+        "the full line must exceed the old 256 KiB line cap"
+    );
+    assert!(
+        line.len() <= MAX_SSE_LINE_BYTES,
+        "the full line must fit the new raised line cap"
+    );
+
+    let mut dec = SseDecoder::default();
+    dec.push_bytes(line.as_bytes())
+        .expect("a single-line argument delta within the 1 MiB budget must parse");
+    // Tool calls accumulate and flush at finalize; supply a terminal finish + DONE.
+    let tail = b"data: {\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\ndata: [DONE]\n\n";
+    dec.push_bytes(tail).expect("terminal chunk must parse");
+    let out = dec
+        .finalize()
+        .expect("finalize must succeed for a valid stream");
+    assert!(
+        out.iter()
+            .any(|d| matches!(d, ChatDelta::ToolCall(tc) if tc.tool_name == "fs.write_file")),
+        "the large single-line tool call must be surfaced"
+    );
+}
+
+/// Guard that the line ceiling still exists after being raised: a line that
+/// genuinely exceeds the NEW `MAX_SSE_LINE_BYTES` is rejected with the `SseLine`
+/// part. The asserted limit is hardcoded to the raised 4 MiB value (NOT the
+/// `MAX_SSE_LINE_BYTES` symbol) on purpose: under the old code this same payload
+/// was rejected as `SseLine` too, but with `limit_bytes = 256 KiB`, so a symbolic
+/// `== MAX_SSE_LINE_BYTES` check would pass against both versions. Pinning the
+/// literal makes this fail against the unfixed 256 KiB constant.
+#[test]
+fn test_sse_decoder_still_rejects_line_above_raised_ceiling() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES};
+
+    // Sanity: the constant under test is the raised value this guard pins.
+    assert_eq!(MAX_SSE_LINE_BYTES, 4 * 1024 * 1024);
+
+    let mut dec = SseDecoder::default();
+    let error = dec
+        .push_bytes(&vec![b'x'; MAX_SSE_LINE_BYTES + 1])
+        .expect_err("a line above the raised ceiling must still be rejected");
+    assert!(
+        matches!(error, ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseLine,
+            limit_bytes,
+        } if limit_bytes == 4 * 1024 * 1024),
+        "must be rejected as SseLine reporting the raised 4 MiB limit (not the old 256 KiB)"
+    );
+}
+
+/// Regression for the cycle-5 finding: a single SSE line whose tool-call
+/// argument exceeds the 1 MiB argument budget must be rejected with the
+/// `ToolArguments` part label, not `SseLine`. Under the old 256 KiB line cap the
+/// ~1.2 MiB line was rejected by the line ceiling first (`SseLine`), so the
+/// argument budget was unreachable for single-line deltas; this test fails
+/// against the unfixed code (it gets `SseLine` instead of `ToolArguments`).
+#[test]
+fn test_sse_decoder_oversized_single_line_argument_hits_argument_cap() {
+    use super::{SseDecoder, MAX_SSE_LINE_BYTES, MAX_STREAMED_TOOL_ARGUMENT_BYTES};
+
+    let arg_len = MAX_STREAMED_TOOL_ARGUMENT_BYTES + 1024;
+    let arguments = "x".repeat(arg_len);
+
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "call_1",
+                    "type": "function",
+                    "function": {
+                        "name": "fs.write_file",
+                        "arguments": arguments,
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    let line = format!("data: {chunk}\n\n");
+    // The line must clear the (raised) line cap so the line ceiling does NOT fire
+    // first, letting the argument budget be the one that rejects it.
+    assert!(
+        line.len() <= MAX_SSE_LINE_BYTES,
+        "oversized-argument line must fit the line cap so the argument cap fires"
+    );
+
+    let mut dec = SseDecoder::default();
+    let error = dec
+        .push_bytes(line.as_bytes())
+        .expect_err("an argument over the 1 MiB budget must be rejected");
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ToolArguments,
+            limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+        }
+    ));
+}
+
+#[test]
+fn test_process_line_null_error_alongside_valid_data_parses_successfully() {
+    // Regression for a false positive: the OLD code did
+    // `value.get("error").is_some()` and returned Err, which wrongly rejected a
+    // chunk carrying `"error": null` next to otherwise-valid data because
+    // `get("error")` returns `Some(&Value::Null)`, not `None`. The fix ignores a
+    // null error and parses the chunk normally. This test would FAIL against the
+    // unfixed code (it would receive an InvalidResponse instead of a Text delta).
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "error": null,
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "hello" },
+            "finish_reason": null,
+        }]
+    });
+    let line = format!("data: {chunk}");
+    dec.process_line(&line, &mut deltas).expect(
+        "a chunk carrying `\"error\": null` alongside valid data must parse, not be rejected",
+    );
+    assert!(
+        matches!(deltas.as_slice(), [ChatDelta::Text(t)] if t == "hello"),
+        "expected the content delta to be emitted; got {deltas:?}"
+    );
+}
+
+#[test]
+fn test_process_line_real_error_surfaces_gateway_message_text() {
+    // Regression for discarded detail: the OLD code threw away the gateway's
+    // message and returned only the fixed generic string. The fix surfaces the
+    // gateway's own `error.message` text inside the InvalidResponse. This test
+    // asserts the formatted error CONTAINS the gateway's actual text
+    // ("rate limited"), which would FAIL against the unfixed code.
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "error": { "message": "rate limited", "type": "requests", "code": "429" }
+    });
+    let line = format!("data: {chunk}");
+    let err = dec
+        .process_line(&line, &mut deltas)
+        .expect_err("a real (non-null) error object must still cause process_line to return Err");
+    let message = match err {
+        ProviderError::InvalidResponse(m) => m,
+        other => panic!("expected InvalidResponse, got {other:?}"),
+    };
+    assert!(
+        message.contains("rate limited"),
+        "error message must surface the gateway's own text; got: {message}"
+    );
+}
+
+#[test]
+fn test_process_line_no_error_field_still_parses_successfully() {
+    // Happy-path regression guard: a normal chunk with NO error field at all
+    // must continue to parse successfully. This already passed before the fix
+    // and is kept to prove the happy path was not broken.
+    use super::SseDecoder;
+
+    let mut dec = SseDecoder::default();
+    let mut deltas = Vec::new();
+    let chunk = serde_json::json!({
+        "choices": [{
+            "index": 0,
+            "delta": { "content": "ok" }
+        }]
+    });
+    let line = format!("data: {chunk}");
+    dec.process_line(&line, &mut deltas)
+        .expect("a normal chunk with no error field must parse successfully");
+    assert!(
+        matches!(deltas.as_slice(), [ChatDelta::Text(t)] if t == "ok"),
+        "expected the content delta to be emitted; got {deltas:?}"
+    );
 }
 
 #[tokio::test]
@@ -1585,10 +1862,14 @@ async fn test_model_context_length_none_when_field_absent() {
     assert_eq!(provider.model_context_length("my-model").await, None);
 }
 
-/// A lone entry is used even if its id doesn't match exactly.
+/// Regression: a lone catalog entry that matches neither exactly nor loosely
+/// must NOT bind a window. Before the fix, the sole-entry fallback accepted
+/// `entries[0]` whatever its id, silently budgeting against the wrong window
+/// (here a "whatever" query against a "served-model" entry returned
+/// `Some(16384)` instead of `None`).
 #[tokio::test]
 #[serial]
-async fn test_model_context_length_lone_entry_fallback() {
+async fn test_model_context_length_lone_nonmatching_entry_is_none() {
     let server = MockServer::start().await;
     let _g = EnvGuard::set(TEST_ENV, "test-token");
     Mock::given(method("GET"))
@@ -1600,7 +1881,52 @@ async fn test_model_context_length_lone_entry_fallback() {
         .mount(&server)
         .await;
     let provider = provider_with_models(server.uri());
-    assert_eq!(provider.model_context_length("whatever").await, Some(16384));
+    // "whatever" is neither an exact id nor a delimiter-bounded loose match of
+    // "served-model": a sole entry must not be accepted as a fallback.
+    assert_eq!(provider.model_context_length("whatever").await, None);
+}
+
+/// A lone entry that DOES match — exactly or loosely — still resolves to its
+/// own context length. (Guards against over-correcting the lone-entry fix into
+/// rejecting every single-entry catalog.)
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_lone_matching_entry_resolves() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"served-model","context_length":16384}]}"#),
+        )
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // Exact id match on the sole entry.
+    assert_eq!(
+        provider.model_context_length("served-model").await,
+        Some(16384)
+    );
+    // A short alias that loosely (delimiter-bounded) matches the sole entry.
+    assert_eq!(provider.model_context_length("served").await, Some(16384));
+}
+
+/// An exact match among multiple entries still resolves (unchanged behavior).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_exact_match_among_many() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"alpha","context_length":4096},{"id":"beta","context_length":32768},{"id":"gamma","context_length":128000}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("beta").await, Some(32768));
 }
 
 /// No models_path configured → no request, None (never errors).
@@ -1653,4 +1979,486 @@ async fn test_model_context_length_unique_loose_match_still_resolves() {
     // "my-model" is not an exact id, but loosely (delimiter-bounded) matches
     // ONLY "my-model-v2" — unambiguous, so it should still resolve.
     assert_eq!(provider.model_context_length("my-model").await, Some(32768));
+}
+
+/// P10: a cache hit must return the memoized context length WITHOUT re-parsing
+/// the catalog JSON. We prove the memo is used by stubbing the catalog with a
+/// single response, calling `model_context_length` (cold miss → parse + memo),
+/// then asserting the second call for the same model returns the same value
+/// while the stub is hit exactly once.
+#[tokio::test]
+async fn test_model_context_length_memoized_on_cache_hit() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: populates the catalog and memoizes 8192 for "m".
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+    // Cache hit: served from the memo, no second HTTP fetch.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+}
+
+/// P10: the memo stores `None` results too, so a model whose length can't be
+/// discovered isn't re-parsed on every call. The stub is hit exactly once.
+#[tokio::test]
+async fn test_model_context_length_memoizes_none() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(r#"{"data":[{"id":"no-field"}]}"#))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("no-field").await, None);
+    // Second call returns the memoized `None`; no re-parse, no second fetch.
+    assert_eq!(provider.model_context_length("no-field").await, None);
+}
+
+/// P10: per-model memo entries are independent — resolving one model does not
+/// short-circuit another. The catalog is fetched once (shared cache) and each
+/// distinct model parses/memoizes independently.
+#[tokio::test]
+async fn test_model_context_length_memo_is_per_model() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"a","context_length":4096},{"id":"b","context_length":32768}]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("a").await, Some(4096));
+    assert_eq!(provider.model_context_length("b").await, Some(32768));
+    // Distinct models re-serve from their own memo slots, still one catalog fetch.
+    assert_eq!(provider.model_context_length("a").await, Some(4096));
+    assert_eq!(provider.model_context_length("b").await, Some(32768));
+}
+
+/// P10, requirement (a) proven rigorously: the earlier `expect(1)` tests above
+/// only show the raw catalog body isn't re-fetched over HTTP — that was ALREADY
+/// true before this change (the catalog body itself was already cached). What's
+/// new here is that the *parsed* length is memoized too, so a cache hit never
+/// touches `serde_json::from_str` again. We prove that by corrupting the cached
+/// raw body in place after the first call: if the second call fell back to
+/// re-parsing the (now-corrupted) cached text instead of returning the memo, it
+/// would return `None`.
+#[tokio::test]
+async fn test_model_context_length_second_call_does_not_reparse_cached_body() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Corrupt the cached raw catalog body in place. A naive re-parse of `text`
+    // on the second call would now fail and return `None`.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        if let Ok((_, text)) = &mut entry.outcome {
+            *text = "not valid json".to_string();
+        }
+    }
+
+    // Still 8192: the memo served the hit, the corrupted body was never touched.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+}
+
+/// P10, requirement (b): once the catalog cache's TTL has actually expired, the
+/// next call must refetch AND re-parse — the memo must not go on serving a
+/// value derived from the now-stale catalog. We force expiry by rewinding
+/// `stored_at` (rather than sleeping out the real 60s TTL) and prove the fresh
+/// value wins.
+#[tokio::test]
+async fn test_model_context_length_memo_refills_after_ttl_expiry() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":8192}]}"#),
+        )
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_body_string(r#"{"data":[{"id":"m","context_length":16384}]}"#),
+        )
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force the cached entry to look TTL-expired without waiting out the real
+    // 60s window.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // TTL expired -> refetch (second mock, now 16384) -> the memo rebuilds from
+    // the fresh body instead of serving the stale 8192 it had cached before.
+    assert_eq!(provider.model_context_length("m").await, Some(16384));
+}
+
+/// P10, requirement (c): a model that isn't in the catalog at all (as opposed
+/// to being present but missing the length field) still returns `None`, and
+/// stays `None` on a repeat call served from the memo.
+#[tokio::test]
+async fn test_model_context_length_unknown_model_stays_none_through_memo() {
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"a","context_length":4096},{"id":"b","context_length":8192}]}"#,
+        ))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // "unknown-model" matches neither entry exactly nor loosely, and there's
+    // more than one entry, so the lone-entry fallback doesn't apply either.
+    assert_eq!(provider.model_context_length("unknown-model").await, None);
+    assert_eq!(provider.model_context_length("unknown-model").await, None);
+}
+
+/// A refresh that returns the SAME catalog text must PRESERVE the warm
+/// per-model context-length memo — not discard it to an empty HashMap.
+/// Before the fix, the cache write in `get_models_response` always reset
+/// `context_lengths` to an empty `HashMap::new()`, so the assertion below
+/// FAILED: the memo was cleared on every refresh regardless of whether the
+/// catalog actually changed. After the fix, the memo is carried across a
+/// refresh only when the new catalog text exactly equals the previous
+/// successful catalog text.
+///
+/// We prove the ACTUAL behavior change by inspecting the memo directly (not a
+/// proxy return value): the first call memoizes `{"m": Some(8192)}`; we force
+/// TTL expiry; we trigger a refresh via `get_models_response` directly (so
+/// `model_context_length` doesn't re-populate the memo via a parse); then we
+/// assert the carried-over memo still contains the entry.
+#[tokio::test]
+async fn test_context_length_memo_preserved_on_same_catalog_refresh() {
+    let server = MockServer::start().await;
+    let catalog = r#"{"data":[{"id":"m","context_length":8192}]}"#;
+    // First fetch — consumed once, then the second mock (same text) takes over.
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: fetches catalog, parses, memoizes {"m": Some(8192)}.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force TTL expiry so the next call triggers a refresh.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // Trigger the refresh directly. This rebuilds the cache entry WITHOUT
+    // going through `model_context_length`, so the memo is NOT re-populated
+    // by a parse — letting us inspect the carried-over memo in isolation.
+    provider
+        .get_models_response(None)
+        .await
+        .expect("refresh succeeds");
+
+    // Inspect the memo directly: it must still contain the entry from before
+    // the refresh. Before the fix this was an empty HashMap → assertion fails.
+    {
+        let cache = provider.models_cache.lock().await;
+        let entry = cache.as_ref().expect("catalog cached after refresh");
+        let memo = entry.context_lengths.lock().unwrap();
+        assert_eq!(
+            memo.get("m"),
+            Some(&Some(8192)),
+            "memo must be preserved across a refresh with identical catalog text"
+        );
+    }
+}
+
+/// A refresh that returns a DIFFERENT catalog text must CLEAR the memo —
+/// carrying the warm memo across a changed catalog would serve stale context
+/// lengths (a correctness bug: the crux). This is the guard that the
+/// carry-only-on-identical-text rule doesn't introduce staleness.
+///
+/// We inspect the memo directly: after a refresh with changed catalog text
+/// the memo must be empty. We additionally confirm a subsequent
+/// `model_context_length` call returns the NEW value (16384), not the stale
+/// memoized one (8192).
+#[tokio::test]
+async fn test_context_length_memo_cleared_on_different_catalog_refresh() {
+    let server = MockServer::start().await;
+    let catalog_a = r#"{"data":[{"id":"m","context_length":8192}]}"#;
+    let catalog_b = r#"{"data":[{"id":"m","context_length":16384}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog_a))
+        .up_to_n_times(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog_b))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    // Cold miss: fetches catalog A, memoizes {"m": Some(8192)}.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+
+    // Force TTL expiry so the next call triggers a refresh.
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after first call");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+
+    // Refresh with a DIFFERENT catalog (catalog B, context_length 16384).
+    provider
+        .get_models_response(None)
+        .await
+        .expect("refresh succeeds");
+
+    // Inspect the memo directly: it must be EMPTY. Carrying {"m": Some(8192)}
+    // across to a catalog that now says 16384 would be stale.
+    {
+        let cache = provider.models_cache.lock().await;
+        let entry = cache.as_ref().expect("catalog cached after refresh");
+        let memo = entry.context_lengths.lock().unwrap();
+        assert!(
+            memo.get("m").is_none(),
+            "memo must be cleared when the catalog text changes — carrying the old value would serve stale context lengths"
+        );
+    }
+
+    // A subsequent call must return the NEW value from catalog B, not the stale
+    // memoized 8192.
+    assert_eq!(provider.model_context_length("m").await, Some(16384));
+}
+
+/// P3 — `build_body` must fast-fail when a tool's `parameters` is not a JSON
+/// object. A non-object schema would otherwise be serialized verbatim and
+/// fail opaquely downstream at the gateway. This test could not compile against
+/// the old infallible signature (`build_body` returned `WireRequest`, not a
+/// `Result`), so it genuinely proves the behavior change.
+#[test]
+fn test_build_body_rejects_non_object_parameters() {
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "bad_tool".to_string(),
+        description: "a tool with a string-typed parameters field".to_string(),
+        parameters: serde_json::json!("not an object"),
+    }]);
+
+    let err = super::build_body(&req).expect_err("non-object parameters must error");
+    // Actionable message names the tool and states the constraint.
+    let msg = err.to_string();
+    assert!(
+        msg.contains("tool bad_tool: parameters must be a JSON Schema object"),
+        "unexpected error message: {msg}"
+    );
+
+    // A numeric `parameters` is also a non-object and must be rejected.
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "num_tool".to_string(),
+        description: "a tool with a numeric parameters field".to_string(),
+        parameters: serde_json::json!(42),
+    }]);
+    let err = super::build_body(&req).expect_err("numeric parameters must error");
+    assert!(
+        err.to_string()
+            .contains("tool num_tool: parameters must be a JSON Schema object"),
+        "unexpected error message for numeric parameters: {}",
+        err
+    );
+}
+
+/// P3, requirement (b): a tool with a valid JSON object `parameters` still
+/// builds successfully — no regression for well-formed descriptors.
+#[test]
+fn test_build_body_accepts_valid_object_parameters() {
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "good_tool".to_string(),
+        description: "a tool with a proper schema".to_string(),
+        parameters: serde_json::json!({"type": "object", "properties": {}}),
+    }]);
+
+    let body = super::build_body(&req).expect("valid object parameters should build");
+    assert!(
+        body.tools.is_some(),
+        "tools should be present on the wire request"
+    );
+}
+
+/// P3, requirement (c): a request with no tools still builds successfully.
+#[test]
+fn test_build_body_ok_with_no_tools() {
+    // `simple_request()` already has `tools: None`.
+    let req = simple_request();
+    let body = super::build_body(&req).expect("no-tools request should build");
+    assert!(
+        body.tools.is_none(),
+        "tools should be absent on the wire request"
+    );
+
+    // An empty tools vec is likewise fine (vacuously no malformed schemas).
+    let mut req = simple_request();
+    req.tools = Some(vec![]);
+    let body = super::build_body(&req).expect("empty-tools request should build");
+    assert!(
+        body.tools.as_ref().map(|t| t.is_empty()).unwrap_or(true),
+        "empty tools should serialize to an empty vec (or be absent)"
+    );
+}
+
+/// Rebase guard: tool-schema validation is a request-boundary invariant, not
+/// merely a property of the private body builder. It must win before auth and
+/// before any network attempt so malformed tools fail deterministically.
+#[tokio::test]
+#[serial]
+async fn test_invalid_tool_schema_fails_before_authentication_or_network() {
+    let _g = EnvGuard::set(TEST_ENV, "");
+    let provider = provider_for("http://127.0.0.1:9".to_string());
+    let mut req = simple_request();
+    req.tools = Some(vec![crate::types::ToolDescriptor {
+        name: "bad_tool".to_string(),
+        description: "invalid scalar schema".to_string(),
+        parameters: serde_json::json!(42),
+    }]);
+
+    let error = match provider.chat_stream(req).await {
+        Ok(_) => panic!("malformed tool schema must fail before request dispatch"),
+        Err(error) => error,
+    };
+    assert!(
+        matches!(
+            error,
+            ProviderError::InvalidResponse(ref message)
+                if message == "tool bad_tool: parameters must be a JSON Schema object"
+        ),
+        "schema validation must precede the missing-auth path; got {error:?}"
+    );
+}
+
+/// Rebase guard: gateways use both response modes interchangeably, so a
+/// top-level `error: null` must preserve the same semantic text and terminal
+/// reason in streaming and non-streaming parsing.
+#[test]
+fn test_null_error_semantics_match_across_response_modes() {
+    use super::{parse_completion, SseDecoder};
+
+    let nonstream = parse_completion(
+        r#"{
+            "error": null,
+            "choices": [{"message": {"content": "same"}, "finish_reason": "stop"}]
+        }"#,
+    )
+    .expect("non-streaming error:null response must parse");
+
+    let mut stream_text = Vec::new();
+    let mut decoder = SseDecoder::default();
+    decoder
+        .process_line(
+            r#"data: {"error":null,"choices":[{"index":0,"delta":{"content":"same"},"finish_reason":"stop"}]}"#,
+            &mut stream_text,
+        )
+        .expect("streaming error:null response must parse");
+    let stream_terminal = decoder
+        .finalize()
+        .expect("streaming error:null response must finalize");
+
+    assert!(matches!(
+        nonstream.as_slice(),
+        [ChatDelta::Text(text), ChatDelta::Done(FinishReason::Stop)] if text == "same"
+    ));
+    assert!(matches!(
+        stream_text.as_slice(),
+        [ChatDelta::Text(text)] if text == "same"
+    ));
+    assert!(matches!(
+        stream_terminal.as_slice(),
+        [ChatDelta::Done(FinishReason::Stop)]
+    ));
+}
+
+/// Rebase guard: an identical catalog refresh must carry the complete memo,
+/// including cached misses. Retaining only successful lengths would silently
+/// reparse unknown models after every refresh and weaken the cache contract.
+#[tokio::test]
+async fn test_same_catalog_refresh_preserves_positive_and_negative_memo_entries() {
+    let server = MockServer::start().await;
+    let catalog = r#"{"data":[{"id":"known","context_length":8192}]}"#;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(catalog))
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_with_models(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    assert_eq!(provider.model_context_length("known").await, Some(8192));
+    assert_eq!(provider.model_context_length("missing").await, None);
+
+    {
+        let mut cache = provider.models_cache.lock().await;
+        let entry = cache.as_mut().expect("catalog cached after lookups");
+        entry.stored_at = tokio::time::Instant::now() - Duration::from_secs(3600);
+    }
+    provider
+        .get_models_response(None)
+        .await
+        .expect("identical catalog refresh succeeds");
+
+    let cache = provider.models_cache.lock().await;
+    let entry = cache.as_ref().expect("catalog remains cached");
+    let memo = entry.context_lengths.lock().unwrap();
+    assert_eq!(memo.len(), 2);
+    assert_eq!(memo.get("known"), Some(&Some(8192)));
+    assert_eq!(memo.get("missing"), Some(&None));
 }
