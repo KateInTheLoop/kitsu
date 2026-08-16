@@ -16,6 +16,10 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install command-containment test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y bubblewrap python3-pytest
     - name: Build
       run: cargo build --verbose
     - name: Run tests
