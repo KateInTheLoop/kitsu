@@ -15601,3 +15601,188 @@ fn test_no_workspace_evidence_flag_and_config_unregister_the_tool() {
         .success()
         .stderr(predicate::str::contains("workspace_diff").not());
 }
+
+#[tokio::test]
+#[serial]
+async fn test_piped_deadline_preserves_completed_tool_round_as_resumable_session() {
+    use std::time::Duration;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().unwrap();
+    write_config(home.path(), &server.uri());
+
+    // The model's first (and only completed) round reads this file; its marker
+    // proves the tool round completed and was persisted rather than discarded.
+    let evidence = home.path().join("evidence.txt");
+    fs::write(&evidence, "TOOL_ROUND_EVIDENCE_MARKER").unwrap();
+    let read_args = serde_json::json!({ "path": evidence.to_string_lossy() }).to_string();
+
+    // Round 2 (the request that carries the tool result back) stalls far past
+    // the turn deadline, forcing a mid-turn timeout after one complete round.
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "arrived after the deadline"},
+                        "finish_reason": "stop"
+                    }]
+                })),
+        )
+        .with_priority(1)
+        .mount(&server)
+        .await;
+    // Round 1: the model asks to read the evidence file (a complete tool round).
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "read_evidence",
+                        "type": "function",
+                        "function": {"name": "fs_read_file", "arguments": read_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .mount(&server)
+        .await;
+
+    // A positional prompt over a non-tty stdin drives the piped/session path
+    // (the automation surface the fix targets), not scripted or interactive.
+    // JSONL is intentional here: the regression must prove that a synthetic
+    // deadline marker is attributed to the request round that timed out.
+    let home_path = home.path().to_path_buf();
+    let output = tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--jsonl",
+                "--no-stream",
+                "--timeout-secs",
+                "3",
+                "chat",
+                "--session",
+                "--allow-path",
+                &home_path.to_string_lossy(),
+                "read the evidence file",
+            ])
+            .output()
+            .unwrap()
+    })
+    .await
+    .unwrap();
+
+    // The turn times out mid-second-round and exits nonzero...
+    assert!(
+        !output.status.success(),
+        "expected a deadline timeout: {output:?}"
+    );
+
+    // ...but the completed tool round is preserved to a resumable session
+    // instead of being discarded. The persisted transcript must carry both the
+    // tool result and the honest deadline marker.
+    let sessions_dir = home.path().join(".kitsu").join("sessions");
+    let persisted = fs::read_dir(&sessions_dir)
+        .into_iter()
+        .flatten()
+        .flatten()
+        .map(|entry| entry.path())
+        .filter(|path| path.extension().map(|ext| ext == "json").unwrap_or(false))
+        .filter_map(|path| fs::read_to_string(path).ok())
+        .any(|body| {
+            body.contains("TOOL_ROUND_EVIDENCE_MARKER") && body.contains("deadline expired")
+        });
+    assert!(
+        persisted,
+        "a piped turn that times out after a completed tool round must persist it as a \
+         resumable session (none found under {sessions_dir:?})"
+    );
+
+    let events = String::from_utf8(output.stdout)
+        .expect("JSONL stdout must be UTF-8")
+        .lines()
+        .map(|line| {
+            serde_json::from_str::<serde_json::Value>(line)
+                .unwrap_or_else(|error| panic!("invalid JSONL line ({error}): {line}"))
+        })
+        .collect::<Vec<_>>();
+    let marker_delta = events
+        .iter()
+        .find(|event| event["type"] == "assistant_delta")
+        .expect("deadline marker delta");
+    assert_eq!(
+        marker_delta["round"], 2,
+        "marker belongs to timed-out round"
+    );
+    assert_eq!(
+        marker_delta["text"],
+        "\n[stopped: deadline expired - completed tool results were preserved; no final answer was produced]"
+    );
+    let marker_assistant = events
+        .iter()
+        .find(|event| event["type"] == "assistant")
+        .expect("synthetic resumable assistant marker");
+    assert_eq!(marker_assistant["text"], marker_delta["text"]);
+    let disposition = events
+        .iter()
+        .find(|event| event["type"] == "assistant_disposition")
+        .expect("partial disposition");
+    assert_eq!(disposition["status"], "committed_partial");
+    assert!(disposition["reason"]
+        .as_str()
+        .is_some_and(|reason| reason.contains("no final answer was produced")));
+    let summary = events.last().expect("final summary");
+    assert_eq!(summary["type"], "final_summary");
+    assert_eq!(summary["status"], "error");
+    assert_eq!(summary["session_snapshot_state"], "resumable");
+    let session_id = summary["session_id"]
+        .as_str()
+        .expect("resumable session id")
+        .to_string();
+
+    let mut show = base_cmd(home.path());
+    let shown = show
+        .args(["sessions", "--json", "show", &session_id])
+        .output()
+        .expect("show preserved session");
+    assert!(shown.status.success(), "{shown:?}");
+    let shown: serde_json::Value = serde_json::from_slice(&shown.stdout).unwrap();
+    let messages = shown["messages"].as_array().expect("saved transcript");
+    let tool_ids = messages
+        .iter()
+        .filter(|message| message["role"] == "tool")
+        .filter_map(|message| message["tool_call_id"].as_str())
+        .collect::<std::collections::HashSet<_>>();
+    assert!(
+        messages.iter().all(|message| {
+            message["role"] != "assistant"
+                || message["tool_calls"].as_array().map_or(true, |calls| {
+                    calls.iter().all(|call| {
+                        call["call_id"]
+                            .as_str()
+                            .is_some_and(|call_id| tool_ids.contains(call_id))
+                    })
+                })
+        }),
+        "preserved transcript contains a dangling tool call: {messages:?}"
+    );
+    assert_eq!(messages.last().unwrap()["content"], marker_delta["text"]);
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "one request per completed/timed-out round"
+    );
+}

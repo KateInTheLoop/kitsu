@@ -16,6 +16,17 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+    - name: Install command-containment test dependencies
+      run: |
+        sudo apt-get update
+        sudo apt-get install --no-install-recommends -y bubblewrap python3-pytest
+        # Ubuntu 24.04's AppArmor default blocks the unprivileged user/network
+        # namespaces exercised by bubblewrap. Relax it only on this ephemeral
+        # test runner; Cargo, Kitsu, and bubblewrap still run as the normal user.
+        sudo sysctl -w kernel.unprivileged_userns_clone=1
+        if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
     - name: Build
       run: cargo build --verbose
     - name: Run tests
