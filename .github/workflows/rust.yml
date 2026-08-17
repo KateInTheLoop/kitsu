@@ -21,9 +21,12 @@ jobs:
         sudo apt-get update
         sudo apt-get install --no-install-recommends -y bubblewrap python3-pytest
         # GitHub-hosted runners deny unprivileged loopback setup inside a new
-        # network namespace. Bubblewrap's setuid mode supplies that capability
-        # while the test process itself remains an unprivileged user.
-        sudo chmod u+s /usr/bin/bwrap
+        # network namespace. Keep Cargo and Kitsu unprivileged so permission
+        # tests remain meaningful, while granting only bubblewrap the runner's
+        # passwordless namespace privileges.
+        sudo mv /usr/bin/bwrap /usr/bin/bwrap.real
+        printf '%s\n' '#!/bin/sh' 'exec /usr/bin/sudo -n /usr/bin/bwrap.real "$@"' | sudo tee /usr/bin/bwrap >/dev/null
+        sudo chmod 0755 /usr/bin/bwrap
     - name: Build
       run: cargo build --verbose
     - name: Run tests
