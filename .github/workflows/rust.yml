@@ -25,7 +25,9 @@ jobs:
         # tests remain meaningful, while granting only bubblewrap the runner's
         # passwordless namespace privileges.
         sudo mv /usr/bin/bwrap /usr/bin/bwrap.real
-        printf '%s\n' '#!/bin/sh' 'exec /usr/bin/sudo -n /usr/bin/bwrap.real "$@"' | sudo tee /usr/bin/bwrap >/dev/null
+        printf '%s\n' 'Defaults closefrom_override' | sudo tee /etc/sudoers.d/kitsu-bwrap >/dev/null
+        sudo chmod 0440 /etc/sudoers.d/kitsu-bwrap
+        printf '%s\n' '#!/bin/sh' 'exec /usr/bin/sudo -n -C 1024 /usr/bin/bwrap.real "$@"' | sudo tee /usr/bin/bwrap >/dev/null
         sudo chmod 0755 /usr/bin/bwrap
     - name: Build
       run: cargo build --verbose
