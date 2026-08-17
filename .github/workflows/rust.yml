@@ -20,15 +20,13 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install --no-install-recommends -y bubblewrap python3-pytest
-        # GitHub-hosted runners deny unprivileged loopback setup inside a new
-        # network namespace. Keep Cargo and Kitsu unprivileged so permission
-        # tests remain meaningful, while granting only bubblewrap the runner's
-        # passwordless namespace privileges.
-        sudo mv /usr/bin/bwrap /usr/bin/bwrap.real
-        printf '%s\n' 'Defaults closefrom_override' | sudo tee /etc/sudoers.d/kitsu-bwrap >/dev/null
-        sudo chmod 0440 /etc/sudoers.d/kitsu-bwrap
-        printf '%s\n' '#!/bin/sh' 'exec /usr/bin/sudo -n -C 1024 /usr/bin/bwrap.real "$@"' | sudo tee /usr/bin/bwrap >/dev/null
-        sudo chmod 0755 /usr/bin/bwrap
+        # Ubuntu 24.04's AppArmor default blocks the unprivileged user/network
+        # namespaces exercised by bubblewrap. Relax it only on this ephemeral
+        # test runner; Cargo, Kitsu, and bubblewrap still run as the normal user.
+        sudo sysctl -w kernel.unprivileged_userns_clone=1
+        if sysctl -N kernel.apparmor_restrict_unprivileged_userns >/dev/null 2>&1; then
+          sudo sysctl -w kernel.apparmor_restrict_unprivileged_userns=0
+        fi
     - name: Build
       run: cargo build --verbose
     - name: Run tests
