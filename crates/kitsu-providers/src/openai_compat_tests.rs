@@ -1935,6 +1935,130 @@ async fn test_model_context_length_from_max_model_len() {
     assert_eq!(provider.model_context_length("my-model").await, Some(32768));
 }
 
+/// The Hugging Face router advertises no top-level window and nests one per
+/// serving provider under `providers[]`. A `:provider` routing pin selects that
+/// provider's window (base id matches the un-pinned catalog id).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_from_pinned_nested_provider() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"deepseek-ai/DeepSeek-V4-Pro","providers":[{"provider":"novita","status":"live","context_length":1048576},{"provider":"together","status":"live","context_length":512000}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(
+        provider
+            .model_context_length("deepseek-ai/DeepSeek-V4-Pro:together")
+            .await,
+        Some(512000)
+    );
+}
+
+/// Unpinned: take the MIN across live nested providers — a safe lower bound,
+/// since an unpinned request may be dispatched to any of them. An error-status
+/// provider is excluded even if it advertises a (tiny) window.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_nested_provider_min_excludes_errored() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"Qwen/Qwen3.5-27B","providers":[{"provider":"deepinfra","status":"live","context_length":262144},{"provider":"novita","status":"live","context_length":131072},{"provider":"broken","status":"error","context_length":4096}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // min(262144, 131072) — the errored 4096 is skipped.
+    assert_eq!(
+        provider.model_context_length("Qwen/Qwen3.5-27B").await,
+        Some(131072)
+    );
+}
+
+/// A top-level window still wins over `providers[]` (unchanged precedence).
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_top_level_beats_nested() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"m","context_length":200000,"providers":[{"provider":"x","status":"live","context_length":8192}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("m").await, Some(200000));
+}
+
+/// The unpinned MIN is floored at the no-discovery default: a provider
+/// advertising a sub-default window must not make discovery worse than the
+/// 8192 fallback it replaces.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_nested_min_floored_at_default() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"m","providers":[{"provider":"a","status":"live","context_length":4096},{"provider":"b","status":"live","context_length":131072}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // raw min is 4096; floored up to 8192 so discovery is never worse than the default.
+    assert_eq!(provider.model_context_length("m").await, Some(8192));
+}
+
+/// A pin naming a provider that is absent from `providers[]` falls through to
+/// the unpinned MIN rather than failing.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_pin_absent_falls_through_to_min() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"org/m","providers":[{"provider":"novita","status":"live","context_length":262144},{"provider":"together","status":"live","context_length":131072}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    // pinned "scaleway" isn't listed → min(262144, 131072).
+    assert_eq!(
+        provider.model_context_length("org/m:scaleway").await,
+        Some(131072)
+    );
+}
+
+/// A non-live status ("staging") is excluded from the MIN (allowlist, not a
+/// single-value denylist), so a small staging window can't drag the budget down.
+#[tokio::test]
+#[serial]
+async fn test_model_context_length_nested_excludes_nonlive_status() {
+    let server = MockServer::start().await;
+    let _g = EnvGuard::set(TEST_ENV, "test-token");
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_string(
+            r#"{"data":[{"id":"m","providers":[{"provider":"live1","status":"live","context_length":131072},{"provider":"stg","status":"staging","context_length":16384}]}]}"#,
+        ))
+        .mount(&server)
+        .await;
+    let provider = provider_with_models(server.uri());
+    assert_eq!(provider.model_context_length("m").await, Some(131072));
+}
+
 /// No context-length field (e.g. Ollama's OpenAI-compat route) → None.
 #[tokio::test]
 #[serial]
