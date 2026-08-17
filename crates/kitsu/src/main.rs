@@ -4151,6 +4151,7 @@ fn build_agent_config(
         offload_dir: (artifact_policy == ArtifactStoragePolicy::Automatic)
             .then_some(offload_dir)
             .flatten(),
+        offload_char_cap: cli.offload_cap.map(|cap| cap as usize),
         artifact_policy,
         stream: !cli.no_stream,
         temperature: cli.temperature,
