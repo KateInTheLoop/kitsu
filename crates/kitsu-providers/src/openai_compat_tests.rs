@@ -354,6 +354,36 @@ async fn test_gateway_400_is_not_retried() {
     assert_eq!(calls.load(Ordering::Relaxed), 1);
 }
 
+/// A generic 500 is intentionally excluded from the transient gateway set.
+/// Lock that policy through the physical send loop so a future classifier
+/// refactor cannot silently turn deterministic server failures into retries.
+#[tokio::test]
+async fn test_gateway_500_is_not_retried() {
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_calls.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(500).set_body_string("deterministic server failure")
+        })
+        .mount(&server)
+        .await;
+
+    let mut provider = provider_for(server.uri());
+    provider.auth = Arc::new(NoAuth);
+    provider.retries = 5;
+    let err = match provider.chat_stream(simple_request()).await {
+        Err(error) => error,
+        Ok(_) => panic!("HTTP 500 must fail without retrying"),
+    };
+
+    assert!(matches!(err, ProviderError::Http { status: 500, .. }));
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+}
+
 #[tokio::test]
 async fn test_gateway_retry_after_seconds_is_honored() {
     let server = MockServer::start().await;
