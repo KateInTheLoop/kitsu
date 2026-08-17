@@ -141,6 +141,15 @@ pub struct AgentConfig {
     /// a tool result over the size cap is written here and replaced in context by
     /// a pointer + preview the model can re-read. Must be a model-readable path.
     pub offload_dir: Option<std::path::PathBuf>,
+    /// Size cap (chars) above which a successful tool result is offloaded to
+    /// `offload_dir` (with a retrievable `fs_read_file` pointer) instead of kept
+    /// inline, when under context pressure. `None` uses the default
+    /// ([`OFFLOAD_CHAR_CAP`], ~2K tokens). Lowering it is "recall mode": more of
+    /// what the agent sees becomes fs-retrievable, so trimming an oldest result
+    /// leaves a pointer the model can re-read instead of losing it outright —
+    /// the difference between a small model recovering `find_cli_tables` output
+    /// and hallucinating it after the window trims that evidence away.
+    pub offload_char_cap: Option<usize>,
     /// Whether Kitsu may create automatic tool/command output artifacts for
     /// this run. `InlineOnly` never writes an offload file and instead keeps a
     /// deterministic UTF-8-safe head/tail preview with explicit byte counts.
@@ -1038,6 +1047,7 @@ impl Default for AgentConfig {
             max_context_bytes: 128 * 1024,
             context_window: None,
             offload_dir: None,
+            offload_char_cap: None,
             artifact_policy: ArtifactStoragePolicy::Automatic,
             stream: true,
             temperature: None,
@@ -3986,7 +3996,8 @@ fn maybe_offload_for_tools_detailed(
             artifact_path: None,
         };
     }
-    maybe_offload_detailed(content, call_id, dir)
+    let cap = cfg.offload_char_cap.unwrap_or(OFFLOAD_CHAR_CAP);
+    maybe_offload_detailed(content, call_id, dir, cap)
 }
 
 /// If `content` exceeds the cap and an offload `dir` is set, allocate a unique
@@ -4000,7 +4011,20 @@ fn maybe_offload(
     call_id: &str,
     dir: Option<&std::path::Path>,
 ) -> (String, Option<std::path::PathBuf>) {
-    let prepared = maybe_offload_detailed(content, call_id, dir);
+    let prepared = maybe_offload_detailed(content, call_id, dir, OFFLOAD_CHAR_CAP);
+    (prepared.content, prepared.artifact_path)
+}
+
+/// Like [`maybe_offload`] but with an explicit size cap, so tests can exercise
+/// the configurable "recall mode" threshold.
+#[cfg(test)]
+fn maybe_offload_with_cap(
+    content: String,
+    call_id: &str,
+    dir: Option<&std::path::Path>,
+    cap: usize,
+) -> (String, Option<std::path::PathBuf>) {
+    let prepared = maybe_offload_detailed(content, call_id, dir, cap);
     (prepared.content, prepared.artifact_path)
 }
 
@@ -4008,6 +4032,7 @@ fn maybe_offload_detailed(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
+    cap: usize,
 ) -> PreparedToolOutput {
     let Some(dir) = dir else {
         let retention = ToolOutputRetention::complete(&content);
@@ -4017,7 +4042,7 @@ fn maybe_offload_detailed(
             artifact_path: None,
         };
     };
-    if content.len() <= OFFLOAD_CHAR_CAP {
+    if content.len() <= cap {
         let retention = ToolOutputRetention::complete(&content);
         return PreparedToolOutput {
             content,
