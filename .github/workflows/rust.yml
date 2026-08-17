@@ -20,10 +20,11 @@ jobs:
       run: |
         sudo apt-get update
         sudo apt-get install --no-install-recommends -y bubblewrap python3-pytest
+        # GitHub-hosted runners deny unprivileged loopback setup inside a new
+        # network namespace. Bubblewrap's setuid mode supplies that capability
+        # while the test process itself remains an unprivileged user.
+        sudo chmod u+s /usr/bin/bwrap
     - name: Build
       run: cargo build --verbose
     - name: Run tests
-      # Bubblewrap's loopback setup requires the runner's namespace capability;
-      # the command-containment integration tests are intentionally run with the
-      # hosted runner's passwordless sudo rather than silently weakening them.
-      run: sudo -E env "PATH=$PATH" cargo test --verbose
+      run: cargo test --verbose
