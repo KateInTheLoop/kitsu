@@ -814,7 +814,7 @@ fn retry_delay(
 
 /// Cheap process-local entropy is sufficient for retry jitter: it is not a
 /// security primitive, only a way to keep concurrent clients from marching in
-/// lockstep after a shared 429/503 response.
+/// lockstep after a shared transient gateway or rate-limit response.
 fn retry_jitter_sample(attempt: u32) -> u64 {
     static COUNTER: AtomicU64 = AtomicU64::new(0);
     let counter = COUNTER.fetch_add(1, Ordering::Relaxed);
@@ -1590,7 +1590,7 @@ impl Provider for OpenAICompatProvider {
         let url = format!("{}{}", self.base_url, self.chat_path);
         let body = build_body(&req)?;
 
-        // Retry transient 429/503 responses within one end-to-end deadline.
+        // Retry the bounded transient status set within one end-to-end deadline.
         // Each attempt receives only the remaining budget; reqwest keeps that
         // timeout active through the response body, including streaming bodies.
         // Auth failures and all other 4xx responses return immediately below.
