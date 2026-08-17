@@ -1482,22 +1482,37 @@ impl OpenAICompatProvider {
 fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
     let json: serde_json::Value = serde_json::from_str(text).ok()?;
     let entries = json.get("data")?.as_array()?;
+    // A model may carry a `:provider` routing pin (e.g. "org/model:together")
+    // that the catalog `id` does not. Match on the pin-stripped base too, and
+    // remember the pinned provider so the nested lookup below can prefer that
+    // provider's window. Only the last `:` segment is a pin; a bare tag like
+    // ollama's "qwen2.5-coder:latest" still matches its full id first.
+    let base = match model.rsplit_once(':') {
+        Some((base, _)) if !base.is_empty() => base,
+        _ => model,
+    };
+    let pinned_provider = match model.rsplit_once(':') {
+        Some((base, prov)) if !base.is_empty() && !prov.is_empty() => Some(prov),
+        _ => None,
+    };
     // Prefer an exact id match; then a loose match, but ONLY if it's unique —
     // an ambiguous loose match (e.g. "gpt-4" loosely matching both
     // "gpt-4-turbo" and "gpt-4-mini") is worse than giving up, since binding
     // to the wrong entry silently budgets against the wrong window. There is
     // NO lone-entry fallback: a sole entry that matches neither exactly nor
     // loosely would silently budget against the wrong window.
-    let exact = entries
-        .iter()
-        .find(|e| e.get("id").and_then(serde_json::Value::as_str) == Some(model));
+    let exact = entries.iter().find(|e| {
+        e.get("id")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|id| id == model || id == base)
+    });
     let entry = if let Some(e) = exact {
         e
     } else {
         let mut loose = entries.iter().filter(|e| {
             e.get("id")
                 .and_then(serde_json::Value::as_str)
-                .is_some_and(|id| loosely_matches(id, model))
+                .is_some_and(|id| loosely_matches(id, base))
         });
         match (loose.next(), loose.next()) {
             (Some(only), None) => only,
@@ -1516,7 +1531,30 @@ fn context_length_from_catalog(text: &str, model: &str) -> Option<u64> {
             _ => {}
         }
     }
-    None
+    // Some routers (e.g. the Hugging Face router) advertise no top-level window
+    // and instead nest one per serving provider under `providers[]`. Prefer the
+    // pinned provider's window; otherwise take the MIN across live providers — a
+    // safe lower bound, since an unpinned request may be dispatched to any of
+    // them and Kitsu must never budget above the smallest one it could hit.
+    let providers = entry.get("providers")?.as_array()?;
+    let provider_window = |p: &serde_json::Value| -> Option<u64> {
+        p.get("context_length")
+            .and_then(serde_json::Value::as_u64)
+            .filter(|n| *n > 0)
+    };
+    if let Some(prov) = pinned_provider {
+        if let Some(p) = providers
+            .iter()
+            .find(|p| p.get("provider").and_then(serde_json::Value::as_str) == Some(prov))
+        {
+            return provider_window(p);
+        }
+    }
+    providers
+        .iter()
+        .filter(|p| p.get("status").and_then(serde_json::Value::as_str) != Some("error"))
+        .filter_map(provider_window)
+        .min()
 }
 
 /// Validate the common catalog envelope before assigning the positive cache
