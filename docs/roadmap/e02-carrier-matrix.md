@@ -35,8 +35,8 @@ still absent, so X003 cannot pass from this fixture.
 Every applicable cell records these independently:
 
 1. run identity assigned before acceptance and unchanged across the carrier;
-2. semantic class: success, user/preflight fault, provider fault, cancelled, or
-   interrupted;
+2. semantic class: success, accepted partial, user/preflight fault, provider
+   fault, tool/policy fault, cancelled, or interrupted;
 3. assistant disposition: committed, discarded, or absent;
 4. cleanup: joined or typed residue;
 5. persistence: committed, preserved, failed, or not requested;
@@ -95,3 +95,26 @@ prompt, or explicitly not applicable. No cell is silently omitted.
   terminals, and cleanup residue.
 - E02-S02 may introduce private production run types only for mismatches proven
   by those mappings.
+
+## Executed mapping after Cycle 012
+
+The first real-carrier tranche reuses the existing loopback fake-provider CLI
+suite and a narrow JSONL inspector. It now proves:
+
+- ask JSONL success: stable non-empty run ID on every record, one logical and
+  physical provider send, committed assistant, one terminal, exit 0;
+- ask and piped JSONL provider failure: stable/distinct per-process run IDs,
+  one logical request and three bounded physical attempts each, no tools, one
+  provider terminal, exit 2;
+- ask JSONL auth preflight: stable run ID, zero logical/physical sends and tool
+  effects, one user terminal, exit 1;
+- script JSONL local tool/policy faults: two logical/physical fake-provider
+  sends, one matched tool start/finish, one tool-class terminal, exit 1;
+- two JSONL processes continuing one durable session: equal session ID,
+  distinct run IDs, one provider request for the creating run and zero for the
+  provider-free resume/status run.
+
+Human and interactive semantic identity remains internal/unobservable from the
+current presentation. Accepted-partial, recovered-tool, persistence-phase, and
+delivery/cleanup fault mappings remain explicit later cells; no common
+production run type is justified by this first tranche alone.

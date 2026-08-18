@@ -166,8 +166,10 @@ fn oracle_rejects_identity_phase_terminal_and_post_terminal_corruption() {
 #[test]
 fn oracle_keeps_outcome_dimensions_distinct() {
     let variants = [
+        OutcomeClass::PartiallySucceeded,
         OutcomeClass::UserFault,
         OutcomeClass::ProviderFault,
+        OutcomeClass::ToolFault,
         OutcomeClass::Cancelled,
         OutcomeClass::Interrupted,
     ];
@@ -188,7 +190,7 @@ fn oracle_keeps_outcome_dimensions_distinct() {
         DeliveryState::NotAttempted,
     ];
 
-    assert_eq!(variants.len(), 4);
+    assert_eq!(variants.len(), 6);
     assert_eq!(assistant.len(), 3);
     assert_eq!(persistence.len(), 4);
     assert_eq!(delivery.len(), 3);

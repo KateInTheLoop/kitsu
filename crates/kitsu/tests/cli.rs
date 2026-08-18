@@ -12,6 +12,9 @@
 //! Tokens: every test uses the dummy value "test-token"; the real
 //! ANTHROPIC_AUTH_TOKEN is never read. Env-touching tests are `#[serial]`.
 
+#[path = "support/jsonl_fixture.rs"]
+mod jsonl_fixture;
+
 use std::fs;
 use std::path::Path;
 
@@ -3723,6 +3726,20 @@ async fn test_jsonl_ask_is_versioned_framed_and_parseable() {
         assert!(events
             .iter()
             .all(|event| event["schema"] == "kitsu.chat.v1"));
+        let facts =
+            jsonl_fixture::inspect_jsonl(&events, output.status.code().expect("process exit code"))
+                .expect("inspect successful ask JSONL");
+        assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Succeeded);
+        assert_eq!(
+            facts.assistant,
+            jsonl_fixture::JsonlAssistantDisposition::Committed
+        );
+        assert_eq!(facts.terminal_count, 1);
+        assert_eq!(facts.exit_code, 0);
+        assert_eq!(facts.provider_requests, 1);
+        assert_eq!(facts.provider_attempts, 1);
+        assert_eq!(facts.tool_started, 0);
+        assert_eq!(facts.tool_finished, 0);
         assert_eq!(events.first().unwrap()["type"], "run_started");
         assert!(events
             .iter()
@@ -6921,7 +6938,8 @@ async fn test_jsonl_agent_provider_failures_are_typed_for_ask_and_piped_chat() {
     write_config(home.path(), &server.uri());
     let home_path = home.path().to_path_buf();
 
-    tokio::task::spawn_blocking(move || {
+    let run_ids = tokio::task::spawn_blocking(move || {
+        let mut run_ids = Vec::new();
         for piped in [false, true] {
             let mut cmd = base_cmd(&home_path);
             cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
@@ -6950,17 +6968,37 @@ async fn test_jsonl_agent_provider_failures_are_typed_for_ask_and_piped_chat() {
             assert_eq!(summary["policy_errors"], 0, "piped={piped}");
             assert_eq!(summary["recovered_tool_errors"], 0, "piped={piped}");
             assert_eq!(summary["recovered_policy_errors"], 0, "piped={piped}");
+            let facts =
+                jsonl_fixture::inspect_jsonl(&events, 2).expect("inspect provider-fault JSONL");
+            assert_eq!(
+                facts.class,
+                jsonl_fixture::JsonlOutcomeClass::ProviderFault,
+                "piped={piped}"
+            );
+            assert_eq!(facts.terminal_count, 1, "piped={piped}");
+            assert_eq!(facts.provider_requests, 1, "piped={piped}");
+            assert_eq!(facts.provider_attempts, 3, "piped={piped}");
+            assert_eq!(facts.tool_started, 0, "piped={piped}");
+            assert_eq!(facts.tool_finished, 0, "piped={piped}");
+            run_ids.push(facts.run_id);
         }
+        run_ids
     })
     .await
     .unwrap();
+    assert_ne!(
+        run_ids[0], run_ids[1],
+        "separate runs need separate identity"
+    );
+    assert_eq!(server.received_requests().await.unwrap().len(), 6);
 }
 
-#[test]
+#[tokio::test]
 #[serial]
-fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
+async fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
+    let server = wiremock::MockServer::start().await;
     let home = TempDir::new().unwrap();
-    write_config(home.path(), "https://gateway.invalid");
+    write_config(home.path(), &server.uri());
     let mut cmd = base_cmd(home.path());
     cmd.env_remove("ANTHROPIC_AUTH_TOKEN");
     cmd.args(["--jsonl", "ask", "hello"]);
@@ -6981,6 +7019,14 @@ fn test_jsonl_preflight_error_keeps_stdout_machine_only() {
         .as_str()
         .is_some_and(|message| message.contains("refresh-token")));
     assert_eq!(events[1]["user_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect preflight-fault JSONL");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::UserFault);
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
+    assert!(server.received_requests().await.unwrap().is_empty());
 }
 
 #[test]
@@ -10054,6 +10100,14 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
         assert_eq!(summary["policy_errors"], expected_policy_errors);
         assert_eq!(summary["recovered_tool_errors"], 0);
         assert_eq!(summary["recovered_policy_errors"], 0);
+        let facts =
+            jsonl_fixture::inspect_jsonl(&events, 1).expect("inspect strict tool-fault JSONL");
+        assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::ToolFault);
+        assert_eq!(facts.terminal_count, 1);
+        assert_eq!(facts.provider_requests, 2);
+        assert_eq!(facts.provider_attempts, 2);
+        assert_eq!(facts.tool_started, 1);
+        assert_eq!(facts.tool_finished, 1);
         server.verify().await;
     }
 
@@ -13123,46 +13177,55 @@ async fn test_jsonl_run_started_reports_resolved_session_and_model() {
     fs::write(&resume_script, "/status\n/quit\n").unwrap();
     let home_path = home.path().to_path_buf();
 
-    let (created, resumed) = tokio::task::spawn_blocking(move || {
-        let run = |extra: &[&str], script: &Path| {
-            let mut cmd = base_cmd(&home_path);
-            let mut args = vec!["--jsonl", "chat"];
-            args.extend_from_slice(extra);
-            args.extend(["--script", script.to_str().unwrap()]);
-            let output = cmd
-                .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
-                .args(args)
-                .output()
-                .expect("session query");
-            assert!(
-                output.status.success(),
-                "stderr: {}\nstdout: {}",
-                String::from_utf8_lossy(&output.stderr),
-                String::from_utf8_lossy(&output.stdout)
-            );
-            assert!(
-                output.stderr.is_empty(),
-                "JSONL must suppress durable/resume/project-context notices: {}",
-                String::from_utf8_lossy(&output.stderr)
-            );
-            String::from_utf8(output.stdout)
-                .unwrap()
-                .lines()
-                .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
-                .find(|event| event["type"] == "run_started")
-                .expect("run_started")
-        };
+    let ((created, created_facts), (resumed, resumed_facts)) =
+        tokio::task::spawn_blocking(move || {
+            let run = |extra: &[&str], script: &Path| {
+                let mut cmd = base_cmd(&home_path);
+                let mut args = vec!["--jsonl", "chat"];
+                args.extend_from_slice(extra);
+                args.extend(["--script", script.to_str().unwrap()]);
+                let output = cmd
+                    .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                    .args(args)
+                    .output()
+                    .expect("session query");
+                assert!(
+                    output.status.success(),
+                    "stderr: {}\nstdout: {}",
+                    String::from_utf8_lossy(&output.stderr),
+                    String::from_utf8_lossy(&output.stdout)
+                );
+                assert!(
+                    output.stderr.is_empty(),
+                    "JSONL must suppress durable/resume/project-context notices: {}",
+                    String::from_utf8_lossy(&output.stderr)
+                );
+                let exit_code = output.status.code().expect("process exit code");
+                let events = String::from_utf8(output.stdout)
+                    .unwrap()
+                    .lines()
+                    .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+                    .collect::<Vec<_>>();
+                let facts = jsonl_fixture::inspect_jsonl(&events, exit_code)
+                    .expect("inspect same-session JSONL run");
+                let started = events
+                    .into_iter()
+                    .find(|event| event["type"] == "run_started")
+                    .expect("run_started");
+                (started, facts)
+            };
 
-        let created = run(&["--session", "--model", "saved-model"], &create_script);
-        let id = created["session_id"]
-            .as_str()
-            .expect("new durable session id")
-            .to_string();
-        let resumed = run(&["--resume", &id], &resume_script);
-        (created, resumed)
-    })
-    .await
-    .unwrap();
+            let (created, created_facts) =
+                run(&["--session", "--model", "saved-model"], &create_script);
+            let id = created["session_id"]
+                .as_str()
+                .expect("new durable session id")
+                .to_string();
+            let (resumed, resumed_facts) = run(&["--resume", &id], &resume_script);
+            ((created, created_facts), (resumed, resumed_facts))
+        })
+        .await
+        .unwrap();
 
     let id = created["session_id"].as_str().unwrap();
     assert_eq!(created["model"], "saved-model");
@@ -13172,6 +13235,19 @@ async fn test_jsonl_run_started_reports_resolved_session_and_model() {
     assert_eq!(resumed["model"], "saved-model");
     assert_eq!(resumed["resumed"], true);
     assert_eq!(resumed["durable_session"], true);
+    assert_ne!(created_facts.run_id, resumed_facts.run_id);
+    assert_eq!(
+        created_facts.class,
+        jsonl_fixture::JsonlOutcomeClass::Succeeded
+    );
+    assert_eq!(created_facts.provider_requests, 1);
+    assert_eq!(
+        resumed_facts.class,
+        jsonl_fixture::JsonlOutcomeClass::Succeeded
+    );
+    assert_eq!(resumed_facts.provider_requests, 0);
+    assert_eq!(created_facts.terminal_count, 1);
+    assert_eq!(resumed_facts.terminal_count, 1);
     server.verify().await;
 }
 

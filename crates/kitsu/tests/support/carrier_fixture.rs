@@ -162,8 +162,10 @@ pub fn applicability(carrier: Carrier, scenario: Scenario) -> Applicability {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum OutcomeClass {
     Succeeded,
+    PartiallySucceeded,
     UserFault,
     ProviderFault,
+    ToolFault,
     Cancelled,
     Interrupted,
 }
