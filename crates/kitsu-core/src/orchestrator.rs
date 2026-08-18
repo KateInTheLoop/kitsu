@@ -1071,6 +1071,9 @@ pub enum AgentError {
     #[error(transparent)]
     Provider(#[from] ProviderError),
 
+    #[error("run interrupted: {0}")]
+    Interrupted(crate::run::RunInterruption),
+
     #[error(
         "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
     )]
@@ -2043,6 +2046,20 @@ where
                     consecutive_failures.remove(&sig); // a success resets the streak
                     *consecutive_successes.entry(sig.clone()).or_insert(0) += 1;
                     (out, false)
+                }
+                Err(kitsu_tools::ToolError::Interrupted(
+                    kitsu_tools::ToolInterruption::AuthorityInputClosed,
+                )) => {
+                    let content = serde_json::json!({
+                        "error": "Interrupted",
+                        "detail": "authority input closed before a decision"
+                    })
+                    .to_string();
+                    tool_event.finish(false, &content, ToolOutputRetention::complete(&content));
+                    abort_if_event_sink_failed(cfg)?;
+                    return Err(AgentError::Interrupted(
+                        crate::run::RunInterruption::AuthorityInputClosed,
+                    ));
                 }
                 Err(e) => {
                     // error-as-tool-result: serialize and continue (design §5). Also

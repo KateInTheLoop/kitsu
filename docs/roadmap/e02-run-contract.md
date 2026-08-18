@@ -1,7 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: Cycle 015 foundation; workspace-internal Rust contract, not a persisted
-format, JSONL schema, or compatibility promise.
+Status: Cycle 016 authority-interruption integration; workspace-internal Rust
+contract, not a persisted format, JSONL schema, or compatibility promise.
 
 Implementation: `crates/kitsu-core/src/run.rs`. Boundary gate:
 `scripts/check-run-boundary.sh`. Behavioral contract:
@@ -47,10 +47,14 @@ through `RunId`. JSONL framing and private runtime/offload generation names read
 the same neutral identity. Identity generation remains a host responsibility;
 `kitsu-core` does not read time, process state, environment, or randomness.
 
-The event and terminal types are not yet wired into authority input or carrier
-presentation. Consequently, confirmation EOF still sends one denial follow-up
-and human mode still does not display the identity. Those are the next two
-cards, not capabilities claimed by this foundation.
+Filesystem and command approval now distinguish an explicit denial from a
+closed authority-input channel. Explicit `n` remains `PolicyDenied` and may be
+returned to the provider for recovery. EOF/input failure becomes typed
+`Interrupted`; core closes the active tool event, returns
+`AuthorityInputClosed`, and performs no later provider send or tool effect.
+Human mode still does not display the run identity or project the neutral
+terminal outcome; that remains the next card rather than a capability claimed
+by this integration.
 
 ## Coupling gate
 
@@ -65,9 +69,7 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Propagate `AuthorityInputClosed` so EOF stops before any later provider/tool
-   work while explicit `n` remains an ordinary denial.
-2. Project the same `RunId` into human run receipts without making presentation
+1. Project the same `RunId` and outcome into human run receipts without making presentation
    canonical.
-3. Add monotonic settlement, cleanup, persistence, delivery, and terminal
+2. Add monotonic settlement, cleanup, persistence, delivery, and terminal
    publication around the neutral outcome; then project compatibly into JSONL.

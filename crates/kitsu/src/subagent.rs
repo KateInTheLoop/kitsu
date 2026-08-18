@@ -140,6 +140,7 @@ pub enum AgentFailureClass {
     ProviderHttp,
     ProviderToolsUnsupported,
     ProviderAuthConfiguration,
+    Interrupted,
     AgentLoop,
     ContextOverflow,
     ContextWindowUnknown,
@@ -158,6 +159,7 @@ impl fmt::Display for AgentFailureClass {
             Self::ProviderHttp => "provider_http",
             Self::ProviderToolsUnsupported => "provider_tools_unsupported",
             Self::ProviderAuthConfiguration => "provider_auth_configuration",
+            Self::Interrupted => "interrupted",
             Self::AgentLoop => "agent_loop",
             Self::ContextOverflow => "context_overflow",
             Self::ContextWindowUnknown => "context_window_unknown",
@@ -1196,6 +1198,7 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
         AgentError::ToolCallDuringToolFreeFinalization => {
             AgentFailureClass::ProviderInvalidResponse
         }
+        AgentError::Interrupted(_) => AgentFailureClass::Interrupted,
         AgentError::Loop(_) => AgentFailureClass::AgentLoop,
         AgentError::ContextOverflow { .. } => AgentFailureClass::ContextOverflow,
         AgentError::ContextWindowUnknown => AgentFailureClass::ContextWindowUnknown,
@@ -1232,6 +1235,7 @@ fn safe_subagent_error(error: &AgentError) -> String {
             "model returned a tool call during tool-free structured finalization; no tool was executed"
                 .to_string()
         }
+        AgentError::Interrupted(_) => "run interrupted before completion".to_string(),
         AgentError::Loop(_) => "agent loop failed".to_string(),
         AgentError::ContextOverflow {
             required,

@@ -127,6 +127,16 @@ pub enum RunInterruption {
     AuthorityInputClosed,
 }
 
+impl fmt::Display for RunInterruption {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::AuthorityInputClosed => f.write_str("authority input closed"),
+        }
+    }
+}
+
+impl std::error::Error for RunInterruption {}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct RunEvent {
     run_id: RunId,

@@ -13,7 +13,7 @@ use kitsu_providers::{
     ChatDelta, ChatRequest, ChatStream, FinishReason, JsonSchemaFormat, Provider, ProviderError,
     ToolCall,
 };
-use kitsu_tools::{HandlerFn, Registry, ToolError};
+use kitsu_tools::{HandlerFn, Registry, ToolError, ToolInterruption};
 
 use crate::orchestrator::{
     run_agent_turn, run_agent_turn_with_state, AgentConfig, AgentSessionState, TurnCompletion,
@@ -1135,6 +1135,80 @@ async fn test_turn_status_separates_policy_denials_from_other_tool_errors() {
     );
     assert_eq!(state.last_turn.tool_errors, 1);
     assert_eq!(state.last_turn.policy_errors, 1);
+}
+
+#[tokio::test]
+async fn authority_input_closure_interrupts_before_a_later_provider_send() {
+    use crate::orchestrator::{AgentError, AgentEventLog, AgentRuntimeEvent};
+    use crate::run::RunInterruption;
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("write", "call-interrupted", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("must never be requested".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let mut tools = Registry::new();
+    tools
+        .register(
+            "write",
+            Box::new(|_| {
+                Box::pin(async {
+                    Err::<String, ToolError>(ToolError::Interrupted(
+                        ToolInterruption::AuthorityInputClosed,
+                    ))
+                })
+            }),
+        )
+        .expect("tool name must be unique");
+    let log = AgentEventLog::default();
+    let mut config = cfg(4);
+    config.quiet = true;
+    config.event_log = Some(log.clone());
+    let mut messages = initial_messages();
+
+    let error = run_agent_turn(&provider, &tools, &mut messages, &config)
+        .await
+        .unwrap_err();
+
+    assert!(matches!(
+        error,
+        AgentError::Interrupted(RunInterruption::AuthorityInputClosed)
+    ));
+    assert_eq!(provider.call_count(), 1, "interruption must end the loop");
+    assert!(
+        messages
+            .iter()
+            .all(|message| message.role != kitsu_providers::Role::Tool),
+        "interruption must not become a provider-visible tool result"
+    );
+    let events = log.take();
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(event, AgentRuntimeEvent::ToolStarted { .. }))
+            .count(),
+        1
+    );
+    assert_eq!(
+        events
+            .iter()
+            .filter(|event| matches!(
+                event,
+                AgentRuntimeEvent::ToolFinished {
+                    success: false,
+                    cancelled: false,
+                    ..
+                }
+            ))
+            .count(),
+        1,
+        "the interrupted tool frame must close truthfully"
+    );
 }
 
 /// Fix #4: a `FinishReason::Length` (model hit its output cap) must be surfaced

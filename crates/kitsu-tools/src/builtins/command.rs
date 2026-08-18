@@ -38,7 +38,7 @@ use kitsu_providers::ToolDescriptor;
 use serde::{Deserialize, Serialize};
 use tokio::io::{AsyncRead, AsyncReadExt};
 
-use crate::{HandlerFn, ToolError};
+use crate::{HandlerFn, ToolError, ToolInterruption};
 
 /// Default wall-clock limit for one command.
 pub const DEFAULT_COMMAND_TIMEOUT: Duration = Duration::from_secs(120);
@@ -131,6 +131,8 @@ pub enum CommandDecision {
     AllowForSession,
     /// Do not run the invocation.
     Deny,
+    /// Authority input closed before a decision; interrupt the current run.
+    Interrupt,
 }
 
 /// How Kitsu resolved `argv[0]` while authorizing an approved command.
@@ -1714,6 +1716,9 @@ impl CommandPolicy {
                         display_argv(argv),
                         cwd.display()
                     ))),
+                    CommandDecision::Interrupt => Err(ToolError::Interrupted(
+                        ToolInterruption::AuthorityInputClosed,
+                    )),
                 }
             }
         }
@@ -1778,7 +1783,7 @@ impl CommandPolicy {
                 let prompter = prompter.clone();
                 tokio::task::spawn_blocking(move || prompter.ask(&request))
                     .await
-                    .unwrap_or(CommandDecision::Deny)
+                    .unwrap_or(CommandDecision::Interrupt)
             }
             None => CommandDecision::Deny,
         }
@@ -3297,6 +3302,34 @@ mod tests {
             Err(ToolError::PolicyDenied(message)) if message.contains("outside the approved command roots")
         ));
         assert_eq!(prompts.load(Ordering::Relaxed), 0);
+    }
+
+    #[cfg(not(windows))]
+    #[tokio::test]
+    async fn closed_authority_input_interrupts_before_command_execution() {
+        let allowed = tempfile::tempdir().unwrap();
+        let target = allowed.path().join("must-not-exist.txt");
+        let prompts = Arc::new(AtomicUsize::new(0));
+        let policy = CommandPolicy::new(&[root(&allowed)], CommandMode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(FixedPrompter {
+                decision: CommandDecision::Interrupt,
+                prompts: prompts.clone(),
+            }));
+        let target_arg = target.to_string_lossy().into_owned();
+
+        assert!(matches!(
+            execute_command(
+                &policy,
+                args(&["/bin/touch", target_arg.as_str()], allowed.path())
+            )
+            .await,
+            Err(ToolError::Interrupted(
+                ToolInterruption::AuthorityInputClosed
+            ))
+        ));
+        assert_eq!(prompts.load(Ordering::Relaxed), 1);
+        assert!(!target.exists(), "interrupted command was executed");
     }
 
     /// Cycle-18 command-path fixes: `~/…` cwds expand against $HOME instead

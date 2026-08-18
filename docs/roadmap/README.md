@@ -183,10 +183,11 @@ or authority behavior changes except truthful preflight failure.
 Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md). Neutral type
 contract: [`e02-run-contract.md`](e02-run-contract.md).
 
-Status: E02-S01 fixture discovery is accepted through Cycle 014. Cycle 015
-starts E02-S02 with neutral identity/event/outcome values and a coupling guard.
-The proven behavior gaps remain open: confirmation EOF still causes one provider
-denial follow-up, and human carriers expose no stable run identity.
+Status: E02-S01 fixture discovery is accepted through Cycle 014. Cycles 015-016
+establish neutral identity/event/outcome values and propagate typed authority
+interruption through filesystem, command, tool, and loop control. Confirmation
+EOF now causes zero later provider sends or effects while explicit denial stays
+recoverable. Human carriers still expose no stable run identity.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

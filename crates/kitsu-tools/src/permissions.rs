@@ -22,7 +22,7 @@ use std::collections::HashSet;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, RwLock};
 
-use crate::error::ToolError;
+use crate::error::{ToolError, ToolInterruption};
 
 /// Default per-tool output cap (bytes); larger tool results are truncated.
 pub const DEFAULT_MAX_BYTES: usize = 64 * 1024;
@@ -175,6 +175,8 @@ pub enum Decision {
     AllowAlways,
     /// Refuse; the tool returns a policy-denied error fed back to the model.
     Deny,
+    /// Authority input closed before a decision; interrupt the current run.
+    Interrupt,
 }
 
 /// How not-yet-allowed operations are handled.
@@ -1508,6 +1510,9 @@ impl Permissions {
                         action.verb(),
                         requested.display()
                     ))),
+                    Decision::Interrupt => Err(ToolError::Interrupted(
+                        ToolInterruption::AuthorityInputClosed,
+                    )),
                 }
             }
         }
@@ -1543,7 +1548,7 @@ impl Permissions {
                 let p = p.clone();
                 tokio::task::spawn_blocking(move || p.ask(&req))
                     .await
-                    .unwrap_or(Decision::Deny)
+                    .unwrap_or(Decision::Interrupt)
             }
             None => Decision::Deny,
         }
@@ -1715,6 +1720,30 @@ mod tests {
             perms.check_read(&f).await,
             Err(ToolError::PolicyDenied(_))
         ));
+    }
+
+    #[tokio::test]
+    async fn ask_mode_interrupts_when_authority_input_closes() {
+        struct Closed;
+        impl Prompter for Closed {
+            fn ask(&self, _req: &PermissionRequest) -> Decision {
+                Decision::Interrupt
+            }
+        }
+        let dir = tempfile::tempdir().unwrap();
+        let target = dir.path().join("must-not-exist.txt");
+        let perms = Permissions::new(&[], &[], Mode::Ask)
+            .unwrap()
+            .with_prompter(Arc::new(Closed));
+
+        assert!(matches!(
+            perms.check_write(&target).await,
+            Err(ToolError::Interrupted(
+                ToolInterruption::AuthorityInputClosed
+            ))
+        ));
+        assert!(perms.write_roots().is_empty());
+        assert!(!target.exists());
     }
 
     #[tokio::test]
