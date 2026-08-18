@@ -180,6 +180,8 @@ or authority behavior changes except truthful preflight failure.
 
 ## E02 — One run identity and causal terminal outcome
 
+Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md)
+
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
 fails.
