@@ -39,7 +39,7 @@ use kitsu_providers::{
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
-    PermissionRequest, Permissions, Prompter, Registry,
+    PermissionRequest, Permissions, Prompter, Registry, RegistryError,
 };
 
 /// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
@@ -1213,6 +1213,12 @@ impl CliError {
             payload["recovery_actions"] = serde_json::json!(diagnostic.recovery_actions());
         }
         payload
+    }
+}
+
+impl From<RegistryError> for CliError {
+    fn from(error: RegistryError) -> Self {
+        Self::user(format!("tool registry composition failed: {error}"))
     }
 }
 
@@ -4021,32 +4027,31 @@ fn register_base_tools(
     can_write: bool,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     commands: Option<&Arc<kitsu_tools::CommandPolicy>>,
-) {
+) -> Result<(), RegistryError> {
     if can_read {
-        builtins::register_fs_tools(tools, perms.clone());
+        builtins::register_fs_tools(tools, perms.clone())?;
     }
     if can_write {
         let (descriptor, handler) =
             builtins::fs::write_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        let registration = tools.register_with_descriptor(descriptor, handler);
-        registration.expect("tool name must be unique");
+        tools.register_with_descriptor(descriptor, handler)?;
     }
     // Exact-text edits necessarily inspect existing content. Do not advertise
     // that read-modify-write primitive for a genuinely write-only invocation.
     if can_read && can_write {
         let (descriptor, handler) =
             builtins::fs::edit_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        let registration = tools.register_with_descriptor(descriptor, handler);
-        registration.expect("tool name must be unique");
+        tools.register_with_descriptor(descriptor, handler)?;
     }
     if !skillset.is_empty() {
         let (d, h) = skills::skill_tool(skillset.clone());
-        let registration = tools.register_with_descriptor(d, h);
-        registration.expect("tool name must be unique");
+        tools.register_with_descriptor(d, h)?;
     }
     if let Some(commands) = commands {
-        builtins::register_command_tool(tools, commands.clone());
+        builtins::register_command_tool(tools, commands.clone())?;
     }
+
+    Ok(())
 }
 
 fn can_resolve_offload_pointers(tool_names: &[String]) -> bool {
@@ -13451,7 +13456,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
-        );
+        )?;
         Arc::new(t)
     };
 
@@ -13469,7 +13474,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             false,
             &write_journal,
             None,
-        );
+        )?;
         Arc::new(tools)
     };
     let reasoning_tools = Arc::new(Registry::new());
@@ -13564,7 +13569,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
-        );
+        )?;
     }
     let mut sub_cfg = build_agent_config(
         setup.model.clone(),
@@ -17873,6 +17878,44 @@ mod tests {
     fn failure_count_phrase_pluralizes_naturally() {
         assert_eq!(failure_count_phrase(1), "1 failure");
         assert_eq!(failure_count_phrase(2), "2 failures");
+    }
+
+    #[test]
+    fn base_tool_duplicate_maps_to_user_error_before_runtime_entry() {
+        let permissions = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let skillset = Arc::new(skills::SkillSet::default());
+        let journal = kitsu_tools::builtins::fs::WriteJournal::new();
+        let mut tools = Registry::new();
+        let (descriptor, handler) = builtins::fs::read_file_tool(permissions.clone());
+        tools
+            .register_with_descriptor(descriptor, handler)
+            .expect("fixture registration succeeds");
+        let descriptors_before = tools.descriptors().to_vec();
+
+        let error = register_base_tools(
+            &mut tools,
+            &permissions,
+            &skillset,
+            true,
+            false,
+            &journal,
+            None,
+        )
+        .expect_err("base composition rejects duplicate");
+
+        assert_eq!(
+            error,
+            kitsu_tools::RegistryError::DuplicateName {
+                name: "fs_read_file".to_string(),
+            }
+        );
+        assert_eq!(tools.descriptors(), descriptors_before);
+        let cli_error = CliError::from(error);
+        assert_eq!(cli_error.exit_code(), EXIT_USER);
+        assert_eq!(
+            cli_error.to_string(),
+            "tool registry composition failed: duplicate tool registration: fs_read_file"
+        );
     }
 
     fn call(id: &str) -> kitsu_providers::ToolCall {

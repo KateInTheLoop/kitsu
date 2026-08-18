@@ -197,4 +197,53 @@ mod tests {
             "first"
         );
     }
+
+    #[tokio::test]
+    async fn descriptor_free_then_described_collision_preserves_handler_only_state() {
+        let mut registry = Registry::new();
+        registry
+            .register("test_tool", handler("descriptor-free"))
+            .expect("first registration succeeds");
+
+        let error = registry
+            .register_with_descriptor(descriptor("test_tool", "described"), handler("described"))
+            .expect_err("cross-path duplicate fails");
+
+        assert_eq!(
+            error,
+            RegistryError::DuplicateName {
+                name: "test_tool".to_string(),
+            }
+        );
+        assert!(registry.descriptors().is_empty());
+        assert_eq!(
+            registry.run("test_tool", "{}".to_string()).await.unwrap(),
+            "descriptor-free"
+        );
+    }
+
+    #[tokio::test]
+    async fn described_then_descriptor_free_collision_preserves_described_state() {
+        let mut registry = Registry::new();
+        let first = descriptor("test_tool", "described");
+        registry
+            .register_with_descriptor(first.clone(), handler("described"))
+            .expect("first registration succeeds");
+
+        let error = registry
+            .register("test_tool", handler("descriptor-free"))
+            .expect_err("cross-path duplicate fails");
+
+        assert_eq!(
+            error,
+            RegistryError::DuplicateName {
+                name: "test_tool".to_string(),
+            }
+        );
+        assert_eq!(registry.descriptors(), &[first]);
+        assert_eq!(
+            registry.run("test_tool", "{}".to_string()).await.unwrap(),
+            "described"
+        );
+    }
 }
