@@ -182,6 +182,11 @@ or authority behavior changes except truthful preflight failure.
 
 Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md)
 
+Status: E02-S01 fixture discovery is accepted through Cycle 014. It proves the
+first production divergences rather than treating them as green: confirmation
+EOF still causes one provider denial follow-up, and human carriers expose no
+stable run identity. E02-S02 owns the minimal private contract for those facts.
+
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
 fails.
@@ -381,8 +386,8 @@ gates merely because a card appears attractive.
 | 010 | E00-S03-C2 | Update current architecture/comparison/backlog/status and close E00 |
 | 011 | E02-S01-C1 | Define carrier matrix and provider-free deterministic driver |
 | 012 | E02-S01-C2 | Cover success, provider/tool/preflight faults, and exact exits |
-| 013 | E02-S01-C3 | Cover cancellation, EOF, broken sink, duplicate/cross-run terminal |
-| 014 | E02-S01-C4 | Close confirmation/queued-cancel/residue/human-identity cells or prove the minimal missing seams |
+| 013 | E02-S01-C3 | Map current cancellation, sink, join, and terminal-uniqueness evidence; retain measured gaps |
+| 014 | E02-S01-C4 | Close confirmation/queued-cancel/residue discovery and prove the minimal EOF/human-identity seams |
 | 015 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
 | 016 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
 | 017 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
