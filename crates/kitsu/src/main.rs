@@ -3486,10 +3486,14 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                         .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
                         match await_cancellable(provider.list_models()).await {
                             Some(Ok(Some(models))) => {
-                                let models = normalize_model_catalog(models);
                                 let effective_model = model.as_deref().expect("validated above");
                                 let effective_model_available =
-                                    models.iter().any(|candidate| candidate == effective_model);
+                                    model_catalog_advertises_selected_model(
+                                        effective_model,
+                                        &models,
+                                        provider_diagnostics,
+                                    );
+                                let models = normalize_model_catalog(models);
                                 if !effective_model_available {
                                     issues.push(format!(
                                         "effective model '{}' is not advertised by the normalized gateway catalog",
@@ -8076,6 +8080,49 @@ fn normalize_model_catalog(models: Vec<String>) -> Vec<String> {
     normalized.sort();
     normalized.dedup();
     normalized
+}
+
+/// Match the selected model against an advertised catalog without broadening
+/// model-ID semantics for generic OpenAI-compatible gateways. Local Ollama is
+/// the sole exception: its catalog canonicalizes an untagged `name` as
+/// `name:latest`, while its inference route accepts the untagged name.
+fn model_catalog_advertises_selected_model(
+    selected_model: &str,
+    models: &[String],
+    diagnostics: ProviderDiagnosticContext,
+) -> bool {
+    let selected_model = selected_model.trim();
+    if selected_model.is_empty() {
+        return false;
+    }
+    if models
+        .iter()
+        .any(|candidate| candidate.trim() == selected_model)
+    {
+        return true;
+    }
+    if !diagnostics.loopback_ollama || ollama_model_id_has_explicit_version(selected_model) {
+        return false;
+    }
+
+    let implicit_latest = format!("{selected_model}:latest");
+    models
+        .iter()
+        .filter(|candidate| candidate.trim() == implicit_latest)
+        .take(2)
+        .count()
+        == 1
+}
+
+/// A registry port in an Ollama model name is not a tag. Tags live in the
+/// final path component; digest-qualified IDs are also explicit and therefore
+/// remain exact-only.
+fn ollama_model_id_has_explicit_version(model: &str) -> bool {
+    model.contains('@')
+        || model
+            .rsplit('/')
+            .next()
+            .is_some_and(|component| component.contains(':'))
 }
 
 fn filter_model_catalog(models: Vec<String>, filter: &str) -> Vec<String> {
@@ -19572,6 +19619,66 @@ mod tests {
         ] {
             assert!(base_url_has_loopback_host(base_url), "{base_url}");
         }
+    }
+
+    #[test]
+    fn local_ollama_model_catalog_matcher_is_narrow_and_ambiguity_safe() {
+        let local_ollama = ProviderDiagnosticContext {
+            loopback_ollama: true,
+        };
+        let generic_gateway = ProviderDiagnosticContext::default();
+        let models = |values: &[&str]| {
+            values
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect::<Vec<_>>()
+        };
+
+        assert!(model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2:7b",
+            &models(&["llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(model_catalog_advertises_selected_model(
+            "llama3.2:7b",
+            &models(&["llama3.2:7b"]),
+            generic_gateway,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest"]),
+            generic_gateway,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["qwen2.5-coder:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "llama3.2",
+            &models(&["llama3.2:latest", "llama3.2:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "",
+            &models(&["", ":latest"]),
+            local_ollama,
+        ));
+        assert!(model_catalog_advertises_selected_model(
+            "localhost:5000/team/model",
+            &models(&["localhost:5000/team/model:latest"]),
+            local_ollama,
+        ));
+        assert!(!model_catalog_advertises_selected_model(
+            "team/model@sha256:1234",
+            &models(&["team/model@sha256:1234:latest"]),
+            local_ollama,
+        ));
     }
 
     /// The shipped huggingface profile's hint must SURVIVE the credential
