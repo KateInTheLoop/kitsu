@@ -42,7 +42,39 @@ select it at runtime.
 
 ## Install
 
-Build from source (Rust 1.80+):
+### Prebuilt packages
+
+Every [release](https://github.com/KateInTheLoop/kitsu/releases) ships packages
+for Linux (x86_64 / aarch64), macOS (Apple Silicon, Intel, universal) and
+Windows (x86_64). The Linux binaries are statically linked against musl, so the
+`.deb` and `.rpm` have no dependencies and install on any reasonably modern
+distro.
+
+```bash
+# Debian / Ubuntu
+curl -LO https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu_0.1.0-1_amd64.deb
+sudo dpkg -i kitsu_0.1.0-1_amd64.deb
+
+# Fedora / RHEL / openSUSE
+sudo dnf install https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-0.1.0-1.x86_64.rpm
+
+# macOS / any Linux — tarball
+curl -L https://github.com/KateInTheLoop/kitsu/releases/latest/download/kitsu-v0.1.0-universal-apple-darwin.tar.gz | tar xz
+sudo install -m755 kitsu-v0.1.0-universal-apple-darwin/kitsu /usr/local/bin/kitsu
+```
+
+Windows: download the `...-x86_64-pc-windows-msvc.zip` asset, unzip it, and put
+`kitsu.exe` somewhere on your `PATH`.
+
+`SHA256SUMS` is published with every release; verify with
+`sha256sum -c SHA256SUMS --ignore-missing`.
+
+macOS builds are not code-signed, so the first run needs
+`xattr -d com.apple.quarantine kitsu` (or Right-click → Open).
+
+### Build from source
+
+Rust 1.80+:
 
 ```bash
 cargo build --release
