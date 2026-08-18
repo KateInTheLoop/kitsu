@@ -18,7 +18,7 @@ pub use builtins::command::{
     CommandOutputStream, CommandPolicy, CommandProgressSink, CommandPrompter, CommandTermination,
     COMMAND_CONTAINMENT_ENVIRONMENT, DEFAULT_BUBBLEWRAP_PATH, SECRET_LIKE_ENV_NAME_MARKERS,
 };
-pub use error::{RegistryError, ToolError};
+pub use error::{RegistryError, ToolError, ToolInterruption};
 pub use permissions::{
     Action, Decision, Mode, PermissionRequest, Permissions, Prompter, ReadAuthorization,
     Revocation, TrustedImplicitReadRoot,

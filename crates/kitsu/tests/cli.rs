@@ -7572,14 +7572,14 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
     assert_eq!(facts.tool_finished, 0);
 }
 
-/// EOF at the only authority-admission surface must mean denial, never an
-/// implicit grant or a successful terminal inferred from input closure.
+/// EOF at an authority-admission surface interrupts the run before the
+/// denial can be projected as a tool result into another provider request.
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
-async fn test_interactive_confirmation_eof_denies_write_and_exposes_followup_send() {
+async fn test_interactive_confirmation_eof_interrupts_without_followup_send() {
     use std::io::Write as _;
-    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
 
     let server = MockServer::start().await;
@@ -7590,22 +7590,6 @@ async fn test_interactive_confirmation_eof_denies_write_and_exposes_followup_sen
         "content": "confirmation EOF must not write"
     })
     .to_string();
-    Mock::given(method("POST"))
-        .and(path(CHAT_PATH))
-        .and(body_string_contains("\"role\":\"tool\""))
-        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
-            "choices": [{
-                "message": {
-                    "role": "assistant",
-                    "content": "CONFIRMATION_EOF_DENIED"
-                },
-                "finish_reason": "stop"
-            }]
-        })))
-        .with_priority(1)
-        .expect(1)
-        .mount(&server)
-        .await;
     Mock::given(method("POST"))
         .and(path(CHAT_PATH))
         .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
@@ -7663,10 +7647,10 @@ async fn test_interactive_confirmation_eof_denies_write_and_exposes_followup_sen
                 terminal.flush().unwrap();
                 eof_sent = true;
             }
-            let final_seen = output
-                .windows(b"CONFIRMATION_EOF_DENIED".len())
-                .any(|window| window == b"CONFIRMATION_EOF_DENIED");
-            if eof_sent && !quit_sent && final_seen && prompt_count >= 2 {
+            let interruption_seen = output
+                .windows(b"authority input closed".len())
+                .any(|window| window == b"authority input closed");
+            if eof_sent && !quit_sent && interruption_seen && prompt_count >= 2 {
                 terminal.write_all(b"/quit\n").expect("exit chat");
                 terminal.flush().unwrap();
                 quit_sent = true;
@@ -7682,20 +7666,132 @@ async fn test_interactive_confirmation_eof_denies_write_and_exposes_followup_sen
         "{transcript}"
     );
     assert!(
-        transcript.contains("CONFIRMATION_EOF_DENIED"),
+        transcript.contains("authority input closed"),
         "{transcript}"
     );
     assert!(
         !transcript.contains("invalid permission response"),
-        "EOF is a direct denial, not malformed consent: {transcript}"
+        "EOF is an interruption, not malformed consent: {transcript}"
     );
     assert!(!target.exists(), "confirmation EOF performed the write");
     let requests = server.received_requests().await.unwrap();
-    assert_eq!(
-        requests.len(),
-        2,
-        "current loop sends one denial receipt after confirmation EOF"
+    assert_eq!(requests.len(), 1, "EOF must prevent a follow-up send");
+    server.verify().await;
+}
+
+/// An explicit `n` is still an ordinary policy denial: no effect occurs, and
+/// the provider may inspect the bounded tool error and recover next round.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_explicit_denial_remains_provider_recoverable() {
+    use std::io::Write as _;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().expect("temp interactive repo");
+    let target = repo.path().join("must-not-exist.txt");
+    let write_arguments = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "explicit denial must not write"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "EXPLICIT_DENIAL_RECOVERED"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "explicit-denial-write",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": write_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut denial_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(&home_path, &repo_path, &[], |output, terminal| {
+            let prompt_count = output
+                .windows(b"kitsu>".len())
+                .filter(|window| *window == b"kitsu>")
+                .count();
+            if !prompt_sent && prompt_count >= 1 {
+                terminal
+                    .write_all(b"request one guarded write\n")
+                    .expect("submit guarded request");
+                terminal.flush().unwrap();
+                prompt_sent = true;
+            }
+            if prompt_sent
+                && !denial_sent
+                && output
+                    .windows(b"permission> kitsu wants to write".len())
+                    .any(|window| window == b"permission> kitsu wants to write")
+            {
+                terminal.write_all(b"n\n").expect("deny guarded write");
+                terminal.flush().unwrap();
+                denial_sent = true;
+            }
+            let recovered = output
+                .windows(b"EXPLICIT_DENIAL_RECOVERED".len())
+                .any(|window| window == b"EXPLICIT_DENIAL_RECOVERED");
+            if denial_sent && !quit_sent && recovered && prompt_count >= 2 {
+                terminal.write_all(b"/quit\n").expect("exit chat");
+                terminal.flush().unwrap();
+                quit_sent = true;
+            }
+        })
+    })
+    .await
+    .expect("interactive explicit-denial fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("EXPLICIT_DENIAL_RECOVERED"),
+        "{transcript}"
     );
+    assert!(
+        !transcript.contains("authority input closed"),
+        "{transcript}"
+    );
+    assert!(!target.exists(), "explicit denial performed the write");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2, "explicit denial should allow recovery");
     assert!(String::from_utf8_lossy(&requests[1].body).contains("\"role\":\"tool\""));
     server.verify().await;
 }

@@ -8902,6 +8902,7 @@ fn strict_failure_cli_error(failure: &StrictTurnFailure) -> CliError {
 fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
     match error {
         kitsu_core::AgentError::Provider(ProviderError::Auth(_))
+        | kitsu_core::AgentError::Interrupted(_)
         | kitsu_core::AgentError::ContextOverflow { .. }
         | kitsu_core::AgentError::ContextWindowUnknown => ScriptFailureKind::User,
         _ => ScriptFailureKind::Provider,
@@ -17513,8 +17514,8 @@ fn finish_slash_model_catalog(
 /// Used only in interactive `Mode::Ask`; the prompt fires mid-turn while
 /// rustyline is idle. Bracketed paste is disabled around the read so a stray
 /// paste can't inject `ESC[200~` markers. Exactly one line is considered:
-/// invalid input, EOF, or an input error denies without letting a later pasted
-/// line become an authorization decision.
+/// Invalid input denies. EOF or an input error interrupts the current run
+/// without letting a later pasted line become an authorization decision.
 struct CliPrompter;
 
 struct CliCommandPrompter;
@@ -17639,7 +17640,7 @@ impl Prompter for CliPrompter {
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
-            return Decision::Deny;
+            return Decision::Interrupt;
         };
         parse_permission_answer(&line).unwrap_or_else(|| {
             eprintln!("invalid permission response; denied (enter y, a/always, or n next time)");
@@ -17698,7 +17699,7 @@ impl CommandPrompter for CliCommandPrompter {
         }
         let _ = std::io::stderr().flush();
         let Some(line) = read_approval_line() else {
-            return CommandDecision::Deny;
+            return CommandDecision::Interrupt;
         };
         match line
             .trim()
@@ -17841,6 +17842,9 @@ fn map_agent_error_with_diagnostics(
     match e {
         kitsu_core::AgentError::Provider(error) => {
             map_provider_error_with_diagnostics(error, operation, timeout_secs, diagnostics)
+        }
+        kitsu_core::AgentError::Interrupted(interruption) => {
+            CliError::user(format!("run interrupted: {interruption}"))
         }
         kitsu_core::AgentError::ToolCallDuringToolFreeFinalization => CliError::provider(
             "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
