@@ -61,6 +61,9 @@ pub fn inspect_jsonl(events: &[serde_json::Value], exit_code: i32) -> Result<Jso
         ));
     }
     let summary = summaries[0];
+    if events.last() != Some(summary) {
+        return Err("records appeared after final_summary".to_string());
+    }
     let class = match summary["status"].as_str() {
         Some("ok") => JsonlOutcomeClass::Succeeded,
         Some("partial") => JsonlOutcomeClass::PartiallySucceeded,
@@ -158,5 +161,29 @@ mod tests {
         assert_eq!(facts.class, JsonlOutcomeClass::PartiallySucceeded);
         assert_eq!(facts.assistant, JsonlAssistantDisposition::Absent);
         assert_eq!(facts.terminal_count, 1);
+    }
+
+    #[test]
+    fn inspector_rejects_duplicate_or_nonterminal_summary() {
+        let summary = || {
+            record(
+                "final_summary",
+                "run-terminal",
+                serde_json::json!({"status": "ok"}),
+            )
+        };
+        let duplicate = vec![summary(), summary()];
+        assert!(inspect_jsonl(&duplicate, 0)
+            .expect_err("duplicate summary must fail")
+            .contains("expected one final_summary"));
+
+        let followed = vec![
+            summary(),
+            record("late_work", "run-terminal", serde_json::json!({})),
+        ];
+        assert_eq!(
+            inspect_jsonl(&followed, 0).unwrap_err(),
+            "records appeared after final_summary"
+        );
     }
 }
