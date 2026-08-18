@@ -166,12 +166,37 @@ pub enum RunOutcomeClass {
     Interrupted,
 }
 
+impl RunOutcomeClass {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Succeeded => "succeeded",
+            Self::PartiallySucceeded => "partially_succeeded",
+            Self::UserFault => "user_fault",
+            Self::ProviderFault => "provider_fault",
+            Self::ToolFault => "tool_fault",
+            Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunAssistantDisposition {
     Committed,
     CommittedPartial,
     Discarded,
     Absent,
+}
+
+impl RunAssistantDisposition {
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Committed => "committed",
+            Self::CommittedPartial => "committed_partial",
+            Self::Discarded => "discarded",
+            Self::Absent => "absent",
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]

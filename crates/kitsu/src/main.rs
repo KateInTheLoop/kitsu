@@ -18,7 +18,7 @@ mod workspace;
 
 use std::cell::{Cell, RefCell};
 use std::rc::Rc;
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
@@ -64,6 +64,9 @@ static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
 static SCRIPT_ACCEPTED_PARTIAL: AtomicBool = AtomicBool::new(false);
+/// Last terminal assistant disposition observed in this process-run. Zero is
+/// the valid initial `Absent` state.
+static RUN_ASSISTANT_DISPOSITION: AtomicU8 = AtomicU8::new(0);
 /// Exact count of semantically successful requested operations mirrored into
 /// JSONL's terminal summary. Scripted execution owns its authoritative local
 /// count (notably, `/quit` is control flow rather than a successful operation)
@@ -1106,14 +1109,24 @@ fn main() {
         .with_writer(trace_writer)
         .try_init();
 
-    let code = match run() {
-        Ok(()) if jsonl_mode => jsonl_output_failure().map_or(0, |error| {
-            std::eprintln!("{error}");
-            error.exit_code()
-        }),
-        Ok(()) => 0,
+    let (code, outcome_class) = match run() {
+        Ok(()) if jsonl_mode => {
+            jsonl_output_failure().map_or((0, kitsu_core::RunOutcomeClass::Succeeded), |error| {
+                std::eprintln!("{error}");
+                (error.exit_code(), error.outcome_class())
+            })
+        }
+        Ok(()) => (
+            0,
+            if SCRIPT_ACCEPTED_PARTIAL.load(Ordering::Acquire) {
+                kitsu_core::RunOutcomeClass::PartiallySucceeded
+            } else {
+                kitsu_core::RunOutcomeClass::Succeeded
+            },
+        ),
         Err(e) => {
-            if !jsonl_mode {
+            let outcome_class = e.outcome_class();
+            let code = if !jsonl_mode {
                 // One weighted `! error:` notice (ember-red on a TTY); any
                 // extra lines in the message are the actionable hint.
                 for line in kitsu_render::error_lines(&e.to_string()) {
@@ -1146,22 +1159,35 @@ fn main() {
                         output_error.exit_code()
                     },
                 )
-            }
+            };
+            (code, outcome_class)
         }
     };
     if !jsonl_mode && output_last_message_preserved_without_commit() {
         std::eprintln!("~ --output-last-message unchanged: no committed assistant message");
     }
     if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
-        let status = match code {
-            0 if SCRIPT_ACCEPTED_PARTIAL.load(Ordering::Acquire) => {
+        let terminal = run_spec().terminal(outcome_class, run_assistant_disposition());
+        let status = match terminal.class() {
+            kitsu_core::RunOutcomeClass::Succeeded => kitsu_render::RunTimingStatus::Ok,
+            kitsu_core::RunOutcomeClass::PartiallySucceeded => {
                 kitsu_render::RunTimingStatus::Partial
             }
-            0 => kitsu_render::RunTimingStatus::Ok,
-            EXIT_CANCELLED => kitsu_render::RunTimingStatus::Cancelled,
-            _ => kitsu_render::RunTimingStatus::Error,
+            kitsu_core::RunOutcomeClass::Cancelled => kitsu_render::RunTimingStatus::Cancelled,
+            kitsu_core::RunOutcomeClass::Interrupted => kitsu_render::RunTimingStatus::Interrupted,
+            kitsu_core::RunOutcomeClass::UserFault
+            | kitsu_core::RunOutcomeClass::ProviderFault
+            | kitsu_core::RunOutcomeClass::ToolFault => kitsu_render::RunTimingStatus::Error,
         };
-        kitsu_render::emit_run_timing(run_elapsed(), status);
+        kitsu_render::emit_run_timing(
+            run_elapsed(),
+            status,
+            kitsu_render::HumanRunReceipt {
+                run_id: terminal.run_id().as_str(),
+                outcome: terminal.class().as_str(),
+                assistant: terminal.assistant().as_str(),
+            },
+        );
     }
     std::process::exit(code);
 }
@@ -1171,6 +1197,7 @@ struct CliError {
     message: String,
     code: i32,
     diagnostic: Option<ProviderDiagnosticCode>,
+    outcome_class: kitsu_core::RunOutcomeClass,
 }
 
 impl CliError {
@@ -1179,6 +1206,7 @@ impl CliError {
             message: message.into(),
             code: EXIT_USER,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::UserFault,
         }
     }
     fn provider(message: impl Into<String>) -> Self {
@@ -1186,6 +1214,7 @@ impl CliError {
             message: message.into(),
             code: EXIT_PROVIDER,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::ProviderFault,
         }
     }
     fn cancelled(message: impl Into<String>) -> Self {
@@ -1193,6 +1222,25 @@ impl CliError {
             message: message.into(),
             code: EXIT_CANCELLED,
             diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::Cancelled,
+        }
+    }
+
+    fn tool(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_USER,
+            diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::ToolFault,
+        }
+    }
+
+    fn interrupted(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            code: EXIT_USER,
+            diagnostic: None,
+            outcome_class: kitsu_core::RunOutcomeClass::Interrupted,
         }
     }
 
@@ -1206,6 +1254,10 @@ impl CliError {
     }
     fn exit_code(&self) -> i32 {
         self.code
+    }
+
+    fn outcome_class(&self) -> kitsu_core::RunOutcomeClass {
+        self.outcome_class
     }
 
     fn jsonl_kind(&self) -> &'static str {
@@ -8895,6 +8947,9 @@ fn strict_failure_cli_error(failure: &StrictTurnFailure) -> CliError {
             CliError::provider(format!("incomplete turn: {}", failure.issue))
         }
         ScriptFailureKind::OutputSchema => CliError::provider(failure.issue.clone()),
+        ScriptFailureKind::Tool | ScriptFailureKind::Policy => {
+            CliError::tool(failure.issue.clone())
+        }
         _ => CliError::user(failure.issue.clone()),
     }
 }
@@ -9114,6 +9169,24 @@ enum AssistantDisposition {
     Discarded,
 }
 
+fn record_run_assistant_disposition(disposition: AssistantDisposition) {
+    let encoded = match disposition {
+        AssistantDisposition::Committed => 1,
+        AssistantDisposition::CommittedPartial => 2,
+        AssistantDisposition::Discarded => 3,
+    };
+    RUN_ASSISTANT_DISPOSITION.store(encoded, Ordering::Release);
+}
+
+fn run_assistant_disposition() -> kitsu_core::RunAssistantDisposition {
+    match RUN_ASSISTANT_DISPOSITION.load(Ordering::Acquire) {
+        1 => kitsu_core::RunAssistantDisposition::Committed,
+        2 => kitsu_core::RunAssistantDisposition::CommittedPartial,
+        3 => kitsu_core::RunAssistantDisposition::Discarded,
+        _ => kitsu_core::RunAssistantDisposition::Absent,
+    }
+}
+
 impl AssistantDisposition {
     fn jsonl_status(self) -> &'static str {
         match self {
@@ -9259,6 +9332,7 @@ fn finish_assistant_disposition(
     disposition: AssistantDisposition,
     reason: Option<&str>,
 ) -> Result<(), CliError> {
+    record_run_assistant_disposition(disposition);
     if disposition == AssistantDisposition::Committed {
         FULLY_COMMITTED_ASSISTANT_SEEN.store(true, Ordering::Release);
     }
@@ -11045,6 +11119,8 @@ async fn finalize_scripted_run(
         );
         primary_error = Some(if status.provider_failures > 0 {
             CliError::provider(message)
+        } else if status.tool_failures > 0 || status.policy_failures > 0 {
+            CliError::tool(message)
         } else {
             CliError::user(message)
         });
@@ -11060,6 +11136,8 @@ async fn finalize_scripted_run(
         );
         primary_error = Some(if status.provider_failures > 0 {
             CliError::provider(message)
+        } else if status.tool_failures > 0 || status.policy_failures > 0 {
+            CliError::tool(message)
         } else {
             CliError::user(message)
         });
@@ -17844,7 +17922,7 @@ fn map_agent_error_with_diagnostics(
             map_provider_error_with_diagnostics(error, operation, timeout_secs, diagnostics)
         }
         kitsu_core::AgentError::Interrupted(interruption) => {
-            CliError::user(format!("run interrupted: {interruption}"))
+            CliError::interrupted(format!("run interrupted: {interruption}"))
         }
         kitsu_core::AgentError::ToolCallDuringToolFreeFinalization => CliError::provider(
             "model returned a tool call after tools were withheld for structured finalization; no tool was executed"
@@ -17896,6 +17974,32 @@ mod tests {
     fn failure_count_phrase_pluralizes_naturally() {
         assert_eq!(failure_count_phrase(1), "1 failure");
         assert_eq!(failure_count_phrase(2), "2 failures");
+    }
+
+    #[test]
+    fn cli_errors_preserve_neutral_outcome_class_independently_from_exit_code() {
+        assert_eq!(
+            CliError::user("bad input").outcome_class(),
+            kitsu_core::RunOutcomeClass::UserFault
+        );
+        assert_eq!(
+            CliError::provider("gateway failed").outcome_class(),
+            kitsu_core::RunOutcomeClass::ProviderFault
+        );
+        assert_eq!(
+            CliError::tool("tool failed").outcome_class(),
+            kitsu_core::RunOutcomeClass::ToolFault
+        );
+        assert_eq!(
+            CliError::cancelled("cancelled").outcome_class(),
+            kitsu_core::RunOutcomeClass::Cancelled
+        );
+        assert_eq!(
+            CliError::interrupted("input closed").outcome_class(),
+            kitsu_core::RunOutcomeClass::Interrupted
+        );
+        assert_eq!(CliError::user("bad input").exit_code(), EXIT_USER);
+        assert_eq!(CliError::tool("tool failed").exit_code(), EXIT_USER);
     }
 
     #[test]

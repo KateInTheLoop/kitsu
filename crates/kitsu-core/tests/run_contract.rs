@@ -68,4 +68,41 @@ fn semantic_class_and_assistant_disposition_remain_independent() {
         terminal.assistant(),
         RunAssistantDisposition::CommittedPartial
     );
+    assert_eq!(terminal.class().as_str(), "provider_fault");
+    assert_eq!(terminal.assistant().as_str(), "committed_partial");
+}
+
+#[test]
+fn neutral_outcome_labels_are_complete_and_stable() {
+    assert_eq!(
+        [
+            RunOutcomeClass::Succeeded,
+            RunOutcomeClass::PartiallySucceeded,
+            RunOutcomeClass::UserFault,
+            RunOutcomeClass::ProviderFault,
+            RunOutcomeClass::ToolFault,
+            RunOutcomeClass::Cancelled,
+            RunOutcomeClass::Interrupted,
+        ]
+        .map(RunOutcomeClass::as_str),
+        [
+            "succeeded",
+            "partially_succeeded",
+            "user_fault",
+            "provider_fault",
+            "tool_fault",
+            "cancelled",
+            "interrupted",
+        ]
+    );
+    assert_eq!(
+        [
+            RunAssistantDisposition::Committed,
+            RunAssistantDisposition::CommittedPartial,
+            RunAssistantDisposition::Discarded,
+            RunAssistantDisposition::Absent,
+        ]
+        .map(RunAssistantDisposition::as_str),
+        ["committed", "committed_partial", "discarded", "absent"]
+    );
 }
