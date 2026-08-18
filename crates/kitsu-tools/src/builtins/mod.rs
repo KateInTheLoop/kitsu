@@ -371,4 +371,38 @@ mod tests {
             .iter()
             .any(|descriptor| descriptor.name == "command_exec"));
     }
+
+    #[test]
+    fn complete_builtin_registry_has_exact_descriptor_handler_parity() {
+        let root = tempfile::tempdir().unwrap();
+        let filesystem = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let command_policy = Arc::new(
+            command::CommandPolicy::new(
+                &[root.path().to_string_lossy().into_owned()],
+                command::CommandMode::Deny,
+            )
+            .unwrap(),
+        );
+        let mut registry = Registry::new();
+
+        register_fs_tools(&mut registry, filesystem.clone()).unwrap();
+        register_write_tools(&mut registry, filesystem).unwrap();
+        register_command_tool(&mut registry, command_policy).unwrap();
+
+        let descriptor_names = registry
+            .descriptors()
+            .iter()
+            .map(|descriptor| descriptor.name.as_str())
+            .collect::<Vec<_>>();
+        let unique_names = descriptor_names
+            .iter()
+            .copied()
+            .collect::<std::collections::BTreeSet<_>>();
+
+        assert_eq!(descriptor_names.len(), unique_names.len());
+        assert_eq!(registry.handlers.len(), descriptor_names.len());
+        for name in descriptor_names {
+            assert!(registry.is_registered(name), "missing handler for {name}");
+        }
+    }
 }
