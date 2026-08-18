@@ -13,6 +13,10 @@ version = "0.1.0"
 edition = "2021"
 rust-version = "1.80"
 license = "MIT"
+description = "One fox, all the fortune. A terminal coding agent that harvests OpenAI, Anthropic, Hugging Face, and local LLMs without picking sides."
+repository = "https://github.com/KateInTheLoop/kitsu"
+homepage = "https://github.com/KateInTheLoop/kitsu"
+authors = ["Kate <kate@westedge.io>"]
 
 [workspace.dependencies]
 # Async runtime + HTTP (locked decisions, development_plan.md)

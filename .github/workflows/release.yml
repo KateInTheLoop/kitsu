@@ -1,0 +1,214 @@
+name: Release
+
+# Tagging is the release. `git tag v0.2.0 && git push origin v0.2.0` builds
+# every artifact and publishes the GitHub Release.
+#
+# workflow_dispatch runs the exact same builds but stops before publishing, so
+# the pipeline can be smoke-tested from the Actions tab without cutting a tag.
+on:
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: 0
+
+jobs:
+  # Fails in seconds if the tag and Cargo.toml disagree, before six build jobs
+  # spend twenty minutes producing artifacts stamped with the wrong version.
+  verify:
+    runs-on: ubuntu-24.04
+    outputs:
+      version: ${{ steps.v.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+      - id: v
+        run: |
+          set -euo pipefail
+          crate_version="$(cargo metadata --no-deps --format-version 1 \
+            | python3 -c 'import json,sys; print(next(p["version"] for p in json.load(sys.stdin)["packages"] if p["name"]=="kitsu"))')"
+          if [ "${GITHUB_REF_TYPE}" = "tag" ]; then
+            tag_version="${GITHUB_REF_NAME#v}"
+            if [ "$tag_version" != "$crate_version" ]; then
+              echo "::error::tag ${GITHUB_REF_NAME} does not match crate version ${crate_version}. Bump [workspace.package] version in Cargo.toml (and commit Cargo.lock) before tagging."
+              exit 1
+            fi
+            echo "version=${GITHUB_REF_NAME}" >> "$GITHUB_OUTPUT"
+          else
+            echo "version=v${crate_version}-dev" >> "$GITHUB_OUTPUT"
+          fi
+
+  linux:
+    needs: verify
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - runner: ubuntu-24.04
+            target: x86_64-unknown-linux-musl
+          - runner: ubuntu-24.04-arm
+            target: aarch64-unknown-linux-musl
+    runs-on: ${{ matrix.runner }}
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # musl-gcc is needed because `ring` compiles C. Pointing cc-rs at it
+      # explicitly avoids its default guess of `<triple>-linux-musl-gcc`,
+      # which Debian's musl-tools does not ship under that name.
+      - name: Install musl toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y musl-tools
+          target_env="$(echo '${{ matrix.target }}' | tr '-' '_')"
+          echo "CC_${target_env}=musl-gcc" >> "$GITHUB_ENV"
+
+      - name: Add Rust target
+        run: rustup target add ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }} -p kitsu
+
+      - name: Strip
+        run: strip target/${{ matrix.target }}/release/kitsu
+
+      - name: Package tarball
+        run: |
+          set -euo pipefail
+          stage="kitsu-${VERSION}-${{ matrix.target }}"
+          mkdir -p "dist/$stage"
+          cp target/${{ matrix.target }}/release/kitsu README.md LICENSE "dist/$stage/"
+          tar -C dist -czf "dist/${stage}.tar.gz" "$stage"
+          rm -rf "dist/$stage"
+
+      - uses: taiki-e/install-action@v2
+        with:
+          tool: cargo-deb,cargo-generate-rpm
+
+      - name: Build .deb and .rpm
+        run: |
+          set -euo pipefail
+          cargo deb --no-build --no-strip -p kitsu --target ${{ matrix.target }} --output dist/
+          cargo generate-rpm -p crates/kitsu --target ${{ matrix.target }} --output dist/
+
+      - name: Show package contents
+        run: |
+          for f in dist/*.deb; do echo "== $f"; dpkg-deb -I "$f"; dpkg-deb -c "$f"; done
+          for f in dist/*.rpm; do echo "== $f"; ls -la "$f"; done
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: linux-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  macos:
+    needs: verify
+    runs-on: macos-14
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Add Rust targets
+        run: rustup target add aarch64-apple-darwin x86_64-apple-darwin
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build both architectures
+        run: |
+          cargo build --release --locked --target aarch64-apple-darwin -p kitsu
+          cargo build --release --locked --target x86_64-apple-darwin -p kitsu
+
+      - name: Package tarballs
+        run: |
+          set -euo pipefail
+          mkdir -p dist universal
+          # A universal2 binary ships alongside the per-arch builds so install
+          # scripts can grab one file that runs on any Mac.
+          lipo -create -output universal/kitsu \
+            target/aarch64-apple-darwin/release/kitsu \
+            target/x86_64-apple-darwin/release/kitsu
+          package() {
+            stage="kitsu-${VERSION}-$2"
+            mkdir -p "dist/$stage"
+            cp "$1" README.md LICENSE "dist/$stage/"
+            strip "dist/$stage/kitsu"
+            tar -C dist -czf "dist/${stage}.tar.gz" "$stage"
+            rm -rf "dist/$stage"
+          }
+          package target/aarch64-apple-darwin/release/kitsu aarch64-apple-darwin
+          package target/x86_64-apple-darwin/release/kitsu x86_64-apple-darwin
+          package universal/kitsu universal-apple-darwin
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: macos
+          path: dist/*
+          if-no-files-found: error
+
+  windows:
+    needs: verify
+    runs-on: windows-latest
+    env:
+      VERSION: ${{ needs.verify.outputs.version }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --release --locked --target x86_64-pc-windows-msvc -p kitsu
+
+      - name: Package zip
+        shell: pwsh
+        run: |
+          $stage = "kitsu-$env:VERSION-x86_64-pc-windows-msvc"
+          New-Item -ItemType Directory -Path "dist/$stage" -Force | Out-Null
+          Copy-Item target/x86_64-pc-windows-msvc/release/kitsu.exe "dist/$stage/"
+          Copy-Item README.md, LICENSE "dist/$stage/"
+          Compress-Archive -Path "dist/$stage" -DestinationPath "dist/$stage.zip"
+          Remove-Item -Recurse -Force "dist/$stage"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: windows
+          path: dist/*
+          if-no-files-found: error
+
+  publish:
+    # Only tags publish. A workflow_dispatch run stops here with the artifacts
+    # attached to the run, which is what makes it usable as a dry run.
+    if: github.ref_type == 'tag'
+    needs: [verify, linux, macos, windows]
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect artifacts and checksums
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -type f -exec mv -t dist/ {} +
+          cd dist
+          sha256sum * > SHA256SUMS
+          ls -la
+
+      - uses: softprops/action-gh-release@v2
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # A tag like v0.2.0-rc.1 publishes as a pre-release.
+          prerelease: ${{ contains(github.ref_name, '-') }}
+          fail_on_unmatched_files: true

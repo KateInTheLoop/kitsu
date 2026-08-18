@@ -4,6 +4,13 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+readme = "../../README.md"
+keywords = ["llm", "cli", "agent", "openai", "anthropic"]
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "kitsu"
@@ -38,3 +45,39 @@ wiremock = { workspace = true }
 tokio = { workspace = true }
 serial_test = { workspace = true }
 futures = { workspace = true }
+
+# ---------------------------------------------------------------------------
+# Distro packaging.
+#
+# Both packages are cut from the statically linked musl binary, so they carry
+# no shared-library dependencies at all and install on any glibc/musl distro
+# of the right architecture -- including releases older than the CI runner.
+# That is why `depends` is empty and rpm auto-requires are disabled: there is
+# genuinely nothing to depend on.
+# ---------------------------------------------------------------------------
+
+[package.metadata.deb]
+maintainer = "Kate <kate@westedge.io>"
+copyright = "2026 Kate"
+license-file = ["../../LICENSE", "0"]
+section = "utils"
+priority = "optional"
+depends = ""
+extended-description = """\
+Kitsu is a terminal coding agent that speaks to OpenAI, Anthropic, \
+Hugging Face, and local (Ollama/llama.cpp) models through one config, \
+with sandboxed tools, subagents, and a session-oriented REPL."""
+assets = [
+    ["target/release/kitsu", "usr/bin/", "755"],
+    ["../../README.md", "usr/share/doc/kitsu/README.md", "644"],
+]
+
+[package.metadata.generate-rpm]
+summary = "Terminal coding agent for OpenAI, Anthropic, Hugging Face, and local LLMs"
+license = "MIT"
+auto-req = "disabled"
+assets = [
+    { source = "target/release/kitsu", dest = "/usr/bin/kitsu", mode = "755" },
+    { source = "../../README.md", dest = "/usr/share/doc/kitsu/README.md", mode = "644", doc = true },
+    { source = "../../LICENSE", dest = "/usr/share/licenses/kitsu/LICENSE", mode = "644", doc = true },
+]
