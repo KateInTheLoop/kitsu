@@ -1807,6 +1807,7 @@ pub enum RunTimingStatus {
     Partial,
     Error,
     Cancelled,
+    Interrupted,
 }
 
 impl RunTimingStatus {
@@ -1816,6 +1817,7 @@ impl RunTimingStatus {
             Self::Partial => "partial",
             Self::Error => "error",
             Self::Cancelled => "cancelled",
+            Self::Interrupted => "interrupted",
         }
     }
 
@@ -1825,8 +1827,18 @@ impl RunTimingStatus {
             Self::Partial => "partially completed in",
             Self::Error => "failed after",
             Self::Cancelled => "cancelled after",
+            Self::Interrupted => "interrupted after",
         }
     }
+}
+
+/// Presentation-only projection of Kitsu's neutral terminal outcome. The
+/// renderer never derives or mutates these fields.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct HumanRunReceipt<'a> {
+    pub run_id: &'a str,
+    pub outcome: &'a str,
+    pub assistant: &'a str,
 }
 
 fn format_run_elapsed(elapsed: std::time::Duration) -> String {
@@ -1844,10 +1856,21 @@ fn format_run_elapsed(elapsed: std::time::Duration) -> String {
 /// terminal gets the same compact secondary-row language as turn statistics;
 /// redirected stderr gets a stable, greppable JSON record. Management-only
 /// commands do not call this function.
-pub fn emit_run_timing(elapsed: std::time::Duration, status: RunTimingStatus) {
+pub fn emit_run_timing(
+    elapsed: std::time::Duration,
+    status: RunTimingStatus,
+    receipt: HumanRunReceipt<'_>,
+) {
     let mut err = io::stderr();
     let destination_is_tty = err.is_terminal();
-    let _ = write_run_timing_with_mode(&mut err, destination_is_tty, plain_mode(), elapsed, status);
+    let _ = write_run_timing_with_mode(
+        &mut err,
+        destination_is_tty,
+        plain_mode(),
+        elapsed,
+        status,
+        receipt,
+    );
 }
 
 fn write_run_timing_with_mode<W: Write>(
@@ -1856,13 +1879,17 @@ fn write_run_timing_with_mode<W: Write>(
     plain: bool,
     elapsed: std::time::Duration,
     status: RunTimingStatus,
+    receipt: HumanRunReceipt<'_>,
 ) -> io::Result<()> {
     if destination_is_tty {
         let marker = if plain { "->" } else { "↳" };
         let line = format!(
-            "  {marker} {} {}",
+            "  {marker} {} {} · run {} · {} · assistant {}",
             status.human_phrase(),
-            format_run_elapsed(elapsed)
+            format_run_elapsed(elapsed),
+            sanitize_terminal_inline(receipt.run_id),
+            sanitize_terminal_inline(receipt.outcome),
+            sanitize_terminal_inline(receipt.assistant),
         );
         if plain {
             writeln!(destination, "{line}")?;
@@ -1871,11 +1898,26 @@ fn write_run_timing_with_mode<W: Write>(
         }
     } else {
         let duration_ms = u64::try_from(elapsed.as_millis()).unwrap_or(u64::MAX);
-        writeln!(
-            destination,
-            "kitsu-timing: {{\"duration_ms\":{duration_ms},\"status\":\"{}\"}}",
-            status.record_label()
+        #[derive(serde::Serialize)]
+        struct RedirectedRunReceipt<'a> {
+            run_id: &'a str,
+            duration_ms: u64,
+            status: &'static str,
+            outcome: &'a str,
+            assistant: &'a str,
+        }
+        destination.write_all(b"kitsu-timing: ")?;
+        serde_json::to_writer(
+            &mut *destination,
+            &RedirectedRunReceipt {
+                run_id: receipt.run_id,
+                duration_ms,
+                status: status.record_label(),
+                outcome: receipt.outcome,
+                assistant: receipt.assistant,
+            },
         )?;
+        destination.write_all(b"\n")?;
     }
     destination.flush()
 }
@@ -2177,9 +2219,9 @@ mod tests {
         milestone_line_with_mode, sanitize_plain_inline, sanitize_terminal_inline,
         sanitize_terminal_text, section_heading, spinner_mode, static_spinner_line, theme_row,
         tool_activity_line, write_run_timing_with_mode, write_static_spinner, write_turn_stats,
-        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, LineStyler, PromptSafeAsyncNotice,
-        RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer, TerminalTextSanitizer, AMBER,
-        CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
+        write_turn_stats_with_mode, AsyncNoticeLevel, DeckState, HumanRunReceipt, LineStyler,
+        PromptSafeAsyncNotice, RenderMode, RunTimingStatus, SpinnerMode, StreamBuffer,
+        TerminalTextSanitizer, AMBER, CREAM, EMBER, FOX, SPINNER_FRAMES, SPINNER_VERBS, THEMES,
     };
 
     fn sgr(rgb: (u8, u8, u8)) -> String {
@@ -2544,12 +2586,24 @@ mod tests {
     #[test]
     fn run_timing_is_compact_for_people_and_stable_when_redirected() {
         let elapsed = std::time::Duration::from_millis(1_250);
+        let success = HumanRunReceipt {
+            run_id: "fixture-run-001",
+            outcome: "succeeded",
+            assistant: "committed",
+        };
         let mut terminal = Vec::new();
-        write_run_timing_with_mode(&mut terminal, true, true, elapsed, RunTimingStatus::Ok)
-            .unwrap();
+        write_run_timing_with_mode(
+            &mut terminal,
+            true,
+            true,
+            elapsed,
+            RunTimingStatus::Ok,
+            success,
+        )
+        .unwrap();
         assert_eq!(
             String::from_utf8(terminal).unwrap(),
-            "  -> completed in 1.2 s\n"
+            "  -> completed in 1.2 s · run fixture-run-001 · succeeded · assistant committed\n"
         );
 
         let mut partial_terminal = Vec::new();
@@ -2559,11 +2613,16 @@ mod tests {
             true,
             elapsed,
             RunTimingStatus::Partial,
+            HumanRunReceipt {
+                outcome: "partially_succeeded",
+                assistant: "committed",
+                ..success
+            },
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(partial_terminal).unwrap(),
-            "  -> partially completed in 1.2 s\n"
+            "  -> partially completed in 1.2 s · run fixture-run-001 · partially_succeeded · assistant committed\n"
         );
 
         let mut styled = Vec::new();
@@ -2573,13 +2632,18 @@ mod tests {
             false,
             elapsed,
             RunTimingStatus::Cancelled,
+            HumanRunReceipt {
+                outcome: "cancelled",
+                assistant: "discarded",
+                ..success
+            },
         )
         .unwrap();
         let styled = String::from_utf8(styled).unwrap();
         assert!(styled.contains('\x1b'));
         assert_eq!(
             sanitize_terminal_text(&styled),
-            "  ↳ cancelled after 1.2 s\n"
+            "  ↳ cancelled after 1.2 s · run fixture-run-001 · cancelled · assistant discarded\n"
         );
 
         let mut redirected = Vec::new();
@@ -2589,11 +2653,16 @@ mod tests {
             false,
             elapsed,
             RunTimingStatus::Error,
+            HumanRunReceipt {
+                outcome: "provider_fault",
+                assistant: "discarded",
+                ..success
+            },
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(redirected).unwrap(),
-            "kitsu-timing: {\"duration_ms\":1250,\"status\":\"error\"}\n"
+            "kitsu-timing: {\"run_id\":\"fixture-run-001\",\"duration_ms\":1250,\"status\":\"error\",\"outcome\":\"provider_fault\",\"assistant\":\"discarded\"}\n"
         );
 
         let mut partial_redirected = Vec::new();
@@ -2603,11 +2672,35 @@ mod tests {
             false,
             elapsed,
             RunTimingStatus::Partial,
+            HumanRunReceipt {
+                outcome: "partially_succeeded",
+                assistant: "committed",
+                ..success
+            },
         )
         .unwrap();
         assert_eq!(
             String::from_utf8(partial_redirected).unwrap(),
-            "kitsu-timing: {\"duration_ms\":1250,\"status\":\"partial\"}\n"
+            "kitsu-timing: {\"run_id\":\"fixture-run-001\",\"duration_ms\":1250,\"status\":\"partial\",\"outcome\":\"partially_succeeded\",\"assistant\":\"committed\"}\n"
+        );
+
+        let mut interrupted = Vec::new();
+        write_run_timing_with_mode(
+            &mut interrupted,
+            false,
+            true,
+            elapsed,
+            RunTimingStatus::Interrupted,
+            HumanRunReceipt {
+                outcome: "interrupted",
+                assistant: "absent",
+                ..success
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            String::from_utf8(interrupted).unwrap(),
+            "kitsu-timing: {\"run_id\":\"fixture-run-001\",\"duration_ms\":1250,\"status\":\"interrupted\",\"outcome\":\"interrupted\",\"assistant\":\"absent\"}\n"
         );
     }
 

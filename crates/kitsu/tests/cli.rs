@@ -6178,7 +6178,7 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
                     "usage": {"prompt_tokens": 4, "completion_tokens": 2, "total_tokens": 6}
                 })),
         )
-        .expect(2)
+        .expect(3)
         .mount(&server)
         .await;
 
@@ -6202,7 +6202,41 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
             .expect("timing receipt is the terminal human record");
         let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
         assert_eq!(timing["status"], "ok");
+        assert_eq!(timing["outcome"], "succeeded");
+        assert_eq!(timing["assistant"], "committed");
+        let human_run_id = timing["run_id"].as_str().expect("human run identity");
+        assert!(!human_run_id.is_empty());
+        assert!(
+            human_run_id
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric()
+                    || matches!(byte, b'-' | b'_' | b'.' | b':')),
+            "{timing}"
+        );
         assert!(timing["duration_ms"].as_u64().unwrap() >= 35, "{timing}");
+
+        let mut second_human = base_cmd(&home_path);
+        let output = second_human
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args(["--no-stream", "-p", "time this again"])
+            .output()
+            .expect("run second timed human prompt");
+        assert!(output.status.success(), "{output:?}");
+        let second_stderr = String::from_utf8(output.stderr).unwrap();
+        let second_timing: serde_json::Value = second_stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .expect("second human terminal receipt");
+        assert_ne!(
+            second_timing["run_id"], timing["run_id"],
+            "sequential process-runs must keep distinct identities"
+        );
+        assert_eq!(second_timing["outcome"], "succeeded");
+        assert_eq!(second_timing["assistant"], "committed");
 
         let mut jsonl = base_cmd(&home_path);
         let output = jsonl
@@ -10395,6 +10429,9 @@ async fn test_prompt_length_limit_names_current_cap_and_retry_value() {
             .expect("failed model command ends with a timing receipt");
         let timing: serde_json::Value = serde_json::from_str(timing).unwrap();
         assert_eq!(timing["status"], "error");
+        assert_eq!(timing["outcome"], "provider_fault");
+        assert_eq!(timing["assistant"], "discarded");
+        assert!(timing["run_id"].as_str().is_some_and(|id| !id.is_empty()));
 
         let mut jsonl = base_cmd(&home_path);
         let output = jsonl
@@ -10482,7 +10519,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                 }]
             })))
             .with_priority(10)
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
         Mock::given(method("POST"))
@@ -10495,7 +10532,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                 }]
             })))
             .with_priority(1)
-            .expect(1)
+            .expect(2)
             .mount(&server)
             .await;
 
@@ -10507,6 +10544,39 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
         let home_path = home.path().to_path_buf();
         let allowed_path = allowed.path().to_path_buf();
 
+        let human_home = home_path.clone();
+        let human_allowed = allowed_path.clone();
+        let human_script = script.clone();
+        let human = tokio::task::spawn_blocking(move || {
+            let mut cmd = base_cmd(&human_home);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .args([
+                    "--no-stream",
+                    "chat",
+                    "--no-session",
+                    "--allow-path",
+                    &human_allowed.to_string_lossy(),
+                    "--script",
+                    &human_script.to_string_lossy(),
+                ])
+                .output()
+                .unwrap()
+        })
+        .await
+        .unwrap();
+        assert_eq!(human.status.code(), Some(1), "{human:?}");
+        let human_stderr = String::from_utf8(human.stderr).unwrap();
+        let human_timing: serde_json::Value = human_stderr
+            .lines()
+            .last()
+            .and_then(|line| line.strip_prefix("kitsu-timing: "))
+            .map(serde_json::from_str)
+            .transpose()
+            .unwrap()
+            .expect("strict human run terminal receipt");
+        assert_eq!(human_timing["outcome"], "tool_fault");
+        assert_eq!(human_timing["assistant"], "discarded");
+
         let output = tokio::task::spawn_blocking(move || {
             let mut cmd = base_cmd(&home_path);
             cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
@@ -10514,6 +10584,7 @@ async fn test_jsonl_strict_script_separates_local_tool_and_policy_failures() {
                     "--jsonl",
                     "--no-stream",
                     "chat",
+                    "--no-session",
                     "--allow-path",
                     &allowed_path.to_string_lossy(),
                     "--script",

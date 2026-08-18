@@ -1,7 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: Cycle 016 authority-interruption integration; workspace-internal Rust
-contract, not a persisted format, JSONL schema, or compatibility promise.
+Status: E02-S02 accepted through Cycle 017; workspace-internal Rust contract
+with human/JSONL projections, not a persisted format or compatibility promise.
 
 Implementation: `crates/kitsu-core/src/run.rs`. Boundary gate:
 `scripts/check-run-boundary.sh`. Behavioral contract:
@@ -14,8 +14,8 @@ represent truthfully:
 
 1. JSONL has a stable process-run identity while human carriers do not expose
    the same semantic identity.
-2. EOF at an authority prompt is currently reduced to ordinary denial, allowing
-   a provider follow-up even though the target contract requires interruption
+2. EOF at an authority prompt was reduced to ordinary denial, allowing a
+   provider follow-up even though the target contract requires interruption
    with zero later send/effect.
 
 This module introduces only the neutral values needed to carry those facts. It
@@ -52,9 +52,14 @@ closed authority-input channel. Explicit `n` remains `PolicyDenied` and may be
 returned to the provider for recovery. EOF/input failure becomes typed
 `Interrupted`; core closes the active tool event, returns
 `AuthorityInputClosed`, and performs no later provider send or tool effect.
-Human mode still does not display the run identity or project the neutral
-terminal outcome; that remains the next card rather than a capability claimed
-by this integration.
+
+Human model-command completion now constructs one `TerminalOutcome` from the
+same process `RunSpec`, typed CLI failure class, and last assistant disposition.
+The renderer receives only a presentation DTO: redirected `kitsu-timing` JSON
+adds `run_id`, `outcome`, and `assistant`, while a TTY gets the same exact tuple
+in its compact terminal line. Sequential human processes prove distinct IDs;
+human and JSONL fixtures agree on success, provider fault, and tool/policy fault
+classification. Presentation does not generate, infer, or mutate these values.
 
 ## Coupling gate
 
@@ -69,7 +74,5 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Project the same `RunId` and outcome into human run receipts without making presentation
-   canonical.
-2. Add monotonic settlement, cleanup, persistence, delivery, and terminal
+1. Add monotonic settlement, cleanup, persistence, delivery, and terminal
    publication around the neutral outcome; then project compatibly into JSONL.
