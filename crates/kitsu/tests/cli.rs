@@ -3280,6 +3280,159 @@ auth = {{ method = "none" }}
 
 #[tokio::test]
 #[serial]
+async fn test_doctor_online_accepts_only_local_ollama_implicit_latest_without_chat() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [
+                {"id": "llama3.2:latest"},
+                {"id": "qwen2.5-coder:latest"}
+            ]
+        })))
+        .expect(5)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-local-ollama.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "ollama"
+[gateways.ollama]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+model = "llama3.2"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut json_alias = base_cmd(&home_path);
+        let output = json_alias
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for implicit latest");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["scope"], "model_catalog_only");
+        assert_eq!(report["online"]["chat_route_probed"], false);
+        assert_eq!(report["online"]["effective_model"], "llama3.2");
+        assert_eq!(report["online"]["effective_model_available"], true);
+        assert!(report["blocking_issues"].as_array().unwrap().is_empty());
+
+        let mut human_alias = base_cmd(&home_path);
+        human_alias
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains(
+                "gateway/model: ollama/llama3.2",
+            ))
+            .stdout(predicate::str::contains(
+                "provider check: reachable — model catalog only; chat/inference access was not tested",
+            ))
+            .stdout(predicate::str::contains(
+                "doctor: no blocking issues found — run `kitsu` to verify chat/inference access",
+            ));
+
+        let mut json_missing = base_cmd(&home_path);
+        let output = json_missing
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "missing-model",
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for missing model");
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["chat_route_probed"], false);
+        assert_eq!(report["online"]["effective_model_available"], false);
+        assert_eq!(report["blocking_issues"].as_array().unwrap().len(), 1);
+
+        let mut human_missing = base_cmd(&home_path);
+        human_missing
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "missing-model",
+                "doctor",
+                "--online",
+            ])
+            .assert()
+            .failure()
+            .code(1)
+            .stdout(predicate::str::contains("doctor: 1 blocking issue(s)"))
+            .stdout(predicate::str::contains(
+                "effective model 'missing-model' is not advertised by the normalized gateway catalog",
+            ));
+
+        let mut explicit_tag = base_cmd(&home_path);
+        let output = explicit_tag
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "--model",
+                "llama3.2:7b",
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run JSON doctor for explicit tag mismatch");
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["effective_model"], "llama3.2:7b");
+        assert_eq!(report["online"]["effective_model_available"], false);
+    })
+    .await
+    .expect("local Ollama doctor processes should join");
+
+    let requests = server
+        .received_requests()
+        .await
+        .expect("record model-catalog requests");
+    assert_eq!(requests.len(), 5);
+    for request in requests {
+        assert_eq!(request.method.as_str(), "GET");
+        assert_eq!(request.url.path(), "/v1/models");
+    }
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_doctor_inference_probe_is_explicit_minimal_and_machine_readable() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
