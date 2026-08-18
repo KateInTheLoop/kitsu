@@ -188,7 +188,8 @@ values now drive typed authority interruption and human completion receipts;
 confirmation EOF causes zero later provider sends/effects, explicit denial
 stays recoverable, and sequential human processes expose distinct run IDs plus
 the same success/provider/tool classifications as JSONL. Terminal phase
-ownership remains E02-S03.
+ownership remains E02-S03; Cycle 018 adds its provider-free monotonic phase
+model before any carrier is migrated.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

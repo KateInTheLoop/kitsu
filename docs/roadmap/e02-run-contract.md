@@ -1,7 +1,8 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted through Cycle 017; workspace-internal Rust contract
-with human/JSONL projections, not a persisted format or compatibility promise.
+Status: E02-S02 accepted and E02-S03 phase model started through Cycle 018;
+workspace-internal Rust contract with human/JSONL projections, not a persisted
+format or compatibility promise.
 
 Implementation: `crates/kitsu-core/src/run.rs`. Boundary gate:
 `scripts/check-run-boundary.sh`. Behavioral contract:
@@ -31,6 +32,8 @@ process-exit policy into core.
 | `RunEvent` | Always carries its originating spec's identity | Phase ordering, publication, JSONL shape |
 | `RunEventKind` | `Accepted` or typed `Interrupted(AuthorityInputClosed)` | EOF inference, denial text, exit code |
 | `TerminalOutcome` | Keeps semantic class and assistant disposition independent | Cleanup, persistence, delivery, process exit |
+| `RunLifecycle` | Enforces `accepted -> settled -> joined -> persisted -> delivered -> published` without mutating rejected transitions | Providers, tools, carriers, stores, clocks, process exit |
+| `PublishedRun` | Immutable semantic outcome plus typed cleanup, persistence, and delivery states | Rendering, serialization, exit-code inference |
 
 `RunOutcomeClass` contains exactly the fixture-proven semantic classes:
 success, accepted partial, user/provider/tool fault, cancellation, and
@@ -61,6 +64,13 @@ in its compact terminal line. Sequential human processes prove distinct IDs;
 human and JSONL fixtures agree on success, provider fault, and tool/policy fault
 classification. Presentation does not generate, infer, or mutate these values.
 
+Cycle 018 adds the provider-free phase owner without wiring it to carriers yet.
+The first settlement is immutable; later cleanup/persistence/delivery failures
+remain independent fields. Cleanup residue requires a nonzero unjoined count,
+publication is single, and duplicate/out-of-order/post-terminal transitions
+fail before mutation. Carrier integration and fault cuts remain later E02-S03
+cards, so current presentation still owns the live sequence.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -74,5 +84,6 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Add monotonic settlement, cleanup, persistence, delivery, and terminal
-   publication around the neutral outcome; then project compatibly into JSONL.
+1. Wire carrier finalization through the phase owner with fault injection at
+   join, persistence, and delivery boundaries.
+2. Project the published common outcome compatibly into JSONL.

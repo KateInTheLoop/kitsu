@@ -20,6 +20,7 @@ pub use orchestrator::{
     ToolArtifactStatus, TurnCompletion,
 };
 pub use run::{
-    RunAssistantDisposition, RunEvent, RunEventKind, RunId, RunIdError, RunInterruption,
-    RunOutcomeClass, RunSpec, TerminalOutcome,
+    PublishedRun, RunAssistantDisposition, RunCleanupState, RunDeliveryState, RunEvent,
+    RunEventKind, RunId, RunIdError, RunInterruption, RunLifecycle, RunOutcomeClass,
+    RunPersistenceState, RunPhase, RunPhaseError, RunSpec, TerminalOutcome,
 };
