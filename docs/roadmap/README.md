@@ -10,6 +10,8 @@ Cycle protocol: [`cycle-protocol.md`](cycle-protocol.md)
 
 Invariant test routing: [`invariant-tests.md`](invariant-tests.md)
 
+Mechanism learning ledger: [`mechanism-ledger.md`](mechanism-ledger.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -63,31 +65,42 @@ Current core dependencies on the concrete tool registry and `kitsu-render` are
 baseline coupling, not proof of the target host/tool ports. E02/E10 may extract
 them only when an executed fixture proves the boundary.
 
-## Milestones and dependency map
+## Architectural thesis, milestones, and dependency map
+
+The program borrows mechanisms rather than plugin models. Its three integration
+spines are immutable provider generations, a canonical session revision/HEAD,
+and a bounded child supervisor. The detailed source-by-source transfer and
+rejection decisions live in the [mechanism learning ledger](mechanism-ledger.md).
 
 | Milestone | Epics | Outcome |
 |---|---|---|
 | M0 — trustworthy starting point | E00-E01 | Current evidence pin, regression envelope, Ollama doctor fix, deterministic registry admission |
-| M1 — truthful execution and continuity | E02-E03 | One run outcome across carriers; canonical session revision/HEAD and safe branching |
-| M2 — truthful model portability | E04-E05 | Compatible Chat plus one distinct compiled wire; transactional onboarding and switching |
-| M3 — bounded external capability | E06 | Disabled-by-default, tools-only stdio MCP experiment behind explicit authority and lifecycle ownership |
-| M4 — measured product breadth | E07-E09 | Evidence-driven semantic context, progressive documentation, and bounded multimodal input |
-| M5 — replaceability certification | E10 | Boundary-by-boundary conformance decision with default-path parity and rollback evidence |
+| M1 — causal execution foundation | E02 | One identity-bearing run outcome across carriers and terminal phases |
+| M2 — immutable provider spine | E04 | Compatible Chat plus one distinct compiled wire and one route generation across all sends |
+| M3 — canonical session spine | E03 | Revisioned logical HEAD, recovery, compaction lineage, and safe branch-at-turn |
+| M4 — bounded child spine | E06 | Private supervisor plus disabled-by-default, tools-only stdio MCP experiment |
+| M5 — measured context and onboarding | E07, E05, E08 | Evidence-driven semantic context, transactional picker/setup, observability, and progressive docs |
+| M6 — later media evidence | E09 | Bounded multimodal input only across truthful capability paths |
+| M7 — replaceability certification | E10 | Boundary-by-boundary conformance decision with default-path parity and rollback evidence |
 
 ```text
-E00 -> E01 -> E02 -> E03
+E00 -> E01 -> E02
           \      \-> E04 -> E05 -> E08
-           \-----> E06 -----/
-           \-----> E07
-                  E04 -> E09
+           \      \-> E03
+           \-------> E06 ------/
+           \-------> E07
+                    E04 -> E09
 E01 + E02 + E03 + E04 + E05 + E06 + E07 + E08 + E09 -> E10
 ```
 
 E02 may start before E01 only for provider-free fixture design; production
-integration waits for deterministic registry admission. E06 requires both E01
-and the cancellation/terminal parts of E02. E09 requires two truthful provider
-capability paths from E04. Documentation skeletons may start earlier, but the
-root rewrite waits for E05/E06 surface stability.
+integration waits for deterministic registry admission. After E02, the serial
+queue prioritizes E04's provider spine, then E03's session spine, then E06's
+supervisor/MCP spine. E06 requires E01 and the cancellation/terminal parts of
+E02, even though delivery priority keeps it after E03. E07 follows the three
+spines; E05/E08 then use the stabilized provider and external-tool surfaces.
+E09 requires two truthful capability paths from E04. No desktop, IDE, listener,
+daemon, or control plane is invented solely to improve X003 breadth.
 
 ## Definition of Ready
 
@@ -127,9 +140,11 @@ existing strengths every later story must preserve.
 | E00-S02 — invariant test manifest | As a maintainer, I want one executable list of the authority, containment, JSONL, session, edit, credential, and cancellation regressions that gate every epic. | Map existing tests before adding new ones; distinguish per-card targeted gates from milestone workspace gates; name platform-specific skips/fail-closed behavior. | Every preserved invariant maps to at least one existing or explicitly missing test; commands run provider-free; manifest links source/test owners. | 1-2 cycles |
 | E00-S03 — live delta audit | As a planner, I want research rebased from `6c713333` to the branch base so completed work is not scheduled twice. | Audit all five boundaries and candidate rows; identify committed retry/context/tool/recovery changes; keep source-backed and runtime-observed labels distinct. | `KITSU_CURRENT_ARCHITECTURE`, `HARNESS_VS_KITSU`, backlog, and program status agree on the same pin and gap status; research audit is clean. | 2-4 cycles |
 | E00-S04 — cycle records | As a reviewer, I want each 30-minute loop to leave a compact decision and verification receipt. | Use the cycle template below; keep raw output out of prose; record incomplete/rejected cards without a production commit. | A script or review check proves every improvement commit has one cycle record naming story, tests, result, and next card. | 1 cycle |
+| E00-S05 — mechanism transfer ledger | As a maintainer, I want every comparative lesson translated into a narrow Kitsu mechanism or explicit rejection so ecosystem breadth cannot smuggle in a plugin model. | Map all ten sources to a gap, safe mechanism, and do-not-copy boundary; name the three spines, dependency-safe order, hard exclusions, and executable gates. | Ledger, epic requirements, milestone order, and cycle queue agree; all local links resolve; no source-backed claim is presented as executed Kitsu evidence. | 1 cycle |
 
 Epic exit: branch baseline and research pin agree; preserved-invariant test
-manifest exists; program audit and the baseline acceptance commands pass.
+manifest and mechanism ledger exist; program audit and the baseline acceptance
+commands pass.
 
 ## E01 — Bounded defects and deterministic tool admission
 
@@ -220,13 +235,14 @@ Dependencies: E04 capability/generation model.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
-| E05-S01 — no-clobber connect preset | As a new user, I want guided local/hosted/custom setup that creates a valid profile without exposing a secret or overwriting config. | Start offline; network only after explicit selection; credentials via managed hidden input/stdin, never argv/output/config; preview normalized effect; atomic no-clobber commit. | Fresh-home local and custom mock paths succeed; decline, invalid input, network failure, collision, and interrupted write leave no partial config/credential. | 4-6 cycles |
-| E05-S02 — unified model picker | As a user, I want one capability-aware picker across configured gateways so I can choose a valid model without memorizing IDs. | Separate configured profiles from optional catalog refresh; active model pinned; filter, recents/favorites optional only after basic selection; unsupported capabilities visible before selection. | Two-mock catalogs, offline/stale catalog, large bounded list, no-catalog gateway, and current-model cases agree across interactive/JSONL. | 4-7 cycles |
+| E05-S01 — no-clobber connect preset | As a new user, I want guided local/hosted/custom setup that creates a valid profile without exposing a secret or overwriting config. | Start offline; network only after explicit selection; credentials via managed hidden input/stdin, never argv/output/config; preview normalized effect; atomic no-clobber commit. | Fresh-home local and custom mock paths succeed; decline, invalid input, permission cancellation, network failure, collision, and interrupted write leave no partial config/credential. | 4-6 cycles |
+| E05-S02 — unified model picker | As a user, I want one capability-aware picker across configured gateways so I can choose a valid model without memorizing IDs. | Separate configured profiles from optional catalog refresh; active model pinned; filter, recents/favorites optional only after basic selection; unsupported capabilities visible before selection. | Two-mock catalogs, offline/stale catalog, large bounded list, no-catalog gateway, current-model, redirected-output, and narrow-terminal cases agree across interactive/JSONL. | 4-7 cycles |
 | E05-S03 — atomic profile/model switch | As a user, I want a failed switch to leave my current session and route usable. | Stage and validate target generation; define transcript, system prompt, context meter, compaction, subagent, and pending-turn semantics; publish once; never cross profile credentials. | Failure before publication leaves old route byte-for-byte active; success changes one generation; active/queued/background cases are deterministic. | 4-7 cycles |
 | E05-S04 — onboarding readiness receipt | As an unattended operator, I want setup to finish with a truthful offline/catalog/inference readiness result. | Offline doctor default; catalog and billable inference remain separate explicit scopes; alias truth from E01; capability mismatch named. | Human/JSON reports and exits agree; no unexpected send; secret scan clean; first-success task needs no TOML editing. | 2-3 cycles |
 
 Epic exit: controlled novice and automation fixtures complete first success and
-switch recovery without implicit mutation.
+switch recovery without implicit mutation, covering E05's applicable `PF-10`
+offline/configuration/permission/terminal cases.
 
 ## E06 — Restricted stdio MCP external-tool experiment
 
@@ -238,28 +254,30 @@ Dependencies: E01 deterministic registry; E02 cancellation/terminal phases.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
-| E06-S01 / A004 — bounded child supervisor | As a runtime maintainer, I want one private long-lived child owner that bounds spawn, environment, pipes, descendants, cancellation, and reap. | Separate `AuthorityProfile`; failed preflight prevents spawn; process group; bounded stdin/stdout/stderr; timeout; idempotent shutdown; typed residue; preserve one-shot command semantics. | Real child covers block, flood, descendant pipe, ignore-cancel, crash, clean EOF, timeout, drop, reload, shutdown, env/fs/network denial; command containment regression passes. | 6-10 cycles |
-| E06-S02 — frozen tool-source snapshot | As the agent loop, I want an immutable advertised tool inventory so a source cannot change schemas or handlers mid-turn. | Host-authored source/tool identity, schema fingerprint, incarnation and inventory revision; collision before publication; atomic withdrawal; per-subagent authority intersection. | Built-ins plus fixture source pass collision, snapshot, mutation, withdrawal, child-authority, and zero-provider tests. | 4-6 cycles |
+| E06-S01 / A004 — bounded child supervisor | As a runtime maintainer, I want one private long-lived child owner that bounds spawn, environment, pipes, descendants, cancellation, and reap. | Separate `AuthorityProfile`; `X002-ADMIT-0` rejects executable discovery/spawn before authority admission; process group; bounded stdin/stdout/stderr; timeout; idempotent shutdown; typed residue; preserve one-shot command semantics. | Real child covers block, flood, descendant pipe, ignore-cancel, crash, clean EOF, timeout, drop, reload, shutdown, env/fs/network denial and zero pre-admission spawn; command containment regression passes. | 6-10 cycles |
+| E06-S02 — frozen tool-source snapshot | As the agent loop, I want an immutable advertised tool inventory so a source cannot change schemas or handlers mid-turn. | Host-authored source/tool identity, schema fingerprint, incarnation and inventory revision; collision before publication; atomic withdrawal; per-subagent authority intersection. | Built-ins plus fixture source pass `PF-06`/`PF-07` collision, snapshot, mutation, withdrawal, child-authority, lifecycle, disabled-path, and zero-provider tests. | 4-6 cycles |
 | E06-S03 — tools-only stdio MCP core | As a user, I want explicitly configured local MCP tools available without package installation or unrelated MCP capabilities. | Initialize/list/call only; one namespaced echo tool first; pinned executable/config; required/optional/disabled; protocol deadline and bounds; no HTTP/resources/prompts/sampling. | Primary protocol fixtures plus real echo child; disabled never spawns; required blocks before inference; optional degrades with receipt. | 6-10 cycles |
 | E06-S04 — crash, withdrawal, and no replay | As a user, I want a crashed tool server withdrawn immediately and a possibly side-effecting call never guessed safe to replay. | EOF/crash removes descriptor and handler atomically; generation/incarnation on calls; explicit new attempt only; cancel/reload/shutdown join or name residue. | Exit-before-journal, exit-after-journal, duplicate response, late response, reconnect, cancellation, and stale-incarnation tests produce no orphan call or advertised dead tool. | 4-7 cycles |
 | E06-S05 — extension receipts and doctor | As an operator, I want secret-free effective authority, source identity, tools, health, and shutdown receipts without doctor starting children by default. | Doctor metadata-only unless explicit active preflight; additive JSONL inventory; path/hash disclosure policy; required/optional distinction. | Offline doctor performs no spawn/network; active fixture reports exact bounded status; old JSONL fixtures remain compatible. | 3-4 cycles |
 | E06-S06 — promotion decision | As a product owner, I want evidence before MCP becomes a supported surface. | Compare task value, startup/default cost, security failures, lifecycle reliability, maintenance burden; record retain/reshape/reject. | Separate ADR; prototype success alone cannot promote; removal leaves no config/session migration burden. | 1-2 cycles |
 
-Epic exit: B001 acceptance matrix passes. Same-process npm/Python, Rust dylibs,
-HTTP MCP, marketplaces, hooks, providers, and public plugin APIs remain out of
-scope.
+Epic exit: B001 plus `X002-ADMIT-0`, `PF-06`, and `PF-07` acceptance matrices
+pass. Same-process npm/Python, Rust dylibs, HTTP MCP, marketplaces, hooks,
+providers, and public plugin APIs remain out of scope.
 
 ## E07 — Measured semantic context and structural navigation
 
 Outcome: Kitsu adds context intelligence only when it improves representative
 repository tasks over its current search, symbol, outline, and manifest tools.
 
-Dependencies: E00 baseline; may run after E01 without blocking E03-E06.
+Dependencies: E00 baseline. Provider-free benchmark preparation may start
+early, but delivery priority keeps the experiment after E04, E03, and E06 and
+it cannot displace a failing correctness or authority gate.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
 | E07-S01 — repository task benchmark | As a product owner, I want a deterministic baseline for locate/explain/change tasks so new context features are evidence-driven. | Mix languages/repo sizes; fixed prompts and budgets; measure success, rounds, prompt tokens, tool bytes, latency; no live-provider dependency for core scoring. | Current tool suite produces reproducible baseline and bounded artifacts; evaluator rubric reviewed before experiments. | 3-5 cycles |
-| E07-S02 — semantic repo-map experiment | As a coding user, I want high-value symbols/files ranked into a token budget when that beats manual discovery. | Provider-neutral contributor; deterministic ranking/rendering; hard token/byte cap; no authority expansion; cached projection keyed by revision. | A/B against baseline; stale/corrupt cache rebuilt; no task regression beyond agreed threshold. | 5-8 cycles |
+| E07-S02 — semantic repo-map experiment | As a coding user, I want high-value symbols/files ranked into a token budget when that beats manual discovery. | Pure provider-neutral tree-sitter/reference-graph/PageRank contributor; deterministic ranking/rendering; hard token/byte cap; no authority expansion; cached projection keyed by revision. | A/B against baseline; denied paths never enter graph/output; stale/corrupt cache rebuilds; stale edit targets still require Kitsu's exact mutation checks; no task regression beyond agreed threshold. | 5-8 cycles |
 | E07-S03 — promote, reshape, or reject | As a maintainer, I want the experiment removed if it does not improve task outcomes enough to justify complexity. | Predeclare thresholds; inspect failure modes and language bias; keep current primitives. | Decision record with measurements; accepted implementation has ongoing regression suite, rejected one leaves no production code. | 1-2 cycles |
 
 Epic exit: measured decision, not assumed feature parity with Aider/Goose.
@@ -279,8 +297,9 @@ surface stability.
 | E08-S03 — move detailed content | As a task user, I want focused gateway/auth/authority/tool/chat/session/context/automation pages. | Populate sole owners before deleting root text; retain compatibility anchors/routes; no duplicate normative defaults. | Link/anchor/ownership checks and relevant behavioral fixtures pass after each move. | 8-14 cycles |
 | E08-S04 — root rewrite | As a new user, I want scope, install, local first success, authority, common tasks, and automation visible without reading an exhaustive manual. | Follow DOC-R001 outline; preserve credential-free path and pre-authority warnings; no line-count target. | G1-G8 plus timed novice lookup tasks pass; root's first 100 lines achieve the defined first success. | 4-7 cycles |
 
-Epic exit: DOC-R001 G1-G8 pass; old links are mapped; safety/automation
-contract coverage is not reduced.
+Epic exit: DOC-R001 G1-G8 and the applicable `PF-10` fresh-home, redirected,
+narrow-terminal, accessibility, snippet, and progressive-navigation cases pass;
+old links are mapped and safety/automation contract coverage is not reduced.
 
 ## E09 — Bounded multimodal image input
 
@@ -337,25 +356,26 @@ gates merely because a card appears attractive.
 | 003 | E01-S01-C1 | Add alias/mismatch/ambiguity doctor tests and minimal local-Ollama matcher |
 | 004 | E01-S01-C2 | Add human/JSON doctor fixtures and close KB-001 gates |
 | 005 | E01-S02-C1 | Rebase registry error/types and same-path duplicate tests |
-| 006 | E01-S02-C2 | Add cross-path/no-mutation/composition-boundary propagation |
-| 007 | E01-S03-C1 | Add descriptor/handler and unused-result coupling gates; close E01 |
-| 008 | E00-S03-C1 | Pin post-E01 evidence baseline and audit committed delta |
-| 009 | E00-S03-C2 | Update current architecture/comparison/backlog/status and close E00 |
-| 010 | E02-S01-C1 | Define carrier matrix and provider-free deterministic driver |
-| 011 | E02-S01-C2 | Cover success, provider/tool/preflight faults, and exact exits |
-| 012 | E02-S01-C3 | Cover cancellation, EOF, broken sink, duplicate/cross-run terminal |
-| 013 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
-| 014 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
-| 015 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
-| 016 | E03-S01-C1 | Write canonical revision/HEAD ADR with field ownership and migration cuts |
-| 017 | E03-S02-C1 | Add opaque revision and expected-revision conflict to current store |
-| 018 | E03-S02-C2 | Stage and publish whole-turn revision atomically |
-| 019 | E03-S03-C1 | Add first K01-K12 crash/stale-writer fault tranche |
-| 020 | E03-S03-C2 | Add corruption/projection/artifact/fork fault tranche |
+| 006 | E00-S05-C1 | Add the mechanism ledger, three-spine thesis, hard exclusions, gates, and revised order |
+| 007 | E01-S02-C2 | Add cross-path/no-mutation/composition-boundary propagation |
+| 008 | E01-S03-C1 | Add descriptor/handler and unused-result coupling gates; close E01 |
+| 009 | E00-S03-C1 | Pin post-E01 evidence baseline and audit committed delta |
+| 010 | E00-S03-C2 | Update current architecture/comparison/backlog/status and close E00 |
+| 011 | E02-S01-C1 | Define carrier matrix and provider-free deterministic driver |
+| 012 | E02-S01-C2 | Cover success, provider/tool/preflight faults, and exact exits |
+| 013 | E02-S01-C3 | Cover cancellation, EOF, broken sink, duplicate/cross-run terminal |
+| 014 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
+| 015 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
+| 016 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
+| 017 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 018 | E04-S02-C1 | Add explicit adapter/profile/generation and capability revision types |
+| 019 | E04-S03-C1 | Add immutable-generation auxiliary-egress fault driver |
+| 020 | E04-S04-C1 | Land the first adapter-local distinct request/stream slice |
 
-After Cycle 020, the next queue is selected from remaining E03 cards based on
-failed conformance cells, then advances through E04-E06. E07 experiments may
-use idle time but cannot displace a failing correctness or authority gate.
+After Cycle 020, the queue finishes E04's generation/adapter gates, then
+advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
+above. Provider-free fixture design may overlap, but it cannot displace a
+failing correctness or authority gate.
 
 ## Branch baseline receipt
 
@@ -373,5 +393,9 @@ plane, and further media types.
 
 Rejected for this program: same-process full-authority npm/Python/script
 plugins, a general Rust dylib ABI, runtime provider/TUI loading, implicit
-marketplace install/update, and any discovery path that executes or fetches
-before explicit admission.
+marketplace install/update, name-only identity, remembered cross-session
+authority, fail-open/unjoined hooks, timeout-by-abandonment, process separation
+presented as containment, EOF/idle/UI state presented as success, a DB/file
+tail/index presented as canonical HEAD, and any discovery path that executes or
+fetches before explicit admission. The complete rationale is in the
+[mechanism learning ledger](mechanism-ledger.md).
