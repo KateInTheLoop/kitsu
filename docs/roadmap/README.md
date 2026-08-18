@@ -382,13 +382,13 @@ gates merely because a card appears attractive.
 | 011 | E02-S01-C1 | Define carrier matrix and provider-free deterministic driver |
 | 012 | E02-S01-C2 | Cover success, provider/tool/preflight faults, and exact exits |
 | 013 | E02-S01-C3 | Cover cancellation, EOF, broken sink, duplicate/cross-run terminal |
-| 014 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
-| 015 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
-| 016 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
-| 017 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
-| 018 | E04-S02-C1 | Add explicit adapter/profile/generation and capability revision types |
-| 019 | E04-S03-C1 | Add immutable-generation auxiliary-egress fault driver |
-| 020 | E04-S04-C1 | Land the first adapter-local distinct request/stream slice |
+| 014 | E02-S01-C4 | Close confirmation/queued-cancel/residue/human-identity cells or prove the minimal missing seams |
+| 015 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
+| 016 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
+| 017 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
+| 018 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 019 | E04-S02-C1 | Add explicit adapter/profile/generation and capability revision types |
+| 020 | E04-S03-C1 | Add immutable-generation auxiliary-egress fault driver |
 
 After Cycle 020, the queue finishes E04's generation/adapter gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order

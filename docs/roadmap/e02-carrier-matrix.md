@@ -118,3 +118,31 @@ Human and interactive semantic identity remains internal/unobservable from the
 current presentation. Accepted-partial, recovered-tool, persistence-phase, and
 delivery/cleanup fault mappings remain explicit later cells; no common
 production run type is justified by this first tranche alone.
+
+## Executed mapping after Cycle 013
+
+Cancellation and terminal-delivery evidence now adds:
+
+- active ask cancellation: stable run ID, discarded assistant, one logical/
+  physical provider attempt closed as cancelled, one final summary, exit 130;
+- cancellation while piped stdin remains open and while a script FIFO has no
+  writer: stable identity, absent assistant, zero provider/tool work, one
+  cancelled summary, exit 130 without waiting for EOF;
+- active scripted `/review` cancellation: its command frame closes around one
+  cancelled logical/physical request, discarded assistant, one summary, exit
+  130;
+- healthy background work: human and JSONL carriers wait for a joined
+  `background_result` before final summary. The JSONL stream exposes two
+  foreground provider requests while the loopback server observes a third
+  child request, so child-attempt correlation is a measured gap;
+- fail-stop delivery: the generic JSONL writer performs one failed write and
+  refuses every later write; the CLI reports `/dev/full` as exit 1. A final
+  summary is intentionally unavailable after sink loss and therefore cannot be
+  used to infer semantic settlement;
+- duplicate summaries, records after summary, and cross-run/stripped IDs are
+  rejected by the test inspector.
+
+Still missing from an executable current-carrier fixture: confirmation EOF at
+an authority prompt, queued-before-active cancellation, typed unjoined cleanup
+residue, and observable human-carrier run identity. E02-S01 stays open and gets
+one more bounded mapping card before production run types.

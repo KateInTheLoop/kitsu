@@ -7177,6 +7177,17 @@ async fn test_jsonl_sigint_emits_cancelled_turn_and_summary() {
     assert_eq!(events[6]["status"], "cancelled");
     assert_eq!(events[7]["status"], "cancelled");
     assert_eq!(events[7]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130).expect("inspect active cancellation");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Discarded
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 1);
+    assert_eq!(facts.provider_attempts, 1);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
 }
 
 #[cfg(unix)]
@@ -7248,6 +7259,18 @@ auth = { method = "none" }
     assert_eq!(events[1]["kind"], "cancelled");
     assert_eq!(events[2]["status"], "cancelled");
     assert_eq!(events[2]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130)
+        .expect("inspect cancellation before piped input acceptance");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Absent
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
 }
 
 #[cfg(unix)]
@@ -7318,6 +7341,16 @@ auth = { method = "none" }
     assert_eq!(events[2]["type"], "final_summary");
     assert_eq!(events[2]["status"], "cancelled");
     assert_eq!(events[2]["cancelled_failures"], 1);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 130)
+        .expect("inspect cancellation before script FIFO acceptance");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Absent
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 0);
+    assert_eq!(facts.provider_attempts, 0);
 }
 
 #[cfg(unix)]
@@ -7423,6 +7456,18 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
     assert_eq!(events[8]["status"], "cancelled");
     assert_eq!(events[9]["status"], "cancelled");
     assert_eq!(events[10]["status"], "cancelled");
+    let facts =
+        jsonl_fixture::inspect_jsonl(&events, 130).expect("inspect scripted command cancellation");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Cancelled);
+    assert_eq!(
+        facts.assistant,
+        jsonl_fixture::JsonlAssistantDisposition::Discarded
+    );
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 1);
+    assert_eq!(facts.provider_attempts, 1);
+    assert_eq!(facts.tool_started, 0);
+    assert_eq!(facts.tool_finished, 0);
 }
 
 #[tokio::test]
@@ -14213,6 +14258,13 @@ async fn test_script_exit_joins_live_background_agents_and_never_claims_a_rollba
         .expect("final summary");
     assert_eq!(summary["status"], "ok");
     assert_eq!(summary["failures"], 0);
+    let facts = jsonl_fixture::inspect_jsonl(&events, 0)
+        .expect("inspect successful background join before terminal");
+    assert_eq!(facts.class, jsonl_fixture::JsonlOutcomeClass::Succeeded);
+    assert_eq!(facts.terminal_count, 1);
+    assert_eq!(facts.provider_requests, 2);
+    assert_eq!(facts.provider_attempts, 2);
+    assert_eq!(facts.tool_started, facts.tool_finished);
     server.verify().await;
 }
 

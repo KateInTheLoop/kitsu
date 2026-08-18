@@ -60,10 +60,11 @@ Status: E00 and E01 accepted through Cycle 010 on
 
 ## Next delivery tranche
 
-Cycles 011-016 build E02 in bounded order: define the provider-free carrier
+Cycles 011-017 build E02 in bounded order: define the provider-free carrier
 matrix/driver; cover success/provider/tool/preflight; cover cancellation/EOF/
-broken-sink/duplicate-terminal; introduce private identity/run types only for
-fixture-proven divergence; add monotonic terminal phases; then project the
+broken-sink/duplicate-terminal; close the newly measured confirmation/queued-
+cancel/residue/human-identity gaps; introduce private identity/run types only
+for fixture-proven divergence; add monotonic terminal phases; then project the
 common outcome into compatible JSONL.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
