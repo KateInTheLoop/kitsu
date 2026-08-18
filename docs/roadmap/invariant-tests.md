@@ -77,7 +77,8 @@ The following cells are deliberately **not** satisfied by the tests above:
 
 | Boundary | Missing fixture/evidence | Owning roadmap epic |
 |---|---|---|
-| Cross-cutting core coupling | Automated negative coupling checks do not exist. Current `kitsu-core` still depends on the concrete tool registry and `kitsu-render`; new integrations must not worsen that dependency, and extraction needs a fixture-proven second consumer. | E02 and E10 |
+| Neutral run-contract coupling | `scripts/check-run-boundary.sh` rejects CLI/session, provider/tool/renderer, serde/JSONL, Tokio, environment/filesystem/I/O/process/time dependencies in `kitsu-core/src/run.rs`; an alternate-source negative fixture proves the guard fails. | `bash scripts/check-run-boundary.sh`; E02 |
+| Cross-cutting core coupling | The new negative check is deliberately scoped to `run.rs`. Current `kitsu-core::orchestrator` still depends on the concrete tool registry and `kitsu-render`; broader automated replacement checks remain missing and new integrations must not worsen that dependency. | E10 |
 | X001 model/provider | A primary-validated distinct compiled dialect, immutable route generation across every send/auxiliary path, same-label mutation/retry/replay/withdrawal/join, and zero concrete wire imports in core | E04 |
 | X002 tool/source | Fallible deterministic admission first, then frozen source identity, authority before acquisition/import/spawn, bounded supervisor, atomic withdrawal, incarnation/no-replay, disabled parity, and built-in plus real source conformance | E01 and E06 |
 | X003 host/protocol | A real named second host/principal plus identity-preserving control/event/outcome port, version/delivery/auth/backpressure negotiation, disconnect behavior, and shared carrier suite | E02 and future named-host proposal |

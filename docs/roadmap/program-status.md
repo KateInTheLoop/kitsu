@@ -47,7 +47,8 @@ Status: E00 and E01 accepted through Cycle 010 on
 ## Current green gates
 
 - Affected runtime suites: 219 `kitsu-tools`, 309 Kitsu binary, 200 CLI, six
-  carrier-matrix, 73 renderer, and 146 `kitsu-core` tests, zero failures.
+  carrier-matrix, 73 renderer, and 149 `kitsu-core` tests (146 unit plus three
+  neutral run-contract tests), zero failures.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
 - Workspace/all-target Clippy passes with warnings denied; formatting and diff
@@ -60,13 +61,13 @@ Status: E00 and E01 accepted through Cycle 010 on
 
 ## Next delivery tranche
 
-Cycles 011-017 build E02 in bounded order. Cycles 011-014 completed carrier
+Cycles 011-019 build E02 in bounded order. Cycles 011-014 completed carrier
 discovery across success/provider/tool/preflight, cancellation, sink/terminal,
 confirmation, queued-cancel, and cleanup-residue cases. The mapping proves two
 production divergences—authority EOF lacks a zero-send interruption and human
-carriers lack run identity. Cycle 015 introduces private identity/run types
-only for those facts; later cards add monotonic terminal phases and project the
-common outcome into compatible JSONL.
+carriers lack run identity. Cycle 015 introduces neutral identity/run types only
+for those facts; Cycles 016-017 integrate each divergence, then later cards add
+monotonic terminal phases and project the common outcome into compatible JSONL.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
