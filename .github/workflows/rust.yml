@@ -29,5 +29,9 @@ jobs:
         fi
     - name: Build
       run: cargo build --verbose
+    - name: Reject ignored must-use results
+      env:
+        RUSTFLAGS: -Dunused-must-use
+      run: cargo check --workspace --all-targets
     - name: Run tests
       run: cargo test --verbose

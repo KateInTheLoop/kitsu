@@ -148,6 +148,10 @@ commands pass.
 
 ## E01 — Bounded defects and deterministic tool admission
 
+Status: accepted through Cycle 008; Ollama alias truth, deterministic registry
+admission, CLI propagation, descriptor/handler parity, and the ignored-result
+CI gate are green on the improvement branch.
+
 Outcome: local Ollama diagnostics are truthful and tool composition cannot
 silently publish duplicate or mismatched handlers/schemas.
 
