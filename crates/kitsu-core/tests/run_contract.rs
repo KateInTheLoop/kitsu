@@ -1,5 +1,8 @@
+use std::num::NonZeroU32;
+
 use kitsu_core::{
-    RunAssistantDisposition, RunEventKind, RunId, RunIdError, RunInterruption, RunOutcomeClass,
+    RunAssistantDisposition, RunCleanupState, RunDeliveryState, RunEventKind, RunId, RunIdError,
+    RunInterruption, RunLifecycle, RunOutcomeClass, RunPersistenceState, RunPhase, RunPhaseError,
     RunSpec,
 };
 
@@ -105,4 +108,126 @@ fn neutral_outcome_labels_are_complete_and_stable() {
         .map(RunAssistantDisposition::as_str),
         ["committed", "committed_partial", "discarded", "absent"]
     );
+}
+
+#[test]
+fn lifecycle_publishes_one_complete_ordered_terminal() {
+    let spec = RunSpec::new(RunId::new("ordered-run").unwrap());
+    let mut lifecycle = RunLifecycle::accept(&spec);
+    assert_eq!(lifecycle.phase(), RunPhase::Accepted);
+
+    lifecycle
+        .settle(
+            RunOutcomeClass::Succeeded,
+            RunAssistantDisposition::Committed,
+        )
+        .unwrap();
+    lifecycle.join(RunCleanupState::Joined).unwrap();
+    lifecycle.persist(RunPersistenceState::Committed).unwrap();
+    lifecycle.deliver(RunDeliveryState::Delivered).unwrap();
+    let published = lifecycle.publish().unwrap();
+
+    assert_eq!(lifecycle.phase(), RunPhase::Published);
+    assert_eq!(published.terminal().run_id(), spec.run_id());
+    assert_eq!(published.terminal().class(), RunOutcomeClass::Succeeded);
+    assert_eq!(published.cleanup(), RunCleanupState::Joined);
+    assert_eq!(published.persistence(), RunPersistenceState::Committed);
+    assert_eq!(published.delivery(), RunDeliveryState::Delivered);
+    assert!(published.is_clean_success());
+}
+
+#[test]
+fn later_phase_failures_never_rewrite_semantic_settlement() {
+    let spec = RunSpec::new(RunId::new("residue-run").unwrap());
+    let mut lifecycle = RunLifecycle::accept(&spec);
+    lifecycle
+        .settle(
+            RunOutcomeClass::Succeeded,
+            RunAssistantDisposition::Committed,
+        )
+        .unwrap();
+    lifecycle
+        .join(RunCleanupState::Residue {
+            unjoined: NonZeroU32::new(2).unwrap(),
+        })
+        .unwrap();
+    lifecycle.persist(RunPersistenceState::Failed).unwrap();
+    lifecycle.deliver(RunDeliveryState::Failed).unwrap();
+    let published = lifecycle.publish().unwrap();
+
+    assert_eq!(published.terminal().class(), RunOutcomeClass::Succeeded);
+    assert_eq!(
+        published.terminal().assistant(),
+        RunAssistantDisposition::Committed
+    );
+    assert_eq!(
+        published.cleanup(),
+        RunCleanupState::Residue {
+            unjoined: NonZeroU32::new(2).unwrap(),
+        }
+    );
+    assert!(!published.is_clean_success());
+}
+
+#[test]
+fn duplicate_and_out_of_order_transitions_are_rejected_without_mutation() {
+    let spec = RunSpec::new(RunId::new("invalid-order-run").unwrap());
+    let mut lifecycle = RunLifecycle::accept(&spec);
+
+    assert_eq!(
+        lifecycle.persist(RunPersistenceState::Committed),
+        Err(RunPhaseError::OutOfOrder {
+            current: RunPhase::Accepted,
+            expected: RunPhase::Settled,
+            attempted: RunPhase::Persisted,
+        })
+    );
+    assert_eq!(lifecycle.phase(), RunPhase::Accepted);
+
+    lifecycle
+        .settle(RunOutcomeClass::UserFault, RunAssistantDisposition::Absent)
+        .unwrap();
+    assert_eq!(
+        lifecycle.settle(
+            RunOutcomeClass::Succeeded,
+            RunAssistantDisposition::Committed,
+        ),
+        Err(RunPhaseError::Duplicate(RunPhase::Settled))
+    );
+    assert_eq!(
+        lifecycle.terminal().unwrap().class(),
+        RunOutcomeClass::UserFault,
+        "a duplicate settlement must not rewrite the first outcome"
+    );
+    assert_eq!(lifecycle.phase(), RunPhase::Settled);
+}
+
+#[test]
+fn terminal_publication_is_single_and_rejects_later_work() {
+    let spec = RunSpec::new(RunId::new("terminal-run").unwrap());
+    let mut lifecycle = RunLifecycle::accept(&spec);
+    lifecycle
+        .settle(
+            RunOutcomeClass::Cancelled,
+            RunAssistantDisposition::Discarded,
+        )
+        .unwrap();
+    lifecycle.join(RunCleanupState::Joined).unwrap();
+    lifecycle
+        .persist(RunPersistenceState::NotRequested)
+        .unwrap();
+    lifecycle.deliver(RunDeliveryState::NotAttempted).unwrap();
+    lifecycle.publish().unwrap();
+
+    assert_eq!(
+        lifecycle.publish(),
+        Err(RunPhaseError::AfterTerminal {
+            attempted: RunPhase::Published,
+        })
+    );
+    assert_eq!(
+        lifecycle.ensure_work_allowed(),
+        Err(RunPhaseError::WorkAfterTerminal)
+    );
+    assert_eq!(lifecycle.phase(), RunPhase::Published);
 }

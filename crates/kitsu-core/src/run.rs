@@ -7,6 +7,7 @@
 //! identity-bearing contract.
 
 use std::fmt;
+use std::num::NonZeroU32;
 
 /// Opaque, bounded identity shared by every event and terminal for one run.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -217,5 +218,235 @@ impl TerminalOutcome {
 
     pub fn assistant(&self) -> RunAssistantDisposition {
         self.assistant
+    }
+}
+
+/// Monotonic terminal lifecycle. The semantic outcome settles first and later
+/// operational phases can report failure without rewriting it.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPhase {
+    Accepted,
+    Settled,
+    Joined,
+    Persisted,
+    Delivered,
+    Published,
+}
+
+impl RunPhase {
+    const fn next(self) -> Option<Self> {
+        match self {
+            Self::Accepted => Some(Self::Settled),
+            Self::Settled => Some(Self::Joined),
+            Self::Joined => Some(Self::Persisted),
+            Self::Persisted => Some(Self::Delivered),
+            Self::Delivered => Some(Self::Published),
+            Self::Published => None,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunCleanupState {
+    Joined,
+    Residue { unjoined: NonZeroU32 },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPersistenceState {
+    Committed,
+    Preserved,
+    Failed,
+    NotRequested,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunDeliveryState {
+    Delivered,
+    Failed,
+    NotAttempted,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunPhaseError {
+    Duplicate(RunPhase),
+    OutOfOrder {
+        current: RunPhase,
+        expected: RunPhase,
+        attempted: RunPhase,
+    },
+    AfterTerminal {
+        attempted: RunPhase,
+    },
+    WorkAfterTerminal,
+}
+
+impl fmt::Display for RunPhaseError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Duplicate(phase) => write!(f, "duplicate run phase: {phase:?}"),
+            Self::OutOfOrder {
+                current,
+                expected,
+                attempted,
+            } => write!(
+                f,
+                "out-of-order run phase: current {current:?}, expected {expected:?}, attempted {attempted:?}"
+            ),
+            Self::AfterTerminal { attempted } => {
+                write!(f, "run is terminal; rejected phase {attempted:?}")
+            }
+            Self::WorkAfterTerminal => f.write_str("run is terminal; rejected later work"),
+        }
+    }
+}
+
+impl std::error::Error for RunPhaseError {}
+
+/// Provider-, carrier-, and store-free owner of one run's terminal phase
+/// progression. Every mutation validates before publication, so a rejected
+/// transition leaves the previous state unchanged.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct RunLifecycle {
+    spec: RunSpec,
+    phase: RunPhase,
+    terminal: Option<TerminalOutcome>,
+    cleanup: Option<RunCleanupState>,
+    persistence: Option<RunPersistenceState>,
+    delivery: Option<RunDeliveryState>,
+}
+
+impl RunLifecycle {
+    pub fn accept(spec: &RunSpec) -> Self {
+        Self {
+            spec: spec.clone(),
+            phase: RunPhase::Accepted,
+            terminal: None,
+            cleanup: None,
+            persistence: None,
+            delivery: None,
+        }
+    }
+
+    pub fn phase(&self) -> RunPhase {
+        self.phase
+    }
+
+    pub fn terminal(&self) -> Option<&TerminalOutcome> {
+        self.terminal.as_ref()
+    }
+
+    pub fn ensure_work_allowed(&self) -> Result<(), RunPhaseError> {
+        if self.phase == RunPhase::Published {
+            Err(RunPhaseError::WorkAfterTerminal)
+        } else {
+            Ok(())
+        }
+    }
+
+    pub fn settle(
+        &mut self,
+        class: RunOutcomeClass,
+        assistant: RunAssistantDisposition,
+    ) -> Result<(), RunPhaseError> {
+        self.validate_transition(RunPhase::Settled)?;
+        self.terminal = Some(self.spec.terminal(class, assistant));
+        self.phase = RunPhase::Settled;
+        Ok(())
+    }
+
+    pub fn join(&mut self, state: RunCleanupState) -> Result<(), RunPhaseError> {
+        self.validate_transition(RunPhase::Joined)?;
+        self.cleanup = Some(state);
+        self.phase = RunPhase::Joined;
+        Ok(())
+    }
+
+    pub fn persist(&mut self, state: RunPersistenceState) -> Result<(), RunPhaseError> {
+        self.validate_transition(RunPhase::Persisted)?;
+        self.persistence = Some(state);
+        self.phase = RunPhase::Persisted;
+        Ok(())
+    }
+
+    pub fn deliver(&mut self, state: RunDeliveryState) -> Result<(), RunPhaseError> {
+        self.validate_transition(RunPhase::Delivered)?;
+        self.delivery = Some(state);
+        self.phase = RunPhase::Delivered;
+        Ok(())
+    }
+
+    pub fn publish(&mut self) -> Result<PublishedRun, RunPhaseError> {
+        self.validate_transition(RunPhase::Published)?;
+        let published = PublishedRun {
+            terminal: self
+                .terminal
+                .clone()
+                .expect("validated lifecycle has a settled outcome"),
+            cleanup: self.cleanup.expect("validated lifecycle has a join result"),
+            persistence: self
+                .persistence
+                .expect("validated lifecycle has a persistence result"),
+            delivery: self
+                .delivery
+                .expect("validated lifecycle has a delivery result"),
+        };
+        self.phase = RunPhase::Published;
+        Ok(published)
+    }
+
+    fn validate_transition(&self, attempted: RunPhase) -> Result<(), RunPhaseError> {
+        if self.phase == RunPhase::Published {
+            return Err(RunPhaseError::AfterTerminal { attempted });
+        }
+        if attempted == self.phase {
+            return Err(RunPhaseError::Duplicate(attempted));
+        }
+        let expected = self
+            .phase
+            .next()
+            .expect("non-terminal run phase must have a successor");
+        if attempted != expected {
+            return Err(RunPhaseError::OutOfOrder {
+                current: self.phase,
+                expected,
+                attempted,
+            });
+        }
+        Ok(())
+    }
+}
+
+/// Immutable terminal publication containing semantic and later-phase truth.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct PublishedRun {
+    terminal: TerminalOutcome,
+    cleanup: RunCleanupState,
+    persistence: RunPersistenceState,
+    delivery: RunDeliveryState,
+}
+
+impl PublishedRun {
+    pub fn terminal(&self) -> &TerminalOutcome {
+        &self.terminal
+    }
+
+    pub fn cleanup(&self) -> RunCleanupState {
+        self.cleanup
+    }
+
+    pub fn persistence(&self) -> RunPersistenceState {
+        self.persistence
+    }
+
+    pub fn delivery(&self) -> RunDeliveryState {
+        self.delivery
+    }
+
+    pub fn is_clean_success(&self) -> bool {
+        self.terminal.class() == RunOutcomeClass::Succeeded
+            && self.cleanup == RunCleanupState::Joined
+            && self.persistence != RunPersistenceState::Failed
+            && self.delivery != RunDeliveryState::Failed
     }
 }
