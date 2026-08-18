@@ -2585,6 +2585,24 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unattached_fault_fixture_reports_typed_unjoined_residue() {
+        let registry = AgentRegistry::new();
+        // Production admission uses spawn_background_thread and installs its
+        // handle atomically. The test-only split start is retained precisely to
+        // inject the malformed state that a cleanup contract must not call
+        // joined.
+        let id = registry.start("unattached fault".to_string()).unwrap();
+        let cancelled = registry.cancel(id).await;
+        let AgentCancelOutcome::Cancelled(cancelled) = cancelled else {
+            panic!("unattached running record should cancel: {cancelled:?}");
+        };
+        assert!(!cancelled.joined);
+        assert!(matches!(cancelled.status, AgentStatus::Cancelled(_)));
+        assert_eq!(registry.snapshot().running, 0);
+        assert_eq!(registry.snapshot().terminal, 1);
+    }
+
+    #[tokio::test]
     async fn zero_background_limits_fail_closed_without_allocating_ids() {
         let registry = AgentRegistry::with_limits(AgentRegistryLimits {
             max_running: 0,

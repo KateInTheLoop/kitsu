@@ -91,10 +91,13 @@ prompt, or explicitly not applicable. No cell is silently omitted.
 - Cycle 011 defines and self-tests this matrix/oracle.
 - Cycle 012 maps success plus provider/tool/preflight faults and exact exits
   from existing carriers.
-- Cycle 013 maps cancellation, EOF, blocked/EPIPE delivery, duplicate/cross-run
-  terminals, and cleanup residue.
-- E02-S02 may introduce private production run types only for mismatches proven
-  by those mappings.
+- Cycle 013 maps current cancellation, blocked/EPIPE delivery, terminal
+  uniqueness, and healthy background joins, leaving measured cells explicit.
+- Cycle 014 closes fixture discovery for confirmation EOF, queued cancellation,
+  and typed residue, and proves the missing human identity/EOF-interruption
+  seams.
+- E02-S02 may introduce private production run types only for the mismatches
+  proven by those mappings.
 
 ## Executed mapping after Cycle 012
 
@@ -146,3 +149,34 @@ Still missing from an executable current-carrier fixture: confirmation EOF at
 an authority prompt, queued-before-active cancellation, typed unjoined cleanup
 residue, and observable human-carrier run identity. E02-S01 stays open and gets
 one more bounded mapping card before production run types.
+
+## Executed mapping after Cycle 014
+
+The last discovery card adds real interactive and registry fault evidence:
+
+- a plain PTY drives a model-requested write to the authority prompt and sends
+  EOF as the only answer. The target remains absent and EOF is a direct denial,
+  not malformed consent;
+- the first fixture run stalled before the authority prompt because type-ahead
+  could reacquire stdin while approval waited. Approval now publishes a counted
+  claim before lock acquisition, preventing starvation and preserving truth
+  when more than one prompt is pending;
+- confirmation EOF currently causes one provider follow-up carrying the denied
+  tool result. That violates the target zero-send-after-EOF cell and proves the
+  need for a typed authority-input interruption below the tool/presentation
+  boundary;
+- a second PTY holds one foreground provider request, queues a distinct prompt,
+  then submits `/quit cancel`. The process clears exactly one queued prompt and
+  the loopback server receives only the foreground request;
+- the test-only malformed registry start injects a running record without an
+  attached handle. Cancellation returns terminal `joined: false`, proving
+  cleanup residue is already representable rather than safely inferable as a
+  join;
+- human PTY carriers still expose no stable semantic run ID while JSONL does.
+  This is the first cross-carrier identity divergence, not evidence for an
+  invented second host.
+
+E02-S01 fixture discovery is complete with two deliberate red cells:
+confirmation EOF interruption and human run identity. They authorize the
+minimal private E02-S02 contract; they do not authorize CLI, signal, JSONL,
+renderer, session-store, or provider-wire dependencies in core.

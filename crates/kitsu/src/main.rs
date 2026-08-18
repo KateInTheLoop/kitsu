@@ -116,7 +116,11 @@ impl JsonlSessionReceipt {
 
 static JSONL_SESSION_RECEIPT: Mutex<JsonlSessionReceipt> =
     Mutex::new(JsonlSessionReceipt::disabled());
-static APPROVAL_INPUT_ACTIVE: AtomicBool = AtomicBool::new(false);
+// Count pending and active approval readers. A claimant increments before it
+// waits for the stdin mutex so type-ahead cannot repeatedly reacquire the lock
+// and starve the authority prompt. A count also avoids a false inactive window
+// when more than one prompt is waiting.
+static APPROVAL_INPUT_ACTIVE: AtomicUsize = AtomicUsize::new(0);
 static APPROVAL_INPUT_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 static FOREGROUND_CANCELLED: AtomicBool = AtomicBool::new(false);
 static ACTIVE_QUIT_CANCEL: AtomicBool = AtomicBool::new(false);
@@ -12486,7 +12490,7 @@ fn run_canonical_typeahead(
 ) -> TypeaheadCaptureResult {
     let mut result = TypeaheadCaptureResult::default();
     while !stop.load(Ordering::Acquire) {
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             std::thread::sleep(Duration::from_millis(25));
             continue;
         }
@@ -12498,7 +12502,7 @@ fn run_canonical_typeahead(
             std::thread::sleep(Duration::from_millis(25));
             continue;
         };
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
 
@@ -12689,7 +12693,7 @@ fn typeahead_slash_hint(buffer: &str) -> String {
 /// [`typeahead_editor::TypeaheadEditor`], and the draft renders on the shared
 /// status row with a real cursor, ↑/↓ history, and editable text — while
 /// streamed output and tool receipts keep flowing above it. Approval prompts
-/// take stdin back by flipping `APPROVAL_INPUT_ACTIVE`: raw mode is released
+/// take stdin back by claiming `APPROVAL_INPUT_ACTIVE`: raw mode is released
 /// and the draft row hidden until the approval completes.
 #[cfg(unix)]
 fn run_live_typeahead(
@@ -12724,7 +12728,7 @@ fn run_live_typeahead(
     live::live_input_begin(prompt.clone());
     update_live_row(&editor);
     while !stop.load(Ordering::Acquire) {
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             if let Some(guard) = raw.take() {
                 // Canonical mode (with echo) back on for the approval reader;
                 // the draft row is already hidden by the approval guard.
@@ -12752,7 +12756,7 @@ fn run_live_typeahead(
             std::thread::sleep(Duration::from_millis(25));
             continue;
         };
-        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        if APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             continue;
         }
 
@@ -12902,7 +12906,7 @@ where
     };
     if outcome.is_none() {
         FOREGROUND_CANCELLED.store(true, Ordering::Release);
-        while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+        while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
     } else {
@@ -13004,7 +13008,7 @@ async fn run_turn_steerable(
         _ = tokio::signal::ctrl_c() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled)
@@ -13012,7 +13016,7 @@ async fn run_turn_steerable(
         correction = corrections.recv() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             let mut texts = correction
@@ -13030,7 +13034,7 @@ async fn run_turn_steerable(
         _ = wait_for_active_quit_cancel() => {
             let _ = steering.close_turn(turn);
             FOREGROUND_CANCELLED.store(true, Ordering::Release);
-            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) {
+            while APPROVAL_INPUT_ACTIVE.load(Ordering::Acquire) > 0 {
                 tokio::time::sleep(Duration::from_millis(10)).await;
             }
             InteractiveTurnOutcome::QuitCancelled
@@ -17507,29 +17511,29 @@ struct CliCommandPrompter;
 
 struct ApprovalInputGuard {
     _owner: std::sync::MutexGuard<'static, ()>,
-    previous_active: bool,
 }
 
 impl ApprovalInputGuard {
     fn enter() -> Self {
+        // Publish the claim before waiting for the mutex. Otherwise the
+        // type-ahead loop can observe `false`, release its short poll lock, and
+        // reacquire it indefinitely while this prompt is already waiting.
+        APPROVAL_INPUT_ACTIVE.fetch_add(1, Ordering::AcqRel);
         let owner = APPROVAL_INPUT_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
-        let previous_active = APPROVAL_INPUT_ACTIVE.swap(true, Ordering::AcqRel);
         // Take the live type-ahead draft row off the terminal before the
         // approval prompt prints; the collector re-shows it (draft intact)
         // once the approval releases stdin.
         kitsu_render::live::live_input_end();
-        Self {
-            _owner: owner,
-            previous_active,
-        }
+        Self { _owner: owner }
     }
 }
 
 impl Drop for ApprovalInputGuard {
     fn drop(&mut self) {
-        APPROVAL_INPUT_ACTIVE.store(self.previous_active, Ordering::Release);
+        let claims = APPROVAL_INPUT_ACTIVE.fetch_sub(1, Ordering::AcqRel);
+        debug_assert!(claims > 0, "approval-input claim underflow");
     }
 }
 

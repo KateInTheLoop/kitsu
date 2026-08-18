@@ -62,6 +62,108 @@ fn base_cmd(home: &Path) -> Command {
     cmd
 }
 
+/// Run a plain interactive chat on a PTY and let a deterministic driver react
+/// to the accumulated transcript. Keeping the PTY mechanics here makes the
+/// confirmation-EOF and active-turn queue fixtures about lifecycle behavior,
+/// not duplicated descriptor plumbing.
+#[cfg(unix)]
+fn run_plain_interactive_chat_pty<F>(
+    home: &Path,
+    cwd: &Path,
+    extra_chat_args: &[&str],
+    mut drive: F,
+) -> (std::process::ExitStatus, String)
+where
+    F: FnMut(&[u8], &mut fs::File),
+{
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let mut master = -1;
+    let mut slave = -1;
+    // SAFETY: both output pointers are valid; null termios and winsize request
+    // the platform defaults.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                std::ptr::null(),
+            )
+        },
+        0,
+        "allocate interactive carrier PTY"
+    );
+    // SAFETY: the master descriptor remains owned by this function. Making it
+    // nonblocking lets the driver synchronize on prompts without hanging.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+    // SAFETY: each duplicated slave descriptor transfers to one Stdio owner.
+    let child_stdin = unsafe { libc::dup(slave) };
+    let child_stdout = unsafe { libc::dup(slave) };
+    assert!(child_stdin >= 0 && child_stdout >= 0);
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    command
+        .env("HOME", home)
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .current_dir(cwd)
+        // SAFETY: all three live descriptors transfer exactly once.
+        .stdin(unsafe { Stdio::from_raw_fd(child_stdin) })
+        .stdout(unsafe { Stdio::from_raw_fd(child_stdout) })
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args([
+            "--plain",
+            "--gateway",
+            "example",
+            "--no-stream",
+            "chat",
+            "--no-session",
+        ])
+        .args(extra_chat_args);
+    let mut child = command.spawn().expect("spawn interactive carrier chat");
+    // SAFETY: ownership of the remaining master descriptor transfers once.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let mut transcript = Vec::new();
+
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => transcript.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            // Linux PTY masters report EIO after the last slave closes.
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read interactive carrier PTY: {error}"),
+        }
+        drive(&transcript, &mut terminal);
+        if let Some(status) = child.try_wait().expect("poll interactive carrier") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "interactive carrier timed out: {}",
+                String::from_utf8_lossy(&transcript)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    (status, String::from_utf8_lossy(&transcript).into_owned())
+}
+
 #[test]
 #[serial]
 fn test_output_last_message_rejects_management_commands_without_touching_destination() {
@@ -7468,6 +7570,223 @@ async fn test_jsonl_script_slash_turn_cancellation_closes_command_frame() {
     assert_eq!(facts.provider_attempts, 1);
     assert_eq!(facts.tool_started, 0);
     assert_eq!(facts.tool_finished, 0);
+}
+
+/// EOF at the only authority-admission surface must mean denial, never an
+/// implicit grant or a successful terminal inferred from input closure.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_confirmation_eof_denies_write_and_exposes_followup_send() {
+    use std::io::Write as _;
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let repo = TempDir::new().expect("temp interactive repo");
+    let target = repo.path().join("must-not-exist.txt");
+    let write_arguments = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "confirmation EOF must not write"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "CONFIRMATION_EOF_DENIED"
+                },
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(1)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "confirmation-eof-write",
+                        "type": "function",
+                        "function": {
+                            "name": "fs_write_file",
+                            "arguments": write_arguments
+                        }
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut eof_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(&home_path, &repo_path, &[], |output, terminal| {
+            let prompt_count = output
+                .windows(b"kitsu>".len())
+                .filter(|window| *window == b"kitsu>")
+                .count();
+            if !prompt_sent && prompt_count >= 1 {
+                terminal
+                    .write_all(b"request one guarded write\n")
+                    .expect("submit guarded request");
+                terminal.flush().unwrap();
+                prompt_sent = true;
+            }
+            if prompt_sent
+                && !eof_sent
+                && output
+                    .windows(b"permission> kitsu wants to write".len())
+                    .any(|window| window == b"permission> kitsu wants to write")
+            {
+                // Ctrl+D at an empty canonical line makes read_line return EOF.
+                terminal
+                    .write_all(b"\x04")
+                    .expect("submit confirmation EOF");
+                terminal.flush().unwrap();
+                eof_sent = true;
+            }
+            let final_seen = output
+                .windows(b"CONFIRMATION_EOF_DENIED".len())
+                .any(|window| window == b"CONFIRMATION_EOF_DENIED");
+            if eof_sent && !quit_sent && final_seen && prompt_count >= 2 {
+                terminal.write_all(b"/quit\n").expect("exit chat");
+                terminal.flush().unwrap();
+                quit_sent = true;
+            }
+        })
+    })
+    .await
+    .expect("interactive confirmation fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("permission> kitsu wants to write"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("CONFIRMATION_EOF_DENIED"),
+        "{transcript}"
+    );
+    assert!(
+        !transcript.contains("invalid permission response"),
+        "EOF is a direct denial, not malformed consent: {transcript}"
+    );
+    assert!(!target.exists(), "confirmation EOF performed the write");
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(
+        requests.len(),
+        2,
+        "current loop sends one denial receipt after confirmation EOF"
+    );
+    assert!(String::from_utf8_lossy(&requests[1].body).contains("\"role\":\"tool\""));
+    server.verify().await;
+}
+
+/// Cancelling an active interactive run must clear already accepted type-ahead
+/// before any queued prompt can become a provider request.
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_quit_cancel_never_activates_queued_prompt() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let request_seen = Arc::new(AtomicBool::new(false));
+    let responder_seen = request_seen.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            responder_seen.store(true, Ordering::Release);
+            ResponseTemplate::new(200)
+                .set_delay(std::time::Duration::from_secs(30))
+                .set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "must be cancelled"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+        })
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo = TempDir::new().expect("temp interactive repo");
+    let repo_path = repo.path().to_path_buf();
+    let driver_seen = request_seen.clone();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut cancel_sent = false;
+        run_plain_interactive_chat_pty(
+            &home_path,
+            &repo_path,
+            &["--no-tools"],
+            |output, terminal| {
+                let prompt_visible = output
+                    .windows(b"kitsu>".len())
+                    .any(|window| window == b"kitsu>");
+                if !prompt_sent && prompt_visible {
+                    terminal
+                        .write_all(b"ACTIVE_PROVIDER_REQUEST\n")
+                        .expect("submit active prompt");
+                    terminal.flush().unwrap();
+                    prompt_sent = true;
+                }
+                if prompt_sent && !cancel_sent && driver_seen.load(Ordering::Acquire) {
+                    terminal
+                        .write_all(b"NEVER_ACTIVATE_QUEUED_PROMPT\n/quit cancel\n")
+                        .expect("queue then cancel");
+                    terminal.flush().unwrap();
+                    cancel_sent = true;
+                }
+            },
+        )
+    })
+    .await
+    .expect("interactive queued-cancel fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("exit cancellation completed"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("1 queued prompt(s) cleared"),
+        "{transcript}"
+    );
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "queued work reached the provider");
+    let request = String::from_utf8_lossy(&requests[0].body);
+    assert!(request.contains("ACTIVE_PROVIDER_REQUEST"), "{request}");
+    assert!(
+        !request.contains("NEVER_ACTIVATE_QUEUED_PROMPT"),
+        "{request}"
+    );
+    server.verify().await;
 }
 
 #[tokio::test]
