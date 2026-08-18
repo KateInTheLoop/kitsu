@@ -14,6 +14,12 @@ Mechanism learning ledger: [`mechanism-ledger.md`](mechanism-ledger.md)
 
 Post-E01 evidence baseline: [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md)
 
+Current architecture: [`current-architecture.md`](current-architecture.md)
+
+Current comparison: [`current-comparison.md`](current-comparison.md)
+
+Program status: [`program-status.md`](program-status.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -132,6 +138,10 @@ A story is done only when:
 - the epic exit suite passes before the epic is marked complete.
 
 ## E00 — Program baseline and safety envelope
+
+Status: accepted through Cycle 010; the clean base, invariant routes, mechanism
+ledger, content-pinned delta audit, current architecture/comparison/program
+views, and cycle-receipt check are Kitsu-owned and mutually consistent.
 
 Outcome: maintainers can prove which Kitsu revision is being changed and which
 existing strengths every later story must preserve.

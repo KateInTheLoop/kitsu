@@ -1,0 +1,71 @@
+# Improvement Program Status
+
+Status: E00 and E01 accepted through Cycle 010 on
+`improvements/harness-roadmap`.
+
+| Field | Current value |
+|---|---|
+| Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
+| Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
+| Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
+| Accepted cycles/commits after this cycle | 10 / 10 |
+| Complete replaceability gates | 0 / 5 |
+| Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
+| Original main worktree | Same ten user-owned modified paths; untouched |
+| Active next epic | E02 — one run identity and causal terminal outcome |
+
+## Epic status
+
+| Epic | State | Evidence/next gate |
+|---|---|---|
+| E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
+| E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
+| E02 causal run/outcome | Ready | Provider-free carrier/fault matrix, then private types only for measured divergence |
+| E04 provider spine | Planned after E02 | Primary wire fixtures, capability types, `X001-G1-AUX`, distinct compiled dialect |
+| E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
+| E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
+| E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
+| E05/E08 onboarding/docs | Planned after provider/tool surfaces stabilize | Transactional setup/picker and PF-10 observability/docs |
+| E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
+| E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
+
+## Accepted cycle ledger
+
+| Cycle | Commit | Outcome |
+|---:|---|---|
+| 001 | `32449e7` | Clean linked worktree, Kitsu-owned backlog and loop |
+| 002 | `8bcb878` | Preserved-invariant test routing |
+| 003 | `254a8d4` | Narrow local Ollama implicit-`latest` matcher |
+| 004 | `41cf17d` | Human/JSON/no-chat Ollama regression closure |
+| 005 | `61a7195` | Typed same-path deterministic registry admission |
+| 006 | `336d2ea` | Comparative mechanism ledger and three-spine order |
+| 007 | `34e128f` | Cross-path preservation and typed CLI propagation |
+| 008 | `986fba9` | Complete builtin parity and ignored-result CI gate |
+| 009 | `030ed34` | Post-E01 Git/content-hash evidence baseline |
+| 010 | this document's commit | Current architecture/comparison/status and E00 close |
+
+## Current green gates
+
+- Affected runtime suites: 219 `kitsu-tools`, 308 Kitsu binary, and 146
+  `kitsu-core` tests, zero failures.
+- Workspace/all-target check passes with ordinary flags and with
+  `RUSTFLAGS=-Dunused-must-use`.
+- Workspace/all-target Clippy passes with warnings denied; formatting and diff
+  checks pass.
+- Original dirty main status remains the same ten paths recorded in Cycle 001.
+- Frozen research worktree is clean at its exact pin; eight non-versioned
+  research decision inputs are SHA-256 pinned.
+- `scripts/check-roadmap.sh` verifies sequential receipts, required fields, and
+  one cycle file per improvement commit on this active branch.
+
+## Next delivery tranche
+
+Cycles 011-016 build E02 in bounded order: define the provider-free carrier
+matrix/driver; cover success/provider/tool/preflight; cover cancellation/EOF/
+broken-sink/duplicate-terminal; introduce private identity/run types only for
+fixture-proven divergence; add monotonic terminal phases; then project the
+common outcome into compatible JSONL.
+
+No provider, session, MCP, semantic-context, onboarding, or multimodal feature
+jumps this foundation because all depend on truthful causal outcome and joined
+cleanup.
