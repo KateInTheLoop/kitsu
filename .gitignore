@@ -11,3 +11,6 @@
 /tests/dogfood/results/
 /history
 .kitsu_history
+
+# Release packaging output
+/dist
