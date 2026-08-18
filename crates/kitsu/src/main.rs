@@ -150,15 +150,21 @@ fn jsonl_requested() -> bool {
         .any(|arg| arg == "--jsonl" || arg.to_str().is_some_and(|arg| arg.starts_with("--jsonl=")))
 }
 
-fn jsonl_run_id() -> &'static str {
-    static RUN_ID: OnceLock<String> = OnceLock::new();
-    RUN_ID.get_or_init(|| {
+fn run_spec() -> &'static kitsu_core::RunSpec {
+    static RUN_SPEC: OnceLock<kitsu_core::RunSpec> = OnceLock::new();
+    RUN_SPEC.get_or_init(|| {
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap_or_default()
             .as_nanos();
-        format!("{}-{nanos}", std::process::id())
+        let run_id = kitsu_core::RunId::new(format!("{}-{nanos}", std::process::id()))
+            .expect("process-generated run identity is machine-safe and bounded");
+        kitsu_core::RunSpec::new(run_id)
     })
+}
+
+fn run_id() -> &'static str {
+    run_spec().run_id().as_str()
 }
 
 fn run_elapsed() -> Duration {
@@ -180,7 +186,7 @@ fn jsonl_emitter() -> &'static Mutex<kitsu_render::jsonl::JsonlEmitter<std::io::
         Mutex::new(kitsu_render::jsonl::JsonlEmitter::new(
             std::io::stdout(),
             JSONL_SCHEMA,
-            jsonl_run_id(),
+            run_id(),
         ))
     })
 }
@@ -1078,6 +1084,10 @@ fn install_broken_pipe_guard() {
 
 fn main() {
     let _ = RUN_STARTED_AT.set(Instant::now());
+    // Every surface receives one neutral identity before argument parsing can
+    // accept work. JSONL, human mode, and private artifacts then refer to the
+    // same process-run spec even when presentation does not yet display it.
+    let _ = run_spec();
     install_broken_pipe_guard();
     let jsonl_mode = jsonl_requested();
     // Logs (never the token: HeaderValue is marked sensitive) go to stderr.
@@ -4270,7 +4280,7 @@ impl ArtifactDirectoryAllocator {
                 .next_generation
                 .checked_add(1)
                 .ok_or_else(|| "artifact generation counter exhausted".to_string())?;
-            let directory = base.join(format!("runtime-{}-{generation}", jsonl_run_id()));
+            let directory = base.join(format!("runtime-{}-{generation}", run_id()));
             match std::fs::create_dir(&directory) {
                 Ok(()) => {
                     #[cfg(unix)]
@@ -13659,7 +13669,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let private_evidence_paths = vec![
             setup.config_path.clone(),
             setup.state_dir.clone(),
-            std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id())),
+            std::env::temp_dir().join(format!("kitsu-offload-{}", run_id())),
         ];
         if let Some((d, h)) =
             workspace_diff_tool(&launch_dir, private_evidence_paths, &perms, &live_mw)
@@ -13686,7 +13696,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let stateless_artifact_base = if command_policy.is_some() {
         setup.state_dir.join("artifacts")
     } else {
-        std::env::temp_dir().join(format!("kitsu-offload-{}", jsonl_run_id()))
+        std::env::temp_dir().join(format!("kitsu-offload-{}", run_id()))
     };
     let mut artifact_directories = ArtifactDirectoryAllocator::default();
     let offload_state = Rc::new(RefCell::new(None));
@@ -20526,7 +20536,7 @@ mod tests {
     #[test]
     fn artifact_allocator_skips_an_existing_generation_instead_of_reusing_it() {
         let root = tempfile::tempdir().unwrap();
-        let occupied = root.path().join(format!("runtime-{}-0", jsonl_run_id()));
+        let occupied = root.path().join(format!("runtime-{}-0", run_id()));
         std::fs::create_dir(&occupied).unwrap();
         std::fs::write(occupied.join("prior.txt"), "prior session").unwrap();
         let mut allocator = ArtifactDirectoryAllocator::default();

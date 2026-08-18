@@ -33,5 +33,7 @@ jobs:
       env:
         RUSTFLAGS: -Dunused-must-use
       run: cargo check --workspace --all-targets
+    - name: Keep the run contract carrier-neutral
+      run: bash scripts/check-run-boundary.sh
     - name: Run tests
       run: cargo test --verbose

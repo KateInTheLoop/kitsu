@@ -5,6 +5,7 @@
 
 pub mod context;
 pub mod orchestrator;
+pub mod run;
 
 pub use context::{ContextBreakdown, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW};
 pub use kitsu_providers::ReasoningEffort;
@@ -17,4 +18,8 @@ pub use orchestrator::{
     ProviderRequestPurpose, RunTallies, SpawnBudget, StructuredFinalizationGate,
     StructuredFinalizationRepair, StructuredFinalizationRepairTarget, SummaryFallbackReason,
     ToolArtifactStatus, TurnCompletion,
+};
+pub use run::{
+    RunAssistantDisposition, RunEvent, RunEventKind, RunId, RunIdError, RunInterruption,
+    RunOutcomeClass, RunSpec, TerminalOutcome,
 };

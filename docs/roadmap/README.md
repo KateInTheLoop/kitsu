@@ -180,12 +180,13 @@ or authority behavior changes except truthful preflight failure.
 
 ## E02 — One run identity and causal terminal outcome
 
-Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md)
+Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md). Neutral type
+contract: [`e02-run-contract.md`](e02-run-contract.md).
 
-Status: E02-S01 fixture discovery is accepted through Cycle 014. It proves the
-first production divergences rather than treating them as green: confirmation
-EOF still causes one provider denial follow-up, and human carriers expose no
-stable run identity. E02-S02 owns the minimal private contract for those facts.
+Status: E02-S01 fixture discovery is accepted through Cycle 014. Cycle 015
+starts E02-S02 with neutral identity/event/outcome values and a coupling guard.
+The proven behavior gaps remain open: confirmation EOF still causes one provider
+denial follow-up, and human carriers expose no stable run identity.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
@@ -389,11 +390,11 @@ gates merely because a card appears attractive.
 | 013 | E02-S01-C3 | Map current cancellation, sink, join, and terminal-uniqueness evidence; retain measured gaps |
 | 014 | E02-S01-C4 | Close confirmation/queued-cancel/residue discovery and prove the minimal EOF/human-identity seams |
 | 015 | E02-S02-C1 | Introduce private identity/run types for first fixture-proven divergence |
-| 016 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
-| 017 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
-| 018 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
-| 019 | E04-S02-C1 | Add explicit adapter/profile/generation and capability revision types |
-| 020 | E04-S03-C1 | Add immutable-generation auxiliary-egress fault driver |
+| 016 | E02-S02-C2 | Propagate authority-input EOF as a zero-later-send interruption while explicit denial remains recoverable |
+| 017 | E02-S02-C3 | Project neutral run identity/outcome into human carrier receipts and close the private contract |
+| 018 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
+| 019 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
+| 020 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 
 After Cycle 020, the queue finishes E04's generation/adapter gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
