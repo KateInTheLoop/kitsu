@@ -8,6 +8,8 @@ Branch base: `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763`
 
 Cycle protocol: [`cycle-protocol.md`](cycle-protocol.md)
 
+Invariant test routing: [`invariant-tests.md`](invariant-tests.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -56,6 +58,10 @@ Every epic inherits these acceptance requirements:
 - New stores, providers, sources, and hosts adapt to Kitsu-owned types. The core
   never imports their concrete protocol, config, credential, or persistence
   types.
+
+Current core dependencies on the concrete tool registry and `kitsu-render` are
+baseline coupling, not proof of the target host/tool ports. E02/E10 may extract
+them only when an executed fixture proves the boundary.
 
 ## Milestones and dependency map
 
