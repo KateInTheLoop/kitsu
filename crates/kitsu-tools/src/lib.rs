@@ -18,7 +18,7 @@ pub use builtins::command::{
     CommandOutputStream, CommandPolicy, CommandProgressSink, CommandPrompter, CommandTermination,
     COMMAND_CONTAINMENT_ENVIRONMENT, DEFAULT_BUBBLEWRAP_PATH, SECRET_LIKE_ENV_NAME_MARKERS,
 };
-pub use error::ToolError;
+pub use error::{RegistryError, ToolError};
 pub use permissions::{
     Action, Decision, Mode, PermissionRequest, Permissions, Prompter, ReadAuthorization,
     Revocation, TrustedImplicitReadRoot,
@@ -80,15 +80,36 @@ impl Registry {
     }
 
     /// Register a handler with no advertised descriptor. The model is not told
-    /// this tool exists; used by the `ask` path and orchestrator tests.
-    pub fn register(&mut self, name: impl Into<String>, handler: HandlerFn) {
-        self.handlers.insert(name.into(), handler);
+    /// this tool exists; used by the `ask` path and orchestrator tests. A name
+    /// collision is rejected before the existing handler is touched.
+    pub fn register(
+        &mut self,
+        name: impl Into<String>,
+        handler: HandlerFn,
+    ) -> Result<(), RegistryError> {
+        let name = name.into();
+        if self.handlers.contains_key(&name) {
+            return Err(RegistryError::DuplicateName { name });
+        }
+        self.handlers.insert(name, handler);
+        Ok(())
     }
 
-    /// Register a handler AND advertise its descriptor to the model.
-    pub fn register_with_descriptor(&mut self, descriptor: ToolDescriptor, handler: HandlerFn) {
+    /// Register a handler AND advertise its descriptor to the model. A name
+    /// collision is rejected before either registry collection is mutated.
+    pub fn register_with_descriptor(
+        &mut self,
+        descriptor: ToolDescriptor,
+        handler: HandlerFn,
+    ) -> Result<(), RegistryError> {
+        if self.handlers.contains_key(&descriptor.name) {
+            return Err(RegistryError::DuplicateName {
+                name: descriptor.name,
+            });
+        }
         self.handlers.insert(descriptor.name.clone(), handler);
         self.descriptors.push(descriptor);
+        Ok(())
     }
 
     /// Descriptors advertised to the model. Empty ⇒ orchestrator sends no
@@ -106,5 +127,74 @@ impl Registry {
             Some(h) => h(args).await,
             None => Err(ToolError::NotFound(name.to_string())),
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn handler(result: &'static str) -> HandlerFn {
+        Box::new(move |_| Box::pin(async move { Ok(result.to_string()) }))
+    }
+
+    fn descriptor(name: &str, description: &str) -> ToolDescriptor {
+        ToolDescriptor {
+            name: name.to_string(),
+            description: description.to_string(),
+            parameters: serde_json::json!({"type": "object"}),
+        }
+    }
+
+    #[tokio::test]
+    async fn descriptor_free_duplicate_is_rejected_without_replacing_first_handler() {
+        let mut registry = Registry::new();
+        registry
+            .register("test_tool", handler("first"))
+            .expect("first registration succeeds");
+
+        let error = registry
+            .register("test_tool", handler("second"))
+            .expect_err("duplicate registration fails");
+
+        assert_eq!(
+            error,
+            RegistryError::DuplicateName {
+                name: "test_tool".to_string(),
+            }
+        );
+        assert!(registry.descriptors().is_empty());
+        assert_eq!(
+            registry.run("test_tool", "{}".to_string()).await.unwrap(),
+            "first"
+        );
+    }
+
+    #[tokio::test]
+    async fn described_duplicate_is_rejected_without_replacing_first_entry() {
+        let mut registry = Registry::new();
+        let first = descriptor("test_tool", "first descriptor");
+        registry
+            .register_with_descriptor(first.clone(), handler("first"))
+            .expect("first registration succeeds");
+
+        let error = registry
+            .register_with_descriptor(
+                descriptor("test_tool", "second descriptor"),
+                handler("second"),
+            )
+            .expect_err("duplicate registration fails");
+
+        assert_eq!(
+            error,
+            RegistryError::DuplicateName {
+                name: "test_tool".to_string(),
+            }
+        );
+        assert_eq!(registry.descriptors(), &[first]);
+        assert_eq!(
+            registry.run("test_tool", "{}".to_string()).await.unwrap(),
+            "first"
+        );
     }
 }
