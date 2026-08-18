@@ -12,6 +12,8 @@ Invariant test routing: [`invariant-tests.md`](invariant-tests.md)
 
 Mechanism learning ledger: [`mechanism-ledger.md`](mechanism-ledger.md)
 
+Post-E01 evidence baseline: [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -138,7 +140,7 @@ existing strengths every later story must preserve.
 |---|---|---|---|---|
 | E00-S01 — clean implementation baseline | As a maintainer, I want the improvement branch based on one clean committed Kitsu revision so research and implementation claims are reproducible. | Resolve ownership of the ten dirty files; create `improvements/harness-roadmap` only after backlog approval; record base SHA, Rust version, tree status, and research delta; never move or discard user edits implicitly. | Branch/worktree is clean at creation; recorded SHA equals its merge base; dirty `main` remains byte-for-byte and status-for-status unchanged. | 1 cycle |
 | E00-S02 — invariant test manifest | As a maintainer, I want one executable list of the authority, containment, JSONL, session, edit, credential, and cancellation regressions that gate every epic. | Map existing tests before adding new ones; distinguish per-card targeted gates from milestone workspace gates; name platform-specific skips/fail-closed behavior. | Every preserved invariant maps to at least one existing or explicitly missing test; commands run provider-free; manifest links source/test owners. | 1-2 cycles |
-| E00-S03 — live delta audit | As a planner, I want research rebased from `6c713333` to the branch base so completed work is not scheduled twice. | Audit all five boundaries and candidate rows; identify committed retry/context/tool/recovery changes; keep source-backed and runtime-observed labels distinct. | `KITSU_CURRENT_ARCHITECTURE`, `HARNESS_VS_KITSU`, backlog, and program status agree on the same pin and gap status; research audit is clean. | 2-4 cycles |
+| E00-S03 — live delta audit | As a planner, I want research rebased from `6c713333` to the branch base so completed work is not scheduled twice. | Pin the non-versioned research inputs without rewriting their frozen/historical claims; audit all five boundaries and candidate rows; identify committed retry/context/tool/recovery changes; keep source-backed and runtime-observed labels distinct. | Kitsu-owned evidence baseline, current architecture, gap status, backlog, and program status agree on the same pin; frozen research inputs retain content hashes; audit checks pass. | 2-4 cycles |
 | E00-S04 — cycle records | As a reviewer, I want each 30-minute loop to leave a compact decision and verification receipt. | Use the cycle template below; keep raw output out of prose; record incomplete/rejected cards without a production commit. | A script or review check proves every improvement commit has one cycle record naming story, tests, result, and next card. | 1 cycle |
 | E00-S05 — mechanism transfer ledger | As a maintainer, I want every comparative lesson translated into a narrow Kitsu mechanism or explicit rejection so ecosystem breadth cannot smuggle in a plugin model. | Map all ten sources to a gap, safe mechanism, and do-not-copy boundary; name the three spines, dependency-safe order, hard exclusions, and executable gates. | Ledger, epic requirements, milestone order, and cycle queue agree; all local links resolve; no source-backed claim is presented as executed Kitsu evidence. | 1 cycle |
 
