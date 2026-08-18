@@ -4028,18 +4028,21 @@ fn register_base_tools(
     if can_write {
         let (descriptor, handler) =
             builtins::fs::write_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        tools.register_with_descriptor(descriptor, handler);
+        let registration = tools.register_with_descriptor(descriptor, handler);
+        registration.expect("tool name must be unique");
     }
     // Exact-text edits necessarily inspect existing content. Do not advertise
     // that read-modify-write primitive for a genuinely write-only invocation.
     if can_read && can_write {
         let (descriptor, handler) =
             builtins::fs::edit_file_tool_with_journal(perms.clone(), Some(journal.clone()));
-        tools.register_with_descriptor(descriptor, handler);
+        let registration = tools.register_with_descriptor(descriptor, handler);
+        registration.expect("tool name must be unique");
     }
     if !skillset.is_empty() {
         let (d, h) = skills::skill_tool(skillset.clone());
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
     }
     if let Some(commands) = commands {
         builtins::register_command_tool(tools, commands.clone());
@@ -13598,7 +13601,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             sub_system.clone(),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         // Stage B: fan several isolated subagents out in parallel.
         let (d, h) = subagent::spawn_agents_tool(
             setup.provider.clone(),
@@ -13608,7 +13612,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             sub_system.clone(),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         // Stage C: detached background subagent (runs quiet so it doesn't corrupt
         // the prompt) + a tool to fetch its result by id.
         let mut bg_cfg = sub_cfg;
@@ -13623,9 +13628,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
             spawn_budget.clone(),
         );
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
         let (d, h) = subagent::agent_result_tool(agent_registry.clone());
-        tools.register_with_descriptor(d, h);
+        let registration = tools.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
     }
 
     // The model-callable `workspace_diff` evidence tool: a bounded disclosure
@@ -13648,7 +13655,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         if let Some((d, h)) =
             workspace_diff_tool(&launch_dir, private_evidence_paths, &perms, &live_mw)
         {
-            tools.register_with_descriptor(d, h);
+            let registration = tools.register_with_descriptor(d, h);
+            registration.expect("tool name must be unique");
         }
     }
     let tool_names: Vec<String> = tools.descriptors().iter().map(|d| d.name.clone()).collect();

@@ -13,7 +13,8 @@ use crate::Registry;
 /// filesystem permissions and auto-approval never register or authorize it.
 pub fn register_command_tool(registry: &mut Registry, policy: Arc<command::CommandPolicy>) {
     let (descriptor, handler) = command::command_exec_tool(policy);
-    registry.register_with_descriptor(descriptor, handler);
+    let registration = registry.register_with_descriptor(descriptor, handler);
+    registration.expect("tool name must be unique");
 }
 
 /// Register the read fs tools against `registry`, bound to `permissions`.
@@ -21,69 +22,89 @@ pub fn register_command_tool(registry: &mut Registry, policy: Arc<command::Comma
 /// not depend on a developer tool being present on the model runner's PATH.
 pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::read_file_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::list_dir_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_csv_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_pdf_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_xlsx_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_docx_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_pptx_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_notebook_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_html_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_image_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_document_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::scan_file_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::find_symbol_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::outline_file_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::read_manifest_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::audit_summary_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::scan_secrets_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::diff_config_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     #[cfg(unix)]
     {
         let (d, h) = fs::grep_tool(policy);
-        registry.register_with_descriptor(d, h);
+        let registration = registry.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
     }
 
     #[cfg(not(unix))]
     if rg_available() {
         let (d, h) = fs::grep_tool(policy);
-        registry.register_with_descriptor(d, h);
+        let registration = registry.register_with_descriptor(d, h);
+        registration.expect("tool name must be unique");
     }
 }
 
@@ -92,10 +113,12 @@ pub fn register_fs_tools(registry: &mut Registry, policy: Arc<Permissions>) {
 /// are resolved at runtime by the permission mode.
 pub fn register_write_tools(registry: &mut Registry, policy: Arc<Permissions>) {
     let (d, h) = fs::write_file_tool(policy.clone());
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::edit_file_tool(policy);
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 }
 
 /// Register write tools that record exact pre/post images for conflict-aware
@@ -107,10 +130,12 @@ pub fn register_write_tools_with_journal(
     journal: fs::WriteJournal,
 ) {
     let (d, h) = fs::write_file_tool_with_journal(policy.clone(), Some(journal.clone()));
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 
     let (d, h) = fs::edit_file_tool_with_journal(policy, Some(journal));
-    registry.register_with_descriptor(d, h);
+    let registration = registry.register_with_descriptor(d, h);
+    registration.expect("tool name must be unique");
 }
 
 /// Non-Unix builds retain the fixed-argv ripgrep backend and advertise it only

@@ -397,7 +397,7 @@ async fn structured_output_can_be_reserved_for_a_tool_free_finalization_round() 
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "write_result".to_string(),
             description: "write the required result".to_string(),
@@ -405,6 +405,7 @@ async fn structured_output_can_be_reserved_for_a_tool_free_finalization_round() 
         },
         ok_handler(r#"{"changed":true}"#),
     );
+    registration.expect("tool name must be unique");
     let schema = serde_json::json!({
         "type": "object",
         "properties": {"answer": {"type": "string"}},
@@ -534,7 +535,7 @@ async fn exact_output_gate_keeps_tools_available_for_one_bounded_repair() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "write_result".to_string(),
             description: "write the required result".to_string(),
@@ -542,6 +543,7 @@ async fn exact_output_gate_keeps_tools_available_for_one_bounded_repair() {
         },
         ok_handler(r#"{"changed":true}"#),
     );
+    registration.expect("tool name must be unique");
     let response_format = JsonSchemaFormat {
         name: "kitsu_output".to_string(),
         schema: serde_json::json!({"type": "object"}),
@@ -672,7 +674,7 @@ async fn exact_output_gate_does_not_consume_the_only_reserved_finalizer_round() 
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "write_result".to_string(),
             description: "write the required result".to_string(),
@@ -680,6 +682,7 @@ async fn exact_output_gate_does_not_consume_the_only_reserved_finalizer_round() 
         },
         ok_handler(r#"{"changed":true}"#),
     );
+    registration.expect("tool name must be unique");
     let gate_calls = Arc::new(AtomicUsize::new(0));
     let observed_gate_calls = gate_calls.clone();
     let log = AgentEventLog::default();
@@ -765,7 +768,7 @@ async fn deferred_structured_finalization_never_executes_an_unoffered_tool_call(
     let ran = Arc::new(AtomicUsize::new(0));
     let handler_runs = ran.clone();
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "write_result".to_string(),
             description: "write a result".to_string(),
@@ -779,6 +782,7 @@ async fn deferred_structured_finalization_never_executes_an_unoffered_tool_call(
             })
         }),
     );
+    registration.expect("tool name must be unique");
     let mut config = cfg(3);
     config.response_format = Some(JsonSchemaFormat {
         name: "kitsu_output".to_string(),
@@ -812,7 +816,7 @@ async fn deferred_finalization_remeasures_the_changed_response_schema() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "write_result".to_string(),
             description: "write a result".to_string(),
@@ -820,6 +824,7 @@ async fn deferred_finalization_remeasures_the_changed_response_schema() {
         },
         ok_handler(r#"{"changed":true}"#),
     );
+    registration.expect("tool name must be unique");
     let mut config = cfg(3);
     config.context_window = Some(3_000);
     config.response_format = Some(JsonSchemaFormat {
@@ -868,7 +873,8 @@ async fn test_loop_native_single_tool_round() {
     ]);
 
     let mut tools = Registry::new();
-    tools.register("get_time", ok_handler(r#"{"time":"12:00"}"#));
+    let registration = tools.register("get_time", ok_handler(r#"{"time":"12:00"}"#));
+    registration.expect("tool name must be unique");
 
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
@@ -909,7 +915,8 @@ async fn test_loop_max_rounds_cap() {
     ]]);
 
     let mut tools = Registry::new();
-    tools.register("loop_tool", ok_handler(r#"{"ok":true}"#));
+    let registration = tools.register("loop_tool", ok_handler(r#"{"ok":true}"#));
+    registration.expect("tool name must be unique");
 
     let mut state = AgentSessionState::default();
     let result = run_agent_turn_with_state(
@@ -958,7 +965,7 @@ async fn test_final_round_withholds_tools_and_forces_answer() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "loop_tool".to_string(),
             description: "loops".to_string(),
@@ -966,6 +973,7 @@ async fn test_final_round_withholds_tools_and_forces_answer() {
         },
         ok_handler(r#"{"ok":true}"#),
     );
+    registration.expect("tool name must be unique");
 
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(3))
         .await
@@ -1001,7 +1009,7 @@ async fn test_single_round_budget_still_offers_tools() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "loop_tool".to_string(),
             description: "loops".to_string(),
@@ -1009,6 +1017,7 @@ async fn test_single_round_budget_still_offers_tools() {
         },
         ok_handler(r#"{"ok":true}"#),
     );
+    registration.expect("tool name must be unique");
 
     let _ = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(1))
         .await
@@ -1044,7 +1053,8 @@ async fn test_loop_tool_error_fed_back() {
 
     let ran = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
-    tools.register("bad_tool", err_handler(ran.clone()));
+    let registration = tools.register("bad_tool", err_handler(ran.clone()));
+    registration.expect("tool name must be unique");
 
     let mut state = AgentSessionState::default();
     let out = run_agent_turn_with_state(
@@ -1098,7 +1108,7 @@ async fn test_turn_status_separates_policy_denials_from_other_tool_errors() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register(
+    let registration = tools.register(
         "write",
         Box::new(|_| {
             Box::pin(async {
@@ -1108,6 +1118,7 @@ async fn test_turn_status_separates_policy_denials_from_other_tool_errors() {
             })
         }),
     );
+    registration.expect("tool name must be unique");
     let mut state = AgentSessionState::default();
 
     assert_eq!(
@@ -1177,7 +1188,8 @@ async fn test_loop_length_during_tool_call_round() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register("get_time", ok_handler(r#"{"time":"noon"}"#));
+    let registration = tools.register("get_time", ok_handler(r#"{"time":"noon"}"#));
+    registration.expect("tool name must be unique");
 
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
@@ -1200,7 +1212,7 @@ async fn test_descriptors_advertised_to_model() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "fs.read_file".to_string(),
             description: "read a file".to_string(),
@@ -1208,6 +1220,7 @@ async fn test_descriptors_advertised_to_model() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
 
     let mut messages = initial_messages();
     let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
@@ -1229,7 +1242,8 @@ async fn test_no_descriptors_means_no_tools_field() {
         ChatDelta::Done(FinishReason::Stop),
     ]]);
     let mut tools = Registry::new();
-    tools.register("legacy_tool", ok_handler("{}"));
+    let registration = tools.register("legacy_tool", ok_handler("{}"));
+    registration.expect("tool name must be unique");
 
     let mut messages = initial_messages();
     let _ = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
@@ -1320,7 +1334,7 @@ async fn test_max_tokens_default_is_none() {
 /// (the negative tests assert it stays 0).
 fn writing_registry(ran: Arc<AtomicUsize>) -> Registry {
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "fs_write_file".to_string(),
             description: "write a file".to_string(),
@@ -1334,6 +1348,7 @@ fn writing_registry(ran: Arc<AtomicUsize>) -> Registry {
             })
         }),
     );
+    registration.expect("tool name must be unique");
     tools
 }
 
@@ -1354,7 +1369,7 @@ async fn assert_text_protocol_executes(text: &str) {
     let ran = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
     let ran2 = ran.clone();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "fs_write_file".to_string(),
             description: "write a file".to_string(),
@@ -1368,6 +1383,7 @@ async fn assert_text_protocol_executes(text: &str) {
             })
         }),
     );
+    registration.expect("tool name must be unique");
 
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
@@ -1491,7 +1507,7 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
     let ran = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
     let ran2 = ran.clone();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "fs_write_file".to_string(),
             description: "write a file".to_string(),
@@ -1505,6 +1521,7 @@ async fn test_text_protocol_multiple_calls_in_one_turn() {
             })
         }),
     );
+    registration.expect("tool name must be unique");
 
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
@@ -1557,7 +1574,7 @@ async fn identical_successful_repeats_short_circuit_after_limit() {
     let ran = Arc::new(AtomicUsize::new(0));
     let ran2 = ran.clone();
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "echo".to_string(),
             description: "echo".to_string(),
@@ -1571,6 +1588,7 @@ async fn identical_successful_repeats_short_circuit_after_limit() {
             })
         }),
     );
+    registration.expect("tool name must be unique");
     let out = run_agent_turn(&provider, &tools, &mut initial_messages(), &cfg(10))
         .await
         .unwrap();
@@ -1741,7 +1759,7 @@ async fn run_tallies_count_reads_failures_and_denials() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "denied_tool".to_string(),
             description: "always denied".to_string(),
@@ -1753,6 +1771,7 @@ async fn run_tallies_count_reads_failures_and_denials() {
             })
         }),
     );
+    registration.expect("tool name must be unique");
     let tallies = std::sync::Arc::new(RunTallies::default());
     let mut config = cfg(10);
     config.run_tallies = Some(tallies.clone());
@@ -1792,7 +1811,7 @@ async fn spawn_cap_refusals_withhold_spawn_tools_for_the_turn() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "spawn_agent".to_string(),
             description: "spawn".to_string(),
@@ -1807,7 +1826,8 @@ async fn spawn_cap_refusals_withhold_spawn_tools_for_the_turn() {
             })
         }),
     );
-    tools.register_with_descriptor(
+    registration.expect("tool name must be unique");
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "other_tool".to_string(),
             description: "still available".to_string(),
@@ -1815,6 +1835,7 @@ async fn spawn_cap_refusals_withhold_spawn_tools_for_the_turn() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut config = cfg(10);
     config.quiet = true;
@@ -1890,7 +1911,7 @@ impl Provider for FixatedProvider {
 async fn test_loop_breaker_on_repeated_failure() {
     let ran = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "bad_tool".to_string(),
             description: "always fails".to_string(),
@@ -1898,6 +1919,7 @@ async fn test_loop_breaker_on_repeated_failure() {
         },
         err_handler(ran.clone()),
     );
+    registration.expect("tool name must be unique");
     let calls = Arc::new(AtomicUsize::new(0));
     let provider = FixatedProvider {
         calls: calls.clone(),
@@ -2536,13 +2558,14 @@ async fn artifact_free_large_tool_result_is_bounded_before_next_request() {
     );
     let original_bytes = result.len() as u64;
     let mut tools = Registry::new();
-    tools.register(
+    let registration = tools.register(
         "read",
         Box::new(move |_args: String| {
             let result = result.clone();
             Box::pin(async move { Ok::<String, ToolError>(result) })
         }),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut config = cfg(2);
     config.artifact_policy = ArtifactStoragePolicy::InlineOnly;
@@ -2719,7 +2742,7 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
     let content = format!("HEAD{}TAIL", "x".repeat(20_000));
     let messages = initial_messages();
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "fs_read_file".to_string(),
             description: "read a file".to_string(),
@@ -2727,6 +2750,7 @@ fn artifact_policy_and_context_pressure_select_one_retention_path() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
 
     let mut roomy = cfg(10);
     roomy.context_window = Some(131_072);
@@ -2818,7 +2842,7 @@ fn repeated_window_shortfall_drives_retention_without_bypassing_artifact_policy(
     let content = format!("HEAD{}TAIL", "x".repeat(20_000));
     let messages = initial_messages();
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "fs_read_file".to_string(),
             description: "read a file".to_string(),
@@ -2826,6 +2850,7 @@ fn repeated_window_shortfall_drives_retention_without_bypassing_artifact_policy(
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
 
     let mut config = cfg(10);
     config.context_window = Some(32_768);
@@ -2913,7 +2938,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
     let dir = tempfile::tempdir().unwrap();
     let big = "x".repeat(20_000);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "command_exec".to_string(),
             description: "run a command".to_string(),
@@ -2921,6 +2946,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
 
     let mut tight = cfg(10);
     tight.context_window = Some(8_192);
@@ -2940,7 +2966,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         "a command-only model cannot recover an fs_read_file pointer"
     );
 
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "fs_read_file".to_string(),
             description: "read a file".to_string(),
@@ -2948,6 +2974,7 @@ fn command_only_tools_keep_large_results_inline_until_read_tool_is_available() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
     let (pointer, offloaded_to) = maybe_offload_for_tools(
         big,
         "readable",
@@ -3310,7 +3337,7 @@ async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
 
     let mut tools = Registry::new();
     // A large schema (~2000 chars, ~500+ tokens) that alone blows the ~80 target.
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "big_tool".to_string(),
             description: "d".repeat(2000),
@@ -3318,6 +3345,7 @@ async fn enforce_budget_counts_tool_schema_tokens_when_unanchored() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
     let schema_json = serde_json::to_string(tools.descriptors()).unwrap();
 
     let mut msgs = vec![
@@ -3370,7 +3398,7 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
     cfg.max_tokens = None; // reserve=500 -> effective=500 -> buffer=100 -> target=400
 
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "big_tool".to_string(),
             description: "d".repeat(2000), // ~500+ tokens if double-counted
@@ -3378,6 +3406,7 @@ async fn enforce_budget_does_not_double_count_schema_tokens_when_anchored() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
     let schema_json = serde_json::to_string(tools.descriptors()).unwrap();
 
     let mut msgs = vec![ChatMessage::system("sys")];
@@ -3751,7 +3780,7 @@ async fn final_round_nudge_is_budgeted_before_the_second_provider_call() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "clock".to_string(),
             description: String::new(),
@@ -3759,6 +3788,7 @@ async fn final_round_nudge_is_budgeted_before_the_second_provider_call() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
     let mut c = cfg(2);
     c.context_window = Some(400);
     c.max_tokens = Some(64); // target = 160
@@ -3941,7 +3971,8 @@ async fn structured_event_log_frames_provider_usage_tools_and_completion() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register("read", ok_handler(r#"{"ok":true}"#));
+    let registration = tools.register("read", ok_handler(r#"{"ok":true}"#));
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4044,7 +4075,7 @@ async fn structured_event_log_never_emits_synthesized_text_tool_json() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "read".to_string(),
             description: "read".to_string(),
@@ -4052,6 +4083,7 @@ async fn structured_event_log_never_emits_synthesized_text_tool_json() {
         },
         ok_handler(r#"{"ok":true}"#),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(3);
     c.stream = true;
@@ -4094,7 +4126,7 @@ async fn assistant_deltas_exclude_intermediate_structured_tool_narration() {
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "read".to_string(),
             description: "read".to_string(),
@@ -4102,6 +4134,7 @@ async fn assistant_deltas_exclude_intermediate_structured_tool_narration() {
         },
         ok_handler(r#"{"ok":true}"#),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(3);
     c.stream = true;
@@ -4146,12 +4179,13 @@ async fn structured_event_log_uses_native_command_fields_instead_of_json_blobs()
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register(
+    let registration = tools.register(
         "command_exec",
         ok_handler(
             r#"{"argv":["git","status"],"cwd":"/workspace","executable":{"invocation":"git","resolution":"ambient_path","observed_path":"/usr/bin/git","pinned":false},"ambient_authority":{"inherits_environment":true,"filesystem_confined_to_command_roots":false,"network_confined":false,"executable_identity_pinned":false},"termination":"exited","success":true,"exit_code":0,"signal":null,"stdout":"clean","stderr":"","stdout_bytes":5,"stderr_bytes":0,"stdout_retained_bytes":5,"stderr_retained_bytes":0,"stdout_truncated":false,"stderr_truncated":false,"stdout_capture_complete":true,"stderr_capture_complete":true,"elapsed_ms":12,"artifact":{"reference":"session:command-1"},"artifact_error":null}"#,
         ),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4289,7 +4323,7 @@ async fn structured_event_log_marks_normal_tool_errors_as_finished_not_cancelled
         ],
     ]);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "fail".to_string(),
             description: "fail normally".to_string(),
@@ -4297,6 +4331,7 @@ async fn structured_event_log_marks_normal_tool_errors_as_finished_not_cancelled
         },
         err_handler(Arc::new(AtomicUsize::new(0))),
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4341,7 +4376,7 @@ async fn dropping_in_flight_tool_turn_records_one_cancelled_terminal_event() {
         })
     });
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "wait".to_string(),
             description: "wait forever".to_string(),
@@ -4349,6 +4384,7 @@ async fn dropping_in_flight_tool_turn_records_one_cancelled_terminal_event() {
         },
         handler,
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4420,7 +4456,7 @@ async fn dropping_in_flight_command_records_native_cancelled_metadata() {
         })
     });
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "command_exec".to_string(),
             description: "wait forever".to_string(),
@@ -4428,6 +4464,7 @@ async fn dropping_in_flight_command_records_native_cancelled_metadata() {
         },
         handler,
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4506,7 +4543,8 @@ async fn cancelling_real_command_preserves_observed_output_and_executable() {
     policy.grant_command(&argv, dir.path()).unwrap();
     let (descriptor, handler) = command_exec_tool(policy);
     let mut tools = Registry::new();
-    tools.register_with_descriptor(descriptor, handler);
+    let registration = tools.register_with_descriptor(descriptor, handler);
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::default();
     let mut c = cfg(4);
     c.quiet = true;
@@ -4599,7 +4637,7 @@ async fn failed_live_event_sink_stops_before_tool_mutation() {
         })
     });
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         ToolDescriptor {
             name: "mutate".to_string(),
             description: "must not run".to_string(),
@@ -4607,6 +4645,7 @@ async fn failed_live_event_sink_stops_before_tool_mutation() {
         },
         handler,
     );
+    registration.expect("tool name must be unique");
     let log = AgentEventLog::with_fallible_observer(|event| {
         !matches!(event, AgentRuntimeEvent::ToolStarted { .. })
     });
@@ -4657,7 +4696,7 @@ async fn test_recovered_tool_error_clears_final_round_status() {
     ]);
     let calls = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
-    tools.register("flaky", {
+    let registration = tools.register("flaky", {
         let calls = calls.clone();
         Box::new(move |_args: String| {
             let calls = calls.clone();
@@ -4689,6 +4728,7 @@ async fn test_recovered_tool_error_clears_final_round_status() {
         state.last_turn.final_round_tool_errors, 0,
         "the last executed tool round succeeded, so the recovery must be visible"
     );
+    registration.expect("tool name must be unique");
     assert_eq!(state.last_turn.completion, TurnCompletion::Complete);
 }
 
@@ -4708,7 +4748,8 @@ async fn test_unrecovered_tool_error_keeps_final_round_status() {
     ]);
     let ran = Arc::new(AtomicUsize::new(0));
     let mut tools = Registry::new();
-    tools.register("bad_tool", err_handler(ran.clone()));
+    let registration = tools.register("bad_tool", err_handler(ran.clone()));
+    registration.expect("tool name must be unique");
     let mut state = AgentSessionState::default();
     run_agent_turn_with_state(
         &provider,
@@ -5402,7 +5443,7 @@ fn format_command_result_renders_artifact_fields_unquoted() {
 #[test]
 fn test_parse_text_tool_calls_arguments_normalization() {
     let mut tools = Registry::new();
-    tools.register_with_descriptor(
+    let registration = tools.register_with_descriptor(
         kitsu_providers::ToolDescriptor {
             name: "foo".to_string(),
             description: "a no-arg tool".to_string(),
@@ -5410,6 +5451,7 @@ fn test_parse_text_tool_calls_arguments_normalization() {
         },
         ok_handler("{}"),
     );
+    registration.expect("tool name must be unique");
 
     // 1. null arguments → "{}" (NOT the literal string "null")
     let recovery = super::parse_text_tool_calls(r#"{"name":"foo","arguments":null}"#, &tools, &[]);

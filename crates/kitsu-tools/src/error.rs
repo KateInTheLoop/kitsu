@@ -1,5 +1,14 @@
 use thiserror::Error;
 
+/// A registry composition error detected before a tool can be published or
+/// invoked. Registration is transactional: an error leaves the existing entry
+/// unchanged.
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum RegistryError {
+    #[error("duplicate tool registration: {name}")]
+    DuplicateName { name: String },
+}
+
 #[derive(Debug, Error)]
 pub enum ToolError {
     #[error("tool not found: {0}")]
