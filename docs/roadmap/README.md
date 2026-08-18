@@ -335,7 +335,7 @@ gates merely because a card appears attractive.
 | 001 | E00-S01-C1 | Create branch safely, import approved plan/protocol, record clean base and preserved dirty-main status |
 | 002 | E00-S02-C1 | Add invariant test manifest from current tests |
 | 003 | E01-S01-C1 | Add alias/mismatch/ambiguity doctor tests and minimal local-Ollama matcher |
-| 004 | E01-S01-C2 | Wire matcher through human/JSON doctor and close KB-001 gates |
+| 004 | E01-S01-C2 | Add human/JSON doctor fixtures and close KB-001 gates |
 | 005 | E01-S02-C1 | Rebase registry error/types and same-path duplicate tests |
 | 006 | E01-S02-C2 | Add cross-path/no-mutation/composition-boundary propagation |
 | 007 | E01-S03-C1 | Add descriptor/handler and unused-result coupling gates; close E01 |
