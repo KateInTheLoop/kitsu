@@ -60,6 +60,13 @@ static RUN_STARTED_AT: OnceLock<Instant> = OnceLock::new();
 /// Set only by inference-capable commands, keeping management/help output free
 /// of an unrelated timing footer.
 static MODEL_COMMAND_ACTIVE: AtomicBool = AtomicBool::new(false);
+/// Distinguishes structurally child-free inference preflight from a carrier
+/// that has begun a provider turn. Only the former may use the top-level
+/// fallback's `Joined` cleanup fact without guessing.
+static MODEL_INFERENCE_STARTED: AtomicBool = AtomicBool::new(false);
+/// One phase owner for the inference-capable process run. Carrier helpers must
+/// advance this instance instead of constructing presentation-local owners.
+static PROCESS_RUN_LIFECYCLE: OnceLock<Mutex<kitsu_core::RunLifecycle>> = OnceLock::new();
 /// Set only when `--allow-turn-errors` converts a scripted run with both a
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
@@ -198,6 +205,19 @@ fn run_id() -> &'static str {
     run_spec().run_id().as_str()
 }
 
+fn process_run_lifecycle() -> &'static Mutex<kitsu_core::RunLifecycle> {
+    PROCESS_RUN_LIFECYCLE.get_or_init(|| Mutex::new(kitsu_core::RunLifecycle::accept(run_spec())))
+}
+
+fn activate_model_command() {
+    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
+    let _ = process_run_lifecycle();
+}
+
+fn mark_model_inference_started() {
+    MODEL_INFERENCE_STARTED.store(true, Ordering::Release);
+}
+
 fn run_elapsed() -> Duration {
     RUN_STARTED_AT.get_or_init(Instant::now).elapsed()
 }
@@ -334,6 +354,7 @@ fn jsonl_summary_outcome(
 /// lifecycle. `ask` has no tools/children or session store, making Joined and
 /// NotRequested structural facts rather than carrier guesses. The delivery
 /// closure is injectable so provider-free tests can cut the sink boundary.
+#[cfg(test)]
 fn finalize_terminal_with_delivery<E>(
     outcome: kitsu_core::RunOutcomeClass,
     assistant: kitsu_core::RunAssistantDisposition,
@@ -342,6 +363,24 @@ fn finalize_terminal_with_delivery<E>(
     deliver: impl FnOnce() -> Result<(), E>,
 ) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
     let mut lifecycle = kitsu_core::RunLifecycle::accept(run_spec());
+    finalize_owned_terminal_with_delivery(
+        &mut lifecycle,
+        outcome,
+        assistant,
+        cleanup,
+        persistence,
+        deliver,
+    )
+}
+
+fn finalize_owned_terminal_with_delivery<E>(
+    lifecycle: &mut kitsu_core::RunLifecycle,
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
     lifecycle.settle(outcome, assistant)?;
     lifecycle.join(cleanup)?;
     lifecycle.persist(persistence)?;
@@ -355,6 +394,27 @@ fn finalize_terminal_with_delivery<E>(
     Ok((published, delivery))
 }
 
+fn finalize_process_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    let mut lifecycle = process_run_lifecycle()
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner);
+    finalize_owned_terminal_with_delivery(
+        &mut lifecycle,
+        outcome,
+        assistant,
+        cleanup,
+        persistence,
+        deliver,
+    )
+}
+
+#[cfg(test)]
 fn finalize_ask_terminal_with_delivery<E>(
     outcome: kitsu_core::RunOutcomeClass,
     assistant: kitsu_core::RunAssistantDisposition,
@@ -381,20 +441,59 @@ fn emit_ask_jsonl_summary_with_local_failures(
 ) -> Result<(), CliError> {
     let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
     let assistant = run_assistant_disposition();
-    let (published, delivery) = finalize_ask_terminal_with_delivery(outcome, assistant, || {
-        emit_jsonl_summary_with_local_failures(
-            status,
-            failures,
-            provider_failures,
-            output_schema_failures,
-            tool_failures,
-            policy_failures,
-            tool_error_totals,
-        )
-    })
+    let (published, delivery) = finalize_process_terminal_with_delivery(
+        outcome,
+        assistant,
+        kitsu_core::RunCleanupState::Joined,
+        kitsu_core::RunPersistenceState::NotRequested,
+        || {
+            emit_jsonl_summary_with_local_failures(
+                status,
+                failures,
+                provider_failures,
+                output_schema_failures,
+                tool_failures,
+                policy_failures,
+                tool_error_totals,
+            )
+        },
+    )
     .map_err(|error| CliError::user(format!("internal ask finalization failed: {error}")))?;
     debug_assert_eq!(published.terminal().class(), outcome);
     debug_assert_eq!(published.terminal().assistant(), assistant);
+    delivery
+}
+
+fn publish_early_inference_jsonl_terminal(error: &CliError) -> Result<(), CliError> {
+    debug_assert!(MODEL_COMMAND_ACTIVE.load(Ordering::Acquire));
+    debug_assert!(!MODEL_INFERENCE_STARTED.load(Ordering::Acquire));
+    let outcome = error.outcome_class();
+    let assistant = run_assistant_disposition();
+    let persistence = jsonl_session_persistence_state();
+    let cancelled = error.exit_code() == EXIT_CANCELLED;
+    let (published, delivery) = finalize_process_terminal_with_delivery(
+        outcome,
+        assistant,
+        kitsu_core::RunCleanupState::Joined,
+        persistence,
+        || {
+            emit_jsonl("error", error.jsonl_error_payload())?;
+            emit_jsonl_summary(
+                if cancelled { "cancelled" } else { "error" },
+                1,
+                usize::from(error.exit_code() == EXIT_PROVIDER),
+            )
+        },
+    )
+    .map_err(|phase_error| {
+        CliError::user(format!(
+            "internal early inference finalization failed: {phase_error}"
+        ))
+    })?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    debug_assert_eq!(published.cleanup(), kitsu_core::RunCleanupState::Joined);
+    debug_assert_eq!(published.persistence(), persistence);
     delivery
 }
 
@@ -410,7 +509,7 @@ fn publish_piped_jsonl_terminal(
     let assistant = run_assistant_disposition();
     let persistence = jsonl_session_persistence_state();
     let (published, delivery) =
-        finalize_terminal_with_delivery(outcome, assistant, cleanup, persistence, deliver)
+        finalize_process_terminal_with_delivery(outcome, assistant, cleanup, persistence, deliver)
             .map_err(|error| {
                 CliError::user(format!("internal piped finalization failed: {error}"))
             })?;
@@ -589,6 +688,16 @@ fn validate_output_schema_surface(cli: &Cli) -> Result<(), CliError> {
     OUTPUT_SCHEMA
         .set(schema)
         .map_err(|_| CliError::user("--output-schema was initialized more than once".to_string()))
+}
+
+fn inference_command_requested(cli: &Cli) -> bool {
+    cli.print_prompt.is_some()
+        || matches!(
+            cli.command.as_ref(),
+            None | Some(Command::Ask { .. })
+                | Some(Command::Review { .. })
+                | Some(Command::Chat { .. })
+        )
 }
 
 fn active_output_schema() -> Option<&'static structured_output::OutputSchema> {
@@ -1293,15 +1402,24 @@ fn main() {
                 if jsonl_output_failure().is_none()
                     && !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire)
                 {
-                    let cancelled = e.exit_code() == EXIT_CANCELLED;
-                    let frame_result =
+                    let frame_result = if MODEL_COMMAND_ACTIVE.load(Ordering::Acquire)
+                        && !MODEL_INFERENCE_STARTED.load(Ordering::Acquire)
+                    {
+                        // Before the first provider turn no child can exist;
+                        // active snapshot truth is already available from the
+                        // session receipt. Publish this inference preflight
+                        // failure through the same process owner as carriers.
+                        publish_early_inference_jsonl_terminal(&e)
+                    } else {
+                        let cancelled = e.exit_code() == EXIT_CANCELLED;
                         emit_jsonl("error", e.jsonl_error_payload()).and_then(|()| {
                             emit_jsonl_summary(
                                 if cancelled { "cancelled" } else { "error" },
                                 1,
                                 usize::from(e.exit_code() == EXIT_PROVIDER),
                             )
-                        });
+                        })
+                    };
                     // `jsonl_output_failure` below reports the retained
                     // terminal error exactly once when framing itself fails.
                     let _ = frame_result;
@@ -1473,6 +1591,11 @@ fn run() -> Result<(), CliError> {
         },
     };
     kitsu_render::configure_terminal_modes(cli.plain, cli.reduced_motion, cli.screen_reader);
+    if inference_command_requested(&cli) {
+        // Accept the process lifecycle before output/config/runtime preflight,
+        // not only after a carrier has successfully built its provider.
+        activate_model_command();
+    }
     validate_output_last_message_surface(&cli)?;
     OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
     validate_output_schema_surface(&cli)?;
@@ -8588,7 +8711,6 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
-    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let setup = build_setup(cli).await?;
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
@@ -11389,7 +11511,7 @@ async fn finalize_scripted_run(
             )?;
             let assistant = run_assistant_disposition();
             let persistence = jsonl_session_persistence_state();
-            let (published, delivery) = finalize_terminal_with_delivery(
+            let (published, delivery) = finalize_process_terminal_with_delivery(
                 outcome,
                 assistant,
                 cleanup_state,
@@ -13276,6 +13398,7 @@ async fn run_turn_cancellable(
     cfg: &AgentConfig,
     state: &mut kitsu_core::AgentSessionState,
 ) -> TurnOutcome {
+    mark_model_inference_started();
     match await_cancellable(run_agent_turn_with_state(
         provider, tools, messages, cfg, state,
     ))
@@ -13309,6 +13432,7 @@ async fn run_turn_steerable(
     turn: prompt_queue::SteeringTurnId,
     mut corrections: prompt_queue::SteeringReceiver,
 ) -> InteractiveTurnOutcome {
+    mark_model_inference_started();
     debug_assert_eq!(corrections.turn(), turn);
     FOREGROUND_CANCELLED.store(false, Ordering::Release);
     ACTIVE_QUIT_CANCEL.store(false, Ordering::Release);
@@ -13358,7 +13482,6 @@ async fn run_turn_steerable(
 }
 
 async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliError> {
-    MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let ChatInvocation {
         first_prompt,
         no_tools,
@@ -18358,6 +18481,81 @@ mod tests {
         );
         assert_eq!(published.delivery(), kitsu_core::RunDeliveryState::Failed);
         assert!(!published.is_clean_success());
+    }
+
+    #[test]
+    fn process_terminal_helper_rejects_a_second_cross_path_publication() {
+        let spec = kitsu_core::RunSpec::new(
+            kitsu_core::RunId::new("shared-process-owner").expect("valid fixture identity"),
+        );
+        let mut lifecycle = kitsu_core::RunLifecycle::accept(&spec);
+        let deliveries = std::cell::Cell::new(0);
+
+        let (_, first_delivery) = finalize_owned_terminal_with_delivery(
+            &mut lifecycle,
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            kitsu_core::RunCleanupState::Joined,
+            kitsu_core::RunPersistenceState::NotRequested,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect("first carrier publishes");
+        assert!(first_delivery.is_ok());
+
+        let duplicate = finalize_owned_terminal_with_delivery(
+            &mut lifecycle,
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+            kitsu_core::RunCleanupState::Joined,
+            kitsu_core::RunPersistenceState::NotRequested,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect_err("another carrier cannot publish the process terminal again");
+
+        assert_eq!(deliveries.get(), 1, "rejected publication cannot deliver");
+        assert_eq!(
+            duplicate,
+            kitsu_core::RunPhaseError::AfterTerminal {
+                attempted: kitsu_core::RunPhase::Settled,
+            }
+        );
+    }
+
+    #[test]
+    fn process_terminal_owner_is_reserved_only_for_inference_commands() {
+        for argv in [
+            vec!["kitsu"],
+            vec!["kitsu", "ask", "hello"],
+            vec!["kitsu", "review"],
+            vec!["kitsu", "chat"],
+            vec!["kitsu", "-p", "hello"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("inference command parses");
+            assert!(
+                inference_command_requested(&cli),
+                "expected inference command: {argv:?}"
+            );
+        }
+
+        for argv in [
+            vec!["kitsu", "init"],
+            vec!["kitsu", "doctor"],
+            vec!["kitsu", "models"],
+            vec!["kitsu", "sessions"],
+            vec!["kitsu", "artifacts"],
+        ] {
+            let cli = Cli::try_parse_from(argv.clone()).expect("management command parses");
+            assert!(
+                !inference_command_requested(&cli),
+                "management command cannot reserve inference lifecycle: {argv:?}"
+            );
+        }
     }
 
     #[test]

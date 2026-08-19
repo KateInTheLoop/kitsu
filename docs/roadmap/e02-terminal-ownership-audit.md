@@ -1,6 +1,7 @@
 # E02 Terminal Ownership Audit
 
-Status: Cycle 023 evidence; E02 remains open and is decomposed below.
+Status: Cycle 023 evidence; C6 process ownership accepted in Cycle 024; E02
+remains open for C7/C8 and exit evaluation.
 
 ## Scope decision
 
@@ -58,7 +59,7 @@ management commands.
 
 | Card | Requirement | Acceptance gate |
 |---|---|---|
-| E02-S03-C6 — process terminal owner | Accept one lifecycle before inference work; every migrated finalizer uses the same owner; a second/cross-path publication is rejected; early inference fallback publishes with structurally truthful facts. | Provider-free duplicate/cross-path and preflight cuts prove exactly one publication and zero work after it. |
+| E02-S03-C6 — process terminal owner (accepted Cycle 024) | Accept one lifecycle before inference work; every migrated finalizer uses the same owner; a second/cross-path publication is rejected; early inference fallback publishes with structurally truthful facts. | Provider-free duplicate/cross-path and preflight cuts prove exactly one publication and zero work after it. |
 | E02-S03-C7 — presentation-neutral facts | Carry semantic, cleanup, persistence, and delivery inputs independently of JSONL; migrate human ask/review/piped/scripted without changing their text or JSONL v1. | Human/JSONL paired fixtures agree on terminal fields; blocked delivery never reclassifies settlement. |
 | E02-S03-C8 — interactive aggregate | Define process aggregation for successful, failed, cancelled, interrupted, retried, and queued turns; join background work and type session persistence before publication. | PTY fixtures cover clean exit, recoverable fault then exit, active/queued cancel, authority EOF, residue, and save failure. |
 | E02-S04-C2 — exit evaluation | Run the independent seven-carrier matrix against the process owner and close E02 only if every applicable phase/exit cell is observed. | X004 evaluation receipt, exact exits, one terminal, no silent cells; otherwise one evidence-backed residual card. |

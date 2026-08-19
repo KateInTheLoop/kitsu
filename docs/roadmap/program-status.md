@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00 and E01 accepted; E02 in progress through Cycle 023 on
+Status: E00 and E01 accepted; E02 in progress through Cycle 024 on
 `improvements/harness-roadmap`.
 
 | Field | Current value |
@@ -8,7 +8,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 023 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 23 / 23 |
+| Accepted cycles/commits after this cycle | 24 / 24 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
@@ -20,7 +20,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 023 on
 |---|---|---|
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
-| E02 causal run/outcome | **In progress** | E02-S01/S02 accepted; local ask/scripted/piped JSONL publication is green; Cycle 023 proves process-singleton, early-fallback, human-phase, and interactive-aggregate gates remain |
+| E02 causal run/outcome | **In progress** | One process owner now covers migrated JSONL carriers and child-free inference fallback; human-phase, post-start fallback, interactive aggregate, and exit-evaluation gates remain |
 | E04 provider spine | Planned after E02 | Primary wire fixtures, capability types, `X001-G1-AUX`, distinct compiled dialect |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
@@ -55,11 +55,12 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 023 on
 | 020 | `2e8a20c` | Live ask lifecycle publication across successful/failed JSONL delivery |
 | 021 | `c6d5144` | Scripted lifecycle publication with actual cleanup and persistence truth |
 | 022 | `6ed375b` | Piped terminal lifecycle with status-preserving rollback cleanup |
-| 023 | this document's commit | E02 terminal-ownership audit and evidence-backed exit decomposition |
+| 023 | `46dfde6` | E02 terminal-ownership audit and evidence-backed exit decomposition |
+| 024 | this document's commit | Process-singleton lifecycle and truthful child-free inference fallback |
 
 ## Current green gates
 
-- Affected runtime suites: 221 `kitsu-tools`, 315 Kitsu binary, 202 CLI, six
+- Affected runtime suites: 221 `kitsu-tools`, 317 Kitsu binary, 202 CLI, six
   carrier-matrix, 73 renderer, and 155 `kitsu-core` tests (147 unit plus eight
   neutral run-contract tests), zero failures.
 - Workspace/all-target check passes with ordinary flags and with
@@ -86,9 +87,10 @@ live lifecycle carrier. Cycle 021 adds scripted cleanup/persistence truth
 without inferring from exit or session ID; Cycle 022 applies that seam to every
 piped JSONL terminal branch. Cycle 023 proves that those helpers still own
 separate lifecycle instances and that early inference fallback plus human paths
-bypass phase publication. Cycles 024-027 add one process owner, carry neutral
-facts through human noninteractive paths, define interactive aggregation, and
-run the independent exit evaluation before provider work begins.
+bypass phase publication. Cycle 024 adds the one process owner and child-free
+fallback cut. Cycles 025-027 carry neutral facts through human noninteractive
+paths, define interactive aggregation, and run the independent exit evaluation
+before provider work begins.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
