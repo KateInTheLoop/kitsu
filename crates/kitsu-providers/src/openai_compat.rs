@@ -11,8 +11,12 @@ use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
 use serde::{Deserialize, Serialize};
 
-use crate::auth::AuthProvider;
-use crate::error::{ProviderError, ProviderResponsePart};
+use crate::auth::{AuthProvider, FrozenAuth};
+use crate::error::{AuthError, ProviderError, ProviderResponsePart};
+use crate::route::{
+    ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
+    ProviderRouteSnapshot,
+};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
@@ -60,6 +64,73 @@ pub struct OpenAICompatConfig {
     pub retries: u32,
     /// End-to-end inference budget, including all retry sleeps and attempts.
     pub timeout: Duration,
+}
+
+/// Consumed composition input for one immutable compatible-Chat generation.
+/// It is intentionally not `Clone`, `Debug`, or serializable: endpoint and
+/// auth-bearing construction values must not become diagnostic payloads.
+pub struct OpenAICompatRouteConfig {
+    pub declaration: ProviderRouteDeclaration,
+    pub model: String,
+    pub auth_source: ProviderAuthSource,
+    pub base_url: String,
+    pub chat_path: String,
+    pub models_path: Option<String>,
+    pub policy: ProviderRoutePolicy,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum OpenAICompatRouteBuildError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Contract(#[from] ProviderRouteContractError),
+}
+
+/// Resolve auth once and construct both physical runtimes from one consumed
+/// route input. Inference and catalog can have distinct retry/cache budgets,
+/// but can no longer drift in endpoint, paths, credential generation, model,
+/// declaration, or source identity through independent CLI construction.
+pub fn build_openai_compatible_route(
+    config: OpenAICompatRouteConfig,
+    auth: &dyn AuthProvider,
+) -> Result<ProviderRouteSnapshot<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    let frozen_auth: Arc<dyn AuthProvider> = Arc::new(FrozenAuth::resolve(auth)?);
+    let inference = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url.clone(),
+                chat_path: config.chat_path.clone(),
+                models_path: config.models_path.clone(),
+                retries: config.policy.inference_retries(),
+                timeout: config.policy.inference_timeout(),
+            },
+            frozen_auth.clone(),
+        )
+        .with_discovery_timeout(config.policy.advisory_discovery_timeout()),
+    );
+    let catalog = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url,
+                chat_path: config.chat_path,
+                models_path: config.models_path,
+                retries: config.policy.catalog_retries(),
+                timeout: config.policy.catalog_timeout(),
+            },
+            frozen_auth,
+        )
+        .with_discovery_timeout(config.policy.catalog_timeout()),
+    );
+    ProviderRouteSnapshot::initial(
+        config.declaration,
+        config.model,
+        config.auth_source,
+        config.policy,
+        inference,
+        catalog,
+    )
+    .map_err(Into::into)
 }
 
 impl OpenAICompatProvider {

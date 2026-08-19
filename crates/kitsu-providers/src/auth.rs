@@ -28,6 +28,51 @@ pub trait AuthProvider: Send + Sync {
     }
 }
 
+/// Credential material resolved exactly once for one immutable route
+/// generation. The raw header bytes are zeroized on drop and every request
+/// receives a fresh sensitive `HeaderValue`; later environment or managed-store
+/// changes cannot alter an already admitted retry or auxiliary call.
+pub struct FrozenAuth {
+    header: Option<(HeaderName, Zeroizing<Vec<u8>>)>,
+    expiry_status: ExpiryStatus,
+    refresh_hint: Option<String>,
+}
+
+impl FrozenAuth {
+    pub fn resolve(source: &dyn AuthProvider) -> Result<Self, AuthError> {
+        let header = source
+            .header()?
+            .map(|(name, value)| (name, Zeroizing::new(value.as_bytes().to_vec())));
+        Ok(Self {
+            header,
+            expiry_status: source.expiry_status(),
+            refresh_hint: source.refresh_hint(),
+        })
+    }
+}
+
+impl AuthProvider for FrozenAuth {
+    fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
+        self.header
+            .as_ref()
+            .map(|(name, raw)| {
+                let mut value = HeaderValue::from_bytes(raw.as_slice())
+                    .expect("a header value validated before route publication remains valid");
+                value.set_sensitive(true);
+                (name.clone(), value)
+            })
+            .map_or(Ok(None), |header| Ok(Some(header)))
+    }
+
+    fn expiry_status(&self) -> ExpiryStatus {
+        self.expiry_status.clone()
+    }
+
+    fn refresh_hint(&self) -> Option<String> {
+        self.refresh_hint.clone()
+    }
+}
+
 /// Reads a bearer token from an environment variable at request time.
 /// Defaults: `env = "ANTHROPIC_AUTH_TOKEN"`, `expires_env = "ANTHROPIC_TOKEN_EXPIRES"`,
 /// `header = "Authorization"`, `scheme = "Bearer"`.

@@ -33,11 +33,15 @@ use kitsu_core::context::{
 };
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
-use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
+use kitsu_providers::openai_compat::{
+    build_openai_compatible_route, OpenAICompatConfig, OpenAICompatProvider,
+    OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
+};
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
-    ProviderError, ProviderProfileId, ProviderRouteContractError, ProviderRouteDeclaration,
-    ProviderTelemetrySink,
+    ProviderAuthSource, ProviderCatalogPolicy, ProviderError, ProviderProfileId,
+    ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
+    ProviderRouteSnapshot, ProviderTelemetrySink,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -4254,10 +4258,11 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
 struct ChatSetup {
     /// `Arc` so the main loop and spawned subagents can share one connection.
     provider: Arc<OpenAICompatProvider>,
-    /// Truthful declaration retained for the next E04 generation/admission
-    /// card. It is intentionally not exposed as a receipt until physical sends
-    /// are actually bound to a published generation.
-    _provider_route_declaration: ProviderRouteDeclaration,
+    /// Immutable owner of the declaration, initial generation, model,
+    /// credential source, runtime policy, and both provider instances. Existing
+    /// call sites temporarily use Arc clones below; later E04 cards make send
+    /// admission and receipts consume this owner directly.
+    provider_route_snapshot: ProviderRouteSnapshot<OpenAICompatProvider>,
     /// User-requested model catalog operations get the full CLI timeout and a
     /// cache isolated from the two-second advisory startup probe. Otherwise a
     /// startup timeout's shared negative cache could make an immediate
@@ -4269,7 +4274,6 @@ struct ChatSetup {
     state_dir: std::path::PathBuf,
     endpoint: String,
     auth_status: String,
-    model: String,
     /// Config-level opt-out for the model-callable `workspace_diff` evidence
     /// tool (docs/workspace-diff-tool.md). Defaults to enabled.
     workspace_evidence: bool,
@@ -8255,6 +8259,34 @@ fn current_provider_route_declaration(
     ))
 }
 
+/// Identify the credential source that the immediately following auth freeze
+/// will resolve. Missing or malformed credentials fail before a snapshot is
+/// returned, so only successful values can become a route receipt.
+fn current_provider_auth_source(
+    gateway: &Gateway,
+    managed_token_available: bool,
+) -> ProviderAuthSource {
+    match gateway.auth.method.as_str() {
+        "none" => ProviderAuthSource::None,
+        "static" => ProviderAuthSource::StaticConfiguration,
+        "bearer-env" => {
+            let environment_selected = std::env::var_os(&gateway.auth.env)
+                .and_then(|value| value.into_string().ok())
+                .is_some_and(|value| !value.trim().is_empty());
+            if environment_selected {
+                ProviderAuthSource::Environment
+            } else if managed_token_available {
+                ProviderAuthSource::ManagedCredential
+            } else {
+                // The freeze will return the existing typed missing/malformed
+                // auth error; this placeholder is never published.
+                ProviderAuthSource::Environment
+            }
+        }
+        _ => ProviderAuthSource::None,
+    }
+}
+
 /// Location used by builds before profile keys became a stable on-disk
 /// contract. Kept only so this release can migrate existing development data.
 fn legacy_profile_dir(base: &std::path::Path, config_path: &std::path::Path) -> std::path::PathBuf {
@@ -8586,6 +8618,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         .resolve_model(cli.model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
     let managed_token = managed_credential(&state_dir, &gateway_name, gateway)?;
+    let provider_auth_source = current_provider_auth_source(gateway, managed_token.is_some());
 
     let auth_status = match gateway.auth.method.as_str() {
         "none" => "none (no credential required)".to_string(),
@@ -8593,12 +8626,10 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         "bearer-env" => format!(
             "bearer-env {} (source: {})",
             gateway.auth.env,
-            if environment_override_present(gateway) {
-                "environment"
-            } else if managed_token.is_some() {
-                "managed"
-            } else {
-                "missing"
+            match provider_auth_source {
+                ProviderAuthSource::Environment => "environment",
+                ProviderAuthSource::ManagedCredential => "managed",
+                ProviderAuthSource::None | ProviderAuthSource::StaticConfiguration => "missing",
             }
         ),
         other => other.to_string(),
@@ -8607,36 +8638,50 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     let auth = build_auth(gateway, &gateway_name, managed_token)
         .map_err(|e| CliError::user(e.to_string()))?;
-    require_auth_ready(auth.as_ref(), ProviderOperation::Chat { model: &model })?;
     let models_path = gateway.models_path.clone().filter(|p| !p.is_empty());
     let context_window_refresh = ContextWindowRefreshConfig {
         cache_path: context_window_cache_path(&state_dir),
         base_url: gateway.base_url.clone(),
         models_path: models_path.clone(),
     };
-    let provider = Arc::new(OpenAICompatProvider::new(
-        OpenAICompatConfig {
+    let catalog_policy = if models_path.is_some() {
+        ProviderCatalogPolicy::Configured
+    } else {
+        ProviderCatalogPolicy::Unavailable
+    };
+    let route_policy = ProviderRoutePolicy::new(
+        2,
+        0,
+        Duration::from_secs(cli.timeout_secs),
+        Duration::from_secs(cli.timeout_secs),
+        Duration::from_secs(2),
+        catalog_policy,
+    )
+    .map_err(|error| CliError::user(format!("config error: invalid provider policy: {error}")))?;
+    let provider_route_snapshot = build_openai_compatible_route(
+        OpenAICompatRouteConfig {
+            declaration: provider_route_declaration,
+            model: model.clone(),
+            auth_source: provider_auth_source,
             base_url: gateway.base_url.clone(),
             chat_path: gateway.chat_path.clone(),
             models_path: models_path.clone(),
-            retries: 2,
-            timeout: Duration::from_secs(cli.timeout_secs),
+            policy: route_policy,
         },
-        auth.clone(),
-    ));
-    let catalog_provider = Arc::new(
-        OpenAICompatProvider::new(
-            OpenAICompatConfig {
-                base_url: gateway.base_url.clone(),
-                chat_path: gateway.chat_path.clone(),
-                models_path: models_path.clone(),
-                retries: 0,
-                timeout: Duration::from_secs(cli.timeout_secs),
-            },
-            auth.clone(),
-        )
-        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs)),
-    );
+        auth.as_ref(),
+    )
+    .map_err(|error| match error {
+        OpenAICompatRouteBuildError::Auth(error) => map_provider_error(
+            ProviderError::Auth(error),
+            ProviderOperation::Chat { model: &model },
+            None,
+        ),
+        OpenAICompatRouteBuildError::Contract(error) => {
+            CliError::user(format!("config error: invalid provider route: {error}"))
+        }
+    })?;
+    let provider = provider_route_snapshot.inference_runtime().clone();
+    let catalog_provider = provider_route_snapshot.catalog_runtime().clone();
 
     if let kitsu_providers::ExpiryStatus::Expired { since } = auth.expiry_status() {
         eprintln!(
@@ -8731,7 +8776,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     Ok(ChatSetup {
         provider,
-        _provider_route_declaration: provider_route_declaration,
+        provider_route_snapshot,
         catalog_provider,
         gateway_name,
         provider_diagnostics,
@@ -8739,7 +8784,6 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         state_dir,
         endpoint,
         auth_status,
-        model,
         workspace_evidence: config.workspace_evidence.unwrap_or(true),
         agent_spawn_cap: config.agent_spawn_cap,
         artifact_policy,
@@ -9041,6 +9085,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         persistence: kitsu_core::RunPersistenceState::NotRequested,
     })?;
     let setup = build_setup(cli).await?;
+    let model = setup.provider_route_snapshot.model().to_string();
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
             "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
@@ -9088,7 +9133,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     messages.push(ChatMessage::user(prompt));
     let tools = Registry::new();
     let mut agent_cfg = build_agent_config(
-        setup.model.clone(),
+        model.clone(),
         cli,
         setup.context_window,
         None,
@@ -9104,7 +9149,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             serde_json::json!({
                 "mode": "ask",
                 "gateway": setup.gateway_name,
-                "model": setup.model,
+                "model": model.clone(),
                 "artifact_policy": artifact_policy_receipt(
                     setup.artifact_policy,
                     setup.artifact_policy_source,
@@ -9230,9 +9275,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             let cause = agent_error_jsonl_cause(&error);
             let mapped = map_agent_error_with_diagnostics(
                 error,
-                ProviderOperation::Chat {
-                    model: &setup.model,
-                },
+                ProviderOperation::Chat { model: &model },
                 Some(cli.timeout_secs),
                 setup.provider_diagnostics,
             );
@@ -13854,6 +13897,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         initial_review,
     } = invocation;
     let setup = build_setup(cli).await?;
+    let initial_model = setup.provider_route_snapshot.model().to_string();
 
     // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode
     // (prompt on demand) with read access to the launch directory by default;
@@ -14316,7 +14360,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // (see the loop below) so a subagent never runs the session's initial model
     // against a stale window.
     let live_mw: subagent::LiveModelWindow = Arc::new(std::sync::Mutex::new((
-        setup.model.clone(),
+        initial_model.clone(),
         setup.context_window,
     )));
     // Registry of BACKGROUND subagents (Stage C), shared with the spawn_agent_bg /
@@ -14364,7 +14408,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         )?;
     }
     let mut sub_cfg = build_agent_config(
-        setup.model.clone(),
+        initial_model.clone(),
         cli,
         setup.context_window,
         None,
@@ -14502,7 +14546,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             None
         };
 
-    let mut model = setup.model.clone();
+    let mut model = initial_model;
     // Shared with session UI state and updated in place by `/model`, so
     // switching models doesn't leave every subsequent turn budgeting against
     // the OLD model's window — a stale, larger window would under-trim and the
@@ -21649,6 +21693,45 @@ mod tests {
                 .unwrap()
                 .profile(),
             reference.profile()
+        );
+    }
+
+    #[test]
+    #[serial]
+    fn provider_auth_source_matches_the_credential_that_route_freezing_selects() {
+        const ROUTE_AUTH_ENV: &str = "KITSU_TEST_ROUTE_AUTH_SOURCE";
+        let _guard = EnvVarGuard::set(ROUTE_AUTH_ENV, "environment-token");
+        let mut gateway = Gateway {
+            flavor: "openai".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: None,
+            model: Some("model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+        gateway.auth.env = ROUTE_AUTH_ENV.to_string();
+
+        assert_eq!(
+            current_provider_auth_source(&gateway, true),
+            ProviderAuthSource::Environment
+        );
+        std::env::set_var(ROUTE_AUTH_ENV, " \t");
+        assert_eq!(
+            current_provider_auth_source(&gateway, true),
+            ProviderAuthSource::ManagedCredential,
+            "whitespace-only environment values select managed fallback"
+        );
+
+        gateway.auth.method = "static".to_string();
+        assert_eq!(
+            current_provider_auth_source(&gateway, false),
+            ProviderAuthSource::StaticConfiguration
+        );
+        gateway.auth.method = "none".to_string();
+        assert_eq!(
+            current_provider_auth_source(&gateway, false),
+            ProviderAuthSource::None
         );
     }
 

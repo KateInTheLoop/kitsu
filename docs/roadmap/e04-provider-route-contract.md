@@ -1,9 +1,11 @@
 # Provider route value contract
 
-Status: E04-S02 accepted through Cycle 033. Cycle 032 establishes the value
-contract; Cycle 033 derives opaque profile identity and makes live composition
-retain the truthful declaration. Generation publication and physical send
-binding remain E04-S03 work.
+Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 034.
+Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
+identity and makes live composition retain the truthful declaration. Cycle 034
+constructs one initial immutable snapshot with both compatible-Chat runtimes
+and a credential resolved once for that generation. Current-generation send
+admission, replacement, draining, and attempt receipts remain E04-S03 work.
 
 ## Decision
 
@@ -48,6 +50,17 @@ compatible-Chat implementation it actually constructs.
   and adapter/wire mismatches.
 - `validate_for_send` rejects a stale generation before examining capabilities;
   a missing capability also rejects. Both outcomes precede physical send.
+- `ProviderRoutePolicy` freezes inference/catalog retries, their nonzero time
+  budgets, the bounded advisory discovery budget, and whether a model catalog
+  is configured. Catalog policy must agree exactly with the declared
+  `model_catalog` capability.
+- `ProviderRouteSnapshot<P>` owns the initial generation, bounded nonempty
+  model ID, secret-free auth source class, policy, and both provider-specific
+  runtimes. The runtime snapshot is intentionally neither serializable nor
+  debuggable; endpoint, paths, caches, and sensitive auth remain inside `P`.
+- `FrozenAuth` resolves a sensitive header once into zeroizing storage. All
+  inference retries and catalog calls owned by the snapshot share that same
+  auth object; later environment changes cannot alter an admitted generation.
 
 The exact v1 JSON vector and all validation cuts are pinned by
 `provider_route_contract.rs`. The provider wire matrix consumes the same
@@ -56,24 +69,26 @@ production capability vocabulary for its unsupported-image zero-send case.
 ## Boundary and non-goals
 
 Cycle 032 defines immutable values and a pure admission operation. Cycle 033
-adds bounded derivation and retains one private declaration in `ChatSetup`
-before constructing the two compatible-Chat provider instances. All accepted
-`openai`, `anthropic`, and `ollama` flavor labels declare the compatible-Chat
-adapter/wire Kitsu actually constructs; no flavor label selects a physical
-adapter. These cards still do not:
+adds bounded derivation and a truthful declaration. Cycle 034 replaces the two
+independent chat-provider constructors with one compatible-Chat route factory.
+It resolves auth exactly once, constructs inference and catalog runtimes from
+one consumed endpoint/path/policy input, and retains their initial generation
+in `ChatSetup`. Existing call sites temporarily use `Arc` clones owned by that
+snapshot. All accepted `openai`, `anthropic`, and `ollama` flavor labels still
+declare the compatible-Chat adapter/wire Kitsu actually constructs; no flavor
+label selects a physical adapter. These cards still do not:
 
-- publish or replace a live route generation;
-- bind endpoint, model, auth, retry, replay, catalog, title, compaction, or
-  auxiliary calls to that generation;
-- alter provider construction or any physical send path;
+- validate every physical send against the current published generation;
+- publish same-label replacement or define old-generation drain/cancel policy;
+- bind replay, title, compaction, or every auxiliary call to a route handle;
 - implement or advertise a native Messages adapter;
-- expose account, billing, quota, or credential data.
+- expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
-flavor-to-adapter switch. The declaration is retained privately and is not yet
-represented as a generation receipt. E04-S03 adds immutable route publication
-and binding; later cards add the distinct adapter and secret-free operational
-receipts.
+flavor-to-adapter switch. The snapshot is retained privately and is not yet a
+live current-generation publisher or receipt. The next E04-S03 cards add send
+admission, same-label replacement, auxiliary binding, and drain/cancel fault
+cuts; later cards add the distinct adapter and secret-free operational receipts.
 
 ## Acceptance and rollback
 
@@ -82,12 +97,15 @@ Provider-free gates:
 ```bash
 cargo test -p kitsu-providers --test provider_route_contract
 cargo test -p kitsu-providers --test provider_route_declaration
+cargo test -p kitsu-providers --test provider_route_snapshot
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, two composition, and sixteen
+Six route-contract, three declaration/derivation, three snapshot, route-factory,
+auth-freeze/source-selection, two declaration-composition, and sixteen
 wire-matrix cases pass offline. The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Removing
-the declaration field/helper, derivation, dependency, tests, and documentation
-is complete rollback because no send path is generation-bound yet.
+the snapshot/factory, restoring the two constructors, and reverting its values,
+tests, and documentation is complete rollback because current-generation send
+admission has not shipped yet.

@@ -7,6 +7,8 @@
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
+use std::sync::Arc;
+use std::time::Duration;
 
 use ring::digest::{Context, SHA256};
 use serde::de::Error as _;
@@ -176,6 +178,111 @@ pub enum ProviderCapability {
     StructuredOutput,
     Usage,
     ModelCatalog,
+}
+
+/// Secret-free origin of the credential frozen into one route generation.
+/// This is safe for diagnostics; it never contains a variable name, header,
+/// token, endpoint, or credential fingerprint.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderAuthSource {
+    None,
+    StaticConfiguration,
+    Environment,
+    ManagedCredential,
+}
+
+/// Whether a separately bounded model-catalog runtime belongs to a route.
+/// The value must agree exactly with the declaration's `ModelCatalog`
+/// capability before the route can be published.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderCatalogPolicy {
+    Unavailable,
+    Configured,
+}
+
+impl ProviderCatalogPolicy {
+    pub fn is_configured(self) -> bool {
+        matches!(self, Self::Configured)
+    }
+}
+
+/// Identifies one timeout inside an immutable route policy without copying a
+/// duration or any route configuration into validation errors.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+pub enum ProviderRouteTimeout {
+    Inference,
+    Catalog,
+    AdvisoryDiscovery,
+}
+
+/// Retry, catalog, and time-budget choices frozen alongside both physical
+/// runtimes. Keeping this provider-neutral lets every compiled adapter publish
+/// the same policy facts without importing CLI/config types.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ProviderRoutePolicy {
+    inference_retries: u32,
+    catalog_retries: u32,
+    inference_timeout: Duration,
+    catalog_timeout: Duration,
+    advisory_discovery_timeout: Duration,
+    catalog: ProviderCatalogPolicy,
+}
+
+impl ProviderRoutePolicy {
+    pub fn new(
+        inference_retries: u32,
+        catalog_retries: u32,
+        inference_timeout: Duration,
+        catalog_timeout: Duration,
+        advisory_discovery_timeout: Duration,
+        catalog: ProviderCatalogPolicy,
+    ) -> Result<Self, ProviderRouteContractError> {
+        for (kind, timeout) in [
+            (ProviderRouteTimeout::Inference, inference_timeout),
+            (ProviderRouteTimeout::Catalog, catalog_timeout),
+            (
+                ProviderRouteTimeout::AdvisoryDiscovery,
+                advisory_discovery_timeout,
+            ),
+        ] {
+            if timeout.is_zero() {
+                return Err(ProviderRouteContractError::ZeroRouteTimeout { kind });
+            }
+        }
+        Ok(Self {
+            inference_retries,
+            catalog_retries,
+            inference_timeout,
+            catalog_timeout,
+            advisory_discovery_timeout,
+            catalog,
+        })
+    }
+
+    pub fn inference_retries(self) -> u32 {
+        self.inference_retries
+    }
+
+    pub fn catalog_retries(self) -> u32 {
+        self.catalog_retries
+    }
+
+    pub fn inference_timeout(self) -> Duration {
+        self.inference_timeout
+    }
+
+    pub fn catalog_timeout(self) -> Duration {
+        self.catalog_timeout
+    }
+
+    pub fn advisory_discovery_timeout(self) -> Duration {
+        self.advisory_discovery_timeout
+    }
+
+    pub fn catalog(self) -> ProviderCatalogPolicy {
+        self.catalog
+    }
 }
 
 /// Explicit capability snapshot with its own nonzero revision. A deterministic
@@ -435,6 +542,94 @@ impl<'de> Deserialize<'de> for ProviderRouteIdentity {
     }
 }
 
+/// One immutable runtime generation. The provider-specific runtime owns its
+/// endpoint, paths, frozen auth material, caches, and transport configuration;
+/// this provider-neutral wrapper owns the corresponding identity, model,
+/// source class, and policy as one inseparable value.
+///
+/// This runtime value is intentionally neither `Debug` nor serializable: only
+/// its secret-free identity and explicit receipt fields may cross diagnostic
+/// boundaries.
+pub struct ProviderRouteSnapshot<P> {
+    identity: ProviderRouteIdentity,
+    model: String,
+    auth_source: ProviderAuthSource,
+    policy: ProviderRoutePolicy,
+    inference_runtime: Arc<P>,
+    catalog_runtime: Arc<P>,
+}
+
+impl<P> ProviderRouteSnapshot<P> {
+    pub const MAX_MODEL_ID_BYTES: usize = 4 * 1024;
+
+    /// Construct the first published generation for one logical profile.
+    /// Later replacement cards will allocate higher generations under a
+    /// publication owner; callers cannot choose or reuse a generation here.
+    pub fn initial(
+        declaration: ProviderRouteDeclaration,
+        model: impl Into<String>,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        inference_runtime: Arc<P>,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        let model = model.into();
+        if model.is_empty() {
+            return Err(ProviderRouteContractError::EmptyModelId);
+        }
+        if model.len() > Self::MAX_MODEL_ID_BYTES {
+            return Err(ProviderRouteContractError::ModelIdTooLong {
+                actual_bytes: model.len(),
+                max_bytes: Self::MAX_MODEL_ID_BYTES,
+            });
+        }
+        let declared_catalog = declaration
+            .capabilities()
+            .supports(ProviderCapability::ModelCatalog);
+        let configured_catalog = policy.catalog().is_configured();
+        if declared_catalog != configured_catalog {
+            return Err(ProviderRouteContractError::CatalogCapabilityMismatch {
+                declared: declared_catalog,
+                configured: configured_catalog,
+            });
+        }
+        let generation = ProviderRouteGeneration::new(1)
+            .expect("the initial provider route generation is nonzero");
+        Ok(Self {
+            identity: ProviderRouteIdentity::from_declaration(declaration, generation),
+            model,
+            auth_source,
+            policy,
+            inference_runtime,
+            catalog_runtime,
+        })
+    }
+
+    pub fn identity(&self) -> &ProviderRouteIdentity {
+        &self.identity
+    }
+
+    pub fn model(&self) -> &str {
+        &self.model
+    }
+
+    pub fn auth_source(&self) -> ProviderAuthSource {
+        self.auth_source
+    }
+
+    pub fn policy(&self) -> ProviderRoutePolicy {
+        self.policy
+    }
+
+    pub fn inference_runtime(&self) -> &Arc<P> {
+        &self.inference_runtime
+    }
+
+    pub fn catalog_runtime(&self) -> &Arc<P> {
+        &self.catalog_runtime
+    }
+}
+
 fn adapter_supports_wire(adapter: ProviderAdapterId, wire: ProviderWireRevision) -> bool {
     matches!(
         (adapter, wire),
@@ -475,6 +670,13 @@ pub enum ProviderRouteContractError {
         actual_bytes: usize,
         max_bytes: usize,
     },
+    #[error("provider model identity must not be empty")]
+    EmptyModelId,
+    #[error("provider model identity is {actual_bytes} bytes; maximum is {max_bytes}")]
+    ModelIdTooLong {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("provider route generation must be nonzero")]
     ZeroGeneration,
     #[error("provider capability revision must be nonzero")]
@@ -495,4 +697,10 @@ pub enum ProviderRouteContractError {
     },
     #[error("provider route does not support {capability:?}")]
     UnsupportedCapability { capability: ProviderCapability },
+    #[error("provider route {kind:?} timeout must be nonzero")]
+    ZeroRouteTimeout { kind: ProviderRouteTimeout },
+    #[error(
+        "provider model-catalog capability ({declared}) does not match configured policy ({configured})"
+    )]
+    CatalogCapabilityMismatch { declared: bool, configured: bool },
 }
