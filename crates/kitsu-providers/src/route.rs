@@ -633,16 +633,7 @@ impl<P> ProviderRouteSnapshot<P> {
         inference_runtime: Arc<P>,
         catalog_runtime: Arc<P>,
     ) -> Result<Self, ProviderRouteContractError> {
-        let model = model.into();
-        if model.is_empty() {
-            return Err(ProviderRouteContractError::EmptyModelId);
-        }
-        if model.len() > Self::MAX_MODEL_ID_BYTES {
-            return Err(ProviderRouteContractError::ModelIdTooLong {
-                actual_bytes: model.len(),
-                max_bytes: Self::MAX_MODEL_ID_BYTES,
-            });
-        }
+        let model = Self::validated_model(model)?;
         let declared_catalog = declaration
             .capabilities()
             .supports(ProviderCapability::ModelCatalog);
@@ -661,6 +652,41 @@ impl<P> ProviderRouteSnapshot<P> {
             inference_runtime,
             catalog_runtime,
         })
+    }
+
+    fn validated_model(model: impl Into<String>) -> Result<String, ProviderRouteContractError> {
+        let model = model.into();
+        if model.is_empty() {
+            return Err(ProviderRouteContractError::EmptyModelId);
+        }
+        if model.len() > Self::MAX_MODEL_ID_BYTES {
+            return Err(ProviderRouteContractError::ModelIdTooLong {
+                actual_bytes: model.len(),
+                max_bytes: Self::MAX_MODEL_ID_BYTES,
+            });
+        }
+        Ok(model)
+    }
+
+    fn successor_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        let declaration = ProviderRouteDeclaration::new(
+            self.identity.adapter(),
+            self.identity.profile().clone(),
+            self.identity.wire_revision(),
+            self.identity.capabilities().clone(),
+        )?;
+        Self::successor(
+            &self.identity,
+            declaration,
+            model,
+            self.auth_source,
+            self.policy,
+            self.inference_runtime.clone(),
+            self.catalog_runtime.clone(),
+        )
     }
 
     pub fn identity(&self) -> &ProviderRouteIdentity {
@@ -717,8 +743,31 @@ impl<P> ProviderRouteCurrent<P> {
             .read()
             .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
             .clone();
+        let model = bound.model().to_string();
         Ok(ProviderRouteHandle {
             bound,
+            model,
+            current: self.current.clone(),
+        })
+    }
+
+    /// Bind a scoped model to the current route generation without changing
+    /// the process default. This is used by explicit subagent profiles: model
+    /// choice is immutable for that logical operation while endpoint, auth,
+    /// wire, caches, and retry policy remain generation-bound.
+    pub fn bind_model(
+        &self,
+        model: impl Into<String>,
+    ) -> Result<ProviderRouteHandle<P>, ProviderRouteContractError> {
+        let model = ProviderRouteSnapshot::<P>::validated_model(model)?;
+        let bound = self
+            .current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
+            .clone();
+        Ok(ProviderRouteHandle {
+            bound,
+            model,
             current: self.current.clone(),
         })
     }
@@ -757,6 +806,42 @@ impl<P> ProviderRouteCurrent<P> {
         *current = Arc::new(replacement);
         Ok(())
     }
+
+    /// Atomically replace only the process-default model. An unchanged model
+    /// is a no-op; a changed model publishes exactly one successor. Validation
+    /// and expected-generation failure leave the current snapshot untouched.
+    pub fn replace_model(
+        &self,
+        expected: ProviderRouteGeneration,
+        model: impl Into<String>,
+    ) -> Result<ProviderRouteHandle<P>, ProviderRouteContractError> {
+        let model = ProviderRouteSnapshot::<P>::validated_model(model)?;
+        let mut current = self
+            .current
+            .write()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?;
+        let actual = current.identity().generation();
+        if actual != expected {
+            return Err(ProviderRouteContractError::StaleGeneration {
+                bound: expected,
+                current: actual,
+            });
+        }
+        if current.model() == model {
+            return Ok(ProviderRouteHandle {
+                bound: current.clone(),
+                model,
+                current: self.current.clone(),
+            });
+        }
+        let replacement = Arc::new(current.successor_model(model.clone())?);
+        *current = replacement.clone();
+        Ok(ProviderRouteHandle {
+            bound: replacement,
+            model,
+            current: self.current.clone(),
+        })
+    }
 }
 
 /// One request-facing binding to an immutable route snapshot. Admission reads
@@ -765,6 +850,7 @@ impl<P> ProviderRouteCurrent<P> {
 /// replacement is published concurrently.
 pub struct ProviderRouteHandle<P> {
     bound: Arc<ProviderRouteSnapshot<P>>,
+    model: String,
     current: Arc<RwLock<Arc<ProviderRouteSnapshot<P>>>>,
 }
 
@@ -772,6 +858,7 @@ impl<P> Clone for ProviderRouteHandle<P> {
     fn clone(&self) -> Self {
         Self {
             bound: self.bound.clone(),
+            model: self.model.clone(),
             current: self.current.clone(),
         }
     }
@@ -783,7 +870,7 @@ impl<P> ProviderRouteHandle<P> {
     }
 
     pub fn model(&self) -> &str {
-        self.bound.model()
+        &self.model
     }
 
     pub fn auth_source(&self) -> ProviderAuthSource {
@@ -858,6 +945,9 @@ where
     async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
         let required = required_chat_capabilities(&req);
         let runtime = self.admit_inference_runtime(&required)?;
+        if req.model != self.model {
+            return Err(ProviderRouteContractError::RequestModelMismatch.into());
+        }
         runtime.chat_stream(req).await
     }
 
@@ -868,6 +958,9 @@ where
     ) -> Result<ChatStream, ProviderError> {
         let required = required_chat_capabilities(&req);
         let runtime = self.admit_inference_runtime(&required)?;
+        if req.model != self.model {
+            return Err(ProviderRouteContractError::RequestModelMismatch.into());
+        }
         runtime.chat_stream_with_telemetry(req, telemetry).await
     }
 
@@ -886,6 +979,44 @@ where
             return Ok(None);
         };
         runtime.list_models_with_telemetry(telemetry).await
+    }
+}
+
+/// Convenience port for one-shot callers. Multi-round logical work should
+/// bind a [`ProviderRouteHandle`] once and retain it for the whole operation;
+/// this implementation deliberately binds only for the duration of one port
+/// call.
+impl<P> Provider for ProviderRouteCurrent<P>
+where
+    P: Provider,
+{
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        self.bind()?.healthcheck().await
+    }
+
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        self.bind_model(req.model.clone())?.chat_stream(req).await
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        self.bind_model(req.model.clone())?
+            .chat_stream_with_telemetry(req, telemetry)
+            .await
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        self.bind()?.list_models().await
+    }
+
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
+        self.bind()?.list_models_with_telemetry(telemetry).await
     }
 }
 
@@ -989,4 +1120,6 @@ pub enum ProviderRouteContractError {
     },
     #[error("current provider route is unavailable")]
     CurrentRouteUnavailable,
+    #[error("provider request model does not match its immutable route binding")]
+    RequestModelMismatch,
 }

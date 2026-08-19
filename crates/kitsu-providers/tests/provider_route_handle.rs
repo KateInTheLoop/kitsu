@@ -77,8 +77,12 @@ fn declaration(catalog: bool) -> ProviderRouteDeclaration {
 }
 
 fn request() -> ChatRequest {
+    request_for("model-a")
+}
+
+fn request_for(model: &str) -> ChatRequest {
     ChatRequest {
-        model: "model-a".to_string(),
+        model: model.to_string(),
         messages: Vec::new(),
         tools: None,
         stream: true,
@@ -186,6 +190,85 @@ async fn request_shape_capabilities_are_rejected_before_inference_runtime() {
 }
 
 #[tokio::test]
+async fn model_bound_handles_reject_mismatch_and_allow_scoped_models() {
+    let runtime = Arc::new(CountingProvider::default());
+    let snapshot = ProviderRouteSnapshot::initial(
+        declaration(true),
+        "model-a",
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Configured),
+        runtime.clone(),
+        runtime.clone(),
+    )
+    .unwrap();
+    let current = ProviderRouteCurrent::new(snapshot);
+    let default_handle = current.bind().unwrap();
+
+    assert!(matches!(
+        default_handle.chat_stream(request_for("model-b")).await,
+        Err(ProviderError::RouteContract(
+            ProviderRouteContractError::RequestModelMismatch
+        ))
+    ));
+    assert_eq!(runtime.chat_sends.load(Ordering::Acquire), 0);
+
+    let scoped = current.bind_model("profile-model").unwrap();
+    drop(
+        scoped
+            .chat_stream(request_for("profile-model"))
+            .await
+            .unwrap(),
+    );
+    assert_eq!(scoped.model(), "profile-model");
+    assert_eq!(scoped.identity().generation().get(), 1);
+    assert_eq!(current.bind().unwrap().model(), "model-a");
+    assert_eq!(runtime.chat_sends.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn model_replacement_publishes_one_successor_or_keeps_the_old_route() {
+    let runtime = Arc::new(CountingProvider::default());
+    let first = ProviderRouteSnapshot::initial(
+        declaration(true),
+        "model-a",
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Configured),
+        runtime.clone(),
+        runtime,
+    )
+    .unwrap();
+    let current = ProviderRouteCurrent::new(first);
+    let old = current.bind().unwrap();
+
+    let replacement = current
+        .replace_model(old.identity().generation(), "model-b")
+        .unwrap();
+    assert_eq!(replacement.identity().generation().get(), 2);
+    assert_eq!(replacement.model(), "model-b");
+    assert_eq!(current.bind().unwrap().model(), "model-b");
+    assert!(matches!(
+        old.chat_stream(request()).await,
+        Err(ProviderError::RouteContract(
+            ProviderRouteContractError::StaleGeneration { .. }
+        ))
+    ));
+
+    let oversized = "m".repeat(ProviderRouteSnapshot::<CountingProvider>::MAX_MODEL_ID_BYTES + 1);
+    assert!(matches!(
+        current.replace_model(replacement.identity().generation(), oversized),
+        Err(ProviderRouteContractError::ModelIdTooLong { .. })
+    ));
+    let still_current = current.bind().unwrap();
+    assert_eq!(still_current.identity().generation().get(), 2);
+    assert_eq!(still_current.model(), "model-b");
+
+    let unchanged = current
+        .replace_model(still_current.identity().generation(), "model-b")
+        .unwrap();
+    assert_eq!(unchanged.identity().generation().get(), 2);
+}
+
+#[tokio::test]
 async fn replacement_makes_old_handle_stale_and_failed_publish_keeps_current() {
     let first_runtime = Arc::new(CountingProvider::default());
     let first = ProviderRouteSnapshot::initial(
@@ -232,7 +315,12 @@ async fn replacement_makes_old_handle_stale_and_failed_publish_keeps_current() {
     assert_eq!(first_runtime.catalog_sends.load(Ordering::Acquire), 0);
 
     let current_handle = current.bind().unwrap();
-    drop(current_handle.chat_stream(request()).await.unwrap());
+    drop(
+        current_handle
+            .chat_stream(request_for("model-b"))
+            .await
+            .unwrap(),
+    );
     assert_eq!(current_handle.identity().generation().get(), 2);
     assert_eq!(second_runtime.chat_sends.load(Ordering::Acquire), 1);
 

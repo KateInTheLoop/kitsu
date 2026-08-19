@@ -282,19 +282,21 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: E04-S01/S02 are accepted and E04-S03 is in progress through Cycle 035.
+Status: E04-S01/S02 are accepted and E04-S03 is in progress through Cycle 036.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
 policy, and a current-generation owner whose bound handles admit every primary
 chat and catalog call before entering those runtimes. Replacement fault cuts
 prove stale zero-send, exact-successor publication, failed-publication
-retention, and admitted-old-work drain. Primary-reviewed
+retention, and admitted-old-work drain. Default `/model` and resumed-session
+model changes now publish exactly one successor before mutating live session
+state; foreground and subagent operations bind their effective model once for
+the whole logical run, including explicit profile overrides. Primary-reviewed
 compatible-Chat and structurally distinct Anthropic Messages fixtures run fully
-offline. Model identity is not yet enforced against the snapshot, production
-model switching does not yet publish/rebind a successor, management-only
-doctor/top-level catalog paths remain outside the chat owner, and native
-Messages decoding plus receipts remain open; X001 therefore still fails.
+offline. Full configuration/auth replacement, management-only doctor/top-level
+catalog binding, the complete retry/replay/auxiliary mutation matrix, native
+Messages decoding, and receipts remain open; X001 therefore still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
@@ -483,6 +485,7 @@ gates merely because a card appears attractive.
 | 034 | E04-S03-C1 | Define one immutable route snapshot that owns declaration, endpoint/model/auth-source, retry/catalog policy, and initial generation |
 | 035 | E04-S03-C2 | Add a current-generation route handle and migrate primary inference/catalog admission without exposing secrets |
 | 036 | E04-S03-C3 | Bind model changes to exact successor publication and rebind future primary work without crossing generations |
+| 037 | E04-S03-C4 | Add generation-aware attempt evidence and close the retry/replay/catalog/compaction/subagent/cancellation mutation matrix |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -492,9 +495,10 @@ collision-resistant profile identity without storing display labels. Cycle 034
 consumes that declaration into an initial immutable snapshot, freezes auth once,
 and constructs inference/catalog runtimes from one endpoint/model/policy input.
 Cycle 035 adds current-generation admission and the first replacement/drain
-fault cuts while preserving optional-catalog absence. Cycle 036 binds model
-selection to successor publication and rebinds future work; remaining
-auxiliary/receipt cuts follow before E04-S04. The queue then advances
+fault cuts while preserving optional-catalog absence. Cycle 036 binds default
+model selection to successor publication and snapshots scoped profile models
+per logical operation. Cycle 037 adds generation-aware attempt evidence and
+the remaining auxiliary mutation cuts before E04-S04. The queue then advances
 through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

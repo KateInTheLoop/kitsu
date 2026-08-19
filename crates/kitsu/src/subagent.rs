@@ -83,6 +83,51 @@ pub const DEFAULT_MAX_BACKGROUND_RECORDS: usize = 128;
 /// against a stale window.
 pub type LiveModelWindow = Arc<Mutex<(String, Option<u64>)>>;
 
+/// Resolve one immutable provider binding after a subagent's effective model
+/// (including an explicit profile override) is known. A binder is snapshotted
+/// once per subagent run, so replacement cannot mix generations across its
+/// internal rounds.
+type ProviderBindFn<P> = dyn Fn(&str) -> Result<Arc<P>, ProviderError> + Send + Sync;
+
+pub struct ProviderBinder<P> {
+    bind: Arc<ProviderBindFn<P>>,
+}
+
+impl<P> Clone for ProviderBinder<P> {
+    fn clone(&self) -> Self {
+        Self {
+            bind: self.bind.clone(),
+        }
+    }
+}
+
+impl<P: 'static> ProviderBinder<P> {
+    pub fn new<F>(bind: F) -> Self
+    where
+        F: Fn(&str) -> Result<Arc<P>, ProviderError> + Send + Sync + 'static,
+    {
+        Self {
+            bind: Arc::new(bind),
+        }
+    }
+
+    #[cfg(test)]
+    fn fixed(provider: Arc<P>) -> Self
+    where
+        P: Send + Sync,
+    {
+        Self::new(move |_| Ok(provider.clone()))
+    }
+
+    fn resolve(&self, model: &str) -> Result<Arc<P>, ToolError> {
+        (self.bind)(model).map_err(|_| {
+            ToolError::ExecError(
+                "provider route could not be bound for this subagent model".to_string(),
+            )
+        })
+    }
+}
+
 /// System prompt seeding a subagent's isolated context.
 const SUBAGENT_SYSTEM: &str = "You are a kitsu subagent handling ONE delegated task in a fresh, \
 isolated context (you cannot see the parent conversation). Use your tools to complete it, then \
@@ -1548,8 +1593,27 @@ fn task_preview(task: &str) -> String {
 /// non-streaming agent config *template*; its `model` and `context_window` are
 /// overwritten at call time from `live` so subagents track `/model`. `extra_system`
 /// seeds inherited context (e.g. a skill index) into the subagent's system prompt.
+#[cfg(test)]
 pub fn spawn_agent_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agent_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        budget,
+    )
+}
+
+pub fn spawn_agent_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1585,6 +1649,7 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
                 return Err(ToolError::ExecError(spawn_cap_error(&budget)));
             }
             let cfg = resolve_cfg(&sub_cfg, &live);
+            let provider = provider.resolve(&cfg.model)?;
             // Fresh state each call; the isolated loop runs to completion and only
             // its final answer is returned (child rounds never enter the parent).
             run_subagent(&provider, &sub_tools, &cfg, &extra_system, a.task)
@@ -1600,8 +1665,27 @@ pub fn spawn_agent_tool<P: Provider + 'static>(
 /// context, so they run in parallel safely; concurrency is capped at
 /// [`MAX_PARALLEL`]. The subagent registry must NOT contain `spawn_agent` /
 /// `spawn_agents` (depth-1). One failing subagent does not fail the others.
+#[cfg(test)]
 pub fn spawn_agents_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agents_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        budget,
+    )
+}
+
+pub fn spawn_agents_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1661,6 +1745,7 @@ pub fn spawn_agents_tool<P: Provider + 'static>(
             let tasks: Vec<String> = a.tasks.into_iter().take(admitted).collect();
             // Same model/window snapshot for the whole batch.
             let cfg = resolve_cfg(&sub_cfg, &live);
+            let provider = provider.resolve(&cfg.model)?;
             // Run each task in its own subagent, at most MAX_PARALLEL at a time.
             let stream = futures::stream::iter(tasks.into_iter().enumerate().map(|(i, task)| {
                 let provider = provider.clone();
@@ -1722,9 +1807,33 @@ impl BackgroundProfileRuntime {
     }
 }
 
+#[cfg(test)]
 #[allow(clippy::too_many_arguments)]
 pub fn spawn_agent_bg_tool<P: Provider + 'static>(
     provider: Arc<P>,
+    sub_tools: Arc<Registry>,
+    sub_cfg: AgentConfig,
+    live: LiveModelWindow,
+    extra_system: String,
+    registry: Arc<AgentRegistry>,
+    profile_runtime: BackgroundProfileRuntime,
+    budget: Arc<SpawnBudget>,
+) -> (ToolDescriptor, HandlerFn) {
+    spawn_agent_bg_tool_with_binder(
+        ProviderBinder::fixed(provider),
+        sub_tools,
+        sub_cfg,
+        live,
+        extra_system,
+        registry,
+        profile_runtime,
+        budget,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn spawn_agent_bg_tool_with_binder<P: Provider + 'static>(
+    provider: ProviderBinder<P>,
     sub_tools: Arc<Registry>,
     sub_cfg: AgentConfig,
     live: LiveModelWindow,
@@ -1800,6 +1909,7 @@ pub fn spawn_agent_bg_tool<P: Provider + 'static>(
                 }
                 debug_assert!(profile.tool_policy.accepts_registry(&effective_tools));
             }
+            let provider = provider.resolve(&cfg.model)?;
             let model = cfg.model.clone();
             let preview = task_preview(&a.task);
             let profile_name = selected_profile
@@ -2059,9 +2169,16 @@ mod tests {
             ]]),
             last_model: Mutex::new(None),
         });
+        let bound_models = Arc::new(Mutex::new(Vec::<String>::new()));
+        let binder_provider = provider.clone();
+        let binder_models = bound_models.clone();
+        let binder = ProviderBinder::new(move |model| {
+            binder_models.lock().unwrap().push(model.to_string());
+            Ok(binder_provider.clone())
+        });
         let live: LiveModelWindow = Arc::new(Mutex::new(("model-A".to_string(), Some(128_000))));
-        let (_d, handler) = spawn_agent_tool(
-            provider.clone(),
+        let (_d, handler) = spawn_agent_tool_with_binder(
+            binder,
             Arc::new(Registry::new()),
             sub_cfg(),
             live.clone(),
@@ -2075,6 +2192,11 @@ mod tests {
             provider.last_model.lock().unwrap().as_deref(),
             Some("model-B"),
             "subagent used the live model, not the frozen initial one"
+        );
+        assert_eq!(
+            *bound_models.lock().unwrap(),
+            ["model-B"],
+            "one immutable provider binding is resolved per subagent run"
         );
     }
 
