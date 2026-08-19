@@ -212,7 +212,11 @@ Cycle 025 carries exact cleanup and active-snapshot persistence from human ask,
 review, piped, and scripted carriers into the same process owner. Human timing
 is now a fallible delivery cut, while an unexpected post-start fallback records
 cleanup as `NotObserved` and therefore cannot certify clean success. Interactive
-aggregation remains the bounded Cycle 026 exit.
+aggregation remains the bounded Cycle 026 exit. Cycle 026 then publishes that
+aggregate: a recovered failure plus later success is partial rather than
+last-turn success; steering replacement is not itself a fault; cancellation and
+authority interruption remain typed; background cleanup and active-session
+persistence reach the same process lifecycle before human timing delivery.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

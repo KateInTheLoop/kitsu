@@ -7706,6 +7706,10 @@ async fn test_interactive_confirmation_eof_interrupts_without_followup_send() {
         "{transcript}"
     );
     assert!(
+        transcript.contains("interrupted") && transcript.contains("assistant discarded"),
+        "interactive process receipt did not retain the authority interruption: {transcript}"
+    );
+    assert!(
         !transcript.contains("invalid permission response"),
         "EOF is an interruption, not malformed consent: {transcript}"
     );
@@ -7822,6 +7826,10 @@ async fn test_interactive_explicit_denial_remains_provider_recoverable() {
         "{transcript}"
     );
     assert!(
+        transcript.contains("succeeded") && transcript.contains("assistant committed"),
+        "recovered denial did not publish a committed interactive aggregate: {transcript}"
+    );
+    assert!(
         !transcript.contains("authority input closed"),
         "{transcript}"
     );
@@ -7909,6 +7917,10 @@ async fn test_interactive_quit_cancel_never_activates_queued_prompt() {
     assert!(
         transcript.contains("1 queued prompt(s) cleared"),
         "{transcript}"
+    );
+    assert!(
+        transcript.contains("cancelled") && transcript.contains("assistant discarded"),
+        "queued exit cancellation did not publish a cancelled aggregate: {transcript}"
     );
     let requests = server.received_requests().await.unwrap();
     assert_eq!(requests.len(), 1, "queued work reached the provider");
@@ -10300,6 +10312,10 @@ async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() 
 
     assert!(transcript.contains("model returned no final assistant text"));
     assert!(transcript.contains("turn rolled back - /retry to try again"));
+    assert!(
+        transcript.contains("provider_fault") && transcript.contains("assistant discarded"),
+        "empty response did not publish the failed interactive aggregate: {transcript}"
+    );
     let mut sessions = base_cmd(home.path());
     let output = sessions
         .args(["sessions", "--json"])
@@ -10308,6 +10324,98 @@ async fn test_interactive_empty_response_rolls_back_and_keeps_retry_available() 
     assert!(output.status.success(), "{output:?}");
     let listed: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
     assert_eq!(listed, serde_json::json!([]));
+    server.verify().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn test_interactive_recovered_failed_turn_publishes_partial_process_outcome() {
+    use std::io::Write as _;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let responder_attempts = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            let content = if responder_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                " \n\t"
+            } else {
+                "RECOVERED_INTERACTIVE_TURN"
+            };
+            ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                "choices": [{
+                    "message": {"role": "assistant", "content": content},
+                    "finish_reason": "stop"
+                }]
+            }))
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let home_path = home.path().to_path_buf();
+    let repo = TempDir::new().expect("temp interactive repo");
+    let repo_path = repo.path().to_path_buf();
+    let (status, transcript) = tokio::task::spawn_blocking(move || {
+        let mut prompt_sent = false;
+        let mut retry_sent = false;
+        let mut quit_sent = false;
+        run_plain_interactive_chat_pty(
+            &home_path,
+            &repo_path,
+            &["--no-tools"],
+            |output, terminal| {
+                let prompt_count = output
+                    .windows(b"kitsu>".len())
+                    .filter(|window| *window == b"kitsu>")
+                    .count();
+                if !prompt_sent && prompt_count >= 1 {
+                    terminal
+                        .write_all(b"FIRST_TURN_IS_EMPTY\n")
+                        .expect("submit first interactive prompt");
+                    terminal.flush().unwrap();
+                    prompt_sent = true;
+                }
+                let rolled_back = output
+                    .windows(b"turn rolled back - /retry".len())
+                    .any(|window| window == b"turn rolled back - /retry");
+                if prompt_sent && !retry_sent && rolled_back && prompt_count >= 2 {
+                    terminal.write_all(b"/retry\n").expect("retry failed turn");
+                    terminal.flush().unwrap();
+                    retry_sent = true;
+                }
+                let recovered = output
+                    .windows(b"RECOVERED_INTERACTIVE_TURN".len())
+                    .any(|window| window == b"RECOVERED_INTERACTIVE_TURN");
+                if retry_sent && !quit_sent && recovered && prompt_count >= 3 {
+                    terminal.write_all(b"/quit\n").expect("exit recovered chat");
+                    terminal.flush().unwrap();
+                    quit_sent = true;
+                }
+            },
+        )
+    })
+    .await
+    .expect("interactive recovered-fault fixture joins");
+
+    assert!(status.success(), "status={status}; transcript={transcript}");
+    assert!(
+        transcript.contains("RECOVERED_INTERACTIVE_TURN"),
+        "{transcript}"
+    );
+    assert!(
+        transcript.contains("partially_succeeded") && transcript.contains("assistant committed"),
+        "process aggregate collapsed to its last successful turn: {transcript}"
+    );
+    assert_eq!(attempts.load(Ordering::Acquire), 2);
     server.verify().await;
 }
 

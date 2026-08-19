@@ -68,7 +68,7 @@ static MODEL_INFERENCE_STARTED: AtomicBool = AtomicBool::new(false);
 /// advance this instance instead of constructing presentation-local owners.
 static PROCESS_RUN_LIFECYCLE: OnceLock<Mutex<kitsu_core::RunLifecycle>> = OnceLock::new();
 static PROCESS_TERMINAL_FACTS: OnceLock<ProcessTerminalFacts> = OnceLock::new();
-static INTERACTIVE_MODEL_COMMAND: AtomicBool = AtomicBool::new(false);
+static PROCESS_INTERACTIVE_TERMINAL_FACTS: OnceLock<InteractiveTerminalFacts> = OnceLock::new();
 /// Set only when `--allow-turn-errors` converts a scripted run with both a
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
@@ -224,6 +224,124 @@ fn mark_model_inference_started() {
 struct ProcessTerminalFacts {
     cleanup: kitsu_core::RunCleanupState,
     persistence: kitsu_core::RunPersistenceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveTerminalFacts {
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct InteractiveRunAggregate {
+    successful_operation: bool,
+    primary_non_success: Option<kitsu_core::RunOutcomeClass>,
+    assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    replaced_turns: u32,
+}
+
+impl Default for InteractiveRunAggregate {
+    fn default() -> Self {
+        Self {
+            successful_operation: false,
+            primary_non_success: None,
+            assistant: kitsu_core::RunAssistantDisposition::Absent,
+            cleanup: kitsu_core::RunCleanupState::Joined,
+            replaced_turns: 0,
+        }
+    }
+}
+
+impl InteractiveRunAggregate {
+    fn record_non_success(&mut self, outcome: kitsu_core::RunOutcomeClass) {
+        debug_assert!(!matches!(outcome, kitsu_core::RunOutcomeClass::Succeeded));
+        self.primary_non_success.get_or_insert(outcome);
+    }
+
+    fn record_turn(
+        &mut self,
+        outcome: kitsu_core::RunOutcomeClass,
+        assistant: kitsu_core::RunAssistantDisposition,
+    ) {
+        match outcome {
+            kitsu_core::RunOutcomeClass::Succeeded => self.successful_operation = true,
+            kitsu_core::RunOutcomeClass::PartiallySucceeded => {
+                self.successful_operation = true;
+                self.primary_non_success
+                    .get_or_insert(kitsu_core::RunOutcomeClass::PartiallySucceeded);
+            }
+            other => self.record_non_success(other),
+        }
+        self.assistant = assistant;
+    }
+
+    fn record_replaced_turn(&mut self) {
+        self.replaced_turns = self.replaced_turns.saturating_add(1);
+        self.assistant = kitsu_core::RunAssistantDisposition::Discarded;
+    }
+
+    fn record_background_snapshot(&mut self, snapshot: &subagent::AgentProgressSnapshot) {
+        self.successful_operation |= snapshot.done > 0;
+        if snapshot.failed > 0 {
+            self.primary_non_success
+                .get_or_insert(kitsu_core::RunOutcomeClass::ProviderFault);
+        }
+        if snapshot.cancelled > 0 {
+            self.primary_non_success
+                .get_or_insert(kitsu_core::RunOutcomeClass::Cancelled);
+        }
+    }
+
+    fn observe_cleanup(&mut self, cleanup: kitsu_core::RunCleanupState) {
+        use kitsu_core::RunCleanupState::{Joined, NotObserved, Residue};
+        self.cleanup = match (self.cleanup, cleanup) {
+            (NotObserved, _) | (_, NotObserved) => NotObserved,
+            (Joined, state) => state,
+            (state, Joined) => state,
+            (Residue { unjoined: left }, Residue { unjoined: right }) => Residue {
+                unjoined: std::num::NonZeroU32::new(left.get().saturating_add(right.get()))
+                    .expect("sum of nonzero cleanup residue remains nonzero"),
+            },
+        };
+    }
+
+    fn outcome(&self) -> kitsu_core::RunOutcomeClass {
+        match (self.successful_operation, self.primary_non_success) {
+            (true, Some(_)) => kitsu_core::RunOutcomeClass::PartiallySucceeded,
+            (true, None) | (false, None) => kitsu_core::RunOutcomeClass::Succeeded,
+            (false, Some(outcome)) => outcome,
+        }
+    }
+
+    const fn assistant(&self) -> kitsu_core::RunAssistantDisposition {
+        self.assistant
+    }
+
+    #[cfg(test)]
+    const fn replaced_turns(&self) -> u32 {
+        self.replaced_turns
+    }
+
+    fn terminal_facts(
+        &self,
+        persistence: kitsu_core::RunPersistenceState,
+    ) -> InteractiveTerminalFacts {
+        InteractiveTerminalFacts {
+            outcome: self.outcome(),
+            assistant: self.assistant(),
+            cleanup: self.cleanup,
+            persistence,
+        }
+    }
+}
+
+fn record_interactive_terminal_facts(facts: InteractiveTerminalFacts) -> Result<(), CliError> {
+    PROCESS_INTERACTIVE_TERMINAL_FACTS
+        .set(facts)
+        .map_err(|_| CliError::user("interactive terminal facts were already recorded"))
 }
 
 fn record_process_terminal_facts_in(
@@ -1421,7 +1539,7 @@ fn main() {
         .with_writer(trace_writer)
         .try_init();
 
-    let (mut code, outcome_class) = match run() {
+    let (mut code, mut outcome_class) = match run() {
         Ok(()) if jsonl_mode => {
             jsonl_output_failure().map_or((0, kitsu_core::RunOutcomeClass::Succeeded), |error| {
                 std::eprintln!("{error}");
@@ -1486,7 +1604,14 @@ fn main() {
         std::eprintln!("~ --output-last-message unchanged: no committed assistant message");
     }
     if !jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
-        let terminal = run_spec().terminal(outcome_class, run_assistant_disposition());
+        let interactive_facts = PROCESS_INTERACTIVE_TERMINAL_FACTS.get().copied();
+        if let Some(facts) = interactive_facts {
+            outcome_class = facts.outcome;
+        }
+        let terminal = run_spec().terminal(
+            outcome_class,
+            interactive_facts.map_or_else(run_assistant_disposition, |facts| facts.assistant),
+        );
         let status = match terminal.class() {
             kitsu_core::RunOutcomeClass::Succeeded => kitsu_render::RunTimingStatus::Ok,
             kitsu_core::RunOutcomeClass::PartiallySucceeded => {
@@ -1509,34 +1634,33 @@ fn main() {
                 },
             )
         };
-        if INTERACTIVE_MODEL_COMMAND.load(Ordering::Acquire) {
-            if deliver().is_err() && code == 0 {
-                code = EXIT_USER;
+        let facts = interactive_facts.map_or_else(process_terminal_facts_or_fallback, |facts| {
+            ProcessTerminalFacts {
+                cleanup: facts.cleanup,
+                persistence: facts.persistence,
             }
-        } else {
-            let facts = process_terminal_facts_or_fallback();
-            match finalize_process_terminal_with_delivery(
-                terminal.class(),
-                terminal.assistant(),
-                facts.cleanup,
-                facts.persistence,
-                deliver,
-            ) {
-                Ok((published, delivery)) => {
-                    debug_assert_eq!(published.terminal(), &terminal);
-                    if (delivery.is_err()
-                        || (terminal.class() == kitsu_core::RunOutcomeClass::Succeeded
-                            && !published.is_clean_success()))
-                        && code == 0
-                    {
-                        code = EXIT_USER;
-                    }
+        });
+        match finalize_process_terminal_with_delivery(
+            terminal.class(),
+            terminal.assistant(),
+            facts.cleanup,
+            facts.persistence,
+            deliver,
+        ) {
+            Ok((published, delivery)) => {
+                debug_assert_eq!(published.terminal(), &terminal);
+                if (delivery.is_err()
+                    || (terminal.class() == kitsu_core::RunOutcomeClass::Succeeded
+                        && !published.is_clean_success()))
+                    && code == 0
+                {
+                    code = EXIT_USER;
                 }
-                Err(error) => {
-                    std::eprintln!("internal human inference finalization failed: {error}");
-                    if code == 0 {
-                        code = EXIT_USER;
-                    }
+            }
+            Err(error) => {
+                std::eprintln!("internal human inference finalization failed: {error}");
+                if code == 0 {
+                    code = EXIT_USER;
                 }
             }
         }
@@ -10753,10 +10877,13 @@ fn format_agent_profiles(catalog: &subagent::profile::AgentProfileCatalog) -> St
     output
 }
 
-async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason: &str) {
+async fn await_background_agents(
+    registry: &Arc<subagent::AgentRegistry>,
+    reason: &str,
+) -> kitsu_core::RunCleanupState {
     let running = registry.running();
     if running == 0 {
-        return;
+        return kitsu_core::RunCleanupState::Joined;
     }
     if !jsonl_requested() {
         eprintln!(
@@ -10772,10 +10899,17 @@ async fn await_background_agents(registry: &Arc<subagent::AgentRegistry>, reason
                 }
             }
             _ = tokio::signal::ctrl_c() => {
-                report_cancelled_agents(registry.cancel_started_after(0).await);
-                break;
+                let cancelled = registry.cancel_started_after_with_status(0).await;
+                let cleanup = terminal_cleanup_state(&cancelled);
+                report_cancelled_agents(cancelled.iter().map(|status| status.id).collect());
+                return cleanup;
             }
         }
+    }
+    if registry.running() == 0 {
+        kitsu_core::RunCleanupState::Joined
+    } else {
+        kitsu_core::RunCleanupState::NotObserved
     }
 }
 
@@ -12040,7 +12174,7 @@ async fn run_scripted_body(
                         "script cancelled at {path}:{line_number}"
                     )));
                 }
-                SlashResult::Quit => {
+                SlashResult::Quit(_) => {
                     finish_command("ok", None, EXIT_USER)?;
                     break;
                 }
@@ -13606,7 +13740,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let scripted = script.is_some();
     let forced_one_shot = initial_review.is_some();
     let interactive = kitsu_render::stdin_is_tty() && !scripted && !forced_one_shot;
-    INTERACTIVE_MODEL_COMMAND.store(interactive, Ordering::Release);
     // Checkpoint blocks always print; the "/undo N" hint is only advertised
     // where a human can actually type it (the interactive REPL).
     UNDO_HINTS_ACTIONABLE.store(interactive, Ordering::Release);
@@ -15501,6 +15634,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     // into the next live editor or idle prompt so typing is never dropped.
     let mut pending_draft = String::new();
     let no_tools = Registry::new();
+    let mut run_aggregate = InteractiveRunAggregate::default();
 
     loop {
         let agent_snapshot = agent_registry.snapshot();
@@ -15545,11 +15679,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     .expect("prompt queue")
                     .status()
                     .is_empty());
-                await_background_agents(
+                let cleanup = await_background_agents(
                     &agent_registry,
                     "end of input never discards detached work",
                 )
                 .await;
+                run_aggregate.observe_cleanup(cleanup);
                 break;
             }
             (None, None) => match read_chat_line(
@@ -15575,6 +15710,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     continue;
                 }
                 ChatReadline::Error(error) => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::UserFault);
                     eprintln!("input error: {error}");
                     break;
                 }
@@ -15627,9 +15763,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     eprintln!("{}", terminal_inline(&message));
                     continue;
                 }
-                SlashResult::Error | SlashResult::ProviderFailure(_) => continue,
-                SlashResult::Cancelled => continue,
-                SlashResult::Quit => {
+                SlashResult::Error => continue,
+                SlashResult::ProviderFailure(_) => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::ProviderFault);
+                    continue;
+                }
+                SlashResult::Cancelled => {
+                    run_aggregate.record_non_success(kitsu_core::RunOutcomeClass::Cancelled);
+                    continue;
+                }
+                SlashResult::Quit(cleanup) => {
+                    run_aggregate.observe_cleanup(cleanup);
                     let running = agent_registry.running();
                     if running > 0 {
                         eprintln!(
@@ -15662,6 +15806,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     match clear_session_boundary(
@@ -15698,6 +15843,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
@@ -15799,6 +15945,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
                     surface_unobserved_background_results(&agent_registry);
                     while deferred_notice_receiver.try_recv().is_ok() {}
                     if !persist_started_session(&session_store, &session, &model, &messages) {
@@ -16116,15 +16263,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     )?;
                     messages = messages_before;
                     rollback_agent_state(&mut session_state, state_before);
-                    let mut retained = turn_reports;
-                    retained.extend(
-                        cancel_agents_and_report_writes(
-                            &agent_registry,
-                            agent_watermark,
-                            &write_journal,
-                        )
-                        .await,
+                    run_aggregate.record_turn(
+                        kitsu_core::RunOutcomeClass::ProviderFault,
+                        kitsu_core::RunAssistantDisposition::Discarded,
                     );
+                    let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                        &agent_registry,
+                        agent_watermark,
+                        &write_journal,
+                    )
+                    .await;
+                    run_aggregate.observe_cleanup(cancelled.cleanup);
+                    let mut retained = turn_reports;
+                    retained.extend(cancelled.reports);
                     last_failed = Some(retry_prompt);
                     eprintln!(
                         "~ {}; turn rolled back - /retry to try again",
@@ -16139,11 +16290,31 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         tools.is_registered("workspace_diff"),
                     )?;
                 } else {
+                    finish_assistant_disposition(
+                        cli,
+                        "interactive",
+                        AssistantDisposition::Committed,
+                        None,
+                    )?;
+                    run_aggregate.record_turn(
+                        kitsu_core::RunOutcomeClass::Succeeded,
+                        kitsu_core::RunAssistantDisposition::Committed,
+                    );
                     last_failed = None;
                     persist_session(&session_store, &session, &model, &messages);
                 }
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(e))) => {
+                let mapped = map_agent_error_with_diagnostics(
+                    e,
+                    ProviderOperation::Chat { model: &model },
+                    Some(cli.timeout_secs),
+                    session.provider_diagnostics,
+                );
+                run_aggregate.record_turn(
+                    mapped.outcome_class(),
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -16152,22 +16323,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 last_failed = Some(retry_prompt);
-                for line in kitsu_render::error_lines(&chat_error_message_with_diagnostics(
-                    e,
-                    &model,
-                    cli.timeout_secs,
-                    session.provider_diagnostics,
-                )) {
+                let message = kitsu_render::sanitize_terminal_text(&mapped.to_string());
+                for line in kitsu_render::error_lines(&message) {
                     eprintln!("{line}");
                 }
                 eprintln!(
@@ -16182,6 +16349,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
             }
             InteractiveTurnOutcome::Turn(TurnOutcome::Cancelled) => {
+                run_aggregate.record_turn(
+                    kitsu_core::RunOutcomeClass::Cancelled,
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -16190,15 +16361,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 last_failed = Some(retry_prompt);
                 kitsu_render::finish_line();
                 eprintln!("^C (response cancelled; turn rolled back - /retry to try again)");
@@ -16212,6 +16383,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
             }
             InteractiveTurnOutcome::Steered(corrections) => {
+                run_aggregate.record_replaced_turn();
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -16220,15 +16392,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 note_rollback_retained_changes(
                     cli,
                     None,
@@ -16254,6 +16426,10 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 eprintln!("~ completed file changes, if any, remain on disk");
             }
             InteractiveTurnOutcome::QuitCancelled => {
+                run_aggregate.record_turn(
+                    kitsu_core::RunOutcomeClass::Cancelled,
+                    kitsu_core::RunAssistantDisposition::Discarded,
+                );
                 finish_assistant_disposition(
                     cli,
                     "interactive",
@@ -16262,15 +16438,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 )?;
                 messages = messages_before;
                 rollback_agent_state(&mut session_state, state_before);
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
+                run_aggregate.observe_cleanup(cancelled.cleanup);
                 let mut retained = turn_reports;
-                retained.extend(
-                    cancel_agents_and_report_writes(
-                        &agent_registry,
-                        agent_watermark,
-                        &write_journal,
-                    )
-                    .await,
-                );
+                retained.extend(cancelled.reports);
                 note_rollback_retained_changes(
                     cli,
                     None,
@@ -16279,6 +16455,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     tools.is_registered("workspace_diff"),
                 )?;
                 let stopped = agent_registry.cancel_all().await;
+                run_aggregate.observe_cleanup(terminal_cleanup_state(&stopped));
                 let removed = prompt_queue.lock().expect("prompt queue").clear();
                 exit_after_queue = true;
                 last_failed = None;
@@ -16293,11 +16470,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
     }
 
-    await_background_agents(
+    let cleanup = await_background_agents(
         &agent_registry,
         "chat input ended before background work completed",
     )
     .await;
+    run_aggregate.observe_cleanup(cleanup);
+    run_aggregate.record_background_snapshot(&agent_registry.progress_snapshot());
     let surfaced_results = surface_unobserved_background_results(&agent_registry);
     if surfaced_results > 0 {
         eprintln!(
@@ -16314,6 +16493,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if let Some(task) = assistive_signal_task {
         task.abort();
     }
+    record_interactive_terminal_facts(
+        run_aggregate.terminal_facts(jsonl_session_persistence_state()),
+    )?;
     Ok(())
 }
 
@@ -16357,7 +16539,7 @@ impl SubmittedPrompt {
 
 enum SlashResult {
     Continue(Option<serde_json::Value>),
-    Quit,
+    Quit(kitsu_core::RunCleanupState),
     Error,
     /// A host-authored, terminal-safe user error that automation should retain
     /// instead of replacing with the generic scripted-command fallback.
@@ -16905,28 +17087,30 @@ async fn handle_slash(
 
     match name {
         "quit" | "exit" => {
-            match arg {
-                "" => {}
+            let cleanup = match arg {
+                "" => kitsu_core::RunCleanupState::Joined,
                 "wait" => {
                     await_background_agents(
                         registry,
                         "exit requested with wait while background jobs are running",
                     )
-                    .await;
+                    .await
                 }
                 "cancel" => {
                     let cancelled = registry.cancel_all().await;
+                    let cleanup = terminal_cleanup_state(&cancelled);
                     eprintln!(
                         "~ cancelled and joined {} background job(s) before exit",
                         cancelled.len()
                     );
+                    cleanup
                 }
                 _ => {
                     eprintln!("usage: /{name} [wait|cancel]");
                     return SlashResult::Error;
                 }
-            }
-            return SlashResult::Quit;
+            };
+            return SlashResult::Quit(cleanup);
         }
         "" | "help" => {
             if !arg.is_empty() {
@@ -18677,6 +18861,84 @@ mod tests {
         record_process_terminal_facts_in(&receipt, facts).expect("first carrier owns facts");
         assert_eq!(receipt.get(), Some(&facts));
         assert!(record_process_terminal_facts_in(&receipt, facts).is_err());
+    }
+
+    #[test]
+    fn interactive_aggregate_is_not_last_turn_wins() {
+        let mut failed_then_recovered = InteractiveRunAggregate::default();
+        failed_then_recovered.record_turn(
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        failed_then_recovered.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+        assert_eq!(
+            failed_then_recovered.outcome(),
+            kitsu_core::RunOutcomeClass::PartiallySucceeded
+        );
+        assert_eq!(
+            failed_then_recovered.assistant(),
+            kitsu_core::RunAssistantDisposition::Committed
+        );
+
+        let mut succeeded_then_failed = InteractiveRunAggregate::default();
+        succeeded_then_failed.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+        succeeded_then_failed.record_turn(
+            kitsu_core::RunOutcomeClass::Interrupted,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        assert_eq!(
+            succeeded_then_failed.outcome(),
+            kitsu_core::RunOutcomeClass::PartiallySucceeded
+        );
+        assert_eq!(
+            succeeded_then_failed.assistant(),
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+    }
+
+    #[test]
+    fn interactive_retry_replacement_is_not_a_terminal_fault() {
+        let mut aggregate = InteractiveRunAggregate::default();
+        aggregate.record_replaced_turn();
+        aggregate.record_turn(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+        );
+
+        assert_eq!(aggregate.outcome(), kitsu_core::RunOutcomeClass::Succeeded);
+        assert_eq!(aggregate.replaced_turns(), 1);
+    }
+
+    #[test]
+    fn interactive_terminal_facts_preserve_cleanup_and_persistence() {
+        let mut aggregate = InteractiveRunAggregate::default();
+        aggregate.record_turn(
+            kitsu_core::RunOutcomeClass::Cancelled,
+            kitsu_core::RunAssistantDisposition::Discarded,
+        );
+        aggregate.observe_cleanup(kitsu_core::RunCleanupState::Residue {
+            unjoined: std::num::NonZeroU32::new(2).unwrap(),
+        });
+        let facts = aggregate.terminal_facts(kitsu_core::RunPersistenceState::Failed);
+
+        assert_eq!(facts.outcome, kitsu_core::RunOutcomeClass::Cancelled);
+        assert_eq!(
+            facts.assistant,
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+        assert_eq!(
+            facts.cleanup,
+            kitsu_core::RunCleanupState::Residue {
+                unjoined: std::num::NonZeroU32::new(2).unwrap()
+            }
+        );
+        assert_eq!(facts.persistence, kitsu_core::RunPersistenceState::Failed);
     }
 
     #[test]
