@@ -1,14 +1,16 @@
 # Provider route value contract
 
-Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 035.
+Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 036.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
 and a credential resolved once for that generation. Cycle 035 adds an atomic
 current owner and bound request handles, migrates primary chat/catalog/context
-calls, and pins replacement plus drain behavior. Model-bound successor
-publication, remaining management auxiliaries, and attempt receipts remain
-E04-S03 work.
+calls, and pins replacement plus drain behavior. Cycle 036 makes every chat
+request match an immutable model-bound handle, publishes default/resumed model
+changes as exact successors, and snapshots each subagent route after profile
+resolution. Remaining management auxiliaries, full config/auth replacement,
+the mutation matrix, and attempt receipts remain E04-S03 work.
 
 ## Decision
 
@@ -75,6 +77,17 @@ compatible-Chat implementation it actually constructs.
   poisoned owner leaves the prior snapshot installed. Once a logical request
   has been admitted, it owns the old runtime long enough to drain its internal
   retry/stream policy; a later call through that old handle fails stale.
+- `bind_model` creates an operation-scoped model binding without changing the
+  process default. Every chat request must match that bound model or it fails
+  locally with zero sends. This preserves explicit subagent profile models:
+  the provider binder resolves after profile selection and is retained across
+  every round of that child run. A concurrent default replacement lets an
+  admitted request drain, then makes the old child's next request fail stale.
+- `replace_model` validates the target before locking, requires the expected
+  generation, treats the same model as a no-op, and otherwise publishes exactly
+  one successor while reusing the unchanged frozen transport/auth/policy
+  owners. `/model` and saved-session resume stage catalog/context facts first,
+  publish next, then mutate live model/window/provenance state.
 - The provider port's catalog is optional: a current route without
   `model_catalog` returns `None` without entering either runtime. Staleness is
   still checked first. Capabilities required by a concrete chat request, such
@@ -95,22 +108,26 @@ one consumed endpoint/path/policy input, and retains their initial generation
 in `ChatSetup`. Cycle 035 replaces those raw `Arc` fields with one current owner
 and passes bound handles through ask, chat, scripted turns, foreground and
 subagent inference, compaction, slash catalog/model validation, context refresh,
-and resume discovery. All accepted `openai`, `anthropic`, and `ollama` flavor labels still
+and resume discovery. Cycle 036 binds foreground turns once, resolves subagent
+bindings once after effective-model/profile selection, and makes direct plus
+resumed model changes advance the process-default generation. All accepted
+`openai`, `anthropic`, and `ollama` flavor labels still
 declare the compatible-Chat adapter/wire Kitsu actually constructs; no flavor
 label selects a physical adapter. These cards still do not:
 
-- require each `ChatRequest.model` to equal the snapshot model;
-- make the production `/model` path construct, publish, and rebind a successor;
-- define queued/background cancellation during a production model replacement;
+- replace endpoint/wire/auth/retry/cache owners from a reloaded configuration;
+- emit generation identity on every physical attempt or replay;
+- complete mutation cuts across retry, replay, catalog, compaction, title-like
+  auxiliary work, and cancellation;
 - bind management-only top-level `models` and doctor probes to this chat owner;
 - implement or advertise a native Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
 flavor-to-adapter switch. The current owner remains private and has no
-user-visible receipt. The next E04-S03 card makes model identity and production
-successor publication agree before remaining auxiliary/receipt cuts; later
-cards add the distinct adapter and secret-free operational receipts.
+user-visible receipt. The next E04-S03 card adds generation-aware attempt
+evidence and the remaining auxiliary mutation cuts; later cards add the
+distinct adapter and complete secret-free operational receipts.
 
 ## Acceptance and rollback
 
@@ -124,12 +141,12 @@ cargo test -p kitsu-providers --test provider_route_handle
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, three snapshot, six
+Six route-contract, three declaration/derivation, three snapshot, eight
 route-handle, route-factory, auth-freeze/source-selection, two
 declaration-composition, and sixteen wire-matrix cases pass offline. The
 derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Removing
-the current owner/handle and restoring `ChatSetup`'s raw snapshot-owned runtime
-clones is the exact source rollback. No config, persisted session, or wire
-schema migration is involved.
+the current owner/handle/provider binder and restoring `ChatSetup`'s raw
+snapshot-owned runtime clones is the exact source rollback. No config,
+persisted session, or wire schema migration is involved.

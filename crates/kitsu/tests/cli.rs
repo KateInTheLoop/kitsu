@@ -8545,6 +8545,68 @@ async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
     server.verify().await;
 }
 
+#[tokio::test]
+#[serial]
+async fn test_failed_model_publication_keeps_the_old_route_usable() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "old route retained"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let oversized = "m".repeat(4097);
+    let script = home.path().join("failed-model-publication.script");
+    fs::write(
+        &script,
+        format!("/model {oversized}\nafter failed switch\n/quit\n"),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--no-stream",
+                "--context-window",
+                "8192",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--allow-turn-errors",
+                "--script",
+                &script_path,
+            ])
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("old route retained"))
+            .stderr(predicate::str::contains("could not publish model switch"));
+    })
+    .await
+    .expect("failed-publication command joins");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1, "failed switch caused an auxiliary send");
+    let body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(body["model"], "example-model-v1");
+    server.verify().await;
+}
+
 /// A positional chat prompt is authoritative input and must not wait for an
 /// unrelated piped stdin handle to reach EOF.
 #[tokio::test]

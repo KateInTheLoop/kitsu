@@ -3465,6 +3465,9 @@ fn safe_provider_error_message(
         }) => format!(
             "{subject} was not sent because the current provider route does not support {capability:?} - choose a compatible route or disable that request feature"
         ),
+        ProviderError::RouteContract(ProviderRouteContractError::RequestModelMismatch) => format!(
+            "{subject} was not sent because its model does not match the immutable provider route binding - retry against the current model route"
+        ),
         ProviderError::RouteContract(_) => format!(
             "{subject} was not sent because the current provider route failed local admission - retry or rebuild the route from valid configuration"
         ),
@@ -8546,7 +8549,7 @@ enum ContextWindowRefreshOutcome {
 /// result. Provider diagnostics are intentionally not accepted here, so an
 /// endpoint URL or response body can never enter the private cache.
 async fn refresh_cached_context_window(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
@@ -8562,7 +8565,7 @@ async fn refresh_cached_context_window(
 }
 
 async fn refresh_cached_context_window_explicit(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
@@ -8702,7 +8705,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         }
     })?;
     let provider_route = ProviderRouteCurrent::new(provider_route_snapshot);
-    let provider = provider_route.bind().map_err(|error| {
+    provider_route.bind().map_err(|error| {
         CliError::user(format!(
             "config error: cannot bind initial provider route: {error}"
         ))
@@ -8761,7 +8764,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     };
     let context_window_provenance = Arc::new(std::sync::Mutex::new(context_window_provenance));
     if let Some((cache_path, cache_key)) = cold_refresh {
-        let discovery_provider = provider.clone();
+        let discovery_provider = provider_route.clone();
         let discovery_model = model.clone();
         let discovery_provenance = context_window_provenance.clone();
         tokio::spawn(async move {
@@ -9108,11 +9111,12 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         persistence: kitsu_core::RunPersistenceState::NotRequested,
     })?;
     let setup = build_setup(cli).await?;
-    let provider =
-        Arc::new(setup.provider_route.bind().map_err(|error| {
-            CliError::user(format!("cannot bind current provider route: {error}"))
-        })?);
-    let model = provider.model().to_string();
+    let provider = Arc::new(setup.provider_route.clone());
+    let model = provider
+        .bind()
+        .map_err(|error| CliError::user(format!("cannot bind current provider route: {error}")))?
+        .model()
+        .to_string();
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
             "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
@@ -11993,7 +11997,7 @@ async fn finalize_scripted_run(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -12055,7 +12059,7 @@ async fn run_scripted(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_body(
     setup: &ChatSetup,
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -12632,7 +12636,7 @@ async fn run_scripted_body(
 /// transactionally while completed filesystem side effects remain inspectable.
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_turn(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -13811,15 +13815,21 @@ async fn read_text_file_cancellable(path: std::path::PathBuf) -> Option<std::io:
 }
 
 async fn run_turn_cancellable(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
     state: &mut kitsu_core::AgentSessionState,
 ) -> TurnOutcome {
+    let provider = match provider.bind_model(&cfg.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return TurnOutcome::Completed(Err(kitsu_core::AgentError::Provider(error.into())))
+        }
+    };
     mark_model_inference_started();
     match await_cancellable(run_agent_turn_with_state(
-        provider, tools, messages, cfg, state,
+        &provider, tools, messages, cfg, state,
     ))
     .await
     {
@@ -13842,7 +13852,7 @@ async fn wait_for_active_quit_cancel() {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_steerable(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -13851,11 +13861,19 @@ async fn run_turn_steerable(
     turn: prompt_queue::SteeringTurnId,
     mut corrections: prompt_queue::SteeringReceiver,
 ) -> InteractiveTurnOutcome {
+    let provider = match provider.bind_model(&cfg.model) {
+        Ok(provider) => provider,
+        Err(error) => {
+            return InteractiveTurnOutcome::Turn(TurnOutcome::Completed(Err(
+                kitsu_core::AgentError::Provider(error.into()),
+            )))
+        }
+    };
     mark_model_inference_started();
     debug_assert_eq!(corrections.turn(), turn);
     FOREGROUND_CANCELLED.store(false, Ordering::Release);
     ACTIVE_QUIT_CANCEL.store(false, Ordering::Release);
-    let future = run_agent_turn_with_state(provider, tools, messages, cfg, state);
+    let future = run_agent_turn_with_state(&provider, tools, messages, cfg, state);
     tokio::pin!(future);
     tokio::select! {
         result = &mut future => {
@@ -13923,11 +13941,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         initial_review,
     } = invocation;
     let setup = build_setup(cli).await?;
-    let provider =
-        Arc::new(setup.provider_route.bind().map_err(|error| {
-            CliError::user(format!("cannot bind current provider route: {error}"))
-        })?);
-    let initial_model = provider.model().to_string();
+    let provider = Arc::new(setup.provider_route.clone());
+    let initial_model = provider
+        .bind()
+        .map_err(|error| CliError::user(format!("cannot bind current provider route: {error}")))?
+        .model()
+        .to_string();
 
     // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode
     // (prompt on demand) with read access to the launch directory by default;
@@ -14463,9 +14482,19 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         )
     };
     if !no_tools && spawn_cap > 0 {
+        let subagent_route = provider.clone();
+        let subagent_provider =
+            subagent::ProviderBinder::<ProviderRouteHandle<OpenAICompatProvider>>::new(
+                move |model| {
+                    subagent_route
+                        .bind_model(model)
+                        .map(Arc::new)
+                        .map_err(ProviderError::from)
+                },
+            );
         // Stage A: synchronous single delegation.
-        let (d, h) = subagent::spawn_agent_tool(
-            provider.clone(),
+        let (d, h) = subagent::spawn_agent_tool_with_binder(
+            subagent_provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
@@ -14475,8 +14504,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let registration = tools.register_with_descriptor(d, h);
         registration.expect("tool name must be unique");
         // Stage B: fan several isolated subagents out in parallel.
-        let (d, h) = subagent::spawn_agents_tool(
-            provider.clone(),
+        let (d, h) = subagent::spawn_agents_tool_with_binder(
+            subagent_provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
@@ -14489,8 +14518,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         // the prompt) + a tool to fetch its result by id.
         let mut bg_cfg = sub_cfg;
         bg_cfg.quiet = true;
-        let (d, h) = subagent::spawn_agent_bg_tool(
-            provider.clone(),
+        let (d, h) = subagent::spawn_agent_bg_tool_with_binder(
+            subagent_provider,
             sub_tools.clone(),
             bg_cfg,
             live_mw.clone(),
@@ -14787,6 +14816,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         )
                     })?
             };
+            let expected_generation = provider
+                .bind()
+                .map_err(|error| {
+                    CliError::user(format!("cannot stage resumed model route: {error}"))
+                })?
+                .identity()
+                .generation();
+            provider
+                .replace_model(expected_generation, resumed_model.clone())
+                .map_err(|error| {
+                    CliError::user(format!("cannot publish resumed model route: {error}"))
+                })?;
             model = resumed_model;
             context_window.set(resumed_window);
             if !setup.context_window_pinned {
@@ -16198,6 +16239,39 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             }
                         }
                     };
+                    let expected_generation = match provider.bind() {
+                        Ok(route) => route.identity().generation(),
+                        Err(error) => {
+                            eprintln!(
+                                "cannot stage resumed model route: {}",
+                                safe_provider_error_message(
+                                    &error.into(),
+                                    ProviderOperation::Chat {
+                                        model: &resumed_model,
+                                    },
+                                    Some(cli.timeout_secs),
+                                    setup.provider_diagnostics,
+                                )
+                            );
+                            continue;
+                        }
+                    };
+                    if let Err(error) =
+                        provider.replace_model(expected_generation, resumed_model.clone())
+                    {
+                        eprintln!(
+                            "cannot publish resumed model route: {}",
+                            safe_provider_error_message(
+                                &error.into(),
+                                ProviderOperation::Chat {
+                                    model: &resumed_model,
+                                },
+                                Some(cli.timeout_secs),
+                                setup.provider_diagnostics,
+                            )
+                        );
+                        continue;
+                    }
                     model = resumed_model;
                     context_window.set(resumed_window);
                     if !setup.context_window_pinned {
@@ -17181,7 +17255,7 @@ fn skill_load_payload(
 
 async fn refresh_session_context_window(
     model: &str,
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
@@ -17281,7 +17355,7 @@ async fn handle_slash(
     cmd: &str,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     tools: &Registry,
     cli: &Cli,
     perms: &Permissions,
@@ -18262,6 +18336,18 @@ async fn handle_slash(
                 };
             } else {
                 let previous_model = model.clone();
+                let expected_generation = match provider.bind() {
+                    Ok(route) => route.identity().generation(),
+                    Err(error) => {
+                        return report_slash_provider_error(
+                            "could not stage model switch",
+                            error.into(),
+                            ProviderOperation::ModelCatalog,
+                            cli.timeout_secs,
+                            session.provider_diagnostics,
+                        );
+                    }
+                };
                 let Some(catalog) = await_cancellable(list_models_with_runtime_telemetry(
                     provider,
                     runtime_log,
@@ -18311,11 +18397,15 @@ async fn handle_slash(
                 // Only re-resolve when the window was never pinned in the first
                 // place: carrying over the OLD model's discovered window (or
                 // lack thereof) would otherwise budget against the wrong limit.
-                let note = if context_window_pinned {
+                let (next_window, next_provenance, note) = if context_window_pinned {
                     let provenance = context_window_provenance(&session.window_provenance);
-                    format!(
-                        " (context window pinned by {}; unchanged)",
-                        provenance.source.label()
+                    (
+                        context_window.get(),
+                        None,
+                        format!(
+                            " (context window pinned by {}; unchanged)",
+                            provenance.source.label()
+                        ),
                     )
                 } else {
                     let Some(discovered) =
@@ -18336,19 +18426,34 @@ async fn handle_slash(
                             );
                         }
                     };
-                    context_window.set(discovered);
-                    *session
-                        .window_provenance
-                        .lock()
-                        .unwrap_or_else(std::sync::PoisonError::into_inner) =
-                        ContextWindowProvenance::live_discovery(discovered);
-                    match discovered {
+                    let note = match discovered {
                         Some(w) => format!(" (context window: {w} tokens)"),
                         None => format!(
                             " (context window not reported; using conservative {DEFAULT_CONTEXT_WINDOW}-token default)"
                         ),
-                    }
+                    };
+                    (
+                        discovered,
+                        Some(ContextWindowProvenance::live_discovery(discovered)),
+                        note,
+                    )
                 };
+                if let Err(error) = provider.replace_model(expected_generation, arg) {
+                    return report_slash_provider_error(
+                        "could not publish model switch",
+                        error.into(),
+                        ProviderOperation::ModelCatalog,
+                        cli.timeout_secs,
+                        session.provider_diagnostics,
+                    );
+                }
+                context_window.set(next_window);
+                if let Some(provenance) = next_provenance {
+                    *session
+                        .window_provenance
+                        .lock()
+                        .unwrap_or_else(std::sync::PoisonError::into_inner) = provenance;
+                }
                 *model = arg.to_string();
                 // The meter's anchor is a real `prompt_tokens` count measured
                 // under the OLD model's tokenizer; a different model can tokenize
@@ -18422,7 +18527,7 @@ fn extract_code_or_text(text: &str) -> String {
 /// like other slash commands. The listed IDs are what you pass to `/model <id>`
 /// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
 async fn list_models_and_print(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     filter: &str,
     current_model: &str,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
@@ -18482,7 +18587,7 @@ fn runtime_model_catalog_telemetry(
 }
 
 async fn list_models_with_runtime_telemetry(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
     request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {

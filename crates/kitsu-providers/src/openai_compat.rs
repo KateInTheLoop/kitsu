@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{AuthProvider, FrozenAuth};
 use crate::error::{AuthError, ProviderError, ProviderResponsePart};
 use crate::route::{
-    ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRouteHandle,
-    ProviderRoutePolicy, ProviderRouteSnapshot,
+    ProviderAuthSource, ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderRouteHandle, ProviderRoutePolicy, ProviderRouteSnapshot,
 };
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
@@ -201,6 +201,21 @@ impl ProviderRouteHandle<OpenAICompatProvider> {
             return Ok(None);
         };
         Ok(runtime.model_context_length(model).await)
+    }
+}
+
+impl ProviderRouteCurrent<OpenAICompatProvider> {
+    pub async fn model_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        self.bind_model(model)?.model_context_length(model).await
+    }
+
+    pub async fn advisory_model_context_length(
+        &self,
+        model: &str,
+    ) -> Result<Option<u64>, ProviderError> {
+        self.bind_model(model)?
+            .advisory_model_context_length(model)
+            .await
     }
 }
 
