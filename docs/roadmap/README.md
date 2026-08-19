@@ -208,6 +208,11 @@ the migrated helpers' temporary owners with one process-scoped lifecycle,
 accepts it before inference preflight, rejects a second cross-path publication,
 and routes structurally child-free JSONL fallback through that owner. A first
 foreground provider-turn marker prevents later fallback from guessing cleanup.
+Cycle 025 carries exact cleanup and active-snapshot persistence from human ask,
+review, piped, and scripted carriers into the same process owner. Human timing
+is now a fallible delivery cut, while an unexpected post-start fallback records
+cleanup as `NotObserved` and therefore cannot certify clean success. Interactive
+aggregation remains the bounded Cycle 026 exit.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

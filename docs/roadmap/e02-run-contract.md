@@ -1,8 +1,9 @@
 # E02 Carrier-Neutral Run Contract
 
 Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
-piped JSONL, E02-S04 compatible projection has started, and the host ownership
-exit is decomposed and its process owner landed through Cycle 024;
+piped JSONL plus human noninteractive presentation, E02-S04 compatible
+projection has started, and the host ownership exit is decomposed through the
+presentation-neutral fact handoff accepted in Cycle 025;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -143,6 +144,23 @@ Post-start fallback remains for C7 because its cleanup/persistence facts must be
 carried, not inferred. Management command detection is unit-tested separately
 and does not reserve the inference lifecycle.
 
+Cycle 025 makes cleanup, persistence, and delivery presentation-neutral for
+human noninteractive inference. Ask records its structural child-free and
+session-free facts; scripted and piped carriers hand off their observed child
+cleanup and active-snapshot persistence only after terminal work completes.
+`main` advances the same process lifecycle and treats the human timing write as
+a fallible delivery cut. A delivery failure cannot rewrite settlement, and a
+pre-existing nonzero semantic exit remains authoritative.
+
+When an unexpected error escapes after provider work starts but before a
+carrier can hand off cleanup, the fallback publishes `NotObserved` rather than
+guessing `Joined`. That state is publishable evidence but can never satisfy
+`PublishedRun::is_clean_success`; a nominally successful process therefore
+exits nonzero if cleanup was not proven. JSONL v1, human receipt text, session
+files, authority, and effect behavior are unchanged. Interactive chat still
+uses its direct timing projection until Cycle 026 defines the multi-operation
+aggregate.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -156,8 +174,8 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Carry presentation-neutral phase facts through human noninteractive paths,
-   then define the interactive aggregate independently from its last turn.
+1. Define the interactive aggregate independently from its last turn and route
+   it through the process owner.
 2. Evaluate all seven carriers before closing E02. Extend projection parity
    only from measured gaps; do not invent a second schema version while
    additive `kitsu.chat.v1` evolution is sufficient.

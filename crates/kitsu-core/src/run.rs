@@ -249,7 +249,13 @@ impl RunPhase {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum RunCleanupState {
     Joined,
-    Residue { unjoined: NonZeroU32 },
+    Residue {
+        unjoined: NonZeroU32,
+    },
+    /// The host reached a fallback without evidence sufficient to claim either
+    /// a full join or a known nonzero residue. This is truthful terminal data,
+    /// but can never satisfy a clean-success gate.
+    NotObserved,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

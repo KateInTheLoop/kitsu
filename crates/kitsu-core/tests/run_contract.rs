@@ -231,3 +231,24 @@ fn terminal_publication_is_single_and_rejects_later_work() {
     );
     assert_eq!(lifecycle.phase(), RunPhase::Published);
 }
+
+#[test]
+fn unobserved_cleanup_can_publish_but_never_claims_clean_success() {
+    let spec = RunSpec::new(RunId::new("run-cleanup-unobserved").unwrap());
+    let mut lifecycle = RunLifecycle::accept(&spec);
+    lifecycle
+        .settle(
+            RunOutcomeClass::Succeeded,
+            RunAssistantDisposition::Committed,
+        )
+        .unwrap();
+    lifecycle.join(RunCleanupState::NotObserved).unwrap();
+    lifecycle
+        .persist(RunPersistenceState::NotRequested)
+        .unwrap();
+    lifecycle.deliver(RunDeliveryState::Delivered).unwrap();
+    let published = lifecycle.publish().unwrap();
+
+    assert_eq!(published.cleanup(), RunCleanupState::NotObserved);
+    assert!(!published.is_clean_success());
+}
