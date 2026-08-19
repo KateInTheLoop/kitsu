@@ -398,6 +398,29 @@ fn emit_ask_jsonl_summary_with_local_failures(
     delivery
 }
 
+fn publish_piped_jsonl_terminal(
+    cleanup: kitsu_core::RunCleanupState,
+    status: &str,
+    provider_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+    deliver: impl FnOnce() -> Result<(), CliError>,
+) -> Result<(), CliError> {
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
+    let assistant = run_assistant_disposition();
+    let persistence = jsonl_session_persistence_state();
+    let (published, delivery) =
+        finalize_terminal_with_delivery(outcome, assistant, cleanup, persistence, deliver)
+            .map_err(|error| {
+                CliError::user(format!("internal piped finalization failed: {error}"))
+            })?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    debug_assert_eq!(published.cleanup(), cleanup);
+    debug_assert_eq!(published.persistence(), persistence);
+    delivery
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_jsonl_summary_with_postcondition_failures(
     status: &str,
@@ -10673,7 +10696,7 @@ async fn join_background_agents_at_exit(
     cancelled
 }
 
-fn scripted_cleanup_state(
+fn terminal_cleanup_state(
     terminal: &[subagent::AgentTerminalStatus],
 ) -> kitsu_core::RunCleanupState {
     let unjoined = terminal.iter().filter(|status| !status.joined).count();
@@ -10889,10 +10912,27 @@ async fn cancel_agents_and_report_writes(
     watermark: u64,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
 ) -> Vec<kitsu_tools::builtins::fs::JournalTurnReport> {
-    report_cancelled_agents(registry.cancel_started_after(watermark).await);
+    cancel_agents_and_report_writes_with_cleanup(registry, watermark, journal)
+        .await
+        .reports
+}
+
+struct CancelledAgentWrites {
+    reports: Vec<kitsu_tools::builtins::fs::JournalTurnReport>,
+    cleanup: kitsu_core::RunCleanupState,
+}
+
+async fn cancel_agents_and_report_writes_with_cleanup(
+    registry: &Arc<subagent::AgentRegistry>,
+    watermark: u64,
+    journal: &kitsu_tools::builtins::fs::WriteJournal,
+) -> CancelledAgentWrites {
+    let cancelled = registry.cancel_started_after_with_status(watermark).await;
+    let cleanup = terminal_cleanup_state(&cancelled);
+    report_cancelled_agents(cancelled.iter().map(|status| status.id).collect());
     let reports = journal.drain_and_take_reports().await;
     report_write_checkpoints(reports.clone());
-    reports
+    CancelledAgentWrites { reports, cleanup }
 }
 
 /// Cap on the changed files enumerated in the rolled-back-turn note and its
@@ -11179,7 +11219,7 @@ async fn finalize_scripted_run(
     };
     let cancelled_at_exit =
         join_background_agents_at_exit(registry, journal, agent_join_timeout, jsonl).await;
-    let cleanup_state = scripted_cleanup_state(&cancelled_at_exit);
+    let cleanup_state = terminal_cleanup_state(&cancelled_at_exit);
     if !cancelled_at_exit.is_empty() {
         // Work kitsu had to stop is not successful automation. Work it waited
         // for and collected is reported by its own terminal status below.
@@ -14481,40 +14521,58 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     let mapped = CliError::user(error);
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
                             "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "attachment",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                            0,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "attachment",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                                )?;
+                                emit_jsonl_summary("error", 1, 0)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary("error", 1, 0)?;
                     }
                     return Err(mapped);
                 }
                 Ok(None) => {
                     let mapped = CliError::cancelled("attachment preflight cancelled by Ctrl+C");
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "cancelled",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
+                            "cancelled",
+                            0,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "cancelled",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                                )?;
+                                emit_jsonl_summary("cancelled", 1, 0)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                        )?;
-                        emit_jsonl_summary("cancelled", 1, 0)?;
                     }
                     return Err(mapped);
                 }
@@ -14524,20 +14582,29 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         cli.timeout_secs
                     ));
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            kitsu_core::RunCleanupState::Joined,
                             "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "deadline",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
+                            1,
+                            0,
+                            0,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "kind": "deadline",
+                                        "message": mapped.to_string(),
+                                        "exit_code": mapped.exit_code(),
+                                    }),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                                )?;
+                                emit_jsonl_summary("error", 1, 1)
+                            },
                         )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary("error", 1, 1)?;
                     }
                     return Err(mapped);
                 }
@@ -14619,6 +14686,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     cli.jsonl,
                 )
                 .await;
+                let cleanup_state = terminal_cleanup_state(&cancelled_at_exit);
                 let background_results = agent_registry.take_unobserved_terminal_results();
                 emit_script_background_results(&background_results, cli.jsonl)?;
                 let failed_background = background_results
@@ -14649,28 +14717,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         "piped turn ended with {unfinished_agents} unfinished or failed background agent(s)"
                     ));
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "unfinished_background_agents",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            1,
-                            0,
-                            0,
-                            0,
-                            unrecovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 1, 0, 0, || {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "turn_id": "piped:1",
+                                    "kind": "unfinished_background_agents",
+                                    "message": mapped.to_string(),
+                                    "exit_code": mapped.exit_code(),
+                                }),
+                            )?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                1,
+                                0,
+                                0,
+                                0,
+                                unrecovered_tool_errors,
+                            )
+                        })?;
                     }
                     return Err(mapped);
                 }
@@ -14751,31 +14821,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     }
                     let mapped = strict_failure_cli_error(&failure);
                     if cli.jsonl {
-                        emit_jsonl(
+                        publish_piped_jsonl_terminal(
+                            cleanup_state,
                             "error",
-                            failure.jsonl_payload(
-                                "piped:1",
-                                &mapped.to_string(),
-                                &session_state.last_turn,
-                            ),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "status": "error",
-                                "tool_errors": session_state.last_turn.tool_errors,
-                                "policy_errors": session_state.last_turn.policy_errors,
-                            }),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
                             usize::from(failure.kind.is_provider_failure()),
-                            usize::from(failure.kind == ScriptFailureKind::OutputSchema),
                             usize::from(failure.kind == ScriptFailureKind::Tool),
                             usize::from(failure.kind == ScriptFailureKind::Policy),
-                            unrecovered_tool_errors,
+                            || {
+                                emit_jsonl(
+                                    "error",
+                                    failure.jsonl_payload(
+                                        "piped:1",
+                                        &mapped.to_string(),
+                                        &session_state.last_turn,
+                                    ),
+                                )?;
+                                emit_jsonl(
+                                    "turn_finished",
+                                    serde_json::json!({
+                                        "turn_id": "piped:1",
+                                        "status": "error",
+                                        "tool_errors": session_state.last_turn.tool_errors,
+                                        "policy_errors": session_state.last_turn.policy_errors,
+                                    }),
+                                )?;
+                                emit_jsonl_summary_with_local_failures(
+                                    "error",
+                                    1,
+                                    usize::from(failure.kind.is_provider_failure()),
+                                    usize::from(failure.kind == ScriptFailureKind::OutputSchema),
+                                    usize::from(failure.kind == ScriptFailureKind::Tool),
+                                    usize::from(failure.kind == ScriptFailureKind::Policy),
+                                    unrecovered_tool_errors,
+                                )
+                            },
                         )?;
                     }
                     return Err(mapped);
@@ -14793,28 +14872,30 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     )?;
                     record_successful_operation();
                     if cli.jsonl {
-                        emit_jsonl(
-                            "error",
-                            serde_json::json!({
-                                "turn_id": "piped:1",
-                                "kind": "session",
-                                "message": mapped.to_string(),
-                                "exit_code": mapped.exit_code(),
-                            }),
-                        )?;
-                        emit_jsonl(
-                            "turn_finished",
-                            serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                        )?;
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "turn_id": "piped:1",
+                                    "kind": "session",
+                                    "message": mapped.to_string(),
+                                    "exit_code": mapped.exit_code(),
+                                }),
+                            )?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
                     }
                     return Err(mapped);
                 }
@@ -14850,33 +14931,41 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     &required_write_evaluation,
                 )?;
                 if let Some(mapped) = required_write_evaluation.failure {
-                    emit_required_write_error(cli, &mapped)?;
                     if cli.jsonl {
-                        emit_jsonl_summary_with_postcondition_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            1,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_required_write_error(cli, &mapped)?;
+                            emit_jsonl_summary_with_postcondition_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                1,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        emit_required_write_error(cli, &mapped)?;
                     }
                     return Err(mapped);
                 }
                 if let Err(mapped) = write_output_last_message(cli, "piped:1", &text) {
-                    emit_output_last_message_error(cli, "piped:1", &mapped)?;
                     if cli.jsonl {
-                        emit_jsonl_summary_with_local_failures(
-                            "error",
-                            1,
-                            0,
-                            0,
-                            0,
-                            0,
-                            recovered_tool_errors,
-                        )?;
+                        publish_piped_jsonl_terminal(cleanup_state, "error", 0, 0, 0, || {
+                            emit_output_last_message_error(cli, "piped:1", &mapped)?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                0,
+                                0,
+                                0,
+                                0,
+                                recovered_tool_errors,
+                            )
+                        })?;
+                    } else {
+                        emit_output_last_message_error(cli, "piped:1", &mapped)?;
                     }
                     return Err(mapped);
                 }
@@ -14893,15 +14982,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     );
                 }
                 if cli.jsonl {
-                    emit_jsonl_summary_with_local_failures(
-                        "ok",
-                        0,
-                        0,
-                        0,
-                        0,
-                        0,
-                        recovered_tool_errors,
-                    )?;
+                    publish_piped_jsonl_terminal(cleanup_state, "ok", 0, 0, 0, || {
+                        emit_jsonl_summary_with_local_failures(
+                            "ok",
+                            0,
+                            0,
+                            0,
+                            0,
+                            0,
+                            recovered_tool_errors,
+                        )
+                    })?;
                 }
                 Ok(())
             }
@@ -14965,8 +15056,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         Some("the model turn failed before commit"),
                     )?;
                 }
-                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
-                    .await;
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
                 let cause = agent_error_jsonl_cause(&error);
                 let mapped = map_agent_error_with_diagnostics(
                     error,
@@ -14975,24 +15070,33 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     setup.provider_diagnostics,
                 );
                 if cli.jsonl {
-                    let mut payload = mapped.jsonl_error_payload();
-                    payload["turn_id"] = serde_json::json!("piped:1");
-                    if let Some(cause) = cause {
-                        payload["cause"] = serde_json::json!(cause);
-                    }
-                    emit_jsonl("error", payload)?;
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "error"}),
-                    )?;
-                    emit_jsonl_summary_with_local_failures(
+                    publish_piped_jsonl_terminal(
+                        cancelled.cleanup,
                         "error",
-                        1,
                         usize::from(mapped.exit_code() == EXIT_PROVIDER),
                         0,
                         0,
-                        0,
-                        unrecovered_tool_errors,
+                        || {
+                            let mut payload = mapped.jsonl_error_payload();
+                            payload["turn_id"] = serde_json::json!("piped:1");
+                            if let Some(cause) = cause {
+                                payload["cause"] = serde_json::json!(cause);
+                            }
+                            emit_jsonl("error", payload)?;
+                            emit_jsonl(
+                                "turn_finished",
+                                serde_json::json!({"turn_id": "piped:1", "status": "error"}),
+                            )?;
+                            emit_jsonl_summary_with_local_failures(
+                                "error",
+                                1,
+                                usize::from(mapped.exit_code() == EXIT_PROVIDER),
+                                0,
+                                0,
+                                0,
+                                unrecovered_tool_errors,
+                            )
+                        },
                     )?;
                 }
                 Err(mapped)
@@ -15004,32 +15108,38 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     AssistantDisposition::Discarded,
                     Some("the model turn was cancelled before commit"),
                 )?;
-                cancel_agents_and_report_writes(&agent_registry, agent_watermark, &write_journal)
-                    .await;
+                let cancelled = cancel_agents_and_report_writes_with_cleanup(
+                    &agent_registry,
+                    agent_watermark,
+                    &write_journal,
+                )
+                .await;
                 let mapped = CliError::cancelled("request cancelled by Ctrl+C");
                 if cli.jsonl {
-                    emit_jsonl(
-                        "error",
-                        serde_json::json!({
-                            "turn_id": "piped:1",
-                            "kind": "cancelled",
-                            "message": mapped.to_string(),
-                            "exit_code": mapped.exit_code(),
-                        }),
-                    )?;
-                    emit_jsonl(
-                        "turn_finished",
-                        serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
-                    )?;
-                    emit_jsonl_summary_with_local_failures(
-                        "cancelled",
-                        1,
-                        0,
-                        0,
-                        0,
-                        0,
-                        unrecovered_tool_errors,
-                    )?;
+                    publish_piped_jsonl_terminal(cancelled.cleanup, "cancelled", 0, 0, 0, || {
+                        emit_jsonl(
+                            "error",
+                            serde_json::json!({
+                                "turn_id": "piped:1",
+                                "kind": "cancelled",
+                                "message": mapped.to_string(),
+                                "exit_code": mapped.exit_code(),
+                            }),
+                        )?;
+                        emit_jsonl(
+                            "turn_finished",
+                            serde_json::json!({"turn_id": "piped:1", "status": "cancelled"}),
+                        )?;
+                        emit_jsonl_summary_with_local_failures(
+                            "cancelled",
+                            1,
+                            0,
+                            0,
+                            0,
+                            0,
+                            unrecovered_tool_errors,
+                        )
+                    })?;
                 }
                 Err(mapped)
             }
@@ -18288,7 +18398,7 @@ mod tests {
     }
 
     #[test]
-    fn scripted_cleanup_state_counts_only_actual_unjoined_residue() {
+    fn terminal_cleanup_state_counts_only_actual_unjoined_residue() {
         let joined = subagent::AgentTerminalStatus {
             id: 1,
             task: "joined".to_string(),
@@ -18303,11 +18413,11 @@ mod tests {
         };
 
         assert_eq!(
-            scripted_cleanup_state(&[]),
+            terminal_cleanup_state(&[]),
             kitsu_core::RunCleanupState::Joined
         );
         assert_eq!(
-            scripted_cleanup_state(&[joined, residue]),
+            terminal_cleanup_state(&[joined, residue]),
             kitsu_core::RunCleanupState::Residue {
                 unjoined: std::num::NonZeroU32::new(1).unwrap()
             }
