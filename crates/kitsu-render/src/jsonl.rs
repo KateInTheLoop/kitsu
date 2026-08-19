@@ -416,6 +416,30 @@ mod tests {
                 .any(|field| field == "session_snapshot_state"),
             "additive v1 fields must not invalidate historical summaries"
         );
+        assert_eq!(
+            summary["properties"]["outcome"]["enum"],
+            serde_json::json!([
+                "succeeded",
+                "partially_succeeded",
+                "user_fault",
+                "provider_fault",
+                "tool_fault",
+                "cancelled",
+                "interrupted"
+            ])
+        );
+        assert_eq!(
+            summary["properties"]["assistant"]["enum"],
+            serde_json::json!(["committed", "committed_partial", "discarded", "absent"])
+        );
+        assert!(
+            !summary["required"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|field| field == "outcome" || field == "assistant"),
+            "new v1 outcome fields must remain additive"
+        );
 
         let exclusions = defs["forward_compatible_event"]["allOf"][1]["properties"]["type"]["not"]
             ["enum"]

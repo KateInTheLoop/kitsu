@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00 and E01 accepted; E02 in progress through Cycle 018 on
+Status: E00 and E01 accepted; E02 in progress through Cycle 019 on
 `improvements/harness-roadmap`.
 
 | Field | Current value |
@@ -8,7 +8,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 018 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 18 / 18 |
+| Accepted cycles/commits after this cycle | 19 / 19 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
@@ -20,7 +20,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 018 on
 |---|---|---|
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
-| E02 causal run/outcome | **In progress** | E02-S01/S02 accepted; provider-free monotonic terminal phase model green, carrier phase migration/fault cuts next |
+| E02 causal run/outcome | **In progress** | E02-S01/S02 accepted; monotonic phase model and compatible JSONL projection green, carrier phase migration/fault cuts next |
 | E04 provider spine | Planned after E02 | Primary wire fixtures, capability types, `X001-G1-AUX`, distinct compiled dialect |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
@@ -50,11 +50,12 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 018 on
 | 015 | `bea3394` | Neutral run identity/event/outcome contract and boundary gate |
 | 016 | `9ba4dee` | Zero-later-send authority interruption with recoverable explicit denial |
 | 017 | `c16c778` | Neutral identity/outcome/assistant tuple in human completion receipts |
-| 018 | this document's commit | Provider-free monotonic terminal lifecycle and immutable publication |
+| 018 | `c1790a6` | Provider-free monotonic terminal lifecycle and immutable publication |
+| 019 | this document's commit | Compatible neutral outcome/assistant fields in JSONL final summaries |
 
 ## Current green gates
 
-- Affected runtime suites: 221 `kitsu-tools`, 310 Kitsu binary, 201 CLI, six
+- Affected runtime suites: 221 `kitsu-tools`, 310 Kitsu binary, 202 CLI, six
   carrier-matrix, 73 renderer, and 155 `kitsu-core` tests (147 unit plus eight
   neutral run-contract tests), zero failures.
 - Workspace/all-target check passes with ordinary flags and with
@@ -69,14 +70,14 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 018 on
 
 ## Next delivery tranche
 
-Cycles 011-019 build E02 in bounded order. Cycles 011-014 completed carrier
+Cycles 011-020 build E02 in bounded order. Cycles 011-014 completed carrier
 discovery across success/provider/tool/preflight, cancellation, sink/terminal,
 confirmation, queued-cancel, and cleanup-residue cases. The mapping proves two
 production divergences—authority EOF lacked a zero-send interruption and human
 carriers lacked run identity. Cycles 015-017 close both through one neutral
-contract. Cycle 018 adds the unwired monotonic terminal phase owner; later cards
-migrate carrier finalization and project the common outcome into compatible
-JSONL.
+contract. Cycle 018 adds the unwired monotonic terminal phase owner. Cycle 019
+projects the common outcome and assistant disposition into compatible JSONL;
+Cycle 020 returns to carrier phase migration and phase-specific fault cuts.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
