@@ -50,7 +50,7 @@ did not execute.
 | X001 provider | Fail | One concrete wire; no immutable route generation/capability conformance across auxiliary sends |
 | X002 tool/source | Fail | Registry integrity improved, but no admitted/supervised external source or two-source suite |
 | X003 host/UI | Fail | No named independent host/principal or shared carrier identity fixture |
-| X004 automation/runtime | Fail | Strong JSONL, but no host-neutral run/outcome port and independent harness |
+| X004 automation/runtime | Fail | Neutral run/outcome phases and an independent seven-carrier default-runtime evaluator now exist; no named alternate runtime adapter runs the suite |
 | X005 session/store | Fail | Strong atomic file snapshots, but no canonical revision/logical HEAD, K01-K12, or second store |
 
 ## Comparative borrowing rule

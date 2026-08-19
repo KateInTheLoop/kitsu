@@ -1,11 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
-piped JSONL plus human noninteractive presentation, E02-S04 compatible
-projection has started, and the host ownership exit is decomposed through the
-interactive aggregate and publication accepted in Cycle 026;
-workspace-internal Rust contract with human/JSONL projections, not a persisted
-format or compatibility promise.
+Status: E02 accepted through Cycle 027; workspace-internal Rust contract with
+human/JSONL projections, not a persisted format or compatibility promise.
 
 Implementation: `crates/kitsu-core/src/run.rs`. Boundary gate:
 `scripts/check-run-boundary.sh`. Behavioral contract:
@@ -177,8 +173,17 @@ observed cleanup into the aggregate; a closed join observer becomes
 `NotObserved` instead of guessed `Joined`. Detached done/failed/cancelled state
 is folded before a session registry reset or process exit. The final active
 snapshot receipt supplies persistence, and human timing is delivered through
-the same process lifecycle as every other inference carrier. Interactive exit
-code policy remains the independent Cycle 027 evaluation.
+the same process lifecycle as every other inference carrier.
+
+Cycle 027 adds one explicit identity for each of the seven inference carriers
+and one presentation-independent process-exit evaluator over `PublishedRun`.
+Human and JSONL paths now consult the same immutable publication. Automation
+uses exact semantic exits `0/1/2/130`; an earlier nonzero causal status remains
+primary; cleanup, persistence, or delivery failure fails an otherwise-clean
+status closed. Interactive chat preserves its established recoverable-turn exit
+behavior while publishing the aggregate outcome in the receipt. The independent
+provider-free carrier harness executes the production evaluator for all semantic
+classes and later-phase failure cuts.
 
 ## Coupling gate
 
@@ -191,8 +196,10 @@ This narrow source gate protects the new contract; it does not claim existing
 `kitsu-core::orchestrator` is already renderer- or tool-independent. The broader
 replaceability gate remains E10.
 
-## Next slices
+## Epic result
 
-1. Evaluate all seven carriers before closing E02. Extend projection parity
-   only from measured gaps; do not invent a second schema version while
-   additive `kitsu.chat.v1` evolution is sufficient.
+E02 closes without a public schema or session-format change. X004 has a
+deterministic evaluation path for Kitsu's default runtime, but remains a failed
+replaceability boundary until a named alternate runtime adapter passes the same
+suite. The next implementation card is E04-S01-C1: primary-spec provider control
+and distinct-wire fixtures.
