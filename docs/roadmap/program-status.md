@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 028 on
+Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 029 on
 `improvements/harness-roadmap`.
 
 | Field | Current value |
@@ -8,11 +8,11 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 028 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 28 / 28 |
+| Accepted cycles/commits after this cycle | 29 / 29 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S01-C2 — tool, fault, malformed, and bound fixtures |
+| Active epic/card | E04 / E04-S01-C3 — timeout, cancellation, aggregate-bound, and capability fixture cuts |
 
 ## Epic status
 
@@ -21,7 +21,7 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 028 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress** through Cycle 028 | Compatible-Chat control plus distinct Messages text fixture are offline and wrong-adapter rejecting; tool/fault/boundary matrix, capability types, `X001-G1-AUX`, and compiled adapter remain |
+| E04 provider spine | **In progress** through Cycle 029 | Compatible-Chat and distinct Messages text/tool/error/bound fixtures are offline and wrong-adapter rejecting; timeout/cancel/capability cuts, capability types, `X001-G1-AUX`, and compiled adapter remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -60,14 +60,15 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 028 on
 | 025 | `c3b7b36` | Presentation-neutral human terminal facts and fallible delivery |
 | 026 | `3aeec6d` | Interactive multi-operation aggregate and process publication |
 | 027 | `d818558` | Seven-carrier production exit evaluator and E02 acceptance |
-| 028 | this document's commit | Primary-reviewed compatible-Chat and distinct Messages wire controls |
+| 028 | `b4baf8b` | Primary-reviewed compatible-Chat and distinct Messages wire controls |
+| 029 | this document's commit | Correlated tool rounds, typed faults, malformed events, and path bounds |
 
 ## Current green gates
 
-- The Cycle 028 provider-wire matrix adds three offline tests: exact compatible
-  Chat request/normalization, structural Chat/Messages divergence, and
-  zero-delta wrong-adapter rejection. Full affected-suite counts are recorded
-  in the cycle receipt.
+- The provider-wire matrix now has eleven offline tests covering exact text and
+  correlated tool rounds, structural Chat/Messages divergence, wrong-adapter
+  rejection, HTTP/mid-stream/malformed faults, and path-level hard bounds. Full
+  affected-suite counts are recorded in the cycle receipt.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
 - Workspace/all-target Clippy passes with warnings denied; formatting and diff
@@ -103,8 +104,11 @@ and passes the independent provider-free semantic/phase matrix. E02 is accepted.
 Cycle 028 pins the current compatible-Chat control and a genuinely distinct
 Anthropic Messages text wire from primary specifications, proves their exact
 request/event divergence, and makes wrong-adapter EOF fail closed. Cycle 029
-extends the fixture matrix through tools, typed faults, malformed events, and
-hard bounds before production adapter code begins.
+adds exact correlated tool-result histories and fragmented tool calls, distinct
+HTTP/mid-stream error bodies, malformed events, and 64 KiB error-body plus 4
+MiB SSE-line rejection on both configured paths. Cycle 030 closes the remaining
+provider-free timeout/cancel/aggregate/capability fixture cuts before production
+adapter code begins.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
