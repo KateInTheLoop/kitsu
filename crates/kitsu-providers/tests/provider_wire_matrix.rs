@@ -7,8 +7,10 @@ use futures::StreamExt;
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
-    ChatMessage, ChatRequest, Provider, ProviderAttemptCategory, ProviderAttemptOutcome,
-    ProviderError, ProviderResponsePart, ProviderTelemetrySink, ToolCall, ToolDescriptor,
+    ChatMessage, ChatRequest, Provider, ProviderAdapterId, ProviderAttemptCategory,
+    ProviderAttemptOutcome, ProviderCapabilities, ProviderCapability, ProviderError,
+    ProviderProfileId, ProviderResponsePart, ProviderRouteContractError, ProviderRouteGeneration,
+    ProviderRouteIdentity, ProviderTelemetrySink, ProviderWireRevision, ToolCall, ToolDescriptor,
 };
 use support::provider_wire_fixture::{
     anthropic_messages_malformed_event, anthropic_messages_midstream_error,
@@ -17,8 +19,7 @@ use support::provider_wire_fixture::{
     anthropic_messages_text, anthropic_messages_tool_round, openai_chat_malformed_event,
     openai_chat_midstream_error, openai_chat_oversized_aggregate, openai_chat_oversized_error,
     openai_chat_oversized_sse_line, openai_chat_oversized_tool_arguments,
-    openai_chat_rate_limit_error, openai_chat_text, openai_chat_tool_round,
-    unsupported_image_capability, CapabilityAdmission, FixtureCapability, HttpFaultFixture,
+    openai_chat_rate_limit_error, openai_chat_text, openai_chat_tool_round, HttpFaultFixture,
     WireDialect, ANTHROPIC_ERRORS_SPEC, ANTHROPIC_MESSAGES_SPEC, ANTHROPIC_STREAMING_SPEC,
     ANTHROPIC_TOOL_SPEC, KITSU_ERROR_BODY_LIMIT_BYTES, KITSU_SSE_LINE_LIMIT_BYTES,
     KITSU_SSE_STREAM_LIMIT_BYTES, KITSU_TOOL_ARGUMENT_LIMIT_BYTES, OPENAI_CHAT_SPEC,
@@ -597,15 +598,35 @@ async fn current_configured_paths_cancel_once_without_post_terminal_send() {
 }
 
 #[test]
-fn unsupported_image_capability_case_requires_zero_send_before_e04_s02() {
-    let fixture = unsupported_image_capability();
-    assert_eq!(fixture.required, FixtureCapability::ImageInput);
-    assert!(!fixture.advertised);
+fn unsupported_image_capability_uses_route_admission_and_zero_send() {
+    let generation = ProviderRouteGeneration::new(1).unwrap();
+    let route = ProviderRouteIdentity::new(
+        ProviderAdapterId::OpenAiCompatible,
+        ProviderProfileId::new("profile-v1-0123456789abcdef0123456789abcdef").unwrap(),
+        generation,
+        ProviderWireRevision::OpenAiChatCompletionsV1,
+        ProviderCapabilities::new(
+            1,
+            [
+                ProviderCapability::Streaming,
+                ProviderCapability::Tools,
+                ProviderCapability::Usage,
+                ProviderCapability::ModelCatalog,
+            ],
+        )
+        .unwrap(),
+    )
+    .unwrap();
+    let mut sends = 0;
+    let admission = route.validate_for_send(generation, &[ProviderCapability::ImageInput]);
+    if admission.is_ok() {
+        sends += 1;
+    }
     assert_eq!(
-        fixture.expected,
-        CapabilityAdmission::RejectBeforeSend {
-            error_code: "unsupported_capability",
-            expected_send_count: 0,
+        admission.unwrap_err(),
+        ProviderRouteContractError::UnsupportedCapability {
+            capability: ProviderCapability::ImageInput,
         }
     );
+    assert_eq!(sends, 0);
 }

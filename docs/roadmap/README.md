@@ -23,6 +23,9 @@ Program status: [`program-status.md`](program-status.md)
 Provider wire fixture contract:
 [`e04-primary-wire-fixtures.md`](e04-primary-wire-fixtures.md)
 
+Provider route value contract:
+[`e04-provider-route-contract.md`](e04-provider-route-contract.md)
+
 Status, context, and usage truth contract:
 [`e08-telemetry-decks.md`](e08-telemetry-decks.md)
 
@@ -279,13 +282,14 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: E04-S01 accepted through Cycle 031. Primary-reviewed compatible-Chat
-and structurally distinct Anthropic Messages text/tool/error/bound fixtures run
-fully offline. The matrix now also proves current-path timeout/cancellation,
-aggregate/tool-argument ceilings, and pins the unsupported-image zero-send
-handoff. Native Messages decoding, production capability/revision types,
-immutable generations, and the distinct adapter remain open; X001 therefore
-still fails.
+Status: E04-S01 accepted through Cycle 031. E04-S02 is in progress through
+Cycle 032: Kitsu now owns a versioned, secret-free adapter/profile/generation,
+wire-revision, and capability value contract plus pure stale/unsupported
+pre-send admission. These values are not yet composed into the live route.
+Primary-reviewed compatible-Chat and structurally distinct Anthropic Messages
+fixtures run fully offline. Native Messages decoding, profile derivation,
+route publication, immutable generation binding across every send, receipts,
+and the distinct adapter remain open; X001 therefore still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
@@ -470,10 +474,14 @@ gates merely because a card appears attractive.
 | 030 | E08-S05-C0 | Scope the portable status/context/usage truth model, compatibility aliases, dependencies, exclusions, and PF-10 matrix |
 | 031 | E04-S01-C3 | Close provider-free timeout, cancellation, aggregate-bound, and unsupported-capability fixture cuts |
 | 032 | E04-S02-C1 | Add private versioned adapter/profile/generation, wire-revision, and capability value contracts with serialization vectors |
+| 033 | E04-S02-C2 | Derive opaque profile IDs and truthful current-route declarations without changing physical send behavior |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
-generation publication and adapter wiring. The queue then
+generation publication and adapter wiring. Cycle 033 makes current composition
+declare the adapter and wire it actually constructs, derives collision-resistant
+profile identity without storing display labels, and still leaves physical send
+admission for the next bounded card. The queue then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. E08-S05's high-value `/status`, `/context window`, and `/usage session`
 slice is 4-7 cycles once its E04-owned identity inputs are ready; complete

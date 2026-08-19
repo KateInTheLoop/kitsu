@@ -22,30 +22,6 @@ pub enum WireDialect {
     AnthropicMessages2023_06_01,
 }
 
-/// Provider-neutral feature required by a conformance case. E04-S02 will move
-/// the production equivalent into Kitsu-owned capability types; this fixture
-/// keeps the zero-send observation stable without prematurely choosing that
-/// public representation.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum FixtureCapability {
-    ImageInput,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub enum CapabilityAdmission {
-    RejectBeforeSend {
-        error_code: &'static str,
-        expected_send_count: usize,
-    },
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
-pub struct CapabilityFixture {
-    pub required: FixtureCapability,
-    pub advertised: bool,
-    pub expected: CapabilityAdmission,
-}
-
 #[derive(Clone, Debug)]
 pub struct WireFixture {
     pub dialect: WireDialect,
@@ -460,19 +436,4 @@ pub fn anthropic_messages_oversized_tool_arguments() -> WireFixture {
     fixture.stream = format!("event: content_block_delta\ndata: {chunk}\n\n");
     fixture.expected_deltas.clear();
     fixture
-}
-
-/// E04-S01 hands this exact observation to E04-S02: an image-bearing neutral
-/// request against a route that does not advertise image input must be rejected
-/// before the first physical send. Account/model-name inference cannot turn the
-/// unavailable capability into support.
-pub fn unsupported_image_capability() -> CapabilityFixture {
-    CapabilityFixture {
-        required: FixtureCapability::ImageInput,
-        advertised: false,
-        expected: CapabilityAdmission::RejectBeforeSend {
-            error_code: "unsupported_capability",
-            expected_send_count: 0,
-        },
-    }
 }

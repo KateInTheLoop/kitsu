@@ -4,10 +4,16 @@
 pub mod auth;
 pub mod error;
 pub mod openai_compat;
+pub mod route;
 pub mod telemetry;
 pub mod types;
 
 pub use error::{AuthError, ExpiryStatus, ProviderError, ProviderResponsePart};
+pub use route::{
+    ProviderAdapterId, ProviderCapabilities, ProviderCapability, ProviderProfileId,
+    ProviderRouteContractError, ProviderRouteGeneration, ProviderRouteIdentity,
+    ProviderWireRevision, PROVIDER_ROUTE_CONTRACT_REVISION,
+};
 pub use telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };

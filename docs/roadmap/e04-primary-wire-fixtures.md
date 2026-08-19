@@ -4,8 +4,10 @@ Status: E04-S01 accepted through Cycle 031. Cycle 028 pins text/usage/stop and
 wrong-adapter rejection; Cycle 029 adds tool rounds, faults, malformed events,
 and error-body/SSE-line ceilings; Cycle 031 adds timeout/cancellation terminal
 cuts, aggregate/tool-argument bounds, and the unsupported-image capability
-handoff. Production capability types and the native Messages adapter remain
-E04-S02 through E04-S04 work.
+handoff. Cycle 032 replaces that handoff's temporary fixture vocabulary with
+the production route contract's pure pre-send capability admission. Live route
+composition/generation binding and the native Messages adapter remain E04-S02
+through E04-S04 work.
 
 ## Primary source pin
 
@@ -62,7 +64,7 @@ Cycle 028, and X001 remains failed.
 | Error-body and SSE-line bounds | C2 | accepted across both configured paths at 64 KiB and 4 MiB |
 | Aggregate-stream and tool-argument bounds | C3 | accepted for the current Chat decoder at both configured paths: 16 MiB aggregate and 1 MiB arguments; structurally distinct Messages `input_json_delta` overflow pinned for the future native decoder |
 | Timeout and cancellation with no post-terminal work | C3 | accepted at both configured paths: one physical request, one terminal timeout/cancel disposition, and no later send |
-| Unsupported image capability fails before send | C3 | zero-send conformance observation pinned; production capability representation/admission belongs to E04-S02 |
+| Unsupported image capability fails before send | C3/Cycle 032 handoff | production `ProviderRouteIdentity` admission rejects with zero sends; live provider wiring remains open |
 
 Provider-free gate:
 
@@ -72,6 +74,7 @@ cargo test -p kitsu-providers --test provider_wire_matrix
 
 E04-S01 exit: the 16-test matrix is offline, credential-free, bounded, and
 wrong-adapter rejecting. Static Messages shapes are not represented as a native
-decoder pass. Next card: E04-S02-C1 introduces Kitsu-owned versioned adapter,
-profile, generation, wire-revision, and capability value contracts without
-wiring production sends.
+decoder pass. Cycle 032 introduces the Kitsu-owned value contract and consumes
+the capability handoff without wiring production sends. Next card:
+E04-S02-C2 derives opaque profile IDs and truthful declarations for current
+composition.
