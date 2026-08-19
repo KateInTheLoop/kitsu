@@ -6254,6 +6254,8 @@ async fn test_model_command_timing_receipt_and_jsonl_summary() {
         let summary = events.last().expect("final summary");
         assert_eq!(summary["type"], "final_summary");
         assert_eq!(summary["status"], "ok");
+        assert_eq!(summary["outcome"], "succeeded");
+        assert_eq!(summary["assistant"], "committed");
         assert!(summary["duration_ms"].as_u64().unwrap() >= 35, "{summary}");
 
         let mut management = base_cmd(&home_path);

@@ -1,6 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted and E02-S03 phase model started through Cycle 018;
+Status: E02-S02 accepted, E02-S03 phase model started, and E02-S04 compatible
+JSONL projection started through Cycle 019;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -71,6 +72,14 @@ publication is single, and duplicate/out-of-order/post-terminal transitions
 fail before mutation. Carrier integration and fault cuts remain later E02-S03
 cards, so current presentation still owns the live sequence.
 
+Cycle 019 projects `TerminalOutcome` into two optional `kitsu.chat.v1`
+`final_summary` fields: `outcome` and `assistant`. New writers always emit the
+canonical labels; old records without them remain valid. The carrier fixture
+derives the historical result from `status`, failure counters, and the last
+`assistant_disposition`, then rejects an explicit field that contradicts that
+evidence. This is additive schema evolution, not a version bump, and the JSONL
+writer's existing terminal-on-write-failure behavior is unchanged.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -86,4 +95,5 @@ replaceability gate remains E10.
 
 1. Wire carrier finalization through the phase owner with fault injection at
    join, persistence, and delivery boundaries.
-2. Project the published common outcome compatibly into JSONL.
+2. Extend projection parity only from measured carrier gaps; do not invent a
+   second schema version while additive `kitsu.chat.v1` evolution is sufficient.

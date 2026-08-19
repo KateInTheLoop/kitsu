@@ -293,6 +293,22 @@ fn emit_jsonl_summary_with_postcondition_failures(
     tool_error_totals: ToolErrorTotals,
 ) -> Result<(), CliError> {
     debug_assert!(output_schema_failures <= provider_failures);
+    let outcome = match status {
+        "ok" => kitsu_core::RunOutcomeClass::Succeeded,
+        "partial" => kitsu_core::RunOutcomeClass::PartiallySucceeded,
+        "cancelled" => kitsu_core::RunOutcomeClass::Cancelled,
+        "error" if provider_failures > 0 => kitsu_core::RunOutcomeClass::ProviderFault,
+        "error" if tool_failures > 0 || policy_failures > 0 => {
+            kitsu_core::RunOutcomeClass::ToolFault
+        }
+        "error" => kitsu_core::RunOutcomeClass::UserFault,
+        unknown => {
+            return Err(CliError::user(format!(
+                "internal final summary status is not recognized: {unknown}"
+            )))
+        }
+    };
+    let terminal = run_spec().terminal(outcome, run_assistant_disposition());
     let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
     let user_failures = failures
         .saturating_sub(provider_failures + tool_failures + policy_failures + cancelled_failures);
@@ -305,6 +321,8 @@ fn emit_jsonl_summary_with_postcondition_failures(
     };
     let mut payload = serde_json::json!({
         "status": status,
+        "outcome": terminal.class().as_str(),
+        "assistant": terminal.assistant().as_str(),
         "failures": failures,
         "provider_failures": provider_failures,
         "output_schema_failures": output_schema_failures,

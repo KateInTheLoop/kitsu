@@ -189,7 +189,9 @@ confirmation EOF causes zero later provider sends/effects, explicit denial
 stays recoverable, and sequential human processes expose distinct run IDs plus
 the same success/provider/tool classifications as JSONL. Terminal phase
 ownership remains E02-S03; Cycle 018 adds its provider-free monotonic phase
-model before any carrier is migrated.
+model before any carrier is migrated. Cycle 019 starts E02-S04 by adding the
+same neutral outcome and exact assistant disposition to `final_summary` without
+invalidating historical `kitsu.chat.v1` records.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
@@ -397,9 +399,10 @@ gates merely because a card appears attractive.
 | 017 | E02-S02-C3 | Project neutral run identity/outcome into human carrier receipts and close the private contract |
 | 018 | E02-S03-C1 | Add monotonic settlement/join/persist/deliver phase model |
 | 019 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
-| 020 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 020 | E02-S03-C2 | Route one bounded noninteractive finalization path through the phase owner and add fault cuts |
+| 021 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 
-After Cycle 020, the queue finishes E04's generation/adapter gates, then
+After Cycle 021, the queue finishes E04's generation/adapter gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. Provider-free fixture design may overlap, but it cannot displace a
 failing correctness or authority gate.

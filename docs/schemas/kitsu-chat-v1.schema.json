@@ -764,6 +764,20 @@
           "properties": {
             "type": { "const": "final_summary" },
             "status": { "enum": ["ok", "partial", "error", "cancelled"] },
+            "outcome": {
+              "enum": [
+                "succeeded",
+                "partially_succeeded",
+                "user_fault",
+                "provider_fault",
+                "tool_fault",
+                "cancelled",
+                "interrupted"
+              ]
+            },
+            "assistant": {
+              "enum": ["committed", "committed_partial", "discarded", "absent"]
+            },
             "failures": { "type": "integer", "minimum": 0 },
             "provider_failures": { "type": "integer", "minimum": 0 },
             "output_schema_failures": { "type": "integer", "minimum": 0 },

@@ -8,11 +8,13 @@ pub enum JsonlOutcomeClass {
     ProviderFault,
     ToolFault,
     Cancelled,
+    Interrupted,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JsonlAssistantDisposition {
     Committed,
+    CommittedPartial,
     Discarded,
     Absent,
 }
@@ -64,7 +66,7 @@ pub fn inspect_jsonl(events: &[serde_json::Value], exit_code: i32) -> Result<Jso
     if events.last() != Some(summary) {
         return Err("records appeared after final_summary".to_string());
     }
-    let class = match summary["status"].as_str() {
+    let inferred_class = match summary["status"].as_str() {
         Some("ok") => JsonlOutcomeClass::Succeeded,
         Some("partial") => JsonlOutcomeClass::PartiallySucceeded,
         Some("cancelled") => JsonlOutcomeClass::Cancelled,
@@ -81,20 +83,54 @@ pub fn inspect_jsonl(events: &[serde_json::Value], exit_code: i32) -> Result<Jso
         Some(status) => return Err(format!("unknown final_summary status '{status}'")),
         None => return Err("final_summary status is missing".to_string()),
     };
+    let class = match summary.get("outcome").and_then(serde_json::Value::as_str) {
+        Some("succeeded") => JsonlOutcomeClass::Succeeded,
+        Some("partially_succeeded") => JsonlOutcomeClass::PartiallySucceeded,
+        Some("user_fault") => JsonlOutcomeClass::UserFault,
+        Some("provider_fault") => JsonlOutcomeClass::ProviderFault,
+        Some("tool_fault") => JsonlOutcomeClass::ToolFault,
+        Some("cancelled") => JsonlOutcomeClass::Cancelled,
+        Some("interrupted") => JsonlOutcomeClass::Interrupted,
+        Some(outcome) => return Err(format!("unknown explicit outcome '{outcome}'")),
+        None => inferred_class,
+    };
+    if class != inferred_class {
+        return Err(format!(
+            "explicit outcome {class:?} contradicts legacy summary evidence {inferred_class:?}"
+        ));
+    }
 
     let dispositions = events
         .iter()
         .filter(|event| event["type"] == "assistant_disposition")
         .collect::<Vec<_>>();
-    let assistant = match dispositions
+    let inferred_assistant = match dispositions
         .last()
         .and_then(|event| event["status"].as_str())
     {
-        Some("committed" | "committed_partial") => JsonlAssistantDisposition::Committed,
+        Some("committed") => JsonlAssistantDisposition::Committed,
+        Some("committed_partial") => JsonlAssistantDisposition::CommittedPartial,
         Some("discarded") => JsonlAssistantDisposition::Discarded,
         Some(status) => return Err(format!("unknown assistant disposition '{status}'")),
         None => JsonlAssistantDisposition::Absent,
     };
+    let assistant = match summary.get("assistant").and_then(serde_json::Value::as_str) {
+        Some("committed") => JsonlAssistantDisposition::Committed,
+        Some("committed_partial") => JsonlAssistantDisposition::CommittedPartial,
+        Some("discarded") => JsonlAssistantDisposition::Discarded,
+        Some("absent") => JsonlAssistantDisposition::Absent,
+        Some(disposition) => {
+            return Err(format!(
+                "unknown explicit assistant disposition '{disposition}'"
+            ))
+        }
+        None => inferred_assistant,
+    };
+    if assistant != inferred_assistant {
+        return Err(format!(
+            "explicit assistant disposition {assistant:?} contradicts event evidence {inferred_assistant:?}"
+        ));
+    }
 
     Ok(JsonlFacts {
         run_id: run_id.to_string(),
@@ -184,6 +220,73 @@ mod tests {
         assert_eq!(
             inspect_jsonl(&followed, 0).unwrap_err(),
             "records appeared after final_summary"
+        );
+    }
+
+    #[test]
+    fn inspector_accepts_legacy_summary_but_rejects_explicit_contradictions() {
+        let legacy = vec![record(
+            "final_summary",
+            "legacy-run",
+            serde_json::json!({"status": "ok"}),
+        )];
+        let legacy_facts = inspect_jsonl(&legacy, 0).unwrap();
+        assert_eq!(legacy_facts.class, JsonlOutcomeClass::Succeeded);
+        assert_eq!(legacy_facts.assistant, JsonlAssistantDisposition::Absent);
+
+        let coherent = vec![
+            record(
+                "assistant_disposition",
+                "coherent-run",
+                serde_json::json!({"status": "committed"}),
+            ),
+            record(
+                "final_summary",
+                "coherent-run",
+                serde_json::json!({
+                    "status": "ok",
+                    "outcome": "succeeded",
+                    "assistant": "committed"
+                }),
+            ),
+        ];
+        let coherent_facts = inspect_jsonl(&coherent, 0).unwrap();
+        assert_eq!(coherent_facts.class, JsonlOutcomeClass::Succeeded);
+        assert_eq!(
+            coherent_facts.assistant,
+            JsonlAssistantDisposition::Committed
+        );
+
+        let contradiction = vec![record(
+            "final_summary",
+            "contradictory-run",
+            serde_json::json!({
+                "status": "ok",
+                "outcome": "provider_fault",
+                "assistant": "committed"
+            }),
+        )];
+        assert!(
+            inspect_jsonl(&contradiction, 0)
+                .unwrap_err()
+                .contains("contradicts"),
+            "explicit common fields must not disagree with legacy evidence"
+        );
+
+        let assistant_contradiction = vec![record(
+            "final_summary",
+            "assistant-contradiction",
+            serde_json::json!({
+                "status": "ok",
+                "outcome": "succeeded",
+                "assistant": "discarded"
+            }),
+        )];
+        assert!(
+            inspect_jsonl(&assistant_contradiction, 0)
+                .unwrap_err()
+                .contains("contradicts"),
+            "explicit assistant state must agree with disposition events"
         );
     }
 }
