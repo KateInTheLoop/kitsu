@@ -203,7 +203,11 @@ it to an ID before cleanup classification. Cycle 023 audits the remaining
 ownership boundary and retains four evidence-backed gates: one process owner,
 presentation-neutral facts, interactive aggregation, and independent exit
 evaluation. Management commands are explicitly outside this inference-run
-contract rather than silently treated as completed carriers.
+contract rather than silently treated as completed carriers. Cycle 024 replaces
+the migrated helpers' temporary owners with one process-scoped lifecycle,
+accepts it before inference preflight, rejects a second cross-path publication,
+and routes structurally child-free JSONL fallback through that owner. A first
+foreground provider-turn marker prevents later fallback from guessing cleanup.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

@@ -2,7 +2,7 @@
 
 Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
 piped JSONL, E02-S04 compatible projection has started, and the host ownership
-exit is decomposed through Cycle 023;
+exit is decomposed and its process owner landed through Cycle 024;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -127,6 +127,22 @@ or model-authored assistant disposition. “Top-level fallback” means the
 inference error path in `main`, not `init`, `doctor`, `auth`, `models`,
 `sessions`, `artifacts`, help, or parse-only output.
 
+Cycle 024 makes the host owner singular for every migrated JSONL carrier. The
+CLI reserves one `RunLifecycle` after successful argument parsing but before
+inference output/config/runtime preflight; ask, scripted, and piped publishers
+advance that same mutex-owned instance. A provider-free helper test performs a
+successful publication, then proves a second cross-path attempt is rejected
+before its delivery closure runs.
+
+The top-level JSONL fallback uses that owner only while the foreground
+provider-turn marker remains false. At that cut no background child can exist,
+so cleanup is structurally `Joined`; persistence still comes from the active
+snapshot receipt instead of an addressability guess. `run_turn_cancellable` and
+the steerable interactive turn set the marker before polling provider work.
+Post-start fallback remains for C7 because its cleanup/persistence facts must be
+carried, not inferred. Management command detection is unit-tested separately
+and does not reserve the inference lifecycle.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -140,10 +156,8 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Add one process-scoped lifecycle owner and route duplicate/cross-path plus
-   early inference fallback cuts through it.
-2. Carry presentation-neutral phase facts through human noninteractive paths,
+1. Carry presentation-neutral phase facts through human noninteractive paths,
    then define the interactive aggregate independently from its last turn.
-3. Evaluate all seven carriers before closing E02. Extend projection parity
+2. Evaluate all seven carriers before closing E02. Extend projection parity
    only from measured gaps; do not invent a second schema version while
    additive `kitsu.chat.v1` evolution is sufficient.
