@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00, E01, E02, E04-S01, and E04-S02 are accepted through Cycle 034;
+Status: E00, E01, E02, E04-S01, and E04-S02 are accepted through Cycle 035;
 E04-S03 is in progress;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 34 / 34 |
+| Accepted cycles/commits after this cycle | 35 / 35 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S03-C2 (Cycle 035) — current-generation inference/catalog admission |
+| Active epic/card | E04 / E04-S03-C3 (Cycle 036) — model-bound successor publication and rebinding |
 
 ## Epic status
 
@@ -23,7 +23,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02 accepted, E04-S03 through C1 | Sixteen wire, six route-contract, three derivation/declaration, three snapshot, auth-freeze, factory, and composition cases cover protocol evidence, secret-free identity, truthful current capabilities, one coherent initial runtime generation, and credential stability; current-generation admission, replacement, `X001-G1-AUX`, and compiled adapter remain |
+| E04 provider spine | **In progress**; E04-S01/S02 accepted, E04-S03 through C2 | Sixteen wire, six route-contract, three derivation/declaration, three snapshot, six route-handle, auth-freeze, factory, and composition cases cover protocol evidence, secret-free identity, truthful current capabilities, one coherent initial runtime generation, current-generation primary admission, failed replacement retention, and admitted-old-work drain; model-bound production replacement, `X001-G1-AUX`, receipts, and compiled adapter remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -68,8 +68,9 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 030 | `96394f7` | Truthful status/context/usage taxonomy, stories, dependencies, and PF-10 matrix |
 | 031 | `5b18de6` | One-send timeout/cancel terminal cuts, aggregate/tool bounds, and image-capability handoff |
 | 032 | `a866702` | Versioned route identity/capability values and pure stale/unsupported admission |
-| 033 | this document's commit | Bounded opaque profile derivation and truthful current compatible-Chat declaration |
-| 034 | this document's commit | Initial immutable compatible-Chat snapshot with shared frozen auth and route policy |
+| 033 | `c26fac4` | Bounded opaque profile derivation and truthful current compatible-Chat declaration |
+| 034 | `70ab219` | Initial immutable compatible-Chat snapshot with shared frozen auth and route policy |
+| 035 | this document's commit | Current-generation primary handles, exact replacement cuts, and optional-catalog preservation |
 
 ## Current green gates
 
@@ -88,11 +89,13 @@ E08 telemetry observability was scoped in Cycle 030 on
   that `anthropic` remains a display/config label until a native adapter ships.
   The CLI retains the declaration privately but does not yet publish a live
   generation receipt.
-- Three snapshot cases plus auth, compatible-Chat factory, and CLI source tests
+- Three snapshot and six route-handle cases plus auth, compatible-Chat factory, and CLI source tests
   pin generation one, bounded model/time policy, exact catalog capability,
   shared endpoint/path/policy construction, and one sensitive credential across
-  later environment mutation. `ChatSetup` retains the snapshot but physical
-  calls do not yet validate it against a current-generation publisher.
+  later environment mutation. `ChatSetup` owns one current publisher; ask/chat,
+  foreground/subagent/compaction inference, model catalog, context discovery,
+  and resume paths validate bound generation before runtime entry. Optional
+  catalog absence remains a truthful no-send `None`.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
 - Workspace/all-target Clippy passes with warnings denied; formatting and diff
@@ -145,9 +148,11 @@ compatible-Chat route it actually constructs; a configured `anthropic` flavor
 must not falsely claim the reserved native Messages adapter.
 Cycle 034 begins E04-S03 with one immutable snapshot owning the declaration,
 endpoint/model/auth-source, retry/catalog policy, both compatible-Chat runtimes,
-and initial generation. Cycle 035 introduces a current-generation route handle
-and migrates primary inference/catalog admission before replacement and the
-remaining auxiliary fault matrix.
+and initial generation. Cycle 035 introduces a current-generation route owner
+and bound handle, migrates primary inference/catalog/context calls, proves
+stale and invalid replacement are zero-send/no-mutation, and lets admitted old
+work drain. Cycle 036 makes the snapshot model and production `/model`
+successor publication agree before the remaining auxiliary/receipt matrix.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

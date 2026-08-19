@@ -1,11 +1,14 @@
 # Provider route value contract
 
-Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 034.
+Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 035.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
-and a credential resolved once for that generation. Current-generation send
-admission, replacement, draining, and attempt receipts remain E04-S03 work.
+and a credential resolved once for that generation. Cycle 035 adds an atomic
+current owner and bound request handles, migrates primary chat/catalog/context
+calls, and pins replacement plus drain behavior. Model-bound successor
+publication, remaining management auxiliaries, and attempt receipts remain
+E04-S03 work.
 
 ## Decision
 
@@ -61,6 +64,22 @@ compatible-Chat implementation it actually constructs.
 - `FrozenAuth` resolves a sensitive header once into zeroizing storage. All
   inference retries and catalog calls owned by the snapshot share that same
   auth object; later environment changes cannot alter an admitted generation.
+- `ProviderRouteCurrent<P>` owns the one process-local current snapshot behind
+  a bounded in-process read/write lock. `bind` returns a
+  `ProviderRouteHandle<P>` tied to that immutable generation; every logical
+  inference, catalog, context-discovery, compaction, foreground, or subagent
+  call validates current generation and required request-shape capabilities
+  before it can enter a provider runtime.
+- Replacement is expected-generation and exact-successor only. A stale
+  expectation, profile mismatch, non-successor, exhausted generation, or
+  poisoned owner leaves the prior snapshot installed. Once a logical request
+  has been admitted, it owns the old runtime long enough to drain its internal
+  retry/stream policy; a later call through that old handle fails stale.
+- The provider port's catalog is optional: a current route without
+  `model_catalog` returns `None` without entering either runtime. Staleness is
+  still checked first. Capabilities required by a concrete chat request, such
+  as streaming, tools, or structured output, fail with a typed local error and
+  zero sends.
 
 The exact v1 JSON vector and all validation cuts are pinned by
 `provider_route_contract.rs`. The provider wire matrix consumes the same
@@ -73,22 +92,25 @@ adds bounded derivation and a truthful declaration. Cycle 034 replaces the two
 independent chat-provider constructors with one compatible-Chat route factory.
 It resolves auth exactly once, constructs inference and catalog runtimes from
 one consumed endpoint/path/policy input, and retains their initial generation
-in `ChatSetup`. Existing call sites temporarily use `Arc` clones owned by that
-snapshot. All accepted `openai`, `anthropic`, and `ollama` flavor labels still
+in `ChatSetup`. Cycle 035 replaces those raw `Arc` fields with one current owner
+and passes bound handles through ask, chat, scripted turns, foreground and
+subagent inference, compaction, slash catalog/model validation, context refresh,
+and resume discovery. All accepted `openai`, `anthropic`, and `ollama` flavor labels still
 declare the compatible-Chat adapter/wire Kitsu actually constructs; no flavor
 label selects a physical adapter. These cards still do not:
 
-- validate every physical send against the current published generation;
-- publish same-label replacement or define old-generation drain/cancel policy;
-- bind replay, title, compaction, or every auxiliary call to a route handle;
+- require each `ChatRequest.model` to equal the snapshot model;
+- make the production `/model` path construct, publish, and rebind a successor;
+- define queued/background cancellation during a production model replacement;
+- bind management-only top-level `models` and doctor probes to this chat owner;
 - implement or advertise a native Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
-flavor-to-adapter switch. The snapshot is retained privately and is not yet a
-live current-generation publisher or receipt. The next E04-S03 cards add send
-admission, same-label replacement, auxiliary binding, and drain/cancel fault
-cuts; later cards add the distinct adapter and secret-free operational receipts.
+flavor-to-adapter switch. The current owner remains private and has no
+user-visible receipt. The next E04-S03 card makes model identity and production
+successor publication agree before remaining auxiliary/receipt cuts; later
+cards add the distinct adapter and secret-free operational receipts.
 
 ## Acceptance and rollback
 
@@ -98,14 +120,16 @@ Provider-free gates:
 cargo test -p kitsu-providers --test provider_route_contract
 cargo test -p kitsu-providers --test provider_route_declaration
 cargo test -p kitsu-providers --test provider_route_snapshot
+cargo test -p kitsu-providers --test provider_route_handle
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, three snapshot, route-factory,
-auth-freeze/source-selection, two declaration-composition, and sixteen
-wire-matrix cases pass offline. The derivation vector is independently checked
+Six route-contract, three declaration/derivation, three snapshot, six
+route-handle, route-factory, auth-freeze/source-selection, two
+declaration-composition, and sixteen wire-matrix cases pass offline. The
+derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Removing
-the snapshot/factory, restoring the two constructors, and reverting its values,
-tests, and documentation is complete rollback because current-generation send
-admission has not shipped yet.
+the current owner/handle and restoring `ChatSetup`'s raw snapshot-owned runtime
+clones is the exact source rollback. No config, persisted session, or wire
+schema migration is involved.

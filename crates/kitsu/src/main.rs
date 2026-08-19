@@ -40,8 +40,8 @@ use kitsu_providers::openai_compat::{
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
     ProviderAuthSource, ProviderCatalogPolicy, ProviderError, ProviderProfileId,
-    ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
-    ProviderRouteSnapshot, ProviderTelemetrySink,
+    ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderRouteHandle, ProviderRoutePolicy, ProviderTelemetrySink,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -3455,6 +3455,19 @@ fn safe_provider_error_message(
         ProviderError::ToolsNotSupported => format!(
             "{subject} requires tool calls that this provider does not support - disable tools or choose a tool-capable model"
         ),
+        ProviderError::RouteContract(ProviderRouteContractError::StaleGeneration { .. }) => {
+            format!(
+                "{subject} was not sent because its provider route generation is stale - retry against the current route"
+            )
+        }
+        ProviderError::RouteContract(ProviderRouteContractError::UnsupportedCapability {
+            capability,
+        }) => format!(
+            "{subject} was not sent because the current provider route does not support {capability:?} - choose a compatible route or disable that request feature"
+        ),
+        ProviderError::RouteContract(_) => format!(
+            "{subject} was not sent because the current provider route failed local admission - retry or rebuild the route from valid configuration"
+        ),
         ProviderError::Auth(kitsu_providers::AuthError::Missing { env, hint }) => {
             format!(
                 "credential variable ${} is missing - set it or update the gateway auth configuration{}",
@@ -4256,18 +4269,10 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
 /// Provider + model + auth resolved from config and CLI flags. Shared by the
 /// `ask` and `chat` commands so they construct the gateway connection identically.
 struct ChatSetup {
-    /// `Arc` so the main loop and spawned subagents can share one connection.
-    provider: Arc<OpenAICompatProvider>,
-    /// Immutable owner of the declaration, initial generation, model,
-    /// credential source, runtime policy, and both provider instances. Existing
-    /// call sites temporarily use Arc clones below; later E04 cards make send
-    /// admission and receipts consume this owner directly.
-    provider_route_snapshot: ProviderRouteSnapshot<OpenAICompatProvider>,
-    /// User-requested model catalog operations get the full CLI timeout and a
-    /// cache isolated from the two-second advisory startup probe. Otherwise a
-    /// startup timeout's shared negative cache could make an immediate
-    /// `/models` fail without honoring the user's requested wait budget.
-    catalog_provider: Arc<OpenAICompatProvider>,
+    /// Atomic owner of the current immutable generation. `ask`/`chat` bind a
+    /// request-facing handle from this owner; raw inference/catalog runtimes do
+    /// not leave composition.
+    provider_route: ProviderRouteCurrent<OpenAICompatProvider>,
     gateway_name: String,
     provider_diagnostics: ProviderDiagnosticContext,
     config_path: std::path::PathBuf,
@@ -8541,18 +8546,34 @@ enum ContextWindowRefreshOutcome {
 /// result. Provider diagnostics are intentionally not accepted here, so an
 /// endpoint URL or response body can never enter the private cache.
 async fn refresh_cached_context_window(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
-) -> ContextWindowRefreshOutcome {
-    let Some(window) = provider.model_context_length(model).await else {
-        return ContextWindowRefreshOutcome::NoMetadata;
+) -> Result<ContextWindowRefreshOutcome, ProviderError> {
+    let Some(window) = provider.advisory_model_context_length(model).await? else {
+        return Ok(ContextWindowRefreshOutcome::NoMetadata);
     };
     if write_cached_context_window(path, key, window).is_ok() {
-        ContextWindowRefreshOutcome::Cached(window)
+        Ok(ContextWindowRefreshOutcome::Cached(window))
     } else {
-        ContextWindowRefreshOutcome::DiscoveredButNotCached(window)
+        Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window))
+    }
+}
+
+async fn refresh_cached_context_window_explicit(
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    model: &str,
+    path: &std::path::Path,
+    key: &str,
+) -> Result<ContextWindowRefreshOutcome, ProviderError> {
+    let Some(window) = provider.model_context_length(model).await? else {
+        return Ok(ContextWindowRefreshOutcome::NoMetadata);
+    };
+    if write_cached_context_window(path, key, window).is_ok() {
+        Ok(ContextWindowRefreshOutcome::Cached(window))
+    } else {
+        Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window))
     }
 }
 
@@ -8680,8 +8701,12 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
             CliError::user(format!("config error: invalid provider route: {error}"))
         }
     })?;
-    let provider = provider_route_snapshot.inference_runtime().clone();
-    let catalog_provider = provider_route_snapshot.catalog_runtime().clone();
+    let provider_route = ProviderRouteCurrent::new(provider_route_snapshot);
+    let provider = provider_route.bind().map_err(|error| {
+        CliError::user(format!(
+            "config error: cannot bind initial provider route: {error}"
+        ))
+    })?;
 
     if let kitsu_providers::ExpiryStatus::Expired { since } = auth.expiry_status() {
         eprintln!(
@@ -8741,20 +8766,20 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         let discovery_provenance = context_window_provenance.clone();
         tokio::spawn(async move {
             let discovery = match refresh_cached_context_window(
-                discovery_provider.as_ref(),
+                &discovery_provider,
                 &discovery_model,
                 &cache_path,
                 &cache_key,
             )
             .await
             {
-                ContextWindowRefreshOutcome::Cached(window) => {
+                Ok(ContextWindowRefreshOutcome::Cached(window)) => {
                     ContextWindowDiscoveryState::ReadyForNextRun { window }
                 }
-                ContextWindowRefreshOutcome::DiscoveredButNotCached(window) => {
+                Ok(ContextWindowRefreshOutcome::DiscoveredButNotCached(window)) => {
                     ContextWindowDiscoveryState::CompleteButNotCached { window }
                 }
-                ContextWindowRefreshOutcome::NoMetadata => {
+                Ok(ContextWindowRefreshOutcome::NoMetadata) | Err(_) => {
                     ContextWindowDiscoveryState::FinishedWithoutMetadata
                 }
             };
@@ -8775,9 +8800,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     }
 
     Ok(ChatSetup {
-        provider,
-        provider_route_snapshot,
-        catalog_provider,
+        provider_route,
         gateway_name,
         provider_diagnostics,
         config_path: path,
@@ -9085,7 +9108,11 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         persistence: kitsu_core::RunPersistenceState::NotRequested,
     })?;
     let setup = build_setup(cli).await?;
-    let model = setup.provider_route_snapshot.model().to_string();
+    let provider =
+        Arc::new(setup.provider_route.bind().map_err(|error| {
+            CliError::user(format!("cannot bind current provider route: {error}"))
+        })?);
+    let model = provider.model().to_string();
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
             "~ artifacts disabled: commands keep bounded previews only; large tool results are not offloaded; existing artifacts are unchanged"
@@ -9167,14 +9194,8 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
     }
 
     let mut state = kitsu_core::AgentSessionState::default();
-    let outcome = run_turn_cancellable(
-        &setup.provider,
-        &tools,
-        &mut messages,
-        &agent_cfg,
-        &mut state,
-    )
-    .await;
+    let outcome =
+        run_turn_cancellable(&provider, &tools, &mut messages, &agent_cfg, &mut state).await;
     let assistant = match &outcome {
         TurnOutcome::Completed(Ok(text)) => Some(text.as_str()),
         _ => None,
@@ -9616,7 +9637,9 @@ fn strict_failure_cli_error(failure: &StrictTurnFailure) -> CliError {
 
 fn script_failure_kind(error: &kitsu_core::AgentError) -> ScriptFailureKind {
     match error {
-        kitsu_core::AgentError::Provider(ProviderError::Auth(_))
+        kitsu_core::AgentError::Provider(
+            ProviderError::Auth(_) | ProviderError::RouteContract(_),
+        )
         | kitsu_core::AgentError::Interrupted(_)
         | kitsu_core::AgentError::ContextOverflow { .. }
         | kitsu_core::AgentError::ContextWindowUnknown => ScriptFailureKind::User,
@@ -11970,6 +11993,7 @@ async fn finalize_scripted_run(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -11992,6 +12016,7 @@ async fn run_scripted(
     let mut status = ScriptRunStatus::default();
     let result = run_scripted_body(
         setup,
+        provider,
         tools,
         messages,
         model,
@@ -12030,6 +12055,7 @@ async fn run_scripted(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_body(
     setup: &ChatSetup,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -12115,7 +12141,7 @@ async fn run_scripted_body(
             idx += 1; // consume the closing ">>>"
             let prompt = SubmittedPrompt::full(block.join("\n"));
             let result = run_scripted_turn(
-                setup,
+                provider,
                 tools,
                 perms,
                 journal,
@@ -12171,7 +12197,7 @@ async fn run_scripted_body(
                 rest,
                 messages,
                 model,
-                &setup.catalog_provider,
+                provider,
                 tools,
                 cli,
                 perms,
@@ -12401,7 +12427,7 @@ async fn run_scripted_body(
                         TurnToolMode::None => &no_tools,
                     };
                     let result = run_scripted_turn(
-                        setup,
+                        provider,
                         turn_tools,
                         perms,
                         journal,
@@ -12453,7 +12479,7 @@ async fn run_scripted_body(
                         TurnToolMode::None => &no_tools,
                     };
                     let result = run_scripted_turn(
-                        setup,
+                        provider,
                         turn_tools,
                         perms,
                         journal,
@@ -12559,7 +12585,7 @@ async fn run_scripted_body(
         }
         let prompt = SubmittedPrompt::full(trimmed);
         let result = run_scripted_turn(
-            setup,
+            provider,
             tools,
             perms,
             journal,
@@ -12606,7 +12632,7 @@ async fn run_scripted_body(
 /// transactionally while completed filesystem side effects remain inspectable.
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_turn(
-    setup: &ChatSetup,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -12724,7 +12750,7 @@ async fn run_scripted_turn(
         turn_deadline,
         journal.scope_turn(
             &journal_turn.token,
-            run_turn_cancellable(&setup.provider, tools, messages, &cfg, state),
+            run_turn_cancellable(provider, tools, messages, &cfg, state),
         ),
     )
     .await
@@ -13785,7 +13811,7 @@ async fn read_text_file_cancellable(path: std::path::PathBuf) -> Option<std::io:
 }
 
 async fn run_turn_cancellable(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -13816,7 +13842,7 @@ async fn wait_for_active_quit_cancel() {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_steerable(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -13897,7 +13923,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         initial_review,
     } = invocation;
     let setup = build_setup(cli).await?;
-    let initial_model = setup.provider_route_snapshot.model().to_string();
+    let provider =
+        Arc::new(setup.provider_route.bind().map_err(|error| {
+            CliError::user(format!("cannot bind current provider route: {error}"))
+        })?);
+    let initial_model = provider.model().to_string();
 
     // Permissions gate the fs tools. Interactive TTY chat uses "ask" mode
     // (prompt on demand) with read access to the launch directory by default;
@@ -14435,7 +14465,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if !no_tools && spawn_cap > 0 {
         // Stage A: synchronous single delegation.
         let (d, h) = subagent::spawn_agent_tool(
-            setup.provider.clone(),
+            provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
@@ -14446,7 +14476,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         registration.expect("tool name must be unique");
         // Stage B: fan several isolated subagents out in parallel.
         let (d, h) = subagent::spawn_agents_tool(
-            setup.provider.clone(),
+            provider.clone(),
             sub_tools.clone(),
             sub_cfg.clone(),
             live_mw.clone(),
@@ -14460,7 +14490,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let mut bg_cfg = sub_cfg;
         bg_cfg.quiet = true;
         let (d, h) = subagent::spawn_agent_bg_tool(
-            setup.provider.clone(),
+            provider.clone(),
             sub_tools.clone(),
             bg_cfg,
             live_mw.clone(),
@@ -14743,10 +14773,18 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             let resumed_window = if setup.context_window_pinned {
                 context_window.get()
             } else {
-                await_cancellable(setup.catalog_provider.model_context_length(&resumed_model))
+                await_cancellable(provider.model_context_length(&resumed_model))
                     .await
                     .ok_or_else(|| {
                         CliError::cancelled("session context-window discovery cancelled by Ctrl+C")
+                    })?
+                    .map_err(|error| {
+                        map_provider_error_with_diagnostics(
+                            error,
+                            ProviderOperation::ModelCatalog,
+                            Some(cli.timeout_secs),
+                            setup.provider_diagnostics,
+                        )
                     })?
             };
             model = resumed_model;
@@ -14958,6 +14996,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if let Some(path) = script {
         return run_scripted(
             &setup,
+            &provider,
             &tools,
             &mut messages,
             &mut model,
@@ -15163,7 +15202,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             write_journal.scope_turn(
                 &journal_turn.token,
                 run_turn_cancellable(
-                    &setup.provider,
+                    &provider,
                     turn_tools,
                     &mut messages,
                     &cfg,
@@ -15902,7 +15941,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 rest,
                 &mut messages,
                 &mut model,
-                &setup.catalog_provider,
+                &provider,
                 &tools,
                 cli,
                 &perms,
@@ -16137,15 +16176,27 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     let resumed_window = if setup.context_window_pinned {
                         context_window.get()
                     } else {
-                        let Some(window) = await_cancellable(
-                            setup.catalog_provider.model_context_length(&resumed_model),
-                        )
-                        .await
+                        let Some(window) =
+                            await_cancellable(provider.model_context_length(&resumed_model)).await
                         else {
                             eprintln!("^C (session context-window discovery cancelled)");
                             continue;
                         };
-                        window
+                        match window {
+                            Ok(window) => window,
+                            Err(error) => {
+                                eprintln!(
+                                    "cannot discover session context window: {}",
+                                    safe_provider_error_message(
+                                        &error,
+                                        ProviderOperation::ModelCatalog,
+                                        Some(cli.timeout_secs),
+                                        setup.provider_diagnostics,
+                                    )
+                                );
+                                continue;
+                            }
+                        }
                     };
                     model = resumed_model;
                     context_window.set(resumed_window);
@@ -16361,7 +16412,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .scope_turn(
                 &journal_turn.token,
                 run_turn_steerable(
-                    &setup.provider,
+                    &provider,
                     turn_tools,
                     &mut messages,
                     &cfg,
@@ -17130,11 +17181,12 @@ fn skill_load_payload(
 
 async fn refresh_session_context_window(
     model: &str,
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
     jsonl: bool,
+    timeout_secs: u64,
 ) -> SlashResult {
     if context_window_pinned {
         let source = context_window_provenance(&session.window_provenance)
@@ -17156,7 +17208,7 @@ async fn refresh_session_context_window(
         return SlashResult::Error;
     }
     let cache_key = session.window_refresh.cache_key(model);
-    let Some(outcome) = await_cancellable(refresh_cached_context_window(
+    let Some(outcome) = await_cancellable(refresh_cached_context_window_explicit(
         provider,
         model,
         &session.window_refresh.cache_path,
@@ -17168,6 +17220,18 @@ async fn refresh_session_context_window(
             eprintln!("^C (context-window refresh cancelled)");
         }
         return SlashResult::Cancelled;
+    };
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(error) => {
+            return report_slash_provider_error(
+                "context-window refresh failed",
+                error,
+                ProviderOperation::ModelCatalog,
+                timeout_secs,
+                session.provider_diagnostics,
+            );
+        }
     };
     let (window, cache_written) = match outcome {
         ContextWindowRefreshOutcome::Cached(window) => (window, true),
@@ -17217,7 +17281,7 @@ async fn handle_slash(
     cmd: &str,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     tools: &Registry,
     cli: &Cli,
     perms: &Permissions,
@@ -17394,6 +17458,7 @@ async fn handle_slash(
                     context_window,
                     context_window_pinned,
                     cli.jsonl,
+                    cli.timeout_secs,
                 )
                 .await;
             }
@@ -18259,6 +18324,18 @@ async fn handle_slash(
                         eprintln!("^C (context-window discovery cancelled)");
                         return SlashResult::Cancelled;
                     };
+                    let discovered = match discovered {
+                        Ok(discovered) => discovered,
+                        Err(error) => {
+                            return report_slash_provider_error(
+                                "could not discover context window",
+                                error,
+                                ProviderOperation::ModelCatalog,
+                                cli.timeout_secs,
+                                session.provider_diagnostics,
+                            );
+                        }
+                    };
                     context_window.set(discovered);
                     *session
                         .window_provenance
@@ -18345,7 +18422,7 @@ fn extract_code_or_text(text: &str) -> String {
 /// like other slash commands. The listed IDs are what you pass to `/model <id>`
 /// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
 async fn list_models_and_print(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     filter: &str,
     current_model: &str,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
@@ -18405,7 +18482,7 @@ fn runtime_model_catalog_telemetry(
 }
 
 async fn list_models_with_runtime_telemetry(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
     request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {
@@ -18438,7 +18515,10 @@ fn report_slash_provider_error(
     timeout_secs: u64,
     diagnostics: ProviderDiagnosticContext,
 ) -> SlashResult {
-    let user_error = matches!(error, ProviderError::Auth(_));
+    let user_error = matches!(
+        error,
+        ProviderError::Auth(_) | ProviderError::RouteContract(_)
+    );
     let message = safe_provider_error_message(&error, operation, Some(timeout_secs), diagnostics);
     eprintln!("{}: {}", terminal_inline(prefix), message);
     if user_error {
@@ -18833,7 +18913,10 @@ fn map_provider_error_with_diagnostics(
     timeout_secs: Option<u64>,
     diagnostics: ProviderDiagnosticContext,
 ) -> CliError {
-    let user_error = matches!(error, ProviderError::Auth(_));
+    let user_error = matches!(
+        error,
+        ProviderError::Auth(_) | ProviderError::RouteContract(_)
+    );
     let diagnostic = diagnostics.code_for(&error);
     let message = safe_provider_error_message(&error, operation, timeout_secs, diagnostics);
     if user_error {
@@ -20858,6 +20941,7 @@ mod tests {
                 status: 401,
                 hint: Some("provider-body-secret".to_string()),
             },
+            ProviderError::RouteContract(ProviderRouteContractError::CurrentRouteUnavailable),
         ];
         for error in &errors {
             let message = safe_provider_error_message(
@@ -20889,6 +20973,12 @@ mod tests {
             ProviderDiagnosticContext::default(),
         );
         assert!(catalog.contains("model catalog request timed out after 17s"));
+        assert_eq!(
+            script_failure_kind(&kitsu_core::AgentError::Provider(
+                ProviderError::RouteContract(ProviderRouteContractError::CurrentRouteUnavailable)
+            )),
+            ScriptFailureKind::User
+        );
 
         let missing = safe_provider_error_message(
             &ProviderError::Auth(kitsu_providers::AuthError::Missing {

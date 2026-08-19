@@ -2,6 +2,8 @@
 
 use thiserror::Error;
 
+use crate::route::ProviderRouteContractError;
+
 /// Bounded response component whose provider-controlled byte ceiling was
 /// exceeded. Keeping this typed lets automation distinguish resource-safety
 /// rejection from malformed JSON or a transport failure without including any
@@ -54,6 +56,11 @@ pub enum ProviderError {
 
     #[error("native tool calling is not supported by this provider")]
     ToolsNotSupported,
+
+    /// A Kitsu-owned route generation/capability check rejected the logical
+    /// request before any provider transport was entered.
+    #[error(transparent)]
+    RouteContract(#[from] ProviderRouteContractError),
 
     #[error(transparent)]
     Auth(#[from] AuthError),
