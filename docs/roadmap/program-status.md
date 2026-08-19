@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00 and E01 accepted; E02 in progress through Cycle 022 on
+Status: E00 and E01 accepted; E02 in progress through Cycle 023 on
 `improvements/harness-roadmap`.
 
 | Field | Current value |
@@ -8,7 +8,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 022 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 22 / 22 |
+| Accepted cycles/commits after this cycle | 23 / 23 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
@@ -20,7 +20,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 022 on
 |---|---|---|
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
-| E02 causal run/outcome | **In progress** | E02-S01/S02 accepted; ask/scripted/piped JSONL lifecycle publication green with actual cleanup/persistence inputs; interactive/top-level exit audit next |
+| E02 causal run/outcome | **In progress** | E02-S01/S02 accepted; local ask/scripted/piped JSONL publication is green; Cycle 023 proves process-singleton, early-fallback, human-phase, and interactive-aggregate gates remain |
 | E04 provider spine | Planned after E02 | Primary wire fixtures, capability types, `X001-G1-AUX`, distinct compiled dialect |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
@@ -54,7 +54,8 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 022 on
 | 019 | `c28c184` | Compatible neutral outcome/assistant fields in JSONL final summaries |
 | 020 | `2e8a20c` | Live ask lifecycle publication across successful/failed JSONL delivery |
 | 021 | `c6d5144` | Scripted lifecycle publication with actual cleanup and persistence truth |
-| 022 | this document's commit | Piped terminal lifecycle with status-preserving rollback cleanup |
+| 022 | `6ed375b` | Piped terminal lifecycle with status-preserving rollback cleanup |
+| 023 | this document's commit | E02 terminal-ownership audit and evidence-backed exit decomposition |
 
 ## Current green gates
 
@@ -73,7 +74,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 022 on
 
 ## Next delivery tranche
 
-Cycles 011-023 build E02 in bounded order. Cycles 011-014 completed carrier
+Cycles 011-027 build E02 in bounded order. Cycles 011-014 completed carrier
 discovery across success/provider/tool/preflight, cancellation, sink/terminal,
 confirmation, queued-cancel, and cleanup-residue cases. The mapping proves two
 production divergences—authority EOF lacked a zero-send interruption and human
@@ -83,8 +84,11 @@ projects the common outcome and assistant disposition into compatible JSONL.
 Cycle 020 makes the structurally child-free/session-free ask finalizer the first
 live lifecycle carrier. Cycle 021 adds scripted cleanup/persistence truth
 without inferring from exit or session ID; Cycle 022 applies that seam to every
-piped JSONL terminal branch. Cycle 023 performs the remaining interactive and
-top-level E02 exit audit before provider work begins.
+piped JSONL terminal branch. Cycle 023 proves that those helpers still own
+separate lifecycle instances and that early inference fallback plus human paths
+bypass phase publication. Cycles 024-027 add one process owner, carry neutral
+facts through human noninteractive paths, define interactive aggregation, and
+run the independent exit evaluation before provider work begins.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

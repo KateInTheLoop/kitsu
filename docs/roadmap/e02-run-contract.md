@@ -1,7 +1,8 @@
 # E02 Carrier-Neutral Run Contract
 
 Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
-piped JSONL, and E02-S04 compatible projection started through Cycle 022;
+piped JSONL, E02-S04 compatible projection has started, and the host ownership
+exit is decomposed through Cycle 023;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -113,6 +114,19 @@ and prevents later work before terminal settlement, while a failure inside the
 terminal delivery closure is phase data and still yields one immutable internal
 publication.
 
+Cycle 023 audits the host boundary rather than inferring completion from those
+local publications. Each migrated helper currently constructs a fresh
+`RunLifecycle`, so single-publication enforcement is instance-local rather than
+process-wide. Early inference errors fall back to direct top-level framing, all
+human variants bypass phase publication, and interactive chat lacks a typed
+multi-operation aggregate. The resulting ownership ledger and bounded C6-C8
+plus exit-evaluation cards live in `e02-terminal-ownership-audit.md`.
+
+Management commands are explicitly outside E02: they create no inference turn
+or model-authored assistant disposition. “Top-level fallback” means the
+inference error path in `main`, not `init`, `doctor`, `auth`, `models`,
+`sessions`, `artifacts`, help, or parse-only output.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -126,8 +140,10 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Audit interactive and top-level management carriers against the E02 exit
-   matrix; close E02 only where actual cleanup/persistence/delivery evidence is
-   complete, and decompose any remaining gap before E04 begins.
-2. Extend projection parity only from measured carrier gaps; do not invent a
-   second schema version while additive `kitsu.chat.v1` evolution is sufficient.
+1. Add one process-scoped lifecycle owner and route duplicate/cross-path plus
+   early inference fallback cuts through it.
+2. Carry presentation-neutral phase facts through human noninteractive paths,
+   then define the interactive aggregate independently from its last turn.
+3. Evaluate all seven carriers before closing E02. Extend projection parity
+   only from measured gaps; do not invent a second schema version while
+   additive `kitsu.chat.v1` evolution is sufficient.
