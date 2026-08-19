@@ -1,7 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted, E02-S03 phase model started, and E02-S04 compatible
-JSONL projection started through Cycle 019;
+Status: E02-S02 accepted, E02-S03 live integration started, and E02-S04
+compatible JSONL projection started through Cycle 020;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -80,6 +80,16 @@ derives the historical result from `status`, failure counters, and the last
 evidence. This is additive schema evolution, not a version bump, and the JSONL
 writer's existing terminal-on-write-failure behavior is unchanged.
 
+Cycle 020 makes the common lifecycle authoritative for the deliberately narrow
+`ask --jsonl` terminal path. `ask` constructs an empty tool registry and has no
+child registry or session store, so cleanup is exactly `Joined` and persistence
+is exactly `NotRequested`. The final-summary write is the delivery cut: success
+records `Delivered`; sink failure records `Failed`; both then yield one
+immutable `PublishedRun`, and the original semantic outcome/assistant state is
+unchanged. Scripted and piped finalization remain outside this tranche because
+their background and snapshot outcomes must be carried explicitly rather than
+inferred from presentation state.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -93,7 +103,7 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Wire carrier finalization through the phase owner with fault injection at
-   join, persistence, and delivery boundaries.
+1. Model scripted finalization inputs so actual join and persistence outcomes
+   can enter the lifecycle without reordering or retrospective inference.
 2. Extend projection parity only from measured carrier gaps; do not invent a
    second schema version while additive `kitsu.chat.v1` evolution is sufficient.
