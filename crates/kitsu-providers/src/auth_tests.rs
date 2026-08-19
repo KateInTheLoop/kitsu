@@ -5,7 +5,7 @@
 //! to `chrono::Utc::now()` (tests may call it; scripts may not) so the suite never
 //! depends on a hardcoded wall-clock date.
 
-use crate::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
+use crate::auth::{AuthProvider, EnvBearerAuth, FrozenAuth, NoAuth, StaticAuth};
 use crate::error::{AuthError, ExpiryStatus};
 use chrono::{Duration, Utc};
 use serial_test::serial;
@@ -121,6 +121,25 @@ fn test_header_value_is_sensitive() {
         value.is_sensitive(),
         "auth HeaderValue must be marked sensitive"
     );
+}
+
+#[test]
+#[serial]
+fn frozen_auth_keeps_one_sensitive_credential_across_environment_changes() {
+    let _g = EnvGuard::set(TEST_ENV, "generation-one-token");
+    let frozen = FrozenAuth::resolve(&auth_for_test()).expect("initial auth resolves");
+
+    env::set_var(TEST_ENV, "generation-two-token");
+    let (name, value) = frozen.header().unwrap().unwrap();
+    assert_eq!(name.as_str(), "authorization");
+    assert_eq!(value.as_bytes(), b"Bearer generation-one-token");
+    assert!(value.is_sensitive());
+}
+
+#[test]
+fn frozen_no_auth_remains_an_explicit_no_auth_generation() {
+    let frozen = FrozenAuth::resolve(&NoAuth).expect("no-auth resolves");
+    assert!(frozen.header().unwrap().is_none());
 }
 
 /// design §3 step 2: missing env var => AuthError::Missing carrying the env name

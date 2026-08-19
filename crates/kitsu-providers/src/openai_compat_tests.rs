@@ -17,7 +17,14 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 
 use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::{ProviderError, ProviderResponsePart};
-use crate::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
+use crate::openai_compat::{
+    build_openai_compatible_route, OpenAICompatConfig, OpenAICompatProvider,
+    OpenAICompatRouteConfig,
+};
+use crate::route::{
+    ProviderAuthSource, ProviderCatalogPolicy, ProviderProfileId, ProviderRouteDeclaration,
+    ProviderRoutePolicy,
+};
 use crate::telemetry::{ProviderAttemptCategory, ProviderAttemptOutcome, ProviderTelemetrySink};
 use crate::types::{ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat};
 use crate::Provider;
@@ -81,6 +88,58 @@ fn simple_request() -> ChatRequest {
         response_format: None,
         prompt_cache_key: None,
     }
+}
+
+#[test]
+#[serial]
+fn route_factory_freezes_auth_and_builds_both_runtimes_from_one_policy() {
+    let _guard = EnvGuard::set(TEST_ENV, "generation-one-token");
+    let auth = EnvBearerAuth::new(TEST_ENV, None, Some("refresh safely".to_string()));
+    let declaration = ProviderRouteDeclaration::compatible_chat_v1(
+        ProviderProfileId::derive_v1(b"route-factory", b"primary").unwrap(),
+        true,
+    );
+    let policy = ProviderRoutePolicy::new(
+        2,
+        0,
+        Duration::from_secs(120),
+        Duration::from_secs(45),
+        Duration::from_secs(2),
+        ProviderCatalogPolicy::Configured,
+    )
+    .unwrap();
+    let snapshot = build_openai_compatible_route(
+        OpenAICompatRouteConfig {
+            declaration,
+            model: "model-a".to_string(),
+            auth_source: ProviderAuthSource::Environment,
+            base_url: "https://example.invalid".to_string(),
+            chat_path: CHAT_PATH.to_string(),
+            models_path: Some("/v1/models".to_string()),
+            policy,
+        },
+        &auth,
+    )
+    .unwrap();
+
+    env::set_var(TEST_ENV, "generation-two-token");
+    let inference = snapshot.inference_runtime();
+    let catalog = snapshot.catalog_runtime();
+    assert_eq!(snapshot.identity().generation().get(), 1);
+    assert_eq!(snapshot.model(), "model-a");
+    assert_eq!(inference.base_url, catalog.base_url);
+    assert_eq!(inference.chat_path, catalog.chat_path);
+    assert_eq!(inference.models_path, catalog.models_path);
+    assert_eq!(inference.retries, 2);
+    assert_eq!(catalog.retries, 0);
+    assert_eq!(inference.timeout, Duration::from_secs(120));
+    assert_eq!(catalog.timeout, Duration::from_secs(45));
+    assert_eq!(inference.discovery_timeout, Duration::from_secs(2));
+    assert_eq!(catalog.discovery_timeout, Duration::from_secs(45));
+    assert!(Arc::ptr_eq(&inference.auth, &catalog.auth));
+    let (_, value) = inference.auth.header().unwrap().unwrap();
+    assert_eq!(value.as_bytes(), b"Bearer generation-one-token");
+    assert!(value.is_sensitive());
 }
 
 /// An SSE body with two content deltas then `[DONE]`, mirroring the OpenAI
