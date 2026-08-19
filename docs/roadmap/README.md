@@ -196,6 +196,9 @@ tool-free, session-free `ask --jsonl` terminal path through the lifecycle and
 cuts successful versus failed summary delivery without semantic reclassification.
 Cycle 021 adds actual cleanup-residue and active-snapshot persistence inputs to
 the scripted JSONL terminal publication, including installed-but-failed saves.
+Cycle 022 routes every piped JSONL terminal branch through the same publisher
+and preserves rollback cancellation's exact `joined` status instead of reducing
+it to an ID before cleanup classification.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
@@ -406,9 +409,10 @@ gates merely because a card appears attractive.
 | 020 | E02-S03-C2 | Route one bounded noninteractive finalization path through the phase owner and add fault cuts |
 | 021 | E02-S03-C3 | Model and migrate scripted join/persistence outcomes without guessing phase state |
 | 022 | E02-S03-C4 | Route piped JSONL finalization through typed cleanup/persistence/delivery inputs |
-| 023 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 023 | E02-S03-C5 | Audit remaining interactive/top-level terminal ownership and close or decompose the E02 exit gate |
+| 024 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 
-After Cycle 023, the queue finishes E04's generation/adapter gates, then
+After Cycle 024, the queue finishes E04's generation/adapter gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. Provider-free fixture design may overlap, but it cannot displace a
 failing correctness or authority gate.

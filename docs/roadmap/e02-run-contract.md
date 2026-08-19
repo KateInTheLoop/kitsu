@@ -1,7 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted, E02-S03 live integration covers ask and scripted
-JSONL, and E02-S04 compatible projection started through Cycle 021;
+Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
+piped JSONL, and E02-S04 compatible projection started through Cycle 022;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -102,6 +102,17 @@ write is one delivery cut and the lifecycle publishes once even when an earlier
 JSONL write made the sink terminal. Piped and human presentation paths remain
 outside this tranche.
 
+Cycle 022 completes the three noninteractive inference carriers' JSONL terminal
+publication. Attachment preflight, background failure, strict failure, session
+save, required-write, output-install, success, provider failure, and cancellation
+branches all enter one piped publisher with explicit cleanup and active-snapshot
+persistence. Rollback cancellation now offers a status-preserving API alongside
+the compatible ID-only projection; malformed/unattached `joined: false` truth
+therefore becomes nonzero residue. Earlier event-sink failure remains fail-stop
+and prevents later work before terminal settlement, while a failure inside the
+terminal delivery closure is phase data and still yields one immutable internal
+publication.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -115,7 +126,8 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Route piped JSONL finalization through the typed cleanup, persistence, and
-   delivery inputs already proven for ask and scripted runs.
+1. Audit interactive and top-level management carriers against the E02 exit
+   matrix; close E02 only where actual cleanup/persistence/delivery evidence is
+   complete, and decompose any remaining gap before E04 begins.
 2. Extend projection parity only from measured carrier gaps; do not invent a
    second schema version while additive `kitsu.chat.v1` evolution is sufficient.

@@ -846,14 +846,26 @@ impl AgentRegistry {
     /// Abort detached agents created by a parent turn that is being rolled
     /// back. Agents that predate the turn are intentionally left alone.
     pub async fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
+        self.cancel_started_after_with_status(watermark)
+            .await
+            .into_iter()
+            .map(|status| status.id)
+            .collect()
+    }
+
+    /// Status-preserving rollback cancellation for terminal lifecycle owners.
+    /// The legacy ID-only projection remains above for callers that need only
+    /// disclosure, while this path retains malformed/unattached `joined: false`
+    /// truth instead of silently upgrading it to successful cleanup.
+    pub async fn cancel_started_after_with_status(
+        &self,
+        watermark: u64,
+    ) -> Vec<AgentTerminalStatus> {
         self.cancel_matching(
             |id| id > watermark,
             "cancelled because the parent turn was rolled back",
         )
         .await
-        .into_iter()
-        .map(|status| status.id)
-        .collect()
     }
 
     async fn cancel_matching<F>(&self, mut predicate: F, reason: &str) -> Vec<AgentTerminalStatus>
@@ -2604,6 +2616,21 @@ mod tests {
         assert!(matches!(cancelled.status, AgentStatus::Cancelled(_)));
         assert_eq!(registry.snapshot().running, 0);
         assert_eq!(registry.snapshot().terminal, 1);
+    }
+
+    #[tokio::test]
+    async fn rollback_cancellation_status_preserves_unjoined_fault_truth() {
+        let registry = AgentRegistry::new();
+        let id = registry
+            .start("unattached rollback fault".to_string())
+            .unwrap();
+
+        let cancelled = registry.cancel_started_after_with_status(0).await;
+
+        assert_eq!(cancelled.len(), 1);
+        assert_eq!(cancelled[0].id, id);
+        assert!(!cancelled[0].joined);
+        assert!(matches!(cancelled[0].status, AgentStatus::Cancelled(_)));
     }
 
     #[tokio::test]
