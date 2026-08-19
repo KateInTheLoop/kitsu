@@ -6,10 +6,20 @@ use std::time::Duration;
 use futures::StreamExt;
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
-use kitsu_providers::{ChatMessage, ChatRequest, Provider};
+use kitsu_providers::{
+    ChatMessage, ChatRequest, Provider, ProviderError, ProviderResponsePart, ToolCall,
+    ToolDescriptor,
+};
 use support::provider_wire_fixture::{
-    anthropic_messages_text, openai_chat_text, WireDialect, ANTHROPIC_ERRORS_SPEC,
-    ANTHROPIC_MESSAGES_SPEC, ANTHROPIC_STREAMING_SPEC, OPENAI_CHAT_SPEC, PRIMARY_SPEC_REVIEWED_UTC,
+    anthropic_messages_malformed_event, anthropic_messages_midstream_error,
+    anthropic_messages_overloaded_error, anthropic_messages_oversized_error,
+    anthropic_messages_oversized_sse_line, anthropic_messages_text, anthropic_messages_tool_round,
+    openai_chat_malformed_event, openai_chat_midstream_error, openai_chat_oversized_error,
+    openai_chat_oversized_sse_line, openai_chat_rate_limit_error, openai_chat_text,
+    openai_chat_tool_round, HttpFaultFixture, WireDialect, ANTHROPIC_ERRORS_SPEC,
+    ANTHROPIC_MESSAGES_SPEC, ANTHROPIC_STREAMING_SPEC, ANTHROPIC_TOOL_SPEC,
+    KITSU_ERROR_BODY_LIMIT_BYTES, KITSU_SSE_LINE_LIMIT_BYTES, OPENAI_CHAT_SPEC,
+    PRIMARY_SPEC_REVIEWED_UTC,
 };
 use wiremock::matchers::{method, path};
 use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -47,6 +57,52 @@ fn neutral_text_request() -> ChatRequest {
         max_tokens: Some(64),
         response_format: None,
         prompt_cache_key: None,
+    }
+}
+
+fn neutral_tool_request() -> ChatRequest {
+    ChatRequest {
+        model: "fixture-model-v1".to_string(),
+        messages: vec![
+            ChatMessage::system("You are concise."),
+            ChatMessage::user("Check the time."),
+            ChatMessage::assistant(
+                "",
+                vec![ToolCall {
+                    tool_name: "get_time".to_string(),
+                    args: r#"{"zone":"UTC"}"#.to_string(),
+                    call_id: "toolu_previous".to_string(),
+                }],
+            ),
+            ChatMessage::tool("toolu_previous", r#"{"time":"12:00"}"#),
+        ],
+        tools: Some(vec![ToolDescriptor {
+            name: "get_time".to_string(),
+            description: "Get the time for a zone.".to_string(),
+            parameters: serde_json::json!({
+                "type": "object",
+                "properties": {"zone": {"type": "string"}},
+                "required": ["zone"],
+                "additionalProperties": false
+            }),
+        }]),
+        stream: true,
+        temperature: None,
+        reasoning_effort: None,
+        max_tokens: Some(64),
+        response_format: None,
+        prompt_cache_key: None,
+    }
+}
+
+fn assert_sse_data_is_json(stream: &str) {
+    for line in stream
+        .lines()
+        .filter_map(|line| line.strip_prefix("data: "))
+    {
+        if line != "[DONE]" {
+            serde_json::from_str::<serde_json::Value>(line).expect("fixture data line is JSON");
+        }
     }
 }
 
@@ -112,6 +168,8 @@ fn primary_pinned_text_fixtures_are_structurally_distinct() {
     assert!(!messages.stream.contains(r"\n"));
     assert!(messages.stream.contains("\"type\":\"message_start\""));
     assert!(messages.stream.contains("\"type\":\"message_stop\""));
+    assert_sse_data_is_json(&chat.stream);
+    assert_sse_data_is_json(&messages.stream);
 }
 
 #[tokio::test]
@@ -174,4 +232,219 @@ async fn anthropic_messages_fixture_fails_against_the_compatible_chat_adapter() 
         error,
         kitsu_providers::ProviderError::InvalidResponse(_)
     ));
+}
+
+#[test]
+fn primary_pinned_tool_rounds_keep_correlation_and_distinct_wire_shapes() {
+    let chat = openai_chat_tool_round();
+    let messages = anthropic_messages_tool_round();
+
+    assert!(ANTHROPIC_TOOL_SPEC.starts_with("https://platform.claude.com/"));
+    assert_eq!(
+        chat.request["messages"][2]["tool_calls"][0]["id"],
+        "toolu_previous"
+    );
+    assert_eq!(chat.request["messages"][3]["role"], "tool");
+    assert_eq!(
+        chat.request["messages"][3]["tool_call_id"],
+        "toolu_previous"
+    );
+    assert_eq!(chat.request["tools"][0]["type"], "function");
+    assert_eq!(
+        messages.request["messages"][1]["content"][0]["type"],
+        "tool_use"
+    );
+    assert_eq!(
+        messages.request["messages"][2]["content"][0]["type"],
+        "tool_result"
+    );
+    assert_eq!(
+        messages.request["messages"][2]["content"][0]["tool_use_id"],
+        "toolu_previous"
+    );
+    assert_eq!(messages.request["tools"][0]["name"], "get_time");
+    assert_eq!(
+        messages.request["tools"][0]["input_schema"]["type"],
+        "object"
+    );
+    assert!(chat.stream.contains("\"tool_calls\""));
+    assert!(messages.stream.contains("\"type\":\"tool_use\""));
+    assert!(messages.stream.contains("\"type\":\"input_json_delta\""));
+    assert_sse_data_is_json(&chat.stream);
+    assert_sse_data_is_json(&messages.stream);
+    assert_eq!(chat.expected_deltas, messages.expected_deltas);
+}
+
+#[tokio::test]
+async fn compatible_chat_control_matches_tool_round_request_and_stream() {
+    let fixture = openai_chat_tool_round();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let provider = provider_for(server.uri(), fixture.path);
+
+    let mut stream = provider
+        .chat_stream(neutral_tool_request())
+        .await
+        .expect("compatible Chat tool fixture starts");
+    let mut deltas = Vec::new();
+    while let Some(item) = stream.next().await {
+        deltas.push(item.expect("compatible Chat tool fixture decodes"));
+    }
+
+    let observed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("one Chat tool request captured");
+    assert_eq!(observed.body, fixture.request);
+    assert!(observed.anthropic_version.is_none());
+    assert_eq!(deltas, fixture.expected_deltas);
+}
+
+#[tokio::test]
+async fn anthropic_tool_stream_fails_against_chat_without_a_partial_tool_call() {
+    let fixture = anthropic_messages_tool_round();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let provider = provider_for(server.uri(), fixture.path);
+
+    let mut stream = provider
+        .chat_stream(neutral_tool_request())
+        .await
+        .expect("HTTP 200 starts before the stream dialect is decoded");
+    let mut decoded = Vec::new();
+    let error = loop {
+        match stream.next().await {
+            Some(Ok(delta)) => decoded.push(delta),
+            Some(Err(error)) => break error,
+            None => panic!("wrong adapter accepted Anthropic tool EOF"),
+        }
+    };
+
+    let observed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("one wrong-adapter tool request captured");
+    assert_ne!(observed.body, fixture.request);
+    assert!(observed.anthropic_version.is_none());
+    assert!(decoded.is_empty(), "wrong wire cannot emit a partial call");
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
+async fn send_http_fault(fixture: &HttpFaultFixture) -> ProviderError {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(fixture.path))
+        .respond_with(
+            ResponseTemplate::new(fixture.status)
+                .insert_header("content-type", "application/json")
+                .set_body_string(fixture.body.clone()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = provider_for(server.uri(), fixture.path);
+    match provider.chat_stream(neutral_text_request()).await {
+        Ok(_) => panic!("HTTP fault unexpectedly started a response stream"),
+        Err(error) => error,
+    }
+}
+
+#[tokio::test]
+async fn dialect_specific_http_faults_preserve_typed_status_and_bounded_body() {
+    for fixture in [
+        openai_chat_rate_limit_error(),
+        anthropic_messages_overloaded_error(),
+    ] {
+        let error = send_http_fault(&fixture).await;
+        match error {
+            ProviderError::Http { status, body } => {
+                assert_eq!(status, fixture.status);
+                assert_eq!(body, fixture.body);
+            }
+            other => panic!("unexpected HTTP fault: {other}"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn malformed_events_fail_before_any_neutral_delta() {
+    for fixture in [
+        openai_chat_malformed_event(),
+        anthropic_messages_malformed_event(),
+    ] {
+        let server = MockServer::start().await;
+        mount_capture(&server, &fixture).await;
+        let provider = provider_for(server.uri(), fixture.path);
+        let mut stream = provider
+            .chat_stream(neutral_text_request())
+            .await
+            .expect("HTTP 200 starts before malformed stream decoding");
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(ProviderError::InvalidResponse(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn midstream_error_events_fail_before_any_neutral_delta() {
+    for fixture in [
+        openai_chat_midstream_error(),
+        anthropic_messages_midstream_error(),
+    ] {
+        assert_sse_data_is_json(&fixture.stream);
+        let server = MockServer::start().await;
+        mount_capture(&server, &fixture).await;
+        let provider = provider_for(server.uri(), fixture.path);
+        let mut stream = provider
+            .chat_stream(neutral_text_request())
+            .await
+            .expect("HTTP 200 starts before the error event is decoded");
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(ProviderError::InvalidResponse(_)))
+        ));
+    }
+}
+
+#[tokio::test]
+async fn both_dialect_paths_reject_oversized_error_bodies() {
+    for fixture in [
+        openai_chat_oversized_error(),
+        anthropic_messages_oversized_error(),
+    ] {
+        let error = send_http_fault(&fixture).await;
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::ErrorBody,
+                limit_bytes: KITSU_ERROR_BODY_LIMIT_BYTES,
+            }
+        ));
+    }
+}
+
+#[tokio::test]
+async fn both_dialect_paths_reject_oversized_sse_lines() {
+    for fixture in [
+        openai_chat_oversized_sse_line(),
+        anthropic_messages_oversized_sse_line(),
+    ] {
+        let server = MockServer::start().await;
+        mount_capture(&server, &fixture).await;
+        let provider = provider_for(server.uri(), fixture.path);
+        let mut stream = provider
+            .chat_stream(neutral_text_request())
+            .await
+            .expect("HTTP 200 starts before bounded stream decoding");
+        assert!(matches!(
+            stream.next().await,
+            Some(Err(ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::SseLine,
+                limit_bytes: KITSU_SSE_LINE_LIMIT_BYTES,
+            }))
+        ));
+    }
 }

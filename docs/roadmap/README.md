@@ -271,10 +271,10 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: in progress through Cycle 028. The primary-reviewed compatible-Chat
-control and structurally distinct Anthropic Messages text fixture run fully
-offline and the Messages wire fails against the current Chat adapter without
-emitting a neutral delta. Tools, error/boundary cases, capability types,
+Status: in progress through Cycle 029. Primary-reviewed compatible-Chat and
+structurally distinct Anthropic Messages text/tool/error/bound fixtures run
+fully offline. The Messages wire fails against the current Chat adapter without
+emitting text or a partial tool call. Timeout/cancellation/capability cuts,
 immutable generations, and the production distinct adapter remain open; X001
 therefore still fails.
 
@@ -449,9 +449,10 @@ gates merely because a card appears attractive.
 | 027 | E02-S04-C2 | Evaluate the seven-carrier exit matrix and close or retain one measured E02 gap |
 | 028 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 | 029 | E04-S01-C2 | Extend both wire fixtures through tools, typed faults, malformed input, and hard bounds |
+| 030 | E04-S01-C3 | Close provider-free timeout, cancellation, aggregate-bound, and unsupported-capability fixture cuts |
 
-After Cycle 029, the queue closes E04-S01 timeout/cancellation/capability cuts,
-then finishes E04's generation/adapter gates and
+After Cycle 030, the queue finishes E04's capability, generation, and adapter
+gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. Provider-free fixture design may overlap, but it cannot displace a
 failing correctness or authority gate.
