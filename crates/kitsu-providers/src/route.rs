@@ -7,13 +7,18 @@
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::Duration;
 
 use ring::digest::{Context, SHA256};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
+
+use crate::error::ProviderError;
+use crate::telemetry::ProviderTelemetrySink;
+use crate::types::ChatRequest;
+use crate::{ChatStream, Provider};
 
 pub const PROVIDER_ROUTE_CONTRACT_REVISION: u32 = 1;
 
@@ -573,6 +578,61 @@ impl<P> ProviderRouteSnapshot<P> {
         inference_runtime: Arc<P>,
         catalog_runtime: Arc<P>,
     ) -> Result<Self, ProviderRouteContractError> {
+        let generation = ProviderRouteGeneration::new(1)
+            .expect("the initial provider route generation is nonzero");
+        Self::with_generation(
+            declaration,
+            generation,
+            model,
+            auth_source,
+            policy,
+            inference_runtime,
+            catalog_runtime,
+        )
+    }
+
+    /// Construct the exact next generation for the same logical profile. This
+    /// does not publish it; [`ProviderRouteCurrent::replace`] performs the
+    /// expected-generation check and atomic swap.
+    pub fn successor(
+        previous: &ProviderRouteIdentity,
+        declaration: ProviderRouteDeclaration,
+        model: impl Into<String>,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        inference_runtime: Arc<P>,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        if declaration.profile() != previous.profile() {
+            return Err(ProviderRouteContractError::ReplacementProfileMismatch);
+        }
+        let next = previous
+            .generation()
+            .get()
+            .checked_add(1)
+            .ok_or(ProviderRouteContractError::GenerationExhausted)?;
+        let generation = ProviderRouteGeneration::new(next)
+            .expect("incrementing a nonzero generation remains nonzero");
+        Self::with_generation(
+            declaration,
+            generation,
+            model,
+            auth_source,
+            policy,
+            inference_runtime,
+            catalog_runtime,
+        )
+    }
+
+    fn with_generation(
+        declaration: ProviderRouteDeclaration,
+        generation: ProviderRouteGeneration,
+        model: impl Into<String>,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        inference_runtime: Arc<P>,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
         let model = model.into();
         if model.is_empty() {
             return Err(ProviderRouteContractError::EmptyModelId);
@@ -593,8 +653,6 @@ impl<P> ProviderRouteSnapshot<P> {
                 configured: configured_catalog,
             });
         }
-        let generation = ProviderRouteGeneration::new(1)
-            .expect("the initial provider route generation is nonzero");
         Ok(Self {
             identity: ProviderRouteIdentity::from_declaration(declaration, generation),
             model,
@@ -628,6 +686,221 @@ impl<P> ProviderRouteSnapshot<P> {
     pub fn catalog_runtime(&self) -> &Arc<P> {
         &self.catalog_runtime
     }
+}
+
+/// Atomic owner of the current snapshot for one process-local profile. A
+/// handle binds one snapshot at creation; replacement changes what future
+/// handles observe without mutating already admitted provider state.
+pub struct ProviderRouteCurrent<P> {
+    current: Arc<RwLock<Arc<ProviderRouteSnapshot<P>>>>,
+}
+
+impl<P> Clone for ProviderRouteCurrent<P> {
+    fn clone(&self) -> Self {
+        Self {
+            current: self.current.clone(),
+        }
+    }
+}
+
+impl<P> ProviderRouteCurrent<P> {
+    pub fn new(initial: ProviderRouteSnapshot<P>) -> Self {
+        Self {
+            current: Arc::new(RwLock::new(Arc::new(initial))),
+        }
+    }
+
+    /// Bind future logical requests to the snapshot that is current now.
+    pub fn bind(&self) -> Result<ProviderRouteHandle<P>, ProviderRouteContractError> {
+        let bound = self
+            .current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
+            .clone();
+        Ok(ProviderRouteHandle {
+            bound,
+            current: self.current.clone(),
+        })
+    }
+
+    /// Publish exactly one successor if `expected` is still current. Any
+    /// validation or lock failure leaves the old snapshot installed.
+    pub fn replace(
+        &self,
+        expected: ProviderRouteGeneration,
+        replacement: ProviderRouteSnapshot<P>,
+    ) -> Result<(), ProviderRouteContractError> {
+        let mut current = self
+            .current
+            .write()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?;
+        let actual = current.identity().generation();
+        if actual != expected {
+            return Err(ProviderRouteContractError::StaleGeneration {
+                bound: expected,
+                current: actual,
+            });
+        }
+        if replacement.identity().profile() != current.identity().profile() {
+            return Err(ProviderRouteContractError::ReplacementProfileMismatch);
+        }
+        let required = actual
+            .get()
+            .checked_add(1)
+            .ok_or(ProviderRouteContractError::GenerationExhausted)?;
+        if replacement.identity().generation().get() != required {
+            return Err(ProviderRouteContractError::NonSuccessorGeneration {
+                current: actual,
+                proposed: replacement.identity().generation(),
+            });
+        }
+        *current = Arc::new(replacement);
+        Ok(())
+    }
+}
+
+/// One request-facing binding to an immutable route snapshot. Admission reads
+/// the current identity once and returns an owned runtime `Arc`; after that an
+/// already admitted request may drain through its bound retry policy even if a
+/// replacement is published concurrently.
+pub struct ProviderRouteHandle<P> {
+    bound: Arc<ProviderRouteSnapshot<P>>,
+    current: Arc<RwLock<Arc<ProviderRouteSnapshot<P>>>>,
+}
+
+impl<P> Clone for ProviderRouteHandle<P> {
+    fn clone(&self) -> Self {
+        Self {
+            bound: self.bound.clone(),
+            current: self.current.clone(),
+        }
+    }
+}
+
+impl<P> ProviderRouteHandle<P> {
+    pub fn identity(&self) -> &ProviderRouteIdentity {
+        self.bound.identity()
+    }
+
+    pub fn model(&self) -> &str {
+        self.bound.model()
+    }
+
+    pub fn auth_source(&self) -> ProviderAuthSource {
+        self.bound.auth_source()
+    }
+
+    pub fn policy(&self) -> ProviderRoutePolicy {
+        self.bound.policy()
+    }
+
+    fn validate(&self, required: &[ProviderCapability]) -> Result<(), ProviderRouteContractError> {
+        let current_generation = self
+            .current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
+            .identity()
+            .generation();
+        self.bound
+            .identity()
+            .validate_for_send(current_generation, required)
+    }
+
+    pub(crate) fn admit_inference_runtime(
+        &self,
+        required: &[ProviderCapability],
+    ) -> Result<Arc<P>, ProviderRouteContractError> {
+        self.validate(required)?;
+        Ok(self.bound.inference_runtime().clone())
+    }
+
+    /// Preserve the provider port's optional-catalog contract: a current route
+    /// without catalog capability reports absence without entering a runtime.
+    /// Stale generations still fail before that graceful `None` result.
+    pub(crate) fn admit_optional_catalog_runtime(
+        &self,
+    ) -> Result<Option<Arc<P>>, ProviderRouteContractError> {
+        self.validate(&[])?;
+        if !self
+            .bound
+            .identity()
+            .capabilities()
+            .supports(ProviderCapability::ModelCatalog)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.bound.catalog_runtime().clone()))
+    }
+
+    /// Use the inference runtime for an optional auxiliary capability while
+    /// retaining the same current-generation and graceful-absence semantics.
+    pub(crate) fn admit_optional_inference_runtime(
+        &self,
+        capability: ProviderCapability,
+    ) -> Result<Option<Arc<P>>, ProviderRouteContractError> {
+        self.validate(&[])?;
+        if !self.bound.identity().capabilities().supports(capability) {
+            return Ok(None);
+        }
+        Ok(Some(self.bound.inference_runtime().clone()))
+    }
+}
+
+impl<P> Provider for ProviderRouteHandle<P>
+where
+    P: Provider,
+{
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        let runtime = self.admit_inference_runtime(&[])?;
+        runtime.healthcheck().await
+    }
+
+    async fn chat_stream(&self, req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        let required = required_chat_capabilities(&req);
+        let runtime = self.admit_inference_runtime(&required)?;
+        runtime.chat_stream(req).await
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        let required = required_chat_capabilities(&req);
+        let runtime = self.admit_inference_runtime(&required)?;
+        runtime.chat_stream_with_telemetry(req, telemetry).await
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        runtime.list_models().await
+    }
+
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        runtime.list_models_with_telemetry(telemetry).await
+    }
+}
+
+fn required_chat_capabilities(req: &ChatRequest) -> Vec<ProviderCapability> {
+    let mut required = Vec::with_capacity(3);
+    if req.stream {
+        required.push(ProviderCapability::Streaming);
+    }
+    if req.tools.as_ref().is_some_and(|tools| !tools.is_empty()) {
+        required.push(ProviderCapability::Tools);
+    }
+    if req.response_format.is_some() {
+        required.push(ProviderCapability::StructuredOutput);
+    }
+    required
 }
 
 fn adapter_supports_wire(adapter: ProviderAdapterId, wire: ProviderWireRevision) -> bool {
@@ -679,6 +952,8 @@ pub enum ProviderRouteContractError {
     },
     #[error("provider route generation must be nonzero")]
     ZeroGeneration,
+    #[error("provider route generation space is exhausted")]
+    GenerationExhausted,
     #[error("provider capability revision must be nonzero")]
     ZeroCapabilityRevision,
     #[error("provider capability {capability:?} is duplicated")]
@@ -703,4 +978,15 @@ pub enum ProviderRouteContractError {
         "provider model-catalog capability ({declared}) does not match configured policy ({configured})"
     )]
     CatalogCapabilityMismatch { declared: bool, configured: bool },
+    #[error("provider route replacement must keep the same logical profile")]
+    ReplacementProfileMismatch,
+    #[error(
+        "provider route replacement generation {proposed:?} is not the successor of {current:?}"
+    )]
+    NonSuccessorGeneration {
+        current: ProviderRouteGeneration,
+        proposed: ProviderRouteGeneration,
+    },
+    #[error("current provider route is unavailable")]
+    CurrentRouteUnavailable,
 }

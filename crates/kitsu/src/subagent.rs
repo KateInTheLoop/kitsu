@@ -27,6 +27,8 @@ use kitsu_core::{
     bound_inline_output, run_agent_turn, AgentConfig, AgentError, AgentEventLog, AgentRuntimeEvent,
     ArtifactStoragePolicy, SpawnBudget,
 };
+#[cfg(test)]
+use kitsu_providers::ProviderRouteContractError;
 use kitsu_providers::{
     ChatMessage, Provider, ProviderAttemptCategory, ProviderAttemptOutcome, ProviderError,
     ToolDescriptor,
@@ -140,6 +142,7 @@ pub enum AgentFailureClass {
     ProviderHttp,
     ProviderToolsUnsupported,
     ProviderAuthConfiguration,
+    ProviderRouteConfiguration,
     Interrupted,
     AgentLoop,
     ContextOverflow,
@@ -159,6 +162,7 @@ impl fmt::Display for AgentFailureClass {
             Self::ProviderHttp => "provider_http",
             Self::ProviderToolsUnsupported => "provider_tools_unsupported",
             Self::ProviderAuthConfiguration => "provider_auth_configuration",
+            Self::ProviderRouteConfiguration => "provider_route_configuration",
             Self::Interrupted => "interrupted",
             Self::AgentLoop => "agent_loop",
             Self::ContextOverflow => "context_overflow",
@@ -1205,6 +1209,7 @@ fn classify_agent_error(error: &AgentError) -> AgentFailureClass {
             ProviderError::Http { .. } => AgentFailureClass::ProviderHttp,
             ProviderError::ToolsNotSupported => AgentFailureClass::ProviderToolsUnsupported,
             ProviderError::Auth(_) => AgentFailureClass::ProviderAuthConfiguration,
+            ProviderError::RouteContract(_) => AgentFailureClass::ProviderRouteConfiguration,
         },
         AgentError::ToolCallDuringToolFreeFinalization => {
             AgentFailureClass::ProviderInvalidResponse
@@ -1241,6 +1246,9 @@ fn safe_subagent_error(error: &AgentError) -> String {
                 "provider does not support required tool calls".to_string()
             }
             ProviderError::Auth(_) => "provider credentials are not configured".to_string(),
+            ProviderError::RouteContract(_) => {
+                "provider route changed or lacks a required capability".to_string()
+            }
         },
         AgentError::ToolCallDuringToolFreeFinalization => {
             "model returned a tool call during tool-free structured finalization; no tool was executed"
@@ -2339,6 +2347,9 @@ mod tests {
                 status: 503,
                 body: unsafe_detail.to_string(),
             }),
+            AgentError::Provider(ProviderError::RouteContract(
+                ProviderRouteContractError::CurrentRouteUnavailable,
+            )),
             AgentError::Loop(unsafe_detail.to_string()),
         ];
 

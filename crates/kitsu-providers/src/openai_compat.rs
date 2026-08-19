@@ -14,8 +14,8 @@ use serde::{Deserialize, Serialize};
 use crate::auth::{AuthProvider, FrozenAuth};
 use crate::error::{AuthError, ProviderError, ProviderResponsePart};
 use crate::route::{
-    ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
-    ProviderRouteSnapshot,
+    ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRouteHandle,
+    ProviderRoutePolicy, ProviderRouteSnapshot,
 };
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
@@ -176,6 +176,31 @@ impl OpenAICompatProvider {
             Some((name, value)) => Ok(rb.header(name, value)),
             None => Ok(rb),
         }
+    }
+}
+
+impl ProviderRouteHandle<OpenAICompatProvider> {
+    /// Admit a full-budget catalog metadata lookup through the catalog runtime.
+    pub async fn model_context_length(&self, model: &str) -> Result<Option<u64>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        Ok(runtime.model_context_length(model).await)
+    }
+
+    /// Admit startup metadata discovery through the separately short-budgeted
+    /// inference runtime. Capability and generation checks are identical; only
+    /// the already frozen discovery/cache policy differs.
+    pub async fn advisory_model_context_length(
+        &self,
+        model: &str,
+    ) -> Result<Option<u64>, ProviderError> {
+        let Some(runtime) =
+            self.admit_optional_inference_runtime(crate::route::ProviderCapability::ModelCatalog)?
+        else {
+            return Ok(None);
+        };
+        Ok(runtime.model_context_length(model).await)
     }
 }
 
