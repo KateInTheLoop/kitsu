@@ -27,6 +27,25 @@ observability, compatibility, rollback, and disabled-path gates.
 | Crush | Offline-capable degraded model picker, staged proposals, and process-group cancellation cases | Weak first-run/model discoverability and no transactional picker | Approval-as-containment, implicit acquisition, or timeout-by-abandonment |
 | DeepSeek Harness | Admission-then-acquire-validate-publish rollback, owned-effect cleanup, shared logical store suites, and explicit cancellation ownership | No alternate-store conformance and no staged contributor seam | Executable configuration, pre-admission imports, uncontained MCP, or a broad runtime plugin surface |
 
+## Operator-supplied telemetry UX evidence
+
+On 2026-08-19 the operator supplied current Codex `/status` and `/usage` output
+plus a Claude Code `/context window` example. This evidence is intentionally not
+folded into the frozen ten-harness research pin. Official OpenAI documentation
+confirms the Codex command distinction: `/status` presents session telemetry,
+while `/usage daily|weekly|cumulative` uses Codex account activity and may
+require Codex service-account authentication. The latter is not a generic
+provider wire capability. Reference:
+<https://learn.chatgpt.com/docs/developer-commands?surface=cli>.
+
+Kitsu will borrow the compact grouped status deck, focused context occupancy,
+and calendar/summary presentation. E08-S05/S06 own the UI and portable
+snapshots; E04 owns provider generation/capability facts, E03 owns durable
+observation fencing, and E06 owns external-tool health. Kitsu will not copy
+account scraping, provider-wide billing claims, ambient telemetry collectors,
+or any layout that makes color/Unicode a machine contract. The detailed truth
+and acceptance contract is [`e08-telemetry-decks.md`](e08-telemetry-decks.md).
+
 ## Three architectural spines
 
 The long-term architecture is organized around three strong spines. Features
@@ -53,6 +72,10 @@ spines. It is not a fourth integration plane: E02 prevents a provider, store,
 child, or carrier from redefining success through EOF, idle, UI state, or a
 failed delivery.
 
+The telemetry deck is likewise not a fourth spine. It is a read-only projection
+of facts owned by E02/E03/E04/E06. A renderer, cache, aggregate, or file tail
+cannot become canonical run, route, session, authority, or usage truth.
+
 ## Dependency-safe delivery order
 
 Epic identifiers stay stable; this order controls queue selection after E01.
@@ -63,8 +86,10 @@ Epic identifiers stay stable; this order controls queue selection after E01.
 4. Build E06-S01's supervisor, then run the restricted tools-only stdio MCP
    experiment through the rest of E06.
 5. Run E07's semantic context/navigation benchmark and experiment.
-6. Deliver E05 transactional setup/model selection and E08 progressive
-   documentation/observability on the stabilized provider and MCP surfaces.
+6. Deliver E05 transactional setup/model selection and E08 truthful telemetry,
+   progressive documentation, and observability on the stabilized provider and
+   MCP surfaces. E08-S05 may consume live route facts after E04; E08-S06 waits
+   for E03 fencing before durable usage publication.
 7. Consider E09 multimodal input only after two truthful provider capability
    paths; consider additional hosts/control planes only after a named consumer.
 8. Use E10 to certify, defer, reshape, or reject each boundary from executed
@@ -84,7 +109,7 @@ architecture scoring.
 | `X002-ADMIT-0` | E06-S01-E06-S03 | Zero fetch, checkout, write, import, initializer, or spawn before artifact/effect authority admission |
 | `PF-06` and `PF-07` | E06 | Tool-source lifecycle/authority, frozen inventory, EOF/crash withdrawal, no replay, cancel/reload/shutdown and descendant reap, disabled zero-effect path |
 | Fixed semantic corpus | E07 | Relevance and token-budget improvement over current tools, denied-path behavior, stale projection rebuild, language bias, and stale-edit safety |
-| `PF-10` | E05 and E08 | Fresh-home first success, invalid configuration, permission cancellation, offline startup, redirected output, narrow terminal, accessibility, executable snippets, and progressive navigation |
+| `PF-10` | E05 and E08 | Fresh-home first success, invalid configuration, permission cancellation, offline startup, redirected output, widths 24/40/60/80/120, plain/screen-reader/JSONL parity, telemetry truth/staleness/secret safety, executable snippets, and progressive navigation |
 
 ## Hard exclusions
 
@@ -107,6 +132,8 @@ This program continues to reject:
 - runtime provider/TUI loading, HTTP/OAuth/marketplace MCP, lifecycle hooks,
   WASM, or a public extension ABI without their separately named consumer and
   reconsideration gate.
+- generic account/billing claims, currency/credit/rate-limit guesses, or
+  default network refresh from status, context, or usage commands.
 
 The safe extension thesis is intentionally narrow: compiled adapters,
 Kitsu-owned ports, inert audited data, and explicitly supervised children may

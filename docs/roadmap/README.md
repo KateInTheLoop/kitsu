@@ -23,6 +23,9 @@ Program status: [`program-status.md`](program-status.md)
 Provider wire fixture contract:
 [`e04-primary-wire-fixtures.md`](e04-primary-wire-fixtures.md)
 
+Status, context, and usage truth contract:
+[`e08-telemetry-decks.md`](e08-telemetry-decks.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -90,17 +93,18 @@ rejection decisions live in the [mechanism learning ledger](mechanism-ledger.md)
 | M2 — immutable provider spine | E04 | Compatible Chat plus one distinct compiled wire and one route generation across all sends |
 | M3 — canonical session spine | E03 | Revisioned logical HEAD, recovery, compaction lineage, and safe branch-at-turn |
 | M4 — bounded child spine | E06 | Private supervisor plus disabled-by-default, tools-only stdio MCP experiment |
-| M5 — measured context and onboarding | E07, E05, E08 | Evidence-driven semantic context, transactional picker/setup, observability, and progressive docs |
+| M5 — measured context and onboarding | E07, E05, E08 | Evidence-driven semantic context, transactional picker/setup, truthful telemetry decks, and progressive docs |
 | M6 — later media evidence | E09 | Bounded multimodal input only across truthful capability paths |
 | M7 — replaceability certification | E10 | Boundary-by-boundary conformance decision with default-path parity and rollback evidence |
 
 ```text
 E00 -> E01 -> E02
-          \      \-> E04 -> E05 -> E08
-           \      \-> E03
-           \-------> E06 ------/
-           \-------> E07
-                    E04 -> E09
+          \-> E04 -> E05 -> E08
+           \      \--------> E08-S05
+           \-> E03 --------> E08-S06
+           \-> E06 --------> E08
+           \-> E07 --------> E08
+               E04 --------> E09
 E01 + E02 + E03 + E04 + E05 + E06 + E07 + E08 + E09 -> E10
 ```
 
@@ -110,6 +114,10 @@ queue prioritizes E04's provider spine, then E03's session spine, then E06's
 supervisor/MCP spine. E06 requires E01 and the cancellation/terminal parts of
 E02, even though delivery priority keeps it after E03. E07 follows the three
 spines; E05/E08 then use the stabilized provider and external-tool surfaces.
+E08-S05 consumes E04 route/capability receipts, while E08-S06 waits for E03's
+canonical revision and fencing before it publishes durable usage observations.
+Provider-free DTO and renderer fixtures may be prepared earlier, but neither
+story may infer missing provider/account data or bypass its owning spine.
 E09 requires two truthful capability paths from E04. No desktop, IDE, listener,
 daemon, or control plane is invented solely to improve X003 breadth.
 
@@ -351,13 +359,17 @@ it cannot displace a failing correctness or authority gate.
 
 Epic exit: measured decision, not assumed feature parity with Aider/Goose.
 
-## E08 — Progressive documentation and executable onboarding
+## E08 — Progressive documentation, executable onboarding, and telemetry
 
-Outcome: users reach first success and authoritative task guidance quickly while
-Kitsu keeps its unusually precise safety and automation contracts.
+Outcome: users reach first success and authoritative task guidance quickly, and
+can inspect route, authority, context, and Kitsu-observed usage through compact
+truthful terminal and automation surfaces while Kitsu keeps its unusually
+precise safety and automation contracts.
 
 Dependencies: DOC-R001 already approved; final root rewrite after E05/E06
-surface stability.
+surface stability. E08-S05 consumes E04 capability/generation receipts;
+E08-S06 consumes E03 canonical revision/fencing. E06 health is additive only
+after the supervised tool-source contract exists.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -365,10 +377,15 @@ surface stability.
 | E08-S02 — generated and executable reference | As a user, I want CLI/slash/tool/schema examples generated or tested so documentation matches the binary. | Generate Clap/slash/tool reference; validate JSONL examples; tag/test shell and TOML fences; fresh HOME/no-network fixtures. | G1-G5 and G7-G8 checks run in CI; unexpected state/network/secret fails. | 5-9 cycles |
 | E08-S03 — move detailed content | As a task user, I want focused gateway/auth/authority/tool/chat/session/context/automation pages. | Populate sole owners before deleting root text; retain compatibility anchors/routes; no duplicate normative defaults. | Link/anchor/ownership checks and relevant behavioral fixtures pass after each move. | 8-14 cycles |
 | E08-S04 — root rewrite | As a new user, I want scope, install, local first success, authority, common tasks, and automation visible without reading an exhaustive manual. | Follow DOC-R001 outline; preserve credential-free path and pre-authority warnings; no line-count target. | G1-G8 plus timed novice lookup tasks pass; root's first 100 lines achieve the defined first success. | 4-7 cycles |
+| E08-S05 — truthful session telemetry decks | As a terminal or automation user, I want one offline, typed view of the active route, authority, context, and current-session usage so attractive output never hides provenance or uncertainty. | Extract presentation-neutral status/context/usage snapshots; classify each quantity as authoritative, reported, derived, estimated, or unavailable; add `/usage [session]`, retain `/cost` as an alias, add `/context window|sources`, and render adaptively without changing JSONL into terminal text. Consume E04/E06/E03 identities only after those owners publish them. | Compatible Chat, distinct Messages, and usage-omitting fixtures; route/model switch, compaction, subagent, rollback, cancellation, and failed-attempt cases; widths 24/40/60/80/120; styled/plain/screen-reader/redirected/JSONL; offline and secret-bearing inputs all agree on the same typed snapshot. | 6-9 cycles |
+| E08-S06 — bounded local usage history | As a user of any supported provider or model, I want daily, weekly, and cumulative Kitsu-observed token activity without confusing it with account billing, credits, or limits. | Publish idempotent body-free usage observations keyed by run/request identity through E03 fencing; preserve reported/missing coverage, outcome, purpose, model and route generation; rebuild bounded aggregates as projections; add `/usage daily|weekly|cumulative`. A future account-quota source requires a separately named adapter and explicit refresh and is not on this path. | Old-or-new crash cuts, duplicate IDs, corrupt/future data, projection deletion/rebuild, incomplete provider usage, multi-model/generation attribution, timezone/DST boundaries, maximum retention, stable redirected output, and bounded JSONL points pass provider-free. | 6-9 cycles |
 
 Epic exit: DOC-R001 G1-G8 and the applicable `PF-10` fresh-home, redirected,
-narrow-terminal, accessibility, snippet, and progressive-navigation cases pass;
-old links are mapped and safety/automation contract coverage is not reduced.
+narrow-terminal, accessibility, snippet, telemetry-truth, and
+progressive-navigation cases pass; old links are mapped and safety/automation
+contract coverage is not reduced. `/status`, `/context`, and `/usage` make no
+network request; only the already-explicit `/context refresh` may discover
+window metadata.
 
 ## E09 — Bounded multimodal image input
 
@@ -449,13 +466,17 @@ gates merely because a card appears attractive.
 | 027 | E02-S04-C2 | Evaluate the seven-carrier exit matrix and close or retain one measured E02 gap |
 | 028 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 | 029 | E04-S01-C2 | Extend both wire fixtures through tools, typed faults, malformed input, and hard bounds |
-| 030 | E04-S01-C3 | Close provider-free timeout, cancellation, aggregate-bound, and unsupported-capability fixture cuts |
+| 030 | E08-S05-C0 | Scope the portable status/context/usage truth model, compatibility aliases, dependencies, exclusions, and PF-10 matrix |
+| 031 | E04-S01-C3 | Close provider-free timeout, cancellation, aggregate-bound, and unsupported-capability fixture cuts |
 
-After Cycle 030, the queue finishes E04's capability, generation, and adapter
+After the documentation-only Cycle 030, Cycle 031 resumes and finishes E04's
+remaining fixture cuts before its capability, generation, and adapter
 gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
-above. Provider-free fixture design may overlap, but it cannot displace a
-failing correctness or authority gate.
+above. E08-S05's high-value `/status`, `/context window`, and `/usage session`
+slice is 4-7 cycles once its E04-owned identity inputs are ready; complete
+telemetry/history work adds 12-18 cycles. Provider-free fixture design may
+overlap, but it cannot displace a failing correctness or authority gate.
 
 ## Branch baseline receipt
 

@@ -1,18 +1,18 @@
 # Improvement Program Status
 
-Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 029 on
-`improvements/harness-roadmap`.
+Status: E00, E01, and E02 accepted; E04-S01 is in progress and E08 telemetry
+observability is scoped through Cycle 030 on `improvements/harness-roadmap`.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 29 / 29 |
+| Accepted cycles/commits after this cycle | 30 / 30 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S01-C3 — timeout, cancellation, aggregate-bound, and capability fixture cuts |
+| Active epic/card | E04 / E04-S01-C3 (Cycle 031) — timeout, cancellation, aggregate-bound, and capability fixture cuts |
 
 ## Epic status
 
@@ -25,7 +25,8 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 029 on
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
-| E05/E08 onboarding/docs | Planned after provider/tool surfaces stabilize | Transactional setup/picker and PF-10 observability/docs |
+| E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
+| E08 telemetry/docs | **Scoped** through Cycle 030; implementation waits on owned inputs | E08-S05 live telemetry consumes E04 receipts; E08-S06 durable usage consumes E03 fencing; progressive docs follow stable surfaces |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -61,7 +62,8 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 029 on
 | 026 | `3aeec6d` | Interactive multi-operation aggregate and process publication |
 | 027 | `d818558` | Seven-carrier production exit evaluator and E02 acceptance |
 | 028 | `b4baf8b` | Primary-reviewed compatible-Chat and distinct Messages wire controls |
-| 029 | this document's commit | Correlated tool rounds, typed faults, malformed events, and path bounds |
+| 029 | `a1d70f7` | Correlated tool rounds, typed faults, malformed events, and path bounds |
+| 030 | this document's commit | Truthful status/context/usage taxonomy, stories, dependencies, and PF-10 matrix |
 
 ## Current green gates
 
@@ -78,6 +80,9 @@ Status: E00, E01, and E02 accepted; E04-S01 is in progress through Cycle 029 on
   research decision inputs are SHA-256 pinned.
 - `scripts/check-roadmap.sh` verifies sequential receipts, required fields, and
   one cycle file per improvement commit on this active branch.
+- E08-S05/S06 now have a provider-neutral command/truth contract: local status
+  and context remain offline; usage is Kitsu-observed provider reporting, never
+  inferred billing/account truth; durable calendar views wait for E03.
 
 ## Next delivery tranche
 
@@ -106,9 +111,11 @@ Anthropic Messages text wire from primary specifications, proves their exact
 request/event divergence, and makes wrong-adapter EOF fail closed. Cycle 029
 adds exact correlated tool-result histories and fragmented tool calls, distinct
 HTTP/mid-stream error bodies, malformed events, and 64 KiB error-body plus 4
-MiB SSE-line rejection on both configured paths. Cycle 030 closes the remaining
-provider-free timeout/cancel/aggregate/capability fixture cuts before production
-adapter code begins.
+MiB SSE-line rejection on both configured paths. Documentation-only Cycle 030
+scopes adaptive `/status`, focused `/context`, `/usage session` plus bounded
+local history without inventing portable account/billing truth. Cycle 031 now
+closes the remaining provider-free timeout/cancel/aggregate/capability fixture
+cuts before production adapter code begins.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
