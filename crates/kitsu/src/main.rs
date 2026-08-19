@@ -281,6 +281,79 @@ fn emit_jsonl_summary_with_local_failures(
     )
 }
 
+fn jsonl_summary_outcome(
+    status: &str,
+    provider_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+) -> Result<kitsu_core::RunOutcomeClass, CliError> {
+    match status {
+        "ok" => Ok(kitsu_core::RunOutcomeClass::Succeeded),
+        "partial" => Ok(kitsu_core::RunOutcomeClass::PartiallySucceeded),
+        "cancelled" => Ok(kitsu_core::RunOutcomeClass::Cancelled),
+        "error" if provider_failures > 0 => Ok(kitsu_core::RunOutcomeClass::ProviderFault),
+        "error" if tool_failures > 0 || policy_failures > 0 => {
+            Ok(kitsu_core::RunOutcomeClass::ToolFault)
+        }
+        "error" => Ok(kitsu_core::RunOutcomeClass::UserFault),
+        unknown => Err(CliError::user(format!(
+            "internal final summary status is not recognized: {unknown}"
+        ))),
+    }
+}
+
+/// Run the deliberately narrow `ask --jsonl` terminal path through the common
+/// lifecycle. `ask` has no tools/children or session store, making Joined and
+/// NotRequested structural facts rather than carrier guesses. The delivery
+/// closure is injectable so provider-free tests can cut the sink boundary.
+fn finalize_ask_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    let mut lifecycle = kitsu_core::RunLifecycle::accept(run_spec());
+    lifecycle.settle(outcome, assistant)?;
+    lifecycle.join(kitsu_core::RunCleanupState::Joined)?;
+    lifecycle.persist(kitsu_core::RunPersistenceState::NotRequested)?;
+    let delivery = deliver();
+    lifecycle.deliver(if delivery.is_ok() {
+        kitsu_core::RunDeliveryState::Delivered
+    } else {
+        kitsu_core::RunDeliveryState::Failed
+    })?;
+    let published = lifecycle.publish()?;
+    Ok((published, delivery))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn emit_ask_jsonl_summary_with_local_failures(
+    status: &str,
+    failures: usize,
+    provider_failures: usize,
+    output_schema_failures: usize,
+    tool_failures: usize,
+    policy_failures: usize,
+    tool_error_totals: ToolErrorTotals,
+) -> Result<(), CliError> {
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
+    let assistant = run_assistant_disposition();
+    let (published, delivery) = finalize_ask_terminal_with_delivery(outcome, assistant, || {
+        emit_jsonl_summary_with_local_failures(
+            status,
+            failures,
+            provider_failures,
+            output_schema_failures,
+            tool_failures,
+            policy_failures,
+            tool_error_totals,
+        )
+    })
+    .map_err(|error| CliError::user(format!("internal ask finalization failed: {error}")))?;
+    debug_assert_eq!(published.terminal().class(), outcome);
+    debug_assert_eq!(published.terminal().assistant(), assistant);
+    delivery
+}
+
 #[allow(clippy::too_many_arguments)]
 fn emit_jsonl_summary_with_postcondition_failures(
     status: &str,
@@ -293,21 +366,7 @@ fn emit_jsonl_summary_with_postcondition_failures(
     tool_error_totals: ToolErrorTotals,
 ) -> Result<(), CliError> {
     debug_assert!(output_schema_failures <= provider_failures);
-    let outcome = match status {
-        "ok" => kitsu_core::RunOutcomeClass::Succeeded,
-        "partial" => kitsu_core::RunOutcomeClass::PartiallySucceeded,
-        "cancelled" => kitsu_core::RunOutcomeClass::Cancelled,
-        "error" if provider_failures > 0 => kitsu_core::RunOutcomeClass::ProviderFault,
-        "error" if tool_failures > 0 || policy_failures > 0 => {
-            kitsu_core::RunOutcomeClass::ToolFault
-        }
-        "error" => kitsu_core::RunOutcomeClass::UserFault,
-        unknown => {
-            return Err(CliError::user(format!(
-                "internal final summary status is not recognized: {unknown}"
-            )))
-        }
-    };
+    let outcome = jsonl_summary_outcome(status, provider_failures, tool_failures, policy_failures)?;
     let terminal = run_spec().terminal(outcome, run_assistant_disposition());
     let cancelled_failures = usize::from(status == "cancelled" && failures > 0);
     let user_failures = failures
@@ -8571,7 +8630,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                             "policy_errors": state.last_turn.policy_errors,
                         }),
                     )?;
-                    emit_jsonl_summary_with_local_failures(
+                    emit_ask_jsonl_summary_with_local_failures(
                         "error",
                         1,
                         usize::from(failure.kind.is_provider_failure()),
@@ -8600,7 +8659,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
             if let Err(mapped) = write_output_last_message(cli, "ask:1", &text) {
                 emit_output_last_message_error(cli, "ask:1", &mapped)?;
                 if cli.jsonl {
-                    emit_jsonl_summary_with_local_failures(
+                    emit_ask_jsonl_summary_with_local_failures(
                         "error",
                         1,
                         0,
@@ -8613,7 +8672,15 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                 return Err(mapped);
             }
             if cli.jsonl {
-                emit_jsonl_summary_with_local_failures("ok", 0, 0, 0, 0, 0, recovered_tool_errors)?;
+                emit_ask_jsonl_summary_with_local_failures(
+                    "ok",
+                    0,
+                    0,
+                    0,
+                    0,
+                    0,
+                    recovered_tool_errors,
+                )?;
             }
             Ok(())
         }
@@ -8648,7 +8715,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "error"}),
                 )?;
-                emit_jsonl_summary_with_local_failures(
+                emit_ask_jsonl_summary_with_local_failures(
                     "error",
                     1,
                     usize::from(mapped.exit_code() == EXIT_PROVIDER),
@@ -8682,7 +8749,7 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
                     "turn_finished",
                     serde_json::json!({"turn_id": "ask:1", "status": "cancelled"}),
                 )?;
-                emit_jsonl_summary_with_local_failures(
+                emit_ask_jsonl_summary_with_local_failures(
                     "cancelled",
                     1,
                     0,
@@ -18018,6 +18085,68 @@ mod tests {
         );
         assert_eq!(CliError::user("bad input").exit_code(), EXIT_USER);
         assert_eq!(CliError::tool("tool failed").exit_code(), EXIT_USER);
+    }
+
+    #[test]
+    fn ask_terminal_lifecycle_publishes_clean_delivery_once() {
+        let deliveries = std::cell::Cell::new(0);
+        let (published, delivery) = finalize_ask_terminal_with_delivery(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Ok::<_, &'static str>(())
+            },
+        )
+        .expect("valid ask phases publish");
+
+        assert!(delivery.is_ok());
+        assert_eq!(deliveries.get(), 1);
+        assert_eq!(
+            published.terminal().class(),
+            kitsu_core::RunOutcomeClass::Succeeded
+        );
+        assert_eq!(
+            published.terminal().assistant(),
+            kitsu_core::RunAssistantDisposition::Committed
+        );
+        assert_eq!(published.cleanup(), kitsu_core::RunCleanupState::Joined);
+        assert_eq!(
+            published.persistence(),
+            kitsu_core::RunPersistenceState::NotRequested
+        );
+        assert_eq!(
+            published.delivery(),
+            kitsu_core::RunDeliveryState::Delivered
+        );
+        assert!(published.is_clean_success());
+    }
+
+    #[test]
+    fn ask_terminal_lifecycle_publishes_delivery_failure_without_reclassification() {
+        let deliveries = std::cell::Cell::new(0);
+        let (published, delivery) = finalize_ask_terminal_with_delivery(
+            kitsu_core::RunOutcomeClass::ProviderFault,
+            kitsu_core::RunAssistantDisposition::Discarded,
+            || {
+                deliveries.set(deliveries.get() + 1);
+                Err::<(), _>("blocked sink")
+            },
+        )
+        .expect("delivery failure is terminal phase data");
+
+        assert_eq!(delivery.unwrap_err(), "blocked sink");
+        assert_eq!(deliveries.get(), 1);
+        assert_eq!(
+            published.terminal().class(),
+            kitsu_core::RunOutcomeClass::ProviderFault
+        );
+        assert_eq!(
+            published.terminal().assistant(),
+            kitsu_core::RunAssistantDisposition::Discarded
+        );
+        assert_eq!(published.delivery(), kitsu_core::RunDeliveryState::Failed);
+        assert!(!published.is_clean_success());
     }
 
     #[test]
