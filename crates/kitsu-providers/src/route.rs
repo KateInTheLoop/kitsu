@@ -8,6 +8,7 @@
 use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
 
+use ring::digest::{Context, SHA256};
 use serde::de::Error as _;
 use serde::{Deserialize, Deserializer, Serialize};
 use thiserror::Error;
@@ -36,9 +37,9 @@ pub enum ProviderWireRevision {
 }
 
 /// Opaque, versioned profile identity. It is deliberately not a user-visible
-/// gateway name: later composition derives the 128-bit lowercase hex payload
-/// from the config namespace plus profile identity so same-label profiles in
-/// different configs cannot collide.
+/// gateway name: composition derives the 128-bit lowercase hex payload from
+/// the config namespace plus profile identity so same-label profiles in
+/// different configs do not share identity.
 #[derive(Clone, Debug, PartialEq, Eq, Hash, PartialOrd, Ord, Serialize)]
 #[serde(transparent)]
 pub struct ProviderProfileId(String);
@@ -47,6 +48,8 @@ impl ProviderProfileId {
     pub const PREFIX: &'static str = "profile-v1-";
     pub const HEX_BYTES: usize = 32;
     pub const MAX_BYTES: usize = Self::PREFIX.len() + Self::HEX_BYTES;
+    pub const MAX_NAMESPACE_BYTES: usize = 64 * 1024;
+    pub const MAX_PROFILE_NAME_BYTES: usize = 1024;
 
     pub fn new(value: impl Into<String>) -> Result<Self, ProviderRouteContractError> {
         let value = value.into();
@@ -81,6 +84,56 @@ impl ProviderProfileId {
 
     pub fn as_str(&self) -> &str {
         &self.0
+    }
+
+    /// Derive a collision-resistant opaque identity from a canonical config
+    /// namespace and the gateway key within that config. Endpoint, model,
+    /// flavor, capability, and credential values are deliberately not inputs:
+    /// those can change while the logical profile identity stays stable and a
+    /// later route generation records the replacement.
+    pub fn derive_v1(
+        namespace: impl AsRef<[u8]>,
+        profile_name: impl AsRef<[u8]>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        let namespace = namespace.as_ref();
+        let profile_name = profile_name.as_ref();
+        if namespace.is_empty() {
+            return Err(ProviderRouteContractError::EmptyProfileNamespace);
+        }
+        if namespace.len() > Self::MAX_NAMESPACE_BYTES {
+            return Err(ProviderRouteContractError::ProfileNamespaceTooLong {
+                actual_bytes: namespace.len(),
+                max_bytes: Self::MAX_NAMESPACE_BYTES,
+            });
+        }
+        if profile_name.is_empty() {
+            return Err(ProviderRouteContractError::EmptyProfileName);
+        }
+        if profile_name.len() > Self::MAX_PROFILE_NAME_BYTES {
+            return Err(ProviderRouteContractError::ProfileNameTooLong {
+                actual_bytes: profile_name.len(),
+                max_bytes: Self::MAX_PROFILE_NAME_BYTES,
+            });
+        }
+
+        // Length framing makes the two inputs unambiguous. SHA-256 is truncated
+        // to 128 bits to match the v1 serialized profile shape while retaining
+        // collision resistance appropriate for a local identity namespace.
+        let mut digest = Context::new(&SHA256);
+        digest.update(b"kitsu.provider-profile.v1\0");
+        digest.update(&(namespace.len() as u64).to_be_bytes());
+        digest.update(namespace);
+        digest.update(&(profile_name.len() as u64).to_be_bytes());
+        digest.update(profile_name);
+        let digest = digest.finish();
+        let mut encoded = String::with_capacity(Self::MAX_BYTES);
+        encoded.push_str(Self::PREFIX);
+        const HEX: &[u8; 16] = b"0123456789abcdef";
+        for byte in &digest.as_ref()[..16] {
+            encoded.push(char::from(HEX[usize::from(byte >> 4)]));
+            encoded.push(char::from(HEX[usize::from(byte & 0x0f)]));
+        }
+        Self::new(encoded)
     }
 }
 
@@ -183,6 +236,79 @@ impl<'de> Deserialize<'de> for ProviderCapabilities {
     }
 }
 
+/// A validated route declaration before a generation is published. Current
+/// composition can state which compiled adapter/wire/capabilities it will use
+/// without falsely claiming that all physical sends are generation-bound.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderRouteDeclaration {
+    adapter: ProviderAdapterId,
+    profile: ProviderProfileId,
+    wire_revision: ProviderWireRevision,
+    capabilities: ProviderCapabilities,
+}
+
+impl ProviderRouteDeclaration {
+    pub fn new(
+        adapter: ProviderAdapterId,
+        profile: ProviderProfileId,
+        wire_revision: ProviderWireRevision,
+        capabilities: ProviderCapabilities,
+    ) -> Result<Self, ProviderRouteContractError> {
+        if !adapter_supports_wire(adapter, wire_revision) {
+            return Err(ProviderRouteContractError::AdapterWireMismatch {
+                adapter,
+                wire_revision,
+            });
+        }
+        Ok(Self {
+            adapter,
+            profile,
+            wire_revision,
+            capabilities,
+        })
+    }
+
+    /// Truthful declaration for today's compiled compatible-Chat adapter.
+    /// `Usage` means the decoder can normalize reported usage, not that every
+    /// compatible endpoint promises to report it.
+    pub fn compatible_chat_v1(profile: ProviderProfileId, model_catalog: bool) -> Self {
+        let mut supported = vec![
+            ProviderCapability::Streaming,
+            ProviderCapability::Tools,
+            ProviderCapability::StructuredOutput,
+            ProviderCapability::Usage,
+        ];
+        if model_catalog {
+            supported.push(ProviderCapability::ModelCatalog);
+        }
+        let capabilities = ProviderCapabilities::new(1, supported)
+            .expect("the compiled compatible-Chat capability set is valid");
+        Self::new(
+            ProviderAdapterId::OpenAiCompatible,
+            profile,
+            ProviderWireRevision::OpenAiChatCompletionsV1,
+            capabilities,
+        )
+        .expect("the compiled compatible-Chat adapter/wire pair is valid")
+    }
+
+    pub fn adapter(&self) -> ProviderAdapterId {
+        self.adapter
+    }
+
+    pub fn profile(&self) -> &ProviderProfileId {
+        &self.profile
+    }
+
+    pub fn wire_revision(&self) -> ProviderWireRevision {
+        self.wire_revision
+    }
+
+    pub fn capabilities(&self) -> &ProviderCapabilities {
+        &self.capabilities
+    }
+}
+
 /// Secret-free identity of one immutable provider route snapshot. Endpoint,
 /// auth and model values will be bound behind this identity by E04-S03 rather
 /// than serialized here.
@@ -205,20 +331,23 @@ impl ProviderRouteIdentity {
         wire_revision: ProviderWireRevision,
         capabilities: ProviderCapabilities,
     ) -> Result<Self, ProviderRouteContractError> {
-        if !adapter_supports_wire(adapter, wire_revision) {
-            return Err(ProviderRouteContractError::AdapterWireMismatch {
-                adapter,
-                wire_revision,
-            });
-        }
-        Ok(Self {
+        let declaration =
+            ProviderRouteDeclaration::new(adapter, profile, wire_revision, capabilities)?;
+        Ok(Self::from_declaration(declaration, generation))
+    }
+
+    pub fn from_declaration(
+        declaration: ProviderRouteDeclaration,
+        generation: ProviderRouteGeneration,
+    ) -> Self {
+        Self {
             contract_revision: PROVIDER_ROUTE_CONTRACT_REVISION,
-            adapter,
-            profile,
+            adapter: declaration.adapter,
+            profile: declaration.profile,
             generation,
-            wire_revision,
-            capabilities,
-        })
+            wire_revision: declaration.wire_revision,
+            capabilities: declaration.capabilities,
+        }
     }
 
     pub fn contract_revision(&self) -> u32 {
@@ -332,6 +461,20 @@ pub enum ProviderRouteContractError {
     InvalidProfileIdCharacter { index: usize, byte: u8 },
     #[error("provider profile identity must be profile-v1- plus 32 lowercase hex digits")]
     InvalidProfileIdFormat,
+    #[error("provider profile namespace must not be empty")]
+    EmptyProfileNamespace,
+    #[error("provider profile namespace is {actual_bytes} bytes; maximum is {max_bytes}")]
+    ProfileNamespaceTooLong {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
+    #[error("provider profile name must not be empty")]
+    EmptyProfileName,
+    #[error("provider profile name is {actual_bytes} bytes; maximum is {max_bytes}")]
+    ProfileNameTooLong {
+        actual_bytes: usize,
+        max_bytes: usize,
+    },
     #[error("provider route generation must be nonzero")]
     ZeroGeneration,
     #[error("provider capability revision must be nonzero")]

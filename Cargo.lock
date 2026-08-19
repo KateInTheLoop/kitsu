@@ -1077,6 +1077,7 @@ dependencies = [
  "chrono",
  "futures",
  "reqwest",
+ "ring",
  "serde",
  "serde_json",
  "serial_test",
