@@ -20,6 +20,9 @@ Current comparison: [`current-comparison.md`](current-comparison.md)
 
 Program status: [`program-status.md`](program-status.md)
 
+Provider wire fixture contract:
+[`e04-primary-wire-fixtures.md`](e04-primary-wire-fixtures.md)
+
 ## Purpose and baseline rule
 
 This is the Kitsu-owned implementation backlog translated from the ten-harness
@@ -268,6 +271,13 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
+Status: in progress through Cycle 028. The primary-reviewed compatible-Chat
+control and structurally distinct Anthropic Messages text fixture run fully
+offline and the Messages wire fails against the current Chat adapter without
+emitting a neutral delta. Tools, error/boundary cases, capability types,
+immutable generations, and the production distinct adapter remain open; X001
+therefore still fails.
+
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
 compatible-chat adapter. OpenAI Responses is an acceptable product decision
@@ -438,8 +448,10 @@ gates merely because a card appears attractive.
 | 026 | E02-S03-C8 | Define and publish the interactive multi-operation aggregate terminal |
 | 027 | E02-S04-C2 | Evaluate the seven-carrier exit matrix and close or retain one measured E02 gap |
 | 028 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 029 | E04-S01-C2 | Extend both wire fixtures through tools, typed faults, malformed input, and hard bounds |
 
-After Cycle 028, the queue finishes E04's generation/adapter gates, then
+After Cycle 029, the queue closes E04-S01 timeout/cancellation/capability cuts,
+then finishes E04's generation/adapter gates and
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. Provider-free fixture design may overlap, but it cannot displace a
 failing correctness or authority gate.
