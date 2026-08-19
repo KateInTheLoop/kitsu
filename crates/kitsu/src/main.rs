@@ -67,6 +67,8 @@ static MODEL_INFERENCE_STARTED: AtomicBool = AtomicBool::new(false);
 /// One phase owner for the inference-capable process run. Carrier helpers must
 /// advance this instance instead of constructing presentation-local owners.
 static PROCESS_RUN_LIFECYCLE: OnceLock<Mutex<kitsu_core::RunLifecycle>> = OnceLock::new();
+static PROCESS_TERMINAL_FACTS: OnceLock<ProcessTerminalFacts> = OnceLock::new();
+static INTERACTIVE_MODEL_COMMAND: AtomicBool = AtomicBool::new(false);
 /// Set only when `--allow-turn-errors` converts a scripted run with both a
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
@@ -216,6 +218,52 @@ fn activate_model_command() {
 
 fn mark_model_inference_started() {
     MODEL_INFERENCE_STARTED.store(true, Ordering::Release);
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProcessTerminalFacts {
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+}
+
+fn record_process_terminal_facts_in(
+    receipt: &OnceLock<ProcessTerminalFacts>,
+    facts: ProcessTerminalFacts,
+) -> Result<(), &'static str> {
+    receipt
+        .set(facts)
+        .map_err(|_| "process terminal facts were already recorded")
+}
+
+fn record_process_terminal_facts(facts: ProcessTerminalFacts) -> Result<(), CliError> {
+    record_process_terminal_facts_in(&PROCESS_TERMINAL_FACTS, facts).map_err(CliError::user)
+}
+
+fn process_terminal_facts_or_fallback() -> ProcessTerminalFacts {
+    PROCESS_TERMINAL_FACTS
+        .get()
+        .copied()
+        .unwrap_or(ProcessTerminalFacts {
+            cleanup: if MODEL_INFERENCE_STARTED.load(Ordering::Acquire) {
+                kitsu_core::RunCleanupState::NotObserved
+            } else {
+                kitsu_core::RunCleanupState::Joined
+            },
+            persistence: jsonl_session_persistence_state(),
+        })
+}
+
+fn record_human_terminal_facts(cleanup: kitsu_core::RunCleanupState) -> Result<(), CliError> {
+    record_process_terminal_facts(ProcessTerminalFacts {
+        cleanup,
+        persistence: jsonl_session_persistence_state(),
+    })
+}
+
+fn record_human_terminal_facts_preserving_error(cleanup: kitsu_core::RunCleanupState) {
+    if let Err(error) = record_human_terminal_facts(cleanup) {
+        eprintln!("~ additional terminal fact handoff failure: {error}");
+    }
 }
 
 fn run_elapsed() -> Duration {
@@ -464,18 +512,17 @@ fn emit_ask_jsonl_summary_with_local_failures(
     delivery
 }
 
-fn publish_early_inference_jsonl_terminal(error: &CliError) -> Result<(), CliError> {
+fn publish_fallback_inference_jsonl_terminal(error: &CliError) -> Result<(), CliError> {
     debug_assert!(MODEL_COMMAND_ACTIVE.load(Ordering::Acquire));
-    debug_assert!(!MODEL_INFERENCE_STARTED.load(Ordering::Acquire));
     let outcome = error.outcome_class();
     let assistant = run_assistant_disposition();
-    let persistence = jsonl_session_persistence_state();
+    let facts = process_terminal_facts_or_fallback();
     let cancelled = error.exit_code() == EXIT_CANCELLED;
     let (published, delivery) = finalize_process_terminal_with_delivery(
         outcome,
         assistant,
-        kitsu_core::RunCleanupState::Joined,
-        persistence,
+        facts.cleanup,
+        facts.persistence,
         || {
             emit_jsonl("error", error.jsonl_error_payload())?;
             emit_jsonl_summary(
@@ -487,13 +534,13 @@ fn publish_early_inference_jsonl_terminal(error: &CliError) -> Result<(), CliErr
     )
     .map_err(|phase_error| {
         CliError::user(format!(
-            "internal early inference finalization failed: {phase_error}"
+            "internal fallback inference finalization failed: {phase_error}"
         ))
     })?;
     debug_assert_eq!(published.terminal().class(), outcome);
     debug_assert_eq!(published.terminal().assistant(), assistant);
-    debug_assert_eq!(published.cleanup(), kitsu_core::RunCleanupState::Joined);
-    debug_assert_eq!(published.persistence(), persistence);
+    debug_assert_eq!(published.cleanup(), facts.cleanup);
+    debug_assert_eq!(published.persistence(), facts.persistence);
     delivery
 }
 
@@ -1374,7 +1421,7 @@ fn main() {
         .with_writer(trace_writer)
         .try_init();
 
-    let (code, outcome_class) = match run() {
+    let (mut code, outcome_class) = match run() {
         Ok(()) if jsonl_mode => {
             jsonl_output_failure().map_or((0, kitsu_core::RunOutcomeClass::Succeeded), |error| {
                 std::eprintln!("{error}");
@@ -1399,18 +1446,13 @@ fn main() {
                 }
                 e.exit_code()
             } else {
-                if jsonl_output_failure().is_none()
-                    && !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire)
-                {
-                    let frame_result = if MODEL_COMMAND_ACTIVE.load(Ordering::Acquire)
-                        && !MODEL_INFERENCE_STARTED.load(Ordering::Acquire)
-                    {
-                        // Before the first provider turn no child can exist;
-                        // active snapshot truth is already available from the
-                        // session receipt. Publish this inference preflight
-                        // failure through the same process owner as carriers.
-                        publish_early_inference_jsonl_terminal(&e)
-                    } else {
+                if !JSONL_SUMMARY_EMITTED.load(Ordering::Acquire) {
+                    let frame_result = if MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
+                        // Carrier-provided facts win. Before the first provider
+                        // turn, Joined is structural; after it, missing cleanup
+                        // evidence is explicitly NotObserved rather than guessed.
+                        publish_fallback_inference_jsonl_terminal(&e)
+                    } else if jsonl_output_failure().is_none() {
                         let cancelled = e.exit_code() == EXIT_CANCELLED;
                         emit_jsonl("error", e.jsonl_error_payload()).and_then(|()| {
                             emit_jsonl_summary(
@@ -1419,6 +1461,9 @@ fn main() {
                                 usize::from(e.exit_code() == EXIT_PROVIDER),
                             )
                         })
+                    } else {
+                        Err(jsonl_output_failure()
+                            .expect("management fallback observed terminal output failure"))
                     };
                     // `jsonl_output_failure` below reports the retained
                     // terminal error exactly once when framing itself fails.
@@ -1453,15 +1498,48 @@ fn main() {
             | kitsu_core::RunOutcomeClass::ProviderFault
             | kitsu_core::RunOutcomeClass::ToolFault => kitsu_render::RunTimingStatus::Error,
         };
-        kitsu_render::emit_run_timing(
-            run_elapsed(),
-            status,
-            kitsu_render::HumanRunReceipt {
-                run_id: terminal.run_id().as_str(),
-                outcome: terminal.class().as_str(),
-                assistant: terminal.assistant().as_str(),
-            },
-        );
+        let deliver = || {
+            kitsu_render::emit_run_timing(
+                run_elapsed(),
+                status,
+                kitsu_render::HumanRunReceipt {
+                    run_id: terminal.run_id().as_str(),
+                    outcome: terminal.class().as_str(),
+                    assistant: terminal.assistant().as_str(),
+                },
+            )
+        };
+        if INTERACTIVE_MODEL_COMMAND.load(Ordering::Acquire) {
+            if deliver().is_err() && code == 0 {
+                code = EXIT_USER;
+            }
+        } else {
+            let facts = process_terminal_facts_or_fallback();
+            match finalize_process_terminal_with_delivery(
+                terminal.class(),
+                terminal.assistant(),
+                facts.cleanup,
+                facts.persistence,
+                deliver,
+            ) {
+                Ok((published, delivery)) => {
+                    debug_assert_eq!(published.terminal(), &terminal);
+                    if (delivery.is_err()
+                        || (terminal.class() == kitsu_core::RunOutcomeClass::Succeeded
+                            && !published.is_clean_success()))
+                        && code == 0
+                    {
+                        code = EXIT_USER;
+                    }
+                }
+                Err(error) => {
+                    std::eprintln!("internal human inference finalization failed: {error}");
+                    if code == 0 {
+                        code = EXIT_USER;
+                    }
+                }
+            }
+        }
     }
     std::process::exit(code);
 }
@@ -8711,6 +8789,10 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
 }
 
 async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
+    record_process_terminal_facts(ProcessTerminalFacts {
+        cleanup: kitsu_core::RunCleanupState::Joined,
+        persistence: kitsu_core::RunPersistenceState::NotRequested,
+    })?;
     let setup = build_setup(cli).await?;
     if setup.artifact_policy == ArtifactStoragePolicy::InlineOnly && !cli.jsonl {
         eprintln!(
@@ -11489,6 +11571,18 @@ async fn finalize_scripted_run(
         );
     }
 
+    let persistence = jsonl_session_persistence_state();
+    if !jsonl {
+        if let Err(error) = record_process_terminal_facts(ProcessTerminalFacts {
+            cleanup: cleanup_state,
+            persistence,
+        }) {
+            if primary_error.is_none() {
+                primary_error = Some(error);
+            }
+        }
+    }
+
     if jsonl {
         let summary_status = if primary_error
             .as_ref()
@@ -11510,7 +11604,6 @@ async fn finalize_scripted_run(
                 status.policy_failures,
             )?;
             let assistant = run_assistant_disposition();
-            let persistence = jsonl_session_persistence_state();
             let (published, delivery) = finalize_process_terminal_with_delivery(
                 outcome,
                 assistant,
@@ -13513,6 +13606,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     let scripted = script.is_some();
     let forced_one_shot = initial_review.is_some();
     let interactive = kitsu_render::stdin_is_tty() && !scripted && !forced_one_shot;
+    INTERACTIVE_MODEL_COMMAND.store(interactive, Ordering::Release);
     // Checkpoint blocks always print; the "/undo N" hint is only advertised
     // where a human can actually type it (the interactive REPL).
     UNDO_HINTS_ACTIONABLE.store(interactive, Ordering::Release);
@@ -14864,6 +14958,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 unrecovered_tool_errors,
                             )
                         })?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -14979,6 +15075,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 )
                             },
                         )?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -15019,6 +15117,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                                 recovered_tool_errors,
                             )
                         })?;
+                    } else {
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -15070,6 +15170,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         })?;
                     } else {
                         emit_required_write_error(cli, &mapped)?;
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -15089,6 +15190,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         })?;
                     } else {
                         emit_output_last_message_error(cli, "piped:1", &mapped)?;
+                        record_human_terminal_facts_preserving_error(cleanup_state);
                     }
                     return Err(mapped);
                 }
@@ -15116,6 +15218,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             recovered_tool_errors,
                         )
                     })?;
+                } else {
+                    record_human_terminal_facts(cleanup_state)?;
                 }
                 Ok(())
             }
@@ -15221,6 +15325,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             )
                         },
                     )?;
+                } else {
+                    record_human_terminal_facts_preserving_error(cancelled.cleanup);
                 }
                 Err(mapped)
             }
@@ -15263,6 +15369,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             unrecovered_tool_errors,
                         )
                     })?;
+                } else {
+                    record_human_terminal_facts_preserving_error(cancelled.cleanup);
                 }
                 Err(mapped)
             }
@@ -18556,6 +18664,19 @@ mod tests {
                 "management command cannot reserve inference lifecycle: {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn process_terminal_fact_handoff_is_single_and_exact() {
+        let receipt = OnceLock::new();
+        let facts = ProcessTerminalFacts {
+            cleanup: kitsu_core::RunCleanupState::Joined,
+            persistence: kitsu_core::RunPersistenceState::Preserved,
+        };
+
+        record_process_terminal_facts_in(&receipt, facts).expect("first carrier owns facts");
+        assert_eq!(receipt.get(), Some(&facts));
+        assert!(record_process_terminal_facts_in(&receipt, facts).is_err());
     }
 
     #[test]

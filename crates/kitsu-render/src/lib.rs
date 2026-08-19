@@ -1860,17 +1860,17 @@ pub fn emit_run_timing(
     elapsed: std::time::Duration,
     status: RunTimingStatus,
     receipt: HumanRunReceipt<'_>,
-) {
+) -> io::Result<()> {
     let mut err = io::stderr();
     let destination_is_tty = err.is_terminal();
-    let _ = write_run_timing_with_mode(
+    write_run_timing_with_mode(
         &mut err,
         destination_is_tty,
         plain_mode(),
         elapsed,
         status,
         receipt,
-    );
+    )
 }
 
 fn write_run_timing_with_mode<W: Write>(
@@ -2702,6 +2702,39 @@ mod tests {
             String::from_utf8(interrupted).unwrap(),
             "kitsu-timing: {\"run_id\":\"fixture-run-001\",\"duration_ms\":1250,\"status\":\"interrupted\",\"outcome\":\"interrupted\",\"assistant\":\"absent\"}\n"
         );
+    }
+
+    #[test]
+    fn run_timing_delivery_failure_is_returned_to_the_lifecycle_owner() {
+        struct RefuseWrites;
+
+        impl std::io::Write for RefuseWrites {
+            fn write(&mut self, _buffer: &[u8]) -> std::io::Result<usize> {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "fixture sink closed",
+                ))
+            }
+
+            fn flush(&mut self) -> std::io::Result<()> {
+                Ok(())
+            }
+        }
+
+        let error = write_run_timing_with_mode(
+            &mut RefuseWrites,
+            false,
+            true,
+            std::time::Duration::from_millis(5),
+            RunTimingStatus::Ok,
+            HumanRunReceipt {
+                run_id: "fixture-run-delivery",
+                outcome: "succeeded",
+                assistant: "committed",
+            },
+        )
+        .expect_err("terminal delivery failure must remain observable");
+        assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe);
     }
 
     #[test]
