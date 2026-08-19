@@ -3,7 +3,7 @@
 Status: E02-S02 accepted, E02-S03 live integration covers ask, scripted, and
 piped JSONL plus human noninteractive presentation, E02-S04 compatible
 projection has started, and the host ownership exit is decomposed through the
-presentation-neutral fact handoff accepted in Cycle 025;
+interactive aggregate and publication accepted in Cycle 026;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -161,6 +161,25 @@ files, authority, and effect behavior are unchanged. Interactive chat still
 uses its direct timing projection until Cycle 026 defines the multi-operation
 aggregate.
 
+Cycle 026 replaces that last presentation-local path with an explicit
+interactive process aggregate. A successful operation plus any failed,
+cancelled, or interrupted operation is `PartiallySucceeded`; with no success,
+the first causal non-success remains the process class. The assistant field is
+the latest attempted turn's actual disposition, so a failed turn followed by a
+successful `/retry` is partial with `Committed`, not either last-turn success or
+stale discarded output. A steering replacement is counted but is not itself a
+terminal fault because the same process immediately restarts it ahead of queued
+work.
+
+Every rollback uses the status-preserving child cancellation path. `/quit
+wait`, `/quit cancel`, queued exit, session transitions, and final shutdown feed
+observed cleanup into the aggregate; a closed join observer becomes
+`NotObserved` instead of guessed `Joined`. Detached done/failed/cancelled state
+is folded before a session registry reset or process exit. The final active
+snapshot receipt supplies persistence, and human timing is delivered through
+the same process lifecycle as every other inference carrier. Interactive exit
+code policy remains the independent Cycle 027 evaluation.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -174,8 +193,6 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Define the interactive aggregate independently from its last turn and route
-   it through the process owner.
-2. Evaluate all seven carriers before closing E02. Extend projection parity
+1. Evaluate all seven carriers before closing E02. Extend projection parity
    only from measured gaps; do not invent a second schema version while
    additive `kitsu.chat.v1` evolution is sufficient.

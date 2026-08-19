@@ -1,6 +1,6 @@
 # Improvement Program Status
 
-Status: E00 and E01 accepted; E02 in progress through Cycle 025 on
+Status: E00 and E01 accepted; E02 in progress through Cycle 026 on
 `improvements/harness-roadmap`.
 
 | Field | Current value |
@@ -8,7 +8,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 025 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 25 / 25 |
+| Accepted cycles/commits after this cycle | 26 / 26 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
@@ -20,7 +20,7 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 025 on
 |---|---|---|
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
-| E02 causal run/outcome | **In progress** | One process owner covers JSONL and human noninteractive carriers; exact carrier facts, fallible delivery, and truthful post-start fallback are accepted; interactive aggregate and exit-evaluation gates remain |
+| E02 causal run/outcome | **In progress** | One process owner covers every inference carrier; exact phase facts, fallible delivery, truthful fallback, and interactive multi-operation aggregation are accepted; only the independent exit-evaluation gate remains |
 | E04 provider spine | Planned after E02 | Primary wire fixtures, capability types, `X001-G1-AUX`, distinct compiled dialect |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
@@ -57,11 +57,12 @@ Status: E00 and E01 accepted; E02 in progress through Cycle 025 on
 | 022 | `6ed375b` | Piped terminal lifecycle with status-preserving rollback cleanup |
 | 023 | `46dfde6` | E02 terminal-ownership audit and evidence-backed exit decomposition |
 | 024 | `217f0f8` | Process-singleton lifecycle and truthful child-free inference fallback |
-| 025 | this document's commit | Presentation-neutral human terminal facts and fallible delivery |
+| 025 | `c3b7b36` | Presentation-neutral human terminal facts and fallible delivery |
+| 026 | this document's commit | Interactive multi-operation aggregate and process publication |
 
 ## Current green gates
 
-- Affected runtime suites: 221 `kitsu-tools`, 318 Kitsu binary, 202 CLI, six
+- Affected runtime suites: 221 `kitsu-tools`, 321 Kitsu binary, 203 CLI, six
   carrier-matrix, 74 renderer, and 156 `kitsu-core` tests (147 unit plus nine
   neutral run-contract tests), zero failures.
 - Workspace/all-target check passes with ordinary flags and with
@@ -91,8 +92,10 @@ separate lifecycle instances and that early inference fallback plus human paths
 bypass phase publication. Cycle 024 adds the one process owner and child-free
 fallback cut. Cycle 025 carries exact cleanup/persistence facts through human
 noninteractive paths, makes timing delivery fallible, and records unproven
-post-start cleanup as `NotObserved`. Cycles 026-027 define interactive
-aggregation and run the independent exit evaluation before provider work begins.
+post-start cleanup as `NotObserved`. Cycle 026 defines the interactive aggregate,
+preserves retry/queue/cancel/interruption and background/session facts, and
+publishes it through the process owner. Cycle 027 now runs the independent exit
+evaluation before provider work begins.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

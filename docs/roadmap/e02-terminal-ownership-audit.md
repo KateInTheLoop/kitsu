@@ -1,8 +1,8 @@
 # E02 Terminal Ownership Audit
 
 Status: Cycle 023 evidence; C6 process ownership accepted in Cycle 024 and C7
-presentation-neutral facts accepted in Cycle 025; E02 remains open for C8 and
-exit evaluation.
+presentation-neutral facts accepted in Cycle 025; C8 interactive aggregation
+accepted in Cycle 026; E02 remains open only for exit evaluation.
 
 ## Scope decision
 
@@ -30,7 +30,7 @@ management commands.
 | scripted JSONL | Typed aggregate status | Actual child statuses and active-snapshot receipt | Terminal error/summary closure | Shared process lifecycle | Accepted through C6 |
 | piped JSONL | Typed branch status | Actual rollback/exit child statuses and active-snapshot receipt | Terminal error/turn/summary closure | Shared process lifecycle | Accepted through C6 |
 | human ask/review/piped/scripted | Typed process outcome and assistant DTO in `main` | Carrier handoff supplies structural or observed cleanup and active-snapshot persistence | Fallible human timing receipt | Shared process lifecycle | Accepted through C7; text unchanged |
-| interactive chat | Process success/error and last assistant DTO in `main` | Background work is joined at loop exit; session/history outcomes are not a typed terminal fact | Human timing receipt | No lifecycle publication | Aggregate policy and phase truth are missing |
+| interactive chat | Typed multi-operation aggregate; success plus any recoverable non-success is partial | Status-preserving rollback/exit cleanup, detached terminal snapshots, and active-session persistence | Fallible human timing receipt | Shared process lifecycle | Accepted through C8; exit policy awaits C2 |
 | inference preflight/top-level fallback | `CliError` class and assistant state | Pre-start is structurally joined; missing post-start evidence is `NotObserved`; snapshot receipt is independent | JSONL summary or fallible human timing | Shared process lifecycle | `NotObserved` cannot certify clean success |
 
 ## Findings
@@ -62,7 +62,7 @@ management commands.
 |---|---|---|
 | E02-S03-C6 — process terminal owner (accepted Cycle 024) | Accept one lifecycle before inference work; every migrated finalizer uses the same owner; a second/cross-path publication is rejected; early inference fallback publishes with structurally truthful facts. | Provider-free duplicate/cross-path and preflight cuts prove exactly one publication and zero work after it. |
 | E02-S03-C7 — presentation-neutral facts (accepted Cycle 025) | Carry semantic, cleanup, persistence, and delivery inputs independently of JSONL; migrate human ask/review/piped/scripted without changing their text or JSONL v1. | Human/JSONL paired fixtures agree on terminal fields; blocked delivery never reclassifies settlement. |
-| E02-S03-C8 — interactive aggregate | Define process aggregation for successful, failed, cancelled, interrupted, retried, and queued turns; join background work and type session persistence before publication. | PTY fixtures cover clean exit, recoverable fault then exit, active/queued cancel, authority EOF, residue, and save failure. |
+| E02-S03-C8 — interactive aggregate (accepted Cycle 026) | Define process aggregation for successful, failed, cancelled, interrupted, retried, and queued turns; join background work and type session persistence before publication. | PTY fixtures cover clean exit, recoverable fault then exit, active/queued cancel, authority EOF, residue, and save failure. |
 | E02-S04-C2 — exit evaluation | Run the independent seven-carrier matrix against the process owner and close E02 only if every applicable phase/exit cell is observed. | X004 evaluation receipt, exact exits, one terminal, no silent cells; otherwise one evidence-backed residual card. |
 
 The decomposition adds no public schema, session format, plugin seam, provider

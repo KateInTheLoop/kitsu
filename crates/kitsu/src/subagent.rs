@@ -843,8 +843,8 @@ impl AgentRegistry {
         self.cancel_matching(|_| true, reason).await
     }
 
-    /// Abort detached agents created by a parent turn that is being rolled
-    /// back. Agents that predate the turn are intentionally left alone.
+    /// Compatible ID-only projection retained for focused registry tests.
+    #[cfg(test)]
     pub async fn cancel_started_after(&self, watermark: u64) -> Vec<u64> {
         self.cancel_started_after_with_status(watermark)
             .await
@@ -854,9 +854,8 @@ impl AgentRegistry {
     }
 
     /// Status-preserving rollback cancellation for terminal lifecycle owners.
-    /// The legacy ID-only projection remains above for callers that need only
-    /// disclosure, while this path retains malformed/unattached `joined: false`
-    /// truth instead of silently upgrading it to successful cleanup.
+    /// This retains malformed/unattached `joined: false` truth instead of
+    /// silently upgrading it to successful cleanup.
     pub async fn cancel_started_after_with_status(
         &self,
         watermark: u64,
