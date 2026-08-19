@@ -8918,8 +8918,11 @@ const HUMAN_MODEL_CATALOG_CAP: usize = 12;
 const MODEL_CATALOG_ROUND: u32 = 1;
 const TOP_LEVEL_MODEL_CATALOG_OPERATION_ID: &str = "models:1";
 
-fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Value {
-    serde_json::json!({
+fn model_catalog_attempt_payload(
+    route_generation: Option<kitsu_providers::ProviderRouteGeneration>,
+    event: ProviderAttemptEvent,
+) -> serde_json::Value {
+    let mut payload = serde_json::json!({
         "round": MODEL_CATALOG_ROUND,
         "purpose": "model_catalog",
         "attempt": event.attempt,
@@ -8932,12 +8935,17 @@ fn model_catalog_attempt_payload(event: ProviderAttemptEvent) -> serde_json::Val
         "retry_after_used": event.retry_after_used,
         "deadline_scope": "provider_request",
         "remaining_deadline_ms": event.remaining_deadline_ms,
-    })
+    });
+    if let Some(generation) = route_generation {
+        payload["route_generation"] = serde_json::json!(generation.get());
+    }
+    payload
 }
 
 fn top_level_model_catalog_telemetry() -> ProviderTelemetrySink {
-    ProviderTelemetrySink::with_fallible_observer(|event| {
-        let mut payload = model_catalog_attempt_payload(event);
+    ProviderTelemetrySink::with_fallible_context_observer(|observation| {
+        let mut payload =
+            model_catalog_attempt_payload(observation.route_generation, observation.event);
         payload["operation_id"] = serde_json::json!(TOP_LEVEL_MODEL_CATALOG_OPERATION_ID);
         emit_jsonl("provider_attempt", payload).is_ok()
     })
@@ -10392,6 +10400,15 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             .failure_class
             .map(|class| format!(" | failure {class}"))
             .unwrap_or_default();
+        let route = match (
+            agent.telemetry.route_generation,
+            agent.telemetry.route_generation_mismatch,
+        ) {
+            (Some(generation), false) => format!(" | route gen {generation}"),
+            (Some(generation), true) => format!(" | route gen {generation} (mismatch observed)"),
+            (None, true) => " | route generation mismatch observed".to_string(),
+            (None, false) => String::new(),
+        };
         let bytes = agent
             .result_bytes
             .map(|bytes| format!(" | result {bytes} B"))
@@ -10403,7 +10420,7 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             .map(terminal_inline)
             .unwrap_or_else(|| "default profile".to_string());
         output.push_str(&format!(
-            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
+            "\n  {} #{} {} | {} | {}\n      {:.1}s | model {}{} | tokens {}/{}/{} | tools {} | writes {} | last {}{}{}",
             kitsu_render::deck_marker(state),
             agent.id,
             agent_progress_status_label(agent.status),
@@ -10411,6 +10428,7 @@ fn format_jobs(registry: &subagent::AgentRegistry) -> String {
             terminal_inline(&agent.task),
             agent.elapsed_ms as f64 / 1000.0,
             model,
+            route,
             agent.telemetry.prompt_tokens,
             agent.telemetry.completion_tokens,
             agent.telemetry.total_tokens,
@@ -10465,6 +10483,8 @@ fn jobs_snapshot_payload(registry: &subagent::AgentRegistry) -> serde_json::Valu
                 "result_bytes": agent.result_bytes,
                 "telemetry": {
                     "model": agent.telemetry.model,
+                    "route_generation": agent.telemetry.route_generation,
+                    "route_generation_mismatch": agent.telemetry.route_generation_mismatch,
                     "prompt_tokens": agent.telemetry.prompt_tokens,
                     "completion_tokens": agent.telemetry.completion_tokens,
                     "total_tokens": agent.telemetry.total_tokens,
@@ -18565,10 +18585,14 @@ fn runtime_model_catalog_telemetry(
 ) -> Option<ProviderTelemetrySink> {
     runtime_log.map(|runtime_log| {
         let runtime_log = runtime_log.clone();
-        ProviderTelemetrySink::with_fallible_observer(move |event| {
+        ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+            let event = observation.event;
             runtime_log.record(kitsu_core::AgentRuntimeEvent::ProviderAttempt {
                 round: MODEL_CATALOG_ROUND,
                 purpose: kitsu_core::ProviderRequestPurpose::ModelCatalog,
+                route_generation: observation
+                    .route_generation
+                    .map(|generation| generation.get()),
                 attempt: event.attempt,
                 max_attempts: event.max_attempts,
                 category: event.category,
@@ -21697,6 +21721,7 @@ mod tests {
         let event = kitsu_core::AgentRuntimeEvent::ProviderAttempt {
             round: 2,
             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: None,
             attempt: 1,
             max_attempts: 3,
             category: kitsu_providers::ProviderAttemptCategory::RateLimited,
@@ -21722,6 +21747,7 @@ mod tests {
         let success = |attempt: u32| kitsu_core::AgentRuntimeEvent::ProviderAttempt {
             round: 1,
             purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: None,
             attempt,
             max_attempts: 3,
             category: kitsu_providers::ProviderAttemptCategory::Success,

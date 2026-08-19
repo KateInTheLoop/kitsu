@@ -9,6 +9,8 @@ use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
 
+use crate::route::ProviderRouteGeneration;
+
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(rename_all = "snake_case")]
 pub enum ProviderAttemptCategory {
@@ -76,6 +78,18 @@ pub struct ProviderAttemptEvent {
     pub remaining_deadline_ms: u64,
 }
 
+/// One transport attempt together with Kitsu-owned route attribution.
+///
+/// Concrete adapters construct only the transport event. The immutable route
+/// handle decorates the sink after admission, keeping route identity outside
+/// adapter-authored event data; raw/legacy providers remain explicitly
+/// unattributed.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderAttemptObservation {
+    pub route_generation: Option<ProviderRouteGeneration>,
+    pub event: ProviderAttemptEvent,
+}
+
 /// Cloneable callback used to connect an adapter to a runtime event log.
 ///
 /// A fallible observer can return `false` to revoke the request before another
@@ -83,36 +97,69 @@ pub struct ProviderAttemptEvent {
 /// its event sink has failed: recording the disposition that discovered the
 /// failure is allowed, but no later network attempt is admitted.
 #[derive(Clone)]
-pub struct ProviderTelemetrySink(Arc<dyn Fn(ProviderAttemptEvent) -> bool + Send + Sync + 'static>);
+pub struct ProviderTelemetrySink {
+    observer: Arc<dyn Fn(ProviderAttemptObservation) -> bool + Send + Sync + 'static>,
+    route_generation: Option<ProviderRouteGeneration>,
+}
 
 impl ProviderTelemetrySink {
     pub fn new<F>(observer: F) -> Self
     where
         F: Fn(ProviderAttemptEvent) + Send + Sync + 'static,
     {
-        Self(Arc::new(move |event| {
-            observer(event);
-            true
-        }))
+        Self {
+            observer: Arc::new(move |observation| {
+                observer(observation.event);
+                true
+            }),
+            route_generation: None,
+        }
     }
 
     pub fn with_fallible_observer<F>(observer: F) -> Self
     where
         F: Fn(ProviderAttemptEvent) -> bool + Send + Sync + 'static,
     {
-        Self(Arc::new(observer))
+        Self {
+            observer: Arc::new(move |observation| observer(observation.event)),
+            route_generation: None,
+        }
+    }
+
+    /// Observe the route attribution installed by an immutable handle as well
+    /// as the adapter-authored transport disposition.
+    pub fn with_fallible_context_observer<F>(observer: F) -> Self
+    where
+        F: Fn(ProviderAttemptObservation) -> bool + Send + Sync + 'static,
+    {
+        Self {
+            observer: Arc::new(observer),
+            route_generation: None,
+        }
+    }
+
+    /// Bind authoritative route attribution after request admission. This is
+    /// crate-private because it belongs to Kitsu's compiled route boundary,
+    /// never to third-party provider implementations.
+    pub(crate) fn with_route_generation(mut self, generation: ProviderRouteGeneration) -> Self {
+        self.route_generation = Some(generation);
+        self
     }
 
     /// Record one disposition. `false` means the observer can no longer make
     /// subsequent physical attempts observable, so retrying must stop.
     pub fn record(&self, event: ProviderAttemptEvent) -> bool {
-        (self.0)(event)
+        (self.observer)(ProviderAttemptObservation {
+            route_generation: self.route_generation,
+            event,
+        })
     }
 }
 
 impl fmt::Debug for ProviderTelemetrySink {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.debug_struct("ProviderTelemetrySink")
+            .field("route_generation", &self.route_generation)
             .finish_non_exhaustive()
     }
 }
@@ -157,5 +204,30 @@ mod tests {
             retry_after_used: false,
             remaining_deadline_ms: 0,
         }));
+    }
+
+    #[test]
+    fn raw_sink_context_is_explicitly_unattributed() {
+        let observed = Arc::new(Mutex::new(None));
+        let captured = Arc::clone(&observed);
+        let sink = ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+            *captured.lock().unwrap() = Some(observation);
+            true
+        });
+        assert!(sink.record(ProviderAttemptEvent {
+            attempt: 1,
+            max_attempts: 1,
+            category: ProviderAttemptCategory::Success,
+            status: Some(200),
+            outcome: ProviderAttemptOutcome::BodyCompleted,
+            terminal: true,
+            retry_delay_ms: None,
+            retry_after_used: false,
+            remaining_deadline_ms: 0,
+        }));
+        assert_eq!(
+            observed.lock().unwrap().as_ref().unwrap().route_generation,
+            None
+        );
     }
 }

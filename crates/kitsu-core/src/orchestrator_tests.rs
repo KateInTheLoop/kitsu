@@ -3527,9 +3527,36 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         enforce_context_budget, AgentEventLog, AgentRuntimeEvent, CompactionMode,
         ProviderRequestPurpose,
     };
-    use kitsu_providers::{ChatMessage, Usage};
+    use kitsu_providers::{
+        ChatMessage, ProviderAuthSource, ProviderCatalogPolicy, ProviderProfileId,
+        ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRoutePolicy, ProviderRouteSnapshot,
+        Usage,
+    };
 
-    let provider = SummaryTelemetryProvider;
+    let runtime = Arc::new(SummaryTelemetryProvider);
+    let declaration = ProviderRouteDeclaration::compatible_chat_v1(
+        ProviderProfileId::derive_v1(b"core-compaction-test", b"primary").unwrap(),
+        false,
+    );
+    let policy = ProviderRoutePolicy::new(
+        0,
+        0,
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(30),
+        std::time::Duration::from_secs(2),
+        ProviderCatalogPolicy::Unavailable,
+    )
+    .unwrap();
+    let snapshot = ProviderRouteSnapshot::initial(
+        declaration,
+        "example-model-v1",
+        ProviderAuthSource::None,
+        policy,
+        runtime.clone(),
+        runtime,
+    )
+    .unwrap();
+    let provider = ProviderRouteCurrent::new(snapshot).bind().unwrap();
     let mut cfg = cfg(10);
     cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
@@ -3583,6 +3610,7 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         event,
         AgentRuntimeEvent::ProviderAttempt {
             purpose: ProviderRequestPurpose::Compaction,
+            route_generation: Some(1),
             terminal: true,
             ..
         }

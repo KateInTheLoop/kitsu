@@ -161,6 +161,11 @@ struct AgentRecord {
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub struct AgentTelemetry {
     pub model: String,
+    /// First immutable provider route generation observed for this child run.
+    pub route_generation: Option<u64>,
+    /// True if attempt evidence ever claimed a second generation. A correctly
+    /// bound child keeps this false; retaining the bit avoids hiding drift.
+    pub route_generation_mismatch: bool,
     pub prompt_tokens: u64,
     pub completion_tokens: u64,
     pub total_tokens: u64,
@@ -240,6 +245,17 @@ impl AgentTelemetry {
             self.recent_activity.remove(0);
         }
         self.recent_activity.push(activity);
+    }
+
+    fn observe_route_generation(&mut self, generation: Option<u64>) {
+        let Some(generation) = generation else {
+            return;
+        };
+        match self.route_generation {
+            None => self.route_generation = Some(generation),
+            Some(existing) if existing != generation => self.route_generation_mismatch = true,
+            Some(_) => {}
+        }
     }
 }
 
@@ -1409,16 +1425,23 @@ fn record_telemetry_event(telemetry: &mut AgentTelemetry, event: AgentRuntimeEve
             if targets.len() == 1 { "" } else { "s" }
         )),
         AgentRuntimeEvent::ProviderAttempt {
+            route_generation,
             attempt,
             max_attempts,
             category,
             outcome,
             ..
-        } => telemetry.record_activity(format!(
-            "provider attempt {attempt}/{max_attempts}: {}, {}",
-            provider_category_label(category),
-            provider_outcome_label(outcome)
-        )),
+        } => {
+            telemetry.observe_route_generation(route_generation);
+            let route = route_generation
+                .map(|generation| format!(" on route generation {generation}"))
+                .unwrap_or_default();
+            telemetry.record_activity(format!(
+                "provider attempt {attempt}/{max_attempts}{route}: {}, {}",
+                provider_category_label(category),
+                provider_outcome_label(outcome)
+            ));
+        }
         AgentRuntimeEvent::Usage {
             prompt_tokens,
             completion_tokens,
@@ -2099,6 +2122,27 @@ mod tests {
                 script.into_iter().map(Ok::<_, ProviderError>),
             )))
         }
+        async fn chat_stream_with_telemetry(
+            &self,
+            req: ChatRequest,
+            telemetry: Option<kitsu_providers::ProviderTelemetrySink>,
+        ) -> Result<ChatStream, ProviderError> {
+            let stream = self.chat_stream(req).await?;
+            if let Some(telemetry) = telemetry {
+                let _ = telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                    attempt: 1,
+                    max_attempts: 1,
+                    category: kitsu_providers::ProviderAttemptCategory::Success,
+                    status: Some(200),
+                    outcome: kitsu_providers::ProviderAttemptOutcome::BodyCompleted,
+                    terminal: true,
+                    retry_delay_ms: None,
+                    retry_after_used: false,
+                    remaining_deadline_ms: 1_000,
+                });
+            }
+            Ok(stream)
+        }
         async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
             Ok(None)
         }
@@ -2198,6 +2242,71 @@ mod tests {
             ["model-B"],
             "one immutable provider binding is resolved per subagent run"
         );
+    }
+
+    #[tokio::test]
+    async fn subagent_report_retains_one_immutable_route_generation() {
+        use kitsu_providers::{
+            ProviderAuthSource, ProviderCatalogPolicy, ProviderProfileId, ProviderRouteCurrent,
+            ProviderRouteDeclaration, ProviderRoutePolicy, ProviderRouteSnapshot,
+        };
+        use std::time::Duration;
+
+        let runtime = Arc::new(MockProvider {
+            rounds: Mutex::new(vec![vec![
+                ChatDelta::Text("route observed".to_string()),
+                ChatDelta::Done(FinishReason::Stop),
+            ]]),
+            last_model: Mutex::new(None),
+        });
+        let declaration = ProviderRouteDeclaration::compatible_chat_v1(
+            ProviderProfileId::derive_v1(b"subagent-route-test", b"primary").unwrap(),
+            false,
+        );
+        let policy = ProviderRoutePolicy::new(
+            0,
+            0,
+            Duration::from_secs(30),
+            Duration::from_secs(30),
+            Duration::from_secs(2),
+            ProviderCatalogPolicy::Unavailable,
+        )
+        .unwrap();
+        let snapshot = ProviderRouteSnapshot::initial(
+            declaration,
+            "model-A",
+            ProviderAuthSource::None,
+            policy,
+            runtime.clone(),
+            runtime,
+        )
+        .unwrap();
+        let provider = Arc::new(
+            ProviderRouteCurrent::new(snapshot)
+                .bind_model("model-B")
+                .unwrap(),
+        );
+        let report = run_subagent_report(
+            &provider,
+            &Arc::new(Registry::new()),
+            &AgentConfig {
+                model: "model-B".to_string(),
+                stream: false,
+                ..Default::default()
+            },
+            "",
+            "inspect route".to_string(),
+        )
+        .await;
+
+        assert_eq!(report.result.unwrap(), "route observed");
+        assert_eq!(report.telemetry.route_generation, Some(1));
+        assert!(!report.telemetry.route_generation_mismatch);
+        assert!(report
+            .telemetry
+            .recent_activity
+            .iter()
+            .any(|activity| { activity.contains("route generation 1") }));
     }
 
     #[tokio::test]
@@ -2441,6 +2550,37 @@ mod tests {
             telemetry.last_activity.as_deref(),
             Some("turn completed; 1 tool error")
         );
+    }
+
+    #[test]
+    fn event_summary_preserves_first_route_generation_and_exposes_drift() {
+        let attempt = |route_generation| AgentRuntimeEvent::ProviderAttempt {
+            round: 1,
+            purpose: kitsu_core::ProviderRequestPurpose::Inference,
+            route_generation: Some(route_generation),
+            attempt: 1,
+            max_attempts: 1,
+            category: ProviderAttemptCategory::Success,
+            status: Some(200),
+            outcome: ProviderAttemptOutcome::BodyCompleted,
+            terminal: true,
+            retry_delay_ms: None,
+            retry_after_used: false,
+            deadline_scope: kitsu_core::ProviderDeadlineScope::ProviderRequest,
+            remaining_deadline_ms: 1_000,
+            turn_remaining_ms: None,
+        };
+        let telemetry = summarize_events(
+            "safe-model".to_string(),
+            vec![attempt(4), attempt(4), attempt(5)],
+            None,
+        );
+
+        assert_eq!(telemetry.route_generation, Some(4));
+        assert!(telemetry.route_generation_mismatch);
+        let activity = telemetry.recent_activity.join("\n");
+        assert!(activity.contains("route generation 4"));
+        assert!(activity.contains("route generation 5"));
     }
 
     #[test]

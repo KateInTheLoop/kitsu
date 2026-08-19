@@ -8531,6 +8531,24 @@ async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
         "catalog lookup is not routed to a model: {catalog_request}"
     );
 
+    let attempt_routes = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt")
+        .map(|event| {
+            (
+                event["purpose"].as_str().unwrap().to_string(),
+                event["route_generation"].as_u64(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempt_routes,
+        [
+            ("inference".to_string(), Some(1)),
+            ("inference".to_string(), Some(2)),
+        ]
+    );
+
     let requests = server.received_requests().await.unwrap();
     let wire_models = requests
         .iter()
@@ -8542,6 +8560,116 @@ async fn test_jsonl_provider_requests_identify_model_after_in_session_switch() {
         })
         .collect::<Vec<_>>();
     assert_eq!(wire_models, inference_models);
+    server.verify().await;
+}
+
+/// `/retry` is a new logical operation, not a hidden replay through the failed
+/// request's old route. After `/model` publishes a successor, the retained
+/// prompt must be sent once through that successor and its attempt receipt must
+/// identify the new generation.
+#[tokio::test]
+#[serial]
+async fn test_retry_after_model_switch_uses_the_successor_generation() {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let responder_attempts = attempts.clone();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(move |_request: &wiremock::Request| {
+            if responder_attempts.fetch_add(1, Ordering::AcqRel) == 0 {
+                ResponseTemplate::new(400).set_body_json(serde_json::json!({
+                    "error": {"message": "deliberate first-operation failure"}
+                }))
+            } else {
+                ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "retry used successor"},
+                        "finish_reason": "stop"
+                    }]
+                }))
+            }
+        })
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("retry-route-successor.script");
+    fs::write(
+        &script,
+        "original replay prompt\n/model retry-model\n/retry\n/quit\n",
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    let script_path = script.to_string_lossy().into_owned();
+
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--gateway",
+                "example",
+                "--jsonl",
+                "--no-stream",
+                "--context-window",
+                "8192",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--allow-turn-errors",
+                "--script",
+                &script_path,
+            ])
+            .output()
+            .expect("run retry route-generation script")
+    })
+    .await
+    .expect("retry route-generation command joins");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let attempt_routes = events
+        .iter()
+        .filter(|event| event["type"] == "provider_attempt" && event["purpose"] == "inference")
+        .map(|event| {
+            (
+                event["route_generation"].as_u64(),
+                event["outcome"].as_str().unwrap().to_string(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        attempt_routes,
+        [
+            (Some(1), "rejected".to_string()),
+            (Some(2), "body_completed".to_string()),
+        ]
+    );
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 2);
+    let bodies = requests
+        .iter()
+        .map(|request| serde_json::from_slice::<serde_json::Value>(&request.body).unwrap())
+        .collect::<Vec<_>>();
+    assert_eq!(bodies[0]["model"], "example-model-v1");
+    assert_eq!(bodies[1]["model"], "retry-model");
+    for body in &bodies {
+        assert!(body["messages"].as_array().unwrap().iter().any(|message| {
+            message["role"] == "user" && message["content"] == "original replay prompt"
+        }));
+    }
     server.verify().await;
 }
 
@@ -13132,6 +13260,7 @@ auth = {{ method = "none" }}
     assert_eq!(events[2]["purpose"], "model_catalog");
     assert_eq!(events[2]["message_count"], 0);
     assert_eq!(events[2]["tools_offered"], 0);
+    assert_eq!(events[3]["route_generation"], 1);
     assert_eq!(events[3]["line"], 1);
     assert_eq!(events[3]["command"], "/models");
     assert_eq!(events[3]["purpose"], "model_catalog");

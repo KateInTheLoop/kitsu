@@ -17,7 +17,8 @@ pub use route::{
     PROVIDER_ROUTE_CONTRACT_REVISION,
 };
 pub use telemetry::{
-    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptObservation,
+    ProviderAttemptOutcome, ProviderTelemetrySink,
 };
 pub use types::{
     ChatDelta, ChatMessage, ChatRequest, FinishReason, JsonSchemaFormat, ReasoningEffort, Role,

@@ -415,6 +415,10 @@ pub enum AgentRuntimeEvent {
     ProviderAttempt {
         round: u32,
         purpose: ProviderRequestPurpose,
+        /// Immutable route generation attributed by Kitsu's admission handle.
+        /// Legacy/raw providers leave it absent rather than inventing identity.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        route_generation: Option<u64>,
         attempt: u32,
         max_attempts: u32,
         category: ProviderAttemptCategory,
@@ -618,10 +622,14 @@ fn provider_telemetry_sink(
 ) -> Option<ProviderTelemetrySink> {
     log.map(|log| {
         let log = log.clone();
-        ProviderTelemetrySink::with_fallible_observer(move |event| {
+        ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+            let event = observation.event;
             log.record(AgentRuntimeEvent::ProviderAttempt {
                 round,
                 purpose,
+                route_generation: observation
+                    .route_generation
+                    .map(|generation| generation.get()),
                 attempt: event.attempt,
                 max_attempts: event.max_attempts,
                 category: event.category,

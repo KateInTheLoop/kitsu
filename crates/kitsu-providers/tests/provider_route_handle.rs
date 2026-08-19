@@ -1,14 +1,15 @@
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::stream::{self, StreamExt};
 use kitsu_providers::{
     ChatDelta, ChatRequest, ChatStream, JsonSchemaFormat, Provider, ProviderAdapterId,
-    ProviderAuthSource, ProviderCapabilities, ProviderCapability, ProviderCatalogPolicy,
-    ProviderError, ProviderProfileId, ProviderRouteContractError, ProviderRouteCurrent,
-    ProviderRouteDeclaration, ProviderRoutePolicy, ProviderRouteSnapshot, ProviderWireRevision,
-    ToolDescriptor,
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptObservation,
+    ProviderAttemptOutcome, ProviderAuthSource, ProviderCapabilities, ProviderCapability,
+    ProviderCatalogPolicy, ProviderError, ProviderProfileId, ProviderRouteContractError,
+    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRoutePolicy, ProviderRouteSnapshot,
+    ProviderTelemetrySink, ProviderWireRevision, ToolDescriptor,
 };
 
 #[derive(Default)]
@@ -22,6 +23,39 @@ struct BlockingProvider {
     chat_sends: AtomicUsize,
     started: tokio::sync::Notify,
     release: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct RetryingProvider {
+    chat_sends: AtomicUsize,
+    catalog_sends: AtomicUsize,
+    chat_started: tokio::sync::Notify,
+    catalog_started: tokio::sync::Notify,
+    release_chat: tokio::sync::Notify,
+    release_catalog: tokio::sync::Notify,
+}
+
+#[derive(Default)]
+struct CancellableProvider {
+    chat_sends: AtomicUsize,
+    started: tokio::sync::Notify,
+}
+
+struct CancellationAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+}
+
+impl Drop for CancellationAttemptGuard {
+    fn drop(&mut self) {
+        if let Some(telemetry) = self.telemetry.take() {
+            let _ = telemetry.record(attempt_event(
+                1,
+                ProviderAttemptCategory::Cancelled,
+                ProviderAttemptOutcome::Cancelled,
+                true,
+            ));
+        }
+    }
 }
 
 impl Provider for BlockingProvider {
@@ -38,6 +72,122 @@ impl Provider for BlockingProvider {
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
         Ok(Some(Vec::new()))
+    }
+}
+
+impl Provider for RetryingProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        self.chat_sends.fetch_add(1, Ordering::AcqRel);
+        Ok(stream::empty::<Result<ChatDelta, ProviderError>>().boxed())
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        _req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        self.chat_sends.fetch_add(1, Ordering::AcqRel);
+        if let Some(sink) = &telemetry {
+            assert!(sink.record(attempt_event(
+                1,
+                ProviderAttemptCategory::Unavailable,
+                ProviderAttemptOutcome::RetryScheduled,
+                false,
+            )));
+        }
+        self.chat_started.notify_one();
+        self.release_chat.notified().await;
+        self.chat_sends.fetch_add(1, Ordering::AcqRel);
+        if let Some(sink) = &telemetry {
+            assert!(sink.record(attempt_event(
+                2,
+                ProviderAttemptCategory::Success,
+                ProviderAttemptOutcome::BodyCompleted,
+                true,
+            )));
+        }
+        Ok(stream::empty::<Result<ChatDelta, ProviderError>>().boxed())
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        self.catalog_sends.fetch_add(1, Ordering::AcqRel);
+        Ok(Some(vec!["model-a".to_string()]))
+    }
+
+    async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
+        self.catalog_sends.fetch_add(1, Ordering::AcqRel);
+        if let Some(sink) = &telemetry {
+            assert!(sink.record(attempt_event(
+                1,
+                ProviderAttemptCategory::Unavailable,
+                ProviderAttemptOutcome::RetryScheduled,
+                false,
+            )));
+        }
+        self.catalog_started.notify_one();
+        self.release_catalog.notified().await;
+        self.catalog_sends.fetch_add(1, Ordering::AcqRel);
+        if let Some(sink) = &telemetry {
+            assert!(sink.record(attempt_event(
+                2,
+                ProviderAttemptCategory::Success,
+                ProviderAttemptOutcome::BodyCompleted,
+                true,
+            )));
+        }
+        Ok(Some(vec!["model-a".to_string()]))
+    }
+}
+
+impl Provider for CancellableProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        unreachable!("the fixture requires telemetry")
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        _req: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        self.chat_sends.fetch_add(1, Ordering::AcqRel);
+        let _guard = CancellationAttemptGuard { telemetry };
+        self.started.notify_one();
+        std::future::pending::<()>().await;
+        unreachable!("the fixture request must be cancelled")
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
+fn attempt_event(
+    attempt: u32,
+    category: ProviderAttemptCategory,
+    outcome: ProviderAttemptOutcome,
+    terminal: bool,
+) -> ProviderAttemptEvent {
+    ProviderAttemptEvent {
+        attempt,
+        max_attempts: 2,
+        category,
+        status: None,
+        outcome,
+        terminal,
+        retry_delay_ms: (!terminal).then_some(1),
+        retry_after_used: false,
+        remaining_deadline_ms: 1_000,
     }
 }
 
@@ -457,5 +607,169 @@ async fn request_admitted_before_replacement_drains_on_its_bound_runtime() {
             ProviderRouteContractError::StaleGeneration { .. }
         ))
     ));
+    assert_eq!(first_runtime.chat_sends.load(Ordering::Acquire), 1);
+}
+
+#[tokio::test]
+async fn admitted_retry_and_catalog_attempts_keep_one_generation_across_replacement() {
+    let first_runtime = Arc::new(RetryingProvider::default());
+    let first = ProviderRouteSnapshot::initial(
+        declaration(true),
+        "model-a",
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Configured),
+        first_runtime.clone(),
+        first_runtime.clone(),
+    )
+    .unwrap();
+    let first_identity = first.identity().clone();
+    let current = ProviderRouteCurrent::new(first);
+    let old = current.bind().unwrap();
+    let chat_events = Arc::new(Mutex::new(Vec::new()));
+    let catalog_events = Arc::new(Mutex::new(Vec::new()));
+
+    let chat = {
+        let handle = old.clone();
+        let events = Arc::clone(&chat_events);
+        tokio::spawn(async move {
+            let sink = ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+                events.lock().unwrap().push(observation);
+                true
+            });
+            drop(
+                handle
+                    .chat_stream_with_telemetry(request(), Some(sink))
+                    .await
+                    .unwrap(),
+            );
+        })
+    };
+    let catalog = {
+        let handle = old.clone();
+        let events = Arc::clone(&catalog_events);
+        tokio::spawn(async move {
+            let sink = ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+                events.lock().unwrap().push(observation);
+                true
+            });
+            assert_eq!(
+                handle.list_models_with_telemetry(Some(sink)).await.unwrap(),
+                Some(vec!["model-a".to_string()])
+            );
+        })
+    };
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        first_runtime.chat_started.notified(),
+    )
+    .await
+    .expect("the first chat attempt starts");
+    tokio::time::timeout(
+        Duration::from_secs(1),
+        first_runtime.catalog_started.notified(),
+    )
+    .await
+    .expect("the first catalog attempt starts");
+
+    let second_runtime = Arc::new(RetryingProvider::default());
+    let second = ProviderRouteSnapshot::successor(
+        &first_identity,
+        declaration(true),
+        "model-b",
+        ProviderAuthSource::Environment,
+        policy(ProviderCatalogPolicy::Configured),
+        second_runtime.clone(),
+        second_runtime.clone(),
+    )
+    .unwrap();
+    current
+        .replace(first_identity.generation(), second)
+        .unwrap();
+    first_runtime.release_chat.notify_one();
+    first_runtime.release_catalog.notify_one();
+    tokio::time::timeout(Duration::from_secs(1), chat)
+        .await
+        .expect("old chat retry drains")
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(1), catalog)
+        .await
+        .expect("old catalog retry drains")
+        .unwrap();
+
+    for events in [&chat_events, &catalog_events] {
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        assert_eq!(events[0].event.attempt, 1);
+        assert_eq!(events[1].event.attempt, 2);
+        assert!(events
+            .iter()
+            .all(|observation: &ProviderAttemptObservation| {
+                observation.route_generation == Some(first_identity.generation())
+            }));
+    }
+    assert_eq!(first_runtime.chat_sends.load(Ordering::Acquire), 2);
+    assert_eq!(first_runtime.catalog_sends.load(Ordering::Acquire), 2);
+    assert_eq!(second_runtime.chat_sends.load(Ordering::Acquire), 0);
+    assert_eq!(second_runtime.catalog_sends.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn cancelled_admitted_attempt_keeps_its_generation_after_replacement() {
+    let first_runtime = Arc::new(CancellableProvider::default());
+    let first = ProviderRouteSnapshot::initial(
+        declaration(false),
+        "model-a",
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Unavailable),
+        first_runtime.clone(),
+        first_runtime.clone(),
+    )
+    .unwrap();
+    let first_identity = first.identity().clone();
+    let current = ProviderRouteCurrent::new(first);
+    let handle = current.bind().unwrap();
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let request_task = {
+        let events = Arc::clone(&events);
+        tokio::spawn(async move {
+            let sink = ProviderTelemetrySink::with_fallible_context_observer(move |observation| {
+                events.lock().unwrap().push(observation);
+                true
+            });
+            let _ = handle
+                .chat_stream_with_telemetry(request(), Some(sink))
+                .await;
+        })
+    };
+    tokio::time::timeout(Duration::from_secs(1), first_runtime.started.notified())
+        .await
+        .expect("the cancellable request starts");
+
+    let second_runtime = Arc::new(CancellableProvider::default());
+    let second = ProviderRouteSnapshot::successor(
+        &first_identity,
+        declaration(false),
+        "model-b",
+        ProviderAuthSource::ManagedCredential,
+        policy(ProviderCatalogPolicy::Unavailable),
+        second_runtime.clone(),
+        second_runtime,
+    )
+    .unwrap();
+    current
+        .replace(first_identity.generation(), second)
+        .unwrap();
+    request_task.abort();
+    assert!(request_task.await.unwrap_err().is_cancelled());
+
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].event.category, ProviderAttemptCategory::Cancelled);
+    assert_eq!(events[0].event.outcome, ProviderAttemptOutcome::Cancelled);
+    assert!(events[0].event.terminal);
+    assert_eq!(
+        events[0].route_generation,
+        Some(first_identity.generation())
+    );
     assert_eq!(first_runtime.chat_sends.load(Ordering::Acquire), 1);
 }

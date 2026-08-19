@@ -961,6 +961,8 @@ where
         if req.model != self.model {
             return Err(ProviderRouteContractError::RequestModelMismatch.into());
         }
+        let telemetry =
+            telemetry.map(|sink| sink.with_route_generation(self.bound.identity().generation()));
         runtime.chat_stream_with_telemetry(req, telemetry).await
     }
 
@@ -978,6 +980,8 @@ where
         let Some(runtime) = self.admit_optional_catalog_runtime()? else {
             return Ok(None);
         };
+        let telemetry =
+            telemetry.map(|sink| sink.with_route_generation(self.bound.identity().generation()));
         runtime.list_models_with_telemetry(telemetry).await
     }
 }
