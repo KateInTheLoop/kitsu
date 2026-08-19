@@ -36,7 +36,8 @@ use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
-    ProviderError, ProviderTelemetrySink,
+    ProviderError, ProviderProfileId, ProviderRouteContractError, ProviderRouteDeclaration,
+    ProviderTelemetrySink,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -4253,6 +4254,10 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
 struct ChatSetup {
     /// `Arc` so the main loop and spawned subagents can share one connection.
     provider: Arc<OpenAICompatProvider>,
+    /// Truthful declaration retained for the next E04 generation/admission
+    /// card. It is intentionally not exposed as a receipt until physical sends
+    /// are actually bound to a published generation.
+    _provider_route_declaration: ProviderRouteDeclaration,
     /// User-requested model catalog operations get the full CLI timeout and a
     /// cache isolated from the two-second advisory startup probe. Otherwise a
     /// startup timeout's shared negative cache could make an immediate
@@ -8202,6 +8207,54 @@ fn stable_profile_key(config_path: &std::path::Path) -> String {
     format!("v1-fnv128-{digest:032x}")
 }
 
+/// Encode the canonical config location without lossy path conversion. This is
+/// an identity input only: the bytes are hashed before they enter the route
+/// declaration and are never exposed in provider receipts.
+fn provider_profile_namespace(config_path: &std::path::Path) -> Vec<u8> {
+    let config_path =
+        std::fs::canonicalize(config_path).unwrap_or_else(|_| config_path.to_path_buf());
+    #[cfg(unix)]
+    {
+        use std::os::unix::ffi::OsStrExt;
+        config_path.as_os_str().as_bytes().to_vec()
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::ffi::OsStrExt;
+        config_path
+            .as_os_str()
+            .encode_wide()
+            .flat_map(u16::to_le_bytes)
+            .collect()
+    }
+    #[cfg(not(any(unix, windows)))]
+    {
+        config_path.to_string_lossy().as_bytes().to_vec()
+    }
+}
+
+/// Declare the route today's composition actually constructs. Flavor remains
+/// a compatibility/display label until a distinct adapter passes E04-S04, so
+/// none of the accepted labels can claim native Messages behavior here.
+fn current_provider_route_declaration(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+) -> Result<ProviderRouteDeclaration, ProviderRouteContractError> {
+    let profile = ProviderProfileId::derive_v1(
+        provider_profile_namespace(config_path),
+        gateway_name.as_bytes(),
+    )?;
+    let has_model_catalog = gateway
+        .models_path
+        .as_deref()
+        .is_some_and(|path| !path.is_empty());
+    Ok(ProviderRouteDeclaration::compatible_chat_v1(
+        profile,
+        has_model_catalog,
+    ))
+}
+
 /// Location used by builds before profile keys became a stable on-disk
 /// contract. Kept only so this release can migrate existing development data.
 fn legacy_profile_dir(base: &std::path::Path, config_path: &std::path::Path) -> std::path::PathBuf {
@@ -8523,6 +8576,12 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
     gateway
         .validate_flavor()
         .map_err(|e| CliError::user(e.to_string()))?;
+    let provider_route_declaration =
+        current_provider_route_declaration(&path, &gateway_name, gateway).map_err(|error| {
+            CliError::user(format!(
+                "config error: cannot derive provider profile identity: {error}"
+            ))
+        })?;
     let model = gateway
         .resolve_model(cli.model.as_deref())
         .map_err(|e| CliError::user(e.to_string()))?;
@@ -8672,6 +8731,7 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
 
     Ok(ChatSetup {
         provider,
+        _provider_route_declaration: provider_route_declaration,
         catalog_provider,
         gateway_name,
         provider_diagnostics,
@@ -21519,6 +21579,102 @@ mod tests {
             stable_profile_key(std::path::Path::new("/workspace/kitsu/kitsu.toml")),
             "v1-fnv128-9f1392a8a96c8bcf6b4866d572b912eb"
         );
+    }
+
+    #[test]
+    fn current_flavor_labels_declare_the_compatible_chat_route_actually_constructed() {
+        let gateway = |flavor: &str, models_path: Option<&str>| Gateway {
+            flavor: flavor.to_string(),
+            base_url: "https://user:secret@example.invalid/?token=hidden".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: models_path.map(str::to_string),
+            model: Some("display-model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+        let config_path = std::path::Path::new("/workspace/kitsu/config.toml");
+        let reference = current_provider_route_declaration(
+            config_path,
+            "primary",
+            &gateway("openai", Some("/v1/models")),
+        )
+        .unwrap();
+
+        for flavor in ["openai", "anthropic", "ollama"] {
+            let declaration = current_provider_route_declaration(
+                config_path,
+                "primary",
+                &gateway(flavor, Some("/v1/models")),
+            )
+            .unwrap();
+            assert_eq!(
+                declaration.adapter(),
+                kitsu_providers::ProviderAdapterId::OpenAiCompatible,
+                "the {flavor} display label must not claim a native adapter"
+            );
+            assert_eq!(
+                declaration.wire_revision(),
+                kitsu_providers::ProviderWireRevision::OpenAiChatCompletionsV1
+            );
+            assert_eq!(declaration.profile(), reference.profile());
+            assert!(declaration
+                .capabilities()
+                .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+            assert!(!declaration
+                .capabilities()
+                .supports(kitsu_providers::ProviderCapability::ImageInput));
+        }
+
+        let without_catalog =
+            current_provider_route_declaration(config_path, "primary", &gateway("anthropic", None))
+                .unwrap();
+        assert!(!without_catalog
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+        assert!(!without_catalog.profile().as_str().contains("primary"));
+        assert!(!without_catalog.profile().as_str().contains("secret"));
+        assert!(!without_catalog.profile().as_str().contains("display-model"));
+
+        let mut changed_route_contents = gateway("ollama", None);
+        changed_route_contents.base_url = "http://different.invalid/private".to_string();
+        changed_route_contents.chat_path = "/different/chat".to_string();
+        changed_route_contents.model = Some("different-model".to_string());
+        changed_route_contents.auth.token = Some("different-secret".to_string());
+        let changed =
+            current_provider_route_declaration(config_path, "primary", &changed_route_contents)
+                .unwrap();
+        assert_eq!(changed.profile(), reference.profile());
+        assert_ne!(
+            current_provider_route_declaration(config_path, "secondary", &changed_route_contents,)
+                .unwrap()
+                .profile(),
+            reference.profile()
+        );
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn provider_profile_identity_uses_the_canonical_config_namespace() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let config_path = temp.path().join("kitsu.toml");
+        let alias_path = temp.path().join("alias.toml");
+        std::fs::write(&config_path, "[gateways]\n").unwrap();
+        symlink(&config_path, &alias_path).unwrap();
+        let gateway = Gateway {
+            flavor: "openai".to_string(),
+            base_url: "https://example.invalid".to_string(),
+            chat_path: "/v1/chat/completions".to_string(),
+            models_path: None,
+            model: Some("model".to_string()),
+            context_window: None,
+            auth: config::AuthConfig::default(),
+        };
+
+        let direct = current_provider_route_declaration(&config_path, "primary", &gateway).unwrap();
+        let aliased = current_provider_route_declaration(&alias_path, "primary", &gateway).unwrap();
+        assert_eq!(direct.profile(), aliased.profile());
     }
 
     #[test]

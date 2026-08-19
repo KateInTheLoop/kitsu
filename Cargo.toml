@@ -39,6 +39,7 @@ regex = "1"
 owo-colors = "4"
 unicode-width = "0.1"
 zeroize = "1"
+ring = "0.17"
 
 # Interactive REPL input (history, arrow keys, Ctrl+A/E/W, bracketed paste)
 rustyline = "14"

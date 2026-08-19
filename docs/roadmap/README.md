@@ -282,14 +282,15 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: E04-S01 accepted through Cycle 031. E04-S02 is in progress through
-Cycle 032: Kitsu now owns a versioned, secret-free adapter/profile/generation,
-wire-revision, and capability value contract plus pure stale/unsupported
-pre-send admission. These values are not yet composed into the live route.
+Status: E04-S01 accepted through Cycle 031 and E04-S02 accepted through Cycle
+033. Kitsu now owns versioned secret-free route values, bounded opaque profile
+derivation, explicit compatible-Chat capabilities, and pure stale/unsupported
+pre-send admission. Live composition retains the truthful compatible-Chat
+declaration for every currently accepted flavor label without changing sends.
 Primary-reviewed compatible-Chat and structurally distinct Anthropic Messages
-fixtures run fully offline. Native Messages decoding, profile derivation,
-route publication, immutable generation binding across every send, receipts,
-and the distinct adapter remain open; X001 therefore still fails.
+fixtures run fully offline. Route generation publication/binding, native
+Messages decoding, receipts, and the distinct adapter remain open; X001
+therefore still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
@@ -475,13 +476,15 @@ gates merely because a card appears attractive.
 | 031 | E04-S01-C3 | Close provider-free timeout, cancellation, aggregate-bound, and unsupported-capability fixture cuts |
 | 032 | E04-S02-C1 | Add private versioned adapter/profile/generation, wire-revision, and capability value contracts with serialization vectors |
 | 033 | E04-S02-C2 | Derive opaque profile IDs and truthful current-route declarations without changing physical send behavior |
+| 034 | E04-S03-C1 | Define one immutable route snapshot that owns declaration, endpoint/model/auth-source, retry/catalog policy, and initial generation |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
 generation publication and adapter wiring. Cycle 033 makes current composition
 declare the adapter and wire it actually constructs, derives collision-resistant
 profile identity without storing display labels, and still leaves physical send
-admission for the next bounded card. The queue then
+admission for E04-S03. Cycle 034 starts the immutable snapshot that later sends
+must retain across awaits, retries, replay, compaction, and auxiliary calls. The queue then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. E08-S05's high-value `/status`, `/context window`, and `/usage session`
 slice is 4-7 cycles once its E04-owned identity inputs are ready; complete
