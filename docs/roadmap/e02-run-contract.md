@@ -1,7 +1,7 @@
 # E02 Carrier-Neutral Run Contract
 
-Status: E02-S02 accepted, E02-S03 live integration started, and E02-S04
-compatible JSONL projection started through Cycle 020;
+Status: E02-S02 accepted, E02-S03 live integration covers ask and scripted
+JSONL, and E02-S04 compatible projection started through Cycle 021;
 workspace-internal Rust contract with human/JSONL projections, not a persisted
 format or compatibility promise.
 
@@ -90,6 +90,18 @@ unchanged. Scripted and piped finalization remain outside this tranche because
 their background and snapshot outcomes must be carried explicitly rather than
 inferred from presentation state.
 
+Cycle 021 carries scripted facts into the same publisher. Background work is
+bounded and observed before semantic settlement because its result is part of
+the script outcome; cancellation statuses then produce `Joined` or a nonzero
+`Residue` from their actual `joined` flag. The active-session receipt tracks
+persistence independently from addressability: disabled is `NotRequested`, an
+unchanged pending/resumed snapshot is `Preserved`, successful installation is
+`Committed`, and pre- or post-install save/observation failure is `Failed`.
+Post-install failure retains the resumable session ID. The final error/summary
+write is one delivery cut and the lifecycle publishes once even when an earlier
+JSONL write made the sink terminal. Piped and human presentation paths remain
+outside this tranche.
+
 ## Coupling gate
 
 CI rejects the following imports in `run.rs`: CLI/session modules; provider,
@@ -103,7 +115,7 @@ replaceability gate remains E10.
 
 ## Next slices
 
-1. Model scripted finalization inputs so actual join and persistence outcomes
-   can enter the lifecycle without reordering or retrospective inference.
+1. Route piped JSONL finalization through the typed cleanup, persistence, and
+   delivery inputs already proven for ask and scripted runs.
 2. Extend projection parity only from measured carrier gaps; do not invent a
    second schema version while additive `kitsu.chat.v1` evolution is sufficient.

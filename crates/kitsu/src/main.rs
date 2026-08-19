@@ -100,20 +100,48 @@ impl SessionSnapshotState {
 struct JsonlSessionReceipt {
     planned_id: Option<String>,
     snapshot_state: SessionSnapshotState,
+    persistence_state: kitsu_core::RunPersistenceState,
 }
 
 impl JsonlSessionReceipt {
-    const fn disabled() -> Self {
+    const fn new(planned_id: Option<String>, snapshot_state: SessionSnapshotState) -> Self {
+        let persistence_state = match snapshot_state {
+            SessionSnapshotState::Disabled => kitsu_core::RunPersistenceState::NotRequested,
+            SessionSnapshotState::PendingUntilFirstSuccess | SessionSnapshotState::Resumable => {
+                kitsu_core::RunPersistenceState::Preserved
+            }
+        };
         Self {
-            planned_id: None,
-            snapshot_state: SessionSnapshotState::Disabled,
+            planned_id,
+            snapshot_state,
+            persistence_state,
         }
+    }
+
+    const fn disabled() -> Self {
+        Self::new(None, SessionSnapshotState::Disabled)
     }
 
     fn terminal_id(&self) -> Option<String> {
         (self.snapshot_state == SessionSnapshotState::Resumable)
             .then(|| self.planned_id.clone())
             .flatten()
+    }
+
+    const fn persistence_state(&self) -> kitsu_core::RunPersistenceState {
+        self.persistence_state
+    }
+
+    fn mark_committed(&mut self, session_id: &str) {
+        self.planned_id = Some(session_id.to_string());
+        self.snapshot_state = SessionSnapshotState::Resumable;
+        self.persistence_state = kitsu_core::RunPersistenceState::Committed;
+    }
+
+    fn mark_failed(&mut self) {
+        if self.persistence_state != kitsu_core::RunPersistenceState::NotRequested {
+            self.persistence_state = kitsu_core::RunPersistenceState::Failed;
+        }
     }
 }
 
@@ -306,15 +334,17 @@ fn jsonl_summary_outcome(
 /// lifecycle. `ask` has no tools/children or session store, making Joined and
 /// NotRequested structural facts rather than carrier guesses. The delivery
 /// closure is injectable so provider-free tests can cut the sink boundary.
-fn finalize_ask_terminal_with_delivery<E>(
+fn finalize_terminal_with_delivery<E>(
     outcome: kitsu_core::RunOutcomeClass,
     assistant: kitsu_core::RunAssistantDisposition,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
     deliver: impl FnOnce() -> Result<(), E>,
 ) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
     let mut lifecycle = kitsu_core::RunLifecycle::accept(run_spec());
     lifecycle.settle(outcome, assistant)?;
-    lifecycle.join(kitsu_core::RunCleanupState::Joined)?;
-    lifecycle.persist(kitsu_core::RunPersistenceState::NotRequested)?;
+    lifecycle.join(cleanup)?;
+    lifecycle.persist(persistence)?;
     let delivery = deliver();
     lifecycle.deliver(if delivery.is_ok() {
         kitsu_core::RunDeliveryState::Delivered
@@ -323,6 +353,20 @@ fn finalize_ask_terminal_with_delivery<E>(
     })?;
     let published = lifecycle.publish()?;
     Ok((published, delivery))
+}
+
+fn finalize_ask_terminal_with_delivery<E>(
+    outcome: kitsu_core::RunOutcomeClass,
+    assistant: kitsu_core::RunAssistantDisposition,
+    deliver: impl FnOnce() -> Result<(), E>,
+) -> Result<(kitsu_core::PublishedRun, Result<(), E>), kitsu_core::RunPhaseError> {
+    finalize_terminal_with_delivery(
+        outcome,
+        assistant,
+        kitsu_core::RunCleanupState::Joined,
+        kitsu_core::RunPersistenceState::NotRequested,
+        deliver,
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -427,17 +471,29 @@ fn output_last_message_summary_state(postcondition_failures: usize) -> Option<&'
 fn set_jsonl_session_receipt(planned_id: Option<String>, snapshot_state: SessionSnapshotState) {
     *JSONL_SESSION_RECEIPT
         .lock()
-        .unwrap_or_else(std::sync::PoisonError::into_inner) = JsonlSessionReceipt {
-        planned_id,
-        snapshot_state,
-    };
+        .unwrap_or_else(std::sync::PoisonError::into_inner) =
+        JsonlSessionReceipt::new(planned_id, snapshot_state);
 }
 
 fn mark_jsonl_session_resumable(session_id: &str) {
-    set_jsonl_session_receipt(
-        Some(session_id.to_string()),
-        SessionSnapshotState::Resumable,
-    );
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mark_committed(session_id);
+}
+
+fn mark_jsonl_session_persistence_failed() {
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .mark_failed();
+}
+
+fn jsonl_session_persistence_state() -> kitsu_core::RunPersistenceState {
+    JSONL_SESSION_RECEIPT
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+        .persistence_state()
 }
 
 fn validate_output_last_message_surface(cli: &Cli) -> Result<(), CliError> {
@@ -5447,6 +5503,7 @@ fn persist_session(
                     );
                 }
             }
+            mark_jsonl_session_persistence_failed();
             session.autosave_dirty.set(true);
             eprintln!("warning: session was not saved: {error}");
             return false;
@@ -5459,6 +5516,7 @@ fn persist_session(
     #[cfg(not(unix))]
     let observation = session.permissions.observe_protected_path(commit.path());
     if let Err(error) = observation {
+        mark_jsonl_session_persistence_failed();
         session.autosave_dirty.set(true);
         eprintln!(
             "warning: session snapshot was saved but its private file identity could not be recorded: {}",
@@ -10615,6 +10673,17 @@ async fn join_background_agents_at_exit(
     cancelled
 }
 
+fn scripted_cleanup_state(
+    terminal: &[subagent::AgentTerminalStatus],
+) -> kitsu_core::RunCleanupState {
+    let unjoined = terminal.iter().filter(|status| !status.joined).count();
+    let Some(unjoined) = std::num::NonZeroU32::new(u32::try_from(unjoined).unwrap_or(u32::MAX))
+    else {
+        return kitsu_core::RunCleanupState::Joined;
+    };
+    kitsu_core::RunCleanupState::Residue { unjoined }
+}
+
 /// Surface every completed detached result that was never opened through
 /// `/jobs show` or `agent_result`. Shutdown is the last point at which an
 /// interactive, in-memory registry can preserve that work, so silently dropping
@@ -11110,6 +11179,7 @@ async fn finalize_scripted_run(
     };
     let cancelled_at_exit =
         join_background_agents_at_exit(registry, journal, agent_join_timeout, jsonl).await;
+    let cleanup_state = scripted_cleanup_state(&cancelled_at_exit);
     if !cancelled_at_exit.is_empty() {
         // Work kitsu had to stop is not successful automation. Work it waited
         // for and collected is reported by its own terminal status below.
@@ -11257,49 +11327,80 @@ async fn finalize_scripted_run(
         );
     }
 
-    // Once an emit fails the emitter retains that terminal error. Do not try
-    // additional writes, but still return only after task cleanup above.
-    if jsonl && jsonl_output_failure().is_none() {
-        if let Some(error) = primary_error.as_ref() {
-            if !status.primary_error_framed {
-                if let Err(output_error) = emit_jsonl(
-                    "error",
-                    serde_json::json!({
-                        "kind": error.jsonl_kind(),
-                        "message": error.to_string(),
-                        "exit_code": error.exit_code(),
-                    }),
-                ) {
-                    finalization_output_error = Some(output_error);
-                }
-            }
-        }
-        if jsonl_output_failure().is_none() {
-            let summary_status = if primary_error
-                .as_ref()
-                .is_some_and(|error| error.exit_code() == EXIT_CANCELLED)
-            {
-                "cancelled"
-            } else if primary_error.is_some() {
-                "error"
-            } else if status.failures > 0 {
-                "partial"
-            } else {
-                "ok"
-            };
-            if let Err(output_error) = emit_jsonl_summary_with_postcondition_failures(
+    if jsonl {
+        let summary_status = if primary_error
+            .as_ref()
+            .is_some_and(|error| error.exit_code() == EXIT_CANCELLED)
+        {
+            "cancelled"
+        } else if primary_error.is_some() {
+            "error"
+        } else if status.failures > 0 {
+            "partial"
+        } else {
+            "ok"
+        };
+        let lifecycle_delivery = (|| -> Result<Result<(), CliError>, CliError> {
+            let outcome = jsonl_summary_outcome(
                 summary_status,
-                status.failures,
                 status.provider_failures,
-                status.output_schema_failures,
-                status.postcondition_failures,
                 status.tool_failures,
                 status.policy_failures,
-                status.tool_error_totals,
-            ) {
-                finalization_output_error = Some(output_error);
-            }
-        }
+            )?;
+            let assistant = run_assistant_disposition();
+            let persistence = jsonl_session_persistence_state();
+            let (published, delivery) = finalize_terminal_with_delivery(
+                outcome,
+                assistant,
+                cleanup_state,
+                persistence,
+                || {
+                    // Once an earlier emit fails the emitter retains that
+                    // terminal error. Record failed delivery without trying
+                    // another frame, but only after cleanup above completed.
+                    if let Some(output_error) = finalization_output_error.take() {
+                        return Err(output_error);
+                    }
+                    if let Some(output_error) = jsonl_output_failure() {
+                        return Err(output_error);
+                    }
+                    if let Some(error) = primary_error.as_ref() {
+                        if !status.primary_error_framed {
+                            emit_jsonl(
+                                "error",
+                                serde_json::json!({
+                                    "kind": error.jsonl_kind(),
+                                    "message": error.to_string(),
+                                    "exit_code": error.exit_code(),
+                                }),
+                            )?;
+                        }
+                    }
+                    emit_jsonl_summary_with_postcondition_failures(
+                        summary_status,
+                        status.failures,
+                        status.provider_failures,
+                        status.output_schema_failures,
+                        status.postcondition_failures,
+                        status.tool_failures,
+                        status.policy_failures,
+                        status.tool_error_totals,
+                    )
+                },
+            )
+            .map_err(|error| {
+                CliError::user(format!("internal scripted finalization failed: {error}"))
+            })?;
+            debug_assert_eq!(published.terminal().class(), outcome);
+            debug_assert_eq!(published.terminal().assistant(), assistant);
+            debug_assert_eq!(published.cleanup(), cleanup_state);
+            debug_assert_eq!(published.persistence(), persistence);
+            Ok(delivery)
+        })();
+        finalization_output_error = match lifecycle_delivery {
+            Ok(Ok(())) => None,
+            Ok(Err(output_error)) | Err(output_error) => Some(output_error),
+        };
     }
 
     // Cleanup/finalization never replaces the semantic error that caused the
@@ -18147,6 +18248,70 @@ mod tests {
         );
         assert_eq!(published.delivery(), kitsu_core::RunDeliveryState::Failed);
         assert!(!published.is_clean_success());
+    }
+
+    #[test]
+    fn session_receipt_tracks_persistence_independently_from_snapshot_addressability() {
+        let disabled = JsonlSessionReceipt::new(None, SessionSnapshotState::Disabled);
+        assert_eq!(
+            disabled.persistence_state(),
+            kitsu_core::RunPersistenceState::NotRequested
+        );
+
+        let mut pending = JsonlSessionReceipt::new(
+            Some("planned-session".to_string()),
+            SessionSnapshotState::PendingUntilFirstSuccess,
+        );
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Preserved
+        );
+        assert_eq!(pending.terminal_id(), None);
+
+        pending.mark_committed("planned-session");
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Committed
+        );
+        assert_eq!(pending.terminal_id().as_deref(), Some("planned-session"));
+
+        pending.mark_failed();
+        assert_eq!(
+            pending.persistence_state(),
+            kitsu_core::RunPersistenceState::Failed
+        );
+        assert_eq!(
+            pending.terminal_id().as_deref(),
+            Some("planned-session"),
+            "post-install failure must not erase addressability"
+        );
+    }
+
+    #[test]
+    fn scripted_cleanup_state_counts_only_actual_unjoined_residue() {
+        let joined = subagent::AgentTerminalStatus {
+            id: 1,
+            task: "joined".to_string(),
+            status: subagent::AgentStatus::Cancelled("bounded stop".to_string()),
+            joined: true,
+        };
+        let residue = subagent::AgentTerminalStatus {
+            id: 2,
+            task: "unattached".to_string(),
+            status: subagent::AgentStatus::Cancelled("malformed fixture".to_string()),
+            joined: false,
+        };
+
+        assert_eq!(
+            scripted_cleanup_state(&[]),
+            kitsu_core::RunCleanupState::Joined
+        );
+        assert_eq!(
+            scripted_cleanup_state(&[joined, residue]),
+            kitsu_core::RunCleanupState::Residue {
+                unjoined: std::num::NonZeroU32::new(1).unwrap()
+            }
+        );
     }
 
     #[test]

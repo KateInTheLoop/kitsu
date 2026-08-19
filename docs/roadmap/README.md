@@ -194,6 +194,8 @@ same neutral outcome and exact assistant disposition to `final_summary` without
 invalidating historical `kitsu.chat.v1` records. Cycle 020 routes the bounded,
 tool-free, session-free `ask --jsonl` terminal path through the lifecycle and
 cuts successful versus failed summary delivery without semantic reclassification.
+Cycle 021 adds actual cleanup-residue and active-snapshot persistence inputs to
+the scripted JSONL terminal publication, including installed-but-failed saves.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence
@@ -403,9 +405,10 @@ gates merely because a card appears attractive.
 | 019 | E02-S04-C1 | Project common outcome into JSONL compatibly and close first carrier tranche |
 | 020 | E02-S03-C2 | Route one bounded noninteractive finalization path through the phase owner and add fault cuts |
 | 021 | E02-S03-C3 | Model and migrate scripted join/persistence outcomes without guessing phase state |
-| 022 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
+| 022 | E02-S03-C4 | Route piped JSONL finalization through typed cleanup/persistence/delivery inputs |
+| 023 | E04-S01-C1 | Add primary-spec control/distinct-wire provider fixtures |
 
-After Cycle 022, the queue finishes E04's generation/adapter gates, then
+After Cycle 023, the queue finishes E04's generation/adapter gates, then
 advances through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
 above. Provider-free fixture design may overlap, but it cannot displace a
 failing correctness or authority gate.
