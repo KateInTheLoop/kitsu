@@ -7,18 +7,21 @@ use futures::StreamExt;
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
-    ChatMessage, ChatRequest, Provider, ProviderError, ProviderResponsePart, ToolCall,
-    ToolDescriptor,
+    ChatMessage, ChatRequest, Provider, ProviderAttemptCategory, ProviderAttemptOutcome,
+    ProviderError, ProviderResponsePart, ProviderTelemetrySink, ToolCall, ToolDescriptor,
 };
 use support::provider_wire_fixture::{
     anthropic_messages_malformed_event, anthropic_messages_midstream_error,
     anthropic_messages_overloaded_error, anthropic_messages_oversized_error,
-    anthropic_messages_oversized_sse_line, anthropic_messages_text, anthropic_messages_tool_round,
-    openai_chat_malformed_event, openai_chat_midstream_error, openai_chat_oversized_error,
-    openai_chat_oversized_sse_line, openai_chat_rate_limit_error, openai_chat_text,
-    openai_chat_tool_round, HttpFaultFixture, WireDialect, ANTHROPIC_ERRORS_SPEC,
-    ANTHROPIC_MESSAGES_SPEC, ANTHROPIC_STREAMING_SPEC, ANTHROPIC_TOOL_SPEC,
-    KITSU_ERROR_BODY_LIMIT_BYTES, KITSU_SSE_LINE_LIMIT_BYTES, OPENAI_CHAT_SPEC,
+    anthropic_messages_oversized_sse_line, anthropic_messages_oversized_tool_arguments,
+    anthropic_messages_text, anthropic_messages_tool_round, openai_chat_malformed_event,
+    openai_chat_midstream_error, openai_chat_oversized_aggregate, openai_chat_oversized_error,
+    openai_chat_oversized_sse_line, openai_chat_oversized_tool_arguments,
+    openai_chat_rate_limit_error, openai_chat_text, openai_chat_tool_round,
+    unsupported_image_capability, CapabilityAdmission, FixtureCapability, HttpFaultFixture,
+    WireDialect, ANTHROPIC_ERRORS_SPEC, ANTHROPIC_MESSAGES_SPEC, ANTHROPIC_STREAMING_SPEC,
+    ANTHROPIC_TOOL_SPEC, KITSU_ERROR_BODY_LIMIT_BYTES, KITSU_SSE_LINE_LIMIT_BYTES,
+    KITSU_SSE_STREAM_LIMIT_BYTES, KITSU_TOOL_ARGUMENT_LIMIT_BYTES, OPENAI_CHAT_SPEC,
     PRIMARY_SPEC_REVIEWED_UTC,
 };
 use wiremock::matchers::{method, path};
@@ -31,13 +34,21 @@ struct ObservedRequest {
 }
 
 fn provider_for(base_url: String, chat_path: &str) -> OpenAICompatProvider {
+    provider_for_with_timeout(base_url, chat_path, Duration::from_secs(2))
+}
+
+fn provider_for_with_timeout(
+    base_url: String,
+    chat_path: &str,
+    timeout: Duration,
+) -> OpenAICompatProvider {
     OpenAICompatProvider::new(
         OpenAICompatConfig {
             base_url,
             chat_path: chat_path.to_string(),
             models_path: None,
             retries: 0,
-            timeout: Duration::from_secs(2),
+            timeout,
         },
         Arc::new(NoAuth),
     )
@@ -447,4 +458,154 @@ async fn both_dialect_paths_reject_oversized_sse_lines() {
             }))
         ));
     }
+}
+
+async fn send_stream_fault(fixture: &support::provider_wire_fixture::WireFixture) -> ProviderError {
+    let server = MockServer::start().await;
+    mount_capture(&server, fixture).await;
+    let provider = provider_for(server.uri(), fixture.path);
+    let mut stream = provider
+        .chat_stream(neutral_tool_request())
+        .await
+        .expect("HTTP 200 starts before bounded stream decoding");
+    match stream.next().await {
+        Some(Err(error)) => error,
+        Some(Ok(delta)) => panic!("bounded fixture emitted a partial delta: {delta:?}"),
+        None => panic!("bounded fixture reached EOF without a typed error"),
+    }
+}
+
+#[tokio::test]
+async fn current_configured_paths_share_aggregate_stream_and_tool_argument_bounds() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let aggregate = openai_chat_oversized_aggregate(path);
+        let error = send_stream_fault(&aggregate).await;
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::SseStream,
+                limit_bytes: KITSU_SSE_STREAM_LIMIT_BYTES,
+            }
+        ));
+
+        let arguments = openai_chat_oversized_tool_arguments(path);
+        let error = send_stream_fault(&arguments).await;
+        assert!(matches!(
+            error,
+            ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::ToolArguments,
+                limit_bytes: KITSU_TOOL_ARGUMENT_LIMIT_BYTES,
+            }
+        ));
+    }
+}
+
+#[test]
+fn native_messages_tool_argument_bound_is_pinned_for_the_future_decoder() {
+    let fixture = anthropic_messages_oversized_tool_arguments();
+    assert_eq!(fixture.dialect, WireDialect::AnthropicMessages2023_06_01);
+    assert_sse_data_is_json(&fixture.stream);
+    assert!(fixture.stream.contains("\"type\":\"input_json_delta\""));
+    assert!(fixture.stream.len() > KITSU_TOOL_ARGUMENT_LIMIT_BYTES);
+    assert!(fixture.stream.len() < KITSU_SSE_LINE_LIMIT_BYTES);
+    assert!(fixture.expected_deltas.is_empty());
+}
+
+#[tokio::test]
+async fn current_configured_paths_timeout_once_without_post_terminal_send() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(1))
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(openai_chat_text().stream),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = provider_for_with_timeout(server.uri(), path, Duration::from_millis(200));
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+
+        let error = match provider
+            .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+            .await
+        {
+            Err(error) => error,
+            Ok(_) => panic!("delayed response exceeded the end-to-end deadline"),
+        };
+        assert!(matches!(error, ProviderError::Timeout));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].category, ProviderAttemptCategory::Timeout);
+        assert_eq!(events[0].outcome, ProviderAttemptOutcome::TransportFailed);
+        assert!(events[0].terminal);
+    }
+}
+
+#[tokio::test]
+async fn current_configured_paths_cancel_once_without_post_terminal_send() {
+    for path in ["/v1/chat/completions", "/v1/messages"] {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(wiremock::matchers::path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(Duration::from_secs(5))
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(openai_chat_text().stream),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let provider = provider_for(server.uri(), path);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let observed = Arc::clone(&events);
+        let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+        let request = tokio::spawn(async move {
+            provider
+                .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+                .await
+        });
+        for _ in 0..100 {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        request.abort();
+        let join_error = match request.await {
+            Err(error) => error,
+            Ok(_) => panic!("cancelled provider request completed unexpectedly"),
+        };
+        assert!(join_error.is_cancelled());
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(server.received_requests().await.unwrap().len(), 1);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].category, ProviderAttemptCategory::Cancelled);
+        assert_eq!(events[0].outcome, ProviderAttemptOutcome::Cancelled);
+        assert!(events[0].terminal);
+    }
+}
+
+#[test]
+fn unsupported_image_capability_case_requires_zero_send_before_e04_s02() {
+    let fixture = unsupported_image_capability();
+    assert_eq!(fixture.required, FixtureCapability::ImageInput);
+    assert!(!fixture.advertised);
+    assert_eq!(
+        fixture.expected,
+        CapabilityAdmission::RejectBeforeSend {
+            error_code: "unsupported_capability",
+            expected_send_count: 0,
+        }
+    );
 }

@@ -1,10 +1,11 @@
 # E04 primary wire fixture contract
 
-Status: Cycle 028 accepts the compatible-Chat control, distinct Messages text
-fixture, normalized text/usage/stop outcome, and wrong-adapter rejection. Cycle
-029 adds correlated tool-use/result rounds, HTTP and mid-stream errors,
-malformed events, and exact error-body/SSE-line ceilings across both configured
-paths. The remaining E04-S01 cases are deliberately pending.
+Status: E04-S01 accepted through Cycle 031. Cycle 028 pins text/usage/stop and
+wrong-adapter rejection; Cycle 029 adds tool rounds, faults, malformed events,
+and error-body/SSE-line ceilings; Cycle 031 adds timeout/cancellation terminal
+cuts, aggregate/tool-argument bounds, and the unsupported-image capability
+handoff. Production capability types and the native Messages adapter remain
+E04-S02 through E04-S04 work.
 
 ## Primary source pin
 
@@ -51,7 +52,7 @@ Cycle 028, and X001 remains failed.
 
 ## E04-S01 scenario ledger
 
-| Scenario | Card | State after Cycle 028 |
+| Scenario | Card | State after Cycle 031 |
 |---|---|---|
 | Exact request, streaming text, usage, explicit stop | C1 | accepted for Chat control; pinned for Messages |
 | Wrong-adapter request/stream rejection | C1 | accepted |
@@ -59,9 +60,9 @@ Cycle 028, and X001 remains failed.
 | HTTP and mid-stream typed errors | C2 | accepted for Chat control and distinct static shapes; status/body remain bounded and wrong decoder fails closed |
 | Malformed event and wrong-dialect EOF | C2 | accepted with zero neutral delta |
 | Error-body and SSE-line bounds | C2 | accepted across both configured paths at 64 KiB and 4 MiB |
-| Aggregate-stream and tool-argument bounds | C2 | existing Chat production gates mapped; native Messages gate remains required before adapter acceptance |
-| Timeout and cancellation with no post-terminal work | C3 | pending |
-| Unsupported image capability fails before send | C3 | pending; capability contract belongs to E04-S02 |
+| Aggregate-stream and tool-argument bounds | C3 | accepted for the current Chat decoder at both configured paths: 16 MiB aggregate and 1 MiB arguments; structurally distinct Messages `input_json_delta` overflow pinned for the future native decoder |
+| Timeout and cancellation with no post-terminal work | C3 | accepted at both configured paths: one physical request, one terminal timeout/cancel disposition, and no later send |
+| Unsupported image capability fails before send | C3 | zero-send conformance observation pinned; production capability representation/admission belongs to E04-S02 |
 
 Provider-free gate:
 
@@ -69,6 +70,8 @@ Provider-free gate:
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Next card: E04-S01-C3 adds provider-free timeout/cancellation cuts, maps every
-existing aggregate/tool-argument ceiling into the common suite, and defines the
-unsupported-image zero-send handoff to E04-S02 before production adapter code.
+E04-S01 exit: the 16-test matrix is offline, credential-free, bounded, and
+wrong-adapter rejecting. Static Messages shapes are not represented as a native
+decoder pass. Next card: E04-S02-C1 introduces Kitsu-owned versioned adapter,
+profile, generation, wire-revision, and capability value contracts without
+wiring production sends.
