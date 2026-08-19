@@ -13,11 +13,37 @@ pub const PRIMARY_SPEC_REVIEWED_UTC: &str = "2026-08-19";
 
 pub const KITSU_ERROR_BODY_LIMIT_BYTES: usize = 64 * 1024;
 pub const KITSU_SSE_LINE_LIMIT_BYTES: usize = 4 * 1024 * 1024;
+pub const KITSU_SSE_STREAM_LIMIT_BYTES: usize = 16 * 1024 * 1024;
+pub const KITSU_TOOL_ARGUMENT_LIMIT_BYTES: usize = 1024 * 1024;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum WireDialect {
     OpenAiChatCompletionsV1,
     AnthropicMessages2023_06_01,
+}
+
+/// Provider-neutral feature required by a conformance case. E04-S02 will move
+/// the production equivalent into Kitsu-owned capability types; this fixture
+/// keeps the zero-send observation stable without prematurely choosing that
+/// public representation.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum FixtureCapability {
+    ImageInput,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CapabilityAdmission {
+    RejectBeforeSend {
+        error_code: &'static str,
+        expected_send_count: usize,
+    },
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CapabilityFixture {
+    pub required: FixtureCapability,
+    pub advertised: bool,
+    pub expected: CapabilityAdmission,
 }
 
 #[derive(Clone, Debug)]
@@ -376,4 +402,77 @@ pub fn openai_chat_oversized_sse_line() -> WireFixture {
 
 pub fn anthropic_messages_oversized_sse_line() -> WireFixture {
     oversized_sse_line(anthropic_messages_text(), Some("content_block_delta"))
+}
+
+/// Current compatible-Chat decoding is selected by the configured adapter,
+/// not by the URL spelling. Exercise its aggregate ceiling at both the Chat
+/// and Messages paths while the native Messages decoder remains an E04-S04
+/// obligation.
+pub fn openai_chat_oversized_aggregate(path: &'static str) -> WireFixture {
+    let mut fixture = openai_chat_text();
+    fixture.path = path;
+    let record = format!(": {}\n\n", "x".repeat(1024 * 1024));
+    fixture.stream = record.repeat(17);
+    fixture.expected_deltas.clear();
+    fixture
+}
+
+/// Compatible-Chat tool arguments exceed their independent 1 MiB ceiling
+/// while the containing SSE line stays below the 4 MiB line ceiling.
+pub fn openai_chat_oversized_tool_arguments(path: &'static str) -> WireFixture {
+    let mut fixture = openai_chat_tool_round();
+    fixture.path = path;
+    let chunk = json!({
+        "choices": [{
+            "index": 0,
+            "delta": {
+                "tool_calls": [{
+                    "index": 0,
+                    "id": "toolu_oversized",
+                    "type": "function",
+                    "function": {
+                        "name": "get_time",
+                        "arguments": "x".repeat(KITSU_TOOL_ARGUMENT_LIMIT_BYTES + 1),
+                    }
+                }]
+            },
+            "finish_reason": null
+        }]
+    });
+    fixture.stream = format!("data: {chunk}\n\n");
+    fixture.expected_deltas.clear();
+    fixture
+}
+
+/// Pin the structurally distinct Messages `input_json_delta` case now. The
+/// future native decoder must reject it as `ToolArguments`, not as an SSE-line
+/// overflow and not after emitting a partial neutral call.
+pub fn anthropic_messages_oversized_tool_arguments() -> WireFixture {
+    let mut fixture = anthropic_messages_tool_round();
+    let chunk = json!({
+        "type": "content_block_delta",
+        "index": 0,
+        "delta": {
+            "type": "input_json_delta",
+            "partial_json": "x".repeat(KITSU_TOOL_ARGUMENT_LIMIT_BYTES + 1),
+        }
+    });
+    fixture.stream = format!("event: content_block_delta\ndata: {chunk}\n\n");
+    fixture.expected_deltas.clear();
+    fixture
+}
+
+/// E04-S01 hands this exact observation to E04-S02: an image-bearing neutral
+/// request against a route that does not advertise image input must be rejected
+/// before the first physical send. Account/model-name inference cannot turn the
+/// unavailable capability into support.
+pub fn unsupported_image_capability() -> CapabilityFixture {
+    CapabilityFixture {
+        required: FixtureCapability::ImageInput,
+        advertised: false,
+        expected: CapabilityAdmission::RejectBeforeSend {
+            error_code: "unsupported_capability",
+            expected_send_count: 0,
+        },
+    }
 }

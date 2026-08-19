@@ -1,18 +1,19 @@
 # Improvement Program Status
 
-Status: E00, E01, and E02 accepted; E04-S01 is in progress and E08 telemetry
-observability is scoped through Cycle 030 on `improvements/harness-roadmap`.
+Status: E00, E01, E02, and E04-S01 accepted through Cycle 031; E04-S02 is next
+and E08 telemetry observability was scoped in Cycle 030 on
+`improvements/harness-roadmap`.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 30 / 30 |
+| Accepted cycles/commits after this cycle | 31 / 31 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S01-C3 (Cycle 031) — timeout, cancellation, aggregate-bound, and capability fixture cuts |
+| Active epic/card | E04 / E04-S02-C1 (Cycle 032) — private versioned identity, wire-revision, and capability value contracts |
 
 ## Epic status
 
@@ -21,7 +22,7 @@ observability is scoped through Cycle 030 on `improvements/harness-roadmap`.
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress** through Cycle 029 | Compatible-Chat and distinct Messages text/tool/error/bound fixtures are offline and wrong-adapter rejecting; timeout/cancel/capability cuts, capability types, `X001-G1-AUX`, and compiled adapter remain |
+| E04 provider spine | **In progress**; E04-S01 accepted through Cycle 031 | Sixteen compatible-Chat/distinct-Messages wire cases cover text, tools, faults, hard bounds, terminal timeout/cancel, and capability handoff; production capability types, `X001-G1-AUX`, and compiled adapter remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -63,13 +64,15 @@ observability is scoped through Cycle 030 on `improvements/harness-roadmap`.
 | 027 | `d818558` | Seven-carrier production exit evaluator and E02 acceptance |
 | 028 | `b4baf8b` | Primary-reviewed compatible-Chat and distinct Messages wire controls |
 | 029 | `a1d70f7` | Correlated tool rounds, typed faults, malformed events, and path bounds |
-| 030 | this document's commit | Truthful status/context/usage taxonomy, stories, dependencies, and PF-10 matrix |
+| 030 | `96394f7` | Truthful status/context/usage taxonomy, stories, dependencies, and PF-10 matrix |
+| 031 | this document's commit | One-send timeout/cancel terminal cuts, aggregate/tool bounds, and image-capability handoff |
 
 ## Current green gates
 
-- The provider-wire matrix now has eleven offline tests covering exact text and
-  correlated tool rounds, structural Chat/Messages divergence, wrong-adapter
-  rejection, HTTP/mid-stream/malformed faults, and path-level hard bounds. Full
+- The provider-wire matrix now has sixteen offline tests covering exact text
+  and correlated tool rounds, structural Chat/Messages divergence,
+  wrong-adapter rejection, HTTP/mid-stream/malformed faults, path-level hard
+  bounds, timeout/cancellation terminality, and the capability handoff. Full
   affected-suite counts are recorded in the cycle receipt.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
@@ -113,9 +116,11 @@ adds exact correlated tool-result histories and fragmented tool calls, distinct
 HTTP/mid-stream error bodies, malformed events, and 64 KiB error-body plus 4
 MiB SSE-line rejection on both configured paths. Documentation-only Cycle 030
 scopes adaptive `/status`, focused `/context`, `/usage session` plus bounded
-local history without inventing portable account/billing truth. Cycle 031 now
-closes the remaining provider-free timeout/cancel/aggregate/capability fixture
-cuts before production adapter code begins.
+local history without inventing portable account/billing truth. Cycle 031
+closes E04-S01 with one-send timeout/cancellation terminal events, 16 MiB
+aggregate and 1 MiB tool-argument cuts, a native-Messages overflow vector, and
+an unsupported-image zero-send observation. Cycle 032 begins private versioned
+identity, wire-revision, and capability value contracts before send wiring.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
