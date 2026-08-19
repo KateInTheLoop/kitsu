@@ -184,8 +184,8 @@ Fixture contract: [`e02-carrier-matrix.md`](e02-carrier-matrix.md). Neutral type
 contract: [`e02-run-contract.md`](e02-run-contract.md). Exit audit:
 [`e02-terminal-ownership-audit.md`](e02-terminal-ownership-audit.md).
 
-Status: E02-S01/S02 are accepted through Cycle 017. Neutral identity/outcome
-values now drive typed authority interruption and human completion receipts;
+Status: accepted through Cycle 027. E02-S01/S02 were accepted through Cycle 017.
+Neutral identity/outcome values now drive typed authority interruption and human completion receipts;
 confirmation EOF causes zero later provider sends/effects, explicit denial
 stays recoverable, and sequential human processes expose distinct run IDs plus
 the same success/provider/tool classifications as JSONL. Terminal phase
@@ -217,6 +217,11 @@ aggregate: a recovered failure plus later success is partial rather than
 last-turn success; steering replacement is not itself a fault; cancellation and
 authority interruption remain typed; background cleanup and active-session
 persistence reach the same process lifecycle before human timing delivery.
+Cycle 027 assigns all seven carrier identities before inference preflight and
+uses one production evaluator over immutable publication for both human and
+JSONL exits. The independent provider-free matrix passes 77 semantic/phase/exit
+vectors with no residual card. X004 remains a failed complete replaceability
+gate because no named alternate runtime adapter executes the same suite.
 
 Outcome: interactive, ask, piped, script, and JSONL carriers expose the same
 semantic run result even when delivery, cancellation, cleanup, or persistence

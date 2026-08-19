@@ -180,3 +180,17 @@ E02-S01 fixture discovery is complete with two deliberate red cells:
 confirmation EOF interruption and human run identity. They authorize the
 minimal private E02-S02 contract; they do not authorize CLI, signal, JSONL,
 renderer, session-store, or provider-wire dependencies in core.
+
+## Executed exit evaluation after Cycle 027
+
+The independent test harness now imports the narrow production exit evaluator
+without importing the CLI carrier implementation. It constructs provider-free
+immutable publications and runs all seven declared carriers through seven
+semantic classes, three later-phase failure cuts, and prior-causal-exit
+preservation: 77 exact vectors in addition to the original 119-cell declaration.
+Carrier classification is separately tested at CLI dispatch, and live JSONL,
+human, piped, script, sink/cancellation, and interactive PTY fixtures retain
+their observable exits and terminal receipts.
+
+This closes E02's default-runtime evaluation with no silent matrix cell. It is
+not an X004 replaceability pass: no named alternate runtime adapter exists yet.

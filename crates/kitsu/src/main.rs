@@ -8,6 +8,7 @@ mod command_artifact;
 mod config;
 mod credential_store;
 mod llms;
+mod process_exit;
 mod prompt_queue;
 mod session;
 mod skills;
@@ -41,11 +42,9 @@ use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
     PermissionRequest, Permissions, Prompter, Registry, RegistryError,
 };
-
-/// Exit codes per design §6: 1 = user/config/auth-missing, 2 = provider.
-const EXIT_USER: i32 = 1;
-const EXIT_PROVIDER: i32 = 2;
-const EXIT_CANCELLED: i32 = 130;
+use process_exit::{
+    evaluate_process_exit, InferenceCarrier, EXIT_CANCELLED, EXIT_PROVIDER, EXIT_USER,
+};
 const JSONL_SCHEMA: &str = "kitsu.chat.v1";
 static JSONL_SUMMARY_EMITTED: AtomicBool = AtomicBool::new(false);
 /// `-o` is a host-owned sink, so a run with no fully committed assistant must
@@ -69,6 +68,8 @@ static MODEL_INFERENCE_STARTED: AtomicBool = AtomicBool::new(false);
 static PROCESS_RUN_LIFECYCLE: OnceLock<Mutex<kitsu_core::RunLifecycle>> = OnceLock::new();
 static PROCESS_TERMINAL_FACTS: OnceLock<ProcessTerminalFacts> = OnceLock::new();
 static PROCESS_INTERACTIVE_TERMINAL_FACTS: OnceLock<InteractiveTerminalFacts> = OnceLock::new();
+static PROCESS_INFERENCE_CARRIER: OnceLock<InferenceCarrier> = OnceLock::new();
+static PROCESS_PUBLISHED_RUN: OnceLock<kitsu_core::PublishedRun> = OnceLock::new();
 /// Set only when `--allow-turn-errors` converts a scripted run with both a
 /// success and a failure into an accepted partial result. The process-level
 /// timing footer otherwise sees only exit code 0 and would mislabel it `ok`.
@@ -211,9 +212,13 @@ fn process_run_lifecycle() -> &'static Mutex<kitsu_core::RunLifecycle> {
     PROCESS_RUN_LIFECYCLE.get_or_init(|| Mutex::new(kitsu_core::RunLifecycle::accept(run_spec())))
 }
 
-fn activate_model_command() {
+fn activate_model_command(carrier: InferenceCarrier) -> Result<(), CliError> {
+    PROCESS_INFERENCE_CARRIER.set(carrier).map_err(|_| {
+        CliError::user("internal inference carrier was initialized more than once".to_string())
+    })?;
     MODEL_COMMAND_ACTIVE.store(true, Ordering::Release);
     let _ = process_run_lifecycle();
+    Ok(())
 }
 
 fn mark_model_inference_started() {
@@ -570,14 +575,19 @@ fn finalize_process_terminal_with_delivery<E>(
     let mut lifecycle = process_run_lifecycle()
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner);
-    finalize_owned_terminal_with_delivery(
+    let result = finalize_owned_terminal_with_delivery(
         &mut lifecycle,
         outcome,
         assistant,
         cleanup,
         persistence,
         deliver,
-    )
+    );
+    if let Ok((published, _)) = &result {
+        let recorded = PROCESS_PUBLISHED_RUN.set(published.clone());
+        debug_assert!(recorded.is_ok(), "process terminal publication is unique");
+    }
+    result
 }
 
 #[cfg(test)]
@@ -863,6 +873,40 @@ fn inference_command_requested(cli: &Cli) -> bool {
                 | Some(Command::Review { .. })
                 | Some(Command::Chat { .. })
         )
+}
+
+fn inference_carrier(cli: &Cli, stdin_is_tty: bool) -> Option<InferenceCarrier> {
+    let human_or_jsonl = |human, jsonl| if cli.jsonl { jsonl } else { human };
+    if cli.print_prompt.is_some() {
+        return Some(human_or_jsonl(
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+        ));
+    }
+    match cli.command.as_ref() {
+        Some(Command::Ask { .. }) => Some(human_or_jsonl(
+            InferenceCarrier::AskHuman,
+            InferenceCarrier::AskJsonl,
+        )),
+        Some(Command::Review { .. }) => Some(human_or_jsonl(
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+        )),
+        Some(Command::Chat {
+            script: Some(_), ..
+        }) => Some(human_or_jsonl(
+            InferenceCarrier::ScriptHuman,
+            InferenceCarrier::ScriptJsonl,
+        )),
+        None | Some(Command::Chat { script: None, .. }) if stdin_is_tty && !cli.jsonl => {
+            Some(InferenceCarrier::InteractiveHuman)
+        }
+        None | Some(Command::Chat { script: None, .. }) => Some(human_or_jsonl(
+            InferenceCarrier::PipedHuman,
+            InferenceCarrier::PipedJsonl,
+        )),
+        _ => None,
+    }
 }
 
 fn active_output_schema() -> Option<&'static structured_output::OutputSchema> {
@@ -1600,6 +1644,21 @@ fn main() {
             (code, outcome_class)
         }
     };
+    if jsonl_mode && MODEL_COMMAND_ACTIVE.load(Ordering::Acquire) {
+        match (
+            PROCESS_INFERENCE_CARRIER.get().copied(),
+            PROCESS_PUBLISHED_RUN.get(),
+        ) {
+            (Some(carrier), Some(published)) => {
+                code = evaluate_process_exit(code, carrier, published);
+            }
+            _ if code == 0 => {
+                std::eprintln!("internal JSONL inference lifecycle was not published");
+                code = EXIT_USER;
+            }
+            _ => {}
+        }
+    }
     if !jsonl_mode && output_last_message_preserved_without_commit() {
         std::eprintln!("~ --output-last-message unchanged: no committed assistant message");
     }
@@ -1649,13 +1708,15 @@ fn main() {
         ) {
             Ok((published, delivery)) => {
                 debug_assert_eq!(published.terminal(), &terminal);
-                if (delivery.is_err()
-                    || (terminal.class() == kitsu_core::RunOutcomeClass::Succeeded
-                        && !published.is_clean_success()))
-                    && code == 0
-                {
-                    code = EXIT_USER;
-                }
+                debug_assert_eq!(
+                    delivery.is_ok(),
+                    published.delivery() == kitsu_core::RunDeliveryState::Delivered
+                );
+                let carrier = PROCESS_INFERENCE_CARRIER
+                    .get()
+                    .copied()
+                    .expect("active model command has an inference carrier");
+                code = evaluate_process_exit(code, carrier, &published);
             }
             Err(error) => {
                 std::eprintln!("internal human inference finalization failed: {error}");
@@ -1796,7 +1857,9 @@ fn run() -> Result<(), CliError> {
     if inference_command_requested(&cli) {
         // Accept the process lifecycle before output/config/runtime preflight,
         // not only after a carrier has successfully built its provider.
-        activate_model_command();
+        let carrier = inference_carrier(&cli, kitsu_render::stdin_is_tty())
+            .expect("every inference command has an explicit carrier");
+        activate_model_command(carrier)?;
     }
     validate_output_last_message_surface(&cli)?;
     OUTPUT_LAST_MESSAGE_REQUESTED.store(cli.output_last_message.is_some(), Ordering::Release);
@@ -18848,6 +18911,59 @@ mod tests {
                 "management command cannot reserve inference lifecycle: {argv:?}"
             );
         }
+    }
+
+    #[test]
+    fn inference_carrier_classification_covers_the_seven_supported_surfaces() {
+        let cases = [
+            (
+                vec!["kitsu", "ask", "hello"],
+                false,
+                InferenceCarrier::AskHuman,
+            ),
+            (
+                vec!["kitsu", "--jsonl", "ask", "hello"],
+                false,
+                InferenceCarrier::AskJsonl,
+            ),
+            (vec!["kitsu", "chat"], false, InferenceCarrier::PipedHuman),
+            (
+                vec!["kitsu", "--jsonl", "chat"],
+                false,
+                InferenceCarrier::PipedJsonl,
+            ),
+            (
+                vec!["kitsu", "chat", "--script", "turns.txt"],
+                true,
+                InferenceCarrier::ScriptHuman,
+            ),
+            (
+                vec!["kitsu", "--jsonl", "chat", "--script", "turns.txt"],
+                true,
+                InferenceCarrier::ScriptJsonl,
+            ),
+            (
+                vec!["kitsu", "chat"],
+                true,
+                InferenceCarrier::InteractiveHuman,
+            ),
+        ];
+
+        for (argv, stdin_is_tty, expected) in cases {
+            let cli = Cli::try_parse_from(argv.clone()).expect("carrier fixture parses");
+            assert_eq!(
+                inference_carrier(&cli, stdin_is_tty),
+                Some(expected),
+                "wrong carrier for {argv:?}"
+            );
+        }
+
+        let review = Cli::try_parse_from(["kitsu", "review"]).expect("review parses");
+        assert_eq!(
+            inference_carrier(&review, true),
+            Some(InferenceCarrier::PipedHuman),
+            "review is always a one-shot carrier even when stdin is a TTY"
+        );
     }
 
     #[test]

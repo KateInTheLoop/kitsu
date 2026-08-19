@@ -1,11 +1,13 @@
+#[path = "../src/process_exit.rs"]
+mod process_exit;
 mod support;
 
 use std::collections::BTreeSet;
 
 use support::carrier_fixture::{
     applicability, observe, Applicability, AssistantDisposition, CleanupState, DeliveryState,
-    ExpectedOutcome, FixtureEvent, FixtureViolation, OutcomeClass, PersistenceState, CARRIERS,
-    SCENARIOS,
+    EntryPoint, ExpectedOutcome, FixtureEvent, FixtureViolation, OutcomeClass, PersistenceState,
+    Surface, CARRIERS, SCENARIOS,
 };
 
 const RUN_ID: &str = "fixture-run-001";
@@ -194,4 +196,130 @@ fn oracle_keeps_outcome_dimensions_distinct() {
     assert_eq!(assistant.len(), 3);
     assert_eq!(persistence.len(), 4);
     assert_eq!(delivery.len(), 3);
+}
+
+fn production_carrier(
+    carrier: support::carrier_fixture::Carrier,
+) -> process_exit::InferenceCarrier {
+    match (carrier.entry, carrier.surface) {
+        (EntryPoint::Ask, Surface::Human) => process_exit::InferenceCarrier::AskHuman,
+        (EntryPoint::Ask, Surface::Jsonl) => process_exit::InferenceCarrier::AskJsonl,
+        (EntryPoint::PipedChat, Surface::Human) => process_exit::InferenceCarrier::PipedHuman,
+        (EntryPoint::PipedChat, Surface::Jsonl) => process_exit::InferenceCarrier::PipedJsonl,
+        (EntryPoint::ScriptChat, Surface::Human) => process_exit::InferenceCarrier::ScriptHuman,
+        (EntryPoint::ScriptChat, Surface::Jsonl) => process_exit::InferenceCarrier::ScriptJsonl,
+        (EntryPoint::InteractiveChat, Surface::Human) => {
+            process_exit::InferenceCarrier::InteractiveHuman
+        }
+        (EntryPoint::InteractiveChat, Surface::Jsonl) => {
+            panic!("interactive JSONL is not one of the seven supported carriers")
+        }
+    }
+}
+
+fn published_run(
+    class: kitsu_core::RunOutcomeClass,
+    cleanup: kitsu_core::RunCleanupState,
+    persistence: kitsu_core::RunPersistenceState,
+    delivery: kitsu_core::RunDeliveryState,
+) -> kitsu_core::PublishedRun {
+    let spec = kitsu_core::RunSpec::new(
+        kitsu_core::RunId::new("independent-exit-fixture").expect("valid fixture run id"),
+    );
+    let mut lifecycle = kitsu_core::RunLifecycle::accept(&spec);
+    let assistant = match class {
+        kitsu_core::RunOutcomeClass::Succeeded => kitsu_core::RunAssistantDisposition::Committed,
+        kitsu_core::RunOutcomeClass::PartiallySucceeded => {
+            kitsu_core::RunAssistantDisposition::CommittedPartial
+        }
+        kitsu_core::RunOutcomeClass::UserFault
+        | kitsu_core::RunOutcomeClass::ProviderFault
+        | kitsu_core::RunOutcomeClass::ToolFault
+        | kitsu_core::RunOutcomeClass::Cancelled
+        | kitsu_core::RunOutcomeClass::Interrupted => {
+            kitsu_core::RunAssistantDisposition::Discarded
+        }
+    };
+    lifecycle.settle(class, assistant).expect("settle fixture");
+    lifecycle.join(cleanup).expect("join fixture");
+    lifecycle.persist(persistence).expect("persist fixture");
+    lifecycle.deliver(delivery).expect("deliver fixture");
+    lifecycle.publish().expect("publish fixture")
+}
+
+#[test]
+fn independent_matrix_evaluates_exact_production_exit_for_all_seven_carriers() {
+    let semantic_cases = [
+        (kitsu_core::RunOutcomeClass::Succeeded, 0, 0),
+        (kitsu_core::RunOutcomeClass::PartiallySucceeded, 0, 0),
+        (kitsu_core::RunOutcomeClass::UserFault, 1, 0),
+        (kitsu_core::RunOutcomeClass::ProviderFault, 2, 0),
+        (kitsu_core::RunOutcomeClass::ToolFault, 1, 0),
+        (kitsu_core::RunOutcomeClass::Cancelled, 130, 0),
+        (kitsu_core::RunOutcomeClass::Interrupted, 1, 0),
+    ];
+
+    for carrier in CARRIERS {
+        let production = production_carrier(carrier);
+        let interactive = carrier.entry == EntryPoint::InteractiveChat;
+        for (class, automation_exit, interactive_exit) in semantic_cases {
+            let published = published_run(
+                class,
+                kitsu_core::RunCleanupState::Joined,
+                kitsu_core::RunPersistenceState::Preserved,
+                kitsu_core::RunDeliveryState::Delivered,
+            );
+            assert_eq!(
+                process_exit::evaluate_process_exit(0, production, &published),
+                if interactive {
+                    interactive_exit
+                } else {
+                    automation_exit
+                },
+                "semantic exit mismatch for {} and {class:?}",
+                carrier.label()
+            );
+        }
+
+        for published in [
+            published_run(
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunCleanupState::NotObserved,
+                kitsu_core::RunPersistenceState::Preserved,
+                kitsu_core::RunDeliveryState::Delivered,
+            ),
+            published_run(
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunCleanupState::Joined,
+                kitsu_core::RunPersistenceState::Failed,
+                kitsu_core::RunDeliveryState::Delivered,
+            ),
+            published_run(
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunCleanupState::Joined,
+                kitsu_core::RunPersistenceState::Preserved,
+                kitsu_core::RunDeliveryState::Failed,
+            ),
+        ] {
+            assert_eq!(
+                process_exit::evaluate_process_exit(0, production, &published),
+                process_exit::EXIT_USER,
+                "later-phase failure must fail closed for {}",
+                carrier.label()
+            );
+        }
+
+        let clean = published_run(
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunCleanupState::Joined,
+            kitsu_core::RunPersistenceState::Preserved,
+            kitsu_core::RunDeliveryState::Delivered,
+        );
+        assert_eq!(
+            process_exit::evaluate_process_exit(process_exit::EXIT_PROVIDER, production, &clean),
+            process_exit::EXIT_PROVIDER,
+            "a prior causal failure must remain primary for {}",
+            carrier.label()
+        );
+    }
 }
