@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 036.
+Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 037.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -9,8 +9,11 @@ current owner and bound request handles, migrates primary chat/catalog/context
 calls, and pins replacement plus drain behavior. Cycle 036 makes every chat
 request match an immutable model-bound handle, publishes default/resumed model
 changes as exact successors, and snapshots each subagent route after profile
-resolution. Remaining management auxiliaries, full config/auth replacement,
-the mutation matrix, and attempt receipts remain E04-S03 work.
+resolution. Cycle 037 attributes physical attempts at the immutable handle
+boundary and closes the retry/replay/catalog/compaction/subagent/cancellation
+mutation matrix for chat-owned routes. Remaining management auxiliaries and
+full config/auth replacement remain E04-S03 work; complete route receipts remain
+E04-S05 work.
 
 ## Decision
 
@@ -88,6 +91,19 @@ compatible-Chat implementation it actually constructs.
   one successor while reusing the unchanged frozen transport/auth/policy
   owners. `/model` and saved-session resume stage catalog/context facts first,
   publish next, then mutate live model/window/provenance state.
+- Raw adapters emit transport dispositions without route identity.
+  `ProviderAttemptObservation` adds an optional generation only when a current
+  immutable handle decorates the telemetry sink after admission. Chat and
+  catalog attempts—including retries, backoff cancellation, and terminal body
+  events—therefore retain the admitted generation even if a successor is
+  published while the request drains. Legacy/raw callers remain explicitly
+  unattributed.
+- Runtime attempt events project the generation as an additive secret-free
+  integer. Foreground and catalog JSONL preserve it; child telemetry retains
+  the first observed generation plus an explicit mismatch bit rather than
+  silently overwriting contradictory evidence. Provider-controlled endpoint,
+  auth, header, body, model content, and configuration values never enter this
+  observation.
 - The provider port's catalog is optional: a current route without
   `model_catalog` returns `None` without entering either runtime. Staleness is
   still checked first. Capabilities required by a concrete chat request, such
@@ -110,24 +126,29 @@ and passes bound handles through ask, chat, scripted turns, foreground and
 subagent inference, compaction, slash catalog/model validation, context refresh,
 and resume discovery. Cycle 036 binds foreground turns once, resolves subagent
 bindings once after effective-model/profile selection, and makes direct plus
-resumed model changes advance the process-default generation. All accepted
+resumed model changes advance the process-default generation. Cycle 037 stamps
+attempt evidence outside adapter-authored events, proves admitted physical
+retry/catalog work drains entirely on its old generation, proves a user-level
+`/retry` binds the new current generation, and retains generation evidence for
+compaction and child work. All accepted
 `openai`, `anthropic`, and `ollama` flavor labels still
 declare the compatible-Chat adapter/wire Kitsu actually constructs; no flavor
 label selects a physical adapter. These cards still do not:
 
 - replace endpoint/wire/auth/retry/cache owners from a reloaded configuration;
-- emit generation identity on every physical attempt or replay;
-- complete mutation cuts across retry, replay, catalog, compaction, title-like
-  auxiliary work, and cancellation;
 - bind management-only top-level `models` and doctor probes to this chat owner;
+- emit the complete adapter/profile/wire/capability/auth-source attempt receipt
+  required by E04-S05;
 - implement or advertise a native Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
-flavor-to-adapter switch. The current owner remains private and has no
-user-visible receipt. The next E04-S03 card adds generation-aware attempt
-evidence and the remaining auxiliary mutation cuts; later cards add the
-distinct adapter and complete secret-free operational receipts.
+flavor-to-adapter switch. There is no title-generation provider call in current
+Kitsu. The three raw management calls are named and queued rather than inferred
+safe. The next E04-S03 card composes top-level `models` and explicit doctor
+probes through a truthful management route while preserving
+catalog-without-model behavior; later cards add the distinct adapter and
+complete secret-free operational receipts.
 
 ## Acceptance and rollback
 
@@ -141,9 +162,10 @@ cargo test -p kitsu-providers --test provider_route_handle
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, three snapshot, eight
+Six route-contract, three declaration/derivation, three snapshot, ten
 route-handle, route-factory, auth-freeze/source-selection, two
-declaration-composition, and sixteen wire-matrix cases pass offline. The
+declaration-composition, generation-aware compaction/subagent/replay/JSONL, and
+sixteen wire-matrix cases pass offline. The
 derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Removing

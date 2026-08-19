@@ -480,20 +480,26 @@ impl AgentThreadState {
             ),
             AgentRuntimeEvent::ProviderAttempt {
                 round,
+                route_generation,
                 attempt,
                 max_attempts,
                 category,
                 outcome,
                 ..
-            } => self.timeline.push(
-                AgentTimelineKind::Provider,
-                Some(*round),
-                &format!(
-                    "attempt {attempt}/{max_attempts}: {}, {}",
-                    category_label(*category),
-                    outcome_label(*outcome)
-                ),
-            ),
+            } => {
+                let route = route_generation
+                    .map(|generation| format!(" on route generation {generation}"))
+                    .unwrap_or_default();
+                self.timeline.push(
+                    AgentTimelineKind::Provider,
+                    Some(*round),
+                    &format!(
+                        "attempt {attempt}/{max_attempts}{route}: {}, {}",
+                        category_label(*category),
+                        outcome_label(*outcome)
+                    ),
+                )
+            }
             AgentRuntimeEvent::AssistantDelta { round, text } => {
                 self.timeline
                     .push(AgentTimelineKind::Assistant, Some(*round), text);
