@@ -4,11 +4,24 @@
 //! Current `SavedSession` v1 files remain authoritative until the explicit
 //! migration card can construct a complete canonical logical value.
 
+use std::ffi::OsStr;
+use std::fmt;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
+
+#[cfg(test)]
+use std::cell::Cell;
+#[cfg(unix)]
+use std::os::fd::AsRawFd;
 
 use kitsu_core::{ExpectedRevision, RevisionId, SessionId, StoreId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+use super::{
+    atomic_write_private_in_detailed, fresh_id, remove_artifact_tree, PrivateDirectory,
+    PrivateEntryKind,
+};
 
 pub(super) const PHYSICAL_SCHEMA_REVISION: u32 = 1;
 pub(super) const MAX_PHYSICAL_RECORD_BYTES: usize = 64 * 1024;
@@ -410,9 +423,520 @@ pub(super) fn decode_head_record(
     Ok(record)
 }
 
+/// Descriptor-pinned owner of the unmounted physical-v1 namespace.
+///
+/// Holding each directory open prevents pathname ancestor replacement from
+/// redirecting later revision reads or writes on Unix. The type remains
+/// private until canonical HEAD publication and migration are complete.
+#[derive(Debug)]
+pub(super) struct PhysicalFileStoreV1 {
+    _root: PrivateDirectory,
+    revisions: PrivateDirectory,
+    _heads: PrivateDirectory,
+    staging: PrivateDirectory,
+    _locks: PrivateDirectory,
+    record: StoreRecordV1,
+    #[cfg(test)]
+    fail_next_target_sync: Cell<bool>,
+}
+
+#[derive(Debug)]
+pub(super) struct InstalledRevisionCandidateV1 {
+    manifest: RevisionManifestV1,
+    manifest_bytes: Vec<u8>,
+    manifest_sha256: Sha256Digest,
+}
+
+impl InstalledRevisionCandidateV1 {
+    pub(super) fn manifest(&self) -> &RevisionManifestV1 {
+        &self.manifest
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VerifiedRevisionCandidateV1 {
+    manifest: RevisionManifestV1,
+    manifest_sha256: Sha256Digest,
+    canonical_bytes: Vec<u8>,
+}
+
+impl VerifiedRevisionCandidateV1 {
+    pub(super) fn manifest(&self) -> &RevisionManifestV1 {
+        &self.manifest
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+
+    pub(super) fn canonical_bytes(&self) -> &[u8] {
+        &self.canonical_bytes
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct PhysicalCandidateInstallError {
+    message: String,
+    installed: bool,
+}
+
+impl PhysicalCandidateInstallError {
+    fn before_install(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            installed: false,
+        }
+    }
+
+    fn after_install(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            installed: true,
+        }
+    }
+
+    pub(super) fn installed(&self) -> bool {
+        self.installed
+    }
+}
+
+impl fmt::Display for PhysicalCandidateInstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PhysicalCandidateInstallError {}
+
+impl PhysicalFileStoreV1 {
+    pub(super) fn create_or_open(session_root: &Path, store_id: StoreId) -> Result<Self, String> {
+        let session_root = PrivateDirectory::prepare(session_root, "physical session root")?;
+        let root = session_root.prepare_child(
+            OsStr::new(ROOT_COMPONENT),
+            "physical session store namespace",
+        )?;
+        session_root.sync("physical session root")?;
+
+        let record = open_or_create_store_record(&root, store_id)?;
+        let revisions = root.prepare_child(
+            OsStr::new(REVISIONS_COMPONENT),
+            "physical revision namespace",
+        )?;
+        let heads = root.prepare_child(OsStr::new(HEADS_COMPONENT), "physical HEAD namespace")?;
+        let staging = root.prepare_child(
+            OsStr::new(STAGING_COMPONENT),
+            "physical revision staging namespace",
+        )?;
+        let locks = root.prepare_child(OsStr::new(LOCKS_COMPONENT), "physical lock namespace")?;
+        root.sync("physical session store namespace")?;
+
+        Ok(Self {
+            _root: root,
+            revisions,
+            _heads: heads,
+            staging,
+            _locks: locks,
+            record,
+            #[cfg(test)]
+            fail_next_target_sync: Cell::new(false),
+        })
+    }
+
+    pub(super) fn store_id(&self) -> &StoreId {
+        self.record.store_id()
+    }
+
+    pub(super) fn install_revision_candidate(
+        &self,
+        logical_schema_revision: u32,
+        session_id: SessionId,
+        revision_id: RevisionId,
+        parent_revision: ExpectedRevision,
+        canonical_bytes: &[u8],
+    ) -> Result<InstalledRevisionCandidateV1, PhysicalCandidateInstallError> {
+        let canonical_len = u64::try_from(canonical_bytes.len()).map_err(|_| {
+            PhysicalCandidateInstallError::before_install(
+                "canonical payload length cannot be represented as u64",
+            )
+        })?;
+        let canonical_sha256 =
+            digest_bytes(canonical_bytes).map_err(PhysicalCandidateInstallError::before_install)?;
+        let manifest = RevisionManifestV1::new(
+            logical_schema_revision,
+            self.store_id().clone(),
+            session_id.clone(),
+            revision_id.clone(),
+            parent_revision,
+            canonical_len,
+            canonical_sha256,
+        )
+        .map_err(PhysicalCandidateInstallError::before_install)?;
+        let manifest_bytes = encode_revision_manifest(&manifest)
+            .map_err(PhysicalCandidateInstallError::before_install)?;
+        let manifest_sha256 =
+            digest_bytes(&manifest_bytes).map_err(PhysicalCandidateInstallError::before_install)?;
+
+        let session_name = encode_component(session_id.as_str());
+        let session_revisions = self
+            .revisions
+            .prepare_child(
+                OsStr::new(&session_name),
+                "physical session revision namespace",
+            )
+            .map_err(PhysicalCandidateInstallError::before_install)?;
+        self.revisions
+            .sync("physical revision namespace")
+            .map_err(PhysicalCandidateInstallError::before_install)?;
+
+        let staging_name = format!("candidate-{}", fresh_id());
+        let staged = self
+            .staging
+            .create_child_exclusive(OsStr::new(&staging_name), "physical revision candidate")
+            .map_err(PhysicalCandidateInstallError::before_install)?;
+
+        let prepare = (|| -> Result<(), String> {
+            write_new_synced(
+                &staged,
+                OsStr::new(CANONICAL_PAYLOAD_NAME),
+                canonical_bytes,
+                "canonical payload",
+            )?;
+            write_new_synced(
+                &staged,
+                OsStr::new(REVISION_MANIFEST_NAME),
+                &manifest_bytes,
+                "revision manifest",
+            )?;
+            staged.sync("physical revision candidate")
+        })();
+        if let Err(error) = prepare {
+            return Err(self.rollback_staged(&staging_name, &staged, error));
+        }
+
+        let revision_name = encode_component(revision_id.as_str());
+        if let Err(error) = rename_directory_no_replace(
+            &self.staging,
+            OsStr::new(&staging_name),
+            &session_revisions,
+            OsStr::new(&revision_name),
+        ) {
+            let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "physical revision candidate '{}' already exists; refusing to overwrite it",
+                    session_revisions.path.join(&revision_name).display()
+                )
+            } else {
+                format!(
+                    "cannot install physical revision candidate '{}': {error}",
+                    session_revisions.path.join(&revision_name).display()
+                )
+            };
+            return Err(self.rollback_staged(&staging_name, &staged, message));
+        }
+
+        #[cfg(test)]
+        if self.fail_next_target_sync.replace(false) {
+            return Err(PhysicalCandidateInstallError::after_install(
+                "physical revision candidate was installed, but target durability is unconfirmed: injected failure",
+            ));
+        }
+        if let Err(error) = session_revisions.sync("physical session revision namespace") {
+            return Err(PhysicalCandidateInstallError::after_install(format!(
+                "physical revision candidate was installed, but target durability is unconfirmed: {error}"
+            )));
+        }
+        if let Err(error) = self.staging.sync("physical revision staging namespace") {
+            return Err(PhysicalCandidateInstallError::after_install(format!(
+                "physical revision candidate was installed, but staging durability is unconfirmed: {error}"
+            )));
+        }
+
+        Ok(InstalledRevisionCandidateV1 {
+            manifest,
+            manifest_bytes,
+            manifest_sha256,
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_next_target_sync_failure(&self) {
+        self.fail_next_target_sync.set(true);
+    }
+
+    pub(super) fn open_revision_candidate(
+        &self,
+        session_id: &SessionId,
+        revision_id: &RevisionId,
+    ) -> Result<VerifiedRevisionCandidateV1, String> {
+        let session_name = encode_component(session_id.as_str());
+        let revision_name = encode_component(revision_id.as_str());
+        let session_revisions = self.revisions.open_child(
+            OsStr::new(&session_name),
+            "physical session revision namespace",
+        )?;
+        let revision = session_revisions
+            .open_child(OsStr::new(&revision_name), "physical revision candidate")?;
+        let manifest_bytes = read_bounded_regular(
+            &revision,
+            OsStr::new(REVISION_MANIFEST_NAME),
+            MAX_PHYSICAL_RECORD_BYTES as u64,
+            "revision manifest",
+        )?;
+        let manifest =
+            decode_revision_manifest(&manifest_bytes, self.store_id(), session_id, revision_id)?;
+        let canonical_bytes = read_bounded_regular(
+            &revision,
+            OsStr::new(CANONICAL_PAYLOAD_NAME),
+            MAX_CANONICAL_PAYLOAD_BYTES,
+            "canonical payload",
+        )?;
+        if canonical_bytes.len() as u64 != manifest.canonical_bytes {
+            return Err(format!(
+                "canonical payload length mismatch: manifest declares {}, read {}",
+                manifest.canonical_bytes,
+                canonical_bytes.len()
+            ));
+        }
+        let observed_digest = digest_bytes(&canonical_bytes)?;
+        if observed_digest != manifest.canonical_sha256 {
+            return Err(format!(
+                "canonical payload digest mismatch: manifest declares {}, observed {}",
+                manifest.canonical_sha256.as_str(),
+                observed_digest.as_str()
+            ));
+        }
+        let manifest_sha256 = digest_bytes(&manifest_bytes)?;
+        Ok(VerifiedRevisionCandidateV1 {
+            manifest,
+            manifest_sha256,
+            canonical_bytes,
+        })
+    }
+
+    fn rollback_staged(
+        &self,
+        staging_name: &str,
+        staged: &PrivateDirectory,
+        primary: impl Into<String>,
+    ) -> PhysicalCandidateInstallError {
+        let primary = primary.into();
+        match remove_artifact_tree(
+            &self.staging,
+            OsStr::new(staging_name),
+            staged,
+            "physical revision candidate rollback",
+        ) {
+            Ok(()) => PhysicalCandidateInstallError::before_install(primary),
+            Err(rollback) => PhysicalCandidateInstallError::before_install(format!(
+                "{primary}; staged candidate cleanup also failed: {rollback}"
+            )),
+        }
+    }
+}
+
+fn open_or_create_store_record(
+    root: &PrivateDirectory,
+    expected_store: StoreId,
+) -> Result<StoreRecordV1, String> {
+    match root.entry_kind(OsStr::new(STORE_RECORD_NAME)) {
+        Ok(PrivateEntryKind::File) => return read_and_validate_store_record(root, &expected_store),
+        Ok(_) => {
+            return Err(format!(
+                "physical store record '{}' is not a regular file",
+                root.path.join(STORE_RECORD_NAME).display()
+            ));
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(format!(
+                "cannot inspect physical store record '{}': {error}",
+                root.path.join(STORE_RECORD_NAME).display()
+            ));
+        }
+    }
+
+    let bytes = encode_store_record(&StoreRecordV1::new(expected_store.clone()))?;
+    match atomic_write_private_in_detailed(
+        root,
+        OsStr::new(STORE_RECORD_NAME),
+        &bytes,
+        false,
+        "physical store record",
+    ) {
+        Ok(_) => read_and_validate_store_record(root, &expected_store),
+        Err(failure)
+            if !failure.installed
+                && matches!(
+                    root.entry_kind(OsStr::new(STORE_RECORD_NAME)),
+                    Ok(PrivateEntryKind::File)
+                ) =>
+        {
+            read_and_validate_store_record(root, &expected_store)
+        }
+        Err(failure) => Err(failure.message),
+    }
+}
+
+fn read_and_validate_store_record(
+    root: &PrivateDirectory,
+    expected_store: &StoreId,
+) -> Result<StoreRecordV1, String> {
+    let bytes = read_bounded_regular(
+        root,
+        OsStr::new(STORE_RECORD_NAME),
+        MAX_PHYSICAL_RECORD_BYTES as u64,
+        "physical store record",
+    )?;
+    let record = decode_store_record(&bytes)?;
+    if record.store_id() != expected_store {
+        return Err(format!(
+            "physical store identity mismatch: expected '{}', observed '{}'",
+            expected_store.as_str(),
+            record.store_id().as_str()
+        ));
+    }
+    Ok(record)
+}
+
+fn write_new_synced(
+    directory: &PrivateDirectory,
+    name: &OsStr,
+    bytes: &[u8],
+    context: &str,
+) -> Result<(), String> {
+    let path = directory.path.join(name);
+    let mut file = directory.create_regular_file(name, context)?;
+    file.write_all(bytes)
+        .and_then(|()| file.sync_all())
+        .map_err(|error| format!("cannot write {context} file '{}': {error}", path.display()))
+}
+
+fn read_bounded_regular(
+    directory: &PrivateDirectory,
+    name: &OsStr,
+    max_bytes: u64,
+    context: &str,
+) -> Result<Vec<u8>, String> {
+    let path = directory.path.join(name);
+    let file = directory.open_regular_file(name, context)?;
+    let metadata = file.metadata().map_err(|error| {
+        format!(
+            "cannot inspect opened {context} file '{}': {error}",
+            path.display()
+        )
+    })?;
+    if metadata.len() > max_bytes {
+        return Err(format!(
+            "{context} file '{}' is {} bytes; limit is {max_bytes}",
+            path.display(),
+            metadata.len()
+        ));
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.take(max_bytes.saturating_add(1))
+        .read_to_end(&mut bytes)
+        .map_err(|error| format!("cannot read {context} file '{}': {error}", path.display()))?;
+    if bytes.len() as u64 > max_bytes {
+        return Err(format!(
+            "{context} file '{}' grew beyond the {max_bytes} byte limit while it was read",
+            path.display()
+        ));
+    }
+    Ok(bytes)
+}
+
+fn digest_bytes(bytes: &[u8]) -> Result<Sha256Digest, String> {
+    Sha256Digest::new(crate::skills::content_sha256_hex(bytes))
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn rename_directory_no_replace(
+    source_parent: &PrivateDirectory,
+    source_name: &OsStr,
+    target_parent: &PrivateDirectory,
+    target_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_name = super::c_name(source_name)?;
+    let target_name = super::c_name(target_name)?;
+    let result = unsafe {
+        libc::renameat2(
+            source_parent.file.as_raw_fd(),
+            source_name.as_ptr(),
+            target_parent.file.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::RENAME_NOREPLACE,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(target_vendor = "apple")]
+fn rename_directory_no_replace(
+    source_parent: &PrivateDirectory,
+    source_name: &OsStr,
+    target_parent: &PrivateDirectory,
+    target_name: &OsStr,
+) -> std::io::Result<()> {
+    let source_name = super::c_name(source_name)?;
+    let target_name = super::c_name(target_name)?;
+    let result = unsafe {
+        libc::renameatx_np(
+            source_parent.file.as_raw_fd(),
+            source_name.as_ptr(),
+            target_parent.file.as_raw_fd(),
+            target_name.as_ptr(),
+            libc::RENAME_EXCL,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(std::io::Error::last_os_error())
+    }
+}
+
+#[cfg(all(
+    unix,
+    not(any(target_os = "linux", target_os = "android")),
+    not(target_vendor = "apple")
+))]
+fn rename_directory_no_replace(
+    _source_parent: &PrivateDirectory,
+    _source_name: &OsStr,
+    _target_parent: &PrivateDirectory,
+    _target_name: &OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory installation is unavailable on this platform",
+    ))
+}
+
+#[cfg(not(unix))]
+fn rename_directory_no_replace(
+    _source_parent: &PrivateDirectory,
+    _source_name: &OsStr,
+    _target_parent: &PrivateDirectory,
+    _target_name: &OsStr,
+) -> std::io::Result<()> {
+    Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "atomic no-replace directory installation is unavailable on this platform",
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use tempfile::TempDir;
 
     fn store() -> StoreId {
         StoreId::new("store-a").unwrap()
@@ -616,5 +1140,239 @@ mod tests {
             assert_eq!(decode_component(&encoded).unwrap(), value);
             assert!(encoded.len() <= 255);
         }
+    }
+
+    #[test]
+    fn store_create_open_is_no_clobber_and_rejects_a_different_identity() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let expected = store();
+
+        let created = PhysicalFileStoreV1::create_or_open(&session_root, expected.clone()).unwrap();
+        assert_eq!(created.store_id(), &expected);
+        let original = std::fs::read(PhysicalLayoutV1::store_record(&session_root)).unwrap();
+
+        let reopened =
+            PhysicalFileStoreV1::create_or_open(&session_root, expected.clone()).unwrap();
+        assert_eq!(reopened.store_id(), &expected);
+        assert_eq!(
+            std::fs::read(PhysicalLayoutV1::store_record(&session_root)).unwrap(),
+            original
+        );
+
+        let other = StoreId::new("store-other").unwrap();
+        let error = PhysicalFileStoreV1::create_or_open(&session_root, other).unwrap_err();
+        assert!(error.contains("store identity"), "{error}");
+        assert_eq!(
+            std::fs::read(PhysicalLayoutV1::store_record(&session_root)).unwrap(),
+            original
+        );
+    }
+
+    #[test]
+    fn store_open_rejects_corruption_without_rewriting_it() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        drop(PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap());
+        let path = PhysicalLayoutV1::store_record(&session_root);
+        let corrupt =
+            b"{\"record_type\":\"store\",\"physical_schema_revision\":99,\"store_id\":\"store-a\"}\n";
+        std::fs::write(&path, corrupt).unwrap();
+
+        let error = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap_err();
+        assert!(error.contains("unsupported physical schema"), "{error}");
+        assert_eq!(std::fs::read(path).unwrap(), corrupt);
+    }
+
+    #[test]
+    fn revision_candidate_round_trips_exact_bytes_and_digests() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision = revision("revision-a");
+        let canonical = b"{\"messages\":[{\"role\":\"user\",\"text\":\"hello\"}]}\n";
+
+        let installed = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision.clone(),
+                ExpectedRevision::Missing,
+                canonical,
+            )
+            .unwrap();
+        assert_eq!(installed.manifest().session_id, session);
+        assert_eq!(installed.manifest().revision_id, revision);
+        assert_eq!(
+            installed.manifest().canonical_sha256.as_str(),
+            crate::skills::content_sha256_hex(canonical)
+        );
+        assert_eq!(
+            installed.manifest_sha256().as_str(),
+            crate::skills::content_sha256_hex(&installed.manifest_bytes)
+        );
+
+        let opened = store.open_revision_candidate(&session, &revision).unwrap();
+        assert_eq!(opened.manifest(), installed.manifest());
+        assert_eq!(opened.manifest_sha256(), installed.manifest_sha256());
+        assert_eq!(opened.canonical_bytes(), canonical);
+        assert!(
+            std::fs::read_dir(PhysicalLayoutV1::staging_root(&session_root))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn revision_collision_preserves_the_first_candidate_exactly() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision = revision("revision-a");
+        let first = b"{\"value\":\"first\"}\n";
+        let second = b"{\"value\":\"second\"}\n";
+
+        store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision.clone(),
+                ExpectedRevision::Missing,
+                first,
+            )
+            .unwrap();
+        let error = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision.clone(),
+                ExpectedRevision::Missing,
+                second,
+            )
+            .unwrap_err();
+        assert!(!error.installed());
+        assert!(error.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            store
+                .open_revision_candidate(&session, &revision)
+                .unwrap()
+                .canonical_bytes(),
+            first
+        );
+        assert!(
+            std::fs::read_dir(PhysicalLayoutV1::staging_root(&session_root))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn post_install_sync_failure_reports_installed_and_keeps_verifiable_bytes() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision = revision("revision-a");
+        let canonical = b"{\"value\":\"installed-unconfirmed\"}\n";
+        store.inject_next_target_sync_failure();
+
+        let error = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision.clone(),
+                ExpectedRevision::Missing,
+                canonical,
+            )
+            .unwrap_err();
+        assert!(error.installed());
+        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert_eq!(
+            store
+                .open_revision_candidate(&session, &revision)
+                .unwrap()
+                .canonical_bytes(),
+            canonical
+        );
+    }
+
+    #[test]
+    fn exact_read_rejects_payload_tampering_and_manifest_retargeting() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision_a = revision("revision-a");
+        let revision_b = revision("revision-b");
+        for revision in [&revision_a, &revision_b] {
+            store
+                .install_revision_candidate(
+                    1,
+                    session.clone(),
+                    revision.clone(),
+                    ExpectedRevision::Missing,
+                    b"{\"value\":1}\n",
+                )
+                .unwrap();
+        }
+
+        std::fs::write(
+            PhysicalLayoutV1::canonical_payload(&session_root, &session, &revision_a),
+            b"{\"value\":2}\n",
+        )
+        .unwrap();
+        let error = store
+            .open_revision_candidate(&session, &revision_a)
+            .unwrap_err();
+        assert!(error.contains("digest mismatch"), "{error}");
+
+        let manifest_b = std::fs::read(PhysicalLayoutV1::revision_manifest(
+            &session_root,
+            &session,
+            &revision_b,
+        ))
+        .unwrap();
+        std::fs::write(
+            PhysicalLayoutV1::revision_manifest(&session_root, &session, &revision_a),
+            manifest_b,
+        )
+        .unwrap();
+        let error = store
+            .open_revision_candidate(&session, &revision_a)
+            .unwrap_err();
+        assert!(error.contains("identity does not match"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exact_read_refuses_symlinked_revision_content() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision = revision("revision-a");
+        store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision.clone(),
+                ExpectedRevision::Missing,
+                b"{\"value\":1}\n",
+            )
+            .unwrap();
+
+        let canonical = PhysicalLayoutV1::canonical_payload(&session_root, &session, &revision);
+        std::fs::remove_file(&canonical).unwrap();
+        symlink("/etc/passwd", &canonical).unwrap();
+        let error = store
+            .open_revision_candidate(&session, &revision)
+            .unwrap_err();
+        assert!(error.contains("cannot open canonical payload"), "{error}");
     }
 }
