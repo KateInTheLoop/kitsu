@@ -68,6 +68,10 @@ impl CanonicalSessionRevisionV1 {
     pub(super) fn selected_head(&self) -> &LogicalHead {
         &self.selected_head
     }
+
+    pub(super) fn has_artifacts(&self) -> bool {
+        !self.artifact_manifest.is_empty()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -128,12 +132,38 @@ struct CanonicalOperationV1 {
     retained_effects: Vec<RetainedEffectRefV1>,
 }
 
-struct CanonicalOperationInputV1 {
+pub(super) struct CanonicalOperationInputV1 {
     turn_id: TurnId,
     terminal: TerminalOutcome,
     messages: Vec<CanonicalMessageV1>,
     retained_effects: Vec<RetainedEffectRefV1>,
     new_artifacts: Vec<ImmutableArtifactRefV1>,
+}
+
+impl CanonicalOperationInputV1 {
+    pub(super) fn artifact_free_text(
+        turn_id: TurnId,
+        terminal: TerminalOutcome,
+        user_content: String,
+        assistant_content: Option<String>,
+    ) -> Self {
+        let mut messages = vec![CanonicalMessageV1::User {
+            content: user_content,
+        }];
+        if let Some(content) = assistant_content {
+            messages.push(CanonicalMessageV1::Assistant {
+                content,
+                tool_calls: Vec::new(),
+            });
+        }
+        Self {
+            turn_id,
+            terminal,
+            messages,
+            retained_effects: Vec::new(),
+            new_artifacts: Vec::new(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -438,7 +468,7 @@ pub(super) fn prepare_current_v1_legacy_baseline(
     build_current_v1_legacy_baseline(input, store_id, revision_id, committed_at)
 }
 
-fn append_complete_operation(
+pub(super) fn append_complete_operation(
     base: &CanonicalSessionRevisionV1,
     revision_id: RevisionId,
     committed_at: String,

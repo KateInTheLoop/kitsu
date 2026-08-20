@@ -11,7 +11,8 @@ use kitsu_core::session::{
 };
 
 use super::canonical::{
-    encode_canonical_payload, prepare_current_v1_legacy_baseline, CanonicalSessionRevisionV1,
+    append_complete_operation, encode_canonical_payload, prepare_current_v1_legacy_baseline,
+    CanonicalOperationInputV1, CanonicalSessionRevisionV1,
 };
 use super::physical::{PhysicalCandidateInstallError, PhysicalFileStoreV1, PhysicalHeadCasError};
 
@@ -135,6 +136,26 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             committed_at,
         )
         .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        self.commit(&payload)
+    }
+
+    fn commit_artifact_free_operation(
+        &self,
+        base: &CanonicalSessionRevisionV1,
+        revision_id: RevisionId,
+        committed_at: String,
+        input: CanonicalOperationInputV1,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        // This composition deliberately cannot publish new or inherited
+        // artifact references until physical artifact installation and closure
+        // verification have their own accepted fault matrix.
+        if base.has_artifacts() {
+            return Err(CanonicalTransactionErrorV1::before_identity(
+                "artifact-bearing canonical history requires durable physical artifact closure",
+            ));
+        }
+        let payload = append_complete_operation(base, revision_id, committed_at, input)
+            .map_err(CanonicalTransactionErrorV1::before_identity)?;
         self.commit(&payload)
     }
 
@@ -428,6 +449,281 @@ mod tests {
             {"role":"tool","content":"contents","tool_call_id":"call-1"},
             {"role":"assistant","content":"done"}
         ]))
+    }
+
+    fn legacy_payload(revision: &str) -> crate::session::canonical::CanonicalSessionRevisionV1 {
+        crate::session::canonical::prepare_current_v1_legacy_baseline(
+            &closed_current_v1(),
+            "session-1",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new(revision).unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap()
+    }
+
+    fn terminal(
+        run: &str,
+        class: kitsu_core::RunOutcomeClass,
+        assistant: kitsu_core::RunAssistantDisposition,
+    ) -> kitsu_core::TerminalOutcome {
+        kitsu_core::RunSpec::new(kitsu_core::RunId::new(run).unwrap()).terminal(class, assistant)
+    }
+
+    fn text_operation_input(
+        turn: &str,
+        run: &str,
+        class: kitsu_core::RunOutcomeClass,
+        disposition: kitsu_core::RunAssistantDisposition,
+        user: &str,
+        assistant: Option<&str>,
+    ) -> CanonicalOperationInputV1 {
+        CanonicalOperationInputV1::artifact_free_text(
+            kitsu_core::session::TurnId::new(turn).unwrap(),
+            terminal(run, class, disposition),
+            user.to_string(),
+            assistant.map(str::to_string),
+        )
+    }
+
+    #[test]
+    fn assembled_text_successor_publishes_exact_update_receipt_and_bytes() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let commit = transaction
+            .commit_artifact_free_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-new",
+                    "run-new",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "new question",
+                    Some("new answer"),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).base_revision(),
+            &ExpectedRevision::Exact(rev_a)
+        );
+        assert_eq!(receipt(&commit).new_revision(), &rev_b);
+        assert_eq!(
+            receipt(&commit).head(),
+            &kitsu_core::session::LogicalHead::Turn(
+                kitsu_core::session::TurnId::new("turn-new").unwrap()
+            )
+        );
+        let head = store.read_head(&session_id).unwrap().unwrap();
+        assert_eq!(head.revision_id(), &rev_b);
+        let decoded =
+            crate::session::canonical::decode_canonical_payload(head.candidate().canonical_bytes())
+                .unwrap();
+        assert_eq!(decoded.revision_id(), &rev_b);
+        assert_eq!(decoded.parent_revision(), receipt(&commit).base_revision());
+        assert_eq!(decoded.selected_head(), receipt(&commit).head());
+    }
+
+    #[test]
+    fn assembled_text_successor_rejects_stale_base_before_candidate_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        transaction
+            .commit_artifact_free_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-new",
+                    "run-new",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "new question",
+                    Some("new answer"),
+                ),
+            )
+            .unwrap();
+        let stale_revision = RevisionId::new("rev-stale").unwrap();
+
+        let error = transaction
+            .commit_artifact_free_operation(
+                &base,
+                stale_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-stale",
+                    "run-stale",
+                    kitsu_core::RunOutcomeClass::ProviderFault,
+                    kitsu_core::RunAssistantDisposition::Absent,
+                    "stale question",
+                    None,
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("conflict"));
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &stale_revision
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn assembled_text_successor_candidate_cut_keeps_old_head_and_exact_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        transaction.inject_next_after_candidate_failure();
+
+        let error = transaction
+            .commit_artifact_free_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-new",
+                    "run-new",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "new question",
+                    Some("new answer"),
+                ),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_b.clone(),
+                durability: CandidateDurabilityV1::Confirmed
+            }
+        );
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert!(store.open_revision_candidate(&session_id, &rev_b).is_ok());
+    }
+
+    #[test]
+    fn assembled_text_successor_head_sync_cut_is_new_visible_unconfirmed() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        store.inject_next_head_sync_failure();
+
+        let commit = transaction
+            .commit_artifact_free_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-new",
+                    "run-new",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "new question",
+                    Some("new answer"),
+                ),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).durability(),
+            CommitDurability::PublishedUnconfirmed
+        );
+        assert!(commit.durability_warning().is_some());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn assembled_text_successor_refuses_artifact_bearing_base_before_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let mut value =
+            serde_json::to_value(payload("store-1", "session-1", "rev-a", None, 1)).unwrap();
+        value["artifact_manifest"] = serde_json::json!([{
+            "artifact_schema":1,
+            "artifact_id":"artifact-old",
+            "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "bytes":4,
+            "media_type":"text/plain"
+        }]);
+        value["operations"][0]["retained_effects"] =
+            serde_json::json!([{"effect_id":"effect-old","artifact_ids":["artifact-old"]}]);
+        let artifact_base = crate::session::canonical::decode_canonical_payload(
+            &serde_json::to_vec(&value).unwrap(),
+        )
+        .unwrap();
+
+        let error = transaction
+            .commit_artifact_free_operation(
+                &artifact_base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-new",
+                    "run-new",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "new question",
+                    Some("new answer"),
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("physical artifact closure"));
+        assert!(error.not_published_outcome().is_none());
+        assert!(store.read_head(&session_id).unwrap().is_none());
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_b
+            )
+            .exists()
+        );
     }
 
     #[test]
