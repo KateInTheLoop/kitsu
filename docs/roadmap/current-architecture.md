@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 060.
+updates through Cycle 061.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -42,7 +42,7 @@ kernel.
 | Filesystem mutation | Canonical/descriptor checks, atomic install, exact preconditions, journaling, verified effects, and conflict-aware undo remain Kitsu-owned. | `crates/kitsu-tools/src/permissions.rs`; `crates/kitsu-tools/src/builtins/fs.rs` | Semantic context or external sources must use these authorization/mutation primitives, never replace them with fuzzy or in-place writes. |
 | Skills | Local bounded skills are discovered as untrusted instructions/resources with path/provenance checks; effects still cross ordinary tools. | `crates/kitsu/src/skills.rs:359,824-900,1514` | This is a declarative data plane, not executable configuration or a plugin loader. |
 | Events/JSONL | Core runtime events are projected by the CLI into versioned `kitsu.chat.v1`; the writer serializes whole records, flushes, and fails terminally. One neutral `RunSpec` supplies JSONL, private generations, and human completion. Human timing and JSONL `final_summary` carry the same exact run outcome/assistant tuple. Every `run_started` now adds the complete provider-route receipt while attempts carry the correlated generation; the new field is optional in the schema so legacy records remain valid. | `crates/kitsu-core/src/run.rs`; `crates/kitsu/src/main.rs`; `crates/kitsu-render/src/lib.rs`; `crates/kitsu-render/src/jsonl.rs`; `docs/schemas/kitsu-chat-v1.schema.json` | E02 is accepted for the default runtime and E04's two-adapter product suite proves receipt/attempt parity. Alternate host/runtime conformance remains open. |
-| Sessions | Production v1 still atomically stores one current `SavedSession` message vector plus gateway/model/project context. Fork copies the complete snapshot/artifact tree to a fresh identity without grants. The E03 ADR assigns target ownership; `kitsu-core::session` supplies the bounded neutral revision/HEAD contract and exact expected-revision admission. Public current-v1 reads and active save cross private transitional ports with unchanged bytes. Provider-free K04/K07/K08 fixtures pin logical publication, durability, stale conflict, and fencing. A private physical-v1 module now fixes a disjoint `.kitsu-store-v1` namespace, closed records, descriptor-pinned store/candidate I/O, exact verification, per-session OS writer fences, verified HEAD reads, exact current/parent admission, atomic HEAD create/replace, and installed-versus-durable publication truth. | `crates/kitsu/src/session.rs`; `crates/kitsu/src/session/physical.rs`; `crates/kitsu-core/src/session.rs`; `crates/kitsu-core/tests/session_k04.rs`; `crates/kitsu-core/tests/session_k07.rs`; `crates/kitsu-core/tests/session_k08.rs`; `scripts/check-session-boundary.sh`; `docs/roadmap/e03-canonical-session-adr.md` | The physical helper is deliberately unmounted: only isolated fixtures invoke its I/O, so it cannot make incomplete current-v1 history canonical. Complete canonical payload assembly, migration, branch-at-turn, recovery, and adapter parity remain open; X005 still fails. |
+| Sessions | Production v1 still atomically stores one current `SavedSession` message vector plus gateway/model/project context. Fork copies the complete snapshot/artifact tree to a fresh identity without grants. The E03 ADR assigns target ownership; `kitsu-core::session` supplies the bounded neutral revision/HEAD contract and exact expected-revision admission. Public current-v1 reads and active save cross private transitional ports with unchanged bytes. Provider-free K04/K07/K08 fixtures pin logical publication, durability, stale conflict, and fencing. Private binary modules now define the disjoint physical-v1 store plus a closed canonical payload: whole terminal operations, exact transcript/tool causality, selected ancestry, artifact/effect closure, compaction generations, and inert resume intent. A separate strict current-v1 decoder preserves the exact source digest but exposes missing-terminal and artifact-resolution blockers rather than fabricating migration truth. | `crates/kitsu/src/session.rs`; `crates/kitsu/src/session/physical.rs`; `crates/kitsu/src/session/canonical.rs`; `crates/kitsu-core/src/session.rs`; `crates/kitsu-core/tests/session_k04.rs`; `crates/kitsu-core/tests/session_k07.rs`; `crates/kitsu-core/tests/session_k08.rs`; `scripts/check-session-boundary.sh`; `docs/roadmap/e03-canonical-session-adr.md` | Both helpers are deliberately unmounted: only isolated fixtures invoke them, so incomplete current-v1 history cannot become canonical. Transaction composition, explicit migration, branch-at-turn, recovery, and adapter parity remain open; X005 still fails. |
 | External tools/hosts | No MCP dependency/client, long-lived child supervisor, bidirectional host adapter, daemon, or second principal is compiled. JSONL is one-way output. | workspace manifests and source search | X002-X004 remain failed; absence preserves the disabled path and avoids ambient authority. |
 
 ## What changed from the frozen research pin
@@ -73,6 +73,12 @@ kernel.
   an independent session continues. Cycle 058 compiles the disjoint physical-v1
   paths and records, solving dot-component, case-folding, length, no-clobber,
   version, digest, and identity-mismatch ambiguity without mounting migration.
+  Cycles 059-060 add descriptor-pinned immutable candidate installation and
+  writer-fenced exact-revision HEAD CAS. Cycle 061 adds a separately versioned,
+  closed canonical payload for whole terminal operations, exact artifact/effect
+  closure, and compaction ancestry/generations; strict current-v1 input retains
+  its exact source digest and reports unavailable terminal/artifact facts rather
+  than inferring them.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
