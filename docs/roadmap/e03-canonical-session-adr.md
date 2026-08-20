@@ -14,6 +14,8 @@ Cycle 064 composes that preparation with the private physical transaction as a
 create-only operation while keeping production behavior unmounted.
 Cycle 065 adds a pure, unmounted successor assembler for one complete new
 operation from neutral E02 terminal truth and closed transcript/effect facts.
+Cycle 066 composes only its artifact-free text subset with fenced file
+publication; artifact-bearing bases remain structurally refused.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -452,6 +454,16 @@ cannot weaken or replace any backend-neutral assertion.
    the old revision-bound compaction projection is cleared. Next compose an
    artifact-free assembled successor with the file transaction and stale/cut
    fixtures before physical artifact publication is designed.
+   **Artifact-free successor transaction complete in Cycle 066:** the only
+   cross-module operation-input constructor creates one user fact plus an
+   optional assistant fact and no tools, retained effects, or artifacts. The
+   composition also rejects any artifact-bearing base before fence/candidate.
+   A confirmed update stores a closed payload whose parent, new revision, and
+   selected HEAD equal the receipt; stale base allocates no candidate; a cut
+   after candidate keeps the old HEAD and reports confirmed unselected residue;
+   and a HEAD-directory sync cut exposes the new revision as published-
+   unconfirmed. Next define descriptor-pinned immutable artifact installation
+   and verification before widening this physical composition.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

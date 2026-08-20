@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 065. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 066. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -306,6 +306,10 @@ terminal plus bounded message/effect/artifact facts. It derives HEAD movement,
 requires fresh revision/time lineage and complete closure, retains legacy
 baseline/lineage, and drops the obsolete compaction binding. It remains
 unmounted.
+The first physical successor composition is restricted to artifact-free text.
+Its only cross-module constructor cannot express tools/effects/artifacts, an
+artifact-bearing base refuses before effects, and exact/stale/candidate/HEAD
+transaction cuts pass without changing production behavior.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -583,6 +587,7 @@ gates merely because a card appears attractive.
 | 063 | E03-S02-C12 | Define an exact current-v1 legacy baseline with fixed loss facts and typed artifact refusal |
 | 064 | E03-S02-C13 | Compose strict legacy preparation with create-only fenced publication and exact rollback/collision truth |
 | 065 | E03-S02-C14 | Assemble one pure canonical successor operation from neutral terminal and closed transcript/effect facts |
+| 066 | E03-S02-C15 | Publish only an artifact-free assembled successor through exact stale/candidate/HEAD transaction cuts |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -647,8 +652,9 @@ rollback bytes, including existing-HEAD zero-allocation, conflicting-orphan
 preservation, refusal before effects, and installed-unselected cut truth. Cycle
 065 completes the pure neutral whole-operation assembly seam. Cycle 066
 composes an artifact-free assembled successor with fenced file publication and
-proves stale/cut truth before physical artifact durability is introduced. The
-queue then continues through E03,
+proves exact update, stale zero-allocation, candidate residue, and HEAD
+durability truth. Cycle 067 defines descriptor-pinned immutable artifact
+closure before this path can widen. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
