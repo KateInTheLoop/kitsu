@@ -1,6 +1,7 @@
 //! kitsu-providers — the Provider trait and concrete adapters (OpenAI-compatible,
 //! gateways like the AI gateway). See docs/architecture.md.
 
+pub mod anthropic_messages;
 pub mod auth;
 pub mod error;
 pub mod openai_compat;

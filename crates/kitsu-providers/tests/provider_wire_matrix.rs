@@ -4,6 +4,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
+use kitsu_providers::anthropic_messages::{
+    AnthropicMessagesConfig, AnthropicMessagesProvider, ANTHROPIC_VERSION,
+};
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
@@ -49,6 +52,17 @@ fn provider_for_with_timeout(
             chat_path: chat_path.to_string(),
             models_path: None,
             retries: 0,
+            timeout,
+        },
+        Arc::new(NoAuth),
+    )
+}
+
+fn messages_provider_for(base_url: String, timeout: Duration) -> AnthropicMessagesProvider {
+    AnthropicMessagesProvider::new(
+        AnthropicMessagesConfig {
+            base_url,
+            messages_path: "/v1/messages".to_string(),
             timeout,
         },
         Arc::new(NoAuth),
@@ -244,6 +258,84 @@ async fn anthropic_messages_fixture_fails_against_the_compatible_chat_adapter() 
         error,
         kitsu_providers::ProviderError::InvalidResponse(_)
     ));
+}
+
+#[tokio::test]
+async fn native_messages_matches_exact_request_and_normalized_text_stream() {
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let mut stream = provider
+        .chat_stream(neutral_text_request())
+        .await
+        .expect("native Messages fixture starts");
+    let mut deltas = Vec::new();
+    while let Some(item) = stream.next().await {
+        deltas.push(item.expect("native Messages fixture decodes"));
+    }
+
+    let observed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("one Messages request captured");
+    assert_eq!(observed.body, fixture.request);
+    assert_eq!(
+        observed.anthropic_version.as_deref(),
+        Some(ANTHROPIC_VERSION)
+    );
+    assert_eq!(deltas, fixture.expected_deltas);
+}
+
+#[tokio::test]
+async fn native_messages_eof_is_not_terminal_success() {
+    let mut fixture = anthropic_messages_text();
+    let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";
+    fixture.stream = fixture
+        .stream
+        .strip_suffix(stop)
+        .expect("fixture has an explicit message_stop")
+        .to_string();
+    let server = MockServer::start().await;
+    mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let mut stream = provider
+        .chat_stream(neutral_text_request())
+        .await
+        .expect("HTTP success starts the stream");
+    let mut saw_done = false;
+    let mut saw_error = false;
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(kitsu_providers::ChatDelta::Done(_)) => saw_done = true,
+            Ok(_) => {}
+            Err(ProviderError::InvalidResponse(_)) => saw_error = true,
+            Err(other) => panic!("unexpected EOF error: {other}"),
+        }
+    }
+    assert!(!saw_done, "EOF cannot synthesize terminal success");
+    assert!(saw_error, "EOF must remain an explicit wire failure");
+}
+
+#[tokio::test]
+async fn native_messages_rejects_tools_before_send() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let error = match provider.chat_stream(neutral_tool_request()).await {
+        Ok(_) => panic!("unimplemented native tool wire reached transport"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::ToolsNotSupported));
 }
 
 #[test]
