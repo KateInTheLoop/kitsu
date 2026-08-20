@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 067. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 068. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -313,8 +313,11 @@ transaction cuts pass without changing production behavior.
 Physical v1 now has a separate session-scoped immutable artifact namespace.
 Closed manifests bind independent artifact schema, exact identity, length,
 SHA-256, and media type; staged descriptor-pinned install/read is no-overwrite
-and reports collision, tamper, symlink, and durability truth. It is not yet
-bound to canonical publication.
+and reports collision, tamper, symlink, and durability truth. Canonical
+publication now compares every artifact fact to exact verified physical state
+both before candidate allocation and after install before HEAD CAS. One complete
+tool/result/effect operation passes exact missing/mismatch/tamper/cut fixtures;
+verified artifact closure on canonical HEAD read remains next.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -594,6 +597,7 @@ gates merely because a card appears attractive.
 | 065 | E03-S02-C14 | Assemble one pure canonical successor operation from neutral terminal and closed transcript/effect facts |
 | 066 | E03-S02-C15 | Publish only an artifact-free assembled successor through exact stale/candidate/HEAD transaction cuts |
 | 067 | E03-S02-C16 | Add session-scoped immutable artifact records plus descriptor-pinned no-overwrite install and verification |
+| 068 | E03-S02-C17 | Bind complete canonical tool/effect publication to exact installed artifact closure before candidate and HEAD publication |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
