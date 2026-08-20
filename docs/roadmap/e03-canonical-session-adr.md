@@ -573,6 +573,17 @@ cannot weaken or replace any backend-neutral assertion.
    selected HEAD. Next split verified manifest-envelope reading from canonical
    payload verification so a selected physical payload/digest fault can expose
    only its already-bound parent link to the same bounded planner.
+   **Manifest-envelope recovery complete in Cycle 074:** HEAD reading first
+   verifies the selected revision manifest and its HEAD-bound digest while
+   retaining the descriptor-pinned revision directory. Canonical payload
+   existence, regular-file shape, length, and digest remain a separate upgrade;
+   the envelope carries no trusted payload. Recovery may cross missing or
+   digest-broken selected and intermediate payloads only through captured exact
+   parent-manifest links. An unverified manifest or future logical manifest
+   stops traversal. Ordinary lookup still fails on the selected corruption and
+   planning performs no write. Next define a pure new recovery revision with
+   complete skipped-revision and unavailable-blocker evidence; recovery remains
+   a new fenced publication, never an in-place HEAD pointer rollback.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

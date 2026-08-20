@@ -911,6 +911,29 @@ pub(super) struct VerifiedRevisionCandidateV1 {
     canonical_bytes: Vec<u8>,
 }
 
+/// A descriptor-pinned revision manifest whose bytes and physical identity are
+/// verified, but whose canonical payload has not been trusted or decoded.
+#[derive(Debug)]
+pub(super) struct VerifiedRevisionEnvelopeV1 {
+    directory: PrivateDirectory,
+    manifest: RevisionManifestV1,
+    manifest_sha256: Sha256Digest,
+}
+
+impl VerifiedRevisionEnvelopeV1 {
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        self.manifest.revision_id()
+    }
+
+    pub(super) fn manifest(&self) -> &RevisionManifestV1 {
+        &self.manifest
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+}
+
 #[derive(Debug)]
 pub(super) struct PhysicalWriterFenceV1 {
     store_id: StoreId,
@@ -952,6 +975,26 @@ impl VerifiedRevisionHeadV1 {
 
     pub(super) fn candidate(&self) -> &VerifiedRevisionCandidateV1 {
         &self.candidate
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VerifiedRevisionHeadEnvelopeV1 {
+    record: HeadRecordV1,
+    envelope: VerifiedRevisionEnvelopeV1,
+}
+
+impl VerifiedRevisionHeadEnvelopeV1 {
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        &self.record.revision_id
+    }
+
+    pub(super) fn manifest(&self) -> &RevisionManifestV1 {
+        self.envelope.manifest()
+    }
+
+    pub(super) fn envelope(&self) -> &VerifiedRevisionEnvelopeV1 {
+        &self.envelope
     }
 }
 
@@ -1198,6 +1241,23 @@ impl PhysicalFileStoreV1 {
         &self,
         session_id: &SessionId,
     ) -> Result<Option<VerifiedRevisionHeadV1>, PhysicalHeadReadErrorV1> {
+        let Some(head) = self.read_head_envelope(session_id)? else {
+            return Ok(None);
+        };
+        let revision_id = head.revision_id().clone();
+        let candidate = self
+            .verify_revision_candidate(head.envelope())
+            .map_err(|error| PhysicalHeadReadErrorV1::at_revision(revision_id, error))?;
+        Ok(Some(VerifiedRevisionHeadV1 {
+            record: head.record,
+            candidate,
+        }))
+    }
+
+    pub(super) fn read_head_envelope(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<VerifiedRevisionHeadEnvelopeV1>, PhysicalHeadReadErrorV1> {
         let head_name = format!("{}.json", encode_component(session_id.as_str()));
         match self.heads.entry_kind(OsStr::new(&head_name)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
@@ -1229,22 +1289,22 @@ impl PhysicalFileStoreV1 {
             PhysicalHeadReadErrorV1::before_revision(PhysicalReadErrorV1::Malformed(message))
         })?;
         let record = decode_head_record_classified(&bytes, self.store_id(), session_id)?;
-        let candidate = self
-            .open_revision_candidate(session_id, &record.revision_id)
+        let envelope = self
+            .open_revision_envelope(session_id, &record.revision_id)
             .map_err(|error| {
                 PhysicalHeadReadErrorV1::at_revision(record.revision_id.clone(), error)
             })?;
-        if candidate.manifest_sha256 != record.revision_manifest_sha256 {
+        if envelope.manifest_sha256 != record.revision_manifest_sha256 {
             return Err(PhysicalHeadReadErrorV1::at_revision(
                 record.revision_id.clone(),
                 PhysicalReadErrorV1::DigestMismatch(format!(
                     "physical HEAD manifest digest mismatch: HEAD declares {}, observed {}",
                     record.revision_manifest_sha256.as_str(),
-                    candidate.manifest_sha256.as_str()
+                    envelope.manifest_sha256.as_str()
                 )),
             ));
         }
-        Ok(Some(VerifiedRevisionHeadV1 { record, candidate }))
+        Ok(Some(VerifiedRevisionHeadEnvelopeV1 { record, envelope }))
     }
 
     pub(super) fn compare_and_swap_head(
@@ -1779,6 +1839,15 @@ impl PhysicalFileStoreV1 {
         session_id: &SessionId,
         revision_id: &RevisionId,
     ) -> Result<VerifiedRevisionCandidateV1, PhysicalReadErrorV1> {
+        let envelope = self.open_revision_envelope(session_id, revision_id)?;
+        self.verify_revision_candidate(&envelope)
+    }
+
+    pub(super) fn open_revision_envelope(
+        &self,
+        session_id: &SessionId,
+        revision_id: &RevisionId,
+    ) -> Result<VerifiedRevisionEnvelopeV1, PhysicalReadErrorV1> {
         let session_name = encode_component(session_id.as_str());
         let revision_name = encode_component(revision_id.as_str());
         match self.revisions.entry_kind(OsStr::new(&session_name)) {
@@ -1864,35 +1933,72 @@ impl PhysicalFileStoreV1 {
             session_id,
             revision_id,
         )?;
-        require_regular(OsStr::new(CANONICAL_PAYLOAD_NAME), "canonical payload")?;
+        let manifest_sha256 =
+            digest_bytes(&manifest_bytes).map_err(PhysicalReadErrorV1::Malformed)?;
+        Ok(VerifiedRevisionEnvelopeV1 {
+            directory: revision,
+            manifest,
+            manifest_sha256,
+        })
+    }
+
+    pub(super) fn verify_revision_candidate(
+        &self,
+        envelope: &VerifiedRevisionEnvelopeV1,
+    ) -> Result<VerifiedRevisionCandidateV1, PhysicalReadErrorV1> {
+        if envelope.manifest.store_id() != self.store_id() {
+            return Err(PhysicalReadErrorV1::IdentityMismatch(
+                "revision envelope belongs to a different physical store".to_string(),
+            ));
+        }
+        let revision = &envelope.directory;
+        match revision.entry_kind(OsStr::new(CANONICAL_PAYLOAD_NAME)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PhysicalReadErrorV1::MissingReference(format!(
+                    "canonical payload '{}' is missing",
+                    revision.path.join(CANONICAL_PAYLOAD_NAME).display()
+                )));
+            }
+            Ok(PrivateEntryKind::File) => {}
+            Ok(_) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "cannot open canonical payload '{}': not a regular file",
+                    revision.path.join(CANONICAL_PAYLOAD_NAME).display()
+                )));
+            }
+            Err(error) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "cannot inspect canonical payload '{}': {error}",
+                    revision.path.join(CANONICAL_PAYLOAD_NAME).display()
+                )));
+            }
+        }
         let canonical_bytes = read_bounded_regular(
-            &revision,
+            revision,
             OsStr::new(CANONICAL_PAYLOAD_NAME),
             MAX_CANONICAL_PAYLOAD_BYTES,
             "canonical payload",
         )
         .map_err(PhysicalReadErrorV1::Malformed)?;
-        if canonical_bytes.len() as u64 != manifest.canonical_bytes {
+        if canonical_bytes.len() as u64 != envelope.manifest.canonical_bytes {
             return Err(PhysicalReadErrorV1::DigestMismatch(format!(
                 "canonical payload length mismatch: manifest declares {}, read {}",
-                manifest.canonical_bytes,
+                envelope.manifest.canonical_bytes,
                 canonical_bytes.len()
             )));
         }
         let observed_digest =
             digest_bytes(&canonical_bytes).map_err(PhysicalReadErrorV1::Malformed)?;
-        if observed_digest != manifest.canonical_sha256 {
+        if observed_digest != envelope.manifest.canonical_sha256 {
             return Err(PhysicalReadErrorV1::DigestMismatch(format!(
                 "canonical payload digest mismatch: manifest declares {}, observed {}",
-                manifest.canonical_sha256.as_str(),
+                envelope.manifest.canonical_sha256.as_str(),
                 observed_digest.as_str()
             )));
         }
-        let manifest_sha256 =
-            digest_bytes(&manifest_bytes).map_err(PhysicalReadErrorV1::Malformed)?;
         Ok(VerifiedRevisionCandidateV1 {
-            manifest,
-            manifest_sha256,
+            manifest: envelope.manifest.clone(),
+            manifest_sha256: envelope.manifest_sha256.clone(),
             canonical_bytes,
         })
     }
