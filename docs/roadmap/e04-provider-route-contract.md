@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 042.
+Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 043.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -21,7 +21,10 @@ mid-stream/malformed, size-bound, timeout, and cancellation parity. Attempt
 telemetry, route composition, and common conformance remain E04-S04; complete
 route receipts remain E04-S05. Cycle 042 adds exactly one terminal native
 attempt observation across success, rejection, decode/body failure, timeout,
-send cancellation, and accepted-body cancellation.
+send cancellation, and accepted-body cancellation. Cycle 043 publishes an
+exact native declaration and immutable frozen-auth snapshot, exercises it
+through the common route handle, and rejects retry/catalog policy the adapter
+cannot yet honor.
 
 ## Decision
 
@@ -55,7 +58,9 @@ implementation it actually constructs.
   tools, structured output, and usage normalization; it advertises model
   catalog only when a non-empty `models_path` is configured, and never image
   input. Its catalog-only declaration advertises exactly `model_catalog` and
-  rejects any inference capability before publication.
+  rejects any inference capability before publication. The native Messages
+  declaration advertises exactly streaming, tools, and usage: no image input,
+  structured output, or catalog.
 - `ProviderRouteGeneration` is a nonzero monotonic identity. Zero cannot look
   like a published generation.
 - `ProviderWireRevision` names an exact compiled protocol revision and must
@@ -81,6 +86,11 @@ implementation it actually constructs.
 - `FrozenAuth` resolves a sensitive header once into zeroizing storage. All
   inference retries and catalog calls owned by the snapshot share that same
   auth object; later environment changes cannot alter an admitted generation.
+- `build_anthropic_messages_route` requires the exact native declaration before
+  acquiring auth, freezes the selected auth source once, constructs generation
+  one, and refuses nonzero inference retries or any catalog policy. The same
+  runtime owner occupies the snapshot's private slots, but missing catalog
+  capability prevents catalog entry before either runtime can be reached.
 - `ProviderRouteCurrent<P>` owns the one process-local current snapshot behind
   a bounded in-process read/write lock. `bind` returns a
   `ProviderRouteHandle<P>` tied to that immutable generation; every logical
@@ -174,7 +184,12 @@ bounded error-body handling, malformed/error events, line and aggregate
 ceilings, deadline timeout, and cancellation all fail without a second send.
 Cycle 042 owns the native send and response-body lifecycles with guards: a 2xx
 header is never success, dropping either phase records cancellation, and every
-physical send has one terminal common event. These cards still do not:
+physical send has one terminal common event. Cycle 043 adds the exact native
+streaming/tools/usage declaration and a factory that validates policy before
+auth acquisition, freezes auth once, and publishes the adapter as generation
+one. Common handle fixtures prove generation-attributed attempts, optional
+catalog absence, and structured-output rejection without a second physical
+send. Production flavor selection remains unchanged. These cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
@@ -186,9 +201,8 @@ physical send has one terminal common event. These cards still do not:
 flavor-to-adapter switch. There is no title-generation provider call in current
 Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
 constructor is confined to compiled provider factories and provider tests. The
-next card constructs a frozen native route generation with a truthful native
-declaration and exercises it through the common bound handle without enabling
-live configuration selection.
+next card adds bounded transient retry/backoff and cancellation parity inside
+one frozen native generation without enabling live configuration selection.
 
 ## Acceptance and rollback
 
@@ -202,10 +216,10 @@ cargo test -p kitsu-providers --test provider_route_handle
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, four snapshot, twelve
+Six route-contract, four declaration/derivation, four snapshot, twelve
 route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
 selection, doctor/catalog-without-model, generation-aware
-compaction/subagent/replay/JSONL, and twenty-six wire-matrix cases pass offline.
+compaction/subagent/replay/JSONL, and twenty-seven wire-matrix cases pass offline.
 The native slices prove exact distinct text and tool request/header shapes,
 normalized text/tool/usage/terminal output, EOF-as-failure, pre-send malformed
 tool-input rejection, and the 1 MiB streamed argument bound. Native fault cases
@@ -214,6 +228,9 @@ malformed/mid-stream rejection, independent line/aggregate ceilings, timeout,
 and cancellation with exactly one send. Native attempt fixtures add terminal
 body success, HTTP rejection,
 decode failure, header timeout/cancellation, and accepted-body cancellation.
+The native route fixture additionally proves exact capability truth,
+once-frozen auth, typed unsupported-policy errors, common-handle generation
+attribution, catalog absence, and structured-output zero-send admission.
 The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting

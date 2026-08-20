@@ -122,3 +122,29 @@ fn current_compatible_chat_declaration_has_truthful_explicit_capabilities() {
         }
     );
 }
+
+#[test]
+fn native_messages_declaration_is_truthful_and_narrow() {
+    let declaration = ProviderRouteDeclaration::native_messages_v1(
+        ProviderProfileId::derive_v1(b"namespace", b"native-messages").unwrap(),
+    );
+    assert_eq!(declaration.adapter(), ProviderAdapterId::AnthropicMessages);
+    assert_eq!(
+        declaration.wire_revision(),
+        ProviderWireRevision::AnthropicMessages2023_06_01
+    );
+    assert_eq!(
+        declaration.capabilities().supported().collect::<Vec<_>>(),
+        vec![
+            ProviderCapability::Streaming,
+            ProviderCapability::Tools,
+            ProviderCapability::Usage,
+        ]
+    );
+    assert!(!declaration
+        .capabilities()
+        .supports(ProviderCapability::StructuredOutput));
+    assert!(!declaration
+        .capabilities()
+        .supports(ProviderCapability::ModelCatalog));
+}

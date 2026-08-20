@@ -5,15 +5,18 @@ use std::time::Duration;
 
 use futures::StreamExt;
 use kitsu_providers::anthropic_messages::{
-    AnthropicMessagesConfig, AnthropicMessagesProvider, ANTHROPIC_VERSION,
+    build_anthropic_messages_route, AnthropicMessagesConfig, AnthropicMessagesProvider,
+    AnthropicMessagesRouteBuildError, AnthropicMessagesRouteConfig, ANTHROPIC_VERSION,
 };
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, Provider, ProviderAdapterId, ProviderAttemptCategory,
-    ProviderAttemptOutcome, ProviderCapabilities, ProviderCapability, ProviderError,
-    ProviderProfileId, ProviderResponsePart, ProviderRouteContractError, ProviderRouteGeneration,
-    ProviderRouteIdentity, ProviderTelemetrySink, ProviderWireRevision, ToolCall, ToolDescriptor,
+    ProviderAttemptOutcome, ProviderAuthSource, ProviderCapabilities, ProviderCapability,
+    ProviderCatalogPolicy, ProviderError, ProviderProfileId, ProviderResponsePart,
+    ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderRouteGeneration, ProviderRouteIdentity, ProviderRoutePolicy, ProviderTelemetrySink,
+    ProviderWireRevision, ToolCall, ToolDescriptor,
 };
 use support::provider_wire_fixture::{
     anthropic_messages_malformed_event, anthropic_messages_midstream_error,
@@ -837,6 +840,117 @@ async fn native_messages_reports_one_terminal_attempt_for_every_lifecycle() {
         None,
         ProviderAttemptOutcome::Cancelled,
     );
+}
+
+#[tokio::test]
+async fn native_messages_route_is_frozen_truthful_and_generation_attributed() {
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let declaration = ProviderRouteDeclaration::native_messages_v1(
+        ProviderProfileId::derive_v1(b"wire-matrix", b"native-route").unwrap(),
+    );
+    let policy = ProviderRoutePolicy::new(
+        0,
+        0,
+        Duration::from_secs(2),
+        Duration::from_secs(2),
+        Duration::from_secs(1),
+        ProviderCatalogPolicy::Unavailable,
+    )
+    .unwrap();
+    let snapshot = build_anthropic_messages_route(
+        AnthropicMessagesRouteConfig {
+            declaration,
+            model: "fixture-model-v1".to_string(),
+            auth_source: ProviderAuthSource::None,
+            base_url: server.uri(),
+            messages_path: "/v1/messages".to_string(),
+            policy,
+        },
+        &NoAuth,
+    )
+    .expect("native route publishes");
+    assert_eq!(
+        snapshot.identity().adapter(),
+        ProviderAdapterId::AnthropicMessages
+    );
+    assert_eq!(
+        snapshot.identity().wire_revision(),
+        ProviderWireRevision::AnthropicMessages2023_06_01
+    );
+    let current = ProviderRouteCurrent::new(snapshot);
+    let handle = current.bind().unwrap();
+    let observations = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&observations);
+    let sink = ProviderTelemetrySink::with_fallible_context_observer(move |event| {
+        observed.lock().unwrap().push(event);
+        true
+    });
+    let mut stream = handle
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("bound native request starts");
+    while let Some(item) = stream.next().await {
+        item.expect("bound native request decodes");
+    }
+    assert_eq!(
+        captured.lock().unwrap().as_ref().unwrap().body,
+        fixture.request
+    );
+    {
+        let observations = observations.lock().unwrap();
+        assert_eq!(observations.len(), 1);
+        assert_eq!(
+            observations[0].route_generation.unwrap().get(),
+            1,
+            "route handle, not adapter, attributes the attempt"
+        );
+    }
+    assert_eq!(handle.list_models().await.unwrap(), None);
+    let mut unsupported = neutral_text_request();
+    unsupported.response_format = Some(kitsu_providers::JsonSchemaFormat {
+        name: "native-unsupported".to_string(),
+        schema: serde_json::json!({"type": "object"}),
+        strict: true,
+    });
+    let error = match handle.chat_stream(unsupported).await {
+        Ok(_) => panic!("native structured output bypassed route capability admission"),
+        Err(error) => error,
+    };
+    assert!(matches!(
+        error,
+        ProviderError::RouteContract(ProviderRouteContractError::UnsupportedCapability {
+            capability: ProviderCapability::StructuredOutput,
+        })
+    ));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+
+    let invalid = build_anthropic_messages_route(
+        AnthropicMessagesRouteConfig {
+            declaration: ProviderRouteDeclaration::native_messages_v1(
+                ProviderProfileId::derive_v1(b"wire-matrix", b"native-invalid").unwrap(),
+            ),
+            model: "fixture-model-v1".to_string(),
+            auth_source: ProviderAuthSource::None,
+            base_url: "http://127.0.0.1:1".to_string(),
+            messages_path: "/v1/messages".to_string(),
+            policy: ProviderRoutePolicy::new(
+                1,
+                0,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                ProviderCatalogPolicy::Unavailable,
+            )
+            .unwrap(),
+        },
+        &NoAuth,
+    );
+    assert!(matches!(
+        invalid,
+        Err(AnthropicMessagesRouteBuildError::UnsupportedInferenceRetries { configured: 1 })
+    ));
 }
 
 #[tokio::test]
