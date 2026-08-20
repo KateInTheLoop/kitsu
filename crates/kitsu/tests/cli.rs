@@ -2370,6 +2370,178 @@ async fn test_chat_no_tools_omits_every_model_tool() {
 
 #[tokio::test]
 #[serial]
+async fn explicit_anthropic_messages_adapter_drives_the_live_native_wire() {
+    use wiremock::matchers::{header, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let sse = [
+        concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_cli_native","type":"message","role":"assistant","content":[],"model":"native-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":8,"output_tokens":0}}}"#
+        ),
+        concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello from native Messages"}}"#
+        ),
+        concat!(
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#
+        ),
+        concat!(
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":4}}"#
+        ),
+        concat!(
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#
+        ),
+    ]
+    .join("\n\n");
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .and(header("anthropic-version", "2023-06-01"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(format!("{sse}\n\n")),
+        )
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "native"
+
+[gateways.native]
+flavor = "anthropic"
+adapter = "anthropic-messages"
+base_url = "{}"
+chat_path = "/v1/messages"
+models_path = ""
+model = "native-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.args([
+            "--max-output-tokens",
+            "64",
+            "chat",
+            "--no-tools",
+            "hello native",
+        ]);
+        cmd.assert()
+            .success()
+            .stdout(predicate::str::contains("hello from native Messages"));
+
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args(["doctor", "--inference", "--json"])
+            .output()
+            .expect("run native inference doctor");
+        assert!(
+            output.status.success(),
+            "stderr: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["effective_model"], "native-model");
+    })
+    .await
+    .expect("native CLI process should join");
+
+    let requests = server.received_requests().await.expect("record request");
+    assert_eq!(requests.len(), 2);
+    let chat_body: serde_json::Value = serde_json::from_slice(&requests[0].body).unwrap();
+    assert_eq!(chat_body["model"], "native-model");
+    assert_eq!(chat_body["max_tokens"], 64);
+    assert_eq!(chat_body["stream"], true);
+    assert_eq!(
+        chat_body["messages"],
+        serde_json::json!([{
+            "role": "user",
+            "content": "hello native"
+        }])
+    );
+    assert!(chat_body.get("system").is_some());
+    assert!(chat_body.get("tools").is_none());
+    assert!(chat_body.get("stream_options").is_none());
+
+    let doctor_body: serde_json::Value = serde_json::from_slice(&requests[1].body).unwrap();
+    assert_eq!(doctor_body["model"], "native-model");
+    assert_eq!(doctor_body["max_tokens"], 1);
+    assert_eq!(doctor_body["stream"], true);
+    assert_eq!(
+        doctor_body["messages"],
+        serde_json::json!([{"role": "user", "content": "Reply OK."}])
+    );
+    assert!(doctor_body.get("tools").is_none());
+}
+
+#[tokio::test]
+#[serial]
+async fn native_adapter_rejects_model_catalog_before_any_network_send() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    let kitsu_dir = home.path().join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).unwrap();
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "native"
+
+[gateways.native]
+flavor = "anthropic"
+adapter = "anthropic-messages"
+base_url = "{}"
+chat_path = "/v1/messages"
+models_path = "/v1/models"
+model = "native-model"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+    tokio::task::spawn_blocking(move || {
+        let mut cmd = base_cmd(&home_path);
+        cmd.arg("models");
+        cmd.assert().failure().stderr(predicate::str::contains(
+            "anthropic-messages adapter does not implement model catalog discovery",
+        ));
+    })
+    .await
+    .expect("native catalog refusal process should join");
+
+    assert!(server
+        .received_requests()
+        .await
+        .expect("inspect requests")
+        .is_empty());
+}
+
+#[tokio::test]
+#[serial]
 async fn test_chat_no_tools_composes_with_named_session_fork_and_resume_after_rebase() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};

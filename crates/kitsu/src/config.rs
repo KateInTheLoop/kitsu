@@ -43,10 +43,22 @@ pub struct Config {
 /// A single named gateway profile. Unknown keys are rejected loudly: a typo
 /// like `token_env` (the real key is `auth.env`) silently changing behavior
 /// cost a cycle-14 audit journey its credentials.
+#[derive(Debug, Clone, Copy, Default, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum GatewayAdapter {
+    #[default]
+    CompatibleChat,
+    AnthropicMessages,
+}
+
 #[derive(Debug, Clone, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct Gateway {
     pub flavor: String,
+    /// Closed compiled wire selection. Legacy flavor-only profiles retain the
+    /// compatible Chat adapter; native Messages requires this explicit value.
+    #[serde(default)]
+    pub adapter: GatewayAdapter,
     pub base_url: String,
     #[serde(default = "default_chat_path")]
     pub chat_path: String,
@@ -403,6 +415,7 @@ mod tests {
         // And via the enclosing Gateway/Config (which derive Debug).
         let gw = Gateway {
             flavor: "openai".to_string(),
+            adapter: GatewayAdapter::CompatibleChat,
             base_url: "https://x".to_string(),
             chat_path: default_chat_path(),
             models_path: None,
@@ -448,6 +461,35 @@ mod tests {
             .expect_err("privacy-sensitive top-level typos must be rejected");
         assert!(error.message().contains("unknown field"));
         assert!(error.message().contains("artifact_stroage"));
+    }
+
+    #[test]
+    fn provider_adapter_is_closed_explicit_and_backward_compatible() {
+        let legacy: Config = toml::from_str(
+            "[gateways.legacy]\nflavor = \"anthropic\"\nbase_url = \"https://example.invalid\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            legacy.gateways["legacy"].adapter,
+            GatewayAdapter::CompatibleChat,
+            "a flavor label must never silently select a different wire"
+        );
+
+        let native: Config = toml::from_str(
+            "[gateways.native]\nflavor = \"anthropic\"\nadapter = \"anthropic-messages\"\nbase_url = \"https://example.invalid\"\nchat_path = \"/v1/messages\"\n",
+        )
+        .unwrap();
+        assert_eq!(
+            native.gateways["native"].adapter,
+            GatewayAdapter::AnthropicMessages
+        );
+
+        let error = toml::from_str::<Config>(
+            "[gateways.bad]\nflavor = \"anthropic\"\nadapter = \"messages-ish\"\nbase_url = \"https://example.invalid\"\n",
+        )
+        .expect_err("unknown adapter names must fail closed");
+        assert!(error.message().contains("unknown variant"));
+        assert!(error.message().contains("messages-ish"));
     }
 
     #[test]

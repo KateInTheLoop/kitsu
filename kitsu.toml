@@ -90,14 +90,15 @@ models_path = "/v1/models"
 model       = "gpt-4o-mini"
 auth        = { method = "bearer-env", env = "OPENAI_API_KEY", refresh_hint = "create a key at https://platform.openai.com/api-keys and `export OPENAI_API_KEY=sk-...`" }
 
-# ── Anthropic direct, via its OpenAI-compatible endpoint (hosted) ────────────
+# ── Anthropic direct, via Kitsu's compiled native Messages adapter ──────────
 # Requires a developer API key (sk-ant-...) from console.anthropic.com — a
 # claude.ai Pro/Max subscription login does NOT work here. Anthropic requires a
 # max_tokens, so pass `--max-output-tokens N`.
 [gateways.anthropic]
-flavor      = "openai"
+flavor      = "anthropic"
+adapter     = "anthropic-messages"
 base_url    = "https://api.anthropic.com"
-chat_path   = "/v1/chat/completions"
-models_path = "/v1/models"
+chat_path   = "/v1/messages"
+models_path = ""
 model       = "claude-opus-4-8"
-auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "", refresh_hint = "create a key at https://console.anthropic.com/settings/keys and `export ANTHROPIC_API_KEY=sk-ant-...`" }
+auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", header = "x-api-key", scheme = "", expires_env = "", refresh_hint = "create a key at https://console.anthropic.com/settings/keys and `export ANTHROPIC_API_KEY=sk-ant-...`" }

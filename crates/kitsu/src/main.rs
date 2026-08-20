@@ -27,16 +27,21 @@ use clap::Parser;
 use rustyline::ExternalPrinter as _;
 
 use cli::{AuthCommand, Cli, Command, SessionCommand};
-use config::{Config, ConfigError, Gateway};
+use config::{Config, ConfigError, Gateway, GatewayAdapter};
 use kitsu_core::context::{
     clamp_window_for_shortfall, estimate_str, ContextBudget, ContextMeter, DEFAULT_CONTEXT_WINDOW,
 };
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
+use kitsu_providers::anthropic_messages::{
+    AnthropicMessagesRouteBuildError, AnthropicMessagesRouteConfig,
+};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
+use kitsu_providers::compiled::{
+    build_compiled_catalog_route, build_compiled_provider_route, CompiledProvider,
+    CompiledProviderRouteBuildError, CompiledProviderRouteConfig,
+};
 use kitsu_providers::openai_compat::{
-    build_openai_compatible_catalog_route, build_openai_compatible_route,
-    OpenAICompatCatalogRouteConfig, OpenAICompatProvider, OpenAICompatRouteBuildError,
-    OpenAICompatRouteConfig,
+    OpenAICompatCatalogRouteConfig, OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
 };
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
@@ -3734,7 +3739,7 @@ fn print_doctor_human(report: &serde_json::Value) {
 }
 
 async fn minimal_inference_probe(
-    provider: &ProviderRouteHandle<OpenAICompatProvider>,
+    provider: &ProviderRouteHandle<CompiledProvider>,
     model: &str,
 ) -> Result<(), ProviderError> {
     use futures::StreamExt as _;
@@ -3743,7 +3748,11 @@ async fn minimal_inference_probe(
         model: model.to_string(),
         messages: vec![ChatMessage::user("Reply OK.")],
         tools: None,
-        stream: false,
+        // Native Messages is streaming-only. Choose from the immutable route
+        // identity, not the mutable gateway label, so this auxiliary request
+        // cannot drift onto a different wire than the route it probes.
+        stream: provider.identity().adapter()
+            == kitsu_providers::ProviderAdapterId::AnthropicMessages,
         temperature: None,
         reasoning_effort: None,
         max_tokens: Some(1),
@@ -3766,10 +3775,63 @@ async fn minimal_inference_probe(
     }
 }
 
-fn route_build_provider_error(error: OpenAICompatRouteBuildError) -> ProviderError {
+fn route_build_cli_error(
+    error: CompiledProviderRouteBuildError,
+    operation: ProviderOperation<'_>,
+    diagnostics: ProviderDiagnosticContext,
+) -> CliError {
     match error {
-        OpenAICompatRouteBuildError::Auth(error) => ProviderError::Auth(error),
-        OpenAICompatRouteBuildError::Contract(error) => ProviderError::RouteContract(error),
+        CompiledProviderRouteBuildError::CompatibleChat(OpenAICompatRouteBuildError::Auth(
+            error,
+        ))
+        | CompiledProviderRouteBuildError::AnthropicMessages(
+            AnthropicMessagesRouteBuildError::Auth(error),
+        ) => map_provider_error_with_diagnostics(
+            ProviderError::Auth(error),
+            operation,
+            None,
+            diagnostics,
+        ),
+        CompiledProviderRouteBuildError::Contract(error)
+        | CompiledProviderRouteBuildError::CompatibleChat(OpenAICompatRouteBuildError::Contract(
+            error,
+        ))
+        | CompiledProviderRouteBuildError::AnthropicMessages(
+            AnthropicMessagesRouteBuildError::Contract(error),
+        ) => CliError::user(format!("config error: invalid provider route: {error}")),
+        error => CliError::user(format!("config error: {error}")),
+    }
+}
+
+fn compiled_provider_route_config(
+    gateway: &Gateway,
+    declaration: ProviderRouteDeclaration,
+    model: String,
+    auth_source: ProviderAuthSource,
+    policy: ProviderRoutePolicy,
+) -> CompiledProviderRouteConfig {
+    match gateway.adapter {
+        GatewayAdapter::CompatibleChat => {
+            CompiledProviderRouteConfig::CompatibleChat(OpenAICompatRouteConfig {
+                declaration,
+                model,
+                auth_source,
+                base_url: gateway.base_url.clone(),
+                chat_path: gateway.chat_path.clone(),
+                models_path: gateway.models_path.clone().filter(|path| !path.is_empty()),
+                policy,
+            })
+        }
+        GatewayAdapter::AnthropicMessages => {
+            CompiledProviderRouteConfig::AnthropicMessages(AnthropicMessagesRouteConfig {
+                declaration,
+                model,
+                auth_source,
+                base_url: gateway.base_url.clone(),
+                messages_path: gateway.chat_path.clone(),
+                policy,
+            })
+        }
     }
 }
 
@@ -3781,7 +3843,7 @@ fn build_inference_management_route(
     auth_source: ProviderAuthSource,
     auth: &dyn AuthProvider,
     timeout: Duration,
-) -> Result<ProviderRouteHandle<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+) -> Result<ProviderRouteHandle<CompiledProvider>, CompiledProviderRouteBuildError> {
     let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
     let catalog_policy = if models_path.is_some() {
         ProviderCatalogPolicy::Configured
@@ -3790,18 +3852,9 @@ fn build_inference_management_route(
     };
     let declaration = current_provider_route_declaration(config_path, gateway_name, gateway)?;
     let policy = ProviderRoutePolicy::new(0, 0, timeout, timeout, timeout, catalog_policy)?;
-    let snapshot = build_openai_compatible_route(
-        OpenAICompatRouteConfig {
-            declaration,
-            model,
-            auth_source,
-            base_url: gateway.base_url.clone(),
-            chat_path: gateway.chat_path.clone(),
-            models_path,
-            policy,
-        },
-        auth,
-    )?;
+    let route_config =
+        compiled_provider_route_config(gateway, declaration, model, auth_source, policy);
+    let snapshot = build_compiled_provider_route(route_config, auth)?;
     ProviderRouteCurrent::new(snapshot)
         .bind()
         .map_err(Into::into)
@@ -3815,7 +3868,10 @@ fn build_catalog_management_route(
     auth_source: ProviderAuthSource,
     auth: &dyn AuthProvider,
     timeout: Duration,
-) -> Result<ProviderCatalogHandle<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+) -> Result<ProviderCatalogHandle<CompiledProvider>, CompiledProviderRouteBuildError> {
+    if gateway.adapter == GatewayAdapter::AnthropicMessages {
+        return Err(CompiledProviderRouteBuildError::AnthropicMessagesCatalogUnsupported);
+    }
     let declaration = current_provider_catalog_route_declaration(config_path, gateway_name)?;
     let policy = ProviderRoutePolicy::new(
         0,
@@ -3825,7 +3881,7 @@ fn build_catalog_management_route(
         timeout,
         ProviderCatalogPolicy::Configured,
     )?;
-    let snapshot = build_openai_compatible_catalog_route(
+    let snapshot = build_compiled_catalog_route(
         OpenAICompatCatalogRouteConfig {
             declaration,
             auth_source,
@@ -4111,12 +4167,11 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                             Duration::from_secs(cli.timeout_secs),
                         )
                         .map_err(|error| {
-                            map_provider_error_with_diagnostics(
-                                route_build_provider_error(error),
+                            route_build_cli_error(
+                                error,
                                 ProviderOperation::InferenceProbe {
                                     model: model.as_deref().expect("validated above"),
                                 },
-                                None,
                                 provider_diagnostics,
                             )
                         })?;
@@ -4209,10 +4264,9 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                                 Duration::from_secs(cli.timeout_secs),
                             )
                             .map_err(|error| {
-                                map_provider_error_with_diagnostics(
-                                    route_build_provider_error(error),
+                                route_build_cli_error(
+                                    error,
                                     ProviderOperation::ModelCatalog,
-                                    None,
                                     provider_diagnostics,
                                 )
                             })?;
@@ -4372,7 +4426,7 @@ struct ChatSetup {
     /// Atomic owner of the current immutable generation. `ask`/`chat` bind a
     /// request-facing handle from this owner; raw inference/catalog runtimes do
     /// not leave composition.
-    provider_route: ProviderRouteCurrent<OpenAICompatProvider>,
+    provider_route: ProviderRouteCurrent<CompiledProvider>,
     gateway_name: String,
     provider_diagnostics: ProviderDiagnosticContext,
     config_path: std::path::PathBuf,
@@ -8342,9 +8396,9 @@ fn provider_profile_namespace(config_path: &std::path::Path) -> Vec<u8> {
     }
 }
 
-/// Declare the route today's composition actually constructs. Flavor remains
-/// a compatibility/display label until a distinct adapter passes E04-S04, so
-/// none of the accepted labels can claim native Messages behavior here.
+/// Declare the exact compiled route selected by configuration. `flavor`
+/// remains a compatibility/display label and cannot silently select a wire
+/// dialect; only the closed `adapter` field can do that.
 fn current_provider_route_declaration(
     config_path: &std::path::Path,
     gateway_name: &str,
@@ -8355,10 +8409,12 @@ fn current_provider_route_declaration(
         .models_path
         .as_deref()
         .is_some_and(|path| !path.is_empty());
-    Ok(ProviderRouteDeclaration::compatible_chat_v1(
-        profile,
-        has_model_catalog,
-    ))
+    Ok(match gateway.adapter {
+        GatewayAdapter::CompatibleChat => {
+            ProviderRouteDeclaration::compatible_chat_v1(profile, has_model_catalog)
+        }
+        GatewayAdapter::AnthropicMessages => ProviderRouteDeclaration::native_messages_v1(profile),
+    })
 }
 
 fn current_provider_catalog_route_declaration(
@@ -8662,7 +8718,7 @@ enum ContextWindowRefreshOutcome {
 /// result. Provider diagnostics are intentionally not accepted here, so an
 /// endpoint URL or response body can never enter the private cache.
 async fn refresh_cached_context_window(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
@@ -8678,7 +8734,7 @@ async fn refresh_cached_context_window(
 }
 
 async fn refresh_cached_context_window_explicit(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     model: &str,
     path: &std::path::Path,
     key: &str,
@@ -8795,28 +8851,21 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
         catalog_policy,
     )
     .map_err(|error| CliError::user(format!("config error: invalid provider policy: {error}")))?;
-    let provider_route_snapshot = build_openai_compatible_route(
-        OpenAICompatRouteConfig {
-            declaration: provider_route_declaration,
-            model: model.clone(),
-            auth_source: provider_auth_source,
-            base_url: gateway.base_url.clone(),
-            chat_path: gateway.chat_path.clone(),
-            models_path: models_path.clone(),
-            policy: route_policy,
-        },
-        auth.as_ref(),
-    )
-    .map_err(|error| match error {
-        OpenAICompatRouteBuildError::Auth(error) => map_provider_error(
-            ProviderError::Auth(error),
-            ProviderOperation::Chat { model: &model },
-            None,
-        ),
-        OpenAICompatRouteBuildError::Contract(error) => {
-            CliError::user(format!("config error: invalid provider route: {error}"))
-        }
-    })?;
+    let route_config = compiled_provider_route_config(
+        gateway,
+        provider_route_declaration,
+        model.clone(),
+        provider_auth_source,
+        route_policy,
+    );
+    let provider_route_snapshot = build_compiled_provider_route(route_config, auth.as_ref())
+        .map_err(|error| {
+            route_build_cli_error(
+                error,
+                ProviderOperation::Chat { model: &model },
+                provider_diagnostics,
+            )
+        })?;
     let provider_route = ProviderRouteCurrent::new(provider_route_snapshot);
     provider_route.bind().map_err(|error| {
         CliError::user(format!(
@@ -9169,15 +9218,8 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
         auth.as_ref(),
         Duration::from_secs(cli.timeout_secs),
     )
-    .map_err(|error| match error {
-        OpenAICompatRouteBuildError::Auth(error) => map_provider_error(
-            ProviderError::Auth(error),
-            ProviderOperation::ModelCatalog,
-            None,
-        ),
-        OpenAICompatRouteBuildError::Contract(error) => {
-            CliError::user(format!("config error: invalid provider route: {error}"))
-        }
+    .map_err(|error| {
+        route_build_cli_error(error, ProviderOperation::ModelCatalog, provider_diagnostics)
     })?;
     if cli.jsonl {
         emit_jsonl(
@@ -12148,7 +12190,7 @@ async fn finalize_scripted_run(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted(
     setup: &ChatSetup,
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -12210,7 +12252,7 @@ async fn run_scripted(
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_body(
     setup: &ChatSetup,
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
@@ -12787,7 +12829,7 @@ async fn run_scripted_body(
 /// transactionally while completed filesystem side effects remain inspectable.
 #[allow(clippy::too_many_arguments)]
 async fn run_scripted_turn(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     perms: &Permissions,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
@@ -13966,7 +14008,7 @@ async fn read_text_file_cancellable(path: std::path::PathBuf) -> Option<std::io:
 }
 
 async fn run_turn_cancellable(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -14003,7 +14045,7 @@ async fn wait_for_active_quit_cancel() {
 
 #[allow(clippy::too_many_arguments)]
 async fn run_turn_steerable(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     messages: &mut Vec<ChatMessage>,
     cfg: &AgentConfig,
@@ -14635,14 +14677,12 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     if !no_tools && spawn_cap > 0 {
         let subagent_route = provider.clone();
         let subagent_provider =
-            subagent::ProviderBinder::<ProviderRouteHandle<OpenAICompatProvider>>::new(
-                move |model| {
-                    subagent_route
-                        .bind_model(model)
-                        .map(Arc::new)
-                        .map_err(ProviderError::from)
-                },
-            );
+            subagent::ProviderBinder::<ProviderRouteHandle<CompiledProvider>>::new(move |model| {
+                subagent_route
+                    .bind_model(model)
+                    .map(Arc::new)
+                    .map_err(ProviderError::from)
+            });
         // Stage A: synchronous single delegation.
         let (d, h) = subagent::spawn_agent_tool_with_binder(
             subagent_provider.clone(),
@@ -17406,7 +17446,7 @@ fn skill_load_payload(
 
 async fn refresh_session_context_window(
     model: &str,
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     session: &SessionInfo,
     context_window: &Rc<Cell<Option<u64>>>,
     context_window_pinned: bool,
@@ -17506,7 +17546,7 @@ async fn handle_slash(
     cmd: &str,
     messages: &mut Vec<ChatMessage>,
     model: &mut String,
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     tools: &Registry,
     cli: &Cli,
     perms: &Permissions,
@@ -18678,7 +18718,7 @@ fn extract_code_or_text(text: &str) -> String {
 /// like other slash commands. The listed IDs are what you pass to `/model <id>`
 /// or `--model` — handy for exploring a big catalog (e.g. Hugging Face).
 async fn list_models_and_print(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     filter: &str,
     current_model: &str,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
@@ -18742,7 +18782,7 @@ fn runtime_model_catalog_telemetry(
 }
 
 async fn list_models_with_runtime_telemetry(
-    provider: &ProviderRouteCurrent<OpenAICompatProvider>,
+    provider: &ProviderRouteCurrent<CompiledProvider>,
     runtime_log: Option<&kitsu_core::AgentEventLog>,
     request_timeout_ms: u64,
 ) -> Result<Option<Vec<String>>, ProviderError> {
@@ -21279,6 +21319,7 @@ mod tests {
     fn loopback_ollama_connection_hint_is_scoped_and_secret_free() {
         let gateway = |flavor: &str, base_url: &str| Gateway {
             flavor: flavor.to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
             base_url: base_url.to_string(),
             chat_path: "/v1/chat/completions".to_string(),
             models_path: Some("/v1/models".to_string()),
@@ -21978,9 +22019,10 @@ mod tests {
     }
 
     #[test]
-    fn current_flavor_labels_declare_the_compatible_chat_route_actually_constructed() {
+    fn explicit_adapter_selects_wire_while_legacy_flavors_stay_compatible() {
         let gateway = |flavor: &str, models_path: Option<&str>| Gateway {
             flavor: flavor.to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
             base_url: "https://user:secret@example.invalid/?token=hidden".to_string(),
             chat_path: "/v1/chat/completions".to_string(),
             models_path: models_path.map(str::to_string),
@@ -22031,6 +22073,27 @@ mod tests {
         assert!(!without_catalog.profile().as_str().contains("secret"));
         assert!(!without_catalog.profile().as_str().contains("display-model"));
 
+        let mut native = gateway("anthropic", None);
+        native.adapter = config::GatewayAdapter::AnthropicMessages;
+        native.chat_path = "/v1/messages".to_string();
+        let native_declaration =
+            current_provider_route_declaration(config_path, "primary", &native).unwrap();
+        assert_eq!(
+            native_declaration.adapter(),
+            kitsu_providers::ProviderAdapterId::AnthropicMessages
+        );
+        assert_eq!(
+            native_declaration.wire_revision(),
+            kitsu_providers::ProviderWireRevision::AnthropicMessages2023_06_01
+        );
+        assert!(native_declaration
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::Streaming));
+        assert!(!native_declaration
+            .capabilities()
+            .supports(kitsu_providers::ProviderCapability::ModelCatalog));
+        assert_eq!(native_declaration.profile(), reference.profile());
+
         let mut changed_route_contents = gateway("ollama", None);
         changed_route_contents.base_url = "http://different.invalid/private".to_string();
         changed_route_contents.chat_path = "/different/chat".to_string();
@@ -22055,6 +22118,7 @@ mod tests {
         let _guard = EnvVarGuard::set(ROUTE_AUTH_ENV, "environment-token");
         let mut gateway = Gateway {
             flavor: "openai".to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
             base_url: "https://example.invalid".to_string(),
             chat_path: "/v1/chat/completions".to_string(),
             models_path: None,
@@ -22099,6 +22163,7 @@ mod tests {
         symlink(&config_path, &alias_path).unwrap();
         let gateway = Gateway {
             flavor: "openai".to_string(),
+            adapter: config::GatewayAdapter::CompatibleChat,
             base_url: "https://example.invalid".to_string(),
             chat_path: "/v1/chat/completions".to_string(),
             models_path: None,

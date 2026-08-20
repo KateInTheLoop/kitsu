@@ -282,8 +282,7 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: E04-S01/S02/S03 are accepted and E04-S04 is in progress through Cycle
-045.
+Status: E04-S01/S02/S03/S04 are accepted through Cycle 046; E04-S05 is next.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
@@ -300,8 +299,7 @@ probes. Primary-reviewed compatible-Chat and structurally distinct Anthropic
 Messages fixtures run fully offline. A distinct native Messages implementation
 now matches the exact text request/header and normalizes streamed text, usage,
 terminal reason, translates exact prior tool use/results, and correlates
-bounded fragmented tool arguments, but is deliberately unreachable from live
-composition. Its typed HTTP, malformed/midstream, size-bound, timeout, and
+bounded fragmented tool arguments. Its typed HTTP, malformed/midstream, size-bound, timeout, and
 cancellation fixtures now pass on the native implementation with exactly one
 send. Native one-attempt telemetry now closes every send/body lifecycle with
 one common terminal event. A fixture-only native route factory freezes auth
@@ -311,11 +309,13 @@ generation. Both compiled adapters now share one bounded transient-status,
 `Retry-After`, jitter, end-to-end deadline, and attempt-lifecycle mechanism.
 Native retry-to-success, deadline refusal, backoff cancellation, and admitted-
 body no-retry cases pass without live selection. One generic route-handle
-harness now makes both compiled adapters satisfy identical neutral text/tool
+harness makes both compiled adapters satisfy identical neutral text/tool
 output, common capability, generation-attributed terminal attempt, catalog-
-absence, exact-successor, and stale zero-send assertions. Explicit live
-composition, complete receipts, and alternate conformance remain open; X001
-therefore still fails.
+absence, exact-successor, and stale zero-send assertions. A closed explicit
+adapter field now selects native Messages for live chat and inference doctor;
+legacy flavor-only profiles retain compatible Chat and native catalog fails
+before transport. Complete receipts and alternate conformance remain open, so
+X001 still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the

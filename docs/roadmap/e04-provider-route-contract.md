@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 045.
+Status: E04-S02/S03/S04 are accepted through Cycle 046; E04-S05 is next.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -29,6 +29,10 @@ compiled adapters use one provider-neutral delay, deadline, status taxonomy,
 and attempt-lifecycle owner.
 Cycle 045 instantiates one generic route-handle conformance harness with both
 compiled adapters; no production exception or dialect branch is required.
+Cycle 046 adds a closed compiled provider enum and explicit adapter config,
+then proves native chat and inference doctor use the exact Messages wire while
+legacy flavor-only profiles stay compatible Chat and native catalog fails
+before transport.
 
 ## Decision
 
@@ -44,11 +48,9 @@ contains an endpoint, credential, auth header, request/response body, model
 content, provider config object, or user-facing gateway label.
 
 The compiled IDs name compatible Chat and Anthropic Messages wire revisions.
-Cycles 039-040 add a real Messages request/event implementation, but that is not
-adapter promotion: production composition may publish it only after the rest
-of E04-S04 passes tool, fault, bound, telemetry, and shared-route conformance.
-Until then, every current flavor truthfully identifies the compatible-Chat
-implementation it actually constructs.
+Cycles 039-045 prove the Messages request/event implementation and shared route
+conformance. Cycle 046 promotes it through an explicit closed selector; flavor
+alone never changes the wire and legacy profiles remain compatible Chat.
 
 ## Values and validation
 
@@ -215,7 +217,6 @@ cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
-- select or advertise the native Messages adapter in production composition;
 - implement model catalog for the Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
@@ -223,10 +224,10 @@ cards still do not:
 provider config, auth implementation, or catalog implementation; its test-only
 route fixture uses provider-neutral values. The CLI has no flavor-to-adapter
 switch. There is no title-generation provider call in current Kitsu.
-Production composition has no raw `OpenAICompatProvider::new` call; the
-constructor is confined to compiled provider factories and provider tests. The
-next card adds an explicit compiled native selector to composition while
-preserving the compatible-Chat behavior of existing flavor-only configuration.
+Production composition has no raw concrete-provider constructor or dynamic
+provider loader. `CompiledProvider` is a closed enum, and only the typed
+`adapter` field selects its variant. The next card defines the complete
+secret-free route receipt consumed by JSONL and diagnostics.
 
 ## Acceptance and rollback
 

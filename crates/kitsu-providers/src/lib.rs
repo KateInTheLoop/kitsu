@@ -3,6 +3,7 @@
 
 pub mod anthropic_messages;
 pub mod auth;
+pub mod compiled;
 pub mod error;
 pub mod openai_compat;
 mod retry;

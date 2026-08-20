@@ -40,17 +40,19 @@ edges is what makes "one binary" real: the agent loop only ever sees the interna
 
 Introduce a **gateway profile** config concept layered on top of the existing providers, and
 generalize the existing `OpenAICompatProvider` to take a configurable `base_url`, endpoint
-path, and an injected `AuthProvider`. Add a separate `AnthropicProvider` only for the
-Anthropic-native flavor (post-MVP). Do **not** create one new provider type per gateway.
+path, and an injected `AuthProvider`. A closed `adapter` field may instead select the
+compiled native Messages implementation. Do **not** create one new provider type per gateway
+or infer a wire from the compatibility/display `flavor` label.
 
 So the mapping is:
 
-- `flavor = "openai"` → `OpenAICompatProvider` (vLLM, OpenAI, Mistral via OpenAI-compat,
-  **and the gateway** — they are all the same wire shape)
-- `flavor = "anthropic"` → `AnthropicProvider` (native `/v1/messages`; post-MVP)
-- `flavor = "ollama"` → existing `OllamaProvider` (unchanged)
+- omitted `adapter` or `adapter = "compatible-chat"` → `OpenAICompatProvider`
+  (vLLM, OpenAI, Mistral, Ollama-compatible, and compatible gateways)
+- `adapter = "anthropic-messages"` → compiled native `/v1/messages` provider
+- `flavor = "openai" | "anthropic" | "ollama"` remains a validated diagnostic/
+  compatibility label and never selects a physical wire
 
-A **gateway profile** is a named bundle of `{ base_url, endpoint, auth, default model, flavor }`.
+A **gateway profile** is a named bundle of `{ adapter, base_url, endpoint, auth, default model, flavor }`.
 `build_provider(profile)` reads the profile and constructs the right provider impl with the
 right transport config. The `Provider` trait signature is **unchanged** — profiles are a
 construction-time concern, not a trait concern.
@@ -126,14 +128,16 @@ models_path  = ""              # empty => no /models endpoint; healthcheck uses 
 model        = "example-model-v1"
 auth         = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN", expires_env = "ANTHROPIC_TOKEN_EXPIRES", refresh_hint = "run `refresh-token` to refresh the gateway JWT" }
 
-# ---- Anthropic native (post-MVP flavor; profile shape shown for completeness) ----
+# ---- Anthropic native (explicit compiled adapter) ----
 [gateways.anthropic]
 flavor       = "anthropic"
+adapter      = "anthropic-messages"
 base_url     = "https://api.anthropic.com"
 chat_path    = "/v1/messages"
+models_path  = ""
 model        = "claude-sonnet-4-5"
 auth         = { method = "bearer-env", env = "ANTHROPIC_API_KEY", header = "x-api-key", scheme = "" }
-# anthropic-native also needs the version header (set by the AnthropicProvider, see §4)
+# The fixed version header is set by AnthropicMessagesProvider (see §4).
 
 # ---- Public OpenAI ----
 [gateways.openai]
