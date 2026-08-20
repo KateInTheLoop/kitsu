@@ -2542,6 +2542,369 @@ auth = {{ method = "none" }}
     assert!(doctor_body.get("tools").is_none());
 }
 
+#[derive(Clone, Copy)]
+struct ProviderProductCase {
+    adapter_config: &'static str,
+    adapter_receipt: &'static str,
+    wire_receipt: &'static str,
+    chat_path: &'static str,
+    capabilities: &'static [&'static str],
+}
+
+const PROVIDER_PRODUCT_CASES: [ProviderProductCase; 2] = [
+    ProviderProductCase {
+        adapter_config: "compatible-chat",
+        adapter_receipt: "openai_compatible",
+        wire_receipt: "openai_chat_completions_v1",
+        chat_path: "/product/chat/completions",
+        capabilities: &["streaming", "tools", "structured_output", "usage"],
+    },
+    ProviderProductCase {
+        adapter_config: "anthropic-messages",
+        adapter_receipt: "anthropic_messages",
+        wire_receipt: "anthropic_messages_2023_06_01",
+        chat_path: "/product/messages",
+        capabilities: &["streaming", "tools", "usage"],
+    },
+];
+
+fn write_provider_product_config(
+    home: &Path,
+    base_url: &str,
+    case: ProviderProductCase,
+    chat_path: &str,
+) {
+    let kitsu_dir = home.join(".kitsu");
+    fs::create_dir_all(&kitsu_dir).expect("create product-conformance config directory");
+    fs::write(
+        kitsu_dir.join("config.toml"),
+        format!(
+            r#"default_gateway = "product"
+
+[gateways.product]
+flavor = "openai"
+adapter = "{}"
+base_url = "{}"
+chat_path = "{}"
+models_path = ""
+model = "product-model"
+context_window = 8192
+auth = {{ method = "none" }}
+"#,
+            case.adapter_config, base_url, chat_path
+        ),
+    )
+    .expect("write product-conformance config");
+}
+
+fn provider_product_sse(case: ProviderProductCase) -> String {
+    if case.adapter_receipt == "openai_compatible" {
+        return [
+            r#"data: {"choices":[{"index":0,"delta":{"content":"product answer"},"finish_reason":"stop"}]}"#,
+            "data: [DONE]",
+            "",
+        ]
+        .join("\n\n");
+    }
+    [
+        concat!(
+            "event: message_start\n",
+            r#"data: {"type":"message_start","message":{"id":"msg_product","type":"message","role":"assistant","content":[],"model":"product-model","stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":5,"output_tokens":0}}}"#
+        ),
+        concat!(
+            "event: content_block_start\n",
+            r#"data: {"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}"#
+        ),
+        concat!(
+            "event: content_block_delta\n",
+            r#"data: {"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"product answer"}}"#
+        ),
+        concat!(
+            "event: content_block_stop\n",
+            r#"data: {"type":"content_block_stop","index":0}"#
+        ),
+        concat!(
+            "event: message_delta\n",
+            r#"data: {"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}"#
+        ),
+        concat!(
+            "event: message_stop\n",
+            r#"data: {"type":"message_stop"}"#
+        ),
+    ]
+    .join("\n\n")
+        + "\n\n"
+}
+
+fn parse_product_jsonl(output: &std::process::Output) -> Vec<serde_json::Value> {
+    String::from_utf8(output.stdout.clone())
+        .expect("product JSONL is UTF-8")
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("product JSONL line"))
+        .collect()
+}
+
+fn assert_product_receipt(
+    receipt: &serde_json::Value,
+    case: ProviderProductCase,
+    expected_model: Option<&str>,
+) {
+    assert_eq!(receipt["receipt_revision"], 1);
+    assert_eq!(receipt["route"]["contract_revision"], 1);
+    assert_eq!(receipt["route"]["adapter"], case.adapter_receipt);
+    assert_eq!(receipt["route"]["wire_revision"], case.wire_receipt);
+    assert_eq!(receipt["route"]["generation"], 1);
+    assert_eq!(
+        receipt["route"]["capabilities"]["supported"],
+        serde_json::json!(case.capabilities)
+    );
+    assert_eq!(receipt["model"], serde_json::json!(expected_model));
+    assert_eq!(receipt["auth_source"], "none");
+    assert_eq!(receipt["policy"]["retry_generation"], "bound_generation");
+    assert_eq!(
+        receipt["policy"]["semantic_replay_generation"],
+        "current_generation"
+    );
+    assert_eq!(receipt["policy"]["fallback"], "disabled");
+}
+
+#[tokio::test]
+#[serial]
+async fn both_compiled_adapters_pass_product_route_receipt_conformance() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in PROVIDER_PRODUCT_CASES {
+        let server = MockServer::start().await;
+        let sse = provider_product_sse(case);
+        if case.adapter_receipt == "openai_compatible" {
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .and(body_string_contains("\"stream\":true"))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .expect(1)
+                .mount(&server)
+                .await;
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .and(body_string_contains("\"stream\":false"))
+                .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+                    "choices": [{
+                        "message": {"role": "assistant", "content": "OK"},
+                        "finish_reason": "stop"
+                    }]
+                })))
+                .expect(1)
+                .mount(&server)
+                .await;
+        } else {
+            Mock::given(method("POST"))
+                .and(path(case.chat_path))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("content-type", "text/event-stream")
+                        .set_body_string(sse),
+                )
+                .expect(2)
+                .mount(&server)
+                .await;
+        }
+        let fault_path = format!("{}/fault", case.chat_path);
+        Mock::given(method("POST"))
+            .and(path(fault_path.as_str()))
+            .respond_with(ResponseTemplate::new(401).set_body_string("provider-secret-body"))
+            .expect(1)
+            .mount(&server)
+            .await;
+
+        let home = TempDir::new().expect("product conformance home");
+        write_provider_product_config(home.path(), &server.uri(), case, case.chat_path);
+        let script = home.path().join("product.script");
+        fs::write(&script, "exercise the product provider seam\n").unwrap();
+        let success = base_cmd(home.path())
+            .args([
+                "--jsonl",
+                "chat",
+                "--no-session",
+                "--no-tools",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run product conformance success");
+        assert!(success.status.success(), "{success:?}");
+        assert!(success.stderr.is_empty(), "{success:?}");
+        let success_events = parse_product_jsonl(&success);
+        let run_started = success_events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("success run_started");
+        let run_receipt = &run_started["provider_route"];
+        assert_product_receipt(run_receipt, case, Some("product-model"));
+        let attempts = success_events
+            .iter()
+            .filter(|event| event["type"] == "provider_attempt")
+            .collect::<Vec<_>>();
+        assert_eq!(attempts.len(), 1);
+        assert_eq!(attempts[0]["category"], "success");
+        assert_eq!(attempts[0]["terminal"], true);
+        assert_eq!(
+            attempts[0]["route_generation"],
+            run_receipt["route"]["generation"]
+        );
+        assert!(!run_receipt.to_string().contains(&server.uri()));
+        assert!(!run_receipt.to_string().contains("provider-secret"));
+
+        let status_script = home.path().join("status.script");
+        fs::write(&status_script, "/status\n/quit\n").unwrap();
+        let status = base_cmd(home.path())
+            .args([
+                "--jsonl",
+                "chat",
+                "--no-session",
+                "--script",
+                &status_script.to_string_lossy(),
+            ])
+            .output()
+            .expect("run product conformance status");
+        assert!(status.status.success(), "{status:?}");
+        let status_events = parse_product_jsonl(&status);
+        let status_result = status_events
+            .iter()
+            .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "status")
+            .expect("structured status receipt");
+        assert_eq!(status_result["result"]["provider_route"], *run_receipt);
+
+        let offline_doctor = base_cmd(home.path())
+            .args(["doctor", "--json"])
+            .output()
+            .expect("run offline product doctor");
+        assert!(offline_doctor.status.success(), "{offline_doctor:?}");
+        let offline_report: serde_json::Value =
+            serde_json::from_slice(&offline_doctor.stdout).unwrap();
+        assert_eq!(
+            offline_report["provider_route"]["status"],
+            "not_constructed_offline"
+        );
+        assert!(offline_report["provider_route"]["receipt"].is_null());
+
+        let inference_doctor = base_cmd(home.path())
+            .args(["doctor", "--inference", "--json"])
+            .output()
+            .expect("run product inference doctor");
+        assert!(inference_doctor.status.success(), "{inference_doctor:?}");
+        let inference_report: serde_json::Value =
+            serde_json::from_slice(&inference_doctor.stdout).unwrap();
+        assert_eq!(inference_report["provider_route"]["status"], "bound");
+        assert_product_receipt(
+            &inference_report["provider_route"]["receipt"],
+            case,
+            Some("product-model"),
+        );
+
+        write_provider_product_config(home.path(), &server.uri(), case, &fault_path);
+        let fault = base_cmd(home.path())
+            .args(["--jsonl", "ask", "exercise the product fault path"])
+            .output()
+            .expect("run product conformance fault");
+        assert_eq!(fault.status.code(), Some(2), "{fault:?}");
+        assert!(fault.stderr.is_empty(), "{fault:?}");
+        let fault_events = parse_product_jsonl(&fault);
+        let fault_run = fault_events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("fault run_started");
+        assert_eq!(fault_run["provider_route"], *run_receipt);
+        let fault_attempt = fault_events
+            .iter()
+            .find(|event| event["type"] == "provider_attempt")
+            .expect("fault provider attempt");
+        assert_eq!(fault_attempt["category"], "authentication");
+        assert_eq!(fault_attempt["status"], 401);
+        assert_eq!(fault_attempt["terminal"], true);
+        assert_eq!(
+            fault_attempt["route_generation"],
+            fault_run["provider_route"]["route"]["generation"]
+        );
+        assert!(!String::from_utf8_lossy(&fault.stdout).contains("provider-secret-body"));
+        server.verify().await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+#[serial]
+async fn both_compiled_adapters_correlate_product_cancellation_to_the_run_receipt() {
+    use std::process::Stdio;
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    for case in PROVIDER_PRODUCT_CASES {
+        let server = MockServer::start().await;
+        Mock::given(method("POST"))
+            .and(path(case.chat_path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .set_delay(std::time::Duration::from_secs(30))
+                    .set_body_string(provider_product_sse(case)),
+            )
+            .expect(1)
+            .mount(&server)
+            .await;
+        let home = TempDir::new().expect("cancel conformance home");
+        write_provider_product_config(home.path(), &server.uri(), case, case.chat_path);
+        let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+        command
+            .env("HOME", home.path())
+            .env("KITSU_NO_PROJECT_CONTEXT", "1")
+            .args(["--jsonl", "ask", "cancel the product request"])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped());
+        let child = command
+            .spawn()
+            .expect("spawn cancellation conformance child");
+        let pid = child.id();
+        for _ in 0..100 {
+            if !server.received_requests().await.unwrap().is_empty() {
+                break;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+        }
+        assert!(!server.received_requests().await.unwrap().is_empty());
+        // SAFETY: `pid` belongs to the live child created immediately above.
+        assert_eq!(unsafe { libc::kill(pid as libc::pid_t, libc::SIGINT) }, 0);
+        let output = tokio::task::spawn_blocking(move || child.wait_with_output().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(output.status.code(), Some(130), "{output:?}");
+        assert!(output.stderr.is_empty(), "{output:?}");
+        let events = parse_product_jsonl(&output);
+        let run_started = events
+            .iter()
+            .find(|event| event["type"] == "run_started")
+            .expect("cancel run_started");
+        assert_product_receipt(&run_started["provider_route"], case, Some("product-model"));
+        let attempt = events
+            .iter()
+            .find(|event| event["type"] == "provider_attempt")
+            .expect("cancel provider attempt");
+        assert_eq!(attempt["category"], "cancelled");
+        assert_eq!(attempt["outcome"], "cancelled");
+        assert_eq!(attempt["terminal"], true);
+        assert_eq!(
+            attempt["route_generation"],
+            run_started["provider_route"]["route"]["generation"]
+        );
+        assert_eq!(events.last().unwrap()["type"], "final_summary");
+        assert_eq!(events.last().unwrap()["status"], "cancelled");
+        server.verify().await;
+    }
+}
+
 #[tokio::test]
 #[serial]
 async fn native_adapter_rejects_model_catalog_before_any_network_send() {

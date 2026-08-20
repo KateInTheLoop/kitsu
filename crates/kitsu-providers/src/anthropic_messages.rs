@@ -1,8 +1,8 @@
 //! Native Anthropic Messages wire adapter.
 //!
-//! The compiled slices support streamed text and correlated tool use/results.
-//! Catalog discovery and live CLI selection remain disabled until their own
-//! conformance fixtures pass.
+//! The compiled adapter supports streamed text and correlated tool use/results
+//! behind explicit live selection. Model-catalog discovery remains unavailable
+//! and is rejected before transport.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -35,6 +35,11 @@ use crate::{
 /// Wire revision pinned by [`crate::ProviderWireRevision::AnthropicMessages2023_06_01`].
 pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 
+/// Messages requires `max_tokens` on the wire even when the neutral caller
+/// intentionally leaves its provider-specific output limit unset. Keep that
+/// ordinary Kitsu path usable with one conservative, adapter-owned bound;
+/// explicit zero remains invalid instead of being silently rewritten.
+const DEFAULT_MAX_TOKENS: u32 = 4_096;
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_STREAM_BYTES: usize = 16 * 1024 * 1024;
@@ -222,10 +227,11 @@ fn build_body(request: &ChatRequest) -> Result<MessagesRequest, ProviderError> {
     if request.prompt_cache_key.is_some() {
         return Err(unsupported_request("prompt_cache_key"));
     }
-    let max_tokens = request
-        .max_tokens
-        .filter(|value| *value > 0)
-        .ok_or_else(|| unsupported_request("missing or zero max_tokens"))?;
+    let max_tokens = match request.max_tokens {
+        Some(0) => return Err(unsupported_request("zero max_tokens")),
+        Some(value) => value,
+        None => DEFAULT_MAX_TOKENS,
+    };
 
     let mut system = Vec::new();
     let mut messages = Vec::new();

@@ -303,6 +303,39 @@ async fn native_messages_matches_exact_request_and_normalized_text_stream() {
 }
 
 #[tokio::test]
+async fn native_messages_supplies_a_bounded_default_but_rejects_explicit_zero() {
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let mut defaulted = neutral_text_request();
+    defaulted.max_tokens = None;
+    let mut stream = provider
+        .chat_stream(defaulted)
+        .await
+        .expect("ordinary neutral request receives the adapter-owned bound");
+    while let Some(item) = stream.next().await {
+        item.expect("defaulted native Messages fixture decodes");
+    }
+    let observed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("defaulted request captured");
+    assert_eq!(observed.body["max_tokens"], 4_096);
+
+    let mut zero = neutral_text_request();
+    zero.max_tokens = Some(0);
+    let error = match provider.chat_stream(zero).await {
+        Ok(_) => panic!("explicit zero must fail before transport"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
 async fn native_messages_eof_is_not_terminal_success() {
     let mut fixture = anthropic_messages_text();
     let stop = "event: message_stop\ndata: {\"type\":\"message_stop\"}\n\n";

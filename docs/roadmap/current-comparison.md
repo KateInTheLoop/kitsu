@@ -1,7 +1,7 @@
 # Current Harness Comparison
 
 Status: Kitsu-owned comparison from post-E01 runtime pin `986fba9`, updated
-through accepted Cycle 048; frozen research inputs and hashes are listed in
+through accepted Cycle 049; frozen research inputs and hashes are listed in
 [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md).
 
 The detailed source-by-source transfer decisions remain in the
@@ -29,10 +29,10 @@ code navigation.
 |---|---|---|
 | Ollama untagged versus `:latest` doctor mismatch | Closed by Cycles 003-004 with local-only, human/JSON, and zero-chat coverage | **Closed**; E01-S01 |
 | Duplicate tool schema/handler registration | Closed for A001's per-entry contract by Cycles 005, 007, 008 | **Closed**; E01-S02/S03 |
-| Provider retry/context discovery | Wider bounded retry and nested context-window discovery landed in the 67-commit delta; Cycles 032-046 bind chat, retry, replay, catalog, compaction, subagent, top-level, and doctor sends to immutable generations for either explicitly selected compiled adapter. Cycles 047-048 define and expose a complete bounded route receipt in status, JSONL run start, and opted-in doctor, with attempt-generation correlation and offline no-construction truth | **Generation/diagnostic gap closed for current production**; final X001 two-adapter conformance remains E04-S05 |
+| Provider retry/context discovery | Wider bounded retry and nested context-window discovery landed in the 67-commit delta; Cycles 032-046 bind chat, retry, replay, catalog, compaction, subagent, top-level, and doctor sends to immutable generations for either explicitly selected compiled adapter. Cycles 047-049 define and expose the complete bounded route receipt, then run identical success/fault/cancellation/status/doctor/offline product fixtures against both adapters | **Closed and conformance-proven**; E04/X001 accepted |
 | Structural code navigation | `repo_grep`, `find_symbol`, `outline_file`, and `read_manifest` exist under read authority | **Narrow gap closed**; semantic selector remains E07 |
 | Timeout/recovery truth | Completed tool rounds survive piped deadline failure; JSONL framing improved | **Partial**; causal run phases remain E02 and session recovery/HEAD remains E03 |
-| Provider dialect breadth | A distinct native Messages text/tool/usage/terminal implementation passes exact wire, fault/lifecycle, telemetry, frozen-auth route, truthful-capability, generation-attribution, bounded retry/deadline, backoff-cancellation, and the same neutral route-handle harness as compatible Chat. An explicit closed adapter selector drives live chat and inference doctor; legacy flavor-only profiles remain compatible Chat, and native catalog requests fail before transport. The complete secret-free route receipt now round-trips, rejects contradictory facts, and is projected through status/JSONL/doctor | **E04-S04 closed; S05 in progress**; run final two-adapter receipt/attempt X001 conformance |
+| Provider dialect breadth | A distinct native Messages text/tool/usage/terminal implementation passes exact wire, fault/lifecycle, telemetry, frozen-auth route, truthful-capability, generation-attribution, bounded retry/deadline, backoff-cancellation, generic route-handle, and product-surface harnesses with compatible Chat. An explicit closed adapter selector drives live chat and inference doctor; legacy flavor-only profiles retain compatible Chat, and native catalog requests fail before transport. The complete secret-free route receipt round-trips and projects through status/JSONL/doctor | **Closed for the two compiled dialects**; E04/X001 accepted |
 | Guided onboarding/model choice | Config and model listing exist, but setup is still manual and not transactional | **Open**; E05 after E04 |
 | Session lineage/branch-at-turn | Whole-history fresh-ID fork exists; no logical HEAD/revision/turn boundary | **Open**; E03 |
 | MCP/external tools | No client or supervisor is compiled | **Open experiment**; E06 after E02 |
@@ -42,12 +42,12 @@ code navigation.
 
 ## Five-boundary scoreboard
 
-Result: **0/5 completely replaceable**. Prerequisites improved; decisive gates
-did not execute.
+Result: **1/5 completely replaceable**. X001 executed against compatible Chat
+and native Messages; X002-X005 retain their exact missing cells.
 
 | Boundary | Score | Why |
 |---|---:|---|
-| X001 provider | Fail | Immutable current-send generations plus two explicitly selectable compiled wires pass exact fault, terminal-attempt, frozen-route, generation-attribution, bounded-retry, and generic route-handle parity; complete receipts and final alternate conformance are absent |
+| X001 provider | **Pass** | Immutable current-send generations plus two explicitly selectable compiled wires pass exact wire/fault/retry/terminal-attempt/frozen-route parity and one shared product suite covering receipt-correlated success, HTTP failure, cancellation, status, JSONL, inference doctor, and offline no-construction |
 | X002 tool/source | Fail | Registry integrity improved, but no admitted/supervised external source or two-source suite |
 | X003 host/UI | Fail | No named independent host/principal or shared carrier identity fixture |
 | X004 automation/runtime | Fail | Neutral run/outcome phases and an independent seven-carrier default-runtime evaluator now exist; no named alternate runtime adapter runs the suite |
@@ -68,6 +68,8 @@ and DB-row/file-tail/projection-as-canonical-HEAD.
 ## Evidence boundary
 
 This comparison is source/test-backed plus the provider-free acceptance tests
-recorded in Cycles 003-042. It does not claim that any subject runtime or full
-X001-X005 suite was executed. Scores change only when the named complete gate
-passes against both required implementations.
+recorded in Cycles 003-049. The full X001 suite executed against both required
+compiled implementations; no live provider, credential, billable request, or
+subject-project runtime was needed. It does not claim execution of X002-X005.
+Scores change only when the named complete gate passes against both required
+implementations.
