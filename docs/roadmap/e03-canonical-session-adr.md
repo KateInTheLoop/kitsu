@@ -282,10 +282,10 @@ cannot weaken or replace any backend-neutral assertion.
 1. **Complete in Cycle 051:** add provider-free opaque ID, logical-head,
    canonical-operation, receipt, and typed-state values with fail-closed
    validation and fixed vectors.
-2. **Read/list half complete in Cycle 052:** extract the current file store
-   behind a private port without changing v1 behavior; mount shared
-   read/list/current invariant cases first. Mutation remains direct until the
-   following card.
+2. **Initial read/write extraction complete in Cycles 052-053:** route current
+   load/load-other/list and active save behind private ports without changing v1
+   behavior. Other lifecycle mutations remain direct until their canonical
+   operation is introduced.
 3. Add expected-revision publication and deterministic K04/K07/K08 fault hooks,
    then migrate whole-operation outcome publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
