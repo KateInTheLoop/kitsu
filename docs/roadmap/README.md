@@ -282,7 +282,8 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 
 Dependencies: E02 run outcome; E00 delta audit.
 
-Status: E04-S01/S02/S03/S04 are accepted through Cycle 046; E04-S05 is next.
+Status: E04-S01/S02/S03/S04 are accepted; E04-S05 is in progress through Cycle
+047.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
@@ -316,12 +317,13 @@ adapter field now selects native Messages for live chat and inference doctor;
 legacy flavor-only profiles retain compatible Chat and native catalog fails
 before transport. Complete receipts and alternate conformance remain open, so
 X001 still fails.
+A versioned private route receipt now also binds exact route identity, optional
+model, auth-source class, retry/time/catalog policy, bound-generation retry,
+current-generation semantic replay, and disabled fallback without a runtime or
+secret-bearing field. Product projection and attempt correlation remain open.
 
-Recommended distinct dialect: Anthropic Messages, because current config and
-documentation already name Anthropic while live construction still uses the
-compatible-chat adapter. OpenAI Responses is an acceptable product decision
-before implementation. An endpoint alias, Ollama profile, or compatible proxy
-does not count as a distinct wire.
+The accepted distinct dialect is Anthropic Messages. An endpoint alias, Ollama
+profile, or compatible proxy does not count as a distinct wire.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -514,6 +516,7 @@ gates merely because a card appears attractive.
 | 044 | E04-S04-C6 | Add bounded native transient retry/backoff and cancellation parity inside one frozen generation before live selection |
 | 045 | E04-S04-C7 | Run both compiled adapters through one provider-neutral route-handle conformance harness before live selection |
 | 046 | E04-S04-C8 | Add explicit compiled native adapter selection in composition while preserving legacy compatible-Chat defaults |
+| 047 | E04-S05-C1 | Define one complete bounded secret-free route receipt and prove fail-closed decoding plus immutable generation truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -543,8 +546,10 @@ adds bounded retry/backoff and cancellation parity inside that generation
 before any config flavor can select it. Cycle 045 makes both compiled adapters
 pass one provider-neutral route-handle conformance harness before composition
 can select the native wire. Cycle 046 adds an explicit, auditable native adapter
-selector without silently changing legacy flavor behavior. The queue then
-advances through E03, E06, E07, E05/E08, and E09 in the
+selector without silently changing legacy flavor behavior. Cycle 047 defines
+the private receipt consumed by status, JSONL, and doctor; Cycle 048 projects
+it additively before final provider conformance. The queue then advances
+through E03, E06, E07, E05/E08, and E09 in the
 dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

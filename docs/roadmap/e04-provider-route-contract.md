@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03/S04 are accepted through Cycle 046; E04-S05 is next.
+Status: E04-S02/S03/S04 are accepted; E04-S05 is in progress through Cycle 047.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -33,6 +33,8 @@ Cycle 046 adds a closed compiled provider enum and explicit adapter config,
 then proves native chat and inference doctor use the exact Messages wire while
 legacy flavor-only profiles stay compatible Chat and native catalog fails
 before transport.
+Cycle 047 defines the complete provider-neutral route receipt projected from
+snapshots and bound/current handles without serializing physical runtimes.
 
 ## Decision
 
@@ -42,6 +44,20 @@ provider route snapshot:
 ```text
 { contract_revision, adapter, profile, generation, wire_revision, capabilities }
 ```
+
+It also owns a versioned diagnostic receipt:
+
+```text
+{ receipt_revision, route, model?, auth_source,
+  policy: { retries, exact time budgets, catalog,
+            retry_generation, semantic_replay_generation, fallback } }
+```
+
+Retry stays on the admitted bound generation; a user-level semantic replay
+binds the current generation; provider fallback is explicitly disabled. Exact
+durations use bounded seconds/nanoseconds pairs, avoiding overflow or lossy
+millisecond conversion. Receipt decoding denies unknown/future fields, zero or
+invalid durations, oversized models, and catalog capability/policy mismatch.
 
 The serialized value is safe for receipts and deterministic fixtures. It never
 contains an endpoint, credential, auth header, request/response body, model
@@ -88,6 +104,10 @@ alone never changes the wire and legacy profiles remain compatible Chat.
   capped `Retry-After`, one end-to-end deadline, and cancellation guards.
   Authentication, deterministic client errors, 500, and admitted response-body
   failures are terminal and never retried.
+- `ProviderRouteReceipt` is projected only from the immutable snapshot behind
+  a snapshot/current/inference/catalog handle. Its runtime is structurally
+  absent. A stale bound handle continues to report its old generation after a
+  successor becomes current; the current owner reports the successor.
 - `ProviderRouteSnapshot<P>` owns either a model-bound inference generation or
   a catalog-only management generation, plus secret-free auth source, policy,
   and its provider-specific runtimes. Catalog-only construction owns no model

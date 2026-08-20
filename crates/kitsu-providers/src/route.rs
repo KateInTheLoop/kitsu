@@ -2,8 +2,8 @@
 //!
 //! These values describe an immutable compiled route generation without
 //! containing an endpoint, credential, request, response, or provider config
-//! object. Composition will publish them in later E04 cards; this module only
-//! establishes validated values and pure pre-send admission.
+//! object. The module owns their validated receipt projection and pure pre-send
+//! admission; product surfaces decide when to publish that projection.
 
 use std::collections::BTreeSet;
 use std::num::{NonZeroU32, NonZeroU64};
@@ -21,6 +21,7 @@ use crate::types::ChatRequest;
 use crate::{ChatStream, Provider};
 
 pub const PROVIDER_ROUTE_CONTRACT_REVISION: u32 = 1;
+pub const PROVIDER_ROUTE_RECEIPT_REVISION: u32 = 1;
 
 /// Closed IDs reserved for compiled Kitsu adapter implementations. The
 /// presence of a variant is not adapter promotion: composition may publish it
@@ -200,10 +201,208 @@ pub enum ProviderAuthSource {
 /// Whether a separately bounded model-catalog runtime belongs to a route.
 /// The value must agree exactly with the declaration's `ModelCatalog`
 /// capability before the route can be published.
-#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
 pub enum ProviderCatalogPolicy {
     Unavailable,
     Configured,
+}
+
+/// Exact bounded serialization of a `Duration`. A seconds/nanoseconds pair is
+/// lossless for every Rust duration and avoids a saturating millisecond cast.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRouteDurationReceipt {
+    seconds: u64,
+    nanoseconds: u32,
+}
+
+impl<'de> Deserialize<'de> for ProviderRouteDurationReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawDuration {
+            seconds: u64,
+            nanoseconds: u32,
+        }
+
+        let raw = RawDuration::deserialize(deserializer)?;
+        let receipt = Self {
+            seconds: raw.seconds,
+            nanoseconds: raw.nanoseconds,
+        };
+        receipt.to_duration().map_err(D::Error::custom)?;
+        Ok(receipt)
+    }
+}
+
+impl ProviderRouteDurationReceipt {
+    fn from_duration(duration: Duration) -> Self {
+        Self {
+            seconds: duration.as_secs(),
+            nanoseconds: duration.subsec_nanos(),
+        }
+    }
+
+    fn to_duration(self) -> Result<Duration, ProviderRouteContractError> {
+        if self.nanoseconds >= 1_000_000_000 {
+            return Err(
+                ProviderRouteContractError::InvalidRouteDurationNanoseconds {
+                    nanoseconds: self.nanoseconds,
+                },
+            );
+        }
+        Ok(Duration::new(self.seconds, self.nanoseconds))
+    }
+
+    pub fn seconds(self) -> u64 {
+        self.seconds
+    }
+
+    pub fn nanoseconds(self) -> u32 {
+        self.nanoseconds
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderRetryGenerationPolicy {
+    BoundGeneration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderReplayGenerationPolicy {
+    CurrentGeneration,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProviderFallbackPolicy {
+    Disabled,
+}
+
+/// Secret-free projection of the retry/time/catalog behavior frozen into one
+/// immutable route. Replay and fallback are explicit instead of being inferred
+/// from an adapter or model label.
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRoutePolicyReceipt {
+    inference_retries: u32,
+    catalog_retries: u32,
+    inference_timeout: ProviderRouteDurationReceipt,
+    catalog_timeout: ProviderRouteDurationReceipt,
+    advisory_discovery_timeout: ProviderRouteDurationReceipt,
+    catalog: ProviderCatalogPolicy,
+    retry_generation: ProviderRetryGenerationPolicy,
+    semantic_replay_generation: ProviderReplayGenerationPolicy,
+    fallback: ProviderFallbackPolicy,
+}
+
+impl<'de> Deserialize<'de> for ProviderRoutePolicyReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawPolicy {
+            inference_retries: u32,
+            catalog_retries: u32,
+            inference_timeout: ProviderRouteDurationReceipt,
+            catalog_timeout: ProviderRouteDurationReceipt,
+            advisory_discovery_timeout: ProviderRouteDurationReceipt,
+            catalog: ProviderCatalogPolicy,
+            retry_generation: ProviderRetryGenerationPolicy,
+            semantic_replay_generation: ProviderReplayGenerationPolicy,
+            fallback: ProviderFallbackPolicy,
+        }
+
+        let raw = RawPolicy::deserialize(deserializer)?;
+        let receipt = Self {
+            inference_retries: raw.inference_retries,
+            catalog_retries: raw.catalog_retries,
+            inference_timeout: raw.inference_timeout,
+            catalog_timeout: raw.catalog_timeout,
+            advisory_discovery_timeout: raw.advisory_discovery_timeout,
+            catalog: raw.catalog,
+            retry_generation: raw.retry_generation,
+            semantic_replay_generation: raw.semantic_replay_generation,
+            fallback: raw.fallback,
+        };
+        receipt.to_policy().map_err(D::Error::custom)?;
+        Ok(receipt)
+    }
+}
+
+impl ProviderRoutePolicyReceipt {
+    fn from_policy(policy: ProviderRoutePolicy) -> Self {
+        Self {
+            inference_retries: policy.inference_retries(),
+            catalog_retries: policy.catalog_retries(),
+            inference_timeout: ProviderRouteDurationReceipt::from_duration(
+                policy.inference_timeout(),
+            ),
+            catalog_timeout: ProviderRouteDurationReceipt::from_duration(policy.catalog_timeout()),
+            advisory_discovery_timeout: ProviderRouteDurationReceipt::from_duration(
+                policy.advisory_discovery_timeout(),
+            ),
+            catalog: policy.catalog(),
+            retry_generation: ProviderRetryGenerationPolicy::BoundGeneration,
+            semantic_replay_generation: ProviderReplayGenerationPolicy::CurrentGeneration,
+            fallback: ProviderFallbackPolicy::Disabled,
+        }
+    }
+
+    fn to_policy(self) -> Result<ProviderRoutePolicy, ProviderRouteContractError> {
+        ProviderRoutePolicy::new(
+            self.inference_retries,
+            self.catalog_retries,
+            self.inference_timeout.to_duration()?,
+            self.catalog_timeout.to_duration()?,
+            self.advisory_discovery_timeout.to_duration()?,
+            self.catalog,
+        )
+    }
+
+    pub fn inference_retries(self) -> u32 {
+        self.inference_retries
+    }
+
+    pub fn catalog_retries(self) -> u32 {
+        self.catalog_retries
+    }
+
+    pub fn inference_timeout(self) -> ProviderRouteDurationReceipt {
+        self.inference_timeout
+    }
+
+    pub fn catalog_timeout(self) -> ProviderRouteDurationReceipt {
+        self.catalog_timeout
+    }
+
+    pub fn advisory_discovery_timeout(self) -> ProviderRouteDurationReceipt {
+        self.advisory_discovery_timeout
+    }
+
+    pub fn catalog(self) -> ProviderCatalogPolicy {
+        self.catalog
+    }
+
+    pub fn retry_generation(self) -> ProviderRetryGenerationPolicy {
+        self.retry_generation
+    }
+
+    pub fn semantic_replay_generation(self) -> ProviderReplayGenerationPolicy {
+        self.semantic_replay_generation
+    }
+
+    pub fn fallback(self) -> ProviderFallbackPolicy {
+        self.fallback
+    }
 }
 
 impl ProviderCatalogPolicy {
@@ -585,6 +784,123 @@ impl<'de> Deserialize<'de> for ProviderRouteIdentity {
     }
 }
 
+/// Complete bounded diagnostic projection of one immutable route generation.
+/// Provider runtimes, endpoints, auth headers, credential selectors, request
+/// bodies, and response bodies are structurally absent.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ProviderRouteReceipt {
+    receipt_revision: u32,
+    route: ProviderRouteIdentity,
+    model: Option<String>,
+    auth_source: ProviderAuthSource,
+    policy: ProviderRoutePolicyReceipt,
+}
+
+impl ProviderRouteReceipt {
+    fn from_valid_snapshot<P>(snapshot: &ProviderRouteSnapshot<P>) -> Self {
+        Self {
+            receipt_revision: PROVIDER_ROUTE_RECEIPT_REVISION,
+            route: snapshot.identity.clone(),
+            model: snapshot.model.clone(),
+            auth_source: snapshot.auth_source,
+            policy: ProviderRoutePolicyReceipt::from_policy(snapshot.policy),
+        }
+    }
+
+    fn validated(
+        route: ProviderRouteIdentity,
+        model: Option<String>,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicyReceipt,
+    ) -> Result<Self, ProviderRouteContractError> {
+        let runtime_policy = policy.to_policy()?;
+        let declared_catalog = route
+            .capabilities()
+            .supports(ProviderCapability::ModelCatalog);
+        if declared_catalog != runtime_policy.catalog().is_configured() {
+            return Err(ProviderRouteContractError::CatalogCapabilityMismatch {
+                declared: declared_catalog,
+                configured: runtime_policy.catalog().is_configured(),
+            });
+        }
+        match model.as_deref() {
+            Some(model) => {
+                ProviderRouteSnapshot::<()>::validated_model(model.to_string())?;
+            }
+            None => {
+                if !declared_catalog {
+                    return Err(ProviderRouteContractError::InferenceUnavailable);
+                }
+                if let Some(capability) = route
+                    .capabilities()
+                    .supported()
+                    .find(|capability| *capability != ProviderCapability::ModelCatalog)
+                {
+                    return Err(ProviderRouteContractError::CatalogOnlyCapabilityMismatch {
+                        capability,
+                    });
+                }
+            }
+        }
+        Ok(Self {
+            receipt_revision: PROVIDER_ROUTE_RECEIPT_REVISION,
+            route,
+            model,
+            auth_source,
+            policy,
+        })
+    }
+
+    pub fn receipt_revision(&self) -> u32 {
+        self.receipt_revision
+    }
+
+    pub fn route(&self) -> &ProviderRouteIdentity {
+        &self.route
+    }
+
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
+    }
+
+    pub fn auth_source(&self) -> ProviderAuthSource {
+        self.auth_source
+    }
+
+    pub fn policy(&self) -> ProviderRoutePolicyReceipt {
+        self.policy
+    }
+}
+
+impl<'de> Deserialize<'de> for ProviderRouteReceipt {
+    fn deserialize<D>(deserializer: D) -> Result<Self, D::Error>
+    where
+        D: Deserializer<'de>,
+    {
+        #[derive(Deserialize)]
+        #[serde(deny_unknown_fields)]
+        struct RawRouteReceipt {
+            receipt_revision: u32,
+            route: ProviderRouteIdentity,
+            model: Option<String>,
+            auth_source: ProviderAuthSource,
+            policy: ProviderRoutePolicyReceipt,
+        }
+
+        let raw = RawRouteReceipt::deserialize(deserializer)?;
+        if raw.receipt_revision != PROVIDER_ROUTE_RECEIPT_REVISION {
+            return Err(D::Error::custom(
+                ProviderRouteContractError::UnsupportedReceiptRevision {
+                    found: raw.receipt_revision,
+                    supported: PROVIDER_ROUTE_RECEIPT_REVISION,
+                },
+            ));
+        }
+        Self::validated(raw.route, raw.model, raw.auth_source, raw.policy).map_err(D::Error::custom)
+    }
+}
+
 /// One immutable runtime generation. The provider-specific runtime owns its
 /// endpoint, paths, frozen auth material, caches, and transport configuration;
 /// this provider-neutral wrapper owns the corresponding identity, model,
@@ -837,6 +1153,10 @@ impl<P> ProviderRouteSnapshot<P> {
         self.policy
     }
 
+    pub fn receipt(&self) -> ProviderRouteReceipt {
+        ProviderRouteReceipt::from_valid_snapshot(self)
+    }
+
     pub fn inference_runtime(&self) -> Option<&Arc<P>> {
         self.inference_runtime.as_ref()
     }
@@ -885,6 +1205,13 @@ impl<P> ProviderRouteCurrent<P> {
         Self {
             current: Arc::new(RwLock::new(Arc::new(initial))),
         }
+    }
+
+    pub fn receipt(&self) -> Result<ProviderRouteReceipt, ProviderRouteContractError> {
+        self.current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)
+            .map(|current| current.receipt())
     }
 
     /// Bind future logical requests to the snapshot that is current now.
@@ -1056,6 +1383,10 @@ impl<P> ProviderRouteHandle<P> {
         self.bound.policy()
     }
 
+    pub fn receipt(&self) -> ProviderRouteReceipt {
+        self.bound.receipt()
+    }
+
     fn validate(&self, required: &[ProviderCapability]) -> Result<(), ProviderRouteContractError> {
         let current_generation = self
             .current
@@ -1143,6 +1474,10 @@ impl<P> ProviderCatalogHandle<P> {
 
     pub fn policy(&self) -> ProviderRoutePolicy {
         self.bound.policy()
+    }
+
+    pub fn receipt(&self) -> ProviderRouteReceipt {
+        self.bound.receipt()
     }
 
     fn validate(&self) -> Result<(), ProviderRouteContractError> {
@@ -1363,6 +1698,12 @@ pub enum ProviderRouteContractError {
     DuplicateCapability { capability: ProviderCapability },
     #[error("provider route contract revision {found} is unsupported; supported revision is {supported}")]
     UnsupportedContractRevision { found: u32, supported: u32 },
+    #[error(
+        "provider route receipt revision {found} is unsupported; supported revision is {supported}"
+    )]
+    UnsupportedReceiptRevision { found: u32, supported: u32 },
+    #[error("provider route duration nanoseconds {nanoseconds} is outside 0..1000000000")]
+    InvalidRouteDurationNanoseconds { nanoseconds: u32 },
     #[error("provider adapter {adapter:?} cannot speak wire revision {wire_revision:?}")]
     AdapterWireMismatch {
         adapter: ProviderAdapterId,
