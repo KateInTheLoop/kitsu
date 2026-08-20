@@ -1,7 +1,7 @@
 # ADR: canonical session revision and logical HEAD
 
-Status: accepted design contract in Cycle 050; no production format or store
-behavior changes in this cycle.
+Status: design contract accepted in Cycle 050 and neutral logical values
+accepted in Cycle 051; no production format or store behavior changes yet.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -43,6 +43,17 @@ Opaque IDs are bounded, closed values. Their initial textual encoding will be
 versioned and validated before filesystem or adapter lookup. Ordering comes
 only from validated parent links and canonical operation order, never lexical
 comparison of IDs.
+
+Cycle 051 implements that vocabulary in `kitsu-core::session`: bounded typed
+`StoreId`, `SessionId`, `RevisionId`, and `TurnId`; explicit
+`ExpectedRevision` and `LogicalHead`; terminal-bound canonical operations and
+history; closed lookup states; and publication receipts that remain separate
+from semantic outcomes. The versioned JSON vectors reject unknown fields,
+future contract revisions, unsafe identities, unknown parent heads,
+duplicate turn/run identities, invalid conflicts, and no-op exact revisions.
+`scripts/check-session-boundary.sh` keeps this logical layer free of physical
+store, provider/tool, Tokio, environment, filesystem, process, and presentation
+dependencies. This is a contract seam, not a new persistence implementation.
 
 ## Canonical logical value
 
@@ -268,8 +279,9 @@ cannot weaken or replace any backend-neutral assertion.
 
 ## Delivery sequence after this ADR
 
-1. Add provider-free opaque ID, logical-head, canonical-operation, receipt, and
-   typed-state values with fail-closed validation and fixed vectors.
+1. **Complete in Cycle 051:** add provider-free opaque ID, logical-head,
+   canonical-operation, receipt, and typed-state values with fail-closed
+   validation and fixed vectors.
 2. Extract the current file store behind a private port without changing v1
    behavior; mount shared read/list/current invariant cases first.
 3. Add expected-revision publication and deterministic K04/K07/K08 fault hooks,

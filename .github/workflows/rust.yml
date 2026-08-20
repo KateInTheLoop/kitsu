@@ -35,5 +35,7 @@ jobs:
       run: cargo check --workspace --all-targets
     - name: Keep the run contract carrier-neutral
       run: bash scripts/check-run-boundary.sh
+    - name: Keep the session contract store-neutral
+      run: bash scripts/check-session-boundary.sh
     - name: Run tests
       run: cargo test --verbose

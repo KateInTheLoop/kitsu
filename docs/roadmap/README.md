@@ -262,15 +262,17 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is in progress through Cycle 050. The accepted canonical ADR
-assigns transcript operations, semantic terminal outcomes, selected logical
+Status: E03-S01 is accepted through Cycle 051. The canonical ADR and neutral
+logical value layer assign transcript operations, semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
 self-validating revision. It separates logical/store/artifact/projection/export
 versions; requires expected-revision CAS in addition to the writer lease;
 defines typed corrupt/future/conflict and publication states; preserves fresh
-authority; and gives K01-K12 stable backend-neutral meanings. Production v1 is
-unchanged; neutral value/validation fixtures are the next card and X005 still
-fails.
+authority; and gives K01-K12 stable backend-neutral meanings. Bounded opaque
+identities, logical HEAD/history, typed lookup states, and publication receipts
+now have closed, versioned, fail-closed vectors under a store-neutral dependency
+guard. Production v1 is unchanged; private current-store extraction is next and
+X005 still fails.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -533,6 +535,7 @@ gates merely because a card appears attractive.
 | 048 | E04-S05-C2 | Project the bounded receipt through status, JSONL run start, and opted-in doctor with offline no-construction proof |
 | 049 | E04-S05-C3 | Run identical two-adapter product conformance, close native default-token divergence, and accept X001 |
 | 050 | E03-S01-C1 | Accept the canonical revision/logical-HEAD ADR, current-v1 ownership map, and stable K01-K12 fixture contract |
+| 051 | E03-S01-C2 | Add neutral canonical session identities, HEAD/history, typed states, publication receipts, and a store-neutral boundary gate |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -569,8 +572,10 @@ Cycle 049 runs final two-adapter receipt/attempt conformance, closes the one
 discovered native default-token divergence, and accepts E04 plus X001. Cycle
 050 accepts E03's canonical revision/logical-HEAD ADR and stable K01-K12 fixture
 contract without changing v1. Cycle 051 adds the neutral opaque ID, HEAD,
-canonical-operation, receipt, and typed-state values with fail-closed vectors
-before extracting the current file store. The queue then advances through E03,
+canonical-operation/history, receipt, and typed-state values with fail-closed
+vectors plus an enforced store-neutral dependency boundary. Cycle 052 begins a
+private port around unchanged current-v1 read/list behavior. The queue then
+advances through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
