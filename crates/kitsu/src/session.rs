@@ -20,9 +20,12 @@ use chrono::{SecondsFormat, Utc};
 use kitsu_providers::ChatMessage;
 use serde::{Deserialize, Serialize};
 
-// Cycles 058-060 compile the physical-v1 records, immutable candidate I/O, and
-// fenced HEAD CAS before a migration card mounts them. Keeping the module
-// private prevents paths, locks, or file records from becoming the neutral API.
+// Cycles 058-061 compile the physical-v1 records, immutable candidate I/O,
+// fenced HEAD CAS, and closed canonical/migration payloads before a migration
+// card mounts them. Keeping these modules private prevents paths, locks,
+// provider wire records, or file records from becoming the neutral API.
+#[allow(dead_code)]
+mod canonical;
 #[allow(dead_code)]
 mod physical;
 

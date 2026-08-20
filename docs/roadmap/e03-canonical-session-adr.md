@@ -4,7 +4,8 @@ Status: design contract accepted in Cycle 050, neutral logical values accepted
 in Cycle 051, and the private compiled physical layout/record contract accepted
 in Cycle 058. Cycle 059 adds private descriptor-pinned candidate I/O and exact
 verification; Cycle 060 adds verified HEAD reads and writer-fenced physical CAS.
-Neither migration nor production store behavior has changed yet.
+Neither migration nor production store behavior has changed yet. Cycle 061
+adds the closed logical payload codec and strict current-v1 migration input.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -70,7 +71,6 @@ CanonicalSessionRevisionV1 {
   session_id,
   revision_id,
   parent_revision: Missing | RevisionId,
-  canonical_digest,
   created_at,
   committed_at,
   metadata: { name?, launch_directory, requested_gateway, requested_model,
@@ -83,6 +83,12 @@ CanonicalSessionRevisionV1 {
   compaction_binding: None | ContextProjectionRefV1,
 }
 ```
+
+`canonical_digest` is deliberately not serialized inside the bytes it hashes.
+The physical revision manifest owns the exact canonical-payload digest and
+length; because the payload contains every immutable artifact digest/reference,
+that outer digest binds the complete logical closure without a recursive or
+mutable checksum field.
 
 `CanonicalOperationV1` records one admitted run identity, user input, ordered
 assistant/tool conversation facts, semantic terminal outcome, assistant
@@ -365,8 +371,17 @@ cannot weaken or replace any backend-neutral assertion.
    **Physical HEAD CAS complete in Cycle 060:** bind a held per-session OS fence,
    verified current pointer, neutral expected revision, exact candidate parent,
    and manifest digest to atomic create/replace with old-or-new visibility and
-   installed-unconfirmed truth. Next define the complete canonical payload and
-   migration input, then migrate whole-operation outcome publication.
+   installed-unconfirmed truth. **Closed canonical payload and migration input
+   complete in Cycle 061:** a binary-private codec validates bounded resume
+   intent, lineage, whole terminal operations, role/tool causality, exact
+   selected-head ancestry, exact immutable artifact closure, retained effects,
+   and compaction generation bindings. A separate strict current-v1 decoder
+   preserves the exact source digest/transcript, rejects unknown nested fields
+   and broken causality, and always reports missing terminal facts; recognized
+   offload pointers add an artifact-closure blocker. It has no publication API,
+   so neither final messages nor file/process state can become invented terminal
+   truth. Next compose this payload with candidate install and fenced HEAD CAS
+   in one provider-free transaction before mounting production behavior.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
