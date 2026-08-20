@@ -2,7 +2,8 @@
 
 Status: design contract accepted in Cycle 050, neutral logical values accepted
 in Cycle 051, and the private compiled physical layout/record contract accepted
-in Cycle 058. Neither migration nor production store behavior has changed yet.
+in Cycle 058. Cycle 059 adds private descriptor-pinned candidate I/O and exact
+verification. Neither migration nor production store behavior has changed yet.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -165,8 +166,13 @@ revision directory is not canonical merely because it exists; only a validated
 head record can select it. Revision/store installation is no-clobber. Unknown
 fields, unknown record kinds, future physical versions, zero logical versions,
 invalid sizes/digests, self-parenting, and physical-location identity mismatch
-fail closed before publication. Digest verification against actual stored bytes,
-descriptor-pinned I/O, and head CAS are mounted in later cards.
+fail closed before publication. Store initialization and revision candidate I/O
+now use descriptor-relative no-follow opens, bounded exact-byte reads, synced
+create-new files, a private staging directory, and OS-level atomic no-replace
+directory installation. Reads verify the manifest location plus exact canonical
+length/digest and return the exact manifest-byte digest for future HEAD binding.
+The physical helper has no production caller; head CAS is mounted in a later
+card.
 
 ## Store contract and typed states
 
@@ -345,8 +351,12 @@ cannot weaken or replace any backend-neutral assertion.
    **Physical layout/record contract complete in Cycle 058:** the disjoint
    namespace, reversible path encoding, create-new store/revision records,
    replace-under-fence head pointer, byte/digest bindings, and fail-closed fixed
-   vectors are compiled but not mounted. Next add descriptor-pinned immutable
-   record I/O and head CAS, then migrate whole-operation outcome publication.
+   vectors are compiled but not mounted. **Candidate I/O complete in Cycle
+   059:** initialize or reopen one exact store identity without clobbering,
+   install privately staged revisions with no-replace rename and joined cleanup,
+   verify exact stored bytes, and preserve installed-unconfirmed sync truth.
+   Next add fenced expected-revision head CAS, then migrate whole-operation
+   outcome publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
