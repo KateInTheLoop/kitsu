@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 044.
+Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 045.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -27,6 +27,8 @@ through the common route handle, and rejects catalog policy the adapter cannot
 honor. Cycle 044 freezes bounded retry policy into that route and makes both
 compiled adapters use one provider-neutral delay, deadline, status taxonomy,
 and attempt-lifecycle owner.
+Cycle 045 instantiates one generic route-handle conformance harness with both
+compiled adapters; no production exception or dialect branch is required.
 
 ## Decision
 
@@ -203,7 +205,13 @@ its behavior and binds native retries to the immutable route policy. Offline
 cuts prove 529-to-success retains generation one across both attempts, an
 oversized `Retry-After` loses to the request deadline with one send, cancellation
 during backoff closes the scheduled attempt without sending it, and a malformed
-accepted body is terminal even when retries remain. These cards still do not:
+accepted body is terminal even when retries remain.
+
+Cycle 045 proves both adapters produce the same neutral text/tool deltas and
+generation-attributed body terminal, advertise the same required common
+capabilities, preserve optional-catalog absence without a send, publish an
+exact model successor, and reject the stale handle before a third send. These
+cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
@@ -211,12 +219,14 @@ accepted body is terminal even when retries remain. These cards still do not:
 - implement model catalog for the Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
-`rg` confirms `kitsu-core` does not import the route contract and the CLI has no
-flavor-to-adapter switch. There is no title-generation provider call in current
-Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
+`rg` confirms production `kitsu-core` does not import either concrete adapter,
+provider config, auth implementation, or catalog implementation; its test-only
+route fixture uses provider-neutral values. The CLI has no flavor-to-adapter
+switch. There is no title-generation provider call in current Kitsu.
+Production composition has no raw `OpenAICompatProvider::new` call; the
 constructor is confined to compiled provider factories and provider tests. The
-next card runs both compiled adapters through one provider-neutral route-handle
-conformance harness without enabling live configuration selection.
+next card adds an explicit compiled native selector to composition while
+preserving the compatible-Chat behavior of existing flavor-only configuration.
 
 ## Acceptance and rollback
 
@@ -247,6 +257,9 @@ once-frozen auth, typed unsupported-policy errors, common-handle generation
 attribution, catalog absence, and structured-output zero-send admission.
 Native retry fixtures add generation-stable transient retry-to-success,
 deadline refusal, backoff cancellation closure, and admitted-body no-retry.
+Two generic route-conformance instantiations add identical neutral text/tool,
+capability, attempt-generation, catalog-absence, successor, and stale zero-send
+evidence for compatible Chat and native Messages.
 The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting
