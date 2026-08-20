@@ -1,7 +1,7 @@
 # Current Harness Comparison
 
 Status: Kitsu-owned comparison from post-E01 runtime pin `986fba9`, updated
-through accepted Cycle 053; frozen research inputs and hashes are listed in
+through accepted Cycle 054; frozen research inputs and hashes are listed in
 [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md).
 
 The detailed source-by-source transfer decisions remain in the
@@ -51,7 +51,7 @@ and native Messages; X002-X005 retain their exact missing cells.
 | X002 tool/source | Fail | Registry integrity improved, but no admitted/supervised external source or two-source suite |
 | X003 host/UI | Fail | No named independent host/principal or shared carrier identity fixture |
 | X004 automation/runtime | Fail | Neutral run/outcome phases and an independent seven-carrier default-runtime evaluator now exist; no named alternate runtime adapter runs the suite |
-| X005 session/store | Fail | Strong atomic file snapshots and a compiled neutral revision/HEAD value contract, but no production CAS publication, complete K01-K12, or second store |
+| X005 session/store | Fail | Strong atomic file snapshots plus a compiled neutral revision/HEAD contract and exact zero-effect conflict admission, but no production revision minting/CAS publication, complete K01-K12, or second store |
 
 ## Comparative borrowing rule
 
@@ -68,7 +68,7 @@ and DB-row/file-tail/projection-as-canonical-HEAD.
 ## Evidence boundary
 
 This comparison is source/test-backed plus the provider-free acceptance tests
-recorded in Cycles 003-053. The full X001 suite executed against both required
+recorded in Cycles 003-054. The full X001 suite executed against both required
 compiled implementations; no live provider, credential, billable request, or
 subject-project runtime was needed. It does not claim execution of X002-X005.
 Scores change only when the named complete gate passes against both required

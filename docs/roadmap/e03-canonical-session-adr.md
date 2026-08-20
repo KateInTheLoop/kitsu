@@ -286,8 +286,11 @@ cannot weaken or replace any backend-neutral assertion.
    load/load-other/list and active save behind private ports without changing v1
    behavior. Other lifecycle mutations remain direct until their canonical
    operation is introduced.
-3. Add expected-revision publication and deterministic K04/K07/K08 fault hooks,
-   then migrate whole-operation outcome publication.
+3. **Admission comparison complete in Cycle 054:** `Missing` admits only no
+   observed revision and `Exact(A)` admits only observed `A`; every mismatch is
+   a typed zero-effect conflict. Next compose revision minting/publication and
+   deterministic K04/K07/K08 fault hooks, then migrate whole-operation outcome
+   publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

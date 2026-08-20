@@ -164,6 +164,28 @@ pub enum ExpectedRevision {
     Exact(RevisionId),
 }
 
+impl ExpectedRevision {
+    /// Admit a mutation only when the caller's expectation exactly matches the
+    /// currently observed canonical revision. This comparison is deliberately
+    /// independent of physical store mechanics: a mismatch is a typed conflict
+    /// and must be returned before staging or publication begins.
+    pub fn admit_observed(&self, observed: Option<&RevisionId>) -> Result<(), SessionLookupState> {
+        let matches = match (self, observed) {
+            (Self::Missing, None) => true,
+            (Self::Exact(expected), Some(observed)) => expected == observed,
+            _ => false,
+        };
+        if matches {
+            Ok(())
+        } else {
+            Err(SessionLookupState::Conflict {
+                expected: self.clone(),
+                observed: observed.cloned(),
+            })
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(
     tag = "kind",
