@@ -21,8 +21,9 @@ composes their exact closure with private canonical publication for one complete
 tool/result/effect operation. Cycle 069 applies the same closure to canonical
 HEAD open. Cycle 070 maps that private result to the neutral lookup vocabulary
 without separating `Present` from its verified payload. Cycle 071 types the
-earlier physical HEAD/revision envelope and invalid selected HEAD. Production is
-unmounted.
+earlier physical HEAD/revision envelope and invalid selected HEAD. Cycle 072
+advances the private physical schema to revision 2, binds exact parent-manifest
+digests, and verifies bounded selected lineage. Production is unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -338,6 +339,9 @@ Versions are independent:
 5. export/import schema.
 
 A store may change its physical schema without changing the logical value. A
+private schema change is still explicit: revision 2 adds the required parent-
+manifest digest to successor records; revision-1 stores are unsupported rather
+than decoded as revision 2. No production store uses either revision yet. A
 projection may be deleted and rebuilt without changing revision or HEAD. An
 export is a bounded disclosure projection with source store/session/revision/
 head and loss metadata; import validates its whole migration and artifact plan,
@@ -549,6 +553,16 @@ cannot weaken or replace any backend-neutral assertion.
    `BrokenCausality`. Every failure returns no payload, writes nothing, and does
    not scan an older candidate. Next verify exact retained revisions and bounded
    lineage without allowing a candidate or projection to become canonical HEAD.
+   **Exact retained lineage complete in Cycle 072:** physical schema revision 2
+   requires every successor manifest to name the SHA-256 of its exact verified
+   parent manifest. Candidate installation refuses an absent/unverified parent;
+   HEAD CAS rechecks that digest against the admitted selected parent. A bounded
+   reader follows only this HEAD-to-root chain, validates every canonical value
+   and artifact closure, ignores installed orphans, and returns no partial
+   lineage for missing, retargeted, cyclic, or over-limit ancestry. Schema
+   revision 1 is explicitly unsupported; production current-v1 files remain
+   untouched. Next derive a read-only last-good recovery plan from the physical
+   chain without publishing or silently changing HEAD.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

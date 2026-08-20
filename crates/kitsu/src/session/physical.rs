@@ -23,7 +23,7 @@ use super::{
     PrivateEntryKind,
 };
 
-pub(super) const PHYSICAL_SCHEMA_REVISION: u32 = 1;
+pub(super) const PHYSICAL_SCHEMA_REVISION: u32 = 2;
 pub(super) const MAX_PHYSICAL_RECORD_BYTES: usize = 64 * 1024;
 pub(super) const MAX_CANONICAL_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
 pub(super) const MAX_IMMUTABLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
@@ -295,6 +295,7 @@ pub(super) struct RevisionManifestV1 {
     session_id: SessionId,
     revision_id: RevisionId,
     parent_revision: ExpectedRevision,
+    parent_manifest_sha256: Option<Sha256Digest>,
     canonical_bytes: u64,
     canonical_sha256: Sha256Digest,
 }
@@ -307,6 +308,7 @@ impl RevisionManifestV1 {
         session_id: SessionId,
         revision_id: RevisionId,
         parent_revision: ExpectedRevision,
+        parent_manifest_sha256: Option<Sha256Digest>,
         canonical_bytes: u64,
         canonical_sha256: Sha256Digest,
     ) -> Result<Self, String> {
@@ -318,6 +320,7 @@ impl RevisionManifestV1 {
             session_id,
             revision_id,
             parent_revision,
+            parent_manifest_sha256,
             canonical_bytes,
             canonical_sha256,
         }
@@ -344,6 +347,17 @@ impl RevisionManifestV1 {
         ) {
             return Err("revision cannot name itself as its parent".to_string());
         }
+        match (&self.parent_revision, &self.parent_manifest_sha256) {
+            (ExpectedRevision::Missing, None) | (ExpectedRevision::Exact(_), Some(_)) => {}
+            (ExpectedRevision::Missing, Some(_)) => {
+                return Err("root revision cannot bind a parent manifest digest".to_string());
+            }
+            (ExpectedRevision::Exact(_), None) => {
+                return Err(
+                    "successor revision must bind its exact parent manifest digest".to_string(),
+                );
+            }
+        }
         Ok(self)
     }
 
@@ -365,6 +379,10 @@ impl RevisionManifestV1 {
 
     pub(super) fn parent_revision(&self) -> &ExpectedRevision {
         &self.parent_revision
+    }
+
+    pub(super) fn parent_manifest_sha256(&self) -> Option<&Sha256Digest> {
+        self.parent_manifest_sha256.as_ref()
     }
 }
 
@@ -1279,6 +1297,19 @@ impl PhysicalFileStoreV1 {
                 candidate.manifest.parent_revision
             )));
         }
+        if let ExpectedRevision::Exact(_) = &expected {
+            let observed_parent_manifest = current
+                .as_ref()
+                .expect("exact expected revision was admitted against a present HEAD")
+                .candidate()
+                .manifest_sha256();
+            if candidate.manifest.parent_manifest_sha256() != Some(observed_parent_manifest) {
+                return Err(PhysicalHeadCasError::Candidate(
+                    "revision candidate parent digest does not match the exact admitted HEAD manifest"
+                        .to_string(),
+                ));
+            }
+        }
 
         fence
             .confirm(self.store_id(), session_id)
@@ -1626,12 +1657,27 @@ impl PhysicalFileStoreV1 {
         })?;
         let canonical_sha256 =
             digest_bytes(canonical_bytes).map_err(PhysicalCandidateInstallError::before_install)?;
+        let parent_manifest_sha256 = match &parent_revision {
+            ExpectedRevision::Missing => None,
+            ExpectedRevision::Exact(parent) => Some(
+                self.open_revision_candidate(&session_id, parent)
+                    .map_err(|error| {
+                        PhysicalCandidateInstallError::before_install(format!(
+                            "cannot bind exact parent revision '{}': {error}",
+                            parent.as_str()
+                        ))
+                    })?
+                    .manifest_sha256
+                    .clone(),
+            ),
+        };
         let manifest = RevisionManifestV1::new(
             logical_schema_revision,
             self.store_id().clone(),
             session_id.clone(),
             revision_id.clone(),
             parent_revision,
+            parent_manifest_sha256,
             canonical_len,
             canonical_sha256,
         )
@@ -2178,14 +2224,14 @@ mod tests {
         let store_record = StoreRecordV1::new(store());
         assert_eq!(
             encode_store_record(&store_record).unwrap(),
-            br#"{"record_type":"store","physical_schema_revision":1,"store_id":"store-a"}
+            br#"{"record_type":"store","physical_schema_revision":2,"store_id":"store-a"}
 "#
         );
         assert_eq!(
             serde_json::to_value(&store_record).unwrap(),
             serde_json::json!({
                 "record_type": "store",
-                "physical_schema_revision": 1,
+                "physical_schema_revision": 2,
                 "store_id": "store-a"
             })
         );
@@ -2200,6 +2246,7 @@ mod tests {
             session(),
             revision("revision-b"),
             ExpectedRevision::Exact(revision("revision-a")),
+            Some(digest("c")),
             123,
             digest("a"),
         )
@@ -2207,6 +2254,7 @@ mod tests {
         let manifest_value = serde_json::to_value(&manifest).unwrap();
         assert_eq!(manifest_value["record_type"], "revision_manifest");
         assert_eq!(manifest_value["canonical_bytes"], 123);
+        assert_eq!(manifest_value["parent_manifest_sha256"], "c".repeat(64));
         assert!(manifest_value.get("logical_head").is_none());
         assert_eq!(
             decode_revision_manifest(
@@ -2253,7 +2301,7 @@ mod tests {
             artifact
         );
         let mut artifact_future = artifact_value.clone();
-        artifact_future["physical_schema_revision"] = serde_json::json!(2);
+        artifact_future["physical_schema_revision"] = serde_json::json!(3);
         assert!(decode_artifact_manifest(
             &serde_json::to_vec(&artifact_future).unwrap(),
             &store(),
@@ -2288,12 +2336,13 @@ mod tests {
             session(),
             revision("revision-b"),
             ExpectedRevision::Exact(revision("revision-a")),
+            Some(digest("c")),
             123,
             digest("a"),
         )
         .unwrap();
         let mut value = serde_json::to_value(&manifest).unwrap();
-        value["physical_schema_revision"] = serde_json::json!(2);
+        value["physical_schema_revision"] = serde_json::json!(3);
         assert!(decode_revision_manifest(
             &serde_json::to_vec(&value).unwrap(),
             &store(),
@@ -2301,7 +2350,7 @@ mod tests {
             &revision("revision-b")
         )
         .is_err());
-        value["physical_schema_revision"] = serde_json::json!(1);
+        value["physical_schema_revision"] = serde_json::json!(2);
         value["ambient_head"] = serde_json::json!("tail");
         assert!(decode_revision_manifest(
             &serde_json::to_vec(&value).unwrap(),
@@ -2324,6 +2373,7 @@ mod tests {
             session(),
             revision("revision-b"),
             ExpectedRevision::Missing,
+            None,
             123,
             digest("a"),
         )
@@ -2334,6 +2384,29 @@ mod tests {
             session(),
             revision("revision-b"),
             ExpectedRevision::Exact(revision("revision-b")),
+            Some(digest("b")),
+            123,
+            digest("a"),
+        )
+        .is_err());
+        assert!(RevisionManifestV1::new(
+            1,
+            store(),
+            session(),
+            revision("revision-b"),
+            ExpectedRevision::Missing,
+            Some(digest("b")),
+            123,
+            digest("a"),
+        )
+        .is_err());
+        assert!(RevisionManifestV1::new(
+            1,
+            store(),
+            session(),
+            revision("revision-b"),
+            ExpectedRevision::Exact(revision("revision-a")),
+            None,
             123,
             digest("a"),
         )
@@ -2421,6 +2494,7 @@ mod tests {
             .unwrap();
         assert_eq!(installed.manifest().session_id, session);
         assert_eq!(installed.manifest().revision_id, revision);
+        assert!(installed.manifest().parent_manifest_sha256().is_none());
         assert_eq!(
             installed.manifest().canonical_sha256.as_str(),
             crate::skills::content_sha256_hex(canonical)
@@ -2799,6 +2873,10 @@ mod tests {
                 b"{\"value\":\"b\"}\n",
             )
             .unwrap();
+        assert_eq!(
+            candidate_b.manifest().parent_manifest_sha256(),
+            Some(candidate_a.manifest_sha256())
+        );
         store
             .compare_and_swap_head(
                 &fence,
