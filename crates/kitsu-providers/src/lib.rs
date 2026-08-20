@@ -11,10 +11,10 @@ pub mod types;
 pub use error::{AuthError, ExpiryStatus, ProviderError, ProviderResponsePart};
 pub use route::{
     ProviderAdapterId, ProviderAuthSource, ProviderCapabilities, ProviderCapability,
-    ProviderCatalogPolicy, ProviderProfileId, ProviderRouteContractError, ProviderRouteCurrent,
-    ProviderRouteDeclaration, ProviderRouteGeneration, ProviderRouteHandle, ProviderRouteIdentity,
-    ProviderRoutePolicy, ProviderRouteSnapshot, ProviderRouteTimeout, ProviderWireRevision,
-    PROVIDER_ROUTE_CONTRACT_REVISION,
+    ProviderCatalogHandle, ProviderCatalogPolicy, ProviderProfileId, ProviderRouteContractError,
+    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRouteGeneration, ProviderRouteHandle,
+    ProviderRouteIdentity, ProviderRoutePolicy, ProviderRouteSnapshot, ProviderRouteTimeout,
+    ProviderWireRevision, PROVIDER_ROUTE_CONTRACT_REVISION,
 };
 pub use telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptObservation,

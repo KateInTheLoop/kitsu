@@ -34,13 +34,14 @@ use kitsu_core::context::{
 use kitsu_core::{run_agent_turn_with_state, AgentConfig, ArtifactStoragePolicy, CompactionMode};
 use kitsu_providers::auth::{AuthProvider, EnvBearerAuth, NoAuth, StaticAuth};
 use kitsu_providers::openai_compat::{
-    build_openai_compatible_route, OpenAICompatConfig, OpenAICompatProvider,
-    OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
+    build_openai_compatible_catalog_route, build_openai_compatible_route,
+    OpenAICompatCatalogRouteConfig, OpenAICompatProvider, OpenAICompatRouteBuildError,
+    OpenAICompatRouteConfig,
 };
 use kitsu_providers::{
     ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
-    ProviderAuthSource, ProviderCatalogPolicy, ProviderError, ProviderProfileId,
-    ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
+    ProviderAuthSource, ProviderCatalogHandle, ProviderCatalogPolicy, ProviderError,
+    ProviderProfileId, ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
     ProviderRouteHandle, ProviderRoutePolicy, ProviderTelemetrySink,
 };
 use kitsu_tools::{
@@ -3733,7 +3734,7 @@ fn print_doctor_human(report: &serde_json::Value) {
 }
 
 async fn minimal_inference_probe(
-    provider: &OpenAICompatProvider,
+    provider: &ProviderRouteHandle<OpenAICompatProvider>,
     model: &str,
 ) -> Result<(), ProviderError> {
     use futures::StreamExt as _;
@@ -3763,6 +3764,81 @@ async fn minimal_inference_probe(
             "inference probe ended without a terminal marker".to_string(),
         ))
     }
+}
+
+fn route_build_provider_error(error: OpenAICompatRouteBuildError) -> ProviderError {
+    match error {
+        OpenAICompatRouteBuildError::Auth(error) => ProviderError::Auth(error),
+        OpenAICompatRouteBuildError::Contract(error) => ProviderError::RouteContract(error),
+    }
+}
+
+fn build_inference_management_route(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+    model: String,
+    auth_source: ProviderAuthSource,
+    auth: &dyn AuthProvider,
+    timeout: Duration,
+) -> Result<ProviderRouteHandle<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
+    let catalog_policy = if models_path.is_some() {
+        ProviderCatalogPolicy::Configured
+    } else {
+        ProviderCatalogPolicy::Unavailable
+    };
+    let declaration = current_provider_route_declaration(config_path, gateway_name, gateway)?;
+    let policy = ProviderRoutePolicy::new(0, 0, timeout, timeout, timeout, catalog_policy)?;
+    let snapshot = build_openai_compatible_route(
+        OpenAICompatRouteConfig {
+            declaration,
+            model,
+            auth_source,
+            base_url: gateway.base_url.clone(),
+            chat_path: gateway.chat_path.clone(),
+            models_path,
+            policy,
+        },
+        auth,
+    )?;
+    ProviderRouteCurrent::new(snapshot)
+        .bind()
+        .map_err(Into::into)
+}
+
+fn build_catalog_management_route(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+    gateway: &Gateway,
+    models_path: String,
+    auth_source: ProviderAuthSource,
+    auth: &dyn AuthProvider,
+    timeout: Duration,
+) -> Result<ProviderCatalogHandle<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    let declaration = current_provider_catalog_route_declaration(config_path, gateway_name)?;
+    let policy = ProviderRoutePolicy::new(
+        0,
+        0,
+        timeout,
+        timeout,
+        timeout,
+        ProviderCatalogPolicy::Configured,
+    )?;
+    let snapshot = build_openai_compatible_catalog_route(
+        OpenAICompatCatalogRouteConfig {
+            declaration,
+            auth_source,
+            base_url: gateway.base_url.clone(),
+            chat_path: gateway.chat_path.clone(),
+            models_path,
+            policy,
+        },
+        auth,
+    )?;
+    ProviderRouteCurrent::new(snapshot)
+        .bind_catalog()
+        .map_err(Into::into)
 }
 
 async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Result<(), CliError> {
@@ -4021,21 +4097,29 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                             "status": issue,
                         });
                     } else {
+                        let auth_source =
+                            current_provider_auth_source(gateway, managed_token.is_some());
                         let auth = build_auth(gateway, gateway_name, managed_token.clone())
                             .map_err(|error| CliError::user(safe_config_error(&error)))?;
-                        let provider = OpenAICompatProvider::new(
-                            OpenAICompatConfig {
-                                base_url: gateway.base_url.clone(),
-                                chat_path: gateway.chat_path.clone(),
-                                models_path: gateway
-                                    .models_path
-                                    .clone()
-                                    .filter(|path| !path.is_empty()),
-                                retries: 0,
-                                timeout: Duration::from_secs(cli.timeout_secs),
-                            },
-                            auth,
-                        );
+                        let provider = build_inference_management_route(
+                            &config_path,
+                            gateway_name,
+                            gateway,
+                            model.clone().expect("validated above"),
+                            auth_source,
+                            auth.as_ref(),
+                            Duration::from_secs(cli.timeout_secs),
+                        )
+                        .map_err(|error| {
+                            map_provider_error_with_diagnostics(
+                                route_build_provider_error(error),
+                                ProviderOperation::InferenceProbe {
+                                    model: model.as_deref().expect("validated above"),
+                                },
+                                None,
+                                provider_diagnostics,
+                            )
+                        })?;
                         let effective_model = model.as_deref().expect("validated above");
                         match await_cancellable(minimal_inference_probe(&provider, effective_model))
                             .await
@@ -4080,110 +4164,123 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                     }
                 } else if online {
                     let models_path = gateway.models_path.clone().filter(|path| !path.is_empty());
-                    if models_path.is_none() {
-                        let issue = "online provider check was requested but skipped: no models_path is configured for a safe read-only probe".to_string();
-                        issues.push(issue.clone());
-                        online_report = serde_json::json!({
-                            "requested": true,
-                            "scope": "model_catalog_only",
-                            "chat_route_probed": false,
-                            "potentially_billable": false,
-                            "request_sent": false,
-                            "status": issue,
-                        });
-                    } else if !flavor_ok
-                        || !auth_valid
-                        || !auth_locally_usable
-                        || credential_present == Some(false)
-                        || model.is_none()
-                    {
-                        let issue = "online provider check was requested but skipped: fix gateway, model, or auth diagnostics first".to_string();
-                        issues.push(issue.clone());
-                        online_report = serde_json::json!({
-                            "requested": true,
-                            "scope": "model_catalog_only",
-                            "chat_route_probed": false,
-                            "potentially_billable": false,
-                            "request_sent": false,
-                            "status": issue,
-                        });
-                    } else {
-                        let auth = build_auth(gateway, gateway_name, managed_token.clone())
-                            .map_err(|error| CliError::user(safe_config_error(&error)))?;
-                        let provider = OpenAICompatProvider::new(
-                            OpenAICompatConfig {
-                                base_url: gateway.base_url.clone(),
-                                chat_path: gateway.chat_path.clone(),
+                    match models_path {
+                        None => {
+                            let issue = "online provider check was requested but skipped: no models_path is configured for a safe read-only probe".to_string();
+                            issues.push(issue.clone());
+                            online_report = serde_json::json!({
+                                "requested": true,
+                                "scope": "model_catalog_only",
+                                "chat_route_probed": false,
+                                "potentially_billable": false,
+                                "request_sent": false,
+                                "status": issue,
+                            });
+                        }
+                        Some(_)
+                            if !flavor_ok
+                                || !auth_valid
+                                || !auth_locally_usable
+                                || credential_present == Some(false) =>
+                        {
+                            let issue = "online provider check was requested but skipped: fix gateway or auth diagnostics first".to_string();
+                            issues.push(issue.clone());
+                            online_report = serde_json::json!({
+                                "requested": true,
+                                "scope": "model_catalog_only",
+                                "chat_route_probed": false,
+                                "potentially_billable": false,
+                                "request_sent": false,
+                                "status": issue,
+                            });
+                        }
+                        Some(models_path) => {
+                            let auth_source =
+                                current_provider_auth_source(gateway, managed_token.is_some());
+                            let auth = build_auth(gateway, gateway_name, managed_token.clone())
+                                .map_err(|error| CliError::user(safe_config_error(&error)))?;
+                            let provider = build_catalog_management_route(
+                                &config_path,
+                                gateway_name,
+                                gateway,
                                 models_path,
-                                retries: 0,
-                                timeout: Duration::from_secs(cli.timeout_secs),
-                            },
-                            auth,
-                        )
-                        .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
-                        match await_cancellable(provider.list_models()).await {
-                            Some(Ok(Some(models))) => {
-                                let effective_model = model.as_deref().expect("validated above");
-                                let effective_model_available =
-                                    model_catalog_advertises_selected_model(
-                                        effective_model,
-                                        &models,
+                                auth_source,
+                                auth.as_ref(),
+                                Duration::from_secs(cli.timeout_secs),
+                            )
+                            .map_err(|error| {
+                                map_provider_error_with_diagnostics(
+                                    route_build_provider_error(error),
+                                    ProviderOperation::ModelCatalog,
+                                    None,
+                                    provider_diagnostics,
+                                )
+                            })?;
+                            match await_cancellable(provider.list_models()).await {
+                                Some(Ok(Some(models))) => {
+                                    let effective_model = model.as_deref();
+                                    let effective_model_available = effective_model.map(|model| {
+                                        model_catalog_advertises_selected_model(
+                                            model,
+                                            &models,
+                                            provider_diagnostics,
+                                        )
+                                    });
+                                    let models = normalize_model_catalog(models);
+                                    if effective_model_available == Some(false) {
+                                        issues.push(format!(
+                                        "effective model '{}' is not advertised by the normalized gateway catalog",
+                                        terminal_inline(effective_model.expect("checked above"))
+                                    ));
+                                    }
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": "reachable",
+                                        "models": models.len(),
+                                        "effective_model": effective_model,
+                                        "effective_model_available": effective_model_available,
+                                    });
+                                }
+                                Some(Ok(None)) => {
+                                    let issue = "online provider check was requested but skipped: provider has no model catalog".to_string();
+                                    issues.push(issue.clone());
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": issue,
+                                    });
+                                }
+                                Some(Err(error)) => {
+                                    let safe = safe_provider_error_message(
+                                        &error,
+                                        ProviderOperation::ModelCatalog,
+                                        Some(cli.timeout_secs),
                                         provider_diagnostics,
                                     );
-                                let models = normalize_model_catalog(models);
-                                if !effective_model_available {
-                                    issues.push(format!(
-                                        "effective model '{}' is not advertised by the normalized gateway catalog",
-                                        terminal_inline(effective_model)
+                                    let reason = bounded_model_catalog_reason(&error);
+                                    issues.push(format!("online provider check failed: {safe}"));
+                                    online_report = serde_json::json!({
+                                        "requested": true,
+                                        "scope": "model_catalog_only",
+                                        "chat_route_probed": false,
+                                        "potentially_billable": false,
+                                        "request_sent": true,
+                                        "status": safe,
+                                        "reason": reason,
+                                    });
+                                }
+                                None => {
+                                    return Err(CliError::cancelled(
+                                        "doctor provider check cancelled by Ctrl+C",
                                     ));
                                 }
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": "reachable",
-                                    "models": models.len(),
-                                    "effective_model": effective_model,
-                                    "effective_model_available": effective_model_available,
-                                });
-                            }
-                            Some(Ok(None)) => {
-                                let issue = "online provider check was requested but skipped: provider has no model catalog".to_string();
-                                issues.push(issue.clone());
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": issue,
-                                });
-                            }
-                            Some(Err(error)) => {
-                                let safe = safe_provider_error_message(
-                                    &error,
-                                    ProviderOperation::ModelCatalog,
-                                    Some(cli.timeout_secs),
-                                    provider_diagnostics,
-                                );
-                                let reason = bounded_model_catalog_reason(&error);
-                                issues.push(format!("online provider check failed: {safe}"));
-                                online_report = serde_json::json!({
-                                    "requested": true,
-                                    "scope": "model_catalog_only",
-                                    "chat_route_probed": false,
-                                    "potentially_billable": false,
-                                    "request_sent": true,
-                                    "status": safe,
-                                    "reason": reason,
-                                });
-                            }
-                            None => {
-                                return Err(CliError::cancelled(
-                                    "doctor provider check cancelled by Ctrl+C",
-                                ));
                             }
                         }
                     }
@@ -8253,10 +8350,7 @@ fn current_provider_route_declaration(
     gateway_name: &str,
     gateway: &Gateway,
 ) -> Result<ProviderRouteDeclaration, ProviderRouteContractError> {
-    let profile = ProviderProfileId::derive_v1(
-        provider_profile_namespace(config_path),
-        gateway_name.as_bytes(),
-    )?;
+    let profile = current_provider_profile_id(config_path, gateway_name)?;
     let has_model_catalog = gateway
         .models_path
         .as_deref()
@@ -8265,6 +8359,25 @@ fn current_provider_route_declaration(
         profile,
         has_model_catalog,
     ))
+}
+
+fn current_provider_catalog_route_declaration(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+) -> Result<ProviderRouteDeclaration, ProviderRouteContractError> {
+    Ok(ProviderRouteDeclaration::compatible_catalog_v1(
+        current_provider_profile_id(config_path, gateway_name)?,
+    ))
+}
+
+fn current_provider_profile_id(
+    config_path: &std::path::Path,
+    gateway_name: &str,
+) -> Result<ProviderProfileId, ProviderRouteContractError> {
+    ProviderProfileId::derive_v1(
+        provider_profile_namespace(config_path),
+        gateway_name.as_bytes(),
+    )
 }
 
 /// Identify the credential source that the immediately following auth freeze
@@ -9034,20 +9147,38 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     let current_model = gateway.resolve_model(cli.model.as_deref()).ok();
     let state_dir = runtime_state_dir_read_only(&path);
     let managed_token = managed_credential(&state_dir, gateway_name, gateway)?;
+    let auth_source = current_provider_auth_source(gateway, managed_token.is_some());
     let auth = build_auth(gateway, gateway_name, managed_token)
         .map_err(|error| CliError::user(error.to_string()))?;
     require_auth_ready(auth.as_ref(), ProviderOperation::ModelCatalog)?;
-    let provider = OpenAICompatProvider::new(
-        OpenAICompatConfig {
-            base_url: gateway.base_url.clone(),
-            chat_path: gateway.chat_path.clone(),
-            models_path: gateway.models_path.clone().filter(|path| !path.is_empty()),
-            retries: 0,
-            timeout: Duration::from_secs(cli.timeout_secs),
-        },
-        auth,
+    let models_path = gateway
+        .models_path
+        .clone()
+        .filter(|path| !path.is_empty())
+        .ok_or_else(|| {
+            CliError::user(
+                "this gateway does not expose a model catalog; configure models_path".to_string(),
+            )
+        })?;
+    let provider = build_catalog_management_route(
+        &path,
+        gateway_name,
+        gateway,
+        models_path,
+        auth_source,
+        auth.as_ref(),
+        Duration::from_secs(cli.timeout_secs),
     )
-    .with_discovery_timeout(Duration::from_secs(cli.timeout_secs));
+    .map_err(|error| match error {
+        OpenAICompatRouteBuildError::Auth(error) => map_provider_error(
+            ProviderError::Auth(error),
+            ProviderOperation::ModelCatalog,
+            None,
+        ),
+        OpenAICompatRouteBuildError::Contract(error) => {
+            CliError::user(format!("config error: invalid provider route: {error}"))
+        }
+    })?;
     if cli.jsonl {
         emit_jsonl(
             "run_started",

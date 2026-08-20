@@ -99,6 +99,14 @@ fn current_compatible_chat_declaration_has_truthful_explicit_capabilities() {
         .capabilities()
         .supports(ProviderCapability::ModelCatalog));
 
+    let catalog_only = ProviderRouteDeclaration::compatible_catalog_v1(
+        ProviderProfileId::derive_v1(b"namespace", b"catalog").unwrap(),
+    );
+    assert_eq!(
+        catalog_only.capabilities().supported().collect::<Vec<_>>(),
+        vec![ProviderCapability::ModelCatalog]
+    );
+
     let mismatch = ProviderRouteDeclaration::new(
         ProviderAdapterId::AnthropicMessages,
         ProviderProfileId::derive_v1(b"namespace", b"other").unwrap(),

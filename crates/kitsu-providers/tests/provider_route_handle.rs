@@ -226,6 +226,12 @@ fn declaration(catalog: bool) -> ProviderRouteDeclaration {
     )
 }
 
+fn catalog_declaration() -> ProviderRouteDeclaration {
+    ProviderRouteDeclaration::compatible_catalog_v1(
+        ProviderProfileId::derive_v1(b"route-handle", b"catalog-only").unwrap(),
+    )
+}
+
 fn request() -> ChatRequest {
     request_for("model-a")
 }
@@ -283,6 +289,77 @@ async fn unavailable_optional_catalog_returns_none_before_the_runtime() {
 
     assert_eq!(handle.list_models().await.unwrap(), None);
     assert_eq!(runtime.catalog_sends.load(Ordering::Acquire), 0);
+}
+
+#[tokio::test]
+async fn catalog_only_handle_admits_catalog_but_cannot_be_rebound_for_chat() {
+    let runtime = Arc::new(CountingProvider::default());
+    let snapshot = ProviderRouteSnapshot::initial_catalog_only(
+        catalog_declaration(),
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Configured),
+        runtime.clone(),
+    )
+    .unwrap();
+    let current = ProviderRouteCurrent::new(snapshot);
+    let catalog = current.bind_catalog().unwrap();
+
+    assert_eq!(catalog.list_models().await.unwrap().unwrap(), ["model-a"]);
+    assert_eq!(catalog.identity().generation().get(), 1);
+    assert_eq!(runtime.catalog_sends.load(Ordering::Acquire), 1);
+    assert_eq!(runtime.chat_sends.load(Ordering::Acquire), 0);
+    assert!(matches!(
+        current.bind(),
+        Err(ProviderRouteContractError::InferenceUnavailable)
+    ));
+    assert!(matches!(
+        current.bind_model("invented-model"),
+        Err(ProviderRouteContractError::InferenceUnavailable)
+    ));
+}
+
+#[tokio::test]
+async fn catalog_only_replacement_stales_old_handle_without_a_send() {
+    let first_runtime = Arc::new(CountingProvider::default());
+    let first = ProviderRouteSnapshot::initial_catalog_only(
+        catalog_declaration(),
+        ProviderAuthSource::None,
+        policy(ProviderCatalogPolicy::Configured),
+        first_runtime.clone(),
+    )
+    .unwrap();
+    let first_identity = first.identity().clone();
+    let current = ProviderRouteCurrent::new(first);
+    let old = current.bind_catalog().unwrap();
+
+    let second_runtime = Arc::new(CountingProvider::default());
+    let second = ProviderRouteSnapshot::successor_catalog_only(
+        &first_identity,
+        catalog_declaration(),
+        ProviderAuthSource::ManagedCredential,
+        policy(ProviderCatalogPolicy::Configured),
+        second_runtime.clone(),
+    )
+    .unwrap();
+    current
+        .replace(first_identity.generation(), second)
+        .unwrap();
+
+    assert!(matches!(
+        old.list_models().await,
+        Err(ProviderError::RouteContract(
+            ProviderRouteContractError::StaleGeneration { .. }
+        ))
+    ));
+    assert_eq!(first_runtime.catalog_sends.load(Ordering::Acquire), 0);
+
+    let current_catalog = current.bind_catalog().unwrap();
+    assert_eq!(current_catalog.identity().generation().get(), 2);
+    assert_eq!(
+        current_catalog.list_models().await.unwrap().unwrap(),
+        ["model-a"]
+    );
+    assert_eq!(second_runtime.catalog_sends.load(Ordering::Acquire), 1);
 }
 
 #[tokio::test]
