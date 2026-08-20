@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 070. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 071. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -321,8 +321,11 @@ canonical HEAD open now decodes and binds the selected revision and reapplies
 that same exact closure. Only an absent HEAD is missing; selected logical,
 binding, or artifact corruption never falls back. A lossless lookup envelope now
 pairs verified payload with `Present`, maps current corruption reasons exactly,
-and distinguishes future logical/artifact/artifact-manifest physical schemas.
-Earlier physical HEAD/revision error typing remains next.
+and distinguishes future logical/artifact/physical schemas. Physical HEAD and
+revision reads now preserve typed missing, malformed, identity, digest, and
+future-schema evidence, including the selected revision whenever the HEAD can
+be decoded. Invalid selected logical HEAD is distinct from broken causality.
+Exact retained-revision verification remains next.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -605,6 +608,7 @@ gates merely because a card appears attractive.
 | 068 | E03-S02-C17 | Bind complete canonical tool/effect publication to exact installed artifact closure before candidate and HEAD publication |
 | 069 | E03-S02-C18 | Decode and bind selected canonical HEAD plus exact artifact closure, refusing corruption without older-revision fallback |
 | 070 | E03-S02-C19 | Pair canonical read with neutral lookup state and classify current corruption plus logical/artifact schema dimensions |
+| 071 | E03-S02-C20 | Type physical HEAD/revision read evidence and distinguish invalid selected HEAD from broken operation causality |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -674,7 +678,7 @@ durability truth. Cycle 067 defines descriptor-pinned immutable artifact
 closure before this path can widen. Cycle 068 binds canonical artifact facts to
 exact verified physical records before candidate/HEAD publication. The queue
 then verifies selected-HEAD closure in Cycle 069, maps the neutral lookup in
-Cycle 070, and continues through E03,
+Cycle 070, types its complete physical envelope in Cycle 071, and continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

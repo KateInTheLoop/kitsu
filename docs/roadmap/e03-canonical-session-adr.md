@@ -20,7 +20,9 @@ Cycle 067 adds private physical immutable artifact records and I/O. Cycle 068
 composes their exact closure with private canonical publication for one complete
 tool/result/effect operation. Cycle 069 applies the same closure to canonical
 HEAD open. Cycle 070 maps that private result to the neutral lookup vocabulary
-without separating `Present` from its verified payload. Production is unmounted.
+without separating `Present` from its verified payload. Cycle 071 types the
+earlier physical HEAD/revision envelope and invalid selected HEAD. Production is
+unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -538,6 +540,15 @@ cannot weaken or replace any backend-neutral assertion.
    map to dimensioned `Unsupported`. Zero schemas remain malformed. Next type the
    earlier physical HEAD/revision envelope failures and split invalid-HEAD from
    other logical-causality validation before any production mounting.
+   **Typed physical lookup envelope complete in Cycle 071:** descriptor-pinned
+   HEAD/revision reads preserve missing-reference, malformed, identity, digest,
+   and future-physical-schema evidence without parsing display text. A decoded
+   HEAD carries its selected revision through every later failure. Schema zero
+   remains malformed; future physical schemas remain `Unsupported`; an unknown
+   selected logical HEAD is `InvalidHead`, while invalid operation ancestry is
+   `BrokenCausality`. Every failure returns no payload, writes nothing, and does
+   not scan an older candidate. Next verify exact retained revisions and bounded
+   lineage without allowing a candidate or projection to become canonical HEAD.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
