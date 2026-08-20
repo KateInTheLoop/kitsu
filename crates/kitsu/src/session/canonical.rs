@@ -722,12 +722,57 @@ fn contains_offload_pointer(content: &str) -> bool {
         .any(|line| line.starts_with("[tool output ") && line.contains("full result saved to "))
 }
 
-pub(super) fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
-    check_payload_size(bytes, "canonical payload")?;
-    let payload: CanonicalSessionRevisionV1 = serde_json::from_slice(bytes)
-        .map_err(|error| format!("cannot decode closed canonical payload: {error}"))?;
-    validate_canonical_payload(&payload)?;
+#[derive(Debug)]
+pub(super) enum CanonicalPayloadDecodeErrorV1 {
+    Malformed(String),
+    UnsupportedLogicalSchema { observed: u32, supported: u32 },
+    Invalid(String),
+}
+
+impl std::fmt::Display for CanonicalPayloadDecodeErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Malformed(message) | Self::Invalid(message) => formatter.write_str(message),
+            Self::UnsupportedLogicalSchema {
+                observed,
+                supported,
+            } => write!(
+                formatter,
+                "unsupported canonical logical schema {observed}; expected {supported}"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalPayloadDecodeErrorV1 {}
+
+pub(super) fn decode_canonical_payload_classified(
+    bytes: &[u8],
+) -> Result<CanonicalSessionRevisionV1, CanonicalPayloadDecodeErrorV1> {
+    check_payload_size(bytes, "canonical payload")
+        .map_err(CanonicalPayloadDecodeErrorV1::Malformed)?;
+    let payload: CanonicalSessionRevisionV1 = serde_json::from_slice(bytes).map_err(|error| {
+        CanonicalPayloadDecodeErrorV1::Malformed(format!(
+            "cannot decode closed canonical payload: {error}"
+        ))
+    })?;
+    if payload.logical_schema == 0 {
+        return Err(CanonicalPayloadDecodeErrorV1::Malformed(
+            "canonical logical schema must be nonzero".to_string(),
+        ));
+    }
+    if payload.logical_schema != LOGICAL_SCHEMA_V1 {
+        return Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
+            observed: payload.logical_schema,
+            supported: LOGICAL_SCHEMA_V1,
+        });
+    }
+    validate_canonical_payload(&payload).map_err(CanonicalPayloadDecodeErrorV1::Invalid)?;
     Ok(payload)
+}
+
+pub(super) fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
+    decode_canonical_payload_classified(bytes).map_err(|error| error.to_string())
 }
 
 pub(super) fn encode_canonical_payload(
@@ -1799,6 +1844,42 @@ mod tests {
         assert!(!String::from_utf8(encoded)
             .unwrap()
             .contains("canonical_digest"));
+    }
+
+    #[test]
+    fn classified_decode_separates_malformed_future_and_invalid_logical_input() {
+        assert!(matches!(
+            decode_canonical_payload_classified(b"not json"),
+            Err(CanonicalPayloadDecodeErrorV1::Malformed(_))
+        ));
+
+        let mut future: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        future["logical_schema"] = serde_json::json!(2);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&future).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
+                observed: 2,
+                supported: 1
+            })
+        ));
+
+        future["logical_schema"] = serde_json::json!(0);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&future).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::Malformed(_))
+        ));
+
+        let mut invalid: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        invalid["operations"][0]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .remove(2);
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&invalid).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::Invalid(_))
+        ));
     }
 
     #[test]

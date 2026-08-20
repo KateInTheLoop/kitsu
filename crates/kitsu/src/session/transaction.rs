@@ -6,19 +6,20 @@ use std::fmt;
 use std::cell::Cell;
 
 use kitsu_core::session::{
-    CommitDurability, ExpectedRevision, RevisionId, SessionCommitOutcome, SessionCommitReceipt,
-    SessionId, SessionLookupState,
+    CommitDurability, CorruptSessionReason, ExpectedRevision, RevisionId, SchemaDimension,
+    SessionCommitOutcome, SessionCommitReceipt, SessionId, SessionLookupState,
 };
 
 #[cfg(test)]
 use super::canonical::CanonicalToolRoundV1;
 use super::canonical::{
-    append_complete_operation, decode_canonical_payload, encode_canonical_payload,
-    prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalSessionRevisionV1,
-    ImmutableArtifactRefV1,
+    append_complete_operation, decode_canonical_payload_classified, encode_canonical_payload,
+    prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalPayloadDecodeErrorV1,
+    CanonicalSessionRevisionV1, ImmutableArtifactRefV1,
 };
 use super::physical::{
-    ArtifactManifestV1, PhysicalCandidateInstallError, PhysicalFileStoreV1, PhysicalHeadCasError,
+    ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
+    PhysicalFileStoreV1, PhysicalHeadCasError,
 };
 
 fn artifact_fact_matches_physical(
@@ -105,12 +106,74 @@ impl std::error::Error for CanonicalTransactionErrorV1 {}
 #[derive(Debug)]
 enum CanonicalHeadReadErrorV1 {
     Physical(String),
-    Logical(String),
-    Binding(String),
-    Artifact {
-        artifact_id: String,
+    Logical {
+        observed_revision: RevisionId,
+        reason: CorruptSessionReason,
         message: String,
     },
+    Binding {
+        observed_revision: RevisionId,
+        message: String,
+    },
+    Artifact {
+        observed_revision: RevisionId,
+        artifact_id: String,
+        reason: CorruptSessionReason,
+        message: String,
+    },
+    Unsupported {
+        observed_revision: RevisionId,
+        dimension: SchemaDimension,
+        observed_schema: u32,
+        supported_schema: u32,
+        message: String,
+    },
+}
+
+impl CanonicalHeadReadErrorV1 {
+    fn observed_revision(&self) -> Option<RevisionId> {
+        match self {
+            Self::Physical(_) => None,
+            Self::Logical {
+                observed_revision, ..
+            }
+            | Self::Binding {
+                observed_revision, ..
+            }
+            | Self::Artifact {
+                observed_revision, ..
+            }
+            | Self::Unsupported {
+                observed_revision, ..
+            } => Some(observed_revision.clone()),
+        }
+    }
+
+    fn lookup_state(&self, session_id: &SessionId) -> SessionLookupState {
+        match self {
+            Self::Unsupported {
+                dimension,
+                observed_schema,
+                supported_schema,
+                ..
+            } => SessionLookupState::unsupported(*dimension, *observed_schema, *supported_schema)
+                .expect("typed readers never report an equal or zero unsupported schema"),
+            _ => {
+                let reason = match self {
+                    Self::Physical(_) => CorruptSessionReason::Malformed,
+                    Self::Logical { reason, .. } => *reason,
+                    Self::Binding { .. } => CorruptSessionReason::IdentityMismatch,
+                    Self::Artifact { reason, .. } => *reason,
+                    Self::Unsupported { .. } => unreachable!(),
+                };
+                SessionLookupState::Corrupt {
+                    session: session_id.clone(),
+                    observed_revision: self.observed_revision(),
+                    reason,
+                }
+            }
+        }
+    }
 }
 
 impl fmt::Display for CanonicalHeadReadErrorV1 {
@@ -119,24 +182,42 @@ impl fmt::Display for CanonicalHeadReadErrorV1 {
             Self::Physical(message) => {
                 write!(formatter, "physical canonical HEAD is corrupt: {message}")
             }
-            Self::Logical(message) => {
+            Self::Logical { message, .. } => {
                 write!(formatter, "canonical HEAD payload is corrupt: {message}")
             }
-            Self::Binding(message) => {
+            Self::Binding { message, .. } => {
                 write!(formatter, "canonical HEAD binding is corrupt: {message}")
             }
             Self::Artifact {
                 artifact_id,
                 message,
+                ..
             } => write!(
                 formatter,
                 "canonical HEAD artifact closure '{artifact_id}' is corrupt: {message}"
             ),
+            Self::Unsupported { message, .. } => formatter.write_str(message),
         }
     }
 }
 
 impl std::error::Error for CanonicalHeadReadErrorV1 {}
+
+#[derive(Debug)]
+struct CanonicalHeadLookupV1 {
+    state: SessionLookupState,
+    payload: Option<CanonicalSessionRevisionV1>,
+}
+
+impl CanonicalHeadLookupV1 {
+    fn state(&self) -> &SessionLookupState {
+        &self.state
+    }
+
+    fn payload(&self) -> Option<&CanonicalSessionRevisionV1> {
+        self.payload.as_ref()
+    }
+}
 
 #[derive(Debug)]
 struct CanonicalTransactionCommitV1 {
@@ -208,8 +289,38 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         };
         let candidate = head.candidate();
         let manifest = candidate.manifest();
-        let payload = decode_canonical_payload(candidate.canonical_bytes())
-            .map_err(CanonicalHeadReadErrorV1::Logical)?;
+        let observed_revision = head.revision_id().clone();
+        let payload =
+            decode_canonical_payload_classified(candidate.canonical_bytes()).map_err(|error| {
+                match error {
+                    CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
+                        observed,
+                        supported,
+                    } => CanonicalHeadReadErrorV1::Unsupported {
+                        observed_revision: observed_revision.clone(),
+                        dimension: SchemaDimension::Logical,
+                        observed_schema: observed,
+                        supported_schema: supported,
+                        message: format!(
+                            "unsupported canonical logical schema {observed}; expected {supported}"
+                        ),
+                    },
+                    CanonicalPayloadDecodeErrorV1::Malformed(message) => {
+                        CanonicalHeadReadErrorV1::Logical {
+                            observed_revision: observed_revision.clone(),
+                            reason: CorruptSessionReason::Malformed,
+                            message,
+                        }
+                    }
+                    CanonicalPayloadDecodeErrorV1::Invalid(message) => {
+                        CanonicalHeadReadErrorV1::Logical {
+                            observed_revision: observed_revision.clone(),
+                            reason: CorruptSessionReason::BrokenCausality,
+                            message,
+                        }
+                    }
+                }
+            })?;
 
         if manifest.logical_schema_revision() != payload.logical_schema()
             || manifest.store_id() != self.store.store_id()
@@ -220,14 +331,37 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             || payload.revision_id() != head.revision_id()
             || manifest.parent_revision() != payload.parent_revision()
         {
-            return Err(CanonicalHeadReadErrorV1::Binding(
-                "logical payload identity, schema, or parent does not match the selected physical revision"
+            return Err(CanonicalHeadReadErrorV1::Binding {
+                observed_revision,
+                message: "logical payload identity, schema, or parent does not match the selected physical revision"
                     .to_string(),
-            ));
+            });
         }
 
         self.verify_artifact_closure_for_read(&payload)?;
         Ok(Some(payload))
+    }
+
+    fn lookup_canonical_head(&self, session_id: &SessionId) -> CanonicalHeadLookupV1 {
+        match self.open_canonical_head(session_id) {
+            Ok(None) => CanonicalHeadLookupV1 {
+                state: SessionLookupState::Missing {
+                    tombstone_revision: None,
+                },
+                payload: None,
+            },
+            Ok(Some(payload)) => CanonicalHeadLookupV1 {
+                state: SessionLookupState::Present {
+                    revision: payload.revision_id().clone(),
+                    head: payload.selected_head().clone(),
+                },
+                payload: Some(payload),
+            },
+            Err(error) => CanonicalHeadLookupV1 {
+                state: error.lookup_state(session_id),
+                payload: None,
+            },
+        }
     }
 
     fn commit_artifact_free_operation(
@@ -474,14 +608,70 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             let verified = self
                 .store
                 .open_artifact(payload.session_id(), fact.artifact_id())
-                .map_err(|message| CanonicalHeadReadErrorV1::Artifact {
-                    artifact_id: fact.artifact_id().to_string(),
-                    message,
+                .map_err(|error| match error {
+                    PhysicalArtifactReadErrorV1::UnsupportedPhysicalSchema {
+                        observed,
+                        supported,
+                        message,
+                    } => CanonicalHeadReadErrorV1::Unsupported {
+                        observed_revision: payload.revision_id().clone(),
+                        dimension: SchemaDimension::Physical,
+                        observed_schema: observed,
+                        supported_schema: supported,
+                        message,
+                    },
+                    PhysicalArtifactReadErrorV1::Missing(message) => {
+                        CanonicalHeadReadErrorV1::Artifact {
+                            observed_revision: payload.revision_id().clone(),
+                            artifact_id: fact.artifact_id().to_string(),
+                            reason: CorruptSessionReason::MissingReference,
+                            message,
+                        }
+                    }
+                    PhysicalArtifactReadErrorV1::Malformed(message) => {
+                        CanonicalHeadReadErrorV1::Artifact {
+                            observed_revision: payload.revision_id().clone(),
+                            artifact_id: fact.artifact_id().to_string(),
+                            reason: CorruptSessionReason::Malformed,
+                            message,
+                        }
+                    }
+                    PhysicalArtifactReadErrorV1::IdentityMismatch(message) => {
+                        CanonicalHeadReadErrorV1::Artifact {
+                            observed_revision: payload.revision_id().clone(),
+                            artifact_id: fact.artifact_id().to_string(),
+                            reason: CorruptSessionReason::IdentityMismatch,
+                            message,
+                        }
+                    }
+                    PhysicalArtifactReadErrorV1::DigestMismatch(message) => {
+                        CanonicalHeadReadErrorV1::Artifact {
+                            observed_revision: payload.revision_id().clone(),
+                            artifact_id: fact.artifact_id().to_string(),
+                            reason: CorruptSessionReason::DigestMismatch,
+                            message,
+                        }
+                    }
                 })?;
             let manifest = verified.manifest();
+            if manifest.artifact_schema_revision() != fact.artifact_schema() {
+                return Err(CanonicalHeadReadErrorV1::Unsupported {
+                    observed_revision: payload.revision_id().clone(),
+                    dimension: SchemaDimension::Artifact,
+                    observed_schema: manifest.artifact_schema_revision(),
+                    supported_schema: fact.artifact_schema(),
+                    message: format!(
+                        "unsupported physical artifact schema {}; canonical revision requires {}",
+                        manifest.artifact_schema_revision(),
+                        fact.artifact_schema()
+                    ),
+                });
+            }
             if !artifact_fact_matches_physical(fact, manifest) {
                 return Err(CanonicalHeadReadErrorV1::Artifact {
+                    observed_revision: payload.revision_id().clone(),
                     artifact_id: fact.artifact_id().to_string(),
+                    reason: CorruptSessionReason::DigestMismatch,
                     message: "canonical fact does not match the exact installed physical artifact"
                         .to_string(),
                 });
@@ -780,7 +970,7 @@ mod tests {
 
         let error = transaction.open_canonical_head(&session_id).unwrap_err();
 
-        assert!(matches!(error, CanonicalHeadReadErrorV1::Binding(_)));
+        assert!(matches!(error, CanonicalHeadReadErrorV1::Binding { .. }));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_b
@@ -811,10 +1001,334 @@ mod tests {
 
         let error = transaction.open_canonical_head(&session_id).unwrap_err();
 
-        assert!(matches!(error, CanonicalHeadReadErrorV1::Logical(_)));
+        assert!(matches!(error, CanonicalHeadReadErrorV1::Logical { .. }));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_b
+        );
+    }
+
+    #[test]
+    fn canonical_lookup_maps_true_missing_and_verified_present_with_payload() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, _) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+
+        let missing = transaction.lookup_canonical_head(&session_id);
+        assert_eq!(
+            missing.state(),
+            &SessionLookupState::Missing {
+                tombstone_revision: None
+            }
+        );
+        assert!(missing.payload().is_none());
+
+        transaction.commit(&legacy_payload("rev-a")).unwrap();
+        let present = transaction.lookup_canonical_head(&session_id);
+        assert_eq!(
+            present.state(),
+            &SessionLookupState::Present {
+                revision: rev_a.clone(),
+                head: kitsu_core::session::LogicalHead::Genesis
+            }
+        );
+        assert_eq!(present.payload().unwrap().revision_id(), &rev_a);
+    }
+
+    #[test]
+    fn canonical_lookup_maps_selected_logical_and_binding_corruption() {
+        let mut broken =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", None, 1)).unwrap();
+        broken["operations"][0]["messages"]
+            .as_array_mut()
+            .unwrap()
+            .pop();
+        for (bytes, expected_reason) in [
+            (
+                b"not a canonical session payload".to_vec(),
+                kitsu_core::session::CorruptSessionReason::Malformed,
+            ),
+            (
+                encode_canonical_payload(&payload("other-store", "session-1", "rev-b", None, 1))
+                    .unwrap(),
+                kitsu_core::session::CorruptSessionReason::IdentityMismatch,
+            ),
+            (
+                serde_json::to_vec(&broken).unwrap(),
+                kitsu_core::session::CorruptSessionReason::BrokenCausality,
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store_id, session_id, _, rev_b) = ids();
+            let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+                root.path(),
+                store_id,
+            )
+            .unwrap();
+            let candidate = store
+                .install_revision_candidate(
+                    1,
+                    session_id.clone(),
+                    rev_b.clone(),
+                    ExpectedRevision::Missing,
+                    &bytes,
+                )
+                .unwrap();
+            let fence = store.acquire_writer_fence(&session_id).unwrap();
+            store
+                .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate)
+                .unwrap();
+            let transaction = CanonicalFileTransactionV1::new(&store);
+
+            let lookup = transaction.lookup_canonical_head(&session_id);
+
+            assert_eq!(
+                lookup.state(),
+                &SessionLookupState::Corrupt {
+                    session: session_id,
+                    observed_revision: Some(rev_b),
+                    reason: expected_reason
+                }
+            );
+            assert!(lookup.payload().is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_lookup_maps_missing_and_digest_broken_artifacts_exactly() {
+        for (fault, expected_reason) in [
+            ("missing-directory", CorruptSessionReason::MissingReference),
+            ("missing-content", CorruptSessionReason::MissingReference),
+            ("tamper", CorruptSessionReason::DigestMismatch),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store_id, session_id, _, rev_b) = ids();
+            let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+                root.path(),
+                store_id,
+            )
+            .unwrap();
+            let transaction = CanonicalFileTransactionV1::new(&store);
+            let base = legacy_payload("rev-a");
+            transaction.commit(&base).unwrap();
+            let artifact_bytes = b"artifact bytes";
+            store
+                .install_artifact(
+                    1,
+                    session_id.clone(),
+                    "artifact-new".to_string(),
+                    None,
+                    artifact_bytes,
+                )
+                .unwrap();
+            transaction
+                .commit_artifact_tool_operation(
+                    &base,
+                    rev_b.clone(),
+                    "2026-08-20T11:01:00.000Z".to_string(),
+                    artifact_operation_input(
+                        "artifact-new",
+                        &crate::skills::content_sha256_hex(artifact_bytes),
+                        artifact_bytes.len() as u64,
+                        None,
+                    ),
+                )
+                .unwrap();
+            if fault == "tamper" {
+                std::fs::write(
+                    crate::session::physical::PhysicalLayoutV1::artifact_content(
+                        root.path(),
+                        &session_id,
+                        "artifact-new",
+                    ),
+                    b"tampered bytes",
+                )
+                .unwrap();
+            } else if fault == "missing-directory" {
+                std::fs::remove_dir_all(
+                    crate::session::physical::PhysicalLayoutV1::artifact_directory(
+                        root.path(),
+                        &session_id,
+                        "artifact-new",
+                    ),
+                )
+                .unwrap();
+            } else {
+                std::fs::remove_file(
+                    crate::session::physical::PhysicalLayoutV1::artifact_content(
+                        root.path(),
+                        &session_id,
+                        "artifact-new",
+                    ),
+                )
+                .unwrap();
+            }
+
+            let lookup = transaction.lookup_canonical_head(&session_id);
+
+            assert_eq!(
+                lookup.state(),
+                &SessionLookupState::Corrupt {
+                    session: session_id,
+                    observed_revision: Some(rev_b),
+                    reason: expected_reason
+                }
+            );
+            assert!(lookup.payload().is_none());
+        }
+    }
+
+    #[test]
+    fn canonical_lookup_maps_future_logical_and_physical_artifact_schemas() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let mut future =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", None, 1)).unwrap();
+        future["logical_schema"] = serde_json::json!(2);
+        let future_bytes = serde_json::to_vec(&future).unwrap();
+        let candidate = store
+            .install_revision_candidate(
+                2,
+                session_id.clone(),
+                rev_b,
+                ExpectedRevision::Missing,
+                &future_bytes,
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate)
+            .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Unsupported {
+                dimension: SchemaDimension::Logical,
+                observed_revision: 2,
+                supported_revision: 1
+            }
+        );
+
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b,
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &crate::skills::content_sha256_hex(artifact_bytes),
+                    artifact_bytes.len() as u64,
+                    None,
+                ),
+            )
+            .unwrap();
+        let manifest_path = crate::session::physical::PhysicalLayoutV1::artifact_manifest(
+            root.path(),
+            &session_id,
+            "artifact-new",
+        );
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["physical_schema_revision"] = serde_json::json!(2);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Unsupported {
+                dimension: SchemaDimension::Physical,
+                observed_revision: 2,
+                supported_revision: 1
+            }
+        );
+        manifest["physical_schema_revision"] = serde_json::json!(0);
+        std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Corrupt {
+                session: session_id,
+                observed_revision: Some(RevisionId::new("rev-b").unwrap()),
+                reason: CorruptSessionReason::Malformed
+            }
+        );
+    }
+
+    #[test]
+    fn canonical_lookup_maps_future_artifact_schema() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                2,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        let successor = append_complete_operation(
+            &base,
+            rev_b.clone(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            artifact_operation_input(
+                "artifact-new",
+                &crate::skills::content_sha256_hex(artifact_bytes),
+                artifact_bytes.len() as u64,
+                None,
+            ),
+        )
+        .unwrap();
+        let candidate = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_b,
+                ExpectedRevision::Exact(rev_a.clone()),
+                &encode_canonical_payload(&successor).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_a), &candidate)
+            .unwrap();
+
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Unsupported {
+                dimension: SchemaDimension::Artifact,
+                observed_revision: 2,
+                supported_revision: 1
+            }
         );
     }
 
@@ -963,12 +1477,20 @@ mod tests {
 
         assert!(matches!(
             error,
-            CanonicalHeadReadErrorV1::Artifact { ref artifact_id, ref message }
+            CanonicalHeadReadErrorV1::Artifact { ref artifact_id, ref message, .. }
                 if artifact_id == "artifact-new" && message.contains("digest mismatch")
         ));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_b
+        );
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_b),
+                reason: CorruptSessionReason::DigestMismatch
+            }
         );
     }
 
@@ -1046,12 +1568,20 @@ mod tests {
 
         assert!(matches!(
             error,
-            CanonicalHeadReadErrorV1::Artifact { ref artifact_id, ref message }
+            CanonicalHeadReadErrorV1::Artifact { ref artifact_id, ref message, .. }
                 if artifact_id == "artifact-new" && message.contains("does not match")
         ));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_b
+        );
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_b),
+                reason: CorruptSessionReason::DigestMismatch
+            }
         );
     }
 

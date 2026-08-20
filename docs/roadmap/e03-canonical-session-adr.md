@@ -19,7 +19,8 @@ publication; artifact-bearing bases remain structurally refused.
 Cycle 067 adds private physical immutable artifact records and I/O. Cycle 068
 composes their exact closure with private canonical publication for one complete
 tool/result/effect operation. Cycle 069 applies the same closure to canonical
-HEAD open. Production remains unmounted.
+HEAD open. Cycle 070 maps that private result to the neutral lookup vocabulary
+without separating `Present` from its verified payload. Production is unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -240,6 +241,16 @@ publication. Only an absent physical HEAD returns `None`; invalid logical bytes,
 binding disagreement, missing closure, content tamper, or self-consistent but
 different physical artifact facts return a typed private read error for the
 selected revision. The reader never scans or silently selects an older candidate.
+
+The private lookup envelope carries exactly one neutral state and an optional
+verified payload. `Missing` and every `Corrupt`/`Unsupported` state carry no
+payload; `Present` carries the same revision and logical HEAD as its decoded
+payload. Current typed evidence maps malformed logical bytes to `Malformed`,
+envelope disagreement to `IdentityMismatch`, invalid closed operation structure
+to `BrokenCausality`, absent required artifact bytes to `MissingReference`, and
+length/digest/exact-closure disagreement to `DigestMismatch`. Future logical,
+artifact, and artifact-manifest physical schemas map to their explicit schema
+dimensions. Zero schema is corruption, never unsupported and never a panic.
 
 ## Store contract and typed states
 
@@ -520,6 +531,13 @@ cannot weaken or replace any backend-neutral assertion.
    disagreement, missing closure, digest tamper, and an independently valid but
    unequal physical replacement all fail on the selected HEAD without fallback.
    Next project these private read failures into the neutral typed lookup state.
+   **Neutral canonical lookup complete in Cycle 070:** verified `Present` remains
+   paired with its exact decoded payload; true absence is `Missing`; malformed,
+   identity, causality, reference, and digest evidence maps to exact `Corrupt`
+   reasons; and future logical, artifact, and artifact-manifest physical schemas
+   map to dimensioned `Unsupported`. Zero schemas remain malformed. Next type the
+   earlier physical HEAD/revision envelope failures and split invalid-HEAD from
+   other logical-causality validation before any production mounting.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

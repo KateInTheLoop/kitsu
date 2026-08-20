@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 069;
+through Cycle 070;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 69 / 69 |
+| Accepted cycles/commits after this cycle | 70 / 70 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C19 (Cycle 070) — map canonical reads to neutral typed lookup states |
+| Active epic/card | E03 / E03-S02-C20 (Cycle 071) — type physical HEAD/revision and invalid-head failures |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C18 | Current-v1 behavior remains unchanged. Neutral K04/K07/K08 fixtures and private migration/successor transactions compose exact candidate/HEAD truth. Publication and selected-HEAD read share exact logical/physical artifact closure; only absent HEAD is missing, while selected logical, binding, missing-reference, and artifact corruption return errors without fallback. No production caller exists; neutral lookup mapping, mounting, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C19 | Current-v1 behavior remains unchanged. Neutral K04/K07/K08 fixtures and private migration/successor transactions compose exact candidate/HEAD truth. Publication/read share artifact closure; neutral lookup pairs verified `Present` payload, exact current corrupt reasons, and dimensioned future logical/artifact schemas without fallback. No production caller exists; typed early physical-envelope failures, mounting, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -104,7 +104,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 066 | `2100189` | Artifact-free assembled-successor file transaction |
 | 067 | `221c25c` | Session-scoped immutable physical artifact closure |
 | 068 | `388e394` | Exact canonical-to-physical artifact publication closure |
-| 069 | this document's commit | Verified canonical HEAD and artifact-closure read |
+| 069 | `ccb05c9` | Verified canonical HEAD and artifact-closure read |
+| 070 | this document's commit | Lossless neutral canonical lookup classification |
 
 ## Current green gates
 
@@ -399,7 +400,13 @@ artifact predicate. True HEAD absence is distinct from invalid logical bytes,
 identity disagreement, missing closure, digest tamper, and self-consistent but
 unequal physical replacement; none scans or falls back. Cycle 070 next maps
 these private results into the neutral `Missing`/`Present`/`Corrupt`/
-`Unsupported` lookup vocabulary.
+`Unsupported` lookup vocabulary. Cycle 070 retains the decoded payload only with
+its exact `Present` revision/HEAD, maps malformed, identity, causality, reference,
+and digest evidence to typed corruption, and maps future logical, artifact, and
+artifact-manifest physical schemas to explicit dimensions. Zero schema is
+malformed. Cycle 071 next types failures that happen before canonical decode in
+the physical HEAD/revision envelope and separates invalid logical HEAD from
+other closed-operation causality failures.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
