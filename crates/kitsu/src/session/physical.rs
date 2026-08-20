@@ -346,6 +346,26 @@ impl RevisionManifestV1 {
         }
         Ok(self)
     }
+
+    pub(super) fn logical_schema_revision(&self) -> u32 {
+        self.logical_schema_revision
+    }
+
+    pub(super) fn store_id(&self) -> &StoreId {
+        &self.store_id
+    }
+
+    pub(super) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        &self.revision_id
+    }
+
+    pub(super) fn parent_revision(&self) -> &ExpectedRevision {
+        &self.parent_revision
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
