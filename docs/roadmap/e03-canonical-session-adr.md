@@ -17,7 +17,8 @@ operation from neutral E02 terminal truth and closed transcript/effect facts.
 Cycle 066 composes only its artifact-free text subset with fenced file
 publication; artifact-bearing bases remain structurally refused.
 Cycle 067 adds private physical immutable artifact records and I/O; canonical
-revision publication still cannot reference them until closure is composed.
+Cycle 068 composes their exact closure with private canonical publication for
+one complete tool/result/effect operation. Production remains unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -223,8 +224,12 @@ directory rename; exact open uses descriptor-relative no-follow reads and
 rechecks physical identity, length, content digest, and manifest digest.
 Collision never overwrites the first bytes. Target-sync failure is
 installed-unconfirmed; missing, future schema, retarget, digest tamper, and
-symlink fail closed. No revision may reference this closure until a later
-transaction verifies every canonical artifact fact against an installed record.
+symlink fail closed. The canonical transaction compares every referenced fact's
+schema, ID, length, SHA-256, and media type against a verified installed record
+under the writer fence before candidate allocation, then reopens and compares
+the entire closure after candidate installation and before HEAD CAS. A missing,
+tampered, or unequal precheck allocates no candidate; a failed recheck leaves a
+confirmed installed-unselected candidate and the old HEAD.
 
 ## Store contract and typed states
 
@@ -491,6 +496,13 @@ cannot weaken or replace any backend-neutral assertion.
    and target-sync cuts have explicit results, including preserved first bytes
    and installed-unconfirmed residue. Next compose canonical artifact facts with
    exact installed-record verification before candidate/HEAD publication.
+   **Canonical artifact publication complete in Cycle 068:** one closed
+   tool-call/result/effect operation binds its canonical artifact fact to the
+   exact installed physical schema, identity, length, digest, and media type.
+   Closure is verified before candidate allocation and rechecked after install
+   before HEAD CAS. Missing, tampered, or mismatched closures are not published;
+   the post-candidate recheck cut retains old HEAD plus exact confirmed residue.
+   Next require verified artifact closure whenever canonical HEAD is opened.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

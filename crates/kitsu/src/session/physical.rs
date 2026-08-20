@@ -411,6 +411,26 @@ impl ArtifactManifestV1 {
         }
         Ok(self)
     }
+
+    pub(super) fn artifact_schema_revision(&self) -> u32 {
+        self.artifact_schema_revision
+    }
+
+    pub(super) fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    pub(super) fn content_bytes(&self) -> u64 {
+        self.content_bytes
+    }
+
+    pub(super) fn content_sha256(&self) -> &Sha256Digest {
+        &self.content_sha256
+    }
+
+    pub(super) fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
 }
 
 fn validate_artifact_id(value: &str) -> Result<(), String> {

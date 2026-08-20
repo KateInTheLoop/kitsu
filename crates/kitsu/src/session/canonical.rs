@@ -72,6 +72,14 @@ impl CanonicalSessionRevisionV1 {
     pub(super) fn has_artifacts(&self) -> bool {
         !self.artifact_manifest.is_empty()
     }
+
+    pub(super) fn artifact_count(&self) -> usize {
+        self.artifact_manifest.len()
+    }
+
+    pub(super) fn artifacts(&self) -> &[ImmutableArtifactRefV1] {
+        &self.artifact_manifest
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -140,6 +148,35 @@ pub(super) struct CanonicalOperationInputV1 {
     new_artifacts: Vec<ImmutableArtifactRefV1>,
 }
 
+pub(super) struct CanonicalToolRoundV1 {
+    tool_name: String,
+    args: String,
+    call_id: String,
+    result_content: String,
+    effect_id: String,
+    artifact: ImmutableArtifactRefV1,
+}
+
+impl CanonicalToolRoundV1 {
+    pub(super) fn new(
+        tool_name: String,
+        args: String,
+        call_id: String,
+        result_content: String,
+        effect_id: String,
+        artifact: ImmutableArtifactRefV1,
+    ) -> Self {
+        Self {
+            tool_name,
+            args,
+            call_id,
+            result_content,
+            effect_id,
+            artifact,
+        }
+    }
+}
+
 impl CanonicalOperationInputV1 {
     pub(super) fn artifact_free_text(
         turn_id: TurnId,
@@ -162,6 +199,48 @@ impl CanonicalOperationInputV1 {
             messages,
             retained_effects: Vec::new(),
             new_artifacts: Vec::new(),
+        }
+    }
+
+    pub(super) fn artifact_tool_round(
+        turn_id: TurnId,
+        terminal: TerminalOutcome,
+        user_content: String,
+        final_assistant_content: String,
+        round: CanonicalToolRoundV1,
+    ) -> Self {
+        let artifact_id = round.artifact.artifact_id.clone();
+        let call_id = round.call_id.clone();
+        Self {
+            turn_id,
+            terminal,
+            messages: vec![
+                CanonicalMessageV1::User {
+                    content: user_content,
+                },
+                CanonicalMessageV1::Assistant {
+                    content: String::new(),
+                    tool_calls: vec![CanonicalToolCallV1 {
+                        tool_name: round.tool_name,
+                        args: round.args,
+                        call_id: call_id.clone(),
+                    }],
+                },
+                CanonicalMessageV1::Tool {
+                    call_id,
+                    content: round.result_content,
+                    artifact_ids: vec![artifact_id.clone()],
+                },
+                CanonicalMessageV1::Assistant {
+                    content: final_assistant_content,
+                    tool_calls: Vec::new(),
+                },
+            ],
+            retained_effects: vec![RetainedEffectRefV1 {
+                effect_id: round.effect_id,
+                artifact_ids: vec![artifact_id],
+            }],
+            new_artifacts: vec![round.artifact],
         }
     }
 }
@@ -214,12 +293,60 @@ struct RetainedEffectRefV1 {
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct ImmutableArtifactRefV1 {
+pub(super) struct ImmutableArtifactRefV1 {
     artifact_schema: u32,
     artifact_id: String,
     sha256: String,
     bytes: u64,
     media_type: Option<String>,
+}
+
+impl ImmutableArtifactRefV1 {
+    pub(super) fn new(
+        artifact_schema: u32,
+        artifact_id: String,
+        sha256: String,
+        bytes: u64,
+        media_type: Option<String>,
+    ) -> Result<Self, String> {
+        if artifact_schema != ARTIFACT_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported artifact schema {artifact_schema}; expected {ARTIFACT_SCHEMA_V1}"
+            ));
+        }
+        validate_opaque_id(&artifact_id, "artifact id")?;
+        validate_sha256(&sha256, "artifact digest")?;
+        if let Some(media_type) = &media_type {
+            bounded_nonempty(media_type, 256, "artifact media type")?;
+        }
+        Ok(Self {
+            artifact_schema,
+            artifact_id,
+            sha256,
+            bytes,
+            media_type,
+        })
+    }
+
+    pub(super) fn artifact_schema(&self) -> u32 {
+        self.artifact_schema
+    }
+
+    pub(super) fn artifact_id(&self) -> &str {
+        &self.artifact_id
+    }
+
+    pub(super) fn sha256(&self) -> &str {
+        &self.sha256
+    }
+
+    pub(super) fn bytes(&self) -> u64 {
+        self.bytes
+    }
+
+    pub(super) fn media_type(&self) -> Option<&str> {
+        self.media_type.as_deref()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]

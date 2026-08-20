@@ -14,6 +14,8 @@ use super::canonical::{
     append_complete_operation, encode_canonical_payload, prepare_current_v1_legacy_baseline,
     CanonicalOperationInputV1, CanonicalSessionRevisionV1,
 };
+#[cfg(test)]
+use super::canonical::{CanonicalToolRoundV1, ImmutableArtifactRefV1};
 use super::physical::{PhysicalCandidateInstallError, PhysicalFileStoreV1, PhysicalHeadCasError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -106,6 +108,8 @@ struct CanonicalFileTransactionV1<'a> {
     store: &'a PhysicalFileStoreV1,
     #[cfg(test)]
     fail_next_after_candidate: Cell<bool>,
+    #[cfg(test)]
+    fail_next_artifact_recheck: Cell<bool>,
 }
 
 impl<'a> CanonicalFileTransactionV1<'a> {
@@ -114,6 +118,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             store,
             #[cfg(test)]
             fail_next_after_candidate: Cell::new(false),
+            #[cfg(test)]
+            fail_next_artifact_recheck: Cell::new(false),
         }
     }
 
@@ -156,6 +162,23 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         }
         let payload = append_complete_operation(base, revision_id, committed_at, input)
             .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        self.commit(&payload)
+    }
+
+    fn commit_artifact_tool_operation(
+        &self,
+        base: &CanonicalSessionRevisionV1,
+        revision_id: RevisionId,
+        committed_at: String,
+        input: CanonicalOperationInputV1,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        let payload = append_complete_operation(base, revision_id, committed_at, input)
+            .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        if !payload.has_artifacts() {
+            return Err(CanonicalTransactionErrorV1::before_identity(
+                "artifact tool operation must carry an immutable artifact closure",
+            ));
+        }
         self.commit(&payload)
     }
 
@@ -222,6 +245,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             ));
         }
 
+        self.verify_artifact_closure(payload, CandidateResidueV1::None)?;
+
         let candidate = self
             .store
             .install_revision_candidate(
@@ -232,6 +257,28 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 &canonical_bytes,
             )
             .map_err(|error| self.install_error(payload, &canonical_bytes, error))?;
+
+        #[cfg(test)]
+        if self.fail_next_artifact_recheck.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected artifact closure recheck failure",
+                self.store,
+                session,
+                expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: revision.clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            ));
+        }
+
+        self.verify_artifact_closure(
+            payload,
+            CandidateResidueV1::InstalledUnselected {
+                revision: revision.clone(),
+                durability: CandidateDurabilityV1::Confirmed,
+            },
+        )?;
 
         #[cfg(test)]
         if self.fail_next_after_candidate.replace(false) {
@@ -296,6 +343,49 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         })
     }
 
+    fn verify_artifact_closure(
+        &self,
+        payload: &CanonicalSessionRevisionV1,
+        candidate_residue: CandidateResidueV1,
+    ) -> Result<(), CanonicalTransactionErrorV1> {
+        for fact in payload.artifacts() {
+            let verified = self
+                .store
+                .open_artifact(payload.session_id(), fact.artifact_id())
+                .map_err(|message| {
+                    CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "canonical artifact closure '{}' cannot be verified: {message}",
+                            fact.artifact_id()
+                        ),
+                        self.store,
+                        payload.session_id(),
+                        payload.parent_revision(),
+                        candidate_residue.clone(),
+                    )
+                })?;
+            let manifest = verified.manifest();
+            if manifest.artifact_schema_revision() != fact.artifact_schema()
+                || manifest.artifact_id() != fact.artifact_id()
+                || manifest.content_bytes() != fact.bytes()
+                || manifest.content_sha256().as_str() != fact.sha256()
+                || manifest.media_type() != fact.media_type()
+            {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    format!(
+                        "canonical artifact closure '{}' does not match the exact installed physical artifact",
+                        fact.artifact_id()
+                    ),
+                    self.store,
+                    payload.session_id(),
+                    payload.parent_revision(),
+                    candidate_residue,
+                ));
+            }
+        }
+        Ok(())
+    }
+
     fn install_error(
         &self,
         payload: &CanonicalSessionRevisionV1,
@@ -336,6 +426,11 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     #[cfg(test)]
     fn inject_next_after_candidate_failure(&self) {
         self.fail_next_after_candidate.set(true);
+    }
+
+    #[cfg(test)]
+    fn inject_next_artifact_recheck_failure(&self) {
+        self.fail_next_artifact_recheck.set(true);
     }
 }
 
@@ -484,6 +579,442 @@ mod tests {
             user.to_string(),
             assistant.map(str::to_string),
         )
+    }
+
+    fn artifact_operation_input(
+        artifact_id: &str,
+        sha256: &str,
+        bytes: u64,
+        media_type: Option<&str>,
+    ) -> CanonicalOperationInputV1 {
+        let artifact = ImmutableArtifactRefV1::new(
+            1,
+            artifact_id.to_string(),
+            sha256.to_string(),
+            bytes,
+            media_type.map(str::to_string),
+        )
+        .unwrap();
+        let tool_round = CanonicalToolRoundV1::new(
+            "fs_read_file".to_string(),
+            "{\"path\":\"artifact.txt\"}".to_string(),
+            "call-artifact".to_string(),
+            "immutable tool output".to_string(),
+            "effect-artifact".to_string(),
+            artifact,
+        );
+        CanonicalOperationInputV1::artifact_tool_round(
+            kitsu_core::session::TurnId::new("turn-artifact").unwrap(),
+            terminal(
+                "run-artifact",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+            ),
+            "inspect artifact".to_string(),
+            "artifact inspected".to_string(),
+            tool_round,
+        )
+    }
+
+    #[test]
+    fn artifact_closed_tool_operation_publishes_exact_receipt_and_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                Some("text/plain".to_string()),
+                artifact_bytes,
+            )
+            .unwrap();
+        let input = artifact_operation_input(
+            "artifact-new",
+            &crate::skills::content_sha256_hex(artifact_bytes),
+            artifact_bytes.len() as u64,
+            Some("text/plain"),
+        );
+
+        let commit = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                input,
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).base_revision(),
+            &ExpectedRevision::Exact(rev_a)
+        );
+        assert_eq!(receipt(&commit).new_revision(), &rev_b);
+        assert_eq!(
+            receipt(&commit).head(),
+            &kitsu_core::session::LogicalHead::Turn(
+                kitsu_core::session::TurnId::new("turn-artifact").unwrap()
+            )
+        );
+        let head = store.read_head(&session_id).unwrap().unwrap();
+        let payload =
+            crate::session::canonical::decode_canonical_payload(head.candidate().canonical_bytes())
+                .unwrap();
+        assert_eq!(payload.revision_id(), &rev_b);
+        assert_eq!(payload.artifact_count(), 1);
+    }
+
+    #[test]
+    fn artifact_closure_missing_or_mismatched_is_zero_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+
+        let missing = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input("artifact-new", &"a".repeat(64), 14, None),
+            )
+            .unwrap_err();
+        assert!(missing.to_string().contains("artifact closure"));
+        assert_eq!(missing.candidate_residue(), CandidateResidueV1::None);
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_b
+            )
+            .exists()
+        );
+
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                Some("text/plain".to_string()),
+                artifact_bytes,
+            )
+            .unwrap();
+        let mismatch_revision = RevisionId::new("rev-mismatch").unwrap();
+        let mismatch = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                mismatch_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &"b".repeat(64),
+                    artifact_bytes.len() as u64,
+                    Some("text/plain"),
+                ),
+            )
+            .unwrap_err();
+        assert!(mismatch.to_string().contains("does not match"));
+        assert_eq!(mismatch.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &mismatch_revision
+            )
+            .exists()
+        );
+
+        let exact_digest = crate::skills::content_sha256_hex(artifact_bytes);
+        let length_revision = RevisionId::new("rev-length-mismatch").unwrap();
+        let length_mismatch = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                length_revision.clone(),
+                "2026-08-20T11:03:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &exact_digest,
+                    artifact_bytes.len() as u64 + 1,
+                    Some("text/plain"),
+                ),
+            )
+            .unwrap_err();
+        assert!(length_mismatch.to_string().contains("does not match"));
+        assert_eq!(
+            length_mismatch.candidate_residue(),
+            CandidateResidueV1::None
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &length_revision
+            )
+            .exists()
+        );
+
+        let media_revision = RevisionId::new("rev-media-mismatch").unwrap();
+        let media_mismatch = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                media_revision.clone(),
+                "2026-08-20T11:04:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &exact_digest,
+                    artifact_bytes.len() as u64,
+                    Some("application/octet-stream"),
+                ),
+            )
+            .unwrap_err();
+        assert!(media_mismatch.to_string().contains("does not match"));
+        assert_eq!(media_mismatch.candidate_residue(), CandidateResidueV1::None);
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &media_revision
+            )
+            .exists()
+        );
+
+        store
+            .install_artifact(
+                2,
+                session_id.clone(),
+                "artifact-schema".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        let schema_revision = RevisionId::new("rev-schema-mismatch").unwrap();
+        let schema_mismatch = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                schema_revision.clone(),
+                "2026-08-20T11:05:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-schema",
+                    &exact_digest,
+                    artifact_bytes.len() as u64,
+                    None,
+                ),
+            )
+            .unwrap_err();
+        assert!(schema_mismatch.to_string().contains("does not match"));
+        assert_eq!(
+            schema_mismatch.candidate_residue(),
+            CandidateResidueV1::None
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &schema_revision
+            )
+            .exists()
+        );
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+    }
+
+    #[test]
+    fn artifact_closure_tamper_is_refused_before_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        std::fs::write(
+            crate::session::physical::PhysicalLayoutV1::artifact_content(
+                root.path(),
+                &session_id,
+                "artifact-new",
+            ),
+            b"tampered bytes",
+        )
+        .unwrap();
+
+        let error = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &crate::skills::content_sha256_hex(artifact_bytes),
+                    artifact_bytes.len() as u64,
+                    None,
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("digest mismatch"));
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_b
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn artifact_closed_candidate_cut_keeps_old_head_and_artifact() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        transaction.inject_next_after_candidate_failure();
+
+        let error = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &crate::skills::content_sha256_hex(artifact_bytes),
+                    artifact_bytes.len() as u64,
+                    None,
+                ),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_b,
+                durability: CandidateDurabilityV1::Confirmed
+            }
+        );
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert_eq!(
+            store
+                .open_artifact(&session_id, "artifact-new")
+                .unwrap()
+                .content_bytes(),
+            artifact_bytes
+        );
+    }
+
+    #[test]
+    fn artifact_recheck_failure_after_candidate_is_not_published() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"artifact bytes";
+        store
+            .install_artifact(
+                1,
+                session_id.clone(),
+                "artifact-new".to_string(),
+                None,
+                artifact_bytes,
+            )
+            .unwrap();
+        transaction.inject_next_artifact_recheck_failure();
+
+        let error = transaction
+            .commit_artifact_tool_operation(
+                &base,
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-new",
+                    &crate::skills::content_sha256_hex(artifact_bytes),
+                    artifact_bytes.len() as u64,
+                    None,
+                ),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("recheck failure"));
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_b.clone(),
+                durability: CandidateDurabilityV1::Confirmed
+            }
+        );
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert!(
+            crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_b
+            )
+            .exists()
+        );
+        assert_eq!(
+            store
+                .open_artifact(&session_id, "artifact-new")
+                .unwrap()
+                .content_bytes(),
+            artifact_bytes
+        );
     }
 
     #[test]
