@@ -19,7 +19,7 @@ use super::canonical::{
 };
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
-    PhysicalFileStoreV1, PhysicalHeadCasError,
+    PhysicalFileStoreV1, PhysicalHeadCasError, PhysicalHeadReadErrorV1, PhysicalReadErrorV1,
 };
 
 fn artifact_fact_matches_physical(
@@ -105,7 +105,11 @@ impl std::error::Error for CanonicalTransactionErrorV1 {}
 
 #[derive(Debug)]
 enum CanonicalHeadReadErrorV1 {
-    Physical(String),
+    Physical {
+        observed_revision: Option<RevisionId>,
+        reason: CorruptSessionReason,
+        message: String,
+    },
     Logical {
         observed_revision: RevisionId,
         reason: CorruptSessionReason,
@@ -122,7 +126,7 @@ enum CanonicalHeadReadErrorV1 {
         message: String,
     },
     Unsupported {
-        observed_revision: RevisionId,
+        observed_revision: Option<RevisionId>,
         dimension: SchemaDimension,
         observed_schema: u32,
         supported_schema: u32,
@@ -131,9 +135,51 @@ enum CanonicalHeadReadErrorV1 {
 }
 
 impl CanonicalHeadReadErrorV1 {
+    fn from_physical(error: PhysicalHeadReadErrorV1) -> Self {
+        let (observed_revision, source) = error.into_parts();
+        match source {
+            PhysicalReadErrorV1::MissingReference(message) => Self::Physical {
+                observed_revision,
+                reason: CorruptSessionReason::MissingReference,
+                message,
+            },
+            PhysicalReadErrorV1::Malformed(message) => Self::Physical {
+                observed_revision,
+                reason: CorruptSessionReason::Malformed,
+                message,
+            },
+            PhysicalReadErrorV1::IdentityMismatch(message) => Self::Physical {
+                observed_revision,
+                reason: CorruptSessionReason::IdentityMismatch,
+                message,
+            },
+            PhysicalReadErrorV1::DigestMismatch(message) => Self::Physical {
+                observed_revision,
+                reason: CorruptSessionReason::DigestMismatch,
+                message,
+            },
+            PhysicalReadErrorV1::UnsupportedPhysicalSchema {
+                observed,
+                supported,
+                message,
+            } => Self::Unsupported {
+                observed_revision,
+                dimension: SchemaDimension::Physical,
+                observed_schema: observed,
+                supported_schema: supported,
+                message,
+            },
+        }
+    }
+
     fn observed_revision(&self) -> Option<RevisionId> {
         match self {
-            Self::Physical(_) => None,
+            Self::Physical {
+                observed_revision, ..
+            }
+            | Self::Unsupported {
+                observed_revision, ..
+            } => observed_revision.clone(),
             Self::Logical {
                 observed_revision, ..
             }
@@ -141,9 +187,6 @@ impl CanonicalHeadReadErrorV1 {
                 observed_revision, ..
             }
             | Self::Artifact {
-                observed_revision, ..
-            }
-            | Self::Unsupported {
                 observed_revision, ..
             } => Some(observed_revision.clone()),
         }
@@ -160,7 +203,7 @@ impl CanonicalHeadReadErrorV1 {
                 .expect("typed readers never report an equal or zero unsupported schema"),
             _ => {
                 let reason = match self {
-                    Self::Physical(_) => CorruptSessionReason::Malformed,
+                    Self::Physical { reason, .. } => *reason,
                     Self::Logical { reason, .. } => *reason,
                     Self::Binding { .. } => CorruptSessionReason::IdentityMismatch,
                     Self::Artifact { reason, .. } => *reason,
@@ -179,7 +222,7 @@ impl CanonicalHeadReadErrorV1 {
 impl fmt::Display for CanonicalHeadReadErrorV1 {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
-            Self::Physical(message) => {
+            Self::Physical { message, .. } => {
                 write!(formatter, "physical canonical HEAD is corrupt: {message}")
             }
             Self::Logical { message, .. } => {
@@ -283,7 +326,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         let Some(head) = self
             .store
             .read_head(session_id)
-            .map_err(CanonicalHeadReadErrorV1::Physical)?
+            .map_err(CanonicalHeadReadErrorV1::from_physical)?
         else {
             return Ok(None);
         };
@@ -297,7 +340,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                         observed,
                         supported,
                     } => CanonicalHeadReadErrorV1::Unsupported {
-                        observed_revision: observed_revision.clone(),
+                        observed_revision: Some(observed_revision.clone()),
                         dimension: SchemaDimension::Logical,
                         observed_schema: observed,
                         supported_schema: supported,
@@ -309,6 +352,13 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                         CanonicalHeadReadErrorV1::Logical {
                             observed_revision: observed_revision.clone(),
                             reason: CorruptSessionReason::Malformed,
+                            message,
+                        }
+                    }
+                    CanonicalPayloadDecodeErrorV1::InvalidHead(message) => {
+                        CanonicalHeadReadErrorV1::Logical {
+                            observed_revision: observed_revision.clone(),
+                            reason: CorruptSessionReason::InvalidHead,
                             message,
                         }
                     }
@@ -440,7 +490,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         // CAS repeats this comparison immediately before publication.
         let current = self.store.read_head(session).map_err(|message| {
             CanonicalTransactionErrorV1::not_published(
-                message,
+                message.to_string(),
                 self.store,
                 session,
                 expected,
@@ -614,7 +664,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                         supported,
                         message,
                     } => CanonicalHeadReadErrorV1::Unsupported {
-                        observed_revision: payload.revision_id().clone(),
+                        observed_revision: Some(payload.revision_id().clone()),
                         dimension: SchemaDimension::Physical,
                         observed_schema: observed,
                         supported_schema: supported,
@@ -656,7 +706,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             let manifest = verified.manifest();
             if manifest.artifact_schema_revision() != fact.artifact_schema() {
                 return Err(CanonicalHeadReadErrorV1::Unsupported {
-                    observed_revision: payload.revision_id().clone(),
+                    observed_revision: Some(payload.revision_id().clone()),
                     dimension: SchemaDimension::Artifact,
                     observed_schema: manifest.artifact_schema_revision(),
                     supported_schema: fact.artifact_schema(),
@@ -1006,6 +1056,221 @@ mod tests {
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_b
         );
+    }
+
+    #[test]
+    fn canonical_lookup_distinguishes_invalid_selected_head_from_broken_causality() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let mut invalid_head =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", None, 1)).unwrap();
+        invalid_head["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        let candidate = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_b.clone(),
+                ExpectedRevision::Missing,
+                &serde_json::to_vec(&invalid_head).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate)
+            .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+
+        let lookup = transaction.lookup_canonical_head(&session_id);
+
+        assert_eq!(
+            lookup.state(),
+            &SessionLookupState::Corrupt {
+                session: session_id,
+                observed_revision: Some(rev_b),
+                reason: CorruptSessionReason::InvalidHead
+            }
+        );
+        assert!(lookup.payload().is_none());
+    }
+
+    #[test]
+    fn canonical_lookup_classifies_physical_head_and_revision_faults_without_messages() {
+        for (fault, expected_state) in [
+            (
+                "future-head-schema",
+                SessionLookupState::Unsupported {
+                    dimension: SchemaDimension::Physical,
+                    observed_revision: 2,
+                    supported_revision: 1,
+                },
+            ),
+            (
+                "zero-head-schema",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::Malformed,
+                },
+            ),
+            (
+                "head-identity",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::IdentityMismatch,
+                },
+            ),
+            (
+                "missing-revision",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::MissingReference,
+                },
+            ),
+            (
+                "future-revision-schema",
+                SessionLookupState::Unsupported {
+                    dimension: SchemaDimension::Physical,
+                    observed_revision: 2,
+                    supported_revision: 1,
+                },
+            ),
+            (
+                "zero-revision-schema",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::Malformed,
+                },
+            ),
+            (
+                "revision-identity",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::IdentityMismatch,
+                },
+            ),
+            (
+                "head-manifest-digest",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::DigestMismatch,
+                },
+            ),
+            (
+                "canonical-digest",
+                SessionLookupState::Corrupt {
+                    session: SessionId::new("session-1").unwrap(),
+                    observed_revision: Some(RevisionId::new("rev-a").unwrap()),
+                    reason: CorruptSessionReason::DigestMismatch,
+                },
+            ),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store_id, session_id, rev_a, _) = ids();
+            let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+                root.path(),
+                store_id,
+            )
+            .unwrap();
+            let transaction = CanonicalFileTransactionV1::new(&store);
+            transaction.commit(&legacy_payload("rev-a")).unwrap();
+
+            match fault {
+                "future-head-schema" | "zero-head-schema" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::head_pointer(
+                        root.path(),
+                        &session_id,
+                    );
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["physical_schema_revision"] =
+                        serde_json::json!(if fault == "future-head-schema" { 2 } else { 0 });
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "head-identity" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::head_pointer(
+                        root.path(),
+                        &session_id,
+                    );
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["session_id"] = serde_json::json!("other-session");
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "missing-revision" => {
+                    std::fs::remove_dir_all(
+                        crate::session::physical::PhysicalLayoutV1::revision_directory(
+                            root.path(),
+                            &session_id,
+                            &rev_a,
+                        ),
+                    )
+                    .unwrap();
+                }
+                "future-revision-schema" | "zero-revision-schema" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::revision_manifest(
+                        root.path(),
+                        &session_id,
+                        &rev_a,
+                    );
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["physical_schema_revision"] =
+                        serde_json::json!(if fault == "future-revision-schema" {
+                            2
+                        } else {
+                            0
+                        });
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "revision-identity" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::revision_manifest(
+                        root.path(),
+                        &session_id,
+                        &rev_a,
+                    );
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["session_id"] = serde_json::json!("other-session");
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "head-manifest-digest" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::head_pointer(
+                        root.path(),
+                        &session_id,
+                    );
+                    let mut value: serde_json::Value =
+                        serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
+                    value["revision_manifest_sha256"] = serde_json::json!("f".repeat(64));
+                    std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
+                }
+                "canonical-digest" => {
+                    let path = crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                        root.path(),
+                        &session_id,
+                        &rev_a,
+                    );
+                    let mut bytes = std::fs::read(&path).unwrap();
+                    let index = bytes.iter().position(|byte| *byte == b'1').unwrap();
+                    bytes[index] = b'2';
+                    std::fs::write(path, bytes).unwrap();
+                }
+                _ => unreachable!(),
+            }
+
+            let lookup = transaction.lookup_canonical_head(&session_id);
+
+            assert_eq!(lookup.state(), &expected_state, "fault: {fault}");
+            assert!(lookup.payload().is_none(), "fault: {fault}");
+        }
     }
 
     #[test]

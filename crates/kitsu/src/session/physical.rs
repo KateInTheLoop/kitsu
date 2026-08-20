@@ -556,12 +556,52 @@ pub(super) fn decode_revision_manifest(
     expected_session: &SessionId,
     expected_revision: &RevisionId,
 ) -> Result<RevisionManifestV1, String> {
-    let record = decode_record::<RevisionManifestV1>(bytes)?.validate()?;
+    decode_revision_manifest_classified(bytes, expected_store, expected_session, expected_revision)
+        .map_err(|error| error.to_string())
+}
+
+fn decode_revision_manifest_classified(
+    bytes: &[u8],
+    expected_store: &StoreId,
+    expected_session: &SessionId,
+    expected_revision: &RevisionId,
+) -> Result<RevisionManifestV1, PhysicalReadErrorV1> {
+    if bytes.is_empty() || bytes.len() > MAX_PHYSICAL_RECORD_BYTES {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical session record is empty or exceeds its byte limit".to_string(),
+        ));
+    }
+    let record: RevisionManifestV1 = serde_json::from_slice(bytes).map_err(|error| {
+        PhysicalReadErrorV1::Malformed(format!("cannot decode physical session record: {error}"))
+    })?;
+    if record.record_type != RecordType::RevisionManifest {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical revision manifest has the wrong record type".to_string(),
+        ));
+    }
+    if record.physical_schema_revision == 0 {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical revision manifest schema must be nonzero".to_string(),
+        ));
+    }
+    if record.physical_schema_revision != PHYSICAL_SCHEMA_REVISION {
+        return Err(PhysicalReadErrorV1::UnsupportedPhysicalSchema {
+            observed: record.physical_schema_revision,
+            supported: PHYSICAL_SCHEMA_REVISION,
+            message: format!(
+                "unsupported physical revision manifest schema {}; expected {PHYSICAL_SCHEMA_REVISION}",
+                record.physical_schema_revision
+            ),
+        });
+    }
+    let record = record.validate().map_err(PhysicalReadErrorV1::Malformed)?;
     if &record.store_id != expected_store
         || &record.session_id != expected_session
         || &record.revision_id != expected_revision
     {
-        return Err("revision manifest identity does not match its physical location".to_string());
+        return Err(PhysicalReadErrorV1::IdentityMismatch(
+            "revision manifest identity does not match its physical location".to_string(),
+        ));
     }
     Ok(record)
 }
@@ -596,9 +636,66 @@ pub(super) fn decode_head_record(
     expected_store: &StoreId,
     expected_session: &SessionId,
 ) -> Result<HeadRecordV1, String> {
-    let record = decode_record::<HeadRecordV1>(bytes)?.validate()?;
+    decode_head_record_classified(bytes, expected_store, expected_session)
+        .map_err(|error| error.to_string())
+}
+
+fn decode_head_record_classified(
+    bytes: &[u8],
+    expected_store: &StoreId,
+    expected_session: &SessionId,
+) -> Result<HeadRecordV1, PhysicalHeadReadErrorV1> {
+    if bytes.is_empty() || bytes.len() > MAX_PHYSICAL_RECORD_BYTES {
+        return Err(PhysicalHeadReadErrorV1::before_revision(
+            PhysicalReadErrorV1::Malformed(
+                "physical session record is empty or exceeds its byte limit".to_string(),
+            ),
+        ));
+    }
+    let record: HeadRecordV1 = serde_json::from_slice(bytes).map_err(|error| {
+        PhysicalHeadReadErrorV1::before_revision(PhysicalReadErrorV1::Malformed(format!(
+            "cannot decode physical session record: {error}"
+        )))
+    })?;
+    let observed_revision = record.revision_id.clone();
+    if record.record_type != RecordType::Head {
+        return Err(PhysicalHeadReadErrorV1::at_revision(
+            observed_revision,
+            PhysicalReadErrorV1::Malformed("physical HEAD has the wrong record type".to_string()),
+        ));
+    }
+    if record.physical_schema_revision == 0 {
+        return Err(PhysicalHeadReadErrorV1::at_revision(
+            observed_revision,
+            PhysicalReadErrorV1::Malformed("physical HEAD schema must be nonzero".to_string()),
+        ));
+    }
+    if record.physical_schema_revision != PHYSICAL_SCHEMA_REVISION {
+        return Err(PhysicalHeadReadErrorV1::at_revision(
+            observed_revision,
+            PhysicalReadErrorV1::UnsupportedPhysicalSchema {
+                observed: record.physical_schema_revision,
+                supported: PHYSICAL_SCHEMA_REVISION,
+                message: format!(
+                    "unsupported physical HEAD schema {}; expected {PHYSICAL_SCHEMA_REVISION}",
+                    record.physical_schema_revision
+                ),
+            },
+        ));
+    }
+    let record = record.validate().map_err(|message| {
+        PhysicalHeadReadErrorV1::at_revision(
+            observed_revision.clone(),
+            PhysicalReadErrorV1::Malformed(message),
+        )
+    })?;
     if &record.store_id != expected_store || &record.session_id != expected_session {
-        return Err("head record identity does not match its physical location".to_string());
+        return Err(PhysicalHeadReadErrorV1::at_revision(
+            observed_revision,
+            PhysicalReadErrorV1::IdentityMismatch(
+                "head record identity does not match its physical location".to_string(),
+            ),
+        ));
     }
     Ok(record)
 }
@@ -652,6 +749,83 @@ pub(super) struct VerifiedArtifactV1 {
     manifest: ArtifactManifestV1,
     manifest_sha256: Sha256Digest,
     content_bytes: Vec<u8>,
+}
+
+#[derive(Debug)]
+pub(super) enum PhysicalReadErrorV1 {
+    MissingReference(String),
+    Malformed(String),
+    IdentityMismatch(String),
+    DigestMismatch(String),
+    UnsupportedPhysicalSchema {
+        observed: u32,
+        supported: u32,
+        message: String,
+    },
+}
+
+impl PhysicalReadErrorV1 {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for PhysicalReadErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::MissingReference(message)
+            | Self::Malformed(message)
+            | Self::IdentityMismatch(message)
+            | Self::DigestMismatch(message)
+            | Self::UnsupportedPhysicalSchema { message, .. } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PhysicalReadErrorV1 {}
+
+#[derive(Debug)]
+pub(super) struct PhysicalHeadReadErrorV1 {
+    observed_revision: Option<RevisionId>,
+    source: PhysicalReadErrorV1,
+}
+
+impl PhysicalHeadReadErrorV1 {
+    fn before_revision(source: PhysicalReadErrorV1) -> Self {
+        Self {
+            observed_revision: None,
+            source,
+        }
+    }
+
+    fn at_revision(revision: RevisionId, source: PhysicalReadErrorV1) -> Self {
+        Self {
+            observed_revision: Some(revision),
+            source,
+        }
+    }
+
+    pub(super) fn into_parts(self) -> (Option<RevisionId>, PhysicalReadErrorV1) {
+        (self.observed_revision, self.source)
+    }
+
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for PhysicalHeadReadErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        self.source.fmt(formatter)
+    }
+}
+
+impl std::error::Error for PhysicalHeadReadErrorV1 {
+    fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
+        Some(&self.source)
+    }
 }
 
 #[derive(Debug)]
@@ -1005,21 +1179,25 @@ impl PhysicalFileStoreV1 {
     pub(super) fn read_head(
         &self,
         session_id: &SessionId,
-    ) -> Result<Option<VerifiedRevisionHeadV1>, String> {
+    ) -> Result<Option<VerifiedRevisionHeadV1>, PhysicalHeadReadErrorV1> {
         let head_name = format!("{}.json", encode_component(session_id.as_str()));
         match self.heads.entry_kind(OsStr::new(&head_name)) {
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
             Ok(PrivateEntryKind::File) => {}
             Ok(_) => {
-                return Err(format!(
-                    "physical HEAD '{}' is not a regular file",
-                    self.heads.path.join(&head_name).display()
+                return Err(PhysicalHeadReadErrorV1::before_revision(
+                    PhysicalReadErrorV1::Malformed(format!(
+                        "physical HEAD '{}' is not a regular file",
+                        self.heads.path.join(&head_name).display()
+                    )),
                 ));
             }
             Err(error) => {
-                return Err(format!(
-                    "cannot inspect physical HEAD '{}': {error}",
-                    self.heads.path.join(&head_name).display()
+                return Err(PhysicalHeadReadErrorV1::before_revision(
+                    PhysicalReadErrorV1::Malformed(format!(
+                        "cannot inspect physical HEAD '{}': {error}",
+                        self.heads.path.join(&head_name).display()
+                    )),
                 ));
             }
         }
@@ -1028,14 +1206,24 @@ impl PhysicalFileStoreV1 {
             OsStr::new(&head_name),
             MAX_PHYSICAL_RECORD_BYTES as u64,
             "physical HEAD",
-        )?;
-        let record = decode_head_record(&bytes, self.store_id(), session_id)?;
-        let candidate = self.open_revision_candidate(session_id, &record.revision_id)?;
+        )
+        .map_err(|message| {
+            PhysicalHeadReadErrorV1::before_revision(PhysicalReadErrorV1::Malformed(message))
+        })?;
+        let record = decode_head_record_classified(&bytes, self.store_id(), session_id)?;
+        let candidate = self
+            .open_revision_candidate(session_id, &record.revision_id)
+            .map_err(|error| {
+                PhysicalHeadReadErrorV1::at_revision(record.revision_id.clone(), error)
+            })?;
         if candidate.manifest_sha256 != record.revision_manifest_sha256 {
-            return Err(format!(
-                "physical HEAD manifest digest mismatch: HEAD declares {}, observed {}",
-                record.revision_manifest_sha256.as_str(),
-                candidate.manifest_sha256.as_str()
+            return Err(PhysicalHeadReadErrorV1::at_revision(
+                record.revision_id.clone(),
+                PhysicalReadErrorV1::DigestMismatch(format!(
+                    "physical HEAD manifest digest mismatch: HEAD declares {}, observed {}",
+                    record.revision_manifest_sha256.as_str(),
+                    candidate.manifest_sha256.as_str()
+                )),
             ));
         }
         Ok(Some(VerifiedRevisionHeadV1 { record, candidate }))
@@ -1060,7 +1248,7 @@ impl PhysicalFileStoreV1 {
         }
         let reloaded = self
             .open_revision_candidate(session_id, &candidate.manifest.revision_id)
-            .map_err(PhysicalHeadCasError::Candidate)?;
+            .map_err(|error| PhysicalHeadCasError::Candidate(error.to_string()))?;
         if reloaded.manifest != candidate.manifest
             || reloaded.manifest_sha256 != candidate.manifest_sha256
         {
@@ -1072,7 +1260,7 @@ impl PhysicalFileStoreV1 {
 
         let current = self
             .read_head(session_id)
-            .map_err(PhysicalHeadCasError::Candidate)?;
+            .map_err(|error| PhysicalHeadCasError::Candidate(error.to_string()))?;
         let observed = current.as_ref().map(VerifiedRevisionHeadV1::revision_id);
         match expected.admit_observed(observed) {
             Ok(()) => {}
@@ -1544,45 +1732,118 @@ impl PhysicalFileStoreV1 {
         &self,
         session_id: &SessionId,
         revision_id: &RevisionId,
-    ) -> Result<VerifiedRevisionCandidateV1, String> {
+    ) -> Result<VerifiedRevisionCandidateV1, PhysicalReadErrorV1> {
         let session_name = encode_component(session_id.as_str());
         let revision_name = encode_component(revision_id.as_str());
-        let session_revisions = self.revisions.open_child(
-            OsStr::new(&session_name),
-            "physical session revision namespace",
-        )?;
+        match self.revisions.entry_kind(OsStr::new(&session_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PhysicalReadErrorV1::MissingReference(format!(
+                    "physical session revision namespace '{}' is missing",
+                    self.revisions.path.join(&session_name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::Directory) => {}
+            Ok(_) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "physical session revision namespace '{}' is not a directory",
+                    self.revisions.path.join(&session_name).display()
+                )))
+            }
+            Err(error) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "cannot inspect physical session revision namespace '{}': {error}",
+                    self.revisions.path.join(&session_name).display()
+                )))
+            }
+        }
+        let session_revisions = self
+            .revisions
+            .open_child(
+                OsStr::new(&session_name),
+                "physical session revision namespace",
+            )
+            .map_err(PhysicalReadErrorV1::Malformed)?;
+        match session_revisions.entry_kind(OsStr::new(&revision_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PhysicalReadErrorV1::MissingReference(format!(
+                    "physical revision candidate '{}' is missing",
+                    session_revisions.path.join(&revision_name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::Directory) => {}
+            Ok(_) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "physical revision candidate '{}' is not a directory",
+                    session_revisions.path.join(&revision_name).display()
+                )))
+            }
+            Err(error) => {
+                return Err(PhysicalReadErrorV1::Malformed(format!(
+                    "cannot inspect physical revision candidate '{}': {error}",
+                    session_revisions.path.join(&revision_name).display()
+                )))
+            }
+        }
         let revision = session_revisions
-            .open_child(OsStr::new(&revision_name), "physical revision candidate")?;
+            .open_child(OsStr::new(&revision_name), "physical revision candidate")
+            .map_err(PhysicalReadErrorV1::Malformed)?;
+        let require_regular = |name: &OsStr, context: &str| match revision.entry_kind(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(PhysicalReadErrorV1::MissingReference(format!(
+                    "{context} '{}' is missing",
+                    revision.path.join(name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::File) => Ok(()),
+            Ok(_) => Err(PhysicalReadErrorV1::Malformed(format!(
+                "cannot open {context} '{}': not a regular file",
+                revision.path.join(name).display()
+            ))),
+            Err(error) => Err(PhysicalReadErrorV1::Malformed(format!(
+                "cannot inspect {context} '{}': {error}",
+                revision.path.join(name).display()
+            ))),
+        };
+        require_regular(OsStr::new(REVISION_MANIFEST_NAME), "revision manifest")?;
         let manifest_bytes = read_bounded_regular(
             &revision,
             OsStr::new(REVISION_MANIFEST_NAME),
             MAX_PHYSICAL_RECORD_BYTES as u64,
             "revision manifest",
+        )
+        .map_err(PhysicalReadErrorV1::Malformed)?;
+        let manifest = decode_revision_manifest_classified(
+            &manifest_bytes,
+            self.store_id(),
+            session_id,
+            revision_id,
         )?;
-        let manifest =
-            decode_revision_manifest(&manifest_bytes, self.store_id(), session_id, revision_id)?;
+        require_regular(OsStr::new(CANONICAL_PAYLOAD_NAME), "canonical payload")?;
         let canonical_bytes = read_bounded_regular(
             &revision,
             OsStr::new(CANONICAL_PAYLOAD_NAME),
             MAX_CANONICAL_PAYLOAD_BYTES,
             "canonical payload",
-        )?;
+        )
+        .map_err(PhysicalReadErrorV1::Malformed)?;
         if canonical_bytes.len() as u64 != manifest.canonical_bytes {
-            return Err(format!(
+            return Err(PhysicalReadErrorV1::DigestMismatch(format!(
                 "canonical payload length mismatch: manifest declares {}, read {}",
                 manifest.canonical_bytes,
                 canonical_bytes.len()
-            ));
+            )));
         }
-        let observed_digest = digest_bytes(&canonical_bytes)?;
+        let observed_digest =
+            digest_bytes(&canonical_bytes).map_err(PhysicalReadErrorV1::Malformed)?;
         if observed_digest != manifest.canonical_sha256 {
-            return Err(format!(
+            return Err(PhysicalReadErrorV1::DigestMismatch(format!(
                 "canonical payload digest mismatch: manifest declares {}, observed {}",
                 manifest.canonical_sha256.as_str(),
                 observed_digest.as_str()
-            ));
+            )));
         }
-        let manifest_sha256 = digest_bytes(&manifest_bytes)?;
+        let manifest_sha256 =
+            digest_bytes(&manifest_bytes).map_err(PhysicalReadErrorV1::Malformed)?;
         Ok(VerifiedRevisionCandidateV1 {
             manifest,
             manifest_sha256,

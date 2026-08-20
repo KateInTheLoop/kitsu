@@ -5,7 +5,8 @@ use std::collections::{HashMap, HashSet};
 use chrono::DateTime;
 use kitsu_core::session::{
     CanonicalHistory, CanonicalOperation, CanonicalTerminal, ExpectedRevision, LogicalHead,
-    RevisionId, SessionAssistantDisposition, SessionId, SessionOutcomeClass, StoreId, TurnId,
+    RevisionId, SessionAssistantDisposition, SessionHistoryError, SessionId, SessionOutcomeClass,
+    StoreId, TurnId,
 };
 use kitsu_core::TerminalOutcome;
 use serde::{Deserialize, Serialize};
@@ -726,13 +727,16 @@ fn contains_offload_pointer(content: &str) -> bool {
 pub(super) enum CanonicalPayloadDecodeErrorV1 {
     Malformed(String),
     UnsupportedLogicalSchema { observed: u32, supported: u32 },
+    InvalidHead(String),
     Invalid(String),
 }
 
 impl std::fmt::Display for CanonicalPayloadDecodeErrorV1 {
     fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::Malformed(message) | Self::Invalid(message) => formatter.write_str(message),
+            Self::Malformed(message) | Self::InvalidHead(message) | Self::Invalid(message) => {
+                formatter.write_str(message)
+            }
             Self::UnsupportedLogicalSchema {
                 observed,
                 supported,
@@ -767,8 +771,27 @@ pub(super) fn decode_canonical_payload_classified(
             supported: LOGICAL_SCHEMA_V1,
         });
     }
+    classify_selected_head(&payload)?;
     validate_canonical_payload(&payload).map_err(CanonicalPayloadDecodeErrorV1::Invalid)?;
     Ok(payload)
+}
+
+fn classify_selected_head(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<(), CanonicalPayloadDecodeErrorV1> {
+    let operations = payload
+        .operations
+        .iter()
+        .map(|operation| operation.operation.clone())
+        .collect();
+    match CanonicalHistory::new(operations, payload.selected_head.clone()) {
+        Err(error @ SessionHistoryError::SelectedHeadUnknown { .. }) => {
+            Err(CanonicalPayloadDecodeErrorV1::InvalidHead(format!(
+                "invalid canonical history: {error}"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 pub(super) fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
@@ -1879,6 +1902,15 @@ mod tests {
         assert!(matches!(
             decode_canonical_payload_classified(&serde_json::to_vec(&invalid).unwrap()),
             Err(CanonicalPayloadDecodeErrorV1::Invalid(_))
+        ));
+
+        let mut invalid_head: serde_json::Value =
+            serde_json::from_slice(&complete_payload_fixture()).unwrap();
+        invalid_head["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        assert!(matches!(
+            decode_canonical_payload_classified(&serde_json::to_vec(&invalid_head).unwrap()),
+            Err(CanonicalPayloadDecodeErrorV1::InvalidHead(_))
         ));
     }
 
