@@ -16,9 +16,10 @@ Cycle 065 adds a pure, unmounted successor assembler for one complete new
 operation from neutral E02 terminal truth and closed transcript/effect facts.
 Cycle 066 composes only its artifact-free text subset with fenced file
 publication; artifact-bearing bases remain structurally refused.
-Cycle 067 adds private physical immutable artifact records and I/O; canonical
-Cycle 068 composes their exact closure with private canonical publication for
-one complete tool/result/effect operation. Production remains unmounted.
+Cycle 067 adds private physical immutable artifact records and I/O. Cycle 068
+composes their exact closure with private canonical publication for one complete
+tool/result/effect operation. Cycle 069 applies the same closure to canonical
+HEAD open. Production remains unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -230,6 +231,15 @@ under the writer fence before candidate allocation, then reopens and compares
 the entire closure after candidate installation and before HEAD CAS. A missing,
 tampered, or unequal precheck allocates no candidate; a failed recheck leaves a
 confirmed installed-unselected candidate and the old HEAD.
+
+Canonical HEAD open first requires the physical HEAD and immutable revision to
+verify, decodes the selected logical payload, and binds its logical schema,
+store, session, revision, and parent to that physical envelope. It then reopens
+every referenced artifact and applies the same exact comparison used by
+publication. Only an absent physical HEAD returns `None`; invalid logical bytes,
+binding disagreement, missing closure, content tamper, or self-consistent but
+different physical artifact facts return a typed private read error for the
+selected revision. The reader never scans or silently selects an older candidate.
 
 ## Store contract and typed states
 
@@ -503,6 +513,13 @@ cannot weaken or replace any backend-neutral assertion.
    before HEAD CAS. Missing, tampered, or mismatched closures are not published;
    the post-candidate recheck cut retains old HEAD plus exact confirmed residue.
    Next require verified artifact closure whenever canonical HEAD is opened.
+   **Verified canonical HEAD open complete in Cycle 069:** the selected physical
+   candidate is decoded and bound to its logical schema/store/session/revision/
+   parent, then every artifact is reopened through the publication predicate.
+   True HEAD absence alone returns no value. Invalid logical bytes, binding
+   disagreement, missing closure, digest tamper, and an independently valid but
+   unequal physical replacement all fail on the selected HEAD without fallback.
+   Next project these private read failures into the neutral typed lookup state.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

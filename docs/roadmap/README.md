@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 068. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 069. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -317,7 +317,10 @@ and reports collision, tamper, symlink, and durability truth. Canonical
 publication now compares every artifact fact to exact verified physical state
 both before candidate allocation and after install before HEAD CAS. One complete
 tool/result/effect operation passes exact missing/mismatch/tamper/cut fixtures;
-verified artifact closure on canonical HEAD read remains next.
+canonical HEAD open now decodes and binds the selected revision and reapplies
+that same exact closure. Only an absent HEAD is missing; selected logical,
+binding, or artifact corruption never falls back. Neutral typed lookup mapping
+remains next.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -598,6 +601,7 @@ gates merely because a card appears attractive.
 | 066 | E03-S02-C15 | Publish only an artifact-free assembled successor through exact stale/candidate/HEAD transaction cuts |
 | 067 | E03-S02-C16 | Add session-scoped immutable artifact records plus descriptor-pinned no-overwrite install and verification |
 | 068 | E03-S02-C17 | Bind complete canonical tool/effect publication to exact installed artifact closure before candidate and HEAD publication |
+| 069 | E03-S02-C18 | Decode and bind selected canonical HEAD plus exact artifact closure, refusing corruption without older-revision fallback |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -666,7 +670,7 @@ proves exact update, stale zero-allocation, candidate residue, and HEAD
 durability truth. Cycle 067 defines descriptor-pinned immutable artifact
 closure before this path can widen. Cycle 068 binds canonical artifact facts to
 exact verified physical records before candidate/HEAD publication. The queue
-then continues through E03,
+then verifies selected-HEAD closure in Cycle 069 and continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
