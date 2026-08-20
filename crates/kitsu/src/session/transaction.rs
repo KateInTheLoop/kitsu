@@ -16,7 +16,7 @@ use super::canonical::CanonicalToolRoundV1;
 use super::canonical::{
     append_complete_operation, decode_canonical_payload_classified, encode_canonical_payload,
     prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalPayloadDecodeErrorV1,
-    CanonicalSessionRevisionV1, ImmutableArtifactRefV1,
+    CanonicalSessionRevisionV1, ImmutableArtifactRefV1, LOGICAL_SCHEMA_V1,
 };
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
@@ -523,7 +523,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     }
 
     fn plan_last_good_recovery(&self, session_id: &SessionId) -> CanonicalRecoveryPlanV1 {
-        let selected_head = match self.store.read_head(session_id) {
+        let selected_head = match self.store.read_head_envelope(session_id) {
             Ok(None) => return CanonicalRecoveryPlanV1::Missing,
             Ok(Some(head)) => head,
             Err(error) => {
@@ -535,20 +535,27 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             }
         };
         let selected = selected_head.revision_id().clone();
-        let selected_candidate = selected_head.candidate();
-        let selected_error =
-            match self.decode_canonical_candidate(session_id, selected.clone(), selected_candidate)
-            {
-                Ok(verified) => {
-                    return CanonicalRecoveryPlanV1::NotNeeded {
-                        selected,
-                        head: verified.payload.selected_head().clone(),
-                    };
+        let selected_error = match self
+            .store
+            .verify_revision_candidate(selected_head.envelope())
+        {
+            Ok(candidate) => {
+                match self.decode_canonical_candidate(session_id, selected.clone(), &candidate) {
+                    Ok(verified) => {
+                        return CanonicalRecoveryPlanV1::NotNeeded {
+                            selected,
+                            head: verified.payload.selected_head().clone(),
+                        };
+                    }
+                    Err(error) => error,
                 }
-                Err(error) => error,
-            };
+            }
+            Err(error) => CanonicalHeadReadErrorV1::from_physical_revision(selected.clone(), error),
+        };
         let selected_state = selected_error.lookup_state(session_id);
-        if matches!(selected_state, SessionLookupState::Unsupported { .. }) {
+        if matches!(selected_state, SessionLookupState::Unsupported { .. })
+            || selected_head.manifest().logical_schema_revision() != LOGICAL_SCHEMA_V1
+        {
             return CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(selected),
                 selected_state,
@@ -558,8 +565,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         // Recovery is advisory and read-only. It follows only the exact,
         // digest-bound physical ancestry of the selected corrupt revision;
         // unselected candidates and directory order can never influence it.
-        let mut parent = selected_candidate.manifest().parent_revision().clone();
-        let mut parent_manifest_sha256 = selected_candidate
+        let mut parent = selected_head.manifest().parent_revision().clone();
+        let mut parent_manifest_sha256 = selected_head
             .manifest()
             .parent_manifest_sha256()
             .map(|digest| digest.as_str().to_string());
@@ -587,11 +594,11 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                     selected_state,
                 };
             };
-            let candidate = match self
+            let envelope = match self
                 .store
-                .open_revision_candidate(session_id, &parent_revision)
+                .open_revision_envelope(session_id, &parent_revision)
             {
-                Ok(candidate) => candidate,
+                Ok(envelope) => envelope,
                 Err(_) => {
                     return CanonicalRecoveryPlanV1::Unavailable {
                         selected: Some(selected),
@@ -599,41 +606,48 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                     };
                 }
             };
-            if candidate.manifest_sha256().as_str() != expected_manifest_sha256 {
+            if envelope.manifest_sha256().as_str() != expected_manifest_sha256
+                || envelope.manifest().logical_schema_revision() != LOGICAL_SCHEMA_V1
+            {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: Some(selected),
                     selected_state,
                 };
             }
 
-            match self.decode_canonical_candidate(session_id, parent_revision.clone(), &candidate) {
-                Ok(verified) => {
-                    return CanonicalRecoveryPlanV1::Available {
-                        selected,
-                        selected_state,
-                        recovery: parent_revision,
-                        recovery_head: verified.payload.selected_head().clone(),
-                    };
-                }
-                Err(error)
-                    if matches!(
-                        error.lookup_state(session_id),
-                        SessionLookupState::Unsupported { .. }
-                    ) =>
-                {
-                    return CanonicalRecoveryPlanV1::Unavailable {
-                        selected: Some(selected),
-                        selected_state,
-                    };
-                }
-                Err(_) => {
-                    parent = candidate.manifest().parent_revision().clone();
-                    parent_manifest_sha256 = candidate
-                        .manifest()
-                        .parent_manifest_sha256()
-                        .map(|digest| digest.as_str().to_string());
+            if let Ok(candidate) = self.store.verify_revision_candidate(&envelope) {
+                match self.decode_canonical_candidate(
+                    session_id,
+                    parent_revision.clone(),
+                    &candidate,
+                ) {
+                    Ok(verified) => {
+                        return CanonicalRecoveryPlanV1::Available {
+                            selected,
+                            selected_state,
+                            recovery: parent_revision,
+                            recovery_head: verified.payload.selected_head().clone(),
+                        };
+                    }
+                    Err(error)
+                        if matches!(
+                            error.lookup_state(session_id),
+                            SessionLookupState::Unsupported { .. }
+                        ) =>
+                    {
+                        return CanonicalRecoveryPlanV1::Unavailable {
+                            selected: Some(selected),
+                            selected_state,
+                        };
+                    }
+                    Err(_) => {}
                 }
             }
+            parent = envelope.manifest().parent_revision().clone();
+            parent_manifest_sha256 = envelope
+                .manifest()
+                .parent_manifest_sha256()
+                .map(|digest| digest.as_str().to_string());
         }
     }
 
@@ -2109,6 +2123,259 @@ mod tests {
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
             &rev_c
+        );
+    }
+
+    #[test]
+    fn recovery_plan_uses_head_bound_manifest_when_selected_payload_is_unreadable() {
+        for (fault, expected_reason) in [
+            ("missing", CorruptSessionReason::MissingReference),
+            ("digest", CorruptSessionReason::DigestMismatch),
+        ] {
+            let root = tempfile::tempdir().unwrap();
+            let (store_id, session_id, rev_a, rev_b) = ids();
+            let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+                root.path(),
+                store_id,
+            )
+            .unwrap();
+            let transaction = CanonicalFileTransactionV1::new(&store);
+            transaction
+                .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+                .unwrap();
+            transaction
+                .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+                .unwrap();
+            let canonical_path = crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                root.path(),
+                &session_id,
+                &rev_b,
+            );
+            if fault == "missing" {
+                std::fs::remove_file(canonical_path).unwrap();
+            } else {
+                std::fs::write(canonical_path, b"tampered canonical bytes").unwrap();
+            }
+
+            let selected_state = SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_b.clone()),
+                reason: expected_reason,
+            };
+            assert_eq!(
+                transaction.lookup_canonical_head(&session_id).state(),
+                &selected_state,
+                "fault: {fault}"
+            );
+            let envelope = store.read_head_envelope(&session_id).unwrap().unwrap();
+            assert_eq!(envelope.revision_id(), &rev_b, "fault: {fault}");
+            assert_eq!(
+                envelope.manifest().parent_revision(),
+                &ExpectedRevision::Exact(rev_a.clone()),
+                "fault: {fault}"
+            );
+
+            assert!(matches!(
+                transaction.plan_last_good_recovery(&session_id),
+                CanonicalRecoveryPlanV1::Available {
+                    ref selected,
+                    selected_state: ref observed_state,
+                    ref recovery,
+                    ref recovery_head,
+                } if selected == &rev_b
+                    && observed_state == &selected_state
+                    && recovery == &rev_a
+                    && recovery_head == &kitsu_core::session::LogicalHead::Turn(
+                        kitsu_core::session::TurnId::new("turn-1").unwrap()
+                    )
+            ));
+            assert_eq!(
+                store
+                    .read_head_envelope(&session_id)
+                    .unwrap()
+                    .unwrap()
+                    .revision_id(),
+                &rev_b,
+                "fault: {fault}"
+            );
+            assert_eq!(
+                transaction.lookup_canonical_head(&session_id).state(),
+                &selected_state,
+                "fault: {fault}"
+            );
+        }
+    }
+
+    #[test]
+    fn recovery_plan_crosses_unreadable_parent_only_through_bound_manifests() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        for value in [
+            payload("store-1", "session-1", "rev-a", None, 1),
+            payload("store-1", "session-1", "rev-b", Some("rev-a"), 2),
+            payload("store-1", "session-1", "rev-c", Some("rev-b"), 3),
+        ] {
+            transaction.commit(&value).unwrap();
+        }
+        for revision in [&rev_b, &rev_c] {
+            std::fs::write(
+                crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                    root.path(),
+                    &session_id,
+                    revision,
+                ),
+                b"tampered canonical bytes",
+            )
+            .unwrap();
+        }
+        let selected_state = SessionLookupState::Corrupt {
+            session: session_id.clone(),
+            observed_revision: Some(rev_c.clone()),
+            reason: CorruptSessionReason::DigestMismatch,
+        };
+
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::Available {
+                ref selected,
+                selected_state: ref observed_state,
+                ref recovery,
+                ref recovery_head,
+            } if selected == &rev_c
+                && observed_state == &selected_state
+                && recovery == &rev_a
+                && recovery_head == &kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+        ));
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &selected_state
+        );
+    }
+
+    #[test]
+    fn recovery_plan_refuses_unverified_selected_manifest_despite_valid_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+        let manifest_path = crate::session::physical::PhysicalLayoutV1::revision_manifest(
+            root.path(),
+            &session_id,
+            &rev_b,
+        );
+        let mut manifest: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
+        manifest["canonical_sha256"] = serde_json::json!("f".repeat(64));
+        std::fs::write(manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let selected_state = SessionLookupState::Corrupt {
+            session: session_id.clone(),
+            observed_revision: Some(rev_b.clone()),
+            reason: CorruptSessionReason::DigestMismatch,
+        };
+
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::Unavailable {
+                selected: Some(ref selected),
+                selected_state: ref observed_state,
+            } if selected == &rev_b && observed_state == &selected_state
+        ));
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &selected_state
+        );
+    }
+
+    #[test]
+    fn recovery_plan_refuses_to_cross_a_future_logical_parent_manifest() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        let mut future =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+                .unwrap();
+        future["logical_schema"] = serde_json::json!(2);
+        let candidate_b = store
+            .install_revision_candidate(
+                2,
+                session_id.clone(),
+                rev_b.clone(),
+                ExpectedRevision::Exact(rev_a.clone()),
+                &serde_json::to_vec(&future).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_a), &candidate_b)
+            .unwrap();
+        drop(fence);
+        let candidate_c = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_c.clone(),
+                ExpectedRevision::Exact(rev_b.clone()),
+                &encode_canonical_payload(&payload(
+                    "store-1",
+                    "session-1",
+                    "rev-c",
+                    Some("rev-b"),
+                    3,
+                ))
+                .unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_b), &candidate_c)
+            .unwrap();
+        std::fs::write(
+            crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                root.path(),
+                &session_id,
+                &rev_c,
+            ),
+            b"tampered canonical bytes",
+        )
+        .unwrap();
+        let selected_state = SessionLookupState::Corrupt {
+            session: session_id.clone(),
+            observed_revision: Some(rev_c.clone()),
+            reason: CorruptSessionReason::DigestMismatch,
+        };
+
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::Unavailable {
+                selected: Some(ref selected),
+                selected_state: ref observed_state,
+            } if selected == &rev_c && observed_state == &selected_state
+        ));
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &selected_state
         );
     }
 

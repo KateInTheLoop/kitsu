@@ -263,7 +263,7 @@ cutting an incomplete exchange.
 Dependencies: E02 terminal outcome model.
 
 Status: E03-S01 is accepted, E03-S02 is implemented through C21, and E03-S04 is
-in progress through Cycle 073. The
+in progress through Cycle 074. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -334,8 +334,11 @@ missing, retargeted, cyclic, or over-limit ancestor. A read-only recovery planne
 now follows the same exact chain across one or more logically corrupt revisions,
 selects only the first fully verified earlier revision, and leaves both ordinary
 lookup and physical HEAD unchanged. Missing, already-valid, unavailable, and
-future-schema outcomes stay explicit. Selected physical payload/digest faults
-still need a verified manifest-only envelope before they can be planned safely.
+future-schema outcomes stay explicit. A descriptor-pinned manifest envelope is
+now verified separately from canonical payload bytes. Missing or digest-broken
+selected and intermediate payloads may be crossed only through exact HEAD/child-
+bound manifest digests; an unverified or future-logical manifest stops the plan.
+Ordinary lookup remains corrupt and no recovery revision is published yet.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -621,6 +624,7 @@ gates merely because a card appears attractive.
 | 071 | E03-S02-C20 | Type physical HEAD/revision read evidence and distinguish invalid selected HEAD from broken operation causality |
 | 072 | E03-S02-C21 | Bind successor manifests to exact parent digests and verify bounded selected lineage without orphan promotion |
 | 073 | E03-S04-C1 | Derive a read-only verified last-good plan across digest-bound logical corruption without changing selected HEAD |
+| 074 | E03-S04-C2 | Split trusted manifest envelopes from payload verification and recover-plan across physical payload faults |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -693,9 +697,10 @@ then verifies selected-HEAD closure in Cycle 069, maps the neutral lookup in
 Cycle 070, types its complete physical envelope in Cycle 071, and binds and
 verifies retained selected lineage in Cycle 072. Cycle 073 begins recovery with
 a mutation-free last-good plan for logically corrupt selected ancestry; Cycle
-074 extends the trusted input split to selected physical payload faults before
-continuing through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
-above.
+074 extends the trusted input split to selected and intermediate physical payload
+faults. Cycle 075 defines a pure new recovery revision and complete skipped/
+blocker evidence before explicit fenced publication, then the queue continues
+through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is implemented
-through C21 and E03-S04 is in progress through Cycle 073;
+through C21 and E03-S04 is in progress through Cycle 074;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 73 / 73 |
+| Accepted cycles/commits after this cycle | 74 / 74 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S04-C2 (Cycle 074) — recover planning inputs from a verified manifest envelope when selected canonical bytes fail physical verification |
+| Active epic/card | E03 / E03-S04-C3 (Cycle 075) — define a pure new recovery revision plus complete skipped/blocker evidence before publication |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C21, E03-S04 through C1 | Current-v1 behavior remains unchanged. Physical schema revision 2 binds every successor to the exact verified parent-manifest digest and rechecks it at HEAD CAS. A bounded selected-lineage reader verifies every canonical/artifact closure, ignores orphans, and fails closed without partial lineage. A read-only planner now crosses logically corrupt digest-bound ancestors and returns only a fully verified earlier revision without changing HEAD; selected physical-byte recovery, publication, mounting, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C21, E03-S04 through C2 | Current-v1 behavior remains unchanged. Physical schema revision 2 binds every successor to the exact verified parent-manifest digest and rechecks it at HEAD CAS. A bounded selected-lineage reader verifies every canonical/artifact closure and ignores orphans. Physical reading separates a HEAD-bound manifest envelope from payload verification; the recovery planner crosses logical or physical payload corruption only through those exact envelopes and stops on unverified/future manifests without changing HEAD. Typed skipped/blocker evidence, recovery publication, mounting, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -108,7 +108,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 070 | `bc42bb9` | Lossless neutral canonical lookup classification |
 | 071 | `fac367f` | Typed physical lookup envelope and invalid-HEAD classification |
 | 072 | `18d4eeb` | Parent-manifest digest chain and bounded selected-lineage verification |
-| 073 | this document's commit | Read-only verified last-good recovery planning |
+| 073 | `da377bc` | Read-only verified last-good recovery planning |
+| 074 | this document's commit | HEAD-bound manifest-envelope recovery across physical payload faults |
 
 ## Current green gates
 
@@ -427,7 +428,13 @@ first fully verified earlier revision, reports missing/valid/unavailable/future
 states explicitly, and leaves ordinary lookup plus physical HEAD unchanged.
 Cycle 074 next separates verified manifest-envelope access from canonical-byte
 verification so selected payload/digest faults can use the same bounded plan
-without trusting corrupted bytes.
+without trusting corrupted bytes. Cycle 074 keeps the descriptor-pinned revision
+directory and verified manifest distinct from untrusted payload bytes. Missing or
+digest-broken selected and intermediate payloads can now reach a fully verified
+ancestor through exact manifest links; manifest retargeting and future logical
+ancestry remain unavailable, ordinary lookup stays corrupt, and HEAD is unchanged.
+Cycle 075 next defines the pure new recovery revision and complete skipped/blocker
+evidence required before any explicit fenced publication can exist.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
