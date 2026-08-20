@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 043.
+Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 044.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -23,8 +23,10 @@ route receipts remain E04-S05. Cycle 042 adds exactly one terminal native
 attempt observation across success, rejection, decode/body failure, timeout,
 send cancellation, and accepted-body cancellation. Cycle 043 publishes an
 exact native declaration and immutable frozen-auth snapshot, exercises it
-through the common route handle, and rejects retry/catalog policy the adapter
-cannot yet honor.
+through the common route handle, and rejects catalog policy the adapter cannot
+honor. Cycle 044 freezes bounded retry policy into that route and makes both
+compiled adapters use one provider-neutral delay, deadline, status taxonomy,
+and attempt-lifecycle owner.
 
 ## Decision
 
@@ -77,6 +79,11 @@ implementation it actually constructs.
   budgets, the bounded advisory discovery budget, and whether a model catalog
   is configured. Catalog policy must agree exactly with the declared
   `model_catalog` capability.
+- The private retry owner defines the shared transient set (408, 429,
+  502-504, 520-524, and 529), exponential floor, bounded positive jitter,
+  capped `Retry-After`, one end-to-end deadline, and cancellation guards.
+  Authentication, deterministic client errors, 500, and admitted response-body
+  failures are terminal and never retried.
 - `ProviderRouteSnapshot<P>` owns either a model-bound inference generation or
   a catalog-only management generation, plus secret-free auth source, policy,
   and its provider-specific runtimes. Catalog-only construction owns no model
@@ -88,7 +95,7 @@ implementation it actually constructs.
   auth object; later environment changes cannot alter an admitted generation.
 - `build_anthropic_messages_route` requires the exact native declaration before
   acquiring auth, freezes the selected auth source once, constructs generation
-  one, and refuses nonzero inference retries or any catalog policy. The same
+  one with its inference retry count, and refuses any catalog policy. The same
   runtime owner occupies the snapshot's private slots, but missing catalog
   capability prevents catalog entry before either runtime can be reached.
 - `ProviderRouteCurrent<P>` owns the one process-local current snapshot behind
@@ -189,20 +196,27 @@ streaming/tools/usage declaration and a factory that validates policy before
 auth acquisition, freezes auth once, and publishes the adapter as generation
 one. Common handle fixtures prove generation-attributed attempts, optional
 catalog absence, and structured-output rejection without a second physical
-send. Production flavor selection remains unchanged. These cards still do not:
+send. Production flavor selection remains unchanged.
+
+Cycle 044 extracts the proven compatible-Chat retry mechanism without changing
+its behavior and binds native retries to the immutable route policy. Offline
+cuts prove 529-to-success retains generation one across both attempts, an
+oversized `Retry-After` loses to the request deadline with one send, cancellation
+during backoff closes the scheduled attempt without sending it, and a malformed
+accepted body is terminal even when retries remain. These cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
 - select or advertise the native Messages adapter in production composition;
-- implement retries or model catalog for the Messages adapter;
+- implement model catalog for the Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
 flavor-to-adapter switch. There is no title-generation provider call in current
 Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
 constructor is confined to compiled provider factories and provider tests. The
-next card adds bounded transient retry/backoff and cancellation parity inside
-one frozen native generation without enabling live configuration selection.
+next card runs both compiled adapters through one provider-neutral route-handle
+conformance harness without enabling live configuration selection.
 
 ## Acceptance and rollback
 
@@ -219,7 +233,7 @@ cargo test -p kitsu-providers --test provider_wire_matrix
 Six route-contract, four declaration/derivation, four snapshot, twelve
 route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
 selection, doctor/catalog-without-model, generation-aware
-compaction/subagent/replay/JSONL, and twenty-seven wire-matrix cases pass offline.
+compaction/subagent/replay/JSONL, and thirty wire-matrix cases pass offline.
 The native slices prove exact distinct text and tool request/header shapes,
 normalized text/tool/usage/terminal output, EOF-as-failure, pre-send malformed
 tool-input rejection, and the 1 MiB streamed argument bound. Native fault cases
@@ -231,6 +245,8 @@ decode failure, header timeout/cancellation, and accepted-body cancellation.
 The native route fixture additionally proves exact capability truth,
 once-frozen auth, typed unsupported-policy errors, common-handle generation
 attribution, catalog absence, and structured-output zero-send admission.
+Native retry fixtures add generation-stable transient retry-to-success,
+deadline refusal, backoff cancellation closure, and admitted-body no-retry.
 The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting

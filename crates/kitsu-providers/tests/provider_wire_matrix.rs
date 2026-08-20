@@ -1,12 +1,13 @@
 mod support;
 
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use futures::StreamExt;
 use kitsu_providers::anthropic_messages::{
     build_anthropic_messages_route, AnthropicMessagesConfig, AnthropicMessagesProvider,
-    AnthropicMessagesRouteBuildError, AnthropicMessagesRouteConfig, ANTHROPIC_VERSION,
+    AnthropicMessagesRouteConfig, ANTHROPIC_VERSION,
 };
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
@@ -62,10 +63,19 @@ fn provider_for_with_timeout(
 }
 
 fn messages_provider_for(base_url: String, timeout: Duration) -> AnthropicMessagesProvider {
+    messages_provider_for_with_retries(base_url, timeout, 0)
+}
+
+fn messages_provider_for_with_retries(
+    base_url: String,
+    timeout: Duration,
+    retries: u32,
+) -> AnthropicMessagesProvider {
     AnthropicMessagesProvider::new(
         AnthropicMessagesConfig {
             base_url,
             messages_path: "/v1/messages".to_string(),
+            retries,
             timeout,
         },
         Arc::new(NoAuth),
@@ -692,6 +702,19 @@ fn captured_attempts() -> (
     (events, sink)
 }
 
+fn captured_attempts_with_context() -> (
+    Arc<Mutex<Vec<kitsu_providers::ProviderAttemptObservation>>>,
+    ProviderTelemetrySink,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::with_fallible_context_observer(move |event| {
+        observed.lock().unwrap().push(event);
+        true
+    });
+    (events, sink)
+}
+
 fn assert_one_native_attempt(
     events: &Arc<Mutex<Vec<kitsu_providers::ProviderAttemptEvent>>>,
     category: ProviderAttemptCategory,
@@ -926,10 +949,10 @@ async fn native_messages_route_is_frozen_truthful_and_generation_attributed() {
     ));
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 
-    let invalid = build_anthropic_messages_route(
+    let retrying = build_anthropic_messages_route(
         AnthropicMessagesRouteConfig {
             declaration: ProviderRouteDeclaration::native_messages_v1(
-                ProviderProfileId::derive_v1(b"wire-matrix", b"native-invalid").unwrap(),
+                ProviderProfileId::derive_v1(b"wire-matrix", b"native-retrying").unwrap(),
             ),
             model: "fixture-model-v1".to_string(),
             auth_source: ProviderAuthSource::None,
@@ -947,10 +970,196 @@ async fn native_messages_route_is_frozen_truthful_and_generation_attributed() {
         },
         &NoAuth,
     );
+    assert_eq!(retrying.unwrap().policy().inference_retries(), 1);
+}
+
+#[tokio::test]
+async fn native_messages_retries_transient_status_inside_one_frozen_generation() {
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    let success_stream = fixture.stream.clone();
+    Mock::given(method("POST"))
+        .and(path(fixture.path))
+        .respond_with(move |_: &wiremock::Request| {
+            if responder_calls.fetch_add(1, Ordering::Relaxed) == 0 {
+                ResponseTemplate::new(529).insert_header("retry-after", "0")
+            } else {
+                ResponseTemplate::new(200)
+                    .insert_header("content-type", "text/event-stream")
+                    .set_body_string(success_stream.clone())
+            }
+        })
+        .mount(&server)
+        .await;
+    let snapshot = build_anthropic_messages_route(
+        AnthropicMessagesRouteConfig {
+            declaration: ProviderRouteDeclaration::native_messages_v1(
+                ProviderProfileId::derive_v1(b"wire-matrix", b"native-retry").unwrap(),
+            ),
+            model: "fixture-model-v1".to_string(),
+            auth_source: ProviderAuthSource::None,
+            base_url: server.uri(),
+            messages_path: fixture.path.to_string(),
+            policy: ProviderRoutePolicy::new(
+                1,
+                0,
+                Duration::from_secs(2),
+                Duration::from_secs(2),
+                Duration::from_secs(1),
+                ProviderCatalogPolicy::Unavailable,
+            )
+            .unwrap(),
+        },
+        &NoAuth,
+    )
+    .expect("native retry route publishes");
+    let handle = ProviderRouteCurrent::new(snapshot).bind().unwrap();
+    let (events, sink) = captured_attempts_with_context();
+    let mut stream = handle
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("transient native failure retries");
+    while let Some(delta) = stream.next().await {
+        delta.expect("retried native body decodes");
+    }
+
+    assert_eq!(calls.load(Ordering::Relaxed), 2);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 2);
+    assert_eq!(events[0].event.attempt, 1);
+    assert_eq!(events[0].event.max_attempts, 2);
+    assert_eq!(events[0].event.status, Some(529));
+    assert_eq!(
+        events[0].event.outcome,
+        ProviderAttemptOutcome::RetryScheduled
+    );
+    assert!(!events[0].event.terminal);
+    assert!(events[0].event.retry_delay_ms.is_some());
+    assert!(!events[0].event.retry_after_used);
+    assert_eq!(events[1].event.attempt, 2);
+    assert_eq!(
+        events[1].event.outcome,
+        ProviderAttemptOutcome::BodyCompleted
+    );
+    assert!(events[1].event.terminal);
+    assert!(events
+        .iter()
+        .all(|event| event.route_generation.unwrap().get() == 1));
+}
+
+#[tokio::test]
+async fn native_messages_retry_deadline_and_backoff_cancellation_are_terminal() {
+    let deadline_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(503).insert_header("retry-after", "30"))
+        .expect(1)
+        .mount(&deadline_server)
+        .await;
+    let deadline_provider =
+        messages_provider_for_with_retries(deadline_server.uri(), Duration::from_millis(100), 3);
+    let (deadline_events, deadline_sink) = captured_attempts();
+    let error = match deadline_provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(deadline_sink))
+        .await
+    {
+        Ok(_) => panic!("retry beyond the request deadline started"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::Timeout));
+    {
+        let deadline_events = deadline_events.lock().unwrap();
+        assert_eq!(deadline_events.len(), 1);
+        assert_eq!(deadline_events[0].attempt, 1);
+        assert_eq!(
+            deadline_events[0].outcome,
+            ProviderAttemptOutcome::DeadlineExceeded
+        );
+        assert!(deadline_events[0].terminal);
+    }
+
+    let cancel_server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(429).insert_header("retry-after", "1"))
+        .expect(1)
+        .mount(&cancel_server)
+        .await;
+    let cancel_provider =
+        messages_provider_for_with_retries(cancel_server.uri(), Duration::from_secs(5), 1);
+    let cancel_events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&cancel_events);
+    let retry_scheduled = Arc::new(tokio::sync::Notify::new());
+    let notified = Arc::clone(&retry_scheduled);
+    let cancel_sink = ProviderTelemetrySink::new(move |event| {
+        let retry = event.outcome == ProviderAttemptOutcome::RetryScheduled;
+        observed.lock().unwrap().push(event);
+        if retry {
+            notified.notify_one();
+        }
+    });
+    let mut request = Box::pin(
+        cancel_provider.chat_stream_with_telemetry(neutral_text_request(), Some(cancel_sink)),
+    );
+    tokio::select! {
+        _ = retry_scheduled.notified() => {}
+        _ = &mut request => panic!("native request left retry backoff unexpectedly"),
+    }
+    drop(request);
+
+    let cancel_events = cancel_events.lock().unwrap();
+    assert_eq!(cancel_events.len(), 2);
+    assert_eq!(
+        cancel_events[0].outcome,
+        ProviderAttemptOutcome::RetryScheduled
+    );
+    assert!(!cancel_events[0].terminal);
+    assert_eq!(cancel_events[1].attempt, 2);
+    assert_eq!(cancel_events[1].outcome, ProviderAttemptOutcome::Cancelled);
+    assert!(cancel_events[1].terminal);
+    assert_eq!(
+        cancel_events.iter().filter(|event| event.terminal).count(),
+        1
+    );
+}
+
+#[tokio::test]
+async fn native_messages_never_retries_after_a_body_is_admitted() {
+    let fixture = anthropic_messages_malformed_event();
+    let server = MockServer::start().await;
+    let calls = Arc::new(AtomicUsize::new(0));
+    let responder_calls = Arc::clone(&calls);
+    Mock::given(method("POST"))
+        .and(path(fixture.path))
+        .respond_with(move |_: &wiremock::Request| {
+            responder_calls.fetch_add(1, Ordering::Relaxed);
+            ResponseTemplate::new(200)
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(fixture.stream.clone())
+        })
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for_with_retries(server.uri(), Duration::from_secs(2), 3);
+    let (events, sink) = captured_attempts();
+    let mut stream = provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("the accepted body owns the terminal result");
     assert!(matches!(
-        invalid,
-        Err(AnthropicMessagesRouteBuildError::UnsupportedInferenceRetries { configured: 1 })
+        stream.next().await,
+        Some(Err(ProviderError::InvalidResponse(_)))
     ));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+
+    assert_eq!(calls.load(Ordering::Relaxed), 1);
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    assert_eq!(events[0].attempt, 1);
+    assert_eq!(events[0].max_attempts, 4);
+    assert_eq!(events[0].outcome, ProviderAttemptOutcome::BodyFailed);
+    assert!(events[0].terminal);
 }
 
 #[tokio::test]

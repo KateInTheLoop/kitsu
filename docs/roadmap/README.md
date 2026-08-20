@@ -283,7 +283,7 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 Dependencies: E02 run outcome; E00 delta audit.
 
 Status: E04-S01/S02/S03 are accepted and E04-S04 is in progress through Cycle
-043.
+044.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
@@ -306,9 +306,13 @@ cancellation fixtures now pass on the native implementation with exactly one
 send. Native one-attempt telemetry now closes every send/body lifecycle with
 one common terminal event. A fixture-only native route factory freezes auth
 once, publishes an exact streaming/tools/usage declaration, rejects unsupported
-retry/catalog policy, and attributes admitted attempts to its generation.
-Native retry/live composition, complete receipts, and alternate conformance
-remain open; X001 therefore still fails.
+catalog policy it cannot honor, and attributes admitted attempts to its
+generation. Both compiled adapters now share one bounded transient-status,
+`Retry-After`, jitter, end-to-end deadline, and attempt-lifecycle mechanism.
+Native retry-to-success, deadline refusal, backoff cancellation, and admitted-
+body no-retry cases pass without live selection. Common route conformance, live
+composition, complete receipts, and alternate conformance remain open; X001
+therefore still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
@@ -505,6 +509,7 @@ gates merely because a card appears attractive.
 | 042 | E04-S04-C4 | Add native one-attempt telemetry with terminal success, rejection, decode-failure, timeout, and cancellation dispositions |
 | 043 | E04-S04-C5 | Construct a frozen native Messages generation with truthful capabilities and exercise it through the common route handle |
 | 044 | E04-S04-C6 | Add bounded native transient retry/backoff and cancellation parity inside one frozen generation before live selection |
+| 045 | E04-S04-C7 | Run both compiled adapters through one provider-neutral route-handle conformance harness before live selection |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -531,7 +536,9 @@ the native adapter to an exact capability declaration and frozen-auth
 snapshot/handle, proves generation-attributed admission and local zero-send
 rejection, and refuses retry or catalog policy it cannot yet honor. Cycle 044
 adds bounded retry/backoff and cancellation parity inside that generation
-before any config flavor can select it. The queue then
+before any config flavor can select it. Cycle 045 makes both compiled adapters
+pass one provider-neutral route-handle conformance harness before composition
+can select the native wire. The queue then
 advances through E03, E06, E07, E05/E08, and E09 in the
 dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is

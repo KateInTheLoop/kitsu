@@ -5,6 +5,7 @@ pub mod anthropic_messages;
 pub mod auth;
 pub mod error;
 pub mod openai_compat;
+mod retry;
 pub mod route;
 pub mod telemetry;
 pub mod types;
