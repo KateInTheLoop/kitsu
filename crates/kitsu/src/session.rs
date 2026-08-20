@@ -20,9 +20,9 @@ use chrono::{SecondsFormat, Utc};
 use kitsu_providers::ChatMessage;
 use serde::{Deserialize, Serialize};
 
-// Cycle 058 freezes the compiled physical v1 contract before the migration
-// card mounts it. Keeping it private prevents paths or file records from
-// becoming the backend-neutral session API.
+// Cycles 058-060 compile the physical-v1 records, immutable candidate I/O, and
+// fenced HEAD CAS before a migration card mounts them. Keeping the module
+// private prevents paths, locks, or file records from becoming the neutral API.
 #[allow(dead_code)]
 mod physical;
 

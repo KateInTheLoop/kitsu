@@ -14,7 +14,7 @@ use std::cell::Cell;
 #[cfg(unix)]
 use std::os::fd::AsRawFd;
 
-use kitsu_core::{ExpectedRevision, RevisionId, SessionId, StoreId};
+use kitsu_core::{ExpectedRevision, RevisionId, SessionId, SessionLookupState, StoreId};
 use serde::de::DeserializeOwned;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
 
@@ -432,12 +432,14 @@ pub(super) fn decode_head_record(
 pub(super) struct PhysicalFileStoreV1 {
     _root: PrivateDirectory,
     revisions: PrivateDirectory,
-    _heads: PrivateDirectory,
+    heads: PrivateDirectory,
     staging: PrivateDirectory,
-    _locks: PrivateDirectory,
+    locks: PrivateDirectory,
     record: StoreRecordV1,
     #[cfg(test)]
     fail_next_target_sync: Cell<bool>,
+    #[cfg(test)]
+    fail_next_head_sync: Cell<bool>,
 }
 
 #[derive(Debug)]
@@ -463,6 +465,79 @@ pub(super) struct VerifiedRevisionCandidateV1 {
     manifest_sha256: Sha256Digest,
     canonical_bytes: Vec<u8>,
 }
+
+#[derive(Debug)]
+pub(super) struct PhysicalWriterFenceV1 {
+    store_id: StoreId,
+    session_id: SessionId,
+    #[cfg(unix)]
+    _file: std::fs::File,
+}
+
+impl PhysicalWriterFenceV1 {
+    fn confirm(&self, store_id: &StoreId, session_id: &SessionId) -> Result<(), String> {
+        if &self.store_id != store_id {
+            return Err(format!(
+                "writer fence store mismatch: expected '{}', observed '{}'",
+                store_id.as_str(),
+                self.store_id.as_str()
+            ));
+        }
+        if &self.session_id != session_id {
+            return Err(format!(
+                "writer fence session mismatch: expected '{}', observed '{}'",
+                session_id.as_str(),
+                self.session_id.as_str()
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VerifiedRevisionHeadV1 {
+    record: HeadRecordV1,
+    candidate: VerifiedRevisionCandidateV1,
+}
+
+impl VerifiedRevisionHeadV1 {
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        &self.record.revision_id
+    }
+
+    pub(super) fn candidate(&self) -> &VerifiedRevisionCandidateV1 {
+        &self.candidate
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum PhysicalHeadCasError {
+    Fence(String),
+    Conflict {
+        expected: ExpectedRevision,
+        observed: Option<RevisionId>,
+    },
+    Candidate(String),
+    Publication {
+        message: String,
+        installed: bool,
+    },
+}
+
+impl fmt::Display for PhysicalHeadCasError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Fence(message) | Self::Candidate(message) => formatter.write_str(message),
+            Self::Conflict { expected, observed } => write!(
+                formatter,
+                "physical HEAD revision conflict: expected {expected:?}, observed {observed:?}"
+            ),
+            Self::Publication { message, .. } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PhysicalHeadCasError {}
 
 impl VerifiedRevisionCandidateV1 {
     pub(super) fn manifest(&self) -> &RevisionManifestV1 {
@@ -537,17 +612,255 @@ impl PhysicalFileStoreV1 {
         Ok(Self {
             _root: root,
             revisions,
-            _heads: heads,
+            heads,
             staging,
-            _locks: locks,
+            locks,
             record,
             #[cfg(test)]
             fail_next_target_sync: Cell::new(false),
+            #[cfg(test)]
+            fail_next_head_sync: Cell::new(false),
         })
     }
 
     pub(super) fn store_id(&self) -> &StoreId {
         self.record.store_id()
+    }
+
+    pub(super) fn acquire_writer_fence(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<PhysicalWriterFenceV1, String> {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            let lock_name = format!("{}.lock", encode_component(session_id.as_str()));
+            let lock_path = self.locks.path.join(&lock_name);
+            let file = super::openat_file(
+                &self.locks.file,
+                OsStr::new(&lock_name),
+                libc::O_RDWR
+                    | libc::O_CREAT
+                    | libc::O_NOFOLLOW
+                    | libc::O_NONBLOCK
+                    | libc::O_CLOEXEC,
+                0o600,
+            )
+            .map_err(|error| {
+                if error.raw_os_error() == Some(libc::ELOOP) {
+                    format!(
+                        "physical writer lock '{}' is not a regular file",
+                        lock_path.display()
+                    )
+                } else {
+                    format!(
+                        "cannot open physical writer lock '{}': {error}",
+                        lock_path.display()
+                    )
+                }
+            })?;
+            let metadata = file.metadata().map_err(|error| {
+                format!(
+                    "cannot inspect physical writer lock '{}': {error}",
+                    lock_path.display()
+                )
+            })?;
+            if !metadata.is_file() {
+                return Err(format!(
+                    "physical writer lock '{}' is not a regular file",
+                    lock_path.display()
+                ));
+            }
+            let result = unsafe { libc::flock(file.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                if error.raw_os_error() == Some(libc::EWOULDBLOCK)
+                    || error.raw_os_error() == Some(libc::EAGAIN)
+                {
+                    return Err(format!(
+                        "physical session '{}' is already active in this or another process",
+                        session_id.as_str()
+                    ));
+                }
+                return Err(format!(
+                    "cannot acquire physical writer lock for session '{}': {error}",
+                    session_id.as_str()
+                ));
+            }
+            file.set_permissions(std::fs::Permissions::from_mode(0o600))
+                .map_err(|error| {
+                    format!(
+                        "cannot secure physical writer lock '{}': {error}",
+                        lock_path.display()
+                    )
+                })?;
+            self.locks.sync("physical lock namespace")?;
+            Ok(PhysicalWriterFenceV1 {
+                store_id: self.store_id().clone(),
+                session_id: session_id.clone(),
+                _file: file,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            let _ = session_id;
+            Err("physical writer fencing is unavailable on this platform".to_string())
+        }
+    }
+
+    pub(super) fn read_head(
+        &self,
+        session_id: &SessionId,
+    ) -> Result<Option<VerifiedRevisionHeadV1>, String> {
+        let head_name = format!("{}.json", encode_component(session_id.as_str()));
+        match self.heads.entry_kind(OsStr::new(&head_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+            Ok(PrivateEntryKind::File) => {}
+            Ok(_) => {
+                return Err(format!(
+                    "physical HEAD '{}' is not a regular file",
+                    self.heads.path.join(&head_name).display()
+                ));
+            }
+            Err(error) => {
+                return Err(format!(
+                    "cannot inspect physical HEAD '{}': {error}",
+                    self.heads.path.join(&head_name).display()
+                ));
+            }
+        }
+        let bytes = read_bounded_regular(
+            &self.heads,
+            OsStr::new(&head_name),
+            MAX_PHYSICAL_RECORD_BYTES as u64,
+            "physical HEAD",
+        )?;
+        let record = decode_head_record(&bytes, self.store_id(), session_id)?;
+        let candidate = self.open_revision_candidate(session_id, &record.revision_id)?;
+        if candidate.manifest_sha256 != record.revision_manifest_sha256 {
+            return Err(format!(
+                "physical HEAD manifest digest mismatch: HEAD declares {}, observed {}",
+                record.revision_manifest_sha256.as_str(),
+                candidate.manifest_sha256.as_str()
+            ));
+        }
+        Ok(Some(VerifiedRevisionHeadV1 { record, candidate }))
+    }
+
+    pub(super) fn compare_and_swap_head(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        expected: ExpectedRevision,
+        candidate: &InstalledRevisionCandidateV1,
+    ) -> Result<VerifiedRevisionHeadV1, PhysicalHeadCasError> {
+        let session_id = &candidate.manifest.session_id;
+        fence
+            .confirm(self.store_id(), session_id)
+            .map_err(PhysicalHeadCasError::Fence)?;
+        if &candidate.manifest.store_id != self.store_id() {
+            return Err(PhysicalHeadCasError::Candidate(format!(
+                "revision candidate store mismatch: expected '{}', observed '{}'",
+                self.store_id().as_str(),
+                candidate.manifest.store_id.as_str()
+            )));
+        }
+        let reloaded = self
+            .open_revision_candidate(session_id, &candidate.manifest.revision_id)
+            .map_err(PhysicalHeadCasError::Candidate)?;
+        if reloaded.manifest != candidate.manifest
+            || reloaded.manifest_sha256 != candidate.manifest_sha256
+        {
+            return Err(PhysicalHeadCasError::Candidate(
+                "revision candidate receipt does not match the exact installed manifest"
+                    .to_string(),
+            ));
+        }
+
+        let current = self
+            .read_head(session_id)
+            .map_err(PhysicalHeadCasError::Candidate)?;
+        let observed = current.as_ref().map(VerifiedRevisionHeadV1::revision_id);
+        match expected.admit_observed(observed) {
+            Ok(()) => {}
+            Err(SessionLookupState::Conflict { expected, observed }) => {
+                return Err(PhysicalHeadCasError::Conflict { expected, observed });
+            }
+            Err(other) => {
+                return Err(PhysicalHeadCasError::Candidate(format!(
+                    "physical HEAD admission returned an invalid state: {other:?}"
+                )));
+            }
+        }
+        if candidate.manifest.parent_revision != expected {
+            return Err(PhysicalHeadCasError::Candidate(format!(
+                "revision candidate parent {:?} does not match admitted HEAD expectation {expected:?}",
+                candidate.manifest.parent_revision
+            )));
+        }
+
+        fence
+            .confirm(self.store_id(), session_id)
+            .map_err(PhysicalHeadCasError::Fence)?;
+        let head = HeadRecordV1::new(
+            self.store_id().clone(),
+            session_id.clone(),
+            candidate.manifest.revision_id.clone(),
+            candidate.manifest_sha256.clone(),
+        );
+        let bytes = encode_head_record(&head).map_err(PhysicalHeadCasError::Candidate)?;
+        let head_name = format!("{}.json", encode_component(session_id.as_str()));
+
+        #[cfg(all(test, unix))]
+        if self.fail_next_head_sync.replace(false) {
+            super::FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|failure| failure.set(true));
+        }
+        let replace = matches!(expected, ExpectedRevision::Exact(_));
+        match atomic_write_private_in_detailed(
+            &self.heads,
+            OsStr::new(&head_name),
+            &bytes,
+            replace,
+            "physical HEAD",
+        ) {
+            Ok(_) => {}
+            Err(failure) => {
+                return Err(PhysicalHeadCasError::Publication {
+                    message: failure.message,
+                    installed: failure.installed,
+                });
+            }
+        }
+
+        let installed =
+            self.read_head(session_id)
+                .map_err(|message| PhysicalHeadCasError::Publication {
+                    message: format!(
+                    "physical HEAD was installed, but exact reload verification failed: {message}"
+                ),
+                    installed: true,
+                })?;
+        let Some(installed) = installed else {
+            return Err(PhysicalHeadCasError::Publication {
+                message: "physical HEAD was installed, but exact reload observed it missing"
+                    .to_string(),
+                installed: true,
+            });
+        };
+        if installed.revision_id() != &candidate.manifest.revision_id {
+            return Err(PhysicalHeadCasError::Publication {
+                message: "physical HEAD was installed, but exact reload selected another revision"
+                    .to_string(),
+                installed: true,
+            });
+        }
+        Ok(installed)
+    }
+
+    #[cfg(test)]
+    fn inject_next_head_sync_failure(&self) {
+        self.fail_next_head_sync.set(true);
     }
 
     pub(super) fn install_revision_candidate(
@@ -1374,5 +1687,193 @@ mod tests {
             .open_revision_candidate(&session, &revision)
             .unwrap_err();
         assert!(error.contains("cannot open canonical payload"), "{error}");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn head_cas_requires_the_exact_fence_and_revision_then_advances_old_to_new() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let other_session = SessionId::new("s-other").unwrap();
+        let fence = store.acquire_writer_fence(&session).unwrap();
+        let busy = store.acquire_writer_fence(&session).unwrap_err();
+        assert!(busy.contains("already active"), "{busy}");
+        let other_fence = store.acquire_writer_fence(&other_session).unwrap();
+
+        let revision_a = revision("revision-a");
+        let candidate_a = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision_a.clone(),
+                ExpectedRevision::Missing,
+                b"{\"value\":\"a\"}\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap_head(&other_fence, ExpectedRevision::Missing, &candidate_a,),
+            Err(PhysicalHeadCasError::Fence(_))
+        ));
+        assert!(store.read_head(&session).unwrap().is_none());
+
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate_a)
+            .unwrap();
+        assert_eq!(
+            store.read_head(&session).unwrap().unwrap().revision_id(),
+            &revision_a
+        );
+
+        let wrong_parent = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision("revision-wrong-parent"),
+                ExpectedRevision::Missing,
+                b"{\"value\":\"wrong-parent\"}\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap_head(
+                &fence,
+                ExpectedRevision::Exact(revision_a.clone()),
+                &wrong_parent,
+            ),
+            Err(PhysicalHeadCasError::Candidate(_))
+        ));
+        assert_eq!(
+            store.read_head(&session).unwrap().unwrap().revision_id(),
+            &revision_a
+        );
+
+        let revision_b = revision("revision-b");
+        let candidate_b = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision_b.clone(),
+                ExpectedRevision::Exact(revision_a.clone()),
+                b"{\"value\":\"b\"}\n",
+            )
+            .unwrap();
+        store
+            .compare_and_swap_head(
+                &fence,
+                ExpectedRevision::Exact(revision_a.clone()),
+                &candidate_b,
+            )
+            .unwrap();
+
+        let stale = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision("revision-stale"),
+                ExpectedRevision::Exact(revision_a.clone()),
+                b"{\"value\":\"stale\"}\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap_head(
+                &fence,
+                ExpectedRevision::Exact(revision_a),
+                &stale,
+            ),
+            Err(PhysicalHeadCasError::Conflict { observed: Some(observed), .. })
+                if observed == revision_b
+        ));
+        assert_eq!(
+            store.read_head(&session).unwrap().unwrap().revision_id(),
+            &revision_b
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn post_install_head_sync_failure_reports_new_visible_head() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision_a = revision("revision-a");
+        let candidate_a = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision_a.clone(),
+                ExpectedRevision::Missing,
+                b"{\"value\":\"a\"}\n",
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate_a)
+            .unwrap();
+        let revision_b = revision("revision-b");
+        let candidate_b = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision_b.clone(),
+                ExpectedRevision::Exact(revision_a.clone()),
+                b"{\"value\":\"b\"}\n",
+            )
+            .unwrap();
+        store.inject_next_head_sync_failure();
+
+        let error = store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(revision_a), &candidate_b)
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            PhysicalHeadCasError::Publication {
+                installed: true,
+                ..
+            }
+        ));
+        assert_eq!(
+            store.read_head(&session).unwrap().unwrap().revision_id(),
+            &revision_b
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn head_read_rejects_manifest_digest_tampering_and_symlinks() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision = revision("revision-a");
+        let candidate = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision,
+                ExpectedRevision::Missing,
+                b"{\"value\":\"a\"}\n",
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate)
+            .unwrap();
+
+        let head_path = PhysicalLayoutV1::head_pointer(&session_root, &session);
+        let mut value: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&head_path).unwrap()).unwrap();
+        value["revision_manifest_sha256"] = serde_json::json!("f".repeat(64));
+        std::fs::write(&head_path, serde_json::to_vec(&value).unwrap()).unwrap();
+        let error = store.read_head(&session).unwrap_err();
+        assert!(error.contains("manifest digest mismatch"), "{error}");
+
+        std::fs::remove_file(&head_path).unwrap();
+        symlink("/etc/passwd", &head_path).unwrap();
+        let error = store.read_head(&session).unwrap_err();
+        assert!(error.contains("not a regular file"), "{error}");
     }
 }

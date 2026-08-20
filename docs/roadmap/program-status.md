@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 059;
+through Cycle 060;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 59 / 59 |
+| Accepted cycles/commits after this cycle | 60 / 60 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C9 (Cycle 060) — fenced physical HEAD compare-and-swap |
+| Active epic/card | E03 / E03-S02-C10 (Cycle 061) — complete canonical payload/migration input |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C8 | Current-v1 behavior remains unchanged. Neutral values plus K04/K07/K08 fixtures prove logical admission/publication/fencing. The private physical-v1 contract now fixes disjoint paths, reversible safe identity encoding, closed records, descriptor-pinned store initialization, staged no-replace revision installation, exact-byte digest verification, and installed-versus-durable truth. It has no production caller; HEAD CAS and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C9 | Current-v1 behavior remains unchanged. Neutral values plus K04/K07/K08 fixtures prove logical admission/publication/fencing. The private physical-v1 contract now fixes disjoint paths, closed records, descriptor-pinned initialization/candidates, exact-byte verification, per-session OS writer fences, validated HEAD reads, exact parent/revision recheck, atomic create/replace, and installed-versus-durable truth. It has no production caller; canonical payload migration and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -94,7 +94,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 056 | `992e93e` | Provider-free K04 old-or-new and durability cut matrix |
 | 057 | `996180d` | Provider-free K07 session-bound writer fencing |
 | 058 | `d265ac2` | Compiled physical-v1 layout and closed record contract |
-| 059 | this document's commit | Descriptor-pinned immutable candidate I/O and verification |
+| 059 | `e038ac5` | Descriptor-pinned immutable candidate I/O and verification |
+| 060 | this document's commit | Writer-fenced exact-revision physical HEAD CAS |
 
 ## Current green gates
 
@@ -348,8 +349,10 @@ progress. Cycle 058 defines the physical revision envelope and no-clobber layout
 without mounting it. Cycle 059 adds descriptor-pinned store create/open, exact
 manifest/payload digest verification, staged OS-level no-replace installation,
 collision cleanup, and installed-unconfirmed durability truth. Cycle 060 adds
-fenced expected-revision HEAD CAS and physical crash cuts before current-v1
-migration.
+verified HEAD reads, a real per-session OS writer fence, exact current/parent
+admission, atomic create/replace publication, and new-visible post-install sync
+truth. Cycle 061 defines the complete canonical current-v1 payload and migration
+input before any production mount.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
