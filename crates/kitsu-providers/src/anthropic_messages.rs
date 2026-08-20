@@ -1,8 +1,8 @@
 //! Native Anthropic Messages wire adapter.
 //!
 //! The compiled slices support streamed text and correlated tool use/results.
-//! Retries, attempt telemetry, catalog discovery, route publication, and live
-//! CLI selection remain disabled until their own conformance fixtures pass.
+//! Retries, catalog discovery, route publication, and live CLI selection remain
+//! disabled until their own conformance fixtures pass.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -13,6 +13,9 @@ use reqwest::StatusCode;
 use serde::Serialize;
 
 use crate::auth::AuthProvider;
+use crate::telemetry::{
+    ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
+};
 use crate::{
     ChatDelta, ChatRequest, ChatStream, FinishReason, Provider, ProviderError,
     ProviderResponsePart, Role, ToolCall, Usage,
@@ -256,6 +259,152 @@ fn map_send_error(error: reqwest::Error) -> ProviderError {
         ProviderError::Timeout
     } else {
         ProviderError::Connection(error.to_string())
+    }
+}
+
+fn remaining_deadline_millis(started: tokio::time::Instant, timeout: Duration) -> u64 {
+    timeout
+        .checked_sub(started.elapsed())
+        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
+        .unwrap_or(0)
+}
+
+fn status_category(status: StatusCode) -> ProviderAttemptCategory {
+    match status {
+        StatusCode::TOO_MANY_REQUESTS => ProviderAttemptCategory::RateLimited,
+        StatusCode::SERVICE_UNAVAILABLE => ProviderAttemptCategory::Unavailable,
+        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderAttemptCategory::Authentication,
+        status if status.is_success() => ProviderAttemptCategory::Success,
+        status if status.is_client_error() => ProviderAttemptCategory::ClientError,
+        status if status.is_server_error() => ProviderAttemptCategory::ServerError,
+        _ => ProviderAttemptCategory::UnexpectedStatus,
+    }
+}
+
+fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) {
+    if let Some(telemetry) = telemetry {
+        let _ = telemetry.record(event);
+    }
+}
+
+struct NativeSendAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+    started: tokio::time::Instant,
+    timeout: Duration,
+    armed: bool,
+}
+
+impl NativeSendAttemptGuard {
+    fn new(
+        telemetry: Option<&ProviderTelemetrySink>,
+        started: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            telemetry: telemetry.cloned(),
+            started,
+            timeout,
+            armed: true,
+        }
+    }
+
+    fn completed(mut self) {
+        self.armed = false;
+    }
+}
+
+impl Drop for NativeSendAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        record_attempt(
+            self.telemetry.as_ref(),
+            ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 1,
+                category: ProviderAttemptCategory::Cancelled,
+                status: None,
+                outcome: ProviderAttemptOutcome::Cancelled,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
+            },
+        );
+    }
+}
+
+struct NativeBodyAttemptGuard {
+    telemetry: Option<ProviderTelemetrySink>,
+    status: u16,
+    started: tokio::time::Instant,
+    timeout: Duration,
+    armed: bool,
+}
+
+impl NativeBodyAttemptGuard {
+    fn new(
+        telemetry: Option<&ProviderTelemetrySink>,
+        status: u16,
+        started: tokio::time::Instant,
+        timeout: Duration,
+    ) -> Self {
+        Self {
+            telemetry: telemetry.cloned(),
+            status,
+            started,
+            timeout,
+            armed: true,
+        }
+    }
+
+    fn completed(mut self) {
+        self.record(
+            ProviderAttemptCategory::Success,
+            ProviderAttemptOutcome::BodyCompleted,
+        );
+        self.armed = false;
+    }
+
+    fn failed(mut self, error: &ProviderError) {
+        let category = match error {
+            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
+            ProviderError::Connection(_) => ProviderAttemptCategory::Connection,
+            ProviderError::ResponseTooLarge { .. } => ProviderAttemptCategory::ResponseTooLarge,
+            _ => ProviderAttemptCategory::InvalidResponse,
+        };
+        self.record(category, ProviderAttemptOutcome::BodyFailed);
+        self.armed = false;
+    }
+
+    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
+        record_attempt(
+            self.telemetry.as_ref(),
+            ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 1,
+                category,
+                status: Some(self.status),
+                outcome,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
+            },
+        );
+    }
+}
+
+impl Drop for NativeBodyAttemptGuard {
+    fn drop(&mut self) {
+        if !self.armed {
+            return;
+        }
+        self.record(
+            ProviderAttemptCategory::Cancelled,
+            ProviderAttemptOutcome::Cancelled,
+        );
     }
 }
 
@@ -686,6 +835,7 @@ enum MessagesSseState {
         stream: ByteStream,
         decoder: MessagesSseDecoder,
         queue: VecDeque<ChatDelta>,
+        attempt_guard: NativeBodyAttemptGuard,
     },
     Draining {
         queue: VecDeque<ChatDelta>,
@@ -701,6 +851,7 @@ async fn messages_sse_step(
             mut stream,
             mut decoder,
             mut queue,
+            attempt_guard,
         } => {
             if let Some(delta) = queue.pop_front() {
                 return Some((
@@ -709,15 +860,18 @@ async fn messages_sse_step(
                         stream,
                         decoder,
                         queue,
+                        attempt_guard,
                     },
                 ));
             }
+            let attempt_guard = attempt_guard;
             loop {
                 match stream.next().await {
                     Some(Ok(bytes)) => match decoder.push_bytes(&bytes) {
                         Ok(deltas) => {
                             queue.extend(deltas);
                             if decoder.saw_message_stop {
+                                attempt_guard.completed();
                                 return queue.pop_front().map(|delta| {
                                     (Ok(delta), MessagesSseState::Draining { queue })
                                 });
@@ -729,26 +883,34 @@ async fn messages_sse_step(
                                         stream,
                                         decoder,
                                         queue,
+                                        attempt_guard,
                                     },
                                 ));
                             }
                         }
                         Err(error) => {
+                            attempt_guard.failed(&error);
                             return Some((Err(error), MessagesSseState::Done));
                         }
                     },
                     Some(Err(error)) => {
-                        return Some((Err(map_send_error(error)), MessagesSseState::Done));
+                        let error = map_send_error(error);
+                        attempt_guard.failed(&error);
+                        return Some((Err(error), MessagesSseState::Done));
                     }
                     None => {
                         return match decoder.finish_eof() {
                             Ok(deltas) => {
+                                attempt_guard.completed();
                                 queue.extend(deltas);
                                 queue
                                     .pop_front()
                                     .map(|delta| (Ok(delta), MessagesSseState::Draining { queue }))
                             }
-                            Err(error) => Some((Err(error), MessagesSseState::Done)),
+                            Err(error) => {
+                                attempt_guard.failed(&error);
+                                Some((Err(error), MessagesSseState::Done))
+                            }
                         };
                     }
                 }
@@ -769,6 +931,14 @@ impl Provider for AnthropicMessagesProvider {
     }
 
     async fn chat_stream(&self, request: ChatRequest) -> Result<ChatStream, ProviderError> {
+        self.chat_stream_with_telemetry(request, None).await
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        request: ChatRequest,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
         let body = build_body(&request)?;
         if self.messages_path.is_empty() {
             return Err(unsupported_request("empty messages path"));
@@ -781,12 +951,52 @@ impl Provider for AnthropicMessagesProvider {
             .header(reqwest::header::CONTENT_TYPE, "application/json")
             .header("anthropic-version", ANTHROPIC_VERSION)
             .json(&body);
-        let response = self
-            .attach_auth(request)?
-            .send()
-            .await
-            .map_err(map_send_error)?;
+        let request = self.attach_auth(request)?;
+        let started = tokio::time::Instant::now();
+        let send_guard = NativeSendAttemptGuard::new(telemetry.as_ref(), started, self.timeout);
+        let send_result = request.send().await;
+        send_guard.completed();
+        let response = match send_result {
+            Ok(response) => response,
+            Err(error) => {
+                let error = map_send_error(error);
+                record_attempt(
+                    telemetry.as_ref(),
+                    ProviderAttemptEvent {
+                        attempt: 1,
+                        max_attempts: 1,
+                        category: match error {
+                            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
+                            _ => ProviderAttemptCategory::Connection,
+                        },
+                        status: None,
+                        outcome: ProviderAttemptOutcome::TransportFailed,
+                        terminal: true,
+                        retry_delay_ms: None,
+                        retry_after_used: false,
+                        remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
+                    },
+                );
+                return Err(error);
+            }
+        };
         let status = response.status();
+        if !status.is_success() {
+            record_attempt(
+                telemetry.as_ref(),
+                ProviderAttemptEvent {
+                    attempt: 1,
+                    max_attempts: 1,
+                    category: status_category(status),
+                    status: Some(status.as_u16()),
+                    outcome: ProviderAttemptOutcome::Rejected,
+                    terminal: true,
+                    retry_delay_ms: None,
+                    retry_after_used: false,
+                    remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
+                },
+            );
+        }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(ProviderError::Unauthorized {
                 status: status.as_u16(),
@@ -800,6 +1010,9 @@ impl Provider for AnthropicMessagesProvider {
             });
         }
 
+        let attempt_guard =
+            NativeBodyAttemptGuard::new(telemetry.as_ref(), status.as_u16(), started, self.timeout);
+
         let stream: ByteStream = response
             .bytes_stream()
             .map(|result| result.map(|bytes| bytes.to_vec()))
@@ -809,6 +1022,7 @@ impl Provider for AnthropicMessagesProvider {
                 stream,
                 decoder: MessagesSseDecoder::default(),
                 queue: VecDeque::new(),
+                attempt_guard,
             },
             messages_sse_step,
         )

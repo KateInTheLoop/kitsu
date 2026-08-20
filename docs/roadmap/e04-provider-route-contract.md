@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 041.
+Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 042.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -19,7 +19,9 @@ Messages text/usage/terminal slice without selecting it in production. Cycle
 correlation. Cycle 041 runs the actual native adapter through HTTP,
 mid-stream/malformed, size-bound, timeout, and cancellation parity. Attempt
 telemetry, route composition, and common conformance remain E04-S04; complete
-route receipts remain E04-S05.
+route receipts remain E04-S05. Cycle 042 adds exactly one terminal native
+attempt observation across success, rejection, decode/body failure, timeout,
+send cancellation, and accepted-body cancellation.
 
 ## Decision
 
@@ -170,22 +172,23 @@ emits one neutral call before usage/terminal output. It is compiled but
 unreachable from production composition. Cycle 041 proves its typed 529 and
 bounded error-body handling, malformed/error events, line and aggregate
 ceilings, deadline timeout, and cancellation all fail without a second send.
-These cards still do not:
+Cycle 042 owns the native send and response-body lifecycles with guards: a 2xx
+header is never success, dropping either phase records cancellation, and every
+physical send has one terminal common event. These cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
 - select or advertise the native Messages adapter in production composition;
-- implement retries, model catalog, or complete attempt telemetry for the
-  Messages adapter;
+- implement retries or model catalog for the Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
 flavor-to-adapter switch. There is no title-generation provider call in current
 Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
 constructor is confined to compiled provider factories and provider tests. The
-next card adds native one-attempt telemetry with exact terminal dispositions
-for success, rejection, decode failure, timeout, and cancellation while keeping
-live composition disabled.
+next card constructs a frozen native route generation with a truthful native
+declaration and exercises it through the common bound handle without enabling
+live configuration selection.
 
 ## Acceptance and rollback
 
@@ -202,13 +205,16 @@ cargo test -p kitsu-providers --test provider_wire_matrix
 Six route-contract, three declaration/derivation, four snapshot, twelve
 route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
 selection, doctor/catalog-without-model, generation-aware
-compaction/subagent/replay/JSONL, and twenty-five wire-matrix cases pass offline.
+compaction/subagent/replay/JSONL, and twenty-six wire-matrix cases pass offline.
 The native slices prove exact distinct text and tool request/header shapes,
 normalized text/tool/usage/terminal output, EOF-as-failure, pre-send malformed
 tool-input rejection, and the 1 MiB streamed argument bound. Native fault cases
 additionally prove typed/bounded HTTP failures,
 malformed/mid-stream rejection, independent line/aggregate ceilings, timeout,
-and cancellation with exactly one send. The derivation vector is independently checked
+and cancellation with exactly one send. Native attempt fixtures add terminal
+body success, HTTP rejection,
+decode failure, header timeout/cancellation, and accepted-body cancellation.
+The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting
 the catalog-only types/factory and management composition restores the previous

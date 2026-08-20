@@ -679,6 +679,166 @@ async fn native_messages_cancel_sends_once() {
     assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
+fn captured_attempts() -> (
+    Arc<Mutex<Vec<kitsu_providers::ProviderAttemptEvent>>>,
+    ProviderTelemetrySink,
+) {
+    let events = Arc::new(Mutex::new(Vec::new()));
+    let observed = Arc::clone(&events);
+    let sink = ProviderTelemetrySink::new(move |event| observed.lock().unwrap().push(event));
+    (events, sink)
+}
+
+fn assert_one_native_attempt(
+    events: &Arc<Mutex<Vec<kitsu_providers::ProviderAttemptEvent>>>,
+    category: ProviderAttemptCategory,
+    status: Option<u16>,
+    outcome: ProviderAttemptOutcome,
+) {
+    let events = events.lock().unwrap();
+    assert_eq!(events.len(), 1);
+    let event = &events[0];
+    assert_eq!(event.attempt, 1);
+    assert_eq!(event.max_attempts, 1);
+    assert_eq!(event.category, category);
+    assert_eq!(event.status, status);
+    assert_eq!(event.outcome, outcome);
+    assert!(event.terminal);
+    assert_eq!(event.retry_delay_ms, None);
+    assert!(!event.retry_after_used);
+}
+
+#[tokio::test]
+async fn native_messages_reports_one_terminal_attempt_for_every_lifecycle() {
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let (events, sink) = captured_attempts();
+    let mut stream = provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("native success starts");
+    while let Some(item) = stream.next().await {
+        item.expect("native success decodes");
+    }
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::Success,
+        Some(200),
+        ProviderAttemptOutcome::BodyCompleted,
+    );
+
+    let overloaded = anthropic_messages_overloaded_error();
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(overloaded.path))
+        .respond_with(ResponseTemplate::new(overloaded.status).set_body_string(overloaded.body))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let (events, sink) = captured_attempts();
+    assert!(provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .is_err());
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::ServerError,
+        Some(529),
+        ProviderAttemptOutcome::Rejected,
+    );
+
+    let fixture = anthropic_messages_malformed_event();
+    let server = MockServer::start().await;
+    mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let (events, sink) = captured_attempts();
+    let mut stream = provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("native malformed body starts");
+    assert!(stream.next().await.unwrap().is_err());
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::InvalidResponse,
+        Some(200),
+        ProviderAttemptOutcome::BodyFailed,
+    );
+
+    let fixture = anthropic_messages_text();
+    let server = MockServer::start().await;
+    mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let (events, sink) = captured_attempts();
+    let stream = provider
+        .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+        .await
+        .expect("native accepted body starts");
+    drop(stream);
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::Cancelled,
+        Some(200),
+        ProviderAttemptOutcome::Cancelled,
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(1)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_millis(100));
+    let (events, sink) = captured_attempts();
+    assert!(matches!(
+        provider
+            .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+            .await,
+        Err(ProviderError::Timeout)
+    ));
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::Timeout,
+        None,
+        ProviderAttemptOutcome::TransportFailed,
+    );
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(ResponseTemplate::new(200).set_delay(Duration::from_secs(5)))
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(10));
+    let (events, sink) = captured_attempts();
+    let request = tokio::spawn(async move {
+        provider
+            .chat_stream_with_telemetry(neutral_text_request(), Some(sink))
+            .await
+    });
+    for _ in 0..100 {
+        if !server.received_requests().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    request.abort();
+    match request.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("cancelled native telemetry request completed"),
+    }
+    assert_one_native_attempt(
+        &events,
+        ProviderAttemptCategory::Cancelled,
+        None,
+        ProviderAttemptOutcome::Cancelled,
+    );
+}
+
 #[tokio::test]
 async fn malformed_events_fail_before_any_neutral_delta() {
     for fixture in [
