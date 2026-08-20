@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 056;
+through Cycle 057;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 56 / 56 |
+| Accepted cycles/commits after this cycle | 57 / 57 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C6 (Cycle 057) — provider-free K07 writer fencing and independent-session progress |
+| Active epic/card | E03 / E03-S02-C7 (Cycle 058) — physical revision envelope and no-clobber layout contract |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C5 | The neutral contract is accepted. Public current-v1 ports preserve existing behavior. A shared provider-free memory store proves exact admission, K08 create/update/stale/retry, and K04 old-or-new plus not-published/published-unconfirmed/confirmed truth. Production revision minting/CAS, physical crash cuts, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C6 | Current-v1 ports preserve behavior. Provider-free K04/K08 fixtures prove exact admission, old/new visibility, durability, and stale retry; K07 proves session-bound exclusive generations, independent progress, and zero-effect lost/replaced/wrong-session refusal. Production revision minting/CAS/fencing, physical crash cuts, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -91,7 +91,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 053 | `c73f734` | Private current-v1 active-save port and commit truth |
 | 054 | `fa51190` | Store-neutral exact revision admission and zero-effect conflict |
 | 055 | `5a7e0c2` | Provider-free K08 logical publication and receipt fixture |
-| 056 | this document's commit | Provider-free K04 old-or-new and durability cut matrix |
+| 056 | `992e93e` | Provider-free K04 old-or-new and durability cut matrix |
+| 057 | this document's commit | Provider-free K07 session-bound writer fencing |
 
 ## Current green gates
 
@@ -213,6 +214,11 @@ E08 telemetry observability was scoped in Cycle 030 on
   a cut after logical publication returns the exact new receipt as published-
   unconfirmed; confirmation returns that new revision as confirmed. Candidate
   allocation never makes an uninstalled revision canonical.
+- K07 adds a provider-free session-bound fence table. Exactly one token owns a
+  session while another session can acquire and publish independently. Tokens
+  for another session, revoked tokens, and generations replaced by a successor
+  fail before mint/publication; only the exact current generation advances the
+  existing revision and HEAD.
 
 ## Next delivery tranche
 
@@ -329,7 +335,8 @@ Cycle 055 composes admission, opaque successor minting, publication, and receipt
 truth in an in-memory K08 fixture before changing production bytes. Cycle 056
 adds provider-free K04 cut points and confirmed versus published-unconfirmed
 durability truth. Cycle 057 adds writer-fence loss and independent-session
-progress before physical publication wiring.
+progress. Cycle 058 defines the physical revision envelope and no-clobber layout
+before current-v1 migration and physical publication wiring.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
