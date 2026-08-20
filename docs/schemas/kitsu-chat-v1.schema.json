@@ -187,6 +187,99 @@
         "containment_hint": { "type": "string" }
       }
     },
+    "provider_route_duration": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["seconds", "nanoseconds"],
+      "properties": {
+        "seconds": { "type": "integer", "minimum": 0 },
+        "nanoseconds": { "type": "integer", "minimum": 0, "maximum": 999999999 }
+      }
+    },
+    "provider_capabilities": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["revision", "supported"],
+      "properties": {
+        "revision": { "type": "integer", "minimum": 1 },
+        "supported": {
+          "type": "array",
+          "uniqueItems": true,
+          "items": {
+            "enum": [
+              "streaming",
+              "tools",
+              "image_input",
+              "structured_output",
+              "usage",
+              "model_catalog"
+            ]
+          }
+        }
+      }
+    },
+    "provider_route_identity": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "contract_revision",
+        "adapter",
+        "profile",
+        "generation",
+        "wire_revision",
+        "capabilities"
+      ],
+      "properties": {
+        "contract_revision": { "const": 1 },
+        "adapter": { "enum": ["openai_compatible", "anthropic_messages"] },
+        "profile": { "type": "string", "pattern": "^profile-v1-[0-9a-f]{32}$" },
+        "generation": { "type": "integer", "minimum": 1 },
+        "wire_revision": {
+          "enum": ["openai_chat_completions_v1", "anthropic_messages_2023_06_01"]
+        },
+        "capabilities": { "$ref": "#/$defs/provider_capabilities" }
+      }
+    },
+    "provider_route_policy": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "inference_retries",
+        "catalog_retries",
+        "inference_timeout",
+        "catalog_timeout",
+        "advisory_discovery_timeout",
+        "catalog",
+        "retry_generation",
+        "semantic_replay_generation",
+        "fallback"
+      ],
+      "properties": {
+        "inference_retries": { "type": "integer", "minimum": 0 },
+        "catalog_retries": { "type": "integer", "minimum": 0 },
+        "inference_timeout": { "$ref": "#/$defs/provider_route_duration" },
+        "catalog_timeout": { "$ref": "#/$defs/provider_route_duration" },
+        "advisory_discovery_timeout": { "$ref": "#/$defs/provider_route_duration" },
+        "catalog": { "enum": ["unavailable", "configured"] },
+        "retry_generation": { "const": "bound_generation" },
+        "semantic_replay_generation": { "const": "current_generation" },
+        "fallback": { "const": "disabled" }
+      }
+    },
+    "provider_route_receipt": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["receipt_revision", "route", "model", "auth_source", "policy"],
+      "properties": {
+        "receipt_revision": { "const": 1 },
+        "route": { "$ref": "#/$defs/provider_route_identity" },
+        "model": { "type": ["string", "null"], "minLength": 1, "maxLength": 4096 },
+        "auth_source": {
+          "enum": ["none", "static_configuration", "environment", "managed_credential"]
+        },
+        "policy": { "$ref": "#/$defs/provider_route_policy" }
+      }
+    },
     "run_started": {
       "allOf": [
         { "$ref": "#/$defs/envelope" },
@@ -203,6 +296,7 @@
             "durable_session": { "type": "boolean" },
             "session_snapshot_state": { "enum": ["disabled", "pending_until_first_success", "resumable"] },
             "system_context_refreshed": { "type": "boolean" },
+            "provider_route": { "$ref": "#/$defs/provider_route_receipt" },
             "skill_context_changes": {
               "type": "array",
               "items": { "type": "string" }

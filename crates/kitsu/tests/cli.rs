@@ -324,6 +324,22 @@ auth = {{ method = "none" }}
         .lines()
         .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
         .collect::<Vec<_>>();
+    let run_started = events
+        .iter()
+        .find(|event| event["type"] == "run_started")
+        .expect("run_started route receipt");
+    let provider_attempt = events
+        .iter()
+        .find(|event| event["type"] == "provider_attempt")
+        .expect("provider attempt");
+    assert_eq!(
+        run_started["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        provider_attempt["route_generation"],
+        run_started["provider_route"]["route"]["generation"]
+    );
     let error = events
         .iter()
         .find(|event| event["type"] == "error")
@@ -439,6 +455,19 @@ auth = {{ method = "none" }}
             "final_summary",
         ]
     );
+    assert_eq!(model_events[0]["provider_route"]["receipt_revision"], 1);
+    assert_eq!(
+        model_events[0]["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        model_events[0]["provider_route"]["model"],
+        serde_json::Value::Null
+    );
+    assert_eq!(
+        model_events[0]["provider_route"]["route"]["capabilities"]["supported"],
+        serde_json::json!(["model_catalog"])
+    );
     assert_eq!(model_events[1]["operation_id"], "models:1");
     assert_eq!(model_events[1]["purpose"], "model_catalog");
     assert_eq!(model_events[1]["message_count"], 0);
@@ -457,6 +486,10 @@ auth = {{ method = "none" }}
     assert_eq!(model_events[2]["status"], serde_json::Value::Null);
     assert_eq!(model_events[2]["outcome"], "transport_failed");
     assert_eq!(model_events[2]["terminal"], true);
+    assert_eq!(
+        model_events[2]["route_generation"],
+        model_events[0]["provider_route"]["route"]["generation"]
+    );
     assert_eq!(model_events[2]["deadline_scope"], "provider_request");
     assert_eq!(
         model_events[2]["turn_remaining_ms"],
@@ -502,6 +535,11 @@ fn test_doctor_reports_config_artifact_storage_disable() {
         report["artifact_policy"]["existing_artifacts_unchanged"],
         true
     );
+    assert_eq!(
+        report["provider_route"]["status"],
+        "not_constructed_offline"
+    );
+    assert_eq!(report["provider_route"]["receipt"], serde_json::Value::Null);
 }
 
 #[test]
@@ -2463,6 +2501,15 @@ auth = {{ method = "none" }}
         let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
         assert_eq!(report["online"]["status"], "reachable");
         assert_eq!(report["online"]["effective_model"], "native-model");
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["adapter"],
+            "anthropic_messages"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["wire_revision"],
+            "anthropic_messages_2023_06_01"
+        );
     })
     .await
     .expect("native CLI process should join");
@@ -3503,6 +3550,15 @@ auth = {{ method = "none" }}
         assert_eq!(report["online"]["models"], 1);
         assert_eq!(report["online"]["effective_model"], "doctor-model");
         assert_eq!(report["online"]["effective_model_available"], true);
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["model"],
+            serde_json::Value::Null
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["capabilities"]["supported"],
+            serde_json::json!(["model_catalog"])
+        );
 
         let mut missing = base_cmd(&home_path);
         let output = missing
@@ -3843,6 +3899,19 @@ auth = {{ method = "none" }}
         assert_eq!(report["online"]["request_sent"], true);
         assert_eq!(report["online"]["status"], "reachable");
         assert_eq!(report["online"]["effective_model"], "doctor-model");
+        assert_eq!(report["provider_route"]["status"], "bound");
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["adapter"],
+            "openai_compatible"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["route"]["wire_revision"],
+            "openai_chat_completions_v1"
+        );
+        assert_eq!(
+            report["provider_route"]["receipt"]["model"],
+            "doctor-model"
+        );
 
         let mut human = base_cmd(&home_path);
         human
@@ -3856,6 +3925,9 @@ auth = {{ method = "none" }}
             .success()
             .stdout(predicate::str::contains(
                 "provider check: reachable — chat/inference accepted one minimal tool-free completion",
+            ))
+            .stdout(predicate::str::contains(
+                "provider route: openai_compatible / openai_chat_completions_v1 / generation 1",
             ))
             .stdout(predicate::str::contains(
                 "doctor: inference probe succeeded — the configured chat route accepted this model",
@@ -13750,6 +13822,12 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
             .stderr(predicate::str::contains("session:"))
             .stderr(predicate::str::contains("gateway      example"))
             .stderr(predicate::str::contains("model        test-model"))
+            .stderr(predicate::str::contains(
+                "provider     openai_compatible | generation 1",
+            ))
+            .stderr(predicate::str::contains(
+                "wire         openai_chat_completions_v1",
+            ))
             .stderr(predicate::str::contains("context"))
             .stderr(predicate::str::contains("permissions:"))
             .stderr(predicate::str::contains("mode         deny"))
@@ -13775,7 +13853,7 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
     let script = home.path().join("queries.txt");
     fs::write(
         &script,
-        "/status\n/permissions\n/context\n/sessions\n/skills\n/jobs\n/model alternate-model\n/compact\n/quit\n",
+        "/status\n/permissions\n/context\n/sessions\n/skills\n/jobs\n/model alternate-model\n/status\n/compact\n/quit\n",
     )
     .unwrap();
 
@@ -13801,13 +13879,25 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .iter()
         .filter(|event| event["type"] == "command_result")
         .collect::<Vec<_>>();
-    assert_eq!(results.len(), 8);
+    assert_eq!(results.len(), 9);
+    let run_started = events
+        .iter()
+        .find(|event| event["type"] == "run_started")
+        .expect("run_started route receipt");
     assert_eq!(results[0]["result"]["kind"], "status");
     assert_eq!(results[0]["result"]["session"]["model"], "example-model-v1");
     assert!(results[0]["result"]["session"]["cwd"].is_string());
     assert!(results[0]["result"]["context"]["effective"].is_number());
     assert!(results[0]["result"]["conversation"]["messages"].is_number());
     assert!(results[0]["result"]["tools"]["names"].is_array());
+    assert_eq!(
+        results[0]["result"]["provider_route"]["route"]["adapter"],
+        "openai_compatible"
+    );
+    assert_eq!(
+        results[0]["result"]["provider_route"]["route"]["generation"],
+        run_started["provider_route"]["route"]["generation"]
+    );
     assert!(results[0]["result"]["text"].is_string());
     assert_eq!(results[1]["result"]["kind"], "permissions");
     assert_eq!(results[1]["result"]["mode"], "deny");
@@ -13833,11 +13923,21 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
     assert_eq!(results[6]["result"]["changed"], true);
     assert_eq!(results[6]["result"]["catalog_validated"], false);
     assert!(results[6]["result"]["effective_context_window"].is_number());
-    assert_eq!(results[7]["result"]["kind"], "compaction");
-    assert!(results[7]["result"]["changed"].is_boolean());
-    assert!(results[7]["result"]["tokens_before"].is_number());
-    assert!(results[7]["result"]["tokens_after"].is_number());
-    assert!(results[7]["result"]["usage"].is_object());
+    assert_eq!(results[7]["result"]["kind"], "status");
+    assert_eq!(results[7]["result"]["session"]["model"], "alternate-model");
+    assert_eq!(
+        results[7]["result"]["provider_route"]["route"]["generation"],
+        2
+    );
+    assert_eq!(
+        results[7]["result"]["provider_route"]["model"],
+        "alternate-model"
+    );
+    assert_eq!(results[8]["result"]["kind"], "compaction");
+    assert!(results[8]["result"]["changed"].is_boolean());
+    assert!(results[8]["result"]["tokens_before"].is_number());
+    assert!(results[8]["result"]["tokens_after"].is_number());
+    assert!(results[8]["result"]["usage"].is_object());
     let started = events
         .iter()
         .filter(|event| event["type"] == "command_started")
@@ -13846,7 +13946,7 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .iter()
         .filter(|event| event["type"] == "command_finished")
         .count();
-    assert_eq!(started, 9);
+    assert_eq!(started, 10);
     assert_eq!(finished, started, "every slash frame must close");
 }
 

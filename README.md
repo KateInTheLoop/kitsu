@@ -160,7 +160,10 @@ reports config lookup and parse status, selected gateway/model,
 credential-variable presence (never its value), context/cache provenance,
 project context, runtime-state writability, and tool policy without changing
 state or contacting a provider. It also reports the effective automatic-artifact
-policy. Add `doctor --online` to opt into a
+policy. Offline doctor explicitly reports that no provider route was
+constructed. An opted-in provider check adds the bounded, secret-free compiled
+adapter/profile/generation/wire/capability/policy receipt for the route it
+actually binds. Add `doctor --online` to opt into a
 model-catalog reachability request. That check does not call the chat route or
 prove that the credential can run inference; the human and JSON reports label
 this scope explicitly. Use `doctor --inference` instead to send exactly one
@@ -807,7 +810,7 @@ Slash commands inside the REPL:
 | `/model <name>` | Switch model (keeps history). |
 | `/models [filter]` | Preview the models the gateway offers (from its `models_path`), optionally filtered by a substring — e.g. `/models qwen`. The active model is pinned and marked; large catalogs show 12 rows plus a narrowing hint. Listed IDs can be passed to `/model`. |
 | `/reasoning [none\|minimal\|low\|medium\|high\|xhigh\|default]` | Show or change reasoning effort for subsequent turns. |
-| `/status` | Show the active gateway/model, directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
+| `/status` | Show the active gateway/model and immutable provider adapter/profile/generation/wire/capability/policy receipt, plus directory, context usage, enabled tools, permissions, background agents, and cumulative/last compaction details. |
 | `/diff [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Show bounded host-verified evidence for an explicit scope. Host-owned: needs no read grant, and the bytes never leave your terminal. |
 | `/review [working\|staged\|unstaged\|base REV\|commit REV\|checkpoint ID] [path]` | Review exactly that verified evidence in a no-tools turn. Discloses one bounded diff to the model without granting a read root. The top-level `kitsu review` provides the noninteractive form. |
 | `/checkpoints` / `/checkpoint <id>` | List recoverable write checkpoints or preview one verified diff. |
@@ -914,7 +917,10 @@ mid-answer in a one-shot run closes it as `committed_partial` (kept, marked,
 still exit `2`). A
 `context_window_mismatch` event reports runtime evidence that the server's
 real context window is smaller than the resolved one. `run_started`
-distinguishes disabled, pending, and
+includes the complete bounded provider-route receipt used at run start; each
+`provider_attempt.route_generation` can therefore be correlated to that
+immutable identity without exposing an endpoint, header, credential, or body.
+It also distinguishes disabled, pending, and
 resumable session snapshots; `final_summary` repeats the terminal state and
 returns a non-null session ID only for an installed, resumable snapshot.
 Top-level `kitsu review --jsonl` also emits one `review_disclosure` between
