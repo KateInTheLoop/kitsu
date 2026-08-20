@@ -1,5 +1,6 @@
 //! Provider-free composition of canonical bytes and physical publication.
 
+use std::collections::HashSet;
 use std::fmt;
 
 #[cfg(test)]
@@ -20,7 +21,10 @@ use super::canonical::{
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
     PhysicalFileStoreV1, PhysicalHeadCasError, PhysicalHeadReadErrorV1, PhysicalReadErrorV1,
+    VerifiedRevisionCandidateV1,
 };
+
+const MAX_CANONICAL_LINEAGE_REVISIONS: usize = 4_096;
 
 fn artifact_fact_matches_physical(
     fact: &ImmutableArtifactRefV1,
@@ -137,6 +141,17 @@ enum CanonicalHeadReadErrorV1 {
 impl CanonicalHeadReadErrorV1 {
     fn from_physical(error: PhysicalHeadReadErrorV1) -> Self {
         let (observed_revision, source) = error.into_parts();
+        Self::from_physical_parts(observed_revision, source)
+    }
+
+    fn from_physical_revision(observed_revision: RevisionId, source: PhysicalReadErrorV1) -> Self {
+        Self::from_physical_parts(Some(observed_revision), source)
+    }
+
+    fn from_physical_parts(
+        observed_revision: Option<RevisionId>,
+        source: PhysicalReadErrorV1,
+    ) -> Self {
         match source {
             PhysicalReadErrorV1::MissingReference(message) => Self::Physical {
                 observed_revision,
@@ -263,6 +278,65 @@ impl CanonicalHeadLookupV1 {
 }
 
 #[derive(Debug)]
+struct VerifiedCanonicalRevisionV1 {
+    payload: CanonicalSessionRevisionV1,
+    manifest_sha256: String,
+    parent_manifest_sha256: Option<String>,
+}
+
+#[derive(Debug)]
+struct CanonicalRevisionLinkV1 {
+    revision: RevisionId,
+    parent: ExpectedRevision,
+    head: kitsu_core::session::LogicalHead,
+    manifest_sha256: String,
+    parent_manifest_sha256: Option<String>,
+}
+
+impl CanonicalRevisionLinkV1 {
+    fn from_verified(verified: VerifiedCanonicalRevisionV1) -> Self {
+        Self {
+            revision: verified.payload.revision_id().clone(),
+            parent: verified.payload.parent_revision().clone(),
+            head: verified.payload.selected_head().clone(),
+            manifest_sha256: verified.manifest_sha256,
+            parent_manifest_sha256: verified.parent_manifest_sha256,
+        }
+    }
+
+    fn revision_id(&self) -> &RevisionId {
+        &self.revision
+    }
+}
+
+#[derive(Debug)]
+struct VerifiedCanonicalLineageV1 {
+    revisions: Vec<CanonicalRevisionLinkV1>,
+}
+
+impl VerifiedCanonicalLineageV1 {
+    fn revisions(&self) -> &[CanonicalRevisionLinkV1] {
+        &self.revisions
+    }
+}
+
+#[derive(Debug)]
+struct CanonicalLineageLookupV1 {
+    state: SessionLookupState,
+    lineage: Option<VerifiedCanonicalLineageV1>,
+}
+
+impl CanonicalLineageLookupV1 {
+    fn state(&self) -> &SessionLookupState {
+        &self.state
+    }
+
+    fn lineage(&self) -> Option<&VerifiedCanonicalLineageV1> {
+        self.lineage.as_ref()
+    }
+}
+
+#[derive(Debug)]
 struct CanonicalTransactionCommitV1 {
     outcome: SessionCommitOutcome,
     durability_warning: Option<String>,
@@ -330,9 +404,18 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         else {
             return Ok(None);
         };
-        let candidate = head.candidate();
-        let manifest = candidate.manifest();
         let observed_revision = head.revision_id().clone();
+        self.decode_canonical_candidate(session_id, observed_revision, head.candidate())
+            .map(|verified| Some(verified.payload))
+    }
+
+    fn decode_canonical_candidate(
+        &self,
+        session_id: &SessionId,
+        observed_revision: RevisionId,
+        candidate: &VerifiedRevisionCandidateV1,
+    ) -> Result<VerifiedCanonicalRevisionV1, CanonicalHeadReadErrorV1> {
+        let manifest = candidate.manifest();
         let payload =
             decode_canonical_payload_classified(candidate.canonical_bytes()).map_err(|error| {
                 match error {
@@ -377,8 +460,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             || payload.store_id() != self.store.store_id()
             || manifest.session_id() != session_id
             || payload.session_id() != session_id
-            || manifest.revision_id() != head.revision_id()
-            || payload.revision_id() != head.revision_id()
+            || manifest.revision_id() != &observed_revision
+            || payload.revision_id() != &observed_revision
             || manifest.parent_revision() != payload.parent_revision()
         {
             return Err(CanonicalHeadReadErrorV1::Binding {
@@ -389,7 +472,13 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         }
 
         self.verify_artifact_closure_for_read(&payload)?;
-        Ok(Some(payload))
+        Ok(VerifiedCanonicalRevisionV1 {
+            payload,
+            manifest_sha256: candidate.manifest_sha256().as_str().to_string(),
+            parent_manifest_sha256: manifest
+                .parent_manifest_sha256()
+                .map(|digest| digest.as_str().to_string()),
+        })
     }
 
     fn lookup_canonical_head(&self, session_id: &SessionId) -> CanonicalHeadLookupV1 {
@@ -411,6 +500,125 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 state: error.lookup_state(session_id),
                 payload: None,
             },
+        }
+    }
+
+    fn lookup_canonical_lineage(&self, session_id: &SessionId) -> CanonicalLineageLookupV1 {
+        self.lookup_canonical_lineage_bounded(session_id, MAX_CANONICAL_LINEAGE_REVISIONS)
+    }
+
+    fn lookup_canonical_lineage_bounded(
+        &self,
+        session_id: &SessionId,
+        max_revisions: usize,
+    ) -> CanonicalLineageLookupV1 {
+        assert!(max_revisions > 0, "canonical lineage bound must be nonzero");
+        let selected_head = match self.store.read_head(session_id) {
+            Ok(None) => {
+                return CanonicalLineageLookupV1 {
+                    state: SessionLookupState::Missing {
+                        tombstone_revision: None,
+                    },
+                    lineage: None,
+                };
+            }
+            Ok(Some(head)) => head,
+            Err(error) => {
+                let error = CanonicalHeadReadErrorV1::from_physical(error);
+                return CanonicalLineageLookupV1 {
+                    state: error.lookup_state(session_id),
+                    lineage: None,
+                };
+            }
+        };
+        let selected_revision = selected_head.revision_id().clone();
+        let selected = match self.decode_canonical_candidate(
+            session_id,
+            selected_revision,
+            selected_head.candidate(),
+        ) {
+            Ok(verified) => verified,
+            Err(error) => {
+                return CanonicalLineageLookupV1 {
+                    state: error.lookup_state(session_id),
+                    lineage: None,
+                };
+            }
+        };
+
+        let selected_link = CanonicalRevisionLinkV1::from_verified(selected);
+        let present = SessionLookupState::Present {
+            revision: selected_link.revision.clone(),
+            head: selected_link.head.clone(),
+        };
+        let mut seen = HashSet::new();
+        seen.insert(selected_link.revision.clone());
+        let mut revisions = vec![selected_link];
+
+        loop {
+            let parent = revisions
+                .last()
+                .expect("selected canonical lineage always has one revision")
+                .parent
+                .clone();
+            let ExpectedRevision::Exact(parent_revision) = parent else {
+                return CanonicalLineageLookupV1 {
+                    state: present,
+                    lineage: Some(VerifiedCanonicalLineageV1 { revisions }),
+                };
+            };
+            if revisions.len() >= max_revisions || !seen.insert(parent_revision.clone()) {
+                return CanonicalLineageLookupV1 {
+                    state: SessionLookupState::Corrupt {
+                        session: session_id.clone(),
+                        observed_revision: Some(parent_revision),
+                        reason: CorruptSessionReason::BrokenCausality,
+                    },
+                    lineage: None,
+                };
+            }
+
+            let candidate = match self
+                .store
+                .open_revision_candidate(session_id, &parent_revision)
+            {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    let error =
+                        CanonicalHeadReadErrorV1::from_physical_revision(parent_revision, error);
+                    return CanonicalLineageLookupV1 {
+                        state: error.lookup_state(session_id),
+                        lineage: None,
+                    };
+                }
+            };
+            let expected_parent_manifest = revisions
+                .last()
+                .expect("selected canonical lineage always has one revision")
+                .parent_manifest_sha256
+                .as_deref()
+                .expect("exact parent revision always binds its manifest digest");
+            if candidate.manifest_sha256().as_str() != expected_parent_manifest {
+                return CanonicalLineageLookupV1 {
+                    state: SessionLookupState::Corrupt {
+                        session: session_id.clone(),
+                        observed_revision: Some(parent_revision),
+                        reason: CorruptSessionReason::DigestMismatch,
+                    },
+                    lineage: None,
+                };
+            }
+            let verified =
+                match self.decode_canonical_candidate(session_id, parent_revision, &candidate) {
+                    Ok(verified) => verified,
+                    Err(error) => {
+                        return CanonicalLineageLookupV1 {
+                            state: error.lookup_state(session_id),
+                            lineage: None,
+                        };
+                    }
+                };
+            revisions.push(CanonicalRevisionLinkV1::from_verified(verified));
         }
     }
 
@@ -1104,8 +1312,8 @@ mod tests {
                 "future-head-schema",
                 SessionLookupState::Unsupported {
                     dimension: SchemaDimension::Physical,
-                    observed_revision: 2,
-                    supported_revision: 1,
+                    observed_revision: 3,
+                    supported_revision: 2,
                 },
             ),
             (
@@ -1136,8 +1344,8 @@ mod tests {
                 "future-revision-schema",
                 SessionLookupState::Unsupported {
                     dimension: SchemaDimension::Physical,
-                    observed_revision: 2,
-                    supported_revision: 1,
+                    observed_revision: 3,
+                    supported_revision: 2,
                 },
             ),
             (
@@ -1192,7 +1400,7 @@ mod tests {
                     let mut value: serde_json::Value =
                         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                     value["physical_schema_revision"] =
-                        serde_json::json!(if fault == "future-head-schema" { 2 } else { 0 });
+                        serde_json::json!(if fault == "future-head-schema" { 3 } else { 0 });
                     std::fs::write(path, serde_json::to_vec(&value).unwrap()).unwrap();
                 }
                 "head-identity" => {
@@ -1225,7 +1433,7 @@ mod tests {
                         serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
                     value["physical_schema_revision"] =
                         serde_json::json!(if fault == "future-revision-schema" {
-                            2
+                            3
                         } else {
                             0
                         });
@@ -1271,6 +1479,245 @@ mod tests {
             assert_eq!(lookup.state(), &expected_state, "fault: {fault}");
             assert!(lookup.payload().is_none(), "fault: {fault}");
         }
+    }
+
+    #[test]
+    fn canonical_lineage_follows_only_selected_parents_and_ignores_orphans() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let orphan = payload("store-1", "session-1", "rev-c", Some("rev-b"), 3);
+        store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_c.clone(),
+                ExpectedRevision::Exact(rev_b.clone()),
+                &encode_canonical_payload(&orphan).unwrap(),
+            )
+            .unwrap();
+
+        let lookup = transaction.lookup_canonical_lineage(&session_id);
+
+        assert_eq!(
+            lookup.state(),
+            &SessionLookupState::Present {
+                revision: rev_b.clone(),
+                head: kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-2").unwrap()
+                )
+            }
+        );
+        let revisions = lookup.lineage().unwrap().revisions();
+        assert_eq!(
+            revisions
+                .iter()
+                .map(|payload| payload.revision_id().as_str())
+                .collect::<Vec<_>>(),
+            vec!["rev-b", "rev-a"]
+        );
+        assert_eq!(
+            revisions[0].parent_manifest_sha256.as_deref(),
+            Some(revisions[1].manifest_sha256.as_str())
+        );
+        assert!(revisions[1].parent_manifest_sha256.is_none());
+        assert!(store.open_revision_candidate(&session_id, &rev_c).is_ok());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+        assert_eq!(revisions.last().unwrap().revision_id(), &rev_a);
+    }
+
+    #[test]
+    fn canonical_lineage_bound_fails_closed_without_reselecting_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+
+        let lookup = transaction.lookup_canonical_lineage_bounded(&session_id, 1);
+
+        assert_eq!(
+            lookup.state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_a),
+                reason: CorruptSessionReason::BrokenCausality
+            }
+        );
+        assert!(lookup.lineage().is_none());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn canonical_lineage_reports_a_missing_ancestor_without_fallback() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+        std::fs::remove_dir_all(
+            crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_a,
+            ),
+        )
+        .unwrap();
+
+        let lookup = transaction.lookup_canonical_lineage(&session_id);
+
+        assert_eq!(
+            lookup.state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_a),
+                reason: CorruptSessionReason::MissingReference
+            }
+        );
+        assert!(lookup.lineage().is_none());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn canonical_lineage_rejects_a_self_consistent_parent_rewrite() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            root.path(),
+            store_id.clone(),
+        )
+        .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+        let replacement =
+            encode_canonical_payload(&payload("store-1", "session-1", "rev-a", None, 2)).unwrap();
+        let replacement_digest = crate::session::physical::Sha256Digest::new(
+            crate::skills::content_sha256_hex(&replacement),
+        )
+        .unwrap();
+        let replacement_manifest = crate::session::physical::RevisionManifestV1::new(
+            1,
+            store_id,
+            session_id.clone(),
+            rev_a.clone(),
+            ExpectedRevision::Missing,
+            None,
+            replacement.len() as u64,
+            replacement_digest,
+        )
+        .unwrap();
+        std::fs::write(
+            crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                root.path(),
+                &session_id,
+                &rev_a,
+            ),
+            replacement,
+        )
+        .unwrap();
+        std::fs::write(
+            crate::session::physical::PhysicalLayoutV1::revision_manifest(
+                root.path(),
+                &session_id,
+                &rev_a,
+            ),
+            crate::session::physical::encode_revision_manifest(&replacement_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let lookup = transaction.lookup_canonical_lineage(&session_id);
+
+        assert_eq!(
+            lookup.state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_a),
+                reason: CorruptSessionReason::DigestMismatch
+            }
+        );
+        assert!(lookup.lineage().is_none());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn canonical_lineage_cycle_cannot_be_seeded_without_an_exact_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+
+        let error = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_a.clone(),
+                ExpectedRevision::Exact(rev_b),
+                &encode_canonical_payload(&payload(
+                    "store-1",
+                    "session-1",
+                    "rev-a",
+                    Some("rev-b"),
+                    1,
+                ))
+                .unwrap(),
+            )
+            .unwrap_err();
+
+        assert!(!error.installed());
+        assert!(error
+            .to_string()
+            .contains("cannot bind exact parent revision"));
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_a,
+            )
+            .exists()
+        );
+        assert!(store.read_head(&session_id).unwrap().is_none());
     }
 
     #[test]
@@ -1518,15 +1965,15 @@ mod tests {
         );
         let mut manifest: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&manifest_path).unwrap()).unwrap();
-        manifest["physical_schema_revision"] = serde_json::json!(2);
+        manifest["physical_schema_revision"] = serde_json::json!(3);
         std::fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
 
         assert_eq!(
             transaction.lookup_canonical_head(&session_id).state(),
             &SessionLookupState::Unsupported {
                 dimension: SchemaDimension::Physical,
-                observed_revision: 2,
-                supported_revision: 1
+                observed_revision: 3,
+                supported_revision: 2
             }
         );
         manifest["physical_schema_revision"] = serde_json::json!(0);

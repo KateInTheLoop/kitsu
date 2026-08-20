@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 071;
+through Cycle 072;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 71 / 71 |
+| Accepted cycles/commits after this cycle | 72 / 72 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C21 (Cycle 072) — verify exact retained revisions and bounded lineage |
+| Active epic/card | E03 / E03-S04-C1 (Cycle 073) — derive a read-only verified last-good recovery plan |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C20 | Current-v1 behavior remains unchanged. Neutral K04/K07/K08 fixtures and private migration/successor transactions compose exact candidate/HEAD truth. Publication/read share artifact closure; neutral lookup pairs verified `Present` payload with typed logical, physical, and artifact evidence without fallback. Physical HEAD/revision faults retain the decoded selected revision, and invalid logical HEAD is distinct from broken causality. No production caller exists; exact retained-revision lineage, mounting, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C21 | Current-v1 behavior remains unchanged. Physical schema revision 2 binds every successor to the exact verified parent-manifest digest and rechecks it at HEAD CAS. A bounded selected-lineage reader verifies every canonical/artifact closure, ignores orphans, and fails closed without partial lineage. No production caller exists; recovery planning/publication, mounting, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -106,7 +106,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 068 | `388e394` | Exact canonical-to-physical artifact publication closure |
 | 069 | `ccb05c9` | Verified canonical HEAD and artifact-closure read |
 | 070 | `bc42bb9` | Lossless neutral canonical lookup classification |
-| 071 | this document's commit | Typed physical lookup envelope and invalid-HEAD classification |
+| 071 | `fac367f` | Typed physical lookup envelope and invalid-HEAD classification |
+| 072 | this document's commit | Parent-manifest digest chain and bounded selected-lineage verification |
 
 ## Current green gates
 
@@ -413,7 +414,13 @@ physical envelope while preserving a decoded selected revision. It maps an
 unknown selected logical HEAD to `InvalidHead` while keeping operation ancestry
 failures as `BrokenCausality`. Cycle 072 next verifies exact retained revisions
 and enumerates bounded lineage without treating a candidate, directory tail, or
-projection as canonical HEAD.
+projection as canonical HEAD. Cycle 072 advances the private physical schema to
+revision 2 so every successor binds its exact verified parent-manifest digest;
+install requires the parent and CAS rechecks the link. Its bounded reader follows
+only HEAD-to-root digest links, validates every canonical/artifact closure,
+ignores orphans, and returns no partial lineage for missing, retargeted, cyclic,
+or over-limit ancestry. Cycle 073 next derives a read-only verified last-good
+recovery plan without publication or implicit HEAD replacement.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
