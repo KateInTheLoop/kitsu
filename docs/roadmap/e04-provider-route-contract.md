@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 039.
+Status: E04-S02/S03 are accepted and E04-S04 is in progress through Cycle 040.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -14,8 +14,9 @@ boundary and closes the retry/replay/catalog/compaction/subagent/cancellation
 mutation matrix for chat-owned routes. Cycle 038 gives management-only catalog
 work a narrower no-model/no-inference generation, binds the three remaining
 production sends, and closes E04-S03. Cycle 039 compiles the first native
-Messages text/usage/terminal slice without selecting it in production. Tool
-correlation, fault parity, route composition, and common conformance remain
+Messages text/usage/terminal slice without selecting it in production. Cycle
+040 adds exact tool-use/result translation and bounded streamed argument
+correlation. Fault parity, route composition, and common conformance remain
 E04-S04; complete route receipts remain E04-S05.
 
 ## Decision
@@ -32,7 +33,7 @@ contains an endpoint, credential, auth header, request/response body, model
 content, provider config object, or user-facing gateway label.
 
 The compiled IDs name compatible Chat and Anthropic Messages wire revisions.
-Cycle 039 adds a real Messages request/event implementation, but that is not
+Cycles 039-040 add a real Messages request/event implementation, but that is not
 adapter promotion: production composition may publish it only after the rest
 of E04-S04 passes tool, fault, bound, telemetry, and shared-route conformance.
 Until then, every current flavor truthfully identifies the compatible-Chat
@@ -159,23 +160,27 @@ successor rather than mutate a generation in place. Cycle 039 adds an
 adapter-local `AnthropicMessagesProvider` that emits the exact pinned
 `/v1/messages` text request, fixed `anthropic-version`, incremental text,
 normalized usage, and terminal reason. It requires explicit `message_stop`,
-bounds event streams/error bodies, and rejects tools before transport. It is
-compiled but unreachable from production composition. These cards still do
-not:
+bounds event streams/error bodies, and initially rejects tools before
+transport. Cycle 040 adds exact prior `tool_use` plus user `tool_result`
+translation, validates prior input before send, correlates fragmented
+`input_json_delta` by bounded block index, validates the completed object, and
+emits one neutral call before usage/terminal output. It is compiled but
+unreachable from production composition. These cards still do not:
 
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
 - select or advertise the native Messages adapter in production composition;
-- translate native tool use/results, retries, model catalog, or complete
-  attempt telemetry for the Messages adapter;
+- implement retries, model catalog, or complete attempt telemetry for the
+  Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
 flavor-to-adapter switch. There is no title-generation provider call in current
 Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
 constructor is confined to compiled provider factories and provider tests. The
-next card adds exact native Messages tool-use/result translation and streamed
-argument correlation while keeping live composition disabled.
+next card runs the native adapter itself through the pinned HTTP,
+mid-stream/malformed, size-bound, timeout, and cancellation fault matrix while
+keeping live composition disabled.
 
 ## Acceptance and rollback
 
@@ -192,9 +197,10 @@ cargo test -p kitsu-providers --test provider_wire_matrix
 Six route-contract, three declaration/derivation, four snapshot, twelve
 route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
 selection, doctor/catalog-without-model, generation-aware
-compaction/subagent/replay/JSONL, and nineteen wire-matrix cases pass offline.
-The native text slice proves an exact distinct request/header, normalized
-text/usage/terminal output, EOF-as-failure, and zero-send tool refusal. The
+compaction/subagent/replay/JSONL, and twenty-one wire-matrix cases pass offline.
+The native slices prove exact distinct text and tool request/header shapes,
+normalized text/tool/usage/terminal output, EOF-as-failure, pre-send malformed
+tool-input rejection, and the 1 MiB streamed argument bound. The
 derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting
