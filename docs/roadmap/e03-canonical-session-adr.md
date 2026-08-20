@@ -5,7 +5,9 @@ in Cycle 051, and the private compiled physical layout/record contract accepted
 in Cycle 058. Cycle 059 adds private descriptor-pinned candidate I/O and exact
 verification; Cycle 060 adds verified HEAD reads and writer-fenced physical CAS.
 Neither migration nor production store behavior has changed yet. Cycle 061
-adds the closed logical payload codec and strict current-v1 migration input.
+adds the closed logical payload codec and strict current-v1 migration input;
+Cycle 062 composes validated bytes with immutable candidate install and fenced
+HEAD publication behind one still-unmounted transaction.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -382,6 +384,18 @@ cannot weaken or replace any backend-neutral assertion.
    so neither final messages nor file/process state can become invented terminal
    truth. Next compose this payload with candidate install and fenced HEAD CAS
    in one provider-free transaction before mounting production behavior.
+   **Provider-free physical transaction complete in Cycle 062:** deterministic
+   canonical encoding and receipt construction precede every physical effect;
+   one exact session fence pre-admits the expected revision before candidate
+   allocation, candidate installation is immutable, and physical CAS repeats
+   admission immediately before HEAD publication. Success returns confirmed or
+   published-unconfirmed neutral receipts. Every prepublication failure returns
+   exact not-published base truth plus none, confirmed/unconfirmed unselected,
+   or conflicting-collision candidate residue. Stale work allocates no orphan;
+   equal and different same-revision collisions preserve the first bytes. The
+   transaction remains private and unmounted. Next resolve the explicit,
+   loss-bearing legacy-baseline migration policy that current-v1's unavailable
+   terminal facts require before any production mount.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

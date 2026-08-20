@@ -9,7 +9,7 @@ use kitsu_core::session::{
 };
 use serde::{Deserialize, Serialize};
 
-const LOGICAL_SCHEMA_V1: u32 = 1;
+pub(super) const LOGICAL_SCHEMA_V1: u32 = 1;
 const ARTIFACT_SCHEMA_V1: u32 = 1;
 const PROJECTION_SCHEMA_V1: u32 = 1;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
@@ -26,7 +26,7 @@ const MAX_LOSS_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct CanonicalSessionRevisionV1 {
+pub(super) struct CanonicalSessionRevisionV1 {
     logical_schema: u32,
     store_id: StoreId,
     session_id: SessionId,
@@ -40,6 +40,32 @@ struct CanonicalSessionRevisionV1 {
     selected_head: LogicalHead,
     artifact_manifest: Vec<ImmutableArtifactRefV1>,
     compaction_binding: Option<ContextProjectionRefV1>,
+}
+
+impl CanonicalSessionRevisionV1 {
+    pub(super) fn logical_schema(&self) -> u32 {
+        self.logical_schema
+    }
+
+    pub(super) fn store_id(&self) -> &StoreId {
+        &self.store_id
+    }
+
+    pub(super) fn session_id(&self) -> &SessionId {
+        &self.session_id
+    }
+
+    pub(super) fn revision_id(&self) -> &RevisionId {
+        &self.revision_id
+    }
+
+    pub(super) fn parent_revision(&self) -> &ExpectedRevision {
+        &self.parent_revision
+    }
+
+    pub(super) fn selected_head(&self) -> &LogicalHead {
+        &self.selected_head
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -383,7 +409,7 @@ fn contains_offload_pointer(content: &str) -> bool {
         .any(|line| line.starts_with("[tool output ") && line.contains("full result saved to "))
 }
 
-fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
+pub(super) fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, String> {
     check_payload_size(bytes, "canonical payload")?;
     let payload: CanonicalSessionRevisionV1 = serde_json::from_slice(bytes)
         .map_err(|error| format!("cannot decode closed canonical payload: {error}"))?;
@@ -391,7 +417,9 @@ fn decode_canonical_payload(bytes: &[u8]) -> Result<CanonicalSessionRevisionV1, 
     Ok(payload)
 }
 
-fn encode_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<Vec<u8>, String> {
+pub(super) fn encode_canonical_payload(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<Vec<u8>, String> {
     validate_canonical_payload(payload)?;
     let bytes = serde_json::to_vec(payload)
         .map_err(|error| format!("cannot encode canonical payload: {error}"))?;
