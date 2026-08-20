@@ -3,7 +3,8 @@
 Status: design contract accepted in Cycle 050, neutral logical values accepted
 in Cycle 051, and the private compiled physical layout/record contract accepted
 in Cycle 058. Cycle 059 adds private descriptor-pinned candidate I/O and exact
-verification. Neither migration nor production store behavior has changed yet.
+verification; Cycle 060 adds verified HEAD reads and writer-fenced physical CAS.
+Neither migration nor production store behavior has changed yet.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -171,8 +172,14 @@ now use descriptor-relative no-follow opens, bounded exact-byte reads, synced
 create-new files, a private staging directory, and OS-level atomic no-replace
 directory installation. Reads verify the manifest location plus exact canonical
 length/digest and return the exact manifest-byte digest for future HEAD binding.
-The physical helper has no production caller; head CAS is mounted in a later
-card.
+HEAD reads validate the closed pointer, physical location, exact manifest digest,
+and canonical candidate before returning a revision. Publication requires a
+held per-session OS writer fence, reloads the current verified HEAD, applies the
+neutral exact-revision admission, checks the candidate's parent and receipt,
+reconfirms the fence, and atomically creates or replaces only the small HEAD
+file. Pre-install failure preserves the old pointer; post-replace directory-sync
+failure reports installed/new-visible but unconfirmed. The physical helper has
+no production caller.
 
 ## Store contract and typed states
 
@@ -355,8 +362,11 @@ cannot weaken or replace any backend-neutral assertion.
    059:** initialize or reopen one exact store identity without clobbering,
    install privately staged revisions with no-replace rename and joined cleanup,
    verify exact stored bytes, and preserve installed-unconfirmed sync truth.
-   Next add fenced expected-revision head CAS, then migrate whole-operation
-   outcome publication.
+   **Physical HEAD CAS complete in Cycle 060:** bind a held per-session OS fence,
+   verified current pointer, neutral expected revision, exact candidate parent,
+   and manifest digest to atomic create/replace with old-or-new visibility and
+   installed-unconfirmed truth. Next define the complete canonical payload and
+   migration input, then migrate whole-operation outcome publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

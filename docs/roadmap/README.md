@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 059. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 060. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -293,9 +293,9 @@ second writer for one session is refused, a different session proceeds, and
 lost/replaced/wrong-session tokens fail before mint or publication.
 The private compiled file-store v1 contract now fixes a disjoint namespace,
 portable reversible identity components, create-new store/revision records,
-exact payload/manifest digest bindings, and a head pointer replaceable only
-after fence plus expected-revision recheck. It is not mounted and changes no
-current-v1 bytes.
+exact payload/manifest digest bindings, descriptor-pinned candidate I/O, and a
+real per-session OS writer fence around exact-revision atomic HEAD replacement.
+It has no production caller and changes no current-v1 bytes.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -567,6 +567,7 @@ gates merely because a card appears attractive.
 | 057 | E03-S02-C6 | Prove K07 same-session writer exclusion, token/session binding, lost-fence refusal, and independent-session progress |
 | 058 | E03-S02-C7 | Compile the physical file-store v1 namespace, reversible identity encoding, immutable revision manifest, and fenced head-pointer contract |
 | 059 | E03-S02-C8 | Add descriptor-pinned store create/open, staged no-replace revision installation, and exact-byte verification |
+| 060 | E03-S02-C9 | Add descriptor-pinned verified HEAD reads and writer-fenced expected-revision atomic replacement |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -616,8 +617,10 @@ Cycle 056 adds provider-free K04 publication-cut and durability truth. Cycle
 defines the physical revision envelope and no-clobber layout. Cycle 059 adds
 descriptor-pinned create/open, immutable staged candidate installation, and
 exact-byte verification without mounting production behavior. Cycle 060 adds
-the fenced expected-revision HEAD CAS and physical crash cuts before current-v1
-migration. The queue then continues through E03,
+verified HEAD reads, per-session OS writer fencing, exact parent/revision
+admission, atomic create/replace, and new-visible installed-unconfirmed truth.
+Cycle 061 defines the complete canonical current-v1 payload/migration input
+before any production mount. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
