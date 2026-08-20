@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 062;
+through Cycle 063;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 62 / 62 |
+| Accepted cycles/commits after this cycle | 63 / 63 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C12 (Cycle 063) — resolve explicit legacy-baseline migration |
+| Active epic/card | E03 / E03-S02-C13 (Cycle 064) — compose no-clobber legacy migration |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C11 | Current-v1 behavior remains unchanged. Neutral K04/K07/K08 fixtures and the private file transaction now compose deterministic canonical bytes, immutable candidate installation, session-fenced pre-admission/recheck, atomic HEAD CAS, and exact publication/orphan/collision truth. No production caller exists; explicit loss-bearing legacy migration, operation assembly, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C12 | Current-v1 behavior remains unchanged. Neutral K04/K07/K08 fixtures and the private file transaction compose deterministic canonical bytes, immutable candidate installation, session-fenced pre-admission/recheck, atomic HEAD CAS, and exact publication/orphan/collision truth. Strict v1 history may become only a digest-bound `Genesis` legacy baseline with a fixed loss manifest; unresolved artifact closure refuses. No production caller exists; transactional migration composition, operation assembly, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -97,7 +97,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 059 | `e038ac5` | Descriptor-pinned immutable candidate I/O and verification |
 | 060 | `f8c5e59` | Writer-fenced exact-revision physical HEAD CAS |
 | 061 | `6f42e79` | Closed canonical payload and blocked current-v1 migration input |
-| 062 | this document's commit | Provider-free canonical candidate/HEAD transaction composition |
+| 062 | `971def4` | Provider-free canonical candidate/HEAD transaction composition |
+| 063 | this document's commit | Explicit loss-bearing current-v1 legacy baseline |
 
 ## Current green gates
 
@@ -360,9 +361,12 @@ source digest/transcript but exposes missing-terminal and artifact-resolution
 blockers, so it cannot publish an inferred history. Cycle 062 composes these
 logical bytes with immutable candidate installation and fenced HEAD CAS in one
 provider-free transaction, including stale zero-allocation, orphan/collision,
-and published-unconfirmed truth. Cycle 063 resolves whether current-v1 history
-can enter a typed loss-bearing legacy baseline or must remain explicitly
-unmigrated before any production mount.
+and published-unconfirmed truth. Cycle 063 permits only a typed, digest-bound
+legacy baseline at `Genesis`: it preserves the exact validated transcript and
+declares unavailable terminal outcomes, logical heads, and turn lineage. It
+creates no operations or authority, and unresolved artifact closure refuses.
+Cycle 064 composes that candidate with the no-clobber transaction while keeping
+the exact current-v1 bytes as rollback.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
