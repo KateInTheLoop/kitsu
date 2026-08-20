@@ -12,6 +12,7 @@ fn k08_stale_writer_is_zero_effect_and_retry_publishes_one_successor() {
         .unwrap();
     let revision_a = first.new_revision().clone();
     assert_eq!(revision_a, revision("revision-memory-k08-1"));
+    assert_eq!(first.session(), store.session_id());
     assert_eq!(first.base_revision(), &ExpectedRevision::Missing);
     assert_eq!(first.durability(), CommitDurability::Confirmed);
 

@@ -8,6 +8,7 @@ fn seeded_store() -> (MemoryRevisionStore, kitsu_core::RevisionId) {
     let receipt = store
         .publish(ExpectedRevision::Missing, LogicalHead::Genesis)
         .unwrap();
+    assert_eq!(receipt.session(), store.session_id());
     let revision = receipt.new_revision().clone();
     (store, revision)
 }

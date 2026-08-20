@@ -117,6 +117,10 @@ impl MemoryRevisionStore {
         self.current.as_ref().map(|current| &current.revision)
     }
 
+    pub fn session_id(&self) -> &SessionId {
+        &self.session
+    }
+
     pub fn current_head(&self) -> Option<&LogicalHead> {
         self.current.as_ref().map(|current| &current.head)
     }
