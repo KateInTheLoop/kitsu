@@ -859,7 +859,7 @@ impl PhysicalFileStoreV1 {
     }
 
     #[cfg(test)]
-    fn inject_next_head_sync_failure(&self) {
+    pub(super) fn inject_next_head_sync_failure(&self) {
         self.fail_next_head_sync.set(true);
     }
 
@@ -976,7 +976,7 @@ impl PhysicalFileStoreV1 {
     }
 
     #[cfg(test)]
-    fn inject_next_target_sync_failure(&self) {
+    pub(super) fn inject_next_target_sync_failure(&self) {
         self.fail_next_target_sync.set(true);
     }
 

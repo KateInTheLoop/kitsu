@@ -28,6 +28,8 @@ use serde::{Deserialize, Serialize};
 mod canonical;
 #[allow(dead_code)]
 mod physical;
+#[allow(dead_code)]
+mod transaction;
 
 const SESSION_VERSION: u32 = 1;
 const MAX_SESSION_BYTES: u64 = 16 * 1024 * 1024;

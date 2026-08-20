@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 061. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 062. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -569,6 +569,7 @@ gates merely because a card appears attractive.
 | 059 | E03-S02-C8 | Add descriptor-pinned store create/open, staged no-replace revision installation, and exact-byte verification |
 | 060 | E03-S02-C9 | Add descriptor-pinned verified HEAD reads and writer-fenced expected-revision atomic replacement |
 | 061 | E03-S02-C10 | Add the closed whole-operation canonical payload and strict blocked current-v1 migration input |
+| 062 | E03-S02-C11 | Compose deterministic canonical bytes, immutable candidate install, and fenced HEAD CAS with exact cut/residue truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -623,8 +624,10 @@ admission, atomic create/replace, and new-visible installed-unconfirmed truth.
 Cycle 061 adds that complete closed payload plus a strict current-v1 decoder
 that preserves exact source bytes while refusing to invent terminal outcomes or
 artifact closure. Cycle 062 composes payload validation, immutable candidate
-installation, and fenced HEAD CAS as one provider-free transaction before any
-production mount. The queue then continues through E03,
+installation, and fenced HEAD CAS as one provider-free transaction, including
+stale zero-allocation, candidate residue/collision, and published-unconfirmed
+truth. Cycle 063 resolves an explicit loss-bearing legacy baseline or refusal
+for current-v1 history before any production mount. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
