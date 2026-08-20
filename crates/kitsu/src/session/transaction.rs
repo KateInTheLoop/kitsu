@@ -278,6 +278,25 @@ impl CanonicalHeadLookupV1 {
 }
 
 #[derive(Debug)]
+enum CanonicalRecoveryPlanV1 {
+    Missing,
+    NotNeeded {
+        selected: RevisionId,
+        head: kitsu_core::session::LogicalHead,
+    },
+    Available {
+        selected: RevisionId,
+        selected_state: SessionLookupState,
+        recovery: RevisionId,
+        recovery_head: kitsu_core::session::LogicalHead,
+    },
+    Unavailable {
+        selected: Option<RevisionId>,
+        selected_state: SessionLookupState,
+    },
+}
+
+#[derive(Debug)]
 struct VerifiedCanonicalRevisionV1 {
     payload: CanonicalSessionRevisionV1,
     manifest_sha256: String,
@@ -500,6 +519,121 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 state: error.lookup_state(session_id),
                 payload: None,
             },
+        }
+    }
+
+    fn plan_last_good_recovery(&self, session_id: &SessionId) -> CanonicalRecoveryPlanV1 {
+        let selected_head = match self.store.read_head(session_id) {
+            Ok(None) => return CanonicalRecoveryPlanV1::Missing,
+            Ok(Some(head)) => head,
+            Err(error) => {
+                let error = CanonicalHeadReadErrorV1::from_physical(error);
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: error.observed_revision(),
+                    selected_state: error.lookup_state(session_id),
+                };
+            }
+        };
+        let selected = selected_head.revision_id().clone();
+        let selected_candidate = selected_head.candidate();
+        let selected_error =
+            match self.decode_canonical_candidate(session_id, selected.clone(), selected_candidate)
+            {
+                Ok(verified) => {
+                    return CanonicalRecoveryPlanV1::NotNeeded {
+                        selected,
+                        head: verified.payload.selected_head().clone(),
+                    };
+                }
+                Err(error) => error,
+            };
+        let selected_state = selected_error.lookup_state(session_id);
+        if matches!(selected_state, SessionLookupState::Unsupported { .. }) {
+            return CanonicalRecoveryPlanV1::Unavailable {
+                selected: Some(selected),
+                selected_state,
+            };
+        }
+
+        // Recovery is advisory and read-only. It follows only the exact,
+        // digest-bound physical ancestry of the selected corrupt revision;
+        // unselected candidates and directory order can never influence it.
+        let mut parent = selected_candidate.manifest().parent_revision().clone();
+        let mut parent_manifest_sha256 = selected_candidate
+            .manifest()
+            .parent_manifest_sha256()
+            .map(|digest| digest.as_str().to_string());
+        let mut seen = HashSet::new();
+        seen.insert(selected.clone());
+
+        loop {
+            let ExpectedRevision::Exact(parent_revision) = parent else {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                };
+            };
+            if seen.len() >= MAX_CANONICAL_LINEAGE_REVISIONS
+                || !seen.insert(parent_revision.clone())
+            {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                };
+            }
+            let Some(expected_manifest_sha256) = parent_manifest_sha256.as_deref() else {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                };
+            };
+            let candidate = match self
+                .store
+                .open_revision_candidate(session_id, &parent_revision)
+            {
+                Ok(candidate) => candidate,
+                Err(_) => {
+                    return CanonicalRecoveryPlanV1::Unavailable {
+                        selected: Some(selected),
+                        selected_state,
+                    };
+                }
+            };
+            if candidate.manifest_sha256().as_str() != expected_manifest_sha256 {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                };
+            }
+
+            match self.decode_canonical_candidate(session_id, parent_revision.clone(), &candidate) {
+                Ok(verified) => {
+                    return CanonicalRecoveryPlanV1::Available {
+                        selected,
+                        selected_state,
+                        recovery: parent_revision,
+                        recovery_head: verified.payload.selected_head().clone(),
+                    };
+                }
+                Err(error)
+                    if matches!(
+                        error.lookup_state(session_id),
+                        SessionLookupState::Unsupported { .. }
+                    ) =>
+                {
+                    return CanonicalRecoveryPlanV1::Unavailable {
+                        selected: Some(selected),
+                        selected_state,
+                    };
+                }
+                Err(_) => {
+                    parent = candidate.manifest().parent_revision().clone();
+                    parent_manifest_sha256 = candidate
+                        .manifest()
+                        .parent_manifest_sha256()
+                        .map(|digest| digest.as_str().to_string());
+                }
+            }
         }
     }
 
@@ -1478,6 +1612,16 @@ mod tests {
 
             assert_eq!(lookup.state(), &expected_state, "fault: {fault}");
             assert!(lookup.payload().is_none(), "fault: {fault}");
+            assert!(
+                matches!(
+                    transaction.plan_last_good_recovery(&session_id),
+                    CanonicalRecoveryPlanV1::Unavailable {
+                        selected: Some(ref selected),
+                        ref selected_state,
+                    } if selected == &rev_a && selected_state == &expected_state
+                ),
+                "recovery fault: {fault}"
+            );
         }
     }
 
@@ -1718,6 +1862,254 @@ mod tests {
             .exists()
         );
         assert!(store.read_head(&session_id).unwrap().is_none());
+    }
+
+    #[test]
+    fn recovery_plan_selects_verified_parent_without_changing_corrupt_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        let mut corrupt =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+                .unwrap();
+        corrupt["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        let candidate = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_b.clone(),
+                ExpectedRevision::Exact(rev_a.clone()),
+                &serde_json::to_vec(&corrupt).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_a.clone()), &candidate)
+            .unwrap();
+
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Corrupt {
+                session: session_id.clone(),
+                observed_revision: Some(rev_b.clone()),
+                reason: CorruptSessionReason::InvalidHead
+            }
+        );
+        let plan = transaction.plan_last_good_recovery(&session_id);
+
+        assert!(matches!(
+            plan,
+            CanonicalRecoveryPlanV1::Available {
+                ref selected,
+                ref selected_state,
+                ref recovery,
+                ref recovery_head,
+            } if selected == &rev_b
+                && selected_state == &SessionLookupState::Corrupt {
+                    session: session_id.clone(),
+                    observed_revision: Some(rev_b.clone()),
+                    reason: CorruptSessionReason::InvalidHead,
+                }
+                && recovery == &rev_a
+                && recovery_head == &kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+        ));
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Corrupt {
+                session: session_id,
+                observed_revision: Some(rev_b),
+                reason: CorruptSessionReason::InvalidHead,
+            }
+        );
+    }
+
+    #[test]
+    fn recovery_plan_is_unavailable_without_a_verified_parent() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::Missing
+        ));
+        let mut corrupt =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", None, 1)).unwrap();
+        corrupt["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        let candidate = store
+            .install_revision_candidate(
+                1,
+                session_id.clone(),
+                rev_b.clone(),
+                ExpectedRevision::Missing,
+                &serde_json::to_vec(&corrupt).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate)
+            .unwrap();
+
+        let plan = transaction.plan_last_good_recovery(&session_id);
+
+        assert!(matches!(
+            plan,
+            CanonicalRecoveryPlanV1::Unavailable {
+                selected: Some(ref selected),
+                ref selected_state,
+            } if selected == &rev_b
+                && selected_state == &SessionLookupState::Corrupt {
+                    session: session_id.clone(),
+                    observed_revision: Some(rev_b.clone()),
+                    reason: CorruptSessionReason::InvalidHead,
+                }
+        ));
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn recovery_plan_does_not_downgrade_valid_or_future_selected_state() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::NotNeeded {
+                ref selected,
+                ref head,
+            } if selected == &rev_a
+                && head == &kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+        ));
+
+        let mut future =
+            serde_json::to_value(payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+                .unwrap();
+        future["logical_schema"] = serde_json::json!(2);
+        let candidate = store
+            .install_revision_candidate(
+                2,
+                session_id.clone(),
+                rev_b.clone(),
+                ExpectedRevision::Exact(rev_a.clone()),
+                &serde_json::to_vec(&future).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_a), &candidate)
+            .unwrap();
+
+        let plan = transaction.plan_last_good_recovery(&session_id);
+
+        assert!(matches!(
+            plan,
+            CanonicalRecoveryPlanV1::Unavailable {
+                selected: Some(ref selected),
+                ref selected_state,
+            } if selected == &rev_b
+                && selected_state == &SessionLookupState::Unsupported {
+                    dimension: SchemaDimension::Logical,
+                    observed_revision: 2,
+                    supported_revision: 1,
+                }
+        ));
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn recovery_plan_crosses_corrupt_parent_to_verified_grandparent() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+
+        for (revision, parent, turn) in [
+            (rev_b.clone(), rev_a.clone(), 2),
+            (rev_c.clone(), rev_b.clone(), 3),
+        ] {
+            let mut corrupt = serde_json::to_value(payload(
+                "store-1",
+                "session-1",
+                revision.as_str(),
+                Some(parent.as_str()),
+                turn,
+            ))
+            .unwrap();
+            corrupt["selected_head"] =
+                serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+            let candidate = store
+                .install_revision_candidate(
+                    1,
+                    session_id.clone(),
+                    revision.clone(),
+                    ExpectedRevision::Exact(parent.clone()),
+                    &serde_json::to_vec(&corrupt).unwrap(),
+                )
+                .unwrap();
+            let fence = store.acquire_writer_fence(&session_id).unwrap();
+            store
+                .compare_and_swap_head(&fence, ExpectedRevision::Exact(parent), &candidate)
+                .unwrap();
+        }
+
+        assert!(matches!(
+            transaction.plan_last_good_recovery(&session_id),
+            CanonicalRecoveryPlanV1::Available {
+                ref selected,
+                ref selected_state,
+                ref recovery,
+                ref recovery_head,
+            } if selected == &rev_c
+                && selected_state == &SessionLookupState::Corrupt {
+                    session: session_id.clone(),
+                    observed_revision: Some(rev_c.clone()),
+                    reason: CorruptSessionReason::InvalidHead,
+                }
+                && recovery == &rev_a
+                && recovery_head == &kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+        ));
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_c
+        );
     }
 
     #[test]
