@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02 is accepted and E04-S03 is in progress through Cycle 037.
+Status: E04-S02/S03 are accepted through Cycle 038; E04-S04 is next.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -11,9 +11,10 @@ request match an immutable model-bound handle, publishes default/resumed model
 changes as exact successors, and snapshots each subagent route after profile
 resolution. Cycle 037 attributes physical attempts at the immutable handle
 boundary and closes the retry/replay/catalog/compaction/subagent/cancellation
-mutation matrix for chat-owned routes. Remaining management auxiliaries and
-full config/auth replacement remain E04-S03 work; complete route receipts remain
-E04-S05 work.
+mutation matrix for chat-owned routes. Cycle 038 gives management-only catalog
+work a narrower no-model/no-inference generation, binds the three remaining
+production sends, and closes E04-S03. Native Messages remains E04-S04 and
+complete route receipts remain E04-S05.
 
 ## Decision
 
@@ -45,7 +46,8 @@ compatible-Chat implementation it actually constructs.
   generation exists. Today's compatible-Chat declaration advertises streaming,
   tools, structured output, and usage normalization; it advertises model
   catalog only when a non-empty `models_path` is configured, and never image
-  input.
+  input. Its catalog-only declaration advertises exactly `model_catalog` and
+  rejects any inference capability before publication.
 - `ProviderRouteGeneration` is a nonzero monotonic identity. Zero cannot look
   like a published generation.
 - `ProviderWireRevision` names an exact compiled protocol revision and must
@@ -62,10 +64,12 @@ compatible-Chat implementation it actually constructs.
   budgets, the bounded advisory discovery budget, and whether a model catalog
   is configured. Catalog policy must agree exactly with the declared
   `model_catalog` capability.
-- `ProviderRouteSnapshot<P>` owns the initial generation, bounded nonempty
-  model ID, secret-free auth source class, policy, and both provider-specific
-  runtimes. The runtime snapshot is intentionally neither serializable nor
-  debuggable; endpoint, paths, caches, and sensitive auth remain inside `P`.
+- `ProviderRouteSnapshot<P>` owns either a model-bound inference generation or
+  a catalog-only management generation, plus secret-free auth source, policy,
+  and its provider-specific runtimes. Catalog-only construction owns no model
+  and no inference runtime. The runtime snapshot is intentionally neither
+  serializable nor debuggable; endpoint, paths, caches, and sensitive auth
+  remain inside `P`.
 - `FrozenAuth` resolves a sensitive header once into zeroizing storage. All
   inference retries and catalog calls owned by the snapshot share that same
   auth object; later environment changes cannot alter an admitted generation.
@@ -75,6 +79,11 @@ compatible-Chat implementation it actually constructs.
   inference, catalog, context-discovery, compaction, foreground, or subagent
   call validates current generation and required request-shape capabilities
   before it can enter a provider runtime.
+- `ProviderCatalogHandle<P>` binds the current catalog generation without a
+  model and deliberately has no `Provider` implementation or chat method.
+  Catalog-only successor publication stales the old handle before a send, and
+  top-level JSONL attempt evidence is stamped by this handle rather than by the
+  adapter.
 - Replacement is expected-generation and exact-successor only. A stale
   expectation, profile mismatch, non-successor, exhausted generation, or
   poisoned owner leaves the prior snapshot installed. Once a logical request
@@ -109,6 +118,11 @@ compatible-Chat implementation it actually constructs.
   still checked first. Capabilities required by a concrete chat request, such
   as streaming, tools, or structured output, fail with a typed local error and
   zero sends.
+- The only three provider sends that were outside chat-owned composition—top-
+  level `models`, `doctor --online`, and `doctor --inference`—now construct and
+  bind immutable management routes. Offline doctor still constructs no route
+  and performs no provider request. Catalog-only doctor remains usable without
+  a configured model; the missing chat model is reported independently.
 
 The exact v1 JSON vector and all validation cuts are pinned by
 `provider_route_contract.rs`. The provider wire matrix consumes the same
@@ -130,13 +144,16 @@ resumed model changes advance the process-default generation. Cycle 037 stamps
 attempt evidence outside adapter-authored events, proves admitted physical
 retry/catalog work drains entirely on its old generation, proves a user-level
 `/retry` binds the new current generation, and retains generation evidence for
-compaction and child work. All accepted
-`openai`, `anthropic`, and `ollama` flavor labels still
-declare the compatible-Chat adapter/wire Kitsu actually constructs; no flavor
-label selects a physical adapter. These cards still do not:
+compaction and child work. Cycle 038 introduces a capability-narrow
+catalog-only declaration/snapshot/handle, freezes its auth once, migrates
+top-level `models` and catalog doctor, and routes the explicit inference doctor
+through a model-bound handle. All accepted `openai`, `anthropic`, and `ollama`
+flavor labels still declare the compatible-Chat adapter/wire Kitsu actually
+constructs; no flavor label selects a physical adapter. E04-S03 is complete for
+every provider send in current production. There is no live configuration
+reload surface; any future reload must construct and atomically publish a full
+successor rather than mutate a generation in place. These cards still do not:
 
-- replace endpoint/wire/auth/retry/cache owners from a reloaded configuration;
-- bind management-only top-level `models` and doctor probes to this chat owner;
 - emit the complete adapter/profile/wire/capability/auth-source attempt receipt
   required by E04-S05;
 - implement or advertise a native Messages adapter;
@@ -144,11 +161,10 @@ label selects a physical adapter. These cards still do not:
 
 `rg` confirms `kitsu-core` does not import the route contract and the CLI has no
 flavor-to-adapter switch. There is no title-generation provider call in current
-Kitsu. The three raw management calls are named and queued rather than inferred
-safe. The next E04-S03 card composes top-level `models` and explicit doctor
-probes through a truthful management route while preserving
-catalog-without-model behavior; later cards add the distinct adapter and
-complete secret-free operational receipts.
+Kitsu. Production composition has no raw `OpenAICompatProvider::new` call; the
+constructor is confined to compiled provider factories and provider tests. The
+next card begins the native Messages text/usage/terminal adapter against the
+already pinned primary fixture without selecting it in live composition.
 
 ## Acceptance and rollback
 
@@ -162,13 +178,14 @@ cargo test -p kitsu-providers --test provider_route_handle
 cargo test -p kitsu-providers --test provider_wire_matrix
 ```
 
-Six route-contract, three declaration/derivation, three snapshot, ten
-route-handle, route-factory, auth-freeze/source-selection, two
-declaration-composition, generation-aware compaction/subagent/replay/JSONL, and
-sixteen wire-matrix cases pass offline. The
+Six route-contract, three declaration/derivation, four snapshot, twelve
+route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
+selection, doctor/catalog-without-model, generation-aware
+compaction/subagent/replay/JSONL, and sixteen wire-matrix cases pass offline. The
 derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
-different config namespaces or gateway keys do not share identity. Removing
-the current owner/handle/provider binder and restoring `ChatSetup`'s raw
-snapshot-owned runtime clones is the exact source rollback. No config,
-persisted session, or wire schema migration is involved.
+different config namespaces or gateway keys do not share identity. Reverting
+the catalog-only types/factory and management composition restores the previous
+three explicitly raw calls; reverting the earlier current owner/handle binder
+restores the pre-E04-S03 chat path. No config, persisted session, or wire schema
+migration is involved.

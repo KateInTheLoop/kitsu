@@ -3385,6 +3385,77 @@ auth = {{ method = "none" }}
 
 #[tokio::test]
 #[serial]
+async fn test_doctor_online_catalog_does_not_require_a_configured_model() {
+    use wiremock::matchers::{method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("GET"))
+        .and(path("/v1/models"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "data": [{"id": "discoverable-model"}]
+        })))
+        .expect(1)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    let config = home.path().join("doctor-online-no-model.toml");
+    fs::write(
+        &config,
+        format!(
+            r#"default_gateway = "example"
+[gateways.example]
+flavor = "openai"
+base_url = "{}"
+chat_path = "/v1/chat/completions"
+models_path = "/v1/models"
+auth = {{ method = "none" }}
+"#,
+            server.uri()
+        ),
+    )
+    .unwrap();
+    let home_path = home.path().to_path_buf();
+
+    tokio::task::spawn_blocking(move || {
+        let mut doctor = base_cmd(&home_path);
+        let output = doctor
+            .args([
+                "--config",
+                &config.to_string_lossy(),
+                "doctor",
+                "--online",
+                "--json",
+            ])
+            .output()
+            .expect("run catalog-only doctor without a model");
+        // Doctor still reports the missing chat model as a readiness issue,
+        // but that issue must not suppress the independent catalog probe.
+        assert_eq!(output.status.code(), Some(1));
+        let report: serde_json::Value = serde_json::from_slice(&output.stdout).unwrap();
+        assert_eq!(report["online"]["status"], "reachable");
+        assert_eq!(report["online"]["request_sent"], true);
+        assert_eq!(report["online"]["models"], 1);
+        assert_eq!(report["online"]["effective_model"], serde_json::Value::Null);
+        assert_eq!(
+            report["online"]["effective_model_available"],
+            serde_json::Value::Null
+        );
+        assert!(!report["blocking_issues"].as_array().unwrap().is_empty());
+    })
+    .await
+    .expect("catalog-only doctor process should join");
+
+    let requests = server.received_requests().await.unwrap();
+    assert_eq!(requests.len(), 1);
+    assert_eq!(requests[0].method.as_str(), "GET");
+    assert_eq!(requests[0].url.path(), "/v1/models");
+    server.verify().await;
+}
+
+#[tokio::test]
+#[serial]
 async fn test_doctor_online_accepts_only_local_ollama_implicit_latest_without_chat() {
     use wiremock::matchers::{method, path};
     use wiremock::{Mock, MockServer, ResponseTemplate};
@@ -8006,6 +8077,7 @@ auth = {{ method = "none" }}
         assert_eq!(events[1]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["operation_id"], "models:1");
         assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["route_generation"], 1);
         assert_eq!(events[2]["deadline_scope"], "provider_request");
         assert_eq!(events[2]["turn_remaining_ms"], serde_json::Value::Null);
         assert_eq!(events[2]["category"], "success");
@@ -8127,6 +8199,7 @@ auth = {{ method = "none" }}
         assert_eq!(events[1]["purpose"], "model_catalog");
         assert_eq!(events[2]["operation_id"], "models:1");
         assert_eq!(events[2]["purpose"], "model_catalog");
+        assert_eq!(events[2]["route_generation"], 1);
         assert_eq!(events[2]["attempt"], 1);
         assert_eq!(events[2]["max_attempts"], 1);
         assert_eq!(events[2]["category"], "unavailable");

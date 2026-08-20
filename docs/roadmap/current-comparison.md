@@ -1,7 +1,7 @@
 # Current Harness Comparison
 
-Status: Kitsu-owned comparison at post-E01 runtime pin `986fba9`; frozen
-research inputs and hashes are listed in
+Status: Kitsu-owned comparison from post-E01 runtime pin `986fba9`, updated
+through accepted Cycle 038; frozen research inputs and hashes are listed in
 [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md).
 
 The detailed source-by-source transfer decisions remain in the
@@ -29,10 +29,10 @@ code navigation.
 |---|---|---|
 | Ollama untagged versus `:latest` doctor mismatch | Closed by Cycles 003-004 with local-only, human/JSON, and zero-chat coverage | **Closed**; E01-S01 |
 | Duplicate tool schema/handler registration | Closed for A001's per-entry contract by Cycles 005, 007, 008 | **Closed**; E01-S02/S03 |
-| Provider retry/context discovery | Wider bounded retry and nested context-window discovery landed in the 67-commit delta | **Partial**; immutable generation/capability work remains E04 |
+| Provider retry/context discovery | Wider bounded retry and nested context-window discovery landed in the 67-commit delta; Cycles 032-038 bind chat, retry, replay, catalog, compaction, subagent, top-level, and doctor sends to immutable generations | **Generation gap closed for current production**; native dialect and receipts remain E04 |
 | Structural code navigation | `repo_grep`, `find_symbol`, `outline_file`, and `read_manifest` exist under read authority | **Narrow gap closed**; semantic selector remains E07 |
 | Timeout/recovery truth | Completed tool rounds survive piped deadline failure; JSONL framing improved | **Partial**; causal run phases remain E02 and session recovery/HEAD remains E03 |
-| Provider dialect breadth | All flavors still use `OpenAICompatProvider` | **Open**; E04 distinct compiled dialect |
+| Provider dialect breadth | All live flavors still select the compatible-Chat adapter despite truthful route identity | **Open**; E04-S04 distinct compiled dialect |
 | Guided onboarding/model choice | Config and model listing exist, but setup is still manual and not transactional | **Open**; E05 after E04 |
 | Session lineage/branch-at-turn | Whole-history fresh-ID fork exists; no logical HEAD/revision/turn boundary | **Open**; E03 |
 | MCP/external tools | No client or supervisor is compiled | **Open experiment**; E06 after E02 |
@@ -47,7 +47,7 @@ did not execute.
 
 | Boundary | Score | Why |
 |---|---:|---|
-| X001 provider | Fail | One concrete wire; no immutable route generation/capability conformance across auxiliary sends |
+| X001 provider | Fail | Immutable current-send generations now pass, but only one compiled live wire exists and complete receipts/alternate conformance are absent |
 | X002 tool/source | Fail | Registry integrity improved, but no admitted/supervised external source or two-source suite |
 | X003 host/UI | Fail | No named independent host/principal or shared carrier identity fixture |
 | X004 automation/runtime | Fail | Neutral run/outcome phases and an independent seven-carrier default-runtime evaluator now exist; no named alternate runtime adapter runs the suite |
@@ -68,6 +68,6 @@ and DB-row/file-tail/projection-as-canonical-HEAD.
 ## Evidence boundary
 
 This comparison is source/test-backed plus the provider-free acceptance tests
-recorded in Cycles 003-008. It does not claim that any subject runtime or full
+recorded in Cycles 003-038. It does not claim that any subject runtime or full
 X001-X005 suite was executed. Scores change only when the named complete gate
 passes against both required implementations.

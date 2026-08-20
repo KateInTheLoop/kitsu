@@ -404,6 +404,22 @@ impl ProviderRouteDeclaration {
         .expect("the compiled compatible-Chat adapter/wire pair is valid")
     }
 
+    /// Truthful declaration for a management generation that can only read
+    /// the compatible adapter's model catalog. The adapter/wire identify the
+    /// compiled implementation; capabilities describe the narrower admitted
+    /// operation surface.
+    pub fn compatible_catalog_v1(profile: ProviderProfileId) -> Self {
+        let capabilities = ProviderCapabilities::new(1, [ProviderCapability::ModelCatalog])
+            .expect("the compiled compatible catalog capability set is valid");
+        Self::new(
+            ProviderAdapterId::OpenAiCompatible,
+            profile,
+            ProviderWireRevision::OpenAiChatCompletionsV1,
+            capabilities,
+        )
+        .expect("the compiled compatible catalog adapter/wire pair is valid")
+    }
+
     pub fn adapter(&self) -> ProviderAdapterId {
         self.adapter
     }
@@ -557,10 +573,10 @@ impl<'de> Deserialize<'de> for ProviderRouteIdentity {
 /// boundaries.
 pub struct ProviderRouteSnapshot<P> {
     identity: ProviderRouteIdentity,
-    model: String,
+    model: Option<String>,
     auth_source: ProviderAuthSource,
     policy: ProviderRoutePolicy,
-    inference_runtime: Arc<P>,
+    inference_runtime: Option<Arc<P>>,
     catalog_runtime: Arc<P>,
 }
 
@@ -589,6 +605,88 @@ impl<P> ProviderRouteSnapshot<P> {
             inference_runtime,
             catalog_runtime,
         )
+    }
+
+    /// Construct an initial generation that can perform catalog management
+    /// but has no selected model or inference runtime. This distinct
+    /// constructor prevents catalog commands from using placeholder models.
+    pub fn initial_catalog_only(
+        declaration: ProviderRouteDeclaration,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        let generation = ProviderRouteGeneration::new(1)
+            .expect("the initial provider route generation is nonzero");
+        Self::catalog_only_with_generation(
+            declaration,
+            generation,
+            auth_source,
+            policy,
+            catalog_runtime,
+        )
+    }
+
+    /// Construct, but do not publish, the exact successor of a catalog-only
+    /// generation. This retains the same stale-writer and no-skip rules as a
+    /// model-bound replacement without introducing an inference binding.
+    pub fn successor_catalog_only(
+        previous: &ProviderRouteIdentity,
+        declaration: ProviderRouteDeclaration,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        if declaration.profile() != previous.profile() {
+            return Err(ProviderRouteContractError::ReplacementProfileMismatch);
+        }
+        let next = previous
+            .generation()
+            .get()
+            .checked_add(1)
+            .ok_or(ProviderRouteContractError::GenerationExhausted)?;
+        let generation = ProviderRouteGeneration::new(next)
+            .expect("incrementing a nonzero generation remains nonzero");
+        Self::catalog_only_with_generation(
+            declaration,
+            generation,
+            auth_source,
+            policy,
+            catalog_runtime,
+        )
+    }
+
+    fn catalog_only_with_generation(
+        declaration: ProviderRouteDeclaration,
+        generation: ProviderRouteGeneration,
+        auth_source: ProviderAuthSource,
+        policy: ProviderRoutePolicy,
+        catalog_runtime: Arc<P>,
+    ) -> Result<Self, ProviderRouteContractError> {
+        Self::validate_catalog_contract(&declaration, policy)?;
+        if !declaration
+            .capabilities()
+            .supports(ProviderCapability::ModelCatalog)
+        {
+            return Err(ProviderRouteContractError::UnsupportedCapability {
+                capability: ProviderCapability::ModelCatalog,
+            });
+        }
+        if let Some(capability) = declaration
+            .capabilities()
+            .supported()
+            .find(|capability| *capability != ProviderCapability::ModelCatalog)
+        {
+            return Err(ProviderRouteContractError::CatalogOnlyCapabilityMismatch { capability });
+        }
+        Ok(Self {
+            identity: ProviderRouteIdentity::from_declaration(declaration, generation),
+            model: None,
+            auth_source,
+            policy,
+            inference_runtime: None,
+            catalog_runtime,
+        })
     }
 
     /// Construct the exact next generation for the same logical profile. This
@@ -634,6 +732,21 @@ impl<P> ProviderRouteSnapshot<P> {
         catalog_runtime: Arc<P>,
     ) -> Result<Self, ProviderRouteContractError> {
         let model = Self::validated_model(model)?;
+        Self::validate_catalog_contract(&declaration, policy)?;
+        Ok(Self {
+            identity: ProviderRouteIdentity::from_declaration(declaration, generation),
+            model: Some(model),
+            auth_source,
+            policy,
+            inference_runtime: Some(inference_runtime),
+            catalog_runtime,
+        })
+    }
+
+    fn validate_catalog_contract(
+        declaration: &ProviderRouteDeclaration,
+        policy: ProviderRoutePolicy,
+    ) -> Result<(), ProviderRouteContractError> {
         let declared_catalog = declaration
             .capabilities()
             .supports(ProviderCapability::ModelCatalog);
@@ -644,14 +757,7 @@ impl<P> ProviderRouteSnapshot<P> {
                 configured: configured_catalog,
             });
         }
-        Ok(Self {
-            identity: ProviderRouteIdentity::from_declaration(declaration, generation),
-            model,
-            auth_source,
-            policy,
-            inference_runtime,
-            catalog_runtime,
-        })
+        Ok(())
     }
 
     fn validated_model(model: impl Into<String>) -> Result<String, ProviderRouteContractError> {
@@ -672,6 +778,10 @@ impl<P> ProviderRouteSnapshot<P> {
         &self,
         model: impl Into<String>,
     ) -> Result<Self, ProviderRouteContractError> {
+        let inference_runtime = self
+            .inference_runtime
+            .clone()
+            .ok_or(ProviderRouteContractError::InferenceUnavailable)?;
         let declaration = ProviderRouteDeclaration::new(
             self.identity.adapter(),
             self.identity.profile().clone(),
@@ -684,7 +794,7 @@ impl<P> ProviderRouteSnapshot<P> {
             model,
             self.auth_source,
             self.policy,
-            self.inference_runtime.clone(),
+            inference_runtime,
             self.catalog_runtime.clone(),
         )
     }
@@ -693,8 +803,8 @@ impl<P> ProviderRouteSnapshot<P> {
         &self.identity
     }
 
-    pub fn model(&self) -> &str {
-        &self.model
+    pub fn model(&self) -> Option<&str> {
+        self.model.as_deref()
     }
 
     pub fn auth_source(&self) -> ProviderAuthSource {
@@ -705,8 +815,8 @@ impl<P> ProviderRouteSnapshot<P> {
         self.policy
     }
 
-    pub fn inference_runtime(&self) -> &Arc<P> {
-        &self.inference_runtime
+    pub fn inference_runtime(&self) -> Option<&Arc<P>> {
+        self.inference_runtime.as_ref()
     }
 
     pub fn catalog_runtime(&self) -> &Arc<P> {
@@ -743,7 +853,10 @@ impl<P> ProviderRouteCurrent<P> {
             .read()
             .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
             .clone();
-        let model = bound.model().to_string();
+        let model = bound
+            .model()
+            .ok_or(ProviderRouteContractError::InferenceUnavailable)?
+            .to_string();
         Ok(ProviderRouteHandle {
             bound,
             model,
@@ -765,9 +878,27 @@ impl<P> ProviderRouteCurrent<P> {
             .read()
             .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
             .clone();
+        if bound.inference_runtime().is_none() {
+            return Err(ProviderRouteContractError::InferenceUnavailable);
+        }
         Ok(ProviderRouteHandle {
             bound,
             model,
+            current: self.current.clone(),
+        })
+    }
+
+    /// Bind a catalog operation without inventing a selected model. Catalog
+    /// capability remains an admission-time check so optional catalogs keep
+    /// their graceful `None` contract.
+    pub fn bind_catalog(&self) -> Result<ProviderCatalogHandle<P>, ProviderRouteContractError> {
+        let bound = self
+            .current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
+            .clone();
+        Ok(ProviderCatalogHandle {
+            bound,
             current: self.current.clone(),
         })
     }
@@ -827,7 +958,10 @@ impl<P> ProviderRouteCurrent<P> {
                 current: actual,
             });
         }
-        if current.model() == model {
+        if current.inference_runtime().is_none() {
+            return Err(ProviderRouteContractError::InferenceUnavailable);
+        }
+        if current.model() == Some(model.as_str()) {
             return Ok(ProviderRouteHandle {
                 bound: current.clone(),
                 model,
@@ -898,7 +1032,10 @@ impl<P> ProviderRouteHandle<P> {
         required: &[ProviderCapability],
     ) -> Result<Arc<P>, ProviderRouteContractError> {
         self.validate(required)?;
-        Ok(self.bound.inference_runtime().clone())
+        self.bound
+            .inference_runtime()
+            .cloned()
+            .ok_or(ProviderRouteContractError::InferenceUnavailable)
     }
 
     /// Preserve the provider port's optional-catalog contract: a current route
@@ -929,7 +1066,93 @@ impl<P> ProviderRouteHandle<P> {
         if !self.bound.identity().capabilities().supports(capability) {
             return Ok(None);
         }
-        Ok(Some(self.bound.inference_runtime().clone()))
+        self.bound
+            .inference_runtime()
+            .cloned()
+            .map(Some)
+            .ok_or(ProviderRouteContractError::InferenceUnavailable)
+    }
+}
+
+/// One catalog-facing binding to an immutable route snapshot. It deliberately
+/// has no `Provider` implementation, model accessor, or chat method: catalog
+/// management cannot acquire inference authority by type confusion.
+pub struct ProviderCatalogHandle<P> {
+    bound: Arc<ProviderRouteSnapshot<P>>,
+    current: Arc<RwLock<Arc<ProviderRouteSnapshot<P>>>>,
+}
+
+impl<P> Clone for ProviderCatalogHandle<P> {
+    fn clone(&self) -> Self {
+        Self {
+            bound: self.bound.clone(),
+            current: self.current.clone(),
+        }
+    }
+}
+
+impl<P> ProviderCatalogHandle<P> {
+    pub fn identity(&self) -> &ProviderRouteIdentity {
+        self.bound.identity()
+    }
+
+    pub fn auth_source(&self) -> ProviderAuthSource {
+        self.bound.auth_source()
+    }
+
+    pub fn policy(&self) -> ProviderRoutePolicy {
+        self.bound.policy()
+    }
+
+    fn validate(&self) -> Result<(), ProviderRouteContractError> {
+        let current_generation = self
+            .current
+            .read()
+            .map_err(|_| ProviderRouteContractError::CurrentRouteUnavailable)?
+            .identity()
+            .generation();
+        self.bound
+            .identity()
+            .validate_for_send(current_generation, &[])
+    }
+
+    pub(crate) fn admit_optional_catalog_runtime(
+        &self,
+    ) -> Result<Option<Arc<P>>, ProviderRouteContractError> {
+        self.validate()?;
+        if !self
+            .bound
+            .identity()
+            .capabilities()
+            .supports(ProviderCapability::ModelCatalog)
+        {
+            return Ok(None);
+        }
+        Ok(Some(self.bound.catalog_runtime().clone()))
+    }
+}
+
+impl<P> ProviderCatalogHandle<P>
+where
+    P: Provider,
+{
+    pub async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        runtime.list_models().await
+    }
+
+    pub async fn list_models_with_telemetry(
+        &self,
+        telemetry: Option<ProviderTelemetrySink>,
+    ) -> Result<Option<Vec<String>>, ProviderError> {
+        let Some(runtime) = self.admit_optional_catalog_runtime()? else {
+            return Ok(None);
+        };
+        let telemetry =
+            telemetry.map(|sink| sink.with_route_generation(self.bound.identity().generation()));
+        runtime.list_models_with_telemetry(telemetry).await
     }
 }
 
@@ -1013,14 +1236,16 @@ where
     }
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
-        self.bind()?.list_models().await
+        self.bind_catalog()?.list_models().await
     }
 
     async fn list_models_with_telemetry(
         &self,
         telemetry: Option<ProviderTelemetrySink>,
     ) -> Result<Option<Vec<String>>, ProviderError> {
-        self.bind()?.list_models_with_telemetry(telemetry).await
+        self.bind_catalog()?
+            .list_models_with_telemetry(telemetry)
+            .await
     }
 }
 
@@ -1085,6 +1310,8 @@ pub enum ProviderRouteContractError {
         actual_bytes: usize,
         max_bytes: usize,
     },
+    #[error("provider model-catalog path must not be empty")]
+    EmptyCatalogPath,
     #[error("provider route generation must be nonzero")]
     ZeroGeneration,
     #[error("provider route generation space is exhausted")]
@@ -1113,6 +1340,8 @@ pub enum ProviderRouteContractError {
         "provider model-catalog capability ({declared}) does not match configured policy ({configured})"
     )]
     CatalogCapabilityMismatch { declared: bool, configured: bool },
+    #[error("catalog-only provider route must not declare {capability:?}")]
+    CatalogOnlyCapabilityMismatch { capability: ProviderCapability },
     #[error("provider route replacement must keep the same logical profile")]
     ReplacementProfileMismatch,
     #[error(
@@ -1124,6 +1353,8 @@ pub enum ProviderRouteContractError {
     },
     #[error("current provider route is unavailable")]
     CurrentRouteUnavailable,
+    #[error("provider route has no inference binding")]
+    InferenceUnavailable,
     #[error("provider request model does not match its immutable route binding")]
     RequestModelMismatch,
 }

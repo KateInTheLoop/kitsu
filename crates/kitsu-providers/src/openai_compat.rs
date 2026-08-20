@@ -79,6 +79,17 @@ pub struct OpenAICompatRouteConfig {
     pub policy: ProviderRoutePolicy,
 }
 
+/// Consumed composition input for a catalog-only compatible generation. It
+/// carries no model and constructs no inference runtime.
+pub struct OpenAICompatCatalogRouteConfig {
+    pub declaration: ProviderRouteDeclaration,
+    pub auth_source: ProviderAuthSource,
+    pub base_url: String,
+    pub chat_path: String,
+    pub models_path: String,
+    pub policy: ProviderRoutePolicy,
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum OpenAICompatRouteBuildError {
     #[error(transparent)]
@@ -128,6 +139,39 @@ pub fn build_openai_compatible_route(
         config.auth_source,
         config.policy,
         inference,
+        catalog,
+    )
+    .map_err(Into::into)
+}
+
+/// Resolve auth once and construct a catalog-only generation. The resulting
+/// snapshot cannot be rebound for chat and therefore needs no placeholder
+/// model or unused inference runtime.
+pub fn build_openai_compatible_catalog_route(
+    config: OpenAICompatCatalogRouteConfig,
+    auth: &dyn AuthProvider,
+) -> Result<ProviderRouteSnapshot<OpenAICompatProvider>, OpenAICompatRouteBuildError> {
+    if config.models_path.is_empty() {
+        return Err(ProviderRouteContractError::EmptyCatalogPath.into());
+    }
+    let frozen_auth: Arc<dyn AuthProvider> = Arc::new(FrozenAuth::resolve(auth)?);
+    let catalog = Arc::new(
+        OpenAICompatProvider::new(
+            OpenAICompatConfig {
+                base_url: config.base_url,
+                chat_path: config.chat_path,
+                models_path: Some(config.models_path),
+                retries: config.policy.catalog_retries(),
+                timeout: config.policy.catalog_timeout(),
+            },
+            frozen_auth,
+        )
+        .with_discovery_timeout(config.policy.catalog_timeout()),
+    );
+    ProviderRouteSnapshot::initial_catalog_only(
+        config.declaration,
+        config.auth_source,
+        config.policy,
         catalog,
     )
     .map_err(Into::into)

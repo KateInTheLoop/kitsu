@@ -13,6 +13,12 @@ fn declaration(catalog: bool) -> ProviderRouteDeclaration {
     )
 }
 
+fn catalog_declaration() -> ProviderRouteDeclaration {
+    ProviderRouteDeclaration::compatible_catalog_v1(
+        ProviderProfileId::derive_v1(b"snapshot-test", b"primary").unwrap(),
+    )
+}
+
 fn policy(catalog: ProviderCatalogPolicy) -> ProviderRoutePolicy {
     ProviderRoutePolicy::new(
         2,
@@ -49,7 +55,7 @@ fn initial_snapshot_owns_one_coherent_runtime_generation() {
     .unwrap();
 
     assert_eq!(snapshot.identity().generation().get(), 1);
-    assert_eq!(snapshot.model(), "model-a");
+    assert_eq!(snapshot.model(), Some("model-a"));
     assert_eq!(snapshot.auth_source(), ProviderAuthSource::Environment);
     assert_eq!(snapshot.policy().inference_retries(), 2);
     assert_eq!(snapshot.policy().catalog_retries(), 0);
@@ -65,13 +71,42 @@ fn initial_snapshot_owns_one_coherent_runtime_generation() {
         snapshot.policy().advisory_discovery_timeout(),
         Duration::from_secs(2)
     );
-    assert!(Arc::ptr_eq(snapshot.inference_runtime(), &inference));
+    assert!(Arc::ptr_eq(
+        snapshot.inference_runtime().unwrap(),
+        &inference
+    ));
+    assert!(Arc::ptr_eq(snapshot.catalog_runtime(), &catalog));
+}
+
+#[test]
+fn catalog_only_snapshot_has_no_inference_binding_or_invented_model() {
+    let catalog = Arc::new("catalog-runtime");
+    let snapshot = ProviderRouteSnapshot::initial_catalog_only(
+        catalog_declaration(),
+        ProviderAuthSource::Environment,
+        policy(ProviderCatalogPolicy::Configured),
+        catalog.clone(),
+    )
+    .unwrap();
+
+    assert_eq!(snapshot.identity().generation().get(), 1);
+    assert_eq!(snapshot.model(), None);
+    assert_eq!(snapshot.inference_runtime(), None);
     assert!(Arc::ptr_eq(snapshot.catalog_runtime(), &catalog));
 }
 
 #[test]
 fn snapshot_rejects_model_and_catalog_ambiguity_before_publication() {
     let runtime = Arc::new(());
+    assert!(matches!(
+        snapshot_error(ProviderRouteSnapshot::initial_catalog_only(
+            declaration(true),
+            ProviderAuthSource::None,
+            policy(ProviderCatalogPolicy::Configured),
+            runtime.clone(),
+        )),
+        ProviderRouteContractError::CatalogOnlyCapabilityMismatch { .. }
+    ));
     assert_eq!(
         snapshot_error(ProviderRouteSnapshot::initial(
             declaration(false),

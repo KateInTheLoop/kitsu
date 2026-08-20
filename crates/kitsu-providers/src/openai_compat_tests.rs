@@ -18,7 +18,8 @@ use wiremock::{Mock, MockServer, ResponseTemplate};
 use crate::auth::{EnvBearerAuth, NoAuth};
 use crate::error::{ProviderError, ProviderResponsePart};
 use crate::openai_compat::{
-    build_openai_compatible_route, OpenAICompatConfig, OpenAICompatProvider,
+    build_openai_compatible_catalog_route, build_openai_compatible_route,
+    OpenAICompatCatalogRouteConfig, OpenAICompatConfig, OpenAICompatProvider,
     OpenAICompatRouteConfig,
 };
 use crate::route::{
@@ -123,10 +124,10 @@ fn route_factory_freezes_auth_and_builds_both_runtimes_from_one_policy() {
     .unwrap();
 
     env::set_var(TEST_ENV, "generation-two-token");
-    let inference = snapshot.inference_runtime();
+    let inference = snapshot.inference_runtime().unwrap();
     let catalog = snapshot.catalog_runtime();
     assert_eq!(snapshot.identity().generation().get(), 1);
-    assert_eq!(snapshot.model(), "model-a");
+    assert_eq!(snapshot.model(), Some("model-a"));
     assert_eq!(inference.base_url, catalog.base_url);
     assert_eq!(inference.chat_path, catalog.chat_path);
     assert_eq!(inference.models_path, catalog.models_path);
@@ -140,6 +141,47 @@ fn route_factory_freezes_auth_and_builds_both_runtimes_from_one_policy() {
     let (_, value) = inference.auth.header().unwrap().unwrap();
     assert_eq!(value.as_bytes(), b"Bearer generation-one-token");
     assert!(value.is_sensitive());
+}
+
+#[test]
+#[serial]
+fn catalog_route_factory_freezes_auth_without_constructing_an_inference_binding() {
+    let _guard = EnvGuard::set(TEST_ENV, "catalog-generation-token");
+    let auth = EnvBearerAuth::new(TEST_ENV, None, None);
+    let declaration = ProviderRouteDeclaration::compatible_catalog_v1(
+        ProviderProfileId::derive_v1(b"catalog-route-factory", b"primary").unwrap(),
+    );
+    let policy = ProviderRoutePolicy::new(
+        9,
+        0,
+        Duration::from_secs(120),
+        Duration::from_secs(45),
+        Duration::from_secs(2),
+        ProviderCatalogPolicy::Configured,
+    )
+    .unwrap();
+    let snapshot = build_openai_compatible_catalog_route(
+        OpenAICompatCatalogRouteConfig {
+            declaration,
+            auth_source: ProviderAuthSource::Environment,
+            base_url: "https://example.invalid".to_string(),
+            chat_path: CHAT_PATH.to_string(),
+            models_path: "/v1/models".to_string(),
+            policy,
+        },
+        &auth,
+    )
+    .unwrap();
+
+    env::set_var(TEST_ENV, "later-token");
+    assert_eq!(snapshot.model(), None);
+    assert!(snapshot.inference_runtime().is_none());
+    let catalog = snapshot.catalog_runtime();
+    assert_eq!(catalog.retries, 0);
+    assert_eq!(catalog.timeout, Duration::from_secs(45));
+    assert_eq!(catalog.discovery_timeout, Duration::from_secs(45));
+    let (_, value) = catalog.auth.header().unwrap().unwrap();
+    assert_eq!(value.as_bytes(), b"Bearer catalog-generation-token");
 }
 
 /// An SSE body with two content deltas then `[DONE]`, mirroring the OpenAI

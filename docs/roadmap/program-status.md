@@ -1,7 +1,7 @@
 # Improvement Program Status
 
-Status: E00, E01, E02, E04-S01, and E04-S02 are accepted through Cycle 037;
-E04-S03 is in progress;
+Status: E00, E01, E02, and E04-S01/S02/S03 are accepted through Cycle 038;
+E04-S04 is next;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 37 / 37 |
+| Accepted cycles/commits after this cycle | 38 / 38 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S03-C5 (Cycle 038) — management-route composition |
+| Active epic/card | E04 / E04-S04-C1 (Cycle 039) — native Messages text/usage/terminal adapter |
 
 ## Epic status
 
@@ -23,7 +23,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02 accepted, E04-S03 through C4 | Sixteen wire, six route-contract, three derivation/declaration, three snapshot, ten route-handle, auth-freeze, factory, composition, generation-aware retry/replay/catalog/compaction/subagent/cancellation, and CLI model-publication cases cover protocol evidence, secret-free identity, current-generation primary admission, immutable request models, exact successor publication, failed replacement retention, old-work drain, and physical-attempt attribution; management routes, full config replacement, complete receipts, and compiled adapter remain |
+| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted | Sixteen wire, six route-contract, three derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, and attempt attribution; native Messages, complete receipts, and alternate conformance remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -71,8 +71,9 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 033 | `c26fac4` | Bounded opaque profile derivation and truthful current compatible-Chat declaration |
 | 034 | `70ab219` | Initial immutable compatible-Chat snapshot with shared frozen auth and route policy |
 | 035 | `d95bf0b` | Current-generation primary handles, exact replacement cuts, and optional-catalog preservation |
-| 036 | this document's commit | Model-bound logical runs and atomic default/resumed successor publication |
-| 037 | this document's commit | Immutable-generation physical-attempt evidence and auxiliary mutation matrix |
+| 036 | `84f9515` | Model-bound logical runs and atomic default/resumed successor publication |
+| 037 | `09f38a5` | Immutable-generation physical-attempt evidence and auxiliary mutation matrix |
+| 038 | this document's commit | Truthful catalog-only management routes and doctor inference binding |
 
 ## Current green gates
 
@@ -89,10 +90,11 @@ E08 telemetry observability was scoped in Cycle 030 on
   domain-separated SHA-256 vector, input bounds, canonical path identity,
   route-content independence, exact compatible-Chat capabilities, and the fact
   that `anthropic` remains a display/config label until a native adapter ships.
-  The CLI retains the declaration privately but does not yet publish a live
+  The CLI retains the declaration privately but does not yet publish a complete
   generation receipt.
-- Three snapshot and ten route-handle cases plus auth, compatible-Chat factory, and CLI source tests
-  pin generation one, bounded model/time policy, exact catalog capability,
+- Four snapshot and twelve route-handle cases plus auth,
+  compatible-Chat/catalog factories, and CLI source tests pin generation one,
+  bounded model/time policy, exact chat-versus-catalog capabilities,
   shared endpoint/path/policy construction, and one sensitive credential across
   later environment mutation. `ChatSetup` owns one current publisher; ask/chat,
   foreground/subagent/compaction inference, model catalog, context discovery,
@@ -105,7 +107,10 @@ E08 telemetry observability was scoped in Cycle 030 on
   drain entirely on generation one after generation two is published;
   cancellation retains generation one; semantic `/retry` binds generation two;
   compaction, runtime catalog JSONL, and bounded subagent telemetry preserve the
-  same evidence. Raw/legacy providers remain explicitly unattributed.
+  same evidence. Top-level `models` now emits the same generation attribution.
+  Catalog-only handles have no model, inference runtime, or chat method; stale
+  replacement is zero-send. Explicit doctor inference and catalog probes bind
+  matching immutable routes, while offline doctor still constructs none.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
 - Workspace/all-target Clippy passes with warnings denied; formatting and diff
@@ -166,9 +171,12 @@ publishes default and resumed model changes before live session mutation, and
 resolves one scoped binding per subagent run after profile selection. Cycle 037
 puts generation attribution outside adapter-authored transport events and
 closes the chat-owned retry/replay/catalog/compaction/subagent/cancellation
-mutation matrix. Cycle 038 composes top-level `models` and explicit doctor
-probes through a truthful management route without sacrificing catalog-only
-operation.
+mutation matrix. Cycle 038 gives catalog management a capability-narrow
+snapshot with no model or inference runtime, migrates top-level `models` and
+explicit doctor catalog through it, and binds the billable doctor inference
+probe to a model-bearing generation. E04-S03 is accepted; Cycle 039 starts the
+compiled native Messages text/usage/terminal path without enabling it in live
+composition.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
