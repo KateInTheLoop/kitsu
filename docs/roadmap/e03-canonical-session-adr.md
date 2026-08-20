@@ -12,6 +12,8 @@ only accepted current-v1 logical import: an exact, loss-bearing legacy baseline
 at `Genesis`; it still has no production publication caller.
 Cycle 064 composes that preparation with the private physical transaction as a
 create-only operation while keeping production behavior unmounted.
+Cycle 065 adds a pure, unmounted successor assembler for one complete new
+operation from neutral E02 terminal truth and closed transcript/effect facts.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -439,6 +441,17 @@ cannot weaken or replace any backend-neutral assertion.
    orphan while the borrowed v1 bytes and HEAD remain unchanged. The seam is
    still unmounted. Next assemble one new whole operation from neutral E02
    terminal/transcript/effect facts before any live save switches ownership.
+   **Pure whole-operation assembly complete in Cycle 065:** the assembler first
+   validates the canonical base, requires a fresh opaque revision and monotonic
+   commit time, converts the neutral E02 terminal, derives after-HEAD solely
+   from assistant disposition, and appends one bounded message/effect/artifact
+   closure. Success/committed advances to its exact turn; a provider fault with
+   discarded output records the operation but retains the prior selected HEAD.
+   Missing artifacts, terminal/disposition disagreement, same revision, and
+   backwards time refuse. The legacy baseline and lineage remain exact, while
+   the old revision-bound compaction projection is cleared. Next compose an
+   artifact-free assembled successor with the file transaction and stale/cut
+   fixtures before physical artifact publication is designed.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

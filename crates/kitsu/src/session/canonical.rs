@@ -4,9 +4,10 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
 use kitsu_core::session::{
-    CanonicalHistory, CanonicalOperation, ExpectedRevision, LogicalHead, RevisionId,
-    SessionAssistantDisposition, SessionId, SessionOutcomeClass, StoreId, TurnId,
+    CanonicalHistory, CanonicalOperation, CanonicalTerminal, ExpectedRevision, LogicalHead,
+    RevisionId, SessionAssistantDisposition, SessionId, SessionOutcomeClass, StoreId, TurnId,
 };
+use kitsu_core::TerminalOutcome;
 use serde::{Deserialize, Serialize};
 
 pub(super) const LOGICAL_SCHEMA_V1: u32 = 1;
@@ -125,6 +126,14 @@ struct CanonicalOperationV1 {
     operation: CanonicalOperation,
     messages: Vec<CanonicalMessageV1>,
     retained_effects: Vec<RetainedEffectRefV1>,
+}
+
+struct CanonicalOperationInputV1 {
+    turn_id: TurnId,
+    terminal: TerminalOutcome,
+    messages: Vec<CanonicalMessageV1>,
+    retained_effects: Vec<RetainedEffectRefV1>,
+    new_artifacts: Vec<ImmutableArtifactRefV1>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -427,6 +436,57 @@ pub(super) fn prepare_current_v1_legacy_baseline(
 ) -> Result<CanonicalSessionRevisionV1, String> {
     let input = decode_current_v1_migration_input(bytes, expected_session_id)?;
     build_current_v1_legacy_baseline(input, store_id, revision_id, committed_at)
+}
+
+fn append_complete_operation(
+    base: &CanonicalSessionRevisionV1,
+    revision_id: RevisionId,
+    committed_at: String,
+    input: CanonicalOperationInputV1,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(base)?;
+    if revision_id == base.revision_id {
+        return Err("canonical successor revision must differ from its parent".to_string());
+    }
+    validate_timestamp(&committed_at, "canonical successor committed_at")?;
+    validate_timestamp_order(&base.committed_at, &committed_at, "canonical successor")?;
+
+    let CanonicalOperationInputV1 {
+        turn_id,
+        terminal,
+        messages,
+        retained_effects,
+        new_artifacts,
+    } = input;
+    let terminal = CanonicalTerminal::from_terminal(&terminal);
+    let before_head = base.selected_head.clone();
+    let after_head = match terminal.assistant() {
+        SessionAssistantDisposition::Committed | SessionAssistantDisposition::CommittedPartial => {
+            LogicalHead::Turn(turn_id.clone())
+        }
+        SessionAssistantDisposition::Discarded | SessionAssistantDisposition::Absent => {
+            before_head.clone()
+        }
+    };
+    let operation = CanonicalOperation::new(turn_id, terminal, before_head, after_head.clone())
+        .map_err(|error| format!("cannot assemble canonical operation: {error}"))?;
+
+    let mut next = base.clone();
+    next.revision_id = revision_id;
+    next.parent_revision = ExpectedRevision::Exact(base.revision_id.clone());
+    next.committed_at = committed_at;
+    next.operations.push(CanonicalOperationV1 {
+        operation,
+        messages,
+        retained_effects,
+    });
+    next.selected_head = after_head;
+    next.artifact_manifest.extend(new_artifacts);
+    // A projection is bound to the old revision and selected HEAD. It is never
+    // carried forward as if it summarized the successor operation.
+    next.compaction_binding = None;
+    validate_canonical_payload(&next)?;
+    Ok(next)
 }
 
 fn convert_current_message(
@@ -1121,6 +1181,36 @@ mod tests {
         ])
     }
 
+    fn legacy_base(revision: &str) -> CanonicalSessionRevisionV1 {
+        prepare_current_v1_legacy_baseline(
+            &current_v1(closed_messages()),
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new(revision).unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap()
+    }
+
+    fn operation_input(
+        turn: &str,
+        run: &str,
+        class: kitsu_core::RunOutcomeClass,
+        assistant: kitsu_core::RunAssistantDisposition,
+        messages: serde_json::Value,
+        retained_effects: serde_json::Value,
+        new_artifacts: serde_json::Value,
+    ) -> CanonicalOperationInputV1 {
+        let spec = kitsu_core::RunSpec::new(kitsu_core::RunId::new(run).unwrap());
+        CanonicalOperationInputV1 {
+            turn_id: TurnId::new(turn).unwrap(),
+            terminal: spec.terminal(class, assistant),
+            messages: serde_json::from_value(messages).unwrap(),
+            retained_effects: serde_json::from_value(retained_effects).unwrap(),
+            new_artifacts: serde_json::from_value(new_artifacts).unwrap(),
+        }
+    }
+
     #[test]
     fn strict_current_v1_is_preserved_as_non_publishable_migration_input() {
         let bytes = current_v1(closed_messages());
@@ -1347,6 +1437,190 @@ mod tests {
                 .unwrap_err()
                 .contains("misplaced system role")
         );
+    }
+
+    #[test]
+    fn operation_assembler_appends_one_terminal_exchange_with_exact_closure() {
+        let base = legacy_base("revision-1");
+        let input = operation_input(
+            "turn-1",
+            "run-1",
+            kitsu_core::RunOutcomeClass::Succeeded,
+            kitsu_core::RunAssistantDisposition::Committed,
+            serde_json::json!([
+                {"role":"user","content":"inspect new state"},
+                {"role":"assistant","content":"","tool_calls":[{
+                    "tool_name":"fs_read_file","args":"{\"path\":\"b.rs\"}","call_id":"call-new"
+                }]},
+                {"role":"tool","call_id":"call-new","content":"saved immutable output",
+                    "artifact_ids":["artifact-1"]},
+                {"role":"assistant","content":"new answer","tool_calls":[]}
+            ]),
+            serde_json::json!([{"effect_id":"effect-1","artifact_ids":["artifact-1"]}]),
+            serde_json::json!([{
+                "artifact_schema":1,
+                "artifact_id":"artifact-1",
+                "sha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "bytes":22,
+                "media_type":"text/plain"
+            }]),
+        );
+
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            input,
+        )
+        .unwrap();
+
+        assert_eq!(
+            next.parent_revision,
+            ExpectedRevision::Exact(RevisionId::new("revision-1").unwrap())
+        );
+        assert_eq!(
+            next.selected_head,
+            LogicalHead::Turn(TurnId::new("turn-1").unwrap())
+        );
+        assert_eq!(next.operations.len(), 1);
+        assert_eq!(
+            next.operations[0].operation.before_head(),
+            &LogicalHead::Genesis
+        );
+        assert_eq!(
+            next.operations[0].operation.after_head(),
+            &LogicalHead::Turn(TurnId::new("turn-1").unwrap())
+        );
+        assert_eq!(next.artifact_manifest.len(), 1);
+        assert_eq!(next.legacy_baseline, base.legacy_baseline);
+        assert!(next.compaction_binding.is_none());
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&next).unwrap()).unwrap(),
+            next
+        );
+    }
+
+    #[test]
+    fn operation_assembler_records_discarded_terminal_without_advancing_head() {
+        let base = append_complete_operation(
+            &legacy_base("revision-1"),
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"first"},
+                    {"role":"assistant","content":"first answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        let prior_head = base.selected_head.clone();
+
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("revision-3").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            operation_input(
+                "turn-2",
+                "run-2",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"second"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(next.operations.len(), 2);
+        assert_eq!(next.selected_head, prior_head);
+        assert_eq!(next.operations[1].operation.before_head(), &prior_head);
+        assert_eq!(next.operations[1].operation.after_head(), &prior_head);
+        assert_eq!(
+            next.operations[1].operation.terminal().class(),
+            SessionOutcomeClass::ProviderFault
+        );
+    }
+
+    #[test]
+    fn operation_assembler_refuses_unclosed_or_inconsistent_facts() {
+        let base = legacy_base("revision-1");
+        let missing_artifact = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"inspect"},
+                    {"role":"assistant","content":"done","tool_calls":[]}
+                ]),
+                serde_json::json!([{"effect_id":"effect-1","artifact_ids":["missing"]}]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(missing_artifact.contains("missing artifact"));
+
+        let mismatched_terminal = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(mismatched_terminal.contains("disagree"));
+
+        let same_revision = append_complete_operation(
+            &base,
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(same_revision.contains("successor revision"));
+
+        let backwards_time = append_complete_operation(
+            &base,
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T10:59:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"inspect"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap_err();
+        assert!(backwards_time.contains("predates"));
     }
 
     #[test]
