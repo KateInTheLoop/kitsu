@@ -1,7 +1,8 @@
 # ADR: canonical session revision and logical HEAD
 
-Status: design contract accepted in Cycle 050 and neutral logical values
-accepted in Cycle 051; no production format or store behavior changes yet.
+Status: design contract accepted in Cycle 050, neutral logical values accepted
+in Cycle 051, and the private compiled physical layout/record contract accepted
+in Cycle 058. Neither migration nor production store behavior has changed yet.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -121,6 +122,51 @@ Current `SavedSession` persists no terminal outcome, lineage revision, selected
 head, artifact manifest, or compaction binding. Those facts cannot be inferred
 from the final message, snapshot path, artifact directory, or process exit
 during migration.
+
+## Physical file-store v1 contract
+
+Cycle 058 freezes a private compiled physical schema without mounting it. It is
+versioned independently from both current `SavedSession.version = 1` and the
+canonical logical schema. Existing `<session-id>.json`, `.locks`, archive, and
+artifact paths remain untouched and authoritative until explicit migration.
+
+```text
+<current session root>/.kitsu-store-v1/
+  store.json
+  revisions/
+    id-<lowercase base32 session identity>/
+      id-<lowercase base32 revision identity>/
+        manifest.json
+        canonical.json
+  heads/
+    id-<lowercase base32 session identity>.json
+  staging/
+  .locks/
+```
+
+Identity components use lowercase RFC 4648 base32 without padding and an `id-`
+prefix. The encoding is reversible, maps `.`/`..` to ordinary non-special
+components, remains collision-free on case-insensitive filesystems, and keeps a
+maximum 128-byte neutral identity below the portable 255-byte filename limit.
+Raw identities, display names, paths, timestamps, hashes, and ordinals are never
+used as physical components or revision identities.
+
+`store.json` is create-new and binds one opaque `StoreId`. Each revision
+directory is staged privately and installed create-new; `manifest.json` binds
+physical/logical schema revisions, store/session/revision identity, exact parent
+expectation, canonical byte length, and lowercase SHA-256 of the exact immutable
+`canonical.json` bytes. The current head record binds store/session/revision and
+the exact manifest-byte SHA-256. It intentionally contains no logical HEAD: the
+selected `LogicalHead` remains inside the validated canonical payload.
+
+Only the small head record is replaceable, and only after an exact session-bound
+writer-fence confirmation plus expected-revision re-read. A staged or installed
+revision directory is not canonical merely because it exists; only a validated
+head record can select it. Revision/store installation is no-clobber. Unknown
+fields, unknown record kinds, future physical versions, zero logical versions,
+invalid sizes/digests, self-parenting, and physical-location identity mismatch
+fail closed before publication. Digest verification against actual stored bytes,
+descriptor-pinned I/O, and head CAS are mounted in later cards.
 
 ## Store contract and typed states
 
@@ -296,8 +342,11 @@ cannot weaken or replace any backend-neutral assertion.
    **Logical K07 fencing complete in Cycle 057:** exact session-bound generations
    exclude a second writer, permit independent sessions, and reject lost,
    replaced, or wrong-session tokens before mint/publication. Next define the
-   physical revision envelope and mount real fence/K04 cuts, then migrate
-   whole-operation outcome publication.
+   **Physical layout/record contract complete in Cycle 058:** the disjoint
+   namespace, reversible path encoding, create-new store/revision records,
+   replace-under-fence head pointer, byte/digest bindings, and fail-closed fixed
+   vectors are compiled but not mounted. Next add descriptor-pinned immutable
+   record I/O and head CAS, then migrate whole-operation outcome publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
