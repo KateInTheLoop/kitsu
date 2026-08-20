@@ -1,7 +1,7 @@
 # Current Harness Comparison
 
 Status: Kitsu-owned comparison from post-E01 runtime pin `986fba9`, updated
-through accepted Cycle 043; frozen research inputs and hashes are listed in
+through accepted Cycle 044; frozen research inputs and hashes are listed in
 [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md).
 
 The detailed source-by-source transfer decisions remain in the
@@ -32,7 +32,7 @@ code navigation.
 | Provider retry/context discovery | Wider bounded retry and nested context-window discovery landed in the 67-commit delta; Cycles 032-038 bind chat, retry, replay, catalog, compaction, subagent, top-level, and doctor sends to immutable generations | **Generation gap closed for current production**; native dialect and receipts remain E04 |
 | Structural code navigation | `repo_grep`, `find_symbol`, `outline_file`, and `read_manifest` exist under read authority | **Narrow gap closed**; semantic selector remains E07 |
 | Timeout/recovery truth | Completed tool rounds survive piped deadline failure; JSONL framing improved | **Partial**; causal run phases remain E02 and session recovery/HEAD remains E03 |
-| Provider dialect breadth | A distinct native Messages text/tool/usage/terminal implementation now passes exact wire, fault/lifecycle, one-attempt telemetry, frozen-auth route, truthful-capability, and generation-attribution fixtures. All live flavors still select compatible Chat, and bounded native retry/common conformance remain open | **Partial**; finish E04-S04 before live selection |
+| Provider dialect breadth | A distinct native Messages text/tool/usage/terminal implementation now passes exact wire, fault/lifecycle, telemetry, frozen-auth route, truthful-capability, generation-attribution, bounded retry/deadline, and backoff-cancellation fixtures using the same retry owner as compatible Chat. All live flavors still select compatible Chat, and common two-adapter route conformance remains open | **Partial**; finish E04-S04 before live selection |
 | Guided onboarding/model choice | Config and model listing exist, but setup is still manual and not transactional | **Open**; E05 after E04 |
 | Session lineage/branch-at-turn | Whole-history fresh-ID fork exists; no logical HEAD/revision/turn boundary | **Open**; E03 |
 | MCP/external tools | No client or supervisor is compiled | **Open experiment**; E06 after E02 |
@@ -47,7 +47,7 @@ did not execute.
 
 | Boundary | Score | Why |
 |---|---:|---|
-| X001 provider | Fail | Immutable current-send generations and one fixture-only distinct text/tool wire with fault, terminal-attempt, frozen-route, and generation-attribution parity pass, but native retry/live composition, complete receipts, and alternate conformance are absent |
+| X001 provider | Fail | Immutable current-send generations and one fixture-only distinct text/tool wire with fault, terminal-attempt, frozen-route, generation-attribution, and bounded-retry parity pass, but common two-adapter conformance, live composition, complete receipts, and alternate conformance are absent |
 | X002 tool/source | Fail | Registry integrity improved, but no admitted/supervised external source or two-source suite |
 | X003 host/UI | Fail | No named independent host/principal or shared carrier identity fixture |
 | X004 automation/runtime | Fail | Neutral run/outcome phases and an independent seven-carrier default-runtime evaluator now exist; no named alternate runtime adapter runs the suite |

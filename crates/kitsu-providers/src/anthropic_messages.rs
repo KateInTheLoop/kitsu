@@ -1,12 +1,12 @@
 //! Native Anthropic Messages wire adapter.
 //!
 //! The compiled slices support streamed text and correlated tool use/results.
-//! Retries, catalog discovery, route publication, and live CLI selection remain
-//! disabled until their own conformance fixtures pass.
+//! Catalog discovery and live CLI selection remain disabled until their own
+//! conformance fixtures pass.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, SystemTime};
 
 use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
@@ -14,6 +14,12 @@ use serde::Serialize;
 
 use crate::auth::{AuthProvider, FrozenAuth};
 use crate::error::AuthError;
+use crate::retry::{
+    duration_millis, is_retryable_status, record_attempt, remaining_deadline_millis,
+    remaining_request_time, retry_delay_decision, retry_jitter_sample, sleep_before_retry,
+    sleep_before_retry_observed, status_category, InFlightAttemptGuard, ResponseBodyAttemptGuard,
+    RetryBackoffAttemptGuard,
+};
 use crate::route::{
     ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
     ProviderRouteSnapshot,
@@ -38,6 +44,7 @@ const MAX_STREAMED_TOOL_CALLS: usize = 64;
 pub struct AnthropicMessagesConfig {
     pub base_url: String,
     pub messages_path: String,
+    pub retries: u32,
     /// End-to-end request budget, including the streamed response body.
     pub timeout: Duration,
 }
@@ -63,8 +70,6 @@ pub enum AnthropicMessagesRouteBuildError {
     DeclarationMismatch,
     #[error("native Messages path cannot be empty")]
     EmptyMessagesPath,
-    #[error("native Messages retries are not implemented (configured {configured})")]
-    UnsupportedInferenceRetries { configured: u32 },
     #[error("native Messages model catalog policy is not implemented")]
     UnsupportedCatalogPolicy,
 }
@@ -76,6 +81,7 @@ pub struct AnthropicMessagesProvider {
     base_url: String,
     messages_path: String,
     auth: Arc<dyn AuthProvider>,
+    retries: u32,
     timeout: Duration,
 }
 
@@ -86,6 +92,7 @@ impl AnthropicMessagesProvider {
             base_url: config.base_url,
             messages_path: config.messages_path,
             auth,
+            retries: config.retries,
             timeout: config.timeout,
         }
     }
@@ -106,8 +113,8 @@ impl AnthropicMessagesProvider {
 }
 
 /// Freeze auth once and publish a truthful native Messages generation.
-/// Retrying and catalog policy are rejected because this compiled adapter does
-/// not implement them yet; accepting either would make the snapshot lie.
+/// Catalog policy is rejected because this compiled adapter does not implement
+/// it yet; bounded inference retry policy is frozen into the runtime.
 pub fn build_anthropic_messages_route(
     config: AnthropicMessagesRouteConfig,
     auth: &dyn AuthProvider,
@@ -120,13 +127,6 @@ pub fn build_anthropic_messages_route(
     if config.messages_path.is_empty() {
         return Err(AnthropicMessagesRouteBuildError::EmptyMessagesPath);
     }
-    if config.policy.inference_retries() != 0 {
-        return Err(
-            AnthropicMessagesRouteBuildError::UnsupportedInferenceRetries {
-                configured: config.policy.inference_retries(),
-            },
-        );
-    }
     if config.policy.catalog().is_configured() || config.policy.catalog_retries() != 0 {
         return Err(AnthropicMessagesRouteBuildError::UnsupportedCatalogPolicy);
     }
@@ -136,6 +136,7 @@ pub fn build_anthropic_messages_route(
         AnthropicMessagesConfig {
             base_url: config.base_url,
             messages_path: config.messages_path,
+            retries: config.policy.inference_retries(),
             timeout: config.policy.inference_timeout(),
         },
         frozen_auth,
@@ -337,152 +338,6 @@ fn map_send_error(error: reqwest::Error) -> ProviderError {
         ProviderError::Timeout
     } else {
         ProviderError::Connection(error.to_string())
-    }
-}
-
-fn remaining_deadline_millis(started: tokio::time::Instant, timeout: Duration) -> u64 {
-    timeout
-        .checked_sub(started.elapsed())
-        .map(|remaining| remaining.as_millis().min(u128::from(u64::MAX)) as u64)
-        .unwrap_or(0)
-}
-
-fn status_category(status: StatusCode) -> ProviderAttemptCategory {
-    match status {
-        StatusCode::TOO_MANY_REQUESTS => ProviderAttemptCategory::RateLimited,
-        StatusCode::SERVICE_UNAVAILABLE => ProviderAttemptCategory::Unavailable,
-        StatusCode::UNAUTHORIZED | StatusCode::FORBIDDEN => ProviderAttemptCategory::Authentication,
-        status if status.is_success() => ProviderAttemptCategory::Success,
-        status if status.is_client_error() => ProviderAttemptCategory::ClientError,
-        status if status.is_server_error() => ProviderAttemptCategory::ServerError,
-        _ => ProviderAttemptCategory::UnexpectedStatus,
-    }
-}
-
-fn record_attempt(telemetry: Option<&ProviderTelemetrySink>, event: ProviderAttemptEvent) {
-    if let Some(telemetry) = telemetry {
-        let _ = telemetry.record(event);
-    }
-}
-
-struct NativeSendAttemptGuard {
-    telemetry: Option<ProviderTelemetrySink>,
-    started: tokio::time::Instant,
-    timeout: Duration,
-    armed: bool,
-}
-
-impl NativeSendAttemptGuard {
-    fn new(
-        telemetry: Option<&ProviderTelemetrySink>,
-        started: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            telemetry: telemetry.cloned(),
-            started,
-            timeout,
-            armed: true,
-        }
-    }
-
-    fn completed(mut self) {
-        self.armed = false;
-    }
-}
-
-impl Drop for NativeSendAttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        record_attempt(
-            self.telemetry.as_ref(),
-            ProviderAttemptEvent {
-                attempt: 1,
-                max_attempts: 1,
-                category: ProviderAttemptCategory::Cancelled,
-                status: None,
-                outcome: ProviderAttemptOutcome::Cancelled,
-                terminal: true,
-                retry_delay_ms: None,
-                retry_after_used: false,
-                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
-            },
-        );
-    }
-}
-
-struct NativeBodyAttemptGuard {
-    telemetry: Option<ProviderTelemetrySink>,
-    status: u16,
-    started: tokio::time::Instant,
-    timeout: Duration,
-    armed: bool,
-}
-
-impl NativeBodyAttemptGuard {
-    fn new(
-        telemetry: Option<&ProviderTelemetrySink>,
-        status: u16,
-        started: tokio::time::Instant,
-        timeout: Duration,
-    ) -> Self {
-        Self {
-            telemetry: telemetry.cloned(),
-            status,
-            started,
-            timeout,
-            armed: true,
-        }
-    }
-
-    fn completed(mut self) {
-        self.record(
-            ProviderAttemptCategory::Success,
-            ProviderAttemptOutcome::BodyCompleted,
-        );
-        self.armed = false;
-    }
-
-    fn failed(mut self, error: &ProviderError) {
-        let category = match error {
-            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
-            ProviderError::Connection(_) => ProviderAttemptCategory::Connection,
-            ProviderError::ResponseTooLarge { .. } => ProviderAttemptCategory::ResponseTooLarge,
-            _ => ProviderAttemptCategory::InvalidResponse,
-        };
-        self.record(category, ProviderAttemptOutcome::BodyFailed);
-        self.armed = false;
-    }
-
-    fn record(&self, category: ProviderAttemptCategory, outcome: ProviderAttemptOutcome) {
-        record_attempt(
-            self.telemetry.as_ref(),
-            ProviderAttemptEvent {
-                attempt: 1,
-                max_attempts: 1,
-                category,
-                status: Some(self.status),
-                outcome,
-                terminal: true,
-                retry_delay_ms: None,
-                retry_after_used: false,
-                remaining_deadline_ms: remaining_deadline_millis(self.started, self.timeout),
-            },
-        );
-    }
-}
-
-impl Drop for NativeBodyAttemptGuard {
-    fn drop(&mut self) {
-        if !self.armed {
-            return;
-        }
-        self.record(
-            ProviderAttemptCategory::Cancelled,
-            ProviderAttemptOutcome::Cancelled,
-        );
     }
 }
 
@@ -913,7 +768,7 @@ enum MessagesSseState {
         stream: ByteStream,
         decoder: MessagesSseDecoder,
         queue: VecDeque<ChatDelta>,
-        attempt_guard: NativeBodyAttemptGuard,
+        attempt_guard: ResponseBodyAttemptGuard,
     },
     Draining {
         queue: VecDeque<ChatDelta>,
@@ -1022,59 +877,202 @@ impl Provider for AnthropicMessagesProvider {
             return Err(unsupported_request("empty messages path"));
         }
         let url = format!("{}{}", self.base_url, self.messages_path);
-        let request = self
-            .http
-            .post(url)
-            .timeout(self.timeout)
-            .header(reqwest::header::CONTENT_TYPE, "application/json")
-            .header("anthropic-version", ANTHROPIC_VERSION)
-            .json(&body);
-        let request = self.attach_auth(request)?;
         let started = tokio::time::Instant::now();
-        let send_guard = NativeSendAttemptGuard::new(telemetry.as_ref(), started, self.timeout);
-        let send_result = request.send().await;
-        send_guard.completed();
-        let response = match send_result {
-            Ok(response) => response,
-            Err(error) => {
-                let error = map_send_error(error);
-                record_attempt(
-                    telemetry.as_ref(),
-                    ProviderAttemptEvent {
-                        attempt: 1,
-                        max_attempts: 1,
-                        category: match error {
-                            ProviderError::Timeout => ProviderAttemptCategory::Timeout,
-                            _ => ProviderAttemptCategory::Connection,
+        let max_attempts = self.retries.saturating_add(1);
+        let mut attempt = 0u32;
+        let (response, final_attempt) = loop {
+            let remaining =
+                remaining_request_time(started, self.timeout).ok_or(ProviderError::Timeout)?;
+            let physical_attempt = attempt.saturating_add(1);
+            let request = self
+                .http
+                .post(&url)
+                .timeout(remaining)
+                .header(reqwest::header::CONTENT_TYPE, "application/json")
+                .header("anthropic-version", ANTHROPIC_VERSION)
+                .json(&body);
+            let request = self.attach_auth(request)?;
+            let send_guard = InFlightAttemptGuard::new(
+                telemetry.as_ref(),
+                physical_attempt,
+                max_attempts,
+                started,
+                self.timeout,
+            );
+            let send_result = request.send().await;
+            send_guard.completed();
+
+            match send_result {
+                Ok(response) => {
+                    let status = response.status();
+                    if is_retryable_status(status) && attempt < self.retries {
+                        let retry_number = attempt.saturating_add(1);
+                        let decision = retry_delay_decision(
+                            retry_number,
+                            response.headers().get(reqwest::header::RETRY_AFTER),
+                            SystemTime::now(),
+                            retry_jitter_sample(retry_number),
+                        );
+                        let remaining_after = remaining_request_time(started, self.timeout);
+                        let can_retry =
+                            remaining_after.is_some_and(|remaining| decision.delay < remaining);
+                        let observer_ready = record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: status_category(status),
+                                status: Some(status.as_u16()),
+                                outcome: if can_retry {
+                                    ProviderAttemptOutcome::RetryScheduled
+                                } else {
+                                    ProviderAttemptOutcome::DeadlineExceeded
+                                },
+                                terminal: !can_retry,
+                                retry_delay_ms: can_retry.then(|| duration_millis(decision.delay)),
+                                retry_after_used: can_retry && decision.retry_after_used,
+                                remaining_deadline_ms: remaining_after
+                                    .map(duration_millis)
+                                    .unwrap_or(0),
+                            },
+                        );
+                        drop(response);
+                        if !observer_ready {
+                            if can_retry {
+                                drop(RetryBackoffAttemptGuard::new(
+                                    telemetry.as_ref(),
+                                    physical_attempt.saturating_add(1),
+                                    max_attempts,
+                                    started,
+                                    self.timeout,
+                                ));
+                            }
+                            return Err(ProviderError::Connection(
+                                "provider telemetry sink stopped the request".to_string(),
+                            ));
+                        }
+                        if !can_retry {
+                            sleep_before_retry(started, self.timeout, decision.delay).await?;
+                            return Err(ProviderError::Timeout);
+                        }
+                        let guard = RetryBackoffAttemptGuard::new(
+                            telemetry.as_ref(),
+                            physical_attempt.saturating_add(1),
+                            max_attempts,
+                            started,
+                            self.timeout,
+                        );
+                        sleep_before_retry_observed(started, self.timeout, decision.delay, guard)
+                            .await?;
+                        attempt = retry_number;
+                        continue;
+                    }
+                    if !status.is_success() {
+                        record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: status_category(status),
+                                status: Some(status.as_u16()),
+                                outcome: ProviderAttemptOutcome::Rejected,
+                                terminal: true,
+                                retry_delay_ms: None,
+                                retry_after_used: false,
+                                remaining_deadline_ms: remaining_deadline_millis(
+                                    started,
+                                    self.timeout,
+                                ),
+                            },
+                        );
+                    }
+                    break (response, physical_attempt);
+                }
+                Err(error) => {
+                    if error.is_timeout() && attempt < self.retries {
+                        let retry_number = attempt.saturating_add(1);
+                        let decision = retry_delay_decision(
+                            retry_number,
+                            None,
+                            SystemTime::now(),
+                            retry_jitter_sample(retry_number),
+                        );
+                        let remaining_after = remaining_request_time(started, self.timeout);
+                        let can_retry =
+                            remaining_after.is_some_and(|remaining| decision.delay < remaining);
+                        let observer_ready = record_attempt(
+                            telemetry.as_ref(),
+                            ProviderAttemptEvent {
+                                attempt: physical_attempt,
+                                max_attempts,
+                                category: ProviderAttemptCategory::Timeout,
+                                status: None,
+                                outcome: if can_retry {
+                                    ProviderAttemptOutcome::RetryScheduled
+                                } else {
+                                    ProviderAttemptOutcome::DeadlineExceeded
+                                },
+                                terminal: !can_retry,
+                                retry_delay_ms: can_retry.then(|| duration_millis(decision.delay)),
+                                retry_after_used: false,
+                                remaining_deadline_ms: remaining_after
+                                    .map(duration_millis)
+                                    .unwrap_or(0),
+                            },
+                        );
+                        if !observer_ready {
+                            if can_retry {
+                                drop(RetryBackoffAttemptGuard::new(
+                                    telemetry.as_ref(),
+                                    physical_attempt.saturating_add(1),
+                                    max_attempts,
+                                    started,
+                                    self.timeout,
+                                ));
+                            }
+                            return Err(ProviderError::Connection(
+                                "provider telemetry sink stopped the request".to_string(),
+                            ));
+                        }
+                        if !can_retry {
+                            sleep_before_retry(started, self.timeout, decision.delay).await?;
+                            return Err(ProviderError::Timeout);
+                        }
+                        let guard = RetryBackoffAttemptGuard::new(
+                            telemetry.as_ref(),
+                            physical_attempt.saturating_add(1),
+                            max_attempts,
+                            started,
+                            self.timeout,
+                        );
+                        sleep_before_retry_observed(started, self.timeout, decision.delay, guard)
+                            .await?;
+                        attempt = retry_number;
+                        continue;
+                    }
+                    record_attempt(
+                        telemetry.as_ref(),
+                        ProviderAttemptEvent {
+                            attempt: physical_attempt,
+                            max_attempts,
+                            category: if error.is_timeout() {
+                                ProviderAttemptCategory::Timeout
+                            } else {
+                                ProviderAttemptCategory::Connection
+                            },
+                            status: None,
+                            outcome: ProviderAttemptOutcome::TransportFailed,
+                            terminal: true,
+                            retry_delay_ms: None,
+                            retry_after_used: false,
+                            remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
                         },
-                        status: None,
-                        outcome: ProviderAttemptOutcome::TransportFailed,
-                        terminal: true,
-                        retry_delay_ms: None,
-                        retry_after_used: false,
-                        remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
-                    },
-                );
-                return Err(error);
+                    );
+                    return Err(map_send_error(error));
+                }
             }
         };
         let status = response.status();
-        if !status.is_success() {
-            record_attempt(
-                telemetry.as_ref(),
-                ProviderAttemptEvent {
-                    attempt: 1,
-                    max_attempts: 1,
-                    category: status_category(status),
-                    status: Some(status.as_u16()),
-                    outcome: ProviderAttemptOutcome::Rejected,
-                    terminal: true,
-                    retry_delay_ms: None,
-                    retry_after_used: false,
-                    remaining_deadline_ms: remaining_deadline_millis(started, self.timeout),
-                },
-            );
-        }
         if status == StatusCode::UNAUTHORIZED || status == StatusCode::FORBIDDEN {
             return Err(ProviderError::Unauthorized {
                 status: status.as_u16(),
@@ -1088,8 +1086,14 @@ impl Provider for AnthropicMessagesProvider {
             });
         }
 
-        let attempt_guard =
-            NativeBodyAttemptGuard::new(telemetry.as_ref(), status.as_u16(), started, self.timeout);
+        let attempt_guard = ResponseBodyAttemptGuard::new(
+            telemetry.as_ref(),
+            final_attempt,
+            max_attempts,
+            status.as_u16(),
+            started,
+            self.timeout,
+        );
 
         let stream: ByteStream = response
             .bytes_stream()
