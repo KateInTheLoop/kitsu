@@ -2188,6 +2188,29 @@ impl SessionReadPort for CurrentV1FileReadPort<'_> {
     }
 }
 
+/// Transitional write-side partner to [`SessionReadPort`]. It owns only the
+/// current v1 candidate-to-physical-commit step and remains private so its path
+/// receipt and string error do not become the canonical revision API.
+trait SessionWritePort {
+    fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentV1FileWritePort<'a> {
+    directory: &'a PrivateDirectory,
+}
+
+impl SessionWritePort for CurrentV1FileWritePort<'_> {
+    fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError> {
+        let (path, commit) = write_saved_file(self.directory, saved, true)?;
+        Ok(SnapshotCommit {
+            path,
+            #[cfg(unix)]
+            file: commit.file,
+        })
+    }
+}
+
 fn list_in(directory: &PrivateDirectory) -> Result<Vec<SessionSummary>, String> {
     let names = directory.entry_names("session")?;
 
@@ -2280,6 +2303,28 @@ fn load_from_port(
         return Err("session id does not match the resolved selector".to_string());
     }
     Ok(saved)
+}
+
+fn commit_to_port(
+    port: &dyn SessionWritePort,
+    saved: &SavedSession,
+) -> Result<SnapshotCommit, SnapshotSaveError> {
+    if saved.version != SESSION_VERSION {
+        return Err(SnapshotSaveError {
+            message: format!(
+                "session '{}' uses unsupported format version {}",
+                saved.id, saved.version
+            ),
+            installed_commit: None,
+        });
+    }
+    if !valid_id(&saved.id) {
+        return Err(SnapshotSaveError {
+            message: "saved session has an invalid id".to_string(),
+            installed_commit: None,
+        });
+    }
+    port.commit(saved)
 }
 
 impl SessionStore {
@@ -2377,12 +2422,10 @@ impl SessionStore {
             project_context: project_context.map(|path| path.display().to_string()),
             messages: messages.to_vec(),
         };
-        let (path, commit) = write_saved_file(&self.directory, &saved, true)?;
-        Ok(SnapshotCommit {
-            path,
-            #[cfg(unix)]
-            file: commit.file,
-        })
+        let port = CurrentV1FileWritePort {
+            directory: &self.directory,
+        };
+        commit_to_port(&port, &saved)
     }
 
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
@@ -2900,6 +2943,21 @@ mod tests {
         }
     }
 
+    #[derive(Debug, Default)]
+    struct RefusingSessionWritePort {
+        observed: std::cell::RefCell<Option<SavedSession>>,
+    }
+
+    impl SessionWritePort for RefusingSessionWritePort {
+        fn commit(&self, saved: &SavedSession) -> Result<SnapshotCommit, SnapshotSaveError> {
+            self.observed.replace(Some(saved.clone()));
+            Err(SnapshotSaveError {
+                message: "fixture refused before publication".to_string(),
+                installed_commit: None,
+            })
+        }
+    }
+
     fn fixture_saved(id: &str, name: Option<&str>, directory: String) -> SavedSession {
         SavedSession {
             version: SESSION_VERSION,
@@ -3018,6 +3076,36 @@ mod tests {
         assert!(SessionStore::load(&dir, "s-corrupt")
             .unwrap_err()
             .contains("cannot parse session"));
+    }
+
+    #[test]
+    fn private_write_port_receives_exact_candidate_and_preserves_preinstall_failure() {
+        let candidate = fixture_saved(
+            "s-write-candidate",
+            Some("write-candidate"),
+            "/fixture/write".to_string(),
+        );
+        let port = RefusingSessionWritePort::default();
+
+        let error = commit_to_port(&port, &candidate).unwrap_err();
+
+        assert!(error.to_string().contains("before publication"));
+        assert!(error.installed_commit().is_none());
+        {
+            let observed = port.observed.borrow();
+            let observed = observed.as_ref().unwrap();
+            assert_eq!(observed.id, candidate.id);
+            assert_eq!(observed.name, candidate.name);
+            assert_eq!(observed.messages, candidate.messages);
+        }
+
+        let mut future = candidate;
+        future.version = SESSION_VERSION + 1;
+        let untouched_port = RefusingSessionWritePort::default();
+        let error = commit_to_port(&untouched_port, &future).unwrap_err();
+        assert!(error.to_string().contains("unsupported format version"));
+        assert!(error.installed_commit().is_none());
+        assert!(untouched_port.observed.borrow().is_none());
     }
 
     #[cfg(unix)]
