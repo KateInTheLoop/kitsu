@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 066. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 067. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -310,6 +310,11 @@ The first physical successor composition is restricted to artifact-free text.
 Its only cross-module constructor cannot express tools/effects/artifacts, an
 artifact-bearing base refuses before effects, and exact/stale/candidate/HEAD
 transaction cuts pass without changing production behavior.
+Physical v1 now has a separate session-scoped immutable artifact namespace.
+Closed manifests bind independent artifact schema, exact identity, length,
+SHA-256, and media type; staged descriptor-pinned install/read is no-overwrite
+and reports collision, tamper, symlink, and durability truth. It is not yet
+bound to canonical publication.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -588,6 +593,7 @@ gates merely because a card appears attractive.
 | 064 | E03-S02-C13 | Compose strict legacy preparation with create-only fenced publication and exact rollback/collision truth |
 | 065 | E03-S02-C14 | Assemble one pure canonical successor operation from neutral terminal and closed transcript/effect facts |
 | 066 | E03-S02-C15 | Publish only an artifact-free assembled successor through exact stale/candidate/HEAD transaction cuts |
+| 067 | E03-S02-C16 | Add session-scoped immutable artifact records plus descriptor-pinned no-overwrite install and verification |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -654,7 +660,9 @@ preservation, refusal before effects, and installed-unselected cut truth. Cycle
 composes an artifact-free assembled successor with fenced file publication and
 proves exact update, stale zero-allocation, candidate residue, and HEAD
 durability truth. Cycle 067 defines descriptor-pinned immutable artifact
-closure before this path can widen. The queue then continues through E03,
+closure before this path can widen. Cycle 068 binds canonical artifact facts to
+exact verified physical records before candidate/HEAD publication. The queue
+then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

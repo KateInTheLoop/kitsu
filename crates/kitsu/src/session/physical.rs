@@ -26,15 +26,19 @@ use super::{
 pub(super) const PHYSICAL_SCHEMA_REVISION: u32 = 1;
 pub(super) const MAX_PHYSICAL_RECORD_BYTES: usize = 64 * 1024;
 pub(super) const MAX_CANONICAL_PAYLOAD_BYTES: u64 = 16 * 1024 * 1024;
+pub(super) const MAX_IMMUTABLE_ARTIFACT_BYTES: u64 = 16 * 1024 * 1024;
 
 const ROOT_COMPONENT: &str = ".kitsu-store-v1";
 const STORE_RECORD_NAME: &str = "store.json";
 const REVISIONS_COMPONENT: &str = "revisions";
 const HEADS_COMPONENT: &str = "heads";
+const ARTIFACTS_COMPONENT: &str = "artifacts";
 const STAGING_COMPONENT: &str = "staging";
 const LOCKS_COMPONENT: &str = ".locks";
 const REVISION_MANIFEST_NAME: &str = "manifest.json";
 const CANONICAL_PAYLOAD_NAME: &str = "canonical.json";
+const ARTIFACT_MANIFEST_NAME: &str = "manifest.json";
+const ARTIFACT_CONTENT_NAME: &str = "content.bin";
 const COMPONENT_PREFIX: &str = "id-";
 const BASE32: &[u8; 32] = b"abcdefghijklmnopqrstuvwxyz234567";
 
@@ -92,6 +96,36 @@ impl PhysicalLayoutV1 {
             .join(format!("{}.json", encode_component(session.as_str())))
     }
 
+    pub(super) fn artifacts_root(session_root: &Path) -> PathBuf {
+        Self::root(session_root).join(ARTIFACTS_COMPONENT)
+    }
+
+    pub(super) fn artifact_directory(
+        session_root: &Path,
+        session: &SessionId,
+        artifact_id: &str,
+    ) -> PathBuf {
+        Self::artifacts_root(session_root)
+            .join(encode_component(session.as_str()))
+            .join(encode_component(artifact_id))
+    }
+
+    pub(super) fn artifact_manifest(
+        session_root: &Path,
+        session: &SessionId,
+        artifact_id: &str,
+    ) -> PathBuf {
+        Self::artifact_directory(session_root, session, artifact_id).join(ARTIFACT_MANIFEST_NAME)
+    }
+
+    pub(super) fn artifact_content(
+        session_root: &Path,
+        session: &SessionId,
+        artifact_id: &str,
+    ) -> PathBuf {
+        Self::artifact_directory(session_root, session, artifact_id).join(ARTIFACT_CONTENT_NAME)
+    }
+
     pub(super) fn staging_root(session_root: &Path) -> PathBuf {
         Self::root(session_root).join(STAGING_COMPONENT)
     }
@@ -105,6 +139,10 @@ impl PhysicalLayoutV1 {
     }
 
     pub(super) const fn revision_install_mode() -> PhysicalInstallMode {
+        PhysicalInstallMode::CreateNew
+    }
+
+    pub(super) const fn artifact_install_mode() -> PhysicalInstallMode {
         PhysicalInstallMode::CreateNew
     }
 
@@ -212,6 +250,7 @@ impl<'de> Deserialize<'de> for Sha256Digest {
 enum RecordType {
     Store,
     RevisionManifest,
+    ArtifactManifest,
     Head,
 }
 
@@ -307,6 +346,86 @@ impl RevisionManifestV1 {
         }
         Ok(self)
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct ArtifactManifestV1 {
+    record_type: RecordType,
+    physical_schema_revision: u32,
+    artifact_schema_revision: u32,
+    store_id: StoreId,
+    session_id: SessionId,
+    artifact_id: String,
+    content_bytes: u64,
+    content_sha256: Sha256Digest,
+    media_type: Option<String>,
+}
+
+impl ArtifactManifestV1 {
+    pub(super) fn new(
+        artifact_schema_revision: u32,
+        store_id: StoreId,
+        session_id: SessionId,
+        artifact_id: String,
+        content_bytes: u64,
+        content_sha256: Sha256Digest,
+        media_type: Option<String>,
+    ) -> Result<Self, String> {
+        Self {
+            record_type: RecordType::ArtifactManifest,
+            physical_schema_revision: PHYSICAL_SCHEMA_REVISION,
+            artifact_schema_revision,
+            store_id,
+            session_id,
+            artifact_id,
+            content_bytes,
+            content_sha256,
+            media_type,
+        }
+        .validate()
+    }
+
+    fn validate(self) -> Result<Self, String> {
+        validate_common(
+            self.record_type,
+            RecordType::ArtifactManifest,
+            self.physical_schema_revision,
+        )?;
+        if self.artifact_schema_revision == 0 {
+            return Err("artifact schema revision must be nonzero".to_string());
+        }
+        validate_artifact_id(&self.artifact_id)?;
+        if self.content_bytes > MAX_IMMUTABLE_ARTIFACT_BYTES {
+            return Err(format!(
+                "artifact content length exceeds {MAX_IMMUTABLE_ARTIFACT_BYTES} bytes"
+            ));
+        }
+        if let Some(media_type) = &self.media_type {
+            if media_type.is_empty() || media_type.len() > 256 {
+                return Err("artifact media type length must be within 1..=256 bytes".to_string());
+            }
+            if media_type.bytes().any(|byte| byte.is_ascii_control()) {
+                return Err("artifact media type contains a control character".to_string());
+            }
+        }
+        Ok(self)
+    }
+}
+
+fn validate_artifact_id(value: &str) -> Result<(), String> {
+    if value.is_empty() || value.len() > SessionId::MAX_BYTES {
+        return Err(format!(
+            "artifact identity length must be within 1..={} bytes",
+            SessionId::MAX_BYTES
+        ));
+    }
+    if let Some(index) = value.bytes().position(|byte| {
+        !(byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+    }) {
+        return Err(format!("artifact identity byte {index} is unsafe"));
+    }
+    Ok(())
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -407,6 +526,27 @@ pub(super) fn decode_revision_manifest(
     Ok(record)
 }
 
+pub(super) fn encode_artifact_manifest(record: &ArtifactManifestV1) -> Result<Vec<u8>, String> {
+    encode_record(record)
+}
+
+pub(super) fn decode_artifact_manifest(
+    bytes: &[u8],
+    expected_store: &StoreId,
+    expected_session: &SessionId,
+    expected_artifact_id: &str,
+) -> Result<ArtifactManifestV1, String> {
+    validate_artifact_id(expected_artifact_id)?;
+    let record = decode_record::<ArtifactManifestV1>(bytes)?.validate()?;
+    if &record.store_id != expected_store
+        || &record.session_id != expected_session
+        || record.artifact_id != expected_artifact_id
+    {
+        return Err("artifact manifest identity does not match its physical location".to_string());
+    }
+    Ok(record)
+}
+
 pub(super) fn encode_head_record(record: &HeadRecordV1) -> Result<Vec<u8>, String> {
     encode_record(record)
 }
@@ -432,6 +572,7 @@ pub(super) fn decode_head_record(
 pub(super) struct PhysicalFileStoreV1 {
     _root: PrivateDirectory,
     revisions: PrivateDirectory,
+    artifacts: PrivateDirectory,
     heads: PrivateDirectory,
     staging: PrivateDirectory,
     locks: PrivateDirectory,
@@ -447,6 +588,44 @@ pub(super) struct InstalledRevisionCandidateV1 {
     manifest: RevisionManifestV1,
     manifest_bytes: Vec<u8>,
     manifest_sha256: Sha256Digest,
+}
+
+#[derive(Debug)]
+pub(super) struct InstalledArtifactV1 {
+    manifest: ArtifactManifestV1,
+    manifest_bytes: Vec<u8>,
+    manifest_sha256: Sha256Digest,
+}
+
+impl InstalledArtifactV1 {
+    pub(super) fn manifest(&self) -> &ArtifactManifestV1 {
+        &self.manifest
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct VerifiedArtifactV1 {
+    manifest: ArtifactManifestV1,
+    manifest_sha256: Sha256Digest,
+    content_bytes: Vec<u8>,
+}
+
+impl VerifiedArtifactV1 {
+    pub(super) fn manifest(&self) -> &ArtifactManifestV1 {
+        &self.manifest
+    }
+
+    pub(super) fn manifest_sha256(&self) -> &Sha256Digest {
+        &self.manifest_sha256
+    }
+
+    pub(super) fn content_bytes(&self) -> &[u8] {
+        &self.content_bytes
+    }
 }
 
 impl InstalledRevisionCandidateV1 {
@@ -559,6 +738,40 @@ pub(super) struct PhysicalCandidateInstallError {
     installed: bool,
 }
 
+#[derive(Debug)]
+pub(super) struct PhysicalArtifactInstallError {
+    message: String,
+    installed: bool,
+}
+
+impl PhysicalArtifactInstallError {
+    fn before_install(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            installed: false,
+        }
+    }
+
+    fn after_install(message: impl Into<String>) -> Self {
+        Self {
+            message: message.into(),
+            installed: true,
+        }
+    }
+
+    pub(super) fn installed(&self) -> bool {
+        self.installed
+    }
+}
+
+impl fmt::Display for PhysicalArtifactInstallError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for PhysicalArtifactInstallError {}
+
 impl PhysicalCandidateInstallError {
     fn before_install(message: impl Into<String>) -> Self {
         Self {
@@ -601,6 +814,10 @@ impl PhysicalFileStoreV1 {
             OsStr::new(REVISIONS_COMPONENT),
             "physical revision namespace",
         )?;
+        let artifacts = root.prepare_child(
+            OsStr::new(ARTIFACTS_COMPONENT),
+            "physical artifact namespace",
+        )?;
         let heads = root.prepare_child(OsStr::new(HEADS_COMPONENT), "physical HEAD namespace")?;
         let staging = root.prepare_child(
             OsStr::new(STAGING_COMPONENT),
@@ -612,6 +829,7 @@ impl PhysicalFileStoreV1 {
         Ok(Self {
             _root: root,
             revisions,
+            artifacts,
             heads,
             staging,
             locks,
@@ -863,6 +1081,168 @@ impl PhysicalFileStoreV1 {
         self.fail_next_head_sync.set(true);
     }
 
+    pub(super) fn install_artifact(
+        &self,
+        artifact_schema_revision: u32,
+        session_id: SessionId,
+        artifact_id: String,
+        media_type: Option<String>,
+        content_bytes: &[u8],
+    ) -> Result<InstalledArtifactV1, PhysicalArtifactInstallError> {
+        let content_len = u64::try_from(content_bytes.len()).map_err(|_| {
+            PhysicalArtifactInstallError::before_install(
+                "artifact content length cannot be represented as u64",
+            )
+        })?;
+        let content_sha256 =
+            digest_bytes(content_bytes).map_err(PhysicalArtifactInstallError::before_install)?;
+        let manifest = ArtifactManifestV1::new(
+            artifact_schema_revision,
+            self.store_id().clone(),
+            session_id.clone(),
+            artifact_id.clone(),
+            content_len,
+            content_sha256,
+            media_type,
+        )
+        .map_err(PhysicalArtifactInstallError::before_install)?;
+        let manifest_bytes = encode_artifact_manifest(&manifest)
+            .map_err(PhysicalArtifactInstallError::before_install)?;
+        let manifest_sha256 =
+            digest_bytes(&manifest_bytes).map_err(PhysicalArtifactInstallError::before_install)?;
+
+        let session_name = encode_component(session_id.as_str());
+        let session_artifacts = self
+            .artifacts
+            .prepare_child(
+                OsStr::new(&session_name),
+                "physical session artifact namespace",
+            )
+            .map_err(PhysicalArtifactInstallError::before_install)?;
+        self.artifacts
+            .sync("physical artifact namespace")
+            .map_err(PhysicalArtifactInstallError::before_install)?;
+
+        let staging_name = format!("artifact-{}", fresh_id());
+        let staged = self
+            .staging
+            .create_child_exclusive(OsStr::new(&staging_name), "physical artifact candidate")
+            .map_err(PhysicalArtifactInstallError::before_install)?;
+        let prepare = (|| -> Result<(), String> {
+            write_new_synced(
+                &staged,
+                OsStr::new(ARTIFACT_CONTENT_NAME),
+                content_bytes,
+                "artifact content",
+            )?;
+            write_new_synced(
+                &staged,
+                OsStr::new(ARTIFACT_MANIFEST_NAME),
+                &manifest_bytes,
+                "artifact manifest",
+            )?;
+            staged.sync("physical artifact candidate")
+        })();
+        if let Err(error) = prepare {
+            return Err(self.rollback_staged_artifact(&staging_name, &staged, error));
+        }
+
+        let artifact_name = encode_component(&artifact_id);
+        if let Err(error) = rename_directory_no_replace(
+            &self.staging,
+            OsStr::new(&staging_name),
+            &session_artifacts,
+            OsStr::new(&artifact_name),
+        ) {
+            let message = if error.kind() == std::io::ErrorKind::AlreadyExists {
+                format!(
+                    "physical artifact '{}' already exists; refusing to overwrite it",
+                    session_artifacts.path.join(&artifact_name).display()
+                )
+            } else {
+                format!(
+                    "cannot install physical artifact '{}': {error}",
+                    session_artifacts.path.join(&artifact_name).display()
+                )
+            };
+            return Err(self.rollback_staged_artifact(&staging_name, &staged, message));
+        }
+
+        #[cfg(test)]
+        if self.fail_next_target_sync.replace(false) {
+            return Err(PhysicalArtifactInstallError::after_install(
+                "physical artifact was installed, but target durability is unconfirmed: injected failure",
+            ));
+        }
+        if let Err(error) = session_artifacts.sync("physical session artifact namespace") {
+            return Err(PhysicalArtifactInstallError::after_install(format!(
+                "physical artifact was installed, but target durability is unconfirmed: {error}"
+            )));
+        }
+        if let Err(error) = self.staging.sync("physical artifact staging namespace") {
+            return Err(PhysicalArtifactInstallError::after_install(format!(
+                "physical artifact was installed, but staging durability is unconfirmed: {error}"
+            )));
+        }
+
+        Ok(InstalledArtifactV1 {
+            manifest,
+            manifest_bytes,
+            manifest_sha256,
+        })
+    }
+
+    pub(super) fn open_artifact(
+        &self,
+        session_id: &SessionId,
+        artifact_id: &str,
+    ) -> Result<VerifiedArtifactV1, String> {
+        validate_artifact_id(artifact_id)?;
+        let session_name = encode_component(session_id.as_str());
+        let artifact_name = encode_component(artifact_id);
+        let session_artifacts = self.artifacts.open_child(
+            OsStr::new(&session_name),
+            "physical session artifact namespace",
+        )?;
+        let artifact =
+            session_artifacts.open_child(OsStr::new(&artifact_name), "physical artifact")?;
+        let manifest_bytes = read_bounded_regular(
+            &artifact,
+            OsStr::new(ARTIFACT_MANIFEST_NAME),
+            MAX_PHYSICAL_RECORD_BYTES as u64,
+            "artifact manifest",
+        )?;
+        let manifest =
+            decode_artifact_manifest(&manifest_bytes, self.store_id(), session_id, artifact_id)?;
+        let content_bytes = read_bounded_regular(
+            &artifact,
+            OsStr::new(ARTIFACT_CONTENT_NAME),
+            MAX_IMMUTABLE_ARTIFACT_BYTES,
+            "artifact content",
+        )?;
+        if content_bytes.len() as u64 != manifest.content_bytes {
+            return Err(format!(
+                "artifact content length mismatch: manifest declares {}, read {}",
+                manifest.content_bytes,
+                content_bytes.len()
+            ));
+        }
+        let observed_digest = digest_bytes(&content_bytes)?;
+        if observed_digest != manifest.content_sha256 {
+            return Err(format!(
+                "artifact content digest mismatch: manifest declares {}, observed {}",
+                manifest.content_sha256.as_str(),
+                observed_digest.as_str()
+            ));
+        }
+        let manifest_sha256 = digest_bytes(&manifest_bytes)?;
+        Ok(VerifiedArtifactV1 {
+            manifest,
+            manifest_sha256,
+            content_bytes,
+        })
+    }
+
     pub(super) fn install_revision_candidate(
         &self,
         logical_schema_revision: u32,
@@ -1046,6 +1426,26 @@ impl PhysicalFileStoreV1 {
             Ok(()) => PhysicalCandidateInstallError::before_install(primary),
             Err(rollback) => PhysicalCandidateInstallError::before_install(format!(
                 "{primary}; staged candidate cleanup also failed: {rollback}"
+            )),
+        }
+    }
+
+    fn rollback_staged_artifact(
+        &self,
+        staging_name: &str,
+        staged: &PrivateDirectory,
+        primary: impl Into<String>,
+    ) -> PhysicalArtifactInstallError {
+        let primary = primary.into();
+        match remove_artifact_tree(
+            &self.staging,
+            OsStr::new(staging_name),
+            staged,
+            "physical artifact candidate rollback",
+        ) {
+            Ok(()) => PhysicalArtifactInstallError::before_install(primary),
+            Err(rollback) => PhysicalArtifactInstallError::before_install(format!(
+                "{primary}; staged artifact cleanup also failed: {rollback}"
             )),
         }
     }
@@ -1299,6 +1699,14 @@ mod tests {
             Path::new("/state/sessions/.kitsu-store-v1/heads/id-omwwc3dqnbqq.json")
         );
         assert_eq!(
+            PhysicalLayoutV1::artifact_manifest(root, &session, "artifact-a"),
+            Path::new("/state/sessions/.kitsu-store-v1/artifacts/id-omwwc3dqnbqq/id-mfzhi2lgmfrxillb/manifest.json")
+        );
+        assert_eq!(
+            PhysicalLayoutV1::artifact_content(root, &session, "artifact-a"),
+            Path::new("/state/sessions/.kitsu-store-v1/artifacts/id-omwwc3dqnbqq/id-mfzhi2lgmfrxillb/content.bin")
+        );
+        assert_eq!(
             PhysicalLayoutV1::staging_root(root),
             Path::new("/state/sessions/.kitsu-store-v1/staging")
         );
@@ -1312,6 +1720,10 @@ mod tests {
         );
         assert_eq!(
             PhysicalLayoutV1::revision_install_mode(),
+            PhysicalInstallMode::CreateNew
+        );
+        assert_eq!(
+            PhysicalLayoutV1::artifact_install_mode(),
             PhysicalInstallMode::CreateNew
         );
         assert_eq!(
@@ -1374,6 +1786,57 @@ mod tests {
             decode_head_record(&encode_head_record(&head).unwrap(), &store(), &session()).unwrap(),
             head
         );
+
+        let artifact = ArtifactManifestV1::new(
+            1,
+            store(),
+            session(),
+            "artifact-a".to_string(),
+            7,
+            digest("c"),
+            Some("text/plain".to_string()),
+        )
+        .unwrap();
+        let artifact_value = serde_json::to_value(&artifact).unwrap();
+        assert_eq!(artifact_value["record_type"], "artifact_manifest");
+        assert_eq!(artifact_value["artifact_id"], "artifact-a");
+        assert_eq!(artifact_value["content_bytes"], 7);
+        assert_eq!(
+            decode_artifact_manifest(
+                &encode_artifact_manifest(&artifact).unwrap(),
+                &store(),
+                &session(),
+                "artifact-a",
+            )
+            .unwrap(),
+            artifact
+        );
+        let mut artifact_future = artifact_value.clone();
+        artifact_future["physical_schema_revision"] = serde_json::json!(2);
+        assert!(decode_artifact_manifest(
+            &serde_json::to_vec(&artifact_future).unwrap(),
+            &store(),
+            &session(),
+            "artifact-a",
+        )
+        .is_err());
+        assert!(decode_artifact_manifest(
+            &encode_artifact_manifest(&artifact).unwrap(),
+            &store(),
+            &session(),
+            "artifact-other",
+        )
+        .is_err());
+        assert!(ArtifactManifestV1::new(
+            1,
+            store(),
+            session(),
+            "../escape".to_string(),
+            1,
+            digest("d"),
+            None,
+        )
+        .is_err());
     }
 
     #[test]
@@ -1535,6 +1998,143 @@ mod tests {
                 .unwrap()
                 .next()
                 .is_none()
+        );
+    }
+
+    #[test]
+    fn artifact_install_read_collision_and_missing_are_exact() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let first = b"immutable artifact bytes";
+
+        let installed = store
+            .install_artifact(
+                1,
+                session.clone(),
+                "artifact-a".to_string(),
+                Some("text/plain".to_string()),
+                first,
+            )
+            .unwrap();
+        assert_eq!(installed.manifest().artifact_id, "artifact-a");
+        assert_eq!(
+            installed.manifest().content_sha256.as_str(),
+            crate::skills::content_sha256_hex(first)
+        );
+        let opened = store.open_artifact(&session, "artifact-a").unwrap();
+        assert_eq!(opened.manifest(), installed.manifest());
+        assert_eq!(opened.manifest_sha256(), installed.manifest_sha256());
+        assert_eq!(
+            installed.manifest_sha256().as_str(),
+            crate::skills::content_sha256_hex(&installed.manifest_bytes)
+        );
+        assert_eq!(opened.content_bytes(), first);
+
+        let collision = store
+            .install_artifact(
+                1,
+                session.clone(),
+                "artifact-a".to_string(),
+                Some("text/plain".to_string()),
+                b"different bytes",
+            )
+            .unwrap_err();
+        assert!(!collision.installed());
+        assert!(collision.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            store
+                .open_artifact(&session, "artifact-a")
+                .unwrap()
+                .content_bytes(),
+            first
+        );
+        assert!(store.open_artifact(&session, "missing").is_err());
+        assert!(
+            std::fs::read_dir(PhysicalLayoutV1::staging_root(&session_root))
+                .unwrap()
+                .next()
+                .is_none()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn artifact_read_refuses_digest_retarget_and_symlink_tampering() {
+        use std::os::unix::fs::symlink;
+
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        for artifact in ["artifact-a", "artifact-b", "artifact-c"] {
+            store
+                .install_artifact(
+                    1,
+                    session.clone(),
+                    artifact.to_string(),
+                    None,
+                    artifact.as_bytes(),
+                )
+                .unwrap();
+        }
+
+        std::fs::write(
+            PhysicalLayoutV1::artifact_content(&session_root, &session, "artifact-a"),
+            b"tampered-a",
+        )
+        .unwrap();
+        let digest_error = store.open_artifact(&session, "artifact-a").unwrap_err();
+        assert!(digest_error.contains("digest mismatch"), "{digest_error}");
+
+        let manifest_b = std::fs::read(PhysicalLayoutV1::artifact_manifest(
+            &session_root,
+            &session,
+            "artifact-b",
+        ))
+        .unwrap();
+        std::fs::write(
+            PhysicalLayoutV1::artifact_manifest(&session_root, &session, "artifact-a"),
+            manifest_b,
+        )
+        .unwrap();
+        let identity_error = store.open_artifact(&session, "artifact-a").unwrap_err();
+        assert!(
+            identity_error.contains("identity does not match"),
+            "{identity_error}"
+        );
+
+        let content_c = PhysicalLayoutV1::artifact_content(&session_root, &session, "artifact-c");
+        std::fs::remove_file(&content_c).unwrap();
+        symlink("/etc/passwd", &content_c).unwrap();
+        let symlink_error = store.open_artifact(&session, "artifact-c").unwrap_err();
+        assert!(
+            symlink_error.contains("cannot open artifact content"),
+            "{symlink_error}"
+        );
+    }
+
+    #[test]
+    fn artifact_post_install_sync_failure_keeps_verifiable_unconfirmed_bytes() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let content = b"installed artifact";
+        store.inject_next_target_sync_failure();
+
+        let error = store
+            .install_artifact(1, session.clone(), "artifact-a".to_string(), None, content)
+            .unwrap_err();
+        assert!(error.installed());
+        assert!(error.to_string().contains("durability is unconfirmed"));
+        assert_eq!(
+            store
+                .open_artifact(&session, "artifact-a")
+                .unwrap()
+                .content_bytes(),
+            content
         );
     }
 
