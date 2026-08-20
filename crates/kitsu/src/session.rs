@@ -20,6 +20,12 @@ use chrono::{SecondsFormat, Utc};
 use kitsu_providers::ChatMessage;
 use serde::{Deserialize, Serialize};
 
+// Cycle 058 freezes the compiled physical v1 contract before the migration
+// card mounts it. Keeping it private prevents paths or file records from
+// becoming the backend-neutral session API.
+#[allow(dead_code)]
+mod physical;
+
 const SESSION_VERSION: u32 = 1;
 const MAX_SESSION_BYTES: u64 = 16 * 1024 * 1024;
 const ARCHIVED_DIR_NAME: &str = "archived";
