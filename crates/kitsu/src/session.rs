@@ -2159,6 +2159,35 @@ fn open_optional_session_directory(path: &Path) -> Result<Option<PrivateDirector
     Ok(directory)
 }
 
+/// Transitional read-only port for the current v1 logical snapshot. It is
+/// deliberately private: E03 can move selector/read behavior behind one seam
+/// before the canonical revision format exists, without publishing the file
+/// adapter or its string errors as the future store contract.
+trait SessionReadPort {
+    /// Return current-v1 summaries in deterministic newest-first order. The v1
+    /// adapter deliberately omits unreadable snapshots; E03's typed lookup
+    /// state will replace that legacy behavior in a later card.
+    fn list(&self) -> Result<Vec<SessionSummary>, String>;
+
+    /// Read one exact id and validate its current-v1 logical/file identity.
+    fn read(&self, id: &str) -> Result<SavedSession, String>;
+}
+
+#[derive(Debug, Clone, Copy)]
+struct CurrentV1FileReadPort<'a> {
+    directory: &'a PrivateDirectory,
+}
+
+impl SessionReadPort for CurrentV1FileReadPort<'_> {
+    fn list(&self) -> Result<Vec<SessionSummary>, String> {
+        list_in(self.directory)
+    }
+
+    fn read(&self, id: &str) -> Result<SavedSession, String> {
+        self.directory.read_saved(id)
+    }
+}
+
 fn list_in(directory: &PrivateDirectory) -> Result<Vec<SessionSummary>, String> {
     let names = directory.entry_names("session")?;
 
@@ -2229,6 +2258,28 @@ fn preferred_last_id(summaries: &[SessionSummary], excluded_id: Option<&str>) ->
         .find(|summary| summary.turns > 0)
         .or_else(|| eligible().next())
         .map(|summary| summary.id.clone())
+}
+
+fn load_from_port(
+    port: &dyn SessionReadPort,
+    selector: &str,
+    excluded_id: Option<&str>,
+) -> Result<SavedSession, String> {
+    let id = resolve_selector(&port.list()?, selector, excluded_id)?;
+    if excluded_id == Some(id.as_str()) {
+        return Err(format!("session '{selector}' is already active"));
+    }
+    let saved = port.read(&id)?;
+    if saved.version != SESSION_VERSION {
+        return Err(format!(
+            "session '{}' uses unsupported format version {}",
+            saved.id, saved.version
+        ));
+    }
+    if saved.id != id || !valid_id(&saved.id) {
+        return Err("session id does not match the resolved selector".to_string());
+    }
+    Ok(saved)
 }
 
 impl SessionStore {
@@ -2336,8 +2387,10 @@ impl SessionStore {
 
     pub fn load(dir: &Path, selector: &str) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        let id = resolve_selector(&list_in(&directory)?, selector, None)?;
-        directory.read_saved(&id)
+        let port = CurrentV1FileReadPort {
+            directory: &directory,
+        };
+        load_from_port(&port, selector, None)
     }
 
     /// Resolve an in-process session switch. `last` means the most recently
@@ -2349,11 +2402,10 @@ impl SessionStore {
         active_id: Option<&str>,
     ) -> Result<SavedSession, String> {
         let directory = open_session_directory(dir)?;
-        let id = resolve_selector(&list_in(&directory)?, selector, active_id)?;
-        if active_id == Some(id.as_str()) {
-            return Err(format!("session '{selector}' is already active"));
-        }
-        directory.read_saved(&id)
+        let port = CurrentV1FileReadPort {
+            directory: &directory,
+        };
+        load_from_port(&port, selector, active_id)
     }
 
     /// Set or clear a saved session's name without touching its transcript or
@@ -2811,13 +2863,162 @@ impl SessionStore {
         let Some(directory) = open_optional_session_directory(dir)? else {
             return Ok(Vec::new());
         };
-        list_in(&directory)
+        CurrentV1FileReadPort {
+            directory: &directory,
+        }
+        .list()
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[derive(Debug)]
+    struct FixtureSessionReadPort {
+        summaries: Vec<SessionSummary>,
+        sessions: Vec<SavedSession>,
+        read_override: Option<SavedSession>,
+        reads: std::cell::RefCell<Vec<String>>,
+    }
+
+    impl SessionReadPort for FixtureSessionReadPort {
+        fn list(&self) -> Result<Vec<SessionSummary>, String> {
+            Ok(self.summaries.clone())
+        }
+
+        fn read(&self, id: &str) -> Result<SavedSession, String> {
+            self.reads.borrow_mut().push(id.to_string());
+            if let Some(saved) = &self.read_override {
+                return Ok(saved.clone());
+            }
+            self.sessions
+                .iter()
+                .find(|saved| saved.id == id)
+                .cloned()
+                .ok_or_else(|| format!("fixture has no session '{id}'"))
+        }
+    }
+
+    fn fixture_saved(id: &str, name: Option<&str>, directory: String) -> SavedSession {
+        SavedSession {
+            version: SESSION_VERSION,
+            id: id.to_string(),
+            created_at: "2026-08-20T00:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T00:00:01.000Z".to_string(),
+            directory,
+            gateway: "fixture-gateway".to_string(),
+            model: "fixture-model".to_string(),
+            name: name.map(str::to_string),
+            project_context: None,
+            messages: vec![ChatMessage::user(id)],
+        }
+    }
+
+    #[test]
+    fn private_read_port_preserves_selector_and_exclusion_semantics() {
+        let cwd = std::env::current_dir().unwrap().display().to_string();
+        let empty = fixture_saved("s-empty", None, "/fixture/other".to_string());
+        let productive = fixture_saved(
+            "s-productive",
+            Some("fox-den"),
+            "/fixture/other".to_string(),
+        );
+        let automatic = fixture_saved("s-auto", None, cwd.clone());
+        let port = FixtureSessionReadPort {
+            summaries: vec![
+                SessionSummary {
+                    id: empty.id.clone(),
+                    name: None,
+                    updated_at: "2026-08-20T00:00:03.000Z".to_string(),
+                    model: empty.model.clone(),
+                    gateway: empty.gateway.clone(),
+                    directory: empty.directory.clone(),
+                    preview: "(no prompt yet)".to_string(),
+                    turns: 0,
+                },
+                SessionSummary {
+                    id: productive.id.clone(),
+                    name: productive.name.clone(),
+                    updated_at: "2026-08-20T00:00:02.000Z".to_string(),
+                    model: productive.model.clone(),
+                    gateway: productive.gateway.clone(),
+                    directory: productive.directory.clone(),
+                    preview: "productive".to_string(),
+                    turns: 1,
+                },
+                SessionSummary {
+                    id: automatic.id.clone(),
+                    name: None,
+                    updated_at: "2026-08-20T00:00:01.000Z".to_string(),
+                    model: automatic.model.clone(),
+                    gateway: automatic.gateway.clone(),
+                    directory: cwd,
+                    preview: "automatic".to_string(),
+                    turns: 1,
+                },
+            ],
+            sessions: vec![empty, productive, automatic],
+            read_override: None,
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+
+        assert_eq!(
+            load_from_port(&port, "last", None).unwrap().id,
+            "s-productive"
+        );
+        assert_eq!(
+            load_from_port(&port, "fox-den", None).unwrap().id,
+            "s-productive"
+        );
+        assert_eq!(load_from_port(&port, "auto", None).unwrap().id, "s-auto");
+        assert_eq!(
+            load_from_port(&port, "last", Some("s-productive"))
+                .unwrap()
+                .id,
+            "s-auto"
+        );
+        let reads_before = port.reads.borrow().len();
+        assert!(load_from_port(&port, "s-productive", Some("s-productive"))
+            .unwrap_err()
+            .contains("already active"));
+        assert_eq!(port.reads.borrow().len(), reads_before);
+
+        let mismatched = FixtureSessionReadPort {
+            summaries: vec![port.summaries[1].clone()],
+            sessions: Vec::new(),
+            read_override: Some(port.sessions[2].clone()),
+            reads: std::cell::RefCell::new(Vec::new()),
+        };
+        assert!(load_from_port(&mismatched, "s-productive", None)
+            .unwrap_err()
+            .contains("does not match the resolved selector"));
+        assert_eq!(mismatched.reads.borrow().as_slice(), ["s-productive"]);
+    }
+
+    #[test]
+    fn current_v1_port_keeps_corrupt_entries_out_of_list_but_exact_reads_fail() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let store = SessionStore::create(dir.clone()).unwrap();
+        store
+            .save(
+                root.path(),
+                "gateway",
+                "model",
+                None,
+                &[ChatMessage::user("valid")],
+            )
+            .unwrap();
+        std::fs::write(dir.join("s-corrupt.json"), b"{").unwrap();
+
+        let listed = SessionStore::list(&dir).unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].id, store.id());
+        assert!(SessionStore::load(&dir, "s-corrupt")
+            .unwrap_err()
+            .contains("cannot parse session"));
+    }
 
     #[cfg(unix)]
     fn after_next_session_directory_pin(hook: impl FnOnce() + 'static) {
