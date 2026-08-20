@@ -10,7 +10,9 @@ use kitsu_core::session::{
     SessionId, SessionLookupState,
 };
 
-use super::canonical::{encode_canonical_payload, CanonicalSessionRevisionV1};
+use super::canonical::{
+    encode_canonical_payload, prepare_current_v1_legacy_baseline, CanonicalSessionRevisionV1,
+};
 use super::physical::{PhysicalCandidateInstallError, PhysicalFileStoreV1, PhysicalHeadCasError};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -112,6 +114,28 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             #[cfg(test)]
             fail_next_after_candidate: Cell::new(false),
         }
+    }
+
+    fn commit_current_v1_legacy_baseline(
+        &self,
+        source_bytes: &[u8],
+        expected_session_id: &str,
+        revision_id: RevisionId,
+        committed_at: String,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        // Preparation is pure and strict. It always produces a root candidate
+        // with ExpectedRevision::Missing, so migration cannot replace an
+        // already-published canonical HEAD. The caller-owned v1 bytes are
+        // borrowed and remain the rollback source at every failure cut.
+        let payload = prepare_current_v1_legacy_baseline(
+            source_bytes,
+            expected_session_id,
+            self.store.store_id().clone(),
+            revision_id,
+            committed_at,
+        )
+        .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        self.commit(&payload)
     }
 
     fn commit(
@@ -377,6 +401,221 @@ mod tests {
             RevisionId::new("rev-a").unwrap(),
             RevisionId::new("rev-b").unwrap(),
         )
+    }
+
+    fn current_v1(messages: serde_json::Value) -> Vec<u8> {
+        serde_json::to_vec(&serde_json::json!({
+            "version": 1,
+            "id": "session-1",
+            "created_at": "2026-08-20T10:00:00.000Z",
+            "updated_at": "2026-08-20T10:01:00.000Z",
+            "directory": "/work/tree",
+            "gateway": "openai",
+            "model": "gpt-test",
+            "name": "kept_name",
+            "project_context": "exact historical context",
+            "messages": messages,
+        }))
+        .unwrap()
+    }
+
+    fn closed_current_v1() -> Vec<u8> {
+        current_v1(serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{\"path\":\"a.rs\"}","call_id":"call-1"
+            }]},
+            {"role":"tool","content":"contents","tool_call_id":"call-1"},
+            {"role":"assistant","content":"done"}
+        ]))
+    }
+
+    #[test]
+    fn legacy_migration_publishes_exact_baseline_without_mutating_source() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, _) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let source = closed_current_v1();
+        let source_before = source.clone();
+
+        let committed = transaction
+            .commit_current_v1_legacy_baseline(
+                &source,
+                "session-1",
+                rev_a.clone(),
+                "2026-08-20T11:00:00.000Z".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(source, source_before);
+        assert_eq!(receipt(&committed).new_revision(), &rev_a);
+        assert_eq!(
+            receipt(&committed).base_revision(),
+            &ExpectedRevision::Missing
+        );
+        let head = store.read_head(&session_id).unwrap().unwrap();
+        assert_eq!(head.revision_id(), &rev_a);
+        let expected = crate::session::canonical::prepare_current_v1_legacy_baseline(
+            &source,
+            "session-1",
+            store.store_id().clone(),
+            rev_a,
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        assert_eq!(
+            head.candidate().canonical_bytes(),
+            encode_canonical_payload(&expected).unwrap()
+        );
+    }
+
+    #[test]
+    fn legacy_migration_is_no_clobber_when_already_present() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let source = closed_current_v1();
+        transaction
+            .commit_current_v1_legacy_baseline(
+                &source,
+                "session-1",
+                rev_a.clone(),
+                "2026-08-20T11:00:00.000Z".to_string(),
+            )
+            .unwrap();
+
+        let error = transaction
+            .commit_current_v1_legacy_baseline(
+                &source,
+                "session-1",
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("conflict"));
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_a
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_b
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn legacy_migration_preserves_a_conflicting_orphan_and_source() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, _) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let different = payload("store-1", "session-1", "rev-a", None, 1);
+        let different_bytes = encode_canonical_payload(&different).unwrap();
+        transaction.inject_next_after_candidate_failure();
+        transaction.commit(&different).unwrap_err();
+        let source = closed_current_v1();
+        let source_before = source.clone();
+
+        let error = transaction
+            .commit_current_v1_legacy_baseline(
+                &source,
+                "session-1",
+                rev_a.clone(),
+                "2026-08-20T11:00:00.000Z".to_string(),
+            )
+            .unwrap_err();
+
+        assert_eq!(source, source_before);
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::PreexistingCollision {
+                revision: rev_a.clone()
+            }
+        );
+        assert!(store.read_head(&session_id).unwrap().is_none());
+        assert_eq!(
+            store
+                .open_revision_candidate(&session_id, &rev_a)
+                .unwrap()
+                .canonical_bytes(),
+            different_bytes
+        );
+    }
+
+    #[test]
+    fn legacy_migration_refusal_and_candidate_cut_never_change_source_or_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let store =
+            crate::session::physical::PhysicalFileStoreV1::create_or_open(root.path(), store_id)
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let unresolved = current_v1(serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{}","call_id":"call-1"
+            }]},
+            {"role":"tool","tool_call_id":"call-1","content":
+                "[tool output 9.0 KB — full result saved to /private/session-1.artifacts/call-1.txt.]"},
+            {"role":"assistant","content":"done"}
+        ]));
+        let unresolved_before = unresolved.clone();
+        let refused = transaction
+            .commit_current_v1_legacy_baseline(
+                &unresolved,
+                "session-1",
+                rev_a.clone(),
+                "2026-08-20T11:00:00.000Z".to_string(),
+            )
+            .unwrap_err();
+        assert!(refused.to_string().contains("artifact closure"));
+        assert!(refused.not_published_outcome().is_none());
+        assert_eq!(unresolved, unresolved_before);
+        assert!(store.read_head(&session_id).unwrap().is_none());
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_a
+            )
+            .exists()
+        );
+
+        let source = closed_current_v1();
+        let source_before = source.clone();
+        transaction.inject_next_after_candidate_failure();
+        let cut = transaction
+            .commit_current_v1_legacy_baseline(
+                &source,
+                "session-1",
+                rev_b.clone(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+            )
+            .unwrap_err();
+        assert_eq!(source, source_before);
+        assert_eq!(
+            cut.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_b.clone(),
+                durability: CandidateDurabilityV1::Confirmed
+            }
+        );
+        assert!(store.read_head(&session_id).unwrap().is_none());
+        assert!(store.open_revision_candidate(&session_id, &rev_b).is_ok());
     }
 
     #[test]

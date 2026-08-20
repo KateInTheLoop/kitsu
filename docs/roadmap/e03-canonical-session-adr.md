@@ -9,7 +9,9 @@ adds the closed logical payload codec and strict current-v1 migration input;
 Cycle 062 composes validated bytes with immutable candidate install and fenced
 HEAD publication behind one still-unmounted transaction. Cycle 063 defines the
 only accepted current-v1 logical import: an exact, loss-bearing legacy baseline
-at `Genesis`; it still has no publication caller.
+at `Genesis`; it still has no production publication caller.
+Cycle 064 composes that preparation with the private physical transaction as a
+create-only operation while keeping production behavior unmounted.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -306,6 +308,13 @@ canonical operations may extend that revision normally, while the fixed source
 loss record remains auditable. Migration publication must still be no-clobber
 and leave the exact v1 source bytes available for rollback.
 
+The private composition borrows current-v1 bytes, prepares the complete
+candidate before effects, and always enters publication with
+`ExpectedRevision::Missing`. An already-present canonical HEAD therefore fails
+before candidate allocation. A same-revision orphan collision is classified and
+preserves the first immutable bytes. A cut after candidate installation reports
+that exact unselected residue; no cut edits or deletes the v1 source.
+
 ## Stable provider-free K01-K12 matrix
 
 These IDs retain the accepted research matrix while adding the canonical-HEAD
@@ -421,6 +430,15 @@ cannot weaken or replace any backend-neutral assertion.
    malformed loss list, source identity mismatch, and invalid causality. Next
    compose this preparation with the physical transaction in a no-clobber
    migration fixture while retaining exact v1 rollback bytes.
+   **Provider-free migration composition complete in Cycle 064:** one private
+   method performs strict pure preparation followed by the existing transaction
+   with `ExpectedRevision::Missing`. Exact publication stores the deterministic
+   baseline bytes; repeat/already-present migration allocates no candidate;
+   conflicting same-revision residue remains untouched; artifact refusal occurs
+   before identity/effects; and an injected post-candidate cut reports the exact
+   orphan while the borrowed v1 bytes and HEAD remain unchanged. The seam is
+   still unmounted. Next assemble one new whole operation from neutral E02
+   terminal/transcript/effect facts before any live save switches ownership.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
