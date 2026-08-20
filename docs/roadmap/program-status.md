@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, and E04-S01/S02/S03 are accepted; E04-S04 is in
-progress through Cycle 039;
+progress through Cycle 040;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 39 / 39 |
+| Accepted cycles/commits after this cycle | 40 / 40 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S04-C2 (Cycle 040) — native Messages tool correlation |
+| Active epic/card | E04 / E04-S04-C3 (Cycle 041) — native Messages fault parity |
 
 ## Epic status
 
@@ -23,7 +23,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted, E04-S04 through C1 | Nineteen wire, six route-contract, three derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, attempt attribution, and a compiled native Messages text/usage/terminal slice; native tools, fault/bound/telemetry parity, live native composition, complete receipts, and alternate conformance remain |
+| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted, E04-S04 through C2 | Twenty-one wire, six route-contract, three derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, attempt attribution, and compiled native Messages text/tool/usage/terminal slices; native fault/timeout/cancellation and telemetry parity, live native composition, complete receipts, and alternate conformance remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -74,16 +74,18 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 036 | `84f9515` | Model-bound logical runs and atomic default/resumed successor publication |
 | 037 | `09f38a5` | Immutable-generation physical-attempt evidence and auxiliary mutation matrix |
 | 038 | `c021e37` | Truthful catalog-only management routes and doctor inference binding |
-| 039 | this document's commit | Native Messages text request and streamed terminal normalization |
+| 039 | `024b036` | Native Messages text request and streamed terminal normalization |
+| 040 | this document's commit | Native Messages tool history translation and bounded correlation |
 
 ## Current green gates
 
-- The provider-wire matrix now has nineteen offline tests covering exact text
+- The provider-wire matrix now has twenty-one offline tests covering exact text
   and correlated tool rounds, structural Chat/Messages divergence,
   wrong-adapter rejection, HTTP/mid-stream/malformed faults, path-level hard
   bounds, timeout/cancellation terminality, and the capability handoff. Three
   native cases additionally prove exact Messages request/header and normalized
-  text/usage/terminal output, EOF-as-failure, and zero-send tool refusal. Full
+  text/tool/usage/terminal output, EOF-as-failure, malformed prior-input
+  zero-send, and the streamed tool-argument ceiling. Full
   affected-suite counts are recorded in the cycle receipt.
 - Six provider-route tests pin a stable secret-free v1 JSON vector, opaque
   profile identity, nonzero generation/revisions, truthful adapter/wire pairs,
@@ -182,8 +184,11 @@ probe to a model-bearing generation. E04-S03 is accepted; Cycle 039 starts the
 compiled native Messages text/usage/terminal path without enabling it in live
 composition. The exact request/header, normalized text/usage/terminal stream,
 explicit message-stop requirement, bounded bodies/events, and zero-send tool
-refusal now pass. Cycle 040 adds native tool-use/result translation and bounded
-streamed argument correlation while keeping production selection disabled.
+refusal now pass. Cycle 040 adds native tool-use/result translation, pre-send
+input validation, bounded block-index correlation, and the 1 MiB streamed
+argument ceiling while keeping production selection disabled. Cycle 041 runs
+the actual native adapter through the remaining pinned fault and lifecycle
+fixtures.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

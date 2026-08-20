@@ -321,7 +321,36 @@ async fn native_messages_eof_is_not_terminal_success() {
 }
 
 #[tokio::test]
-async fn native_messages_rejects_tools_before_send() {
+async fn native_messages_matches_tool_request_and_correlated_stream() {
+    let fixture = anthropic_messages_tool_round();
+    let server = MockServer::start().await;
+    let captured = mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let mut stream = provider
+        .chat_stream(neutral_tool_request())
+        .await
+        .expect("native Messages tool fixture starts");
+    let mut deltas = Vec::new();
+    while let Some(item) = stream.next().await {
+        deltas.push(item.expect("native Messages tool fixture decodes"));
+    }
+
+    let observed = captured
+        .lock()
+        .unwrap()
+        .clone()
+        .expect("one Messages tool request captured");
+    assert_eq!(observed.body, fixture.request);
+    assert_eq!(
+        observed.anthropic_version.as_deref(),
+        Some(ANTHROPIC_VERSION)
+    );
+    assert_eq!(deltas, fixture.expected_deltas);
+}
+
+#[tokio::test]
+async fn native_messages_rejects_malformed_prior_tool_json_before_send() {
     let server = MockServer::start().await;
     Mock::given(method("POST"))
         .and(path("/v1/messages"))
@@ -330,12 +359,41 @@ async fn native_messages_rejects_tools_before_send() {
         .mount(&server)
         .await;
     let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let mut request = neutral_tool_request();
+    request.messages[2].tool_calls[0].args = "{".to_string();
 
-    let error = match provider.chat_stream(neutral_tool_request()).await {
-        Ok(_) => panic!("unimplemented native tool wire reached transport"),
+    let error = match provider.chat_stream(request).await {
+        Ok(_) => panic!("malformed prior tool JSON reached transport"),
         Err(error) => error,
     };
-    assert!(matches!(error, ProviderError::ToolsNotSupported));
+    assert!(matches!(error, ProviderError::InvalidResponse(_)));
+}
+
+#[tokio::test]
+async fn native_messages_bounds_fragmented_tool_arguments() {
+    let fixture = anthropic_messages_oversized_tool_arguments();
+    let server = MockServer::start().await;
+    mount_capture(&server, &fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+
+    let mut stream = provider
+        .chat_stream(neutral_tool_request())
+        .await
+        .expect("HTTP success starts the oversized tool stream");
+    let mut error = None;
+    while let Some(item) = stream.next().await {
+        if let Err(found) = item {
+            error = Some(found);
+            break;
+        }
+    }
+    assert!(matches!(
+        error,
+        Some(ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ToolArguments,
+            limit_bytes: KITSU_TOOL_ARGUMENT_LIMIT_BYTES,
+        })
+    ));
 }
 
 #[test]

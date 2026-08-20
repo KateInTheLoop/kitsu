@@ -283,7 +283,7 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 Dependencies: E02 run outcome; E00 delta audit.
 
 Status: E04-S01/S02/S03 are accepted and E04-S04 is in progress through Cycle
-039.
+040.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
@@ -299,9 +299,11 @@ only catalog capability, and bind top-level `models` plus explicit doctor
 probes. Primary-reviewed compatible-Chat and structurally distinct Anthropic
 Messages fixtures run fully offline. A distinct native Messages implementation
 now matches the exact text request/header and normalizes streamed text, usage,
-and terminal reason, but is deliberately unreachable from live composition.
-Native tools, fault/bound parity, route composition, complete receipts, and
-alternate conformance remain open; X001 therefore still fails.
+terminal reason, translates exact prior tool use/results, and correlates
+bounded fragmented tool arguments, but is deliberately unreachable from live
+composition. Native fault/timeout/cancellation parity, attempt telemetry,
+route composition, complete receipts, and alternate conformance remain open;
+X001 therefore still fails.
 
 Recommended distinct dialect: Anthropic Messages, because current config and
 documentation already name Anthropic while live construction still uses the
@@ -494,6 +496,7 @@ gates merely because a card appears attractive.
 | 038 | E04-S03-C5 | Bind top-level models and explicit doctor probes to a truthful management route while preserving catalog-without-model behavior |
 | 039 | E04-S04-C1 | Add a compiled native Messages text/usage/terminal adapter against the exact primary fixture without selecting it in live composition |
 | 040 | E04-S04-C2 | Add native Messages tool-use/result request translation and bounded streamed argument correlation without live selection |
+| 041 | E04-S04-C3 | Run the native Messages adapter through HTTP, stream-fault, size-bound, timeout, and cancellation parity without live selection |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -512,8 +515,10 @@ management calls with model-bound inference or catalog-only generations and
 closes E04-S03. Cycle 039 begins the compiled native Messages adapter with the
 smallest complete text/usage/terminal wire slice, including explicit
 message-stop truth and zero-send tool refusal. Cycle 040 adds exact tool
-translation and argument correlation; the remaining common fault/bound,
-telemetry, and route matrices follow before live composition. The
+translation, pre-send input validation, correlated argument reconstruction,
+and the 1 MiB argument bound. Cycle 041 applies the existing native fixtures to
+the actual adapter; telemetry and route matrices follow before live
+composition. The
 queue then advances through E03, E06, E07, E05/E08, and E09 in the
 dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is

@@ -1,8 +1,8 @@
 //! Native Anthropic Messages wire adapter.
 //!
-//! This first compiled slice deliberately supports only streamed text. Tool
-//! translation, retries, catalog discovery, route publication, and live CLI
-//! selection remain disabled until their own conformance fixtures pass.
+//! The compiled slices support streamed text and correlated tool use/results.
+//! Retries, attempt telemetry, catalog discovery, route publication, and live
+//! CLI selection remain disabled until their own conformance fixtures pass.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -15,7 +15,7 @@ use serde::Serialize;
 use crate::auth::AuthProvider;
 use crate::{
     ChatDelta, ChatRequest, ChatStream, FinishReason, Provider, ProviderError,
-    ProviderResponsePart, Role, Usage,
+    ProviderResponsePart, Role, ToolCall, Usage,
 };
 
 /// Wire revision pinned by [`crate::ProviderWireRevision::AnthropicMessages2023_06_01`].
@@ -24,6 +24,8 @@ pub const ANTHROPIC_VERSION: &str = "2023-06-01";
 const MAX_ERROR_BODY_BYTES: usize = 64 * 1024;
 const MAX_SSE_LINE_BYTES: usize = 4 * 1024 * 1024;
 const MAX_SSE_STREAM_BYTES: usize = 16 * 1024 * 1024;
+const MAX_STREAMED_TOOL_ARGUMENT_BYTES: usize = 1024 * 1024;
+const MAX_STREAMED_TOOL_CALLS: usize = 64;
 
 pub struct AnthropicMessagesConfig {
     pub base_url: String,
@@ -78,12 +80,45 @@ struct MessagesRequest {
     system: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     temperature: Option<f32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    tools: Option<Vec<MessagesTool>>,
 }
 
 #[derive(Debug, Serialize)]
 struct MessagesMessage {
     role: &'static str,
-    content: String,
+    content: MessagesContent,
+}
+
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum MessagesContent {
+    Text(String),
+    Blocks(Vec<MessagesContentBlock>),
+}
+
+#[derive(Debug, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+enum MessagesContentBlock {
+    Text {
+        text: String,
+    },
+    ToolUse {
+        id: String,
+        name: String,
+        input: serde_json::Value,
+    },
+    ToolResult {
+        tool_use_id: String,
+        content: String,
+    },
+}
+
+#[derive(Debug, Serialize)]
+struct MessagesTool {
+    name: String,
+    description: String,
+    input_schema: serde_json::Value,
 }
 
 fn unsupported_request(feature: &str) -> ProviderError {
@@ -93,18 +128,6 @@ fn unsupported_request(feature: &str) -> ProviderError {
 }
 
 fn build_body(request: &ChatRequest) -> Result<MessagesRequest, ProviderError> {
-    if request
-        .tools
-        .as_ref()
-        .is_some_and(|tools| !tools.is_empty())
-        || request.messages.iter().any(|message| {
-            message.role == Role::Tool
-                || message.tool_call_id.is_some()
-                || !message.tool_calls.is_empty()
-        })
-    {
-        return Err(ProviderError::ToolsNotSupported);
-    }
     if !request.stream {
         return Err(unsupported_request("non-streaming response"));
     }
@@ -129,13 +152,62 @@ fn build_body(request: &ChatRequest) -> Result<MessagesRequest, ProviderError> {
             Role::System => system.push(message.content.as_str()),
             Role::User => messages.push(MessagesMessage {
                 role: "user",
-                content: message.content.clone(),
+                content: MessagesContent::Text(message.content.clone()),
             }),
-            Role::Assistant => messages.push(MessagesMessage {
+            Role::Assistant if message.tool_calls.is_empty() => messages.push(MessagesMessage {
                 role: "assistant",
-                content: message.content.clone(),
+                content: MessagesContent::Text(message.content.clone()),
             }),
-            Role::Tool => return Err(ProviderError::ToolsNotSupported),
+            Role::Assistant => {
+                let mut blocks = Vec::new();
+                if !message.content.is_empty() {
+                    blocks.push(MessagesContentBlock::Text {
+                        text: message.content.clone(),
+                    });
+                }
+                for call in &message.tool_calls {
+                    if call.args.len() > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+                        return Err(ProviderError::ResponseTooLarge {
+                            part: ProviderResponsePart::ToolArguments,
+                            limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+                        });
+                    }
+                    let input: serde_json::Value =
+                        serde_json::from_str(&call.args).map_err(|_| {
+                            ProviderError::InvalidResponse(
+                                "native Messages prior tool input is not valid JSON".to_string(),
+                            )
+                        })?;
+                    if !input.is_object() {
+                        return Err(ProviderError::InvalidResponse(
+                            "native Messages prior tool input must be a JSON object".to_string(),
+                        ));
+                    }
+                    blocks.push(MessagesContentBlock::ToolUse {
+                        id: call.call_id.clone(),
+                        name: call.tool_name.clone(),
+                        input,
+                    });
+                }
+                messages.push(MessagesMessage {
+                    role: "assistant",
+                    content: MessagesContent::Blocks(blocks),
+                });
+            }
+            Role::Tool => {
+                let tool_use_id = message.tool_call_id.clone().ok_or_else(|| {
+                    ProviderError::InvalidResponse(
+                        "native Messages tool result has no correlation id".to_string(),
+                    )
+                })?;
+                messages.push(MessagesMessage {
+                    role: "user",
+                    content: MessagesContent::Blocks(vec![MessagesContentBlock::ToolResult {
+                        tool_use_id,
+                        content: message.content.clone(),
+                    }]),
+                });
+            }
         }
     }
     if messages.is_empty() {
@@ -144,6 +216,30 @@ fn build_body(request: &ChatRequest) -> Result<MessagesRequest, ProviderError> {
         ));
     }
 
+    let tools = request
+        .tools
+        .as_ref()
+        .filter(|tools| !tools.is_empty())
+        .map(|tools| {
+            tools
+                .iter()
+                .map(|tool| {
+                    if !tool.parameters.is_object() {
+                        return Err(ProviderError::InvalidResponse(format!(
+                            "native Messages tool schema for {} must be a JSON object",
+                            tool.name
+                        )));
+                    }
+                    Ok(MessagesTool {
+                        name: tool.name.clone(),
+                        description: tool.description.clone(),
+                        input_schema: tool.parameters.clone(),
+                    })
+                })
+                .collect::<Result<Vec<_>, ProviderError>>()
+        })
+        .transpose()?;
+
     Ok(MessagesRequest {
         model: request.model.clone(),
         max_tokens,
@@ -151,6 +247,7 @@ fn build_body(request: &ChatRequest) -> Result<MessagesRequest, ProviderError> {
         stream: true,
         system: (!system.is_empty()).then(|| system.join("\n\n")),
         temperature: request.temperature,
+        tools,
     })
 }
 
@@ -188,6 +285,61 @@ async fn read_error_body(response: reqwest::Response) -> Result<String, Provider
     Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
+struct MessagesToolAcc {
+    id: String,
+    name: String,
+    initial_input: serde_json::Value,
+    args: String,
+    saw_delta: bool,
+}
+
+fn event_index(value: &serde_json::Value) -> Result<usize, ProviderError> {
+    value
+        .get("index")
+        .and_then(serde_json::Value::as_u64)
+        .and_then(|index| usize::try_from(index).ok())
+        .ok_or_else(|| {
+            ProviderError::InvalidResponse(
+                "native Messages content event has no bounded index".to_string(),
+            )
+        })
+}
+
+impl MessagesToolAcc {
+    fn finish(self) -> Result<ToolCall, ProviderError> {
+        let args = if self.saw_delta {
+            self.args
+        } else {
+            serde_json::to_string(&self.initial_input).map_err(|_| {
+                ProviderError::InvalidResponse(
+                    "native Messages tool input could not be serialized".to_string(),
+                )
+            })?
+        };
+        if args.len() > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+            return Err(ProviderError::ResponseTooLarge {
+                part: ProviderResponsePart::ToolArguments,
+                limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+            });
+        }
+        let input: serde_json::Value = serde_json::from_str(&args).map_err(|_| {
+            ProviderError::InvalidResponse(
+                "native Messages streamed tool input is not valid JSON".to_string(),
+            )
+        })?;
+        if !input.is_object() {
+            return Err(ProviderError::InvalidResponse(
+                "native Messages streamed tool input must be a JSON object".to_string(),
+            ));
+        }
+        Ok(ToolCall {
+            tool_name: self.name,
+            args,
+            call_id: self.id,
+        })
+    }
+}
+
 #[derive(Default)]
 struct MessagesSseDecoder {
     buf: Vec<u8>,
@@ -198,6 +350,7 @@ struct MessagesSseDecoder {
     finish: Option<FinishReason>,
     input_tokens: Option<u64>,
     output_tokens: Option<u64>,
+    tool_calls: Vec<Option<MessagesToolAcc>>,
 }
 
 impl MessagesSseDecoder {
@@ -269,23 +422,85 @@ impl MessagesSseDecoder {
                     .pointer("/message/usage/output_tokens")
                     .and_then(serde_json::Value::as_u64);
             }
-            "content_block_start" | "content_block_stop" => {
+            "content_block_start" => {
                 self.require_started(event_type)?;
-                if value
+                match value
                     .pointer("/content_block/type")
                     .and_then(serde_json::Value::as_str)
-                    == Some("tool_use")
                 {
-                    return Err(ProviderError::ToolsNotSupported);
+                    Some("text") => {}
+                    Some("tool_use") => {
+                        let index = event_index(&value)?;
+                        if index >= MAX_STREAMED_TOOL_CALLS {
+                            return Err(ProviderError::InvalidResponse(
+                                "native Messages exceeded the streamed tool-call count".to_string(),
+                            ));
+                        }
+                        if self.tool_calls.len() <= index {
+                            self.tool_calls.resize_with(index + 1, || None);
+                        }
+                        if self.tool_calls[index].is_some() {
+                            return Err(ProviderError::InvalidResponse(
+                                "native Messages repeated a tool-use block index".to_string(),
+                            ));
+                        }
+                        let id = value
+                            .pointer("/content_block/id")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|id| !id.is_empty())
+                            .ok_or_else(|| {
+                                ProviderError::InvalidResponse(
+                                    "native Messages tool-use block has no id".to_string(),
+                                )
+                            })?;
+                        let name = value
+                            .pointer("/content_block/name")
+                            .and_then(serde_json::Value::as_str)
+                            .filter(|name| !name.is_empty())
+                            .ok_or_else(|| {
+                                ProviderError::InvalidResponse(
+                                    "native Messages tool-use block has no name".to_string(),
+                                )
+                            })?;
+                        let initial_input = value
+                            .pointer("/content_block/input")
+                            .cloned()
+                            .unwrap_or_else(|| serde_json::json!({}));
+                        if !initial_input.is_object() {
+                            return Err(ProviderError::InvalidResponse(
+                                "native Messages tool-use input must be a JSON object".to_string(),
+                            ));
+                        }
+                        self.tool_calls[index] = Some(MessagesToolAcc {
+                            id: id.to_string(),
+                            name: name.to_string(),
+                            initial_input,
+                            args: String::new(),
+                            saw_delta: false,
+                        });
+                    }
+                    _ => {
+                        return Err(ProviderError::InvalidResponse(
+                            "native Messages content block has an unsupported type".to_string(),
+                        ));
+                    }
+                }
+            }
+            "content_block_stop" => {
+                self.require_started(event_type)?;
+                let index = event_index(&value)?;
+                if let Some(acc) = self.tool_calls.get_mut(index).and_then(Option::take) {
+                    output.push(ChatDelta::ToolCall(acc.finish()?));
+                    self.saw_semantic_content = true;
                 }
             }
             "content_block_delta" => {
-                self.require_started(event_type)?;
                 match value
                     .pointer("/delta/type")
                     .and_then(serde_json::Value::as_str)
                 {
                     Some("text_delta") => {
+                        self.require_started(event_type)?;
                         let text = value
                             .pointer("/delta/text")
                             .and_then(serde_json::Value::as_str)
@@ -299,7 +514,56 @@ impl MessagesSseDecoder {
                             output.push(ChatDelta::Text(text.to_string()));
                         }
                     }
-                    Some("input_json_delta") => return Err(ProviderError::ToolsNotSupported),
+                    Some("input_json_delta") => {
+                        let index = event_index(&value)?;
+                        let partial = value
+                            .pointer("/delta/partial_json")
+                            .and_then(serde_json::Value::as_str)
+                            .ok_or_else(|| {
+                                ProviderError::InvalidResponse(
+                                    "native Messages input_json_delta has no partial_json"
+                                        .to_string(),
+                                )
+                            })?;
+                        if partial.len() > MAX_STREAMED_TOOL_ARGUMENT_BYTES {
+                            return Err(ProviderError::ResponseTooLarge {
+                                part: ProviderResponsePart::ToolArguments,
+                                limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+                            });
+                        }
+                        self.require_started(event_type)?;
+                        let acc = self
+                            .tool_calls
+                            .get_mut(index)
+                            .and_then(Option::as_mut)
+                            .ok_or_else(|| {
+                                ProviderError::InvalidResponse(
+                                    "native Messages tool delta has no open tool-use block"
+                                        .to_string(),
+                                )
+                            })?;
+                        if !acc.saw_delta
+                            && acc
+                                .initial_input
+                                .as_object()
+                                .is_some_and(|input| !input.is_empty())
+                        {
+                            return Err(ProviderError::InvalidResponse(
+                                "native Messages mixed complete and incremental tool input"
+                                    .to_string(),
+                            ));
+                        }
+                        if acc.args.len().saturating_add(partial.len())
+                            > MAX_STREAMED_TOOL_ARGUMENT_BYTES
+                        {
+                            return Err(ProviderError::ResponseTooLarge {
+                                part: ProviderResponsePart::ToolArguments,
+                                limit_bytes: MAX_STREAMED_TOOL_ARGUMENT_BYTES,
+                            });
+                        }
+                        acc.args.push_str(partial);
+                        acc.saw_delta = true;
+                    }
                     _ => {
                         return Err(ProviderError::InvalidResponse(
                             "native Messages content delta has an unsupported type".to_string(),
@@ -334,6 +598,11 @@ impl MessagesSseDecoder {
             }
             "message_stop" => {
                 self.require_started(event_type)?;
+                if self.tool_calls.iter().any(Option::is_some) {
+                    return Err(ProviderError::InvalidResponse(
+                        "native Messages ended with an open tool-use block".to_string(),
+                    ));
+                }
                 if !self.saw_semantic_content {
                     return Err(ProviderError::InvalidResponse(
                         "native Messages ended without semantic content".to_string(),
