@@ -403,6 +403,63 @@ fn lookup_states_are_closed_typed_and_semantically_validated() {
 }
 
 #[test]
+fn expected_revision_admission_is_exact_and_conflicts_are_zero_effect() {
+    fn admit_then_count(
+        expected: &ExpectedRevision,
+        observed: Option<&RevisionId>,
+        writes: &std::cell::Cell<usize>,
+    ) -> Result<(), SessionLookupState> {
+        expected.admit_observed(observed)?;
+        writes.set(writes.get() + 1);
+        Ok(())
+    }
+
+    let revision_a = revision("revision-v1-a");
+    let revision_b = revision("revision-v1-b");
+    let writes = std::cell::Cell::new(0);
+
+    admit_then_count(&ExpectedRevision::Missing, None, &writes).unwrap();
+    admit_then_count(
+        &ExpectedRevision::Exact(revision_a.clone()),
+        Some(&revision_a),
+        &writes,
+    )
+    .unwrap();
+    assert_eq!(writes.get(), 2);
+
+    assert_eq!(
+        admit_then_count(&ExpectedRevision::Missing, Some(&revision_b), &writes),
+        Err(SessionLookupState::Conflict {
+            expected: ExpectedRevision::Missing,
+            observed: Some(revision_b.clone()),
+        })
+    );
+    assert_eq!(writes.get(), 2);
+
+    assert_eq!(
+        admit_then_count(
+            &ExpectedRevision::Exact(revision_a.clone()),
+            Some(&revision_b),
+            &writes,
+        ),
+        Err(SessionLookupState::Conflict {
+            expected: ExpectedRevision::Exact(revision_a.clone()),
+            observed: Some(revision_b),
+        })
+    );
+    assert_eq!(writes.get(), 2);
+
+    assert_eq!(
+        admit_then_count(&ExpectedRevision::Exact(revision_a.clone()), None, &writes),
+        Err(SessionLookupState::Conflict {
+            expected: ExpectedRevision::Exact(revision_a),
+            observed: None,
+        })
+    );
+    assert_eq!(writes.get(), 2);
+}
+
+#[test]
 fn commit_receipts_separate_publication_from_semantic_outcome() {
     let receipt = SessionCommitReceipt::new(
         store(),

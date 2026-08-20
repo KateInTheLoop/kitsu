@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 053.
+updates through Cycle 054.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -42,7 +42,7 @@ kernel.
 | Filesystem mutation | Canonical/descriptor checks, atomic install, exact preconditions, journaling, verified effects, and conflict-aware undo remain Kitsu-owned. | `crates/kitsu-tools/src/permissions.rs`; `crates/kitsu-tools/src/builtins/fs.rs` | Semantic context or external sources must use these authorization/mutation primitives, never replace them with fuzzy or in-place writes. |
 | Skills | Local bounded skills are discovered as untrusted instructions/resources with path/provenance checks; effects still cross ordinary tools. | `crates/kitsu/src/skills.rs:359,824-900,1514` | This is a declarative data plane, not executable configuration or a plugin loader. |
 | Events/JSONL | Core runtime events are projected by the CLI into versioned `kitsu.chat.v1`; the writer serializes whole records, flushes, and fails terminally. One neutral `RunSpec` supplies JSONL, private generations, and human completion. Human timing and JSONL `final_summary` carry the same exact run outcome/assistant tuple. Every `run_started` now adds the complete provider-route receipt while attempts carry the correlated generation; the new field is optional in the schema so legacy records remain valid. | `crates/kitsu-core/src/run.rs`; `crates/kitsu/src/main.rs`; `crates/kitsu-render/src/lib.rs`; `crates/kitsu-render/src/jsonl.rs`; `docs/schemas/kitsu-chat-v1.schema.json` | E02 is accepted for the default runtime and E04's two-adapter product suite proves receipt/attempt parity. Alternate host/runtime conformance remains open. |
-| Sessions | Production v1 still atomically stores one current `SavedSession` message vector plus gateway/model/project context. Fork copies the complete snapshot/artifact tree to a fresh identity without grants. The E03 ADR assigns target ownership; `kitsu-core::session` supplies the bounded neutral revision/HEAD contract. Public load/load-other/list cross private `SessionReadPort`; active autosave crosses `SessionWritePort`. Both use the existing descriptor-pinned v1 file adapter. Selector/exclusion/auto behavior, corrupt-list omission, exact installed inode, and post-install sync failure evidence are pinned. | `crates/kitsu/src/session.rs`; `crates/kitsu-core/src/session.rs`; `scripts/check-session-boundary.sh`; `docs/roadmap/e03-canonical-session-adr.md` | These seams are real but transitional: they return v1 values/path receipts/string errors, other lifecycle mutations remain direct, and production still has no revision CAS/logical HEAD, branch-at-turn, canonical compaction history, or verified last-good generation. X005 remains failed. |
+| Sessions | Production v1 still atomically stores one current `SavedSession` message vector plus gateway/model/project context. Fork copies the complete snapshot/artifact tree to a fresh identity without grants. The E03 ADR assigns target ownership; `kitsu-core::session` supplies the bounded neutral revision/HEAD contract and exact expected-revision admission. Public load/load-other/list cross private `SessionReadPort`; active autosave crosses `SessionWritePort`. Both use the existing descriptor-pinned v1 file adapter. Selector/exclusion/auto behavior, corrupt-list omission, exact installed inode, post-install sync failure evidence, and zero-effect stale conflict are pinned. | `crates/kitsu/src/session.rs`; `crates/kitsu-core/src/session.rs`; `crates/kitsu-core/tests/session_contract.rs`; `scripts/check-session-boundary.sh`; `docs/roadmap/e03-canonical-session-adr.md` | These seams are real but transitional: current v1 has no canonical revision to compare or mint, so production save remains unconditional. Other lifecycle mutations remain direct, and production still has no revision CAS/logical HEAD, branch-at-turn, canonical compaction history, or verified last-good generation. X005 remains failed. |
 | External tools/hosts | No MCP dependency/client, long-lived child supervisor, bidirectional host adapter, daemon, or second principal is compiled. JSONL is one-way output. | workspace manifests and source search | X002-X004 remain failed; absence preserves the disabled path and avoids ambient authority. |
 
 ## What changed from the frozen research pin
@@ -63,7 +63,8 @@ kernel.
 - E03-S01 defines and compiles the store-neutral canonical session vocabulary;
   Cycles 052-053 route current-v1 read/list and active save through private ports
   without changing bytes, selectors, corruption handling, or physical commit
-  evidence.
+  evidence. Cycle 054 adds exact expected-revision admission and proves every
+  stale/missing mismatch remains zero-effect before a store is entered.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
