@@ -290,9 +290,11 @@ cannot weaken or replace any backend-neutral assertion.
    observed revision and `Exact(A)` admits only observed `A`; every mismatch is
    a typed zero-effect conflict. **Logical K08 path complete in Cycle 055:** an
    independent in-memory fixture composes admission, opaque successors, exact
-   receipts, stale zero-effect rejection, and retry. Next add deterministic
-   K04/K07 physical/fence fault hooks, then migrate whole-operation outcome
-   publication.
+   receipts, stale zero-effect rejection, and retry. **Logical K04 cuts complete
+   in Cycle 056:** pre-candidate and staged candidate remain not-published/old;
+   post-publication is new/published-unconfirmed; confirmation is new/confirmed.
+   Next add K07 fence hooks and physical K04 cuts, then migrate whole-operation
+   outcome publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
