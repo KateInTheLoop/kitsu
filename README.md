@@ -97,7 +97,8 @@ A **gateway profile** is a named block in the config describing one endpoint:
 
 ```toml
 [gateways.myprofile]
-flavor      = "openai"                       # wire protocol (openai chat/completions)
+flavor      = "openai"                       # compatibility/diagnostic label
+adapter     = "compatible-chat"              # optional; this is the wire selector
 base_url    = "https://host.example.com"     # scheme + host (+ optional port)
 chat_path   = "/v1/chat/completions"         # appended to base_url for chat
 models_path = "/v1/models"                   # optional; endpoint's model list
@@ -122,6 +123,10 @@ shell. The complete precedence is:
 2. explicit `--gateway` / `--model`
 3. `KITSU_GATEWAY` / `KITSU_MODEL`
 4. `default_gateway` / the selected profile's `model`
+
+`adapter` is a closed compiled choice: `compatible-chat` (the default when the
+field is omitted) or `anthropic-messages`. `flavor` never silently changes the
+wire, so existing profiles keep their current compatible-Chat behavior.
 
 For example:
 
@@ -415,17 +420,17 @@ kitsu --gateway openai ask "hi"
 
 ### Anthropic
 
-Anthropic hosts an OpenAI-compatible endpoint, so kitsu talks to it with no
-special handling.
+Use Kitsu's compiled native Messages adapter explicitly:
 
 ```toml
 [gateways.anthropic]
-flavor      = "openai"
+flavor      = "anthropic"
+adapter     = "anthropic-messages"
 base_url    = "https://api.anthropic.com"
-chat_path   = "/v1/chat/completions"
-models_path = "/v1/models"
+chat_path   = "/v1/messages"
+models_path = ""
 model       = "claude-opus-4-8"
-auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", expires_env = "" }
+auth        = { method = "bearer-env", env = "ANTHROPIC_API_KEY", header = "x-api-key", scheme = "", expires_env = "" }
 ```
 
 ```bash
@@ -436,7 +441,8 @@ kitsu --gateway anthropic ask --max-output-tokens 1024 "hi"
 - Requires a **developer API key** (`sk-ant-…`). A claude.ai Pro/Max
   **subscription** login does *not* grant API access — it's a separate system.
 - Anthropic's endpoint requires a `max_tokens`, so pass `--max-output-tokens N`
-  or the request may be rejected.
+  for ordinary chat. This adapter is streaming-only and does not expose model
+  catalog, structured-output, image-input, or prompt-cache capabilities yet.
 
 ---
 

@@ -1,7 +1,6 @@
 # Improvement Program Status
 
-Status: E00, E01, E02, and E04-S01/S02/S03 are accepted; E04-S04 is in
-progress through Cycle 045;
+Status: E00, E01, E02, and E04-S01/S02/S03/S04 are accepted through Cycle 046;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +9,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 45 / 45 |
+| Accepted cycles/commits after this cycle | 46 / 46 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S04-C8 (Cycle 046) — explicit native composition selector |
+| Active epic/card | E04 / E04-S05-C1 (Cycle 047) — secret-free provider route receipt value |
 
 ## Epic status
 
@@ -23,7 +22,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted, E04-S04 through C7 | Thirty wire, two common route-conformance, six route-contract, four derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, attempt attribution, and compiled native Messages text/tool/usage/terminal plus fault/lifecycle/telemetry parity. Both adapters share bounded retry ownership and now pass one generic neutral text/tool/capability/attempt/catalog/staleness/successor harness. Explicit live composition, complete receipts, and alternate conformance remain |
+| E04 provider spine | **In progress**; E04-S01/S02/S03/S04 accepted | Thirty wire, two common route-conformance, route-contract/derivation/snapshot/handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI cases cover protocol evidence, secret-free identity, every production send, immutable request models, exact successor publication, failed-publication retention, old-work drain, attempt attribution, and native Messages fault/lifecycle/telemetry parity. A closed explicit selector now composes either adapter without flavor inference or runtime loading; native chat and inference doctor hit the exact Messages wire, while unsupported catalog fails before send. Complete receipts and final X001 conformance remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -80,7 +79,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 042 | `9299647` | Native Messages send/body terminal attempt ownership |
 | 043 | `03ac9ab` | Frozen truthful native route generation and common admission |
 | 044 | `d5ea219` | Shared bounded retry and native frozen-generation parity |
-| 045 | this document's commit | Generic two-adapter route-handle conformance |
+| 045 | `53e68dc` | Generic two-adapter route-handle conformance |
+| 046 | this document's commit | Explicit legacy-safe live native composition |
 
 ## Current green gates
 
@@ -103,12 +103,13 @@ E08 telemetry observability was scoped in Cycle 030 on
 - Six provider-route tests pin a stable secret-free v1 JSON vector, opaque
   profile identity, nonzero generation/revisions, truthful adapter/wire pairs,
   all six deterministic capabilities, fail-closed decoding, and zero-send
-  stale/unsupported admission. Core still does not import provider route values.
-- Four derivation/declaration and two CLI declaration-composition tests pin the
+  stale/unsupported admission. Core still does not import concrete adapters.
+- Four derivation/declaration and live CLI composition tests pin the
   domain-separated SHA-256 vector, input bounds, canonical path identity,
-  route-content independence, exact compatible-Chat capabilities, and the fact
-  that `anthropic` remains a display/config label until the compiled native
-  adapter completes its production-eligibility gates.
+  route-content independence, exact compatible-Chat/native capabilities, and
+  the fact that `anthropic` remains a display/config label while only the
+  closed `adapter` field selects a physical wire. Live native chat and doctor
+  hit `/v1/messages`; native catalog refusal is local and zero-send.
 - Two common route-conformance instantiations run the same generic assertions
   against compatible Chat and native Messages: normalized text/tool output,
   streaming/tools/usage capabilities, generation-one terminal attempts,
@@ -223,7 +224,10 @@ The generic harness passes unchanged for compatible Chat and native Messages,
 covering neutral text/tool deltas, shared capabilities, generation-attributed
 terminal attempts, optional-catalog absence, exact successor publication, and
 stale zero-send. Cycle 046 adds explicit live composition without changing
-legacy flavor defaults implicitly.
+legacy flavor defaults implicitly. One closed compiled enum delegates the
+provider port, immutable route declarations select exact wires, native doctor
+uses its route identity to choose streaming, and unsupported native catalog
+discovery fails locally before transport. E04-S04 is accepted.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

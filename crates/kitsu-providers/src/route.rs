@@ -844,6 +844,25 @@ impl<P> ProviderRouteSnapshot<P> {
     pub fn catalog_runtime(&self) -> &Arc<P> {
         &self.catalog_runtime
     }
+
+    /// Rewrap private compiled runtimes without changing any immutable route
+    /// fact. Composition uses this to place concrete adapters behind one closed
+    /// enum while preserving identity, policy, auth source, and generation.
+    pub(crate) fn map_runtime<Q, F>(self, mut wrap: F) -> ProviderRouteSnapshot<Q>
+    where
+        F: FnMut(Arc<P>) -> Arc<Q>,
+    {
+        let inference_runtime = self.inference_runtime.map(&mut wrap);
+        let catalog_runtime = wrap(self.catalog_runtime);
+        ProviderRouteSnapshot {
+            identity: self.identity,
+            model: self.model,
+            auth_source: self.auth_source,
+            policy: self.policy,
+            inference_runtime,
+            catalog_runtime,
+        }
+    }
 }
 
 /// Atomic owner of the current snapshot for one process-local profile. A
