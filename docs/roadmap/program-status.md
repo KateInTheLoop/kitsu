@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, and E04 are accepted; E03-S02 is in progress
-through Cycle 054;
+through Cycle 055;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 54 / 54 |
+| Accepted cycles/commits after this cycle | 55 / 55 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C4 (Cycle 055) — in-memory K08 revision publication and receipt fixture |
+| Active epic/card | E03 / E03-S02-C5 (Cycle 056) — provider-free K04 publication cuts and durability truth |
 
 ## Epic status
 
@@ -24,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C3 | The neutral contract is accepted. Public current-v1 reads/listing and active save cross private ports with unchanged descriptor-pinned decode/install evidence. Exact expected-revision admission accepts only matching absence/identity and returns typed zero-effect conflict for every mismatch. Production revision minting/CAS and X005 remain open |
+| E03 session spine | **In progress**; E03-S01 accepted, E03-S02 through C4 | The neutral contract is accepted. Public current-v1 reads/listing and active save cross private ports with unchanged descriptor-pinned decode/install evidence. Exact admission plus an independent in-memory K08 store prove create/update/stale/retry, no-clobber, opaque successor, receipt, and zero-effect conflict semantics. Production revision minting/CAS and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -89,7 +89,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 051 | `fcf848b` | Neutral canonical session values and store-boundary gate |
 | 052 | `02ea526` | Private current-v1 read port with unchanged behavior |
 | 053 | `c73f734` | Private current-v1 active-save port and commit truth |
-| 054 | this document's commit | Store-neutral exact revision admission and zero-effect conflict |
+| 054 | `fa51190` | Store-neutral exact revision admission and zero-effect conflict |
+| 055 | this document's commit | Provider-free K08 logical publication and receipt fixture |
 
 ## Current green gates
 
@@ -201,6 +202,11 @@ E08 telemetry observability was scoped in Cycle 030 on
   create, changed, and disappeared observations return an exact typed conflict.
   A provider-free counter fixture proves all conflict paths perform zero store
   effects; current v1 is not falsely assigned a revision or mounted to CAS.
+- An independent test-only memory store composes that admission with opaque
+  successor allocation, selected HEAD publication, and a confirmed commit
+  receipt. K08 create A, update B, stale A-versus-B, retry from B to C, and
+  no-clobber create all preserve exact revision/mint/publication counts. This is
+  logical conformance evidence only; it is not a named product store.
 
 ## Next delivery tranche
 
@@ -314,7 +320,9 @@ unchanged current-v1 reads and listing before any format migration. Cycle 053
 extracts current v1 active save/commit without claiming revision CAS. Cycle 054
 adds provider-free expected-revision admission and stale zero-write conflict.
 Cycle 055 composes admission, opaque successor minting, publication, and receipt
-truth in an in-memory K08 fixture before changing production bytes.
+truth in an in-memory K08 fixture before changing production bytes. Cycle 056
+adds provider-free K04 cut points and confirmed versus published-unconfirmed
+durability truth before physical publication wiring.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
