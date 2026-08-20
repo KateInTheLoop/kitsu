@@ -1,7 +1,6 @@
 # Improvement Program Status
 
-Status: E00, E01, E02, and E04-S01/S02/S03/S04 are accepted; E04-S05 is in
-progress through Cycle 048;
+Status: E00, E01, E02, and E04 are accepted through Cycle 049;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +9,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 48 / 48 |
-| Complete replaceability gates | 0 / 5 |
+| Accepted cycles/commits after this cycle | 49 / 49 |
+| Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S05-C3 (Cycle 049) — final two-adapter receipt/attempt conformance and X001 audit |
+| Active epic/card | E03 / E03-S01-C1 (Cycle 050) — canonical session revision/HEAD ADR and K01-K12 fixture contract |
 
 ## Epic status
 
@@ -23,8 +22,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02/S03/S04 accepted, E04-S05 through C2 | Thirty wire, two common route-conformance, route-contract/derivation/snapshot/handle/receipt, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI cases cover protocol evidence, secret-free identity, every production send, immutable request models, exact successor publication, failed-publication retention, old-work drain, attempt attribution, and native Messages fault/lifecycle/telemetry parity. A closed explicit selector composes either adapter. `/status`, every JSONL `run_started`, and opted-in doctor checks now project the complete bounded v1 receipt; attempt generations correlate to it and offline doctor proves no route construction. Final two-adapter X001 conformance remains |
-| E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
+| E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
+| E03 session spine | **Next**; starts Cycle 050 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -83,11 +82,12 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 045 | `53e68dc` | Generic two-adapter route-handle conformance |
 | 046 | `c78018e` | Explicit legacy-safe live native composition |
 | 047 | `c4cbb0a` | Complete bounded secret-free route receipt value |
-| 048 | this document's commit | Additive status/JSONL/doctor route receipt projection |
+| 048 | `0ba0715` | Additive status/JSONL/doctor route receipt projection |
+| 049 | this document's commit | Two-adapter product conformance and X001 acceptance |
 
 ## Current green gates
 
-- The provider-wire matrix now has thirty offline tests covering exact text
+- The provider-wire matrix now has thirty-one offline tests covering exact text
   and correlated tool rounds, structural Chat/Messages divergence,
   wrong-adapter rejection, HTTP/mid-stream/malformed faults, path-level hard
   bounds, timeout/cancellation terminality, and the capability handoff. Three
@@ -145,6 +145,14 @@ E08 telemetry observability was scoped in Cycle 030 on
   Catalog-only handles have no model, inference runtime, or chat method; stale
   replacement is zero-send. Explicit doctor inference and catalog probes bind
   matching immutable routes, while offline doctor still constructs none.
+- One product-level harness now executes identical compatible-Chat and native-
+  Messages success, HTTP-fault, status, JSONL, inference-doctor, and offline-
+  doctor assertions. A second identical harness sends SIGINT through both
+  adapters and correlates the cancelled attempt with the run-start receipt.
+  The only divergence it exposed was native Messages omitting required
+  `max_tokens` when the CLI option was absent; omission now maps to a bounded
+  4,096-token wire default while explicit zero fails before transport. This
+  completes `X001-G1-AUX` and makes X001 the first passing replaceability gate.
 - Workspace/all-target check passes with ordinary flags and with
   `RUSTFLAGS=-Dunused-must-use`.
 - Workspace/all-target Clippy passes with warnings denied; formatting and diff
@@ -248,6 +256,14 @@ JSONL run-entry paths capture their start generation, provider attempts
 correlate by generation, and doctor distinguishes offline no-construction from
 an opted-in bound inference or catalog route. The v1 JSONL field is additive,
 so legacy records remain valid.
+Cycle 049 runs the same product surface against both compiled adapters. Success,
+typed HTTP failure with body redaction, cancellation, status, JSONL start,
+inference doctor, and offline doctor all preserve one immutable receipt/attempt
+generation. The red harness found and closed the native omitted-`max_tokens`
+defect. Static audits confirm core has no concrete adapter import, composition
+has no dynamic loader, and Kitsu has no title-generation provider call to bind.
+E04 and `X001-G1-AUX` are accepted; Cycle 050 starts E03's canonical session
+revision/HEAD contract.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

@@ -127,6 +127,9 @@ shell. The complete precedence is:
 `adapter` is a closed compiled choice: `compatible-chat` (the default when the
 field is omitted) or `anthropic-messages`. `flavor` never silently changes the
 wire, so existing profiles keep their current compatible-Chat behavior.
+Messages requires a `max_tokens` wire field; when `--max-output-tokens` is not
+set, that adapter uses Kitsu's bounded 4,096-token default. An explicit value
+is preserved, while explicit zero is rejected before any request.
 
 For example:
 
@@ -134,8 +137,9 @@ For example:
 kitsu --gateway huggingface --model "deepseek-ai/DeepSeek-V3:together" ask "hi"
 ```
 
-That's the whole model. Adding a new provider is just adding a block — no code
-changes, nothing baked into the binary.
+Adding another profile for either compiled adapter is just adding a block.
+Adding a genuinely different wire dialect requires a compiled Kitsu adapter
+and the shared conformance suite; configuration cannot load provider code.
 
 ---
 

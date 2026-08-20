@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03/S04 are accepted; E04-S05 is in progress through Cycle 048.
+Status: E04-S02/S03/S04/S05 and E04 are accepted through Cycle 049.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -17,9 +17,10 @@ production sends, and closes E04-S03. Cycle 039 compiles the first native
 Messages text/usage/terminal slice without selecting it in production. Cycle
 040 adds exact tool-use/result translation and bounded streamed argument
 correlation. Cycle 041 runs the actual native adapter through HTTP,
-mid-stream/malformed, size-bound, timeout, and cancellation parity. Attempt
-telemetry, route composition, and common conformance remain E04-S04; complete
-route receipts remain E04-S05. Cycle 042 adds exactly one terminal native
+mid-stream/malformed, size-bound, timeout, and cancellation parity. At that
+cut, attempt telemetry, route composition, and common conformance remained
+E04-S04 while complete route receipts remained E04-S05. Cycle 042 adds exactly
+one terminal native
 attempt observation across success, rejection, decode/body failure, timeout,
 send cancellation, and accepted-body cancellation. Cycle 043 publishes an
 exact native declaration and immutable frozen-auth snapshot, exercises it
@@ -39,6 +40,13 @@ Cycle 048 exposes that exact value additively in `/status`, all JSONL run-entry
 paths, and opted-in doctor checks. Offline doctor emits an explicit
 no-construction state; JSONL attempts correlate to the run receipt by immutable
 generation; `/model` successor status reads the new current receipt.
+Cycle 049 drives both compiled adapters through one identical product-level
+success/fault/status/JSONL/doctor/offline harness and one identical SIGINT
+cancellation harness. The red fixture found native Messages omitted its
+required `max_tokens` when the user supplied no limit; omission now maps to a
+bounded 4,096-token default while explicit zero is rejected before transport.
+The final static coupling/loading/title-generation audit is clean, so E04 and
+X001 are accepted.
 
 ## Decision
 
@@ -236,13 +244,13 @@ accepted body is terminal even when retries remain.
 Cycle 045 proves both adapters produce the same neutral text/tool deltas and
 generation-attributed body terminal, advertise the same required common
 capabilities, preserve optional-catalog absence without a send, publish an
-exact model successor, and reject the stale handle before a third send. These
-cards still do not:
+exact model successor, and reject the stale handle before a third send. Cycle
+049 adds the product-level route receipt, success, HTTP-fault, cancellation,
+status, JSONL, doctor, and offline cuts. Intentional truthful limitations remain:
 
-- run the final identical two-adapter receipt/attempt product conformance gate
-  required by E04-S05/X001;
-- implement model catalog for the Messages adapter;
-- expose provider account, billing, quota, endpoint, or credential data.
+- the Messages adapter has no model catalog;
+- Kitsu does not expose provider account, billing, quota, endpoint, or
+  credential data.
 
 `rg` confirms production `kitsu-core` does not import either concrete adapter,
 provider config, auth implementation, or catalog implementation; its test-only
@@ -250,9 +258,8 @@ route fixture uses provider-neutral values. The CLI has no flavor-to-adapter
 switch. There is no title-generation provider call in current Kitsu.
 Production composition has no raw concrete-provider constructor or dynamic
 provider loader. `CompiledProvider` is a closed enum, and only the typed
-`adapter` field selects its variant. The next card runs the final two-adapter
-receipt/attempt product conformance and audits X001 without adding a plugin
-surface.
+`adapter` field selects its variant. X001 passes without adding a plugin
+surface. Provider work can now yield to E03's canonical session spine.
 
 ## Acceptance and rollback
 
@@ -263,13 +270,15 @@ cargo test -p kitsu-providers --test provider_route_contract
 cargo test -p kitsu-providers --test provider_route_declaration
 cargo test -p kitsu-providers --test provider_route_snapshot
 cargo test -p kitsu-providers --test provider_route_handle
+cargo test -p kitsu-providers --test provider_route_conformance
 cargo test -p kitsu-providers --test provider_wire_matrix
+cargo test -p kitsu --test cli both_compiled_adapters_
 ```
 
 Six route-contract, four declaration/derivation, four snapshot, twelve
 route-handle, compatible-Chat/catalog route-factory, auth-freeze/source-
 selection, doctor/catalog-without-model, generation-aware
-compaction/subagent/replay/JSONL, and thirty wire-matrix cases pass offline.
+compaction/subagent/replay/JSONL, and thirty-one wire-matrix cases pass offline.
 The native slices prove exact distinct text and tool request/header shapes,
 normalized text/tool/usage/terminal output, EOF-as-failure, pre-send malformed
 tool-input rejection, and the 1 MiB streamed argument bound. Native fault cases
@@ -286,6 +295,12 @@ deadline refusal, backoff cancellation closure, and admitted-body no-retry.
 Two generic route-conformance instantiations add identical neutral text/tool,
 capability, attempt-generation, catalog-absence, successor, and stale zero-send
 evidence for compatible Chat and native Messages.
+Two product-level CLI cases add identical route-receipt correlation across
+success, bounded/redacted HTTP failure, SIGINT cancellation, status, JSONL,
+inference doctor, and offline doctor. The native default-token regression pins
+omitted `max_tokens` to 4,096 and explicit zero to a pre-send error. Together
+with the retry/replay/catalog/compaction/subagent/cancellation mutation cases,
+these execute `X001-G1-AUX`; no title-generation call exists to bind.
 The derivation vector is independently checked
 against `sha256sum`; symlink aliases resolve to one canonical namespace, while
 different config namespaces or gateway keys do not share identity. Reverting

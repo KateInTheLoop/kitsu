@@ -5,9 +5,9 @@ wrong-adapter rejection; Cycle 029 adds tool rounds, faults, malformed events,
 and error-body/SSE-line ceilings; Cycle 031 adds timeout/cancellation terminal
 cuts, aggregate/tool-argument bounds, and the unsupported-image capability
 handoff. Cycle 032 replaces that handoff's temporary fixture vocabulary with
-the production route contract's pure pre-send capability admission. Live route
-composition/generation binding and the native Messages adapter remain E04-S02
-through E04-S04 work.
+the production route contract's pure pre-send capability admission. Follow-on
+route, native-adapter, receipt, and two-adapter product conformance work is
+accepted through Cycle 049 in `e04-provider-route-contract.md`.
 
 ## Primary source pin
 
