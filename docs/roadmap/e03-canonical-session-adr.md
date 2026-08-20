@@ -288,8 +288,10 @@ cannot weaken or replace any backend-neutral assertion.
    operation is introduced.
 3. **Admission comparison complete in Cycle 054:** `Missing` admits only no
    observed revision and `Exact(A)` admits only observed `A`; every mismatch is
-   a typed zero-effect conflict. Next compose revision minting/publication and
-   deterministic K04/K07/K08 fault hooks, then migrate whole-operation outcome
+   a typed zero-effect conflict. **Logical K08 path complete in Cycle 055:** an
+   independent in-memory fixture composes admission, opaque successors, exact
+   receipts, stale zero-effect rejection, and retry. Next add deterministic
+   K04/K07 physical/fence fault hooks, then migrate whole-operation outcome
    publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.

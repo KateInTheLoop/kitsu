@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 054. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 055. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -279,6 +279,10 @@ evidence. A store-neutral exact-revision admission now accepts only
 `Missing`/absent or identical `Exact`/present pairs and returns a typed conflict
 before effects for every mismatch. Other mutation paths retain direct v1
 behavior; production revision minting/publication is not yet mounted.
+An independent test-only memory store now composes admission, deterministic
+opaque successor minting, publication, and exact receipts through the K08
+create/update/stale/retry sequence. It is conformance evidence, not a second
+product store or an X005 promotion.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -545,6 +549,7 @@ gates merely because a card appears attractive.
 | 052 | E03-S02-C1 | Route unchanged current-v1 load, load-other, and list behavior through a private read port and provider-free selector fixture |
 | 053 | E03-S02-C2 | Route unchanged current-v1 active save through a private write port while preserving exact install evidence |
 | 054 | E03-S02-C3 | Add store-neutral expected-revision admission with typed conflict and provider-free zero-effect evidence |
+| 055 | E03-S02-C4 | Execute K08 create, update, stale conflict, no-clobber create, and retry through an independent in-memory revision fixture |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -588,8 +593,9 @@ advances through E03. Cycle 052 lands that read-only port and records rather
 than hides v1's corrupt-entry listing omission; Cycle 053 extracts the active
 save/commit side without changing bytes. Cycle 054 adds provider-free
 expected-revision admission and stale zero-write conflict. Cycle 055 composes
-that admission with revision minting and receipts in an in-memory K08 fixture
-before physical CAS wiring. The queue then continues through E03,
+that admission with revision minting and receipts in an in-memory K08 fixture.
+Cycle 056 adds provider-free K04 publication-cut and durability truth before
+physical CAS wiring. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
