@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 063. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 064. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -296,6 +296,11 @@ portable reversible identity components, create-new store/revision records,
 exact payload/manifest digest bindings, descriptor-pinned candidate I/O, and a
 real per-session OS writer fence around exact-revision atomic HEAD replacement.
 It has no production caller and changes no current-v1 bytes.
+Strict current-v1 history now has one create-only private migration path: exact
+legacy baseline preparation feeds the same fenced file transaction with
+`ExpectedRevision::Missing`. Repeat/existing HEAD attempts allocate nothing,
+colliding orphan bytes are preserved, and source v1 bytes remain rollback at
+every tested cut.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -571,6 +576,7 @@ gates merely because a card appears attractive.
 | 061 | E03-S02-C10 | Add the closed whole-operation canonical payload and strict blocked current-v1 migration input |
 | 062 | E03-S02-C11 | Compose deterministic canonical bytes, immutable candidate install, and fenced HEAD CAS with exact cut/residue truth |
 | 063 | E03-S02-C12 | Define an exact current-v1 legacy baseline with fixed loss facts and typed artifact refusal |
+| 064 | E03-S02-C13 | Compose strict legacy preparation with create-only fenced publication and exact rollback/collision truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -631,7 +637,10 @@ truth. Cycle 063 admits current-v1 history only as an exact digest-bound
 `Genesis` baseline with a fixed terminal/head/lineage loss manifest, no
 canonical operations, and explicit unresolved-artifact refusal. Cycle 064
 composes preparation with no-clobber publication while retaining exact v1
-rollback bytes. The queue then continues through E03,
+rollback bytes. Cycle 064 proves that composition, including exact publication,
+existing-HEAD zero-allocation, conflicting-orphan preservation, refusal before
+effects, and installed-unselected cut truth. Cycle 065 assembles one neutral
+whole operation before any production mount. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
