@@ -16,6 +16,8 @@ Cycle 065 adds a pure, unmounted successor assembler for one complete new
 operation from neutral E02 terminal truth and closed transcript/effect facts.
 Cycle 066 composes only its artifact-free text subset with fenced file
 publication; artifact-bearing bases remain structurally refused.
+Cycle 067 adds private physical immutable artifact records and I/O; canonical
+revision publication still cannot reference them until closure is composed.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -166,6 +168,11 @@ artifact paths remain untouched and authoritative until explicit migration.
       id-<lowercase base32 revision identity>/
         manifest.json
         canonical.json
+  artifacts/
+    id-<lowercase base32 session identity>/
+      id-<lowercase base32 artifact identity>/
+        manifest.json
+        content.bin
   heads/
     id-<lowercase base32 session identity>.json
   staging/
@@ -206,6 +213,18 @@ reconfirms the fence, and atomically creates or replaces only the small HEAD
 file. Pre-install failure preserves the old pointer; post-replace directory-sync
 failure reports installed/new-visible but unconfirmed. The physical helper has
 no production caller.
+
+Artifact directories are session-scoped and installed create-new through the
+same private staging owner. Their independently versioned closed manifest binds
+store/session/artifact identity, logical artifact schema, exact content length,
+lowercase SHA-256, and optional bounded media type. Content is capped at 16 MiB.
+Install writes and syncs content plus manifest before an atomic no-replace
+directory rename; exact open uses descriptor-relative no-follow reads and
+rechecks physical identity, length, content digest, and manifest digest.
+Collision never overwrites the first bytes. Target-sync failure is
+installed-unconfirmed; missing, future schema, retarget, digest tamper, and
+symlink fail closed. No revision may reference this closure until a later
+transaction verifies every canonical artifact fact against an installed record.
 
 ## Store contract and typed states
 
@@ -464,6 +483,14 @@ cannot weaken or replace any backend-neutral assertion.
    and a HEAD-directory sync cut exposes the new revision as published-
    unconfirmed. Next define descriptor-pinned immutable artifact installation
    and verification before widening this physical composition.
+   **Physical immutable artifact closure complete in Cycle 067:** a portable
+   session/artifact namespace and closed record bind identity, independent
+   artifact schema, length, SHA-256, and media type. Private staged install is
+   synced and no-overwrite; verified open is descriptor-pinned and exact.
+   Missing, collision, future schema, physical retarget, content tamper, symlink,
+   and target-sync cuts have explicit results, including preserved first bytes
+   and installed-unconfirmed residue. Next compose canonical artifact facts with
+   exact installed-record verification before candidate/HEAD publication.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
