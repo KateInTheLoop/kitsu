@@ -654,6 +654,40 @@ pub(super) struct VerifiedArtifactV1 {
     content_bytes: Vec<u8>,
 }
 
+#[derive(Debug)]
+pub(super) enum PhysicalArtifactReadErrorV1 {
+    Missing(String),
+    Malformed(String),
+    IdentityMismatch(String),
+    DigestMismatch(String),
+    UnsupportedPhysicalSchema {
+        observed: u32,
+        supported: u32,
+        message: String,
+    },
+}
+
+impl PhysicalArtifactReadErrorV1 {
+    #[cfg(test)]
+    fn contains(&self, needle: &str) -> bool {
+        self.to_string().contains(needle)
+    }
+}
+
+impl fmt::Display for PhysicalArtifactReadErrorV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Missing(message)
+            | Self::Malformed(message)
+            | Self::IdentityMismatch(message)
+            | Self::DigestMismatch(message)
+            | Self::UnsupportedPhysicalSchema { message, .. } => formatter.write_str(message),
+        }
+    }
+}
+
+impl std::error::Error for PhysicalArtifactReadErrorV1 {}
+
 impl VerifiedArtifactV1 {
     pub(super) fn manifest(&self) -> &ArtifactManifestV1 {
         &self.manifest
@@ -1236,46 +1270,152 @@ impl PhysicalFileStoreV1 {
         &self,
         session_id: &SessionId,
         artifact_id: &str,
-    ) -> Result<VerifiedArtifactV1, String> {
-        validate_artifact_id(artifact_id)?;
+    ) -> Result<VerifiedArtifactV1, PhysicalArtifactReadErrorV1> {
+        validate_artifact_id(artifact_id).map_err(PhysicalArtifactReadErrorV1::Malformed)?;
         let session_name = encode_component(session_id.as_str());
         let artifact_name = encode_component(artifact_id);
-        let session_artifacts = self.artifacts.open_child(
-            OsStr::new(&session_name),
-            "physical session artifact namespace",
-        )?;
-        let artifact =
-            session_artifacts.open_child(OsStr::new(&artifact_name), "physical artifact")?;
+        match self.artifacts.entry_kind(OsStr::new(&session_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PhysicalArtifactReadErrorV1::Missing(format!(
+                    "physical session artifact namespace '{}' is missing",
+                    self.artifacts.path.join(&session_name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::Directory) => {}
+            Ok(_) => {
+                return Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                    "physical session artifact namespace '{}' is not a directory",
+                    self.artifacts.path.join(&session_name).display()
+                )))
+            }
+            Err(error) => {
+                return Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                    "cannot inspect physical session artifact namespace '{}': {error}",
+                    self.artifacts.path.join(&session_name).display()
+                )))
+            }
+        }
+        let session_artifacts = self
+            .artifacts
+            .open_child(
+                OsStr::new(&session_name),
+                "physical session artifact namespace",
+            )
+            .map_err(PhysicalArtifactReadErrorV1::Malformed)?;
+        match session_artifacts.entry_kind(OsStr::new(&artifact_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                return Err(PhysicalArtifactReadErrorV1::Missing(format!(
+                    "physical artifact '{}' is missing",
+                    session_artifacts.path.join(&artifact_name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::Directory) => {}
+            Ok(_) => {
+                return Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                    "physical artifact '{}' is not a directory",
+                    session_artifacts.path.join(&artifact_name).display()
+                )))
+            }
+            Err(error) => {
+                return Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                    "cannot inspect physical artifact '{}': {error}",
+                    session_artifacts.path.join(&artifact_name).display()
+                )))
+            }
+        }
+        let artifact = session_artifacts
+            .open_child(OsStr::new(&artifact_name), "physical artifact")
+            .map_err(PhysicalArtifactReadErrorV1::Malformed)?;
+        let require_regular = |name: &OsStr, context: &str| match artifact.entry_kind(name) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                Err(PhysicalArtifactReadErrorV1::Missing(format!(
+                    "{context} '{}' is missing",
+                    artifact.path.join(name).display()
+                )))
+            }
+            Ok(PrivateEntryKind::File) => Ok(()),
+            Ok(_) => Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                "cannot open {context} '{}': not a regular file",
+                artifact.path.join(name).display()
+            ))),
+            Err(error) => Err(PhysicalArtifactReadErrorV1::Malformed(format!(
+                "cannot inspect {context} '{}': {error}",
+                artifact.path.join(name).display()
+            ))),
+        };
+        require_regular(OsStr::new(ARTIFACT_MANIFEST_NAME), "artifact manifest")?;
         let manifest_bytes = read_bounded_regular(
             &artifact,
             OsStr::new(ARTIFACT_MANIFEST_NAME),
             MAX_PHYSICAL_RECORD_BYTES as u64,
             "artifact manifest",
-        )?;
-        let manifest =
-            decode_artifact_manifest(&manifest_bytes, self.store_id(), session_id, artifact_id)?;
+        )
+        .map_err(PhysicalArtifactReadErrorV1::Malformed)?;
+        let manifest: ArtifactManifestV1 =
+            serde_json::from_slice(&manifest_bytes).map_err(|error| {
+                PhysicalArtifactReadErrorV1::Malformed(format!(
+                    "cannot decode physical artifact manifest: {error}"
+                ))
+            })?;
+        if manifest.record_type != RecordType::ArtifactManifest {
+            return Err(PhysicalArtifactReadErrorV1::Malformed(
+                "physical artifact manifest has the wrong record type".to_string(),
+            ));
+        }
+        if manifest.physical_schema_revision == 0 {
+            return Err(PhysicalArtifactReadErrorV1::Malformed(
+                "physical artifact manifest schema must be nonzero".to_string(),
+            ));
+        }
+        if manifest.physical_schema_revision != PHYSICAL_SCHEMA_REVISION {
+            return Err(
+                PhysicalArtifactReadErrorV1::UnsupportedPhysicalSchema {
+                    observed: manifest.physical_schema_revision,
+                    supported: PHYSICAL_SCHEMA_REVISION,
+                    message: format!(
+                        "unsupported physical artifact manifest schema {}; expected {PHYSICAL_SCHEMA_REVISION}",
+                        manifest.physical_schema_revision
+                    ),
+                },
+            );
+        }
+        let manifest = manifest
+            .validate()
+            .map_err(PhysicalArtifactReadErrorV1::Malformed)?;
+        if manifest.store_id != *self.store_id()
+            || manifest.session_id != *session_id
+            || manifest.artifact_id != artifact_id
+        {
+            return Err(PhysicalArtifactReadErrorV1::IdentityMismatch(
+                "artifact manifest identity does not match its physical location".to_string(),
+            ));
+        }
+        require_regular(OsStr::new(ARTIFACT_CONTENT_NAME), "artifact content")?;
         let content_bytes = read_bounded_regular(
             &artifact,
             OsStr::new(ARTIFACT_CONTENT_NAME),
             MAX_IMMUTABLE_ARTIFACT_BYTES,
             "artifact content",
-        )?;
+        )
+        .map_err(PhysicalArtifactReadErrorV1::Malformed)?;
         if content_bytes.len() as u64 != manifest.content_bytes {
-            return Err(format!(
+            return Err(PhysicalArtifactReadErrorV1::DigestMismatch(format!(
                 "artifact content length mismatch: manifest declares {}, read {}",
                 manifest.content_bytes,
                 content_bytes.len()
-            ));
+            )));
         }
-        let observed_digest = digest_bytes(&content_bytes)?;
+        let observed_digest =
+            digest_bytes(&content_bytes).map_err(PhysicalArtifactReadErrorV1::Malformed)?;
         if observed_digest != manifest.content_sha256 {
-            return Err(format!(
+            return Err(PhysicalArtifactReadErrorV1::DigestMismatch(format!(
                 "artifact content digest mismatch: manifest declares {}, observed {}",
                 manifest.content_sha256.as_str(),
                 observed_digest.as_str()
-            ));
+            )));
         }
-        let manifest_sha256 = digest_bytes(&manifest_bytes)?;
+        let manifest_sha256 =
+            digest_bytes(&manifest_bytes).map_err(PhysicalArtifactReadErrorV1::Malformed)?;
         Ok(VerifiedArtifactV1 {
             manifest,
             manifest_sha256,
