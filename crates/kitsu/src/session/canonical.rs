@@ -36,6 +36,7 @@ pub(super) struct CanonicalSessionRevisionV1 {
     committed_at: String,
     metadata: CanonicalMetadataV1,
     lineage: CanonicalLineageV1,
+    legacy_baseline: Option<LegacyBaselineV1>,
     operations: Vec<CanonicalOperationV1>,
     selected_head: LogicalHead,
     artifact_manifest: Vec<ImmutableArtifactRefV1>,
@@ -90,6 +91,33 @@ enum CanonicalLineageV1 {
         branch_turn: LogicalHead,
     },
 }
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LegacyBaselineV1 {
+    legacy_schema: u32,
+    source_session_id: SessionId,
+    source_snapshot_sha256: String,
+    source_updated_at: String,
+    messages: Vec<CanonicalMessageV1>,
+    loss_manifest: Vec<LegacyBaselineLossV1>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+enum LegacyBaselineLossV1 {
+    #[serde(rename = "terminal_outcomes_unavailable")]
+    TerminalOutcomes,
+    #[serde(rename = "logical_heads_unavailable")]
+    LogicalHeads,
+    #[serde(rename = "turn_lineage_unavailable")]
+    TurnLineage,
+}
+
+const LEGACY_BASELINE_LOSSES: [LegacyBaselineLossV1; 3] = [
+    LegacyBaselineLossV1::TerminalOutcomes,
+    LegacyBaselineLossV1::LogicalHeads,
+    LegacyBaselineLossV1::TurnLineage,
+];
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -333,6 +361,74 @@ fn decode_current_v1_migration_input(
     })
 }
 
+fn build_current_v1_legacy_baseline(
+    input: CurrentV1MigrationInput,
+    store_id: StoreId,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    if input.blockers.iter().any(|blocker| {
+        matches!(
+            blocker,
+            CurrentV1MigrationBlocker::ArtifactClosureRequired { .. }
+        )
+    }) {
+        return Err(
+            "current-v1 legacy baseline requires explicit immutable artifact closure resolution"
+                .to_string(),
+        );
+    }
+    if input.blockers.as_slice() != [CurrentV1MigrationBlocker::MissingTerminalOutcomes] {
+        return Err("current-v1 migration input has an unsupported blocker set".to_string());
+    }
+    validate_timestamp(&committed_at, "legacy migration committed_at")?;
+    validate_timestamp_order(&input.updated_at, &committed_at, "legacy migration")?;
+    let session_id = SessionId::new(input.id.clone())
+        .map_err(|error| format!("current-v1 session identity is not canonical: {error}"))?;
+    let payload = CanonicalSessionRevisionV1 {
+        logical_schema: LOGICAL_SCHEMA_V1,
+        store_id,
+        session_id: session_id.clone(),
+        revision_id,
+        parent_revision: ExpectedRevision::Missing,
+        created_at: input.created_at,
+        committed_at,
+        metadata: CanonicalMetadataV1 {
+            name: input.name,
+            launch_directory: input.directory,
+            requested_gateway: input.gateway,
+            requested_model: input.model,
+            project_context_source: input.project_context,
+        },
+        lineage: CanonicalLineageV1::Root,
+        legacy_baseline: Some(LegacyBaselineV1 {
+            legacy_schema: super::SESSION_VERSION,
+            source_session_id: session_id,
+            source_snapshot_sha256: input.source_snapshot_sha256,
+            source_updated_at: input.updated_at,
+            messages: input.messages,
+            loss_manifest: LEGACY_BASELINE_LOSSES.to_vec(),
+        }),
+        operations: Vec::new(),
+        selected_head: LogicalHead::Genesis,
+        artifact_manifest: Vec::new(),
+        compaction_binding: None,
+    };
+    validate_canonical_payload(&payload)?;
+    Ok(payload)
+}
+
+pub(super) fn prepare_current_v1_legacy_baseline(
+    bytes: &[u8],
+    expected_session_id: &str,
+    store_id: StoreId,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    let input = decode_current_v1_migration_input(bytes, expected_session_id)?;
+    build_current_v1_legacy_baseline(input, store_id, revision_id, committed_at)
+}
+
 fn convert_current_message(
     index: usize,
     message: CurrentV1MessageWire,
@@ -448,6 +544,9 @@ fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<()
         payload.metadata.name.as_deref(),
         payload.metadata.project_context_source.as_deref(),
     )?;
+    if let Some(baseline) = &payload.legacy_baseline {
+        validate_legacy_baseline(payload, baseline)?;
+    }
     if matches!(payload.lineage, CanonicalLineageV1::Fork { .. })
         && !matches!(payload.parent_revision, ExpectedRevision::Missing)
     {
@@ -485,7 +584,10 @@ fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<()
         }
     }
 
-    let mut total_messages = 0usize;
+    let mut total_messages = payload
+        .legacy_baseline
+        .as_ref()
+        .map_or(0, |baseline| baseline.messages.len());
     let mut effect_ids = HashSet::new();
     let mut referenced_artifacts = HashSet::new();
     let mut operation_envelopes = Vec::with_capacity(payload.operations.len());
@@ -519,6 +621,67 @@ fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<()
         .map_err(|error| format!("invalid canonical history: {error}"))?;
     if let Some(binding) = &payload.compaction_binding {
         validate_projection_binding(payload, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_legacy_baseline(
+    payload: &CanonicalSessionRevisionV1,
+    baseline: &LegacyBaselineV1,
+) -> Result<(), String> {
+    if baseline.legacy_schema != super::SESSION_VERSION {
+        return Err(format!(
+            "unsupported legacy baseline schema {}; expected {}",
+            baseline.legacy_schema,
+            super::SESSION_VERSION
+        ));
+    }
+    if matches!(payload.lineage, CanonicalLineageV1::Root)
+        && baseline.source_session_id != payload.session_id
+    {
+        return Err(
+            "root legacy baseline source session must match canonical session identity".to_string(),
+        );
+    }
+    validate_sha256(
+        &baseline.source_snapshot_sha256,
+        "legacy source snapshot digest",
+    )?;
+    validate_timestamp(&baseline.source_updated_at, "legacy source updated_at")?;
+    validate_timestamp_order(
+        &payload.created_at,
+        &baseline.source_updated_at,
+        "legacy source",
+    )?;
+    validate_timestamp_order(
+        &baseline.source_updated_at,
+        &payload.committed_at,
+        "legacy migration",
+    )?;
+    if baseline.loss_manifest.as_slice() != LEGACY_BASELINE_LOSSES {
+        return Err("legacy baseline must carry the exact fixed loss manifest".to_string());
+    }
+    if baseline.messages.len() > MAX_MESSAGES {
+        return Err(format!(
+            "legacy baseline has {} messages; maximum is {MAX_MESSAGES}",
+            baseline.messages.len()
+        ));
+    }
+    validate_message_causality(&baseline.messages, true, true, false, "legacy baseline")?;
+    for message in &baseline.messages {
+        if let CanonicalMessageV1::Tool {
+            content,
+            artifact_ids,
+            ..
+        } = message
+        {
+            if contains_offload_pointer(content) || !artifact_ids.is_empty() {
+                return Err(
+                    "legacy baseline has unresolved artifact closure; explicit resolution is required"
+                        .to_string(),
+                );
+            }
+        }
     }
     Ok(())
 }
@@ -1085,6 +1248,104 @@ mod tests {
                     message_indices: vec![2]
                 }
             ]
+        );
+    }
+
+    #[test]
+    fn explicit_legacy_import_preserves_transcript_and_declares_fixed_loss() {
+        let source = current_v1(closed_messages());
+        let payload = prepare_current_v1_legacy_baseline(
+            &source,
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap();
+
+        assert_eq!(payload.selected_head, LogicalHead::Genesis);
+        assert!(payload.operations.is_empty());
+        let baseline = payload.legacy_baseline.as_ref().unwrap();
+        assert_eq!(
+            baseline.source_snapshot_sha256,
+            crate::skills::content_sha256_hex(&source)
+        );
+        assert_eq!(baseline.messages.len(), 5);
+        assert_eq!(
+            baseline.loss_manifest,
+            vec![
+                LegacyBaselineLossV1::TerminalOutcomes,
+                LegacyBaselineLossV1::LogicalHeads,
+                LegacyBaselineLossV1::TurnLineage,
+            ]
+        );
+        let round_trip =
+            decode_canonical_payload(&encode_canonical_payload(&payload).unwrap()).unwrap();
+        assert_eq!(round_trip, payload);
+
+        let mut mismatch = serde_json::to_value(payload).unwrap();
+        mismatch["legacy_baseline"]["source_session_id"] = serde_json::json!("other-session");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&mismatch).unwrap())
+                .unwrap_err()
+                .contains("source session")
+        );
+    }
+
+    #[test]
+    fn legacy_import_refuses_unresolved_artifact_pointer_without_writing_a_payload() {
+        let messages = serde_json::json!([
+            {"role":"user","content":"inspect"},
+            {"role":"assistant","content":"","tool_calls":[{
+                "tool_name":"fs_read_file","args":"{}","call_id":"call-1"
+            }]},
+            {"role":"tool","tool_call_id":"call-1","content":
+                "[tool output 9.0 KB — full result saved to /private/s-source.artifacts/call-1.txt.]"},
+            {"role":"assistant","content":"done"}
+        ]);
+        let error = prepare_current_v1_legacy_baseline(
+            &current_v1(messages),
+            "s-source",
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap_err();
+
+        assert!(error.contains("artifact closure"));
+    }
+
+    #[test]
+    fn canonical_legacy_baseline_rejects_missing_or_fabricated_loss_facts() {
+        let input =
+            decode_current_v1_migration_input(&current_v1(closed_messages()), "s-source").unwrap();
+        let payload = build_current_v1_legacy_baseline(
+            input,
+            StoreId::new("store-1").unwrap(),
+            RevisionId::new("revision-1").unwrap(),
+            "2026-08-20T11:00:00.000Z".to_string(),
+        )
+        .unwrap();
+        let mut value = serde_json::to_value(payload).unwrap();
+        value["legacy_baseline"]["loss_manifest"] =
+            serde_json::json!(["terminal_outcomes_unavailable"]);
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("exact fixed loss manifest")
+        );
+
+        value["legacy_baseline"]["loss_manifest"] = serde_json::json!([
+            "terminal_outcomes_unavailable",
+            "logical_heads_unavailable",
+            "turn_lineage_unavailable"
+        ]);
+        value["legacy_baseline"]["messages"][4] =
+            serde_json::json!({"role":"system","content":"done"});
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&value).unwrap())
+                .unwrap_err()
+                .contains("misplaced system role")
         );
     }
 

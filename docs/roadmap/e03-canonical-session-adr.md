@@ -7,7 +7,9 @@ verification; Cycle 060 adds verified HEAD reads and writer-fenced physical CAS.
 Neither migration nor production store behavior has changed yet. Cycle 061
 adds the closed logical payload codec and strict current-v1 migration input;
 Cycle 062 composes validated bytes with immutable candidate install and fenced
-HEAD publication behind one still-unmounted transaction.
+HEAD publication behind one still-unmounted transaction. Cycle 063 defines the
+only accepted current-v1 logical import: an exact, loss-bearing legacy baseline
+at `Genesis`; it still has no publication caller.
 
 Owner: E03. Depends on E02's causal run outcome. This ADR refines the
 K01-K12/X005 gate in the [mechanism ledger](mechanism-ledger.md) and supersedes
@@ -132,6 +134,16 @@ Current `SavedSession` persists no terminal outcome, lineage revision, selected
 head, artifact manifest, or compaction binding. Those facts cannot be inferred
 from the final message, snapshot path, artifact directory, or process exit
 during migration.
+
+Cycle 063 therefore permits only a typed legacy baseline, not reconstructed
+operations. It binds the exact source snapshot digest, source session and update
+time, preserves the validated semantic message sequence, selects `Genesis`, and
+starts with no canonical operations. Its fixed loss manifest declares
+`terminal_outcomes_unavailable`, `logical_heads_unavailable`, and
+`turn_lineage_unavailable`. The baseline is not a valid branch turn. Recognized
+offload pointers or artifact references require an explicit immutable resolver
+and otherwise refuse before candidate creation. No persisted provider, model,
+directory, message, or legacy metadata restores authority.
 
 ## Physical file-store v1 contract
 
@@ -287,6 +299,13 @@ Exact source revert remains the rollback until the v2 migration is released;
 after release, rollback is a new canonical revision selecting a validated prior
 head, never a pointer or projection rewrite.
 
+The initial current-v1 candidate is a root revision whose selected logical HEAD
+is `Genesis`. Historical messages live only in the typed legacy baseline; they
+do not masquerade as terminal operations and cannot be branch points. Later
+canonical operations may extend that revision normally, while the fixed source
+loss record remains auditable. Migration publication must still be no-clobber
+and leave the exact v1 source bytes available for rollback.
+
 ## Stable provider-free K01-K12 matrix
 
 These IDs retain the accepted research matrix while adding the canonical-HEAD
@@ -393,9 +412,15 @@ cannot weaken or replace any backend-neutral assertion.
    exact not-published base truth plus none, confirmed/unconfirmed unselected,
    or conflicting-collision candidate residue. Stale work allocates no orphan;
    equal and different same-revision collisions preserve the first bytes. The
-   transaction remains private and unmounted. Next resolve the explicit,
-   loss-bearing legacy-baseline migration policy that current-v1's unavailable
-   terminal facts require before any production mount.
+   transaction remains private and unmounted. **Explicit current-v1 legacy
+   baseline complete in Cycle 063:** strict input becomes a root `Genesis`
+   candidate with exact source digest, timestamp, resume metadata, and closed
+   transcript plus the fixed three-fact loss manifest. It creates no operations,
+   invents no terminal result or branch point, restores no authority, and
+   refuses unresolved offload artifacts. Closed-payload validation rejects a
+   malformed loss list, source identity mismatch, and invalid causality. Next
+   compose this preparation with the physical transaction in a no-clobber
+   migration fixture while retaining exact v1 rollback bytes.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
