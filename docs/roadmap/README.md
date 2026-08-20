@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 055. The
+Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 056. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -283,6 +283,11 @@ An independent test-only memory store now composes admission, deterministic
 opaque successor minting, publication, and exact receipts through the K08
 create/update/stale/retry sequence. It is conformance evidence, not a second
 product store or an X005 promotion.
+A shared provider-free memory harness now also executes bounded K04 cuts:
+before-candidate and staged-candidate outcomes keep the old canonical revision
+and report not-published; post-publication exposes the new revision as
+published-unconfirmed; owner confirmation exposes the same new revision as
+confirmed.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -550,6 +555,7 @@ gates merely because a card appears attractive.
 | 053 | E03-S02-C2 | Route unchanged current-v1 active save through a private write port while preserving exact install evidence |
 | 054 | E03-S02-C3 | Add store-neutral expected-revision admission with typed conflict and provider-free zero-effect evidence |
 | 055 | E03-S02-C4 | Execute K08 create, update, stale conflict, no-clobber create, and retry through an independent in-memory revision fixture |
+| 056 | E03-S02-C5 | Execute provider-free K04 pre-candidate, staged, published-unconfirmed, and confirmed visibility cuts |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -594,8 +600,9 @@ than hides v1's corrupt-entry listing omission; Cycle 053 extracts the active
 save/commit side without changing bytes. Cycle 054 adds provider-free
 expected-revision admission and stale zero-write conflict. Cycle 055 composes
 that admission with revision minting and receipts in an in-memory K08 fixture.
-Cycle 056 adds provider-free K04 publication-cut and durability truth before
-physical CAS wiring. The queue then continues through E03,
+Cycle 056 adds provider-free K04 publication-cut and durability truth. Cycle
+057 adds K07 writer-fence loss and independent-session progress before physical
+CAS wiring. The queue then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
