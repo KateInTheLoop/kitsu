@@ -1,7 +1,7 @@
 # Current Harness Comparison
 
 Status: Kitsu-owned comparison from post-E01 runtime pin `986fba9`, updated
-through accepted Cycle 049; frozen research inputs and hashes are listed in
+through accepted Cycle 050; frozen research inputs and hashes are listed in
 [`post-e01-evidence-baseline.md`](post-e01-evidence-baseline.md).
 
 The detailed source-by-source transfer decisions remain in the
@@ -34,7 +34,7 @@ code navigation.
 | Timeout/recovery truth | Completed tool rounds survive piped deadline failure; JSONL framing improved | **Partial**; causal run phases remain E02 and session recovery/HEAD remains E03 |
 | Provider dialect breadth | A distinct native Messages text/tool/usage/terminal implementation passes exact wire, fault/lifecycle, telemetry, frozen-auth route, truthful-capability, generation-attribution, bounded retry/deadline, backoff-cancellation, generic route-handle, and product-surface harnesses with compatible Chat. An explicit closed adapter selector drives live chat and inference doctor; legacy flavor-only profiles retain compatible Chat, and native catalog requests fail before transport. The complete secret-free route receipt round-trips and projects through status/JSONL/doctor | **Closed for the two compiled dialects**; E04/X001 accepted |
 | Guided onboarding/model choice | Config and model listing exist, but setup is still manual and not transactional | **Open**; E05 after E04 |
-| Session lineage/branch-at-turn | Whole-history fresh-ID fork exists; no logical HEAD/revision/turn boundary | **Open**; E03 |
+| Session lineage/branch-at-turn | Whole-history fresh-ID fork exists. Cycle 050 closes the ownership ambiguity with one canonical revision/selected-HEAD ADR, five separate version planes, typed CAS/corruption/publication states, explicit recovery, fresh authority, and stable K01-K12 meanings; production v1 has not implemented them | **Design accepted, implementation open**; E03-S01 continues |
 | MCP/external tools | No client or supervisor is compiled | **Open experiment**; E06 after E02 |
 | Semantic context | No tree-sitter/reference graph/PageRank token-fit selector | **Open experiment**; E07 fixed corpus |
 | Multimodal input | Image metadata reader exists; model requests remain text/tool oriented | **Deferred**; E09 after truthful capabilities |
@@ -68,7 +68,7 @@ and DB-row/file-tail/projection-as-canonical-HEAD.
 ## Evidence boundary
 
 This comparison is source/test-backed plus the provider-free acceptance tests
-recorded in Cycles 003-049. The full X001 suite executed against both required
+recorded in Cycles 003-050. The full X001 suite executed against both required
 compiled implementations; no live provider, credential, billable request, or
 subject-project runtime was needed. It does not claim execution of X002-X005.
 Scores change only when the named complete gate passes against both required

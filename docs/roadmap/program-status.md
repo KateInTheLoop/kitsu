@@ -1,6 +1,7 @@
 # Improvement Program Status
 
-Status: E00, E01, E02, and E04 are accepted through Cycle 049;
+Status: E00, E01, E02, and E04 are accepted; E03-S01 is in progress through
+Cycle 050;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -9,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 49 / 49 |
+| Accepted cycles/commits after this cycle | 50 / 50 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S01-C1 (Cycle 050) — canonical session revision/HEAD ADR and K01-K12 fixture contract |
+| Active epic/card | E03 / E03-S01-C2 (Cycle 051) — neutral revision/HEAD/receipt values and fail-closed validation |
 
 ## Epic status
 
@@ -23,7 +24,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **Next**; starts Cycle 050 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
+| E03 session spine | **In progress**; E03-S01 through C1 | The canonical ADR gives every restart-authoritative field one owner, separates five schema/version planes, defines opaque revision plus selected logical HEAD, expected-revision CAS, typed lookup/commit states, explicit migration/recovery, fresh authority, and stable K01-K12 meanings. Neutral value fixtures are next; production v1 is unchanged and X005 still fails |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -83,7 +84,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 046 | `c78018e` | Explicit legacy-safe live native composition |
 | 047 | `c4cbb0a` | Complete bounded secret-free route receipt value |
 | 048 | `0ba0715` | Additive status/JSONL/doctor route receipt projection |
-| 049 | this document's commit | Two-adapter product conformance and X001 acceptance |
+| 049 | `791014f` | Two-adapter product conformance and X001 acceptance |
+| 050 | this document's commit | Canonical session revision/HEAD ADR and stable K01-K12 contract |
 
 ## Current green gates
 
@@ -165,6 +167,12 @@ E08 telemetry observability was scoped in Cycle 030 on
 - E08-S05/S06 now have a provider-neutral command/truth contract: local status
   and context remain offline; usage is Kitsu-observed provider reporting, never
   inferred billing/account truth; durable calendar views wait for E03.
+- E03 now has an accepted ownership ADR before persistence changes. It forbids
+  paths, tails, rows, timestamps, digests, leases, projections, and exports from
+  acting as revision or logical HEAD; maps current v1 fields and missing facts;
+  defines typed `Missing/Present/Corrupt/Unsupported/Conflict` reads and exact
+  not-published/published-unconfirmed/confirmed commit results; and freezes the
+  backend-neutral K01-K12 meanings used by every later store adapter.
 
 ## Next delivery tranche
 
@@ -264,6 +272,15 @@ defect. Static audits confirm core has no concrete adapter import, composition
 has no dynamic loader, and Kitsu has no title-generation provider call to bind.
 E04 and `X001-G1-AUX` are accepted; Cycle 050 starts E03's canonical session
 revision/HEAD contract.
+Cycle 050 accepts that contract without mutating v1. One self-validating
+canonical revision owns transcript operations, semantic terminal outcomes,
+selected logical HEAD, resume intent, lineage, immutable artifact references,
+and compaction binding. Expected-revision recheck complements the writer lease;
+five schemas remain independently versioned; projections and exports are never
+canonical; corrupt-current recovery is explicit; and K01-K12 now names stable
+whole-operation, physical-cut, concurrency, artifact, authority, recovery, and
+adapter-parity assertions. Cycle 051 implements only the neutral opaque values
+and fail-closed validation before extracting the file store.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
