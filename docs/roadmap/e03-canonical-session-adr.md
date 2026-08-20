@@ -563,6 +563,16 @@ cannot weaken or replace any backend-neutral assertion.
    revision 1 is explicitly unsupported; production current-v1 files remain
    untouched. Next derive a read-only last-good recovery plan from the physical
    chain without publishing or silently changing HEAD.
+   **Read-only logical recovery plan complete in Cycle 073:** the transaction
+   reports `Missing`, `NotNeeded`, `Available`, or `Unavailable` without writing
+   any file or changing canonical selection. For a current logically corrupt
+   selected revision it follows only exact parent revision plus bound manifest
+   digest, crosses additional corrupt ancestors, and returns the first revision
+   whose logical value and artifact closure verify completely. Future selected
+   schemas are never downgraded; ordinary lookup continues to report the corrupt
+   selected HEAD. Next split verified manifest-envelope reading from canonical
+   payload verification so a selected physical payload/digest fault can expose
+   only its already-bound parent link to the same bounded planner.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

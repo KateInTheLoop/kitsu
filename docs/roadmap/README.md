@@ -262,7 +262,8 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted and E03-S02 is in progress through Cycle 072. The
+Status: E03-S01 is accepted, E03-S02 is implemented through C21, and E03-S04 is
+in progress through Cycle 073. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -329,8 +330,12 @@ Physical schema revision 2 now binds every successor manifest to the exact
 verified parent-manifest digest. Candidate install requires that parent before
 allocation and HEAD CAS rechecks the link. A bounded HEAD-to-root lineage reader
 follows only these links, ignores unselected orphans, and fails closed on a
-missing, retargeted, cyclic, or over-limit ancestor. Read-only last-good recovery
-planning remains next.
+missing, retargeted, cyclic, or over-limit ancestor. A read-only recovery planner
+now follows the same exact chain across one or more logically corrupt revisions,
+selects only the first fully verified earlier revision, and leaves both ordinary
+lookup and physical HEAD unchanged. Missing, already-valid, unavailable, and
+future-schema outcomes stay explicit. Selected physical payload/digest faults
+still need a verified manifest-only envelope before they can be planned safely.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -615,6 +620,7 @@ gates merely because a card appears attractive.
 | 070 | E03-S02-C19 | Pair canonical read with neutral lookup state and classify current corruption plus logical/artifact schema dimensions |
 | 071 | E03-S02-C20 | Type physical HEAD/revision read evidence and distinguish invalid selected HEAD from broken operation causality |
 | 072 | E03-S02-C21 | Bind successor manifests to exact parent digests and verify bounded selected lineage without orphan promotion |
+| 073 | E03-S04-C1 | Derive a read-only verified last-good plan across digest-bound logical corruption without changing selected HEAD |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -685,8 +691,11 @@ closure before this path can widen. Cycle 068 binds canonical artifact facts to
 exact verified physical records before candidate/HEAD publication. The queue
 then verifies selected-HEAD closure in Cycle 069, maps the neutral lookup in
 Cycle 070, types its complete physical envelope in Cycle 071, and binds and
-verifies retained selected lineage in Cycle 072 before continuing through E03,
-E06, E07, E05/E08, and E09 in the dependency-safe order above.
+verifies retained selected lineage in Cycle 072. Cycle 073 begins recovery with
+a mutation-free last-good plan for logically corrupt selected ancestry; Cycle
+074 extends the trusted input split to selected physical payload faults before
+continuing through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
+above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
