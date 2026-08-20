@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, and E04-S01/S02/S03 are accepted; E04-S04 is in
-progress through Cycle 042;
+progress through Cycle 043;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 42 / 42 |
+| Accepted cycles/commits after this cycle | 43 / 43 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S04-C5 (Cycle 043) — frozen native route generation |
+| Active epic/card | E04 / E04-S04-C6 (Cycle 044) — bounded native retry inside one generation |
 
 ## Epic status
 
@@ -23,7 +23,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted, E04-S04 through C4 | Twenty-six wire, six route-contract, three derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, attempt attribution, and compiled native Messages text/tool/usage/terminal plus fault/lifecycle/one-attempt telemetry parity; immutable native route/live composition, complete receipts, and alternate conformance remain |
+| E04 provider spine | **In progress**; E04-S01/S02/S03 accepted, E04-S04 through C5 | Twenty-seven wire, six route-contract, four derivation/declaration, four snapshot, twelve route-handle, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI model-publication cases cover protocol evidence, secret-free identity, every current production send, immutable request models, exact successor publication, failed replacement retention, old-work drain, attempt attribution, and compiled native Messages text/tool/usage/terminal plus fault/lifecycle/one-attempt telemetry parity. The native factory now freezes auth, advertises exact capabilities, rejects unsupported policy, and runs through the common generation handle; native retry/live composition, complete receipts, and alternate conformance remain |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -77,11 +77,12 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 039 | `024b036` | Native Messages text request and streamed terminal normalization |
 | 040 | `3fddc26` | Native Messages tool history translation and bounded correlation |
 | 041 | `86f96d5` | Native Messages HTTP, stream, bound, timeout, and cancellation parity |
-| 042 | this document's commit | Native Messages send/body terminal attempt ownership |
+| 042 | `9299647` | Native Messages send/body terminal attempt ownership |
+| 043 | this document's commit | Frozen truthful native route generation and common admission |
 
 ## Current green gates
 
-- The provider-wire matrix now has twenty-six offline tests covering exact text
+- The provider-wire matrix now has twenty-seven offline tests covering exact text
   and correlated tool rounds, structural Chat/Messages divergence,
   wrong-adapter rejection, HTTP/mid-stream/malformed faults, path-level hard
   bounds, timeout/cancellation terminality, and the capability handoff. Three
@@ -91,13 +92,15 @@ E08 telemetry observability was scoped in Cycle 030 on
   failures, malformed/midstream events, line/aggregate ceilings, timeout, and
   cancellation with one send. Native telemetry additionally proves one
   terminal common event for completed body, rejection, decode failure, header
-  timeout/cancellation, and accepted-body cancellation. Full
+  timeout/cancellation, and accepted-body cancellation. Its frozen-route case
+  adds exact capability truth, generation attribution, catalog absence, and
+  structured-output zero-send refusal. Full
   affected-suite counts are recorded in the cycle receipt.
 - Six provider-route tests pin a stable secret-free v1 JSON vector, opaque
   profile identity, nonzero generation/revisions, truthful adapter/wire pairs,
   all six deterministic capabilities, fail-closed decoding, and zero-send
   stale/unsupported admission. Core still does not import provider route values.
-- Three derivation/declaration and two CLI declaration-composition tests pin the
+- Four derivation/declaration and two CLI declaration-composition tests pin the
   domain-separated SHA-256 vector, input bounds, canonical path identity,
   route-content independence, exact compatible-Chat capabilities, and the fact
   that `anthropic` remains a display/config label until the compiled native
@@ -198,7 +201,11 @@ fixtures; all pass without implementation churn or a second send. Cycle 042
 adds exact terminal attempt observations before route composition: send and
 accepted-body guards make cancellation explicit, and a 2xx header is never
 success. Cycle 043 constructs the first immutable native generation and common
-route binding while keeping configuration selection disabled.
+route binding while keeping configuration selection disabled. Its exact
+streaming/tools/usage declaration, once-frozen auth, zero-retry/no-catalog
+policy, generation-attributed attempts, optional-catalog absence, and
+structured-output zero-send refusal all pass offline. Cycle 044 adds the
+bounded retry/backoff lifecycle without crossing that frozen generation.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

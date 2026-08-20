@@ -420,6 +420,28 @@ impl ProviderRouteDeclaration {
         .expect("the compiled compatible catalog adapter/wire pair is valid")
     }
 
+    /// Truthful declaration for the compiled Anthropic Messages 2023-06-01
+    /// adapter. Structured output, image input, and model catalog remain
+    /// absent because the native implementation does not expose them.
+    pub fn native_messages_v1(profile: ProviderProfileId) -> Self {
+        let capabilities = ProviderCapabilities::new(
+            1,
+            [
+                ProviderCapability::Streaming,
+                ProviderCapability::Tools,
+                ProviderCapability::Usage,
+            ],
+        )
+        .expect("the compiled native Messages capability set is valid");
+        Self::new(
+            ProviderAdapterId::AnthropicMessages,
+            profile,
+            ProviderWireRevision::AnthropicMessages2023_06_01,
+            capabilities,
+        )
+        .expect("the compiled native Messages adapter/wire pair is valid")
+    }
+
     pub fn adapter(&self) -> ProviderAdapterId {
         self.adapter
     }

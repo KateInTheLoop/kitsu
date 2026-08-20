@@ -12,7 +12,12 @@ use futures::stream::{self, StreamExt};
 use reqwest::StatusCode;
 use serde::Serialize;
 
-use crate::auth::AuthProvider;
+use crate::auth::{AuthProvider, FrozenAuth};
+use crate::error::AuthError;
+use crate::route::{
+    ProviderAuthSource, ProviderRouteContractError, ProviderRouteDeclaration, ProviderRoutePolicy,
+    ProviderRouteSnapshot,
+};
 use crate::telemetry::{
     ProviderAttemptCategory, ProviderAttemptEvent, ProviderAttemptOutcome, ProviderTelemetrySink,
 };
@@ -35,6 +40,33 @@ pub struct AnthropicMessagesConfig {
     pub messages_path: String,
     /// End-to-end request budget, including the streamed response body.
     pub timeout: Duration,
+}
+
+/// Consumed composition input for one immutable native Messages generation.
+/// Endpoint/auth-bearing values stay private and are never receipt payloads.
+pub struct AnthropicMessagesRouteConfig {
+    pub declaration: ProviderRouteDeclaration,
+    pub model: String,
+    pub auth_source: ProviderAuthSource,
+    pub base_url: String,
+    pub messages_path: String,
+    pub policy: ProviderRoutePolicy,
+}
+
+#[derive(Debug, thiserror::Error)]
+pub enum AnthropicMessagesRouteBuildError {
+    #[error(transparent)]
+    Auth(#[from] AuthError),
+    #[error(transparent)]
+    Contract(#[from] ProviderRouteContractError),
+    #[error("native Messages route requires its exact compiled declaration")]
+    DeclarationMismatch,
+    #[error("native Messages path cannot be empty")]
+    EmptyMessagesPath,
+    #[error("native Messages retries are not implemented (configured {configured})")]
+    UnsupportedInferenceRetries { configured: u32 },
+    #[error("native Messages model catalog policy is not implemented")]
+    UnsupportedCatalogPolicy,
 }
 
 /// A distinct compiled implementation of the Anthropic Messages 2023-06-01
@@ -71,6 +103,52 @@ impl AnthropicMessagesProvider {
     fn refresh_hint(&self) -> Option<String> {
         self.auth.refresh_hint()
     }
+}
+
+/// Freeze auth once and publish a truthful native Messages generation.
+/// Retrying and catalog policy are rejected because this compiled adapter does
+/// not implement them yet; accepting either would make the snapshot lie.
+pub fn build_anthropic_messages_route(
+    config: AnthropicMessagesRouteConfig,
+    auth: &dyn AuthProvider,
+) -> Result<ProviderRouteSnapshot<AnthropicMessagesProvider>, AnthropicMessagesRouteBuildError> {
+    let expected =
+        ProviderRouteDeclaration::native_messages_v1(config.declaration.profile().clone());
+    if config.declaration != expected {
+        return Err(AnthropicMessagesRouteBuildError::DeclarationMismatch);
+    }
+    if config.messages_path.is_empty() {
+        return Err(AnthropicMessagesRouteBuildError::EmptyMessagesPath);
+    }
+    if config.policy.inference_retries() != 0 {
+        return Err(
+            AnthropicMessagesRouteBuildError::UnsupportedInferenceRetries {
+                configured: config.policy.inference_retries(),
+            },
+        );
+    }
+    if config.policy.catalog().is_configured() || config.policy.catalog_retries() != 0 {
+        return Err(AnthropicMessagesRouteBuildError::UnsupportedCatalogPolicy);
+    }
+
+    let frozen_auth: Arc<dyn AuthProvider> = Arc::new(FrozenAuth::resolve(auth)?);
+    let runtime = Arc::new(AnthropicMessagesProvider::new(
+        AnthropicMessagesConfig {
+            base_url: config.base_url,
+            messages_path: config.messages_path,
+            timeout: config.policy.inference_timeout(),
+        },
+        frozen_auth,
+    ));
+    ProviderRouteSnapshot::initial(
+        config.declaration,
+        config.model,
+        config.auth_source,
+        config.policy,
+        runtime.clone(),
+        runtime,
+    )
+    .map_err(Into::into)
 }
 
 #[derive(Debug, Serialize)]
@@ -1031,5 +1109,75 @@ impl Provider for AnthropicMessagesProvider {
 
     async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
         Ok(None)
+    }
+}
+
+#[cfg(test)]
+mod route_factory_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    use reqwest::header::{HeaderName, HeaderValue};
+
+    use crate::error::ExpiryStatus;
+    use crate::route::{ProviderCatalogPolicy, ProviderProfileId};
+
+    struct MutableAuth {
+        value: Mutex<String>,
+    }
+
+    impl AuthProvider for MutableAuth {
+        fn header(&self) -> Result<Option<(HeaderName, HeaderValue)>, AuthError> {
+            let raw = self.value.lock().unwrap().clone();
+            let mut value = HeaderValue::from_str(&raw).unwrap();
+            value.set_sensitive(true);
+            Ok(Some((HeaderName::from_static("x-fixture-auth"), value)))
+        }
+
+        fn expiry_status(&self) -> ExpiryStatus {
+            ExpiryStatus::Unknown
+        }
+    }
+
+    #[test]
+    fn native_route_factory_freezes_auth_once() {
+        let auth = MutableAuth {
+            value: Mutex::new("generation-one".to_string()),
+        };
+        let policy = ProviderRoutePolicy::new(
+            0,
+            0,
+            Duration::from_secs(2),
+            Duration::from_secs(2),
+            Duration::from_secs(1),
+            ProviderCatalogPolicy::Unavailable,
+        )
+        .unwrap();
+        let snapshot = build_anthropic_messages_route(
+            AnthropicMessagesRouteConfig {
+                declaration: ProviderRouteDeclaration::native_messages_v1(
+                    ProviderProfileId::derive_v1(b"native-test", b"frozen-auth").unwrap(),
+                ),
+                model: "model-a".to_string(),
+                auth_source: ProviderAuthSource::Environment,
+                base_url: "http://127.0.0.1:1".to_string(),
+                messages_path: "/v1/messages".to_string(),
+                policy,
+            },
+            &auth,
+        )
+        .unwrap();
+        *auth.value.lock().unwrap() = "generation-two".to_string();
+
+        let (_, header) = snapshot
+            .inference_runtime()
+            .unwrap()
+            .auth
+            .header()
+            .unwrap()
+            .unwrap();
+        assert_eq!(header.as_bytes(), b"generation-one");
+        assert!(header.is_sensitive());
+        assert_eq!(snapshot.identity().generation().get(), 1);
     }
 }
