@@ -1,6 +1,6 @@
 # Provider route value contract
 
-Status: E04-S02/S03/S04 are accepted; E04-S05 is in progress through Cycle 047.
+Status: E04-S02/S03/S04 are accepted; E04-S05 is in progress through Cycle 048.
 Cycle 032 establishes the value contract; Cycle 033 derives opaque profile
 identity and makes live composition retain the truthful declaration. Cycle 034
 constructs one initial immutable snapshot with both compatible-Chat runtimes
@@ -35,6 +35,10 @@ legacy flavor-only profiles stay compatible Chat and native catalog fails
 before transport.
 Cycle 047 defines the complete provider-neutral route receipt projected from
 snapshots and bound/current handles without serializing physical runtimes.
+Cycle 048 exposes that exact value additively in `/status`, all JSONL run-entry
+paths, and opted-in doctor checks. Offline doctor emits an explicit
+no-construction state; JSONL attempts correlate to the run receipt by immutable
+generation; `/model` successor status reads the new current receipt.
 
 ## Decision
 
@@ -235,8 +239,8 @@ capabilities, preserve optional-catalog absence without a send, publish an
 exact model successor, and reject the stale handle before a third send. These
 cards still do not:
 
-- emit the complete adapter/profile/wire/capability/auth-source attempt receipt
-  required by E04-S05;
+- run the final identical two-adapter receipt/attempt product conformance gate
+  required by E04-S05/X001;
 - implement model catalog for the Messages adapter;
 - expose provider account, billing, quota, endpoint, or credential data.
 
@@ -246,8 +250,9 @@ route fixture uses provider-neutral values. The CLI has no flavor-to-adapter
 switch. There is no title-generation provider call in current Kitsu.
 Production composition has no raw concrete-provider constructor or dynamic
 provider loader. `CompiledProvider` is a closed enum, and only the typed
-`adapter` field selects its variant. The next card defines the complete
-secret-free route receipt consumed by JSONL and diagnostics.
+`adapter` field selects its variant. The next card runs the final two-adapter
+receipt/attempt product conformance and audits X001 without adding a plugin
+surface.
 
 ## Acceptance and rollback
 

@@ -313,6 +313,18 @@ mod tests {
         assert!(defs["command_execution_result"].is_object());
         assert!(defs["command_result"]["allOf"].is_array());
         assert_eq!(
+            defs["run_started"]["allOf"][1]["properties"]["provider_route"]["$ref"],
+            "#/$defs/provider_route_receipt"
+        );
+        assert_eq!(
+            defs["provider_route_receipt"]["properties"]["receipt_revision"]["const"],
+            1
+        );
+        assert_eq!(
+            defs["provider_route_identity"]["properties"]["generation"]["minimum"],
+            1
+        );
+        assert_eq!(
             defs["model_catalog_identity"]["properties"]["operation_id"]["pattern"],
             "^models:[1-9][0-9]*$"
         );

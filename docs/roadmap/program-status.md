@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, and E04-S01/S02/S03/S04 are accepted; E04-S05 is in
-progress through Cycle 047;
+progress through Cycle 048;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -10,11 +10,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 47 / 47 |
+| Accepted cycles/commits after this cycle | 48 / 48 |
 | Complete replaceability gates | 0 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E04 / E04-S05-C2 (Cycle 048) — status/JSONL/doctor route receipt projection |
+| Active epic/card | E04 / E04-S05-C3 (Cycle 049) — final two-adapter receipt/attempt conformance and X001 audit |
 
 ## Epic status
 
@@ -23,7 +23,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E00 baseline/safety | **Accepted** | Clean base, invariant map, mechanism ledger, content-pinned delta, current views, cycle check |
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
-| E04 provider spine | **In progress**; E04-S01/S02/S03/S04 accepted, E04-S05 through C1 | Thirty wire, two common route-conformance, route-contract/derivation/snapshot/handle/receipt, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI cases cover protocol evidence, secret-free identity, every production send, immutable request models, exact successor publication, failed-publication retention, old-work drain, attempt attribution, and native Messages fault/lifecycle/telemetry parity. A closed explicit selector composes either adapter. The complete private v1 receipt now binds identity/model/auth-source/retry/replay/fallback facts and rejects secret/contradictory input; product projection and final X001 conformance remain |
+| E04 provider spine | **In progress**; E04-S01/S02/S03/S04 accepted, E04-S05 through C2 | Thirty wire, two common route-conformance, route-contract/derivation/snapshot/handle/receipt, auth-freeze/factory, generation-aware retry/replay/catalog/compaction/subagent/cancellation, doctor, and CLI cases cover protocol evidence, secret-free identity, every production send, immutable request models, exact successor publication, failed-publication retention, old-work drain, attempt attribution, and native Messages fault/lifecycle/telemetry parity. A closed explicit selector composes either adapter. `/status`, every JSONL `run_started`, and opted-in doctor checks now project the complete bounded v1 receipt; attempt generations correlate to it and offline doctor proves no route construction. Final two-adapter X001 conformance remains |
 | E03 session spine | Planned after E04 | Canonical revision/HEAD ADR, CAS/fencing, K01-K12, recovery, branch-at-turn |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
@@ -82,7 +82,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 044 | `d5ea219` | Shared bounded retry and native frozen-generation parity |
 | 045 | `53e68dc` | Generic two-adapter route-handle conformance |
 | 046 | `c78018e` | Explicit legacy-safe live native composition |
-| 047 | this document's commit | Complete bounded secret-free route receipt value |
+| 047 | `c4cbb0a` | Complete bounded secret-free route receipt value |
+| 048 | this document's commit | Additive status/JSONL/doctor route receipt projection |
 
 ## Current green gates
 
@@ -117,8 +118,8 @@ E08 telemetry observability was scoped in Cycle 030 on
   streaming/tools/usage capabilities, generation-one terminal attempts,
   catalog absence without a send, exact successor publication, and stale
   zero-send all agree without adapter branches in the harness.
-  The CLI retains the declaration privately but does not yet publish a complete
-  generation receipt.
+  The CLI now publishes the same bounded receipt through current status, all
+  JSONL run starts, and opted-in doctor checks; offline doctor constructs none.
 - Four provider-route receipt fixtures pin one stable v1 vector with exact
   identity, optional model, auth-source class, lossless time budgets, retry
   counts, bound-generation retry, current-generation semantic replay, and
@@ -241,6 +242,12 @@ Snapshot, inference handle, catalog handle, and current owner can project the
 same bounded facts without serializing a runtime. Exact vectors and replacement
 fixtures prove that receipt generation follows its immutable binding rather
 than whichever generation is current when it is rendered.
+Cycle 048 projects that value without widening it. `/status` reads the current
+generation, including an immediately published `/model` successor. All three
+JSONL run-entry paths capture their start generation, provider attempts
+correlate by generation, and doctor distinguishes offline no-construction from
+an opted-in bound inference or catalog route. The v1 JSONL field is additive,
+so legacy records remain valid.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

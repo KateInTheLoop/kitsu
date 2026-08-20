@@ -283,7 +283,7 @@ wire dialect behind the same Kitsu-owned port and capability contract.
 Dependencies: E02 run outcome; E00 delta audit.
 
 Status: E04-S01/S02/S03/S04 are accepted; E04-S05 is in progress through Cycle
-047.
+048.
 Kitsu now owns versioned secret-free route values, bounded opaque profile
 derivation, explicit compatible-Chat capabilities, one initial immutable
 snapshot whose inference/catalog runtimes share a frozen credential and route
@@ -315,12 +315,13 @@ output, common capability, generation-attributed terminal attempt, catalog-
 absence, exact-successor, and stale zero-send assertions. A closed explicit
 adapter field now selects native Messages for live chat and inference doctor;
 legacy flavor-only profiles retain compatible Chat and native catalog fails
-before transport. Complete receipts and alternate conformance remain open, so
-X001 still fails.
-A versioned private route receipt now also binds exact route identity, optional
+before transport. Final two-adapter product conformance remains open, so X001
+still fails.
+A versioned route receipt binds exact route identity, optional
 model, auth-source class, retry/time/catalog policy, bound-generation retry,
 current-generation semantic replay, and disabled fallback without a runtime or
-secret-bearing field. Product projection and attempt correlation remain open.
+secret-bearing field. Status, JSONL run start, and opted-in doctor project it;
+attempt generations correlate, while offline doctor constructs no route.
 
 The accepted distinct dialect is Anthropic Messages. An endpoint alias, Ollama
 profile, or compatible proxy does not count as a distinct wire.
@@ -517,6 +518,7 @@ gates merely because a card appears attractive.
 | 045 | E04-S04-C7 | Run both compiled adapters through one provider-neutral route-handle conformance harness before live selection |
 | 046 | E04-S04-C8 | Add explicit compiled native adapter selection in composition while preserving legacy compatible-Chat defaults |
 | 047 | E04-S05-C1 | Define one complete bounded secret-free route receipt and prove fail-closed decoding plus immutable generation truth |
+| 048 | E04-S05-C2 | Project the bounded receipt through status, JSONL run start, and opted-in doctor with offline no-construction proof |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -548,8 +550,9 @@ pass one provider-neutral route-handle conformance harness before composition
 can select the native wire. Cycle 046 adds an explicit, auditable native adapter
 selector without silently changing legacy flavor behavior. Cycle 047 defines
 the private receipt consumed by status, JSONL, and doctor; Cycle 048 projects
-it additively before final provider conformance. The queue then advances
-through E03, E06, E07, E05/E08, and E09 in the
+it additively and correlates attempts without changing the v1 required fields.
+Cycle 049 runs final two-adapter receipt/attempt conformance and audits X001
+before the queue advances through E03, E06, E07, E05/E08, and E09 in the
 dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

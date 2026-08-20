@@ -44,10 +44,12 @@ use kitsu_providers::openai_compat::{
     OpenAICompatCatalogRouteConfig, OpenAICompatRouteBuildError, OpenAICompatRouteConfig,
 };
 use kitsu_providers::{
-    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAttemptEvent,
-    ProviderAuthSource, ProviderCatalogHandle, ProviderCatalogPolicy, ProviderError,
-    ProviderProfileId, ProviderRouteContractError, ProviderRouteCurrent, ProviderRouteDeclaration,
-    ProviderRouteHandle, ProviderRoutePolicy, ProviderTelemetrySink,
+    ChatDelta, ChatMessage, ChatRequest, JsonSchemaFormat, Provider, ProviderAdapterId,
+    ProviderAttemptEvent, ProviderAuthSource, ProviderCapability, ProviderCatalogHandle,
+    ProviderCatalogPolicy, ProviderError, ProviderFallbackPolicy, ProviderProfileId,
+    ProviderReplayGenerationPolicy, ProviderRetryGenerationPolicy, ProviderRouteContractError,
+    ProviderRouteCurrent, ProviderRouteDeclaration, ProviderRouteHandle, ProviderRoutePolicy,
+    ProviderRouteReceipt, ProviderTelemetrySink, ProviderWireRevision,
 };
 use kitsu_tools::{
     builtins, CommandApprovalRequest, CommandDecision, CommandPrompter, Decision, Mode,
@@ -3627,6 +3629,24 @@ fn print_doctor_human(report: &serde_json::Value) {
         doctor_text(report, "/gateway/model"),
     );
     println!("[info] auth: {}", doctor_text(report, "/auth/status"),);
+    if doctor_value(report, "/provider_route/status") == "bound" {
+        println!(
+            "[info] provider route: {} / {} / generation {} / {}",
+            doctor_text(report, "/provider_route/receipt/route/adapter"),
+            doctor_text(report, "/provider_route/receipt/route/wire_revision"),
+            report
+                .pointer("/provider_route/receipt/route/generation")
+                .and_then(serde_json::Value::as_u64)
+                .map(|value| value.to_string())
+                .unwrap_or_else(|| "unavailable".to_string()),
+            doctor_text(report, "/provider_route/receipt/route/profile"),
+        );
+    } else {
+        println!(
+            "[info] provider route: {}",
+            doctor_text(report, "/provider_route/status"),
+        );
+    }
     println!(
         "[info] context window: {} tokens ({})",
         report
@@ -3950,6 +3970,14 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
     } else {
         "model_catalog_only"
     };
+    let mut provider_route_report = serde_json::json!({
+        "status": if provider_check_requested {
+            "not_constructed"
+        } else {
+            "not_constructed_offline"
+        },
+        "receipt": null,
+    });
     let mut online_report = serde_json::json!({
         "requested": provider_check_requested,
         "scope": provider_check_scope,
@@ -4175,6 +4203,10 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                                 provider_diagnostics,
                             )
                         })?;
+                        provider_route_report = serde_json::json!({
+                            "status": "bound",
+                            "receipt": provider.receipt(),
+                        });
                         let effective_model = model.as_deref().expect("validated above");
                         match await_cancellable(minimal_inference_probe(&provider, effective_model))
                             .await
@@ -4270,6 +4302,10 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
                                     provider_diagnostics,
                                 )
                             })?;
+                            provider_route_report = serde_json::json!({
+                                "status": "bound",
+                                "receipt": provider.receipt(),
+                            });
                             match await_cancellable(provider.list_models()).await {
                                 Some(Ok(Some(models))) => {
                                     let effective_model = model.as_deref();
@@ -4385,6 +4421,7 @@ async fn run_doctor(cli: &Cli, online: bool, inference: bool, json: bool) -> Res
         },
         "gateway": gateway_report,
         "auth": auth_report,
+        "provider_route": provider_route_report,
         "context": context_report,
         "project_context": project_report,
         "runtime_state": runtime_state,
@@ -7384,6 +7421,73 @@ fn context_totals(
     (window, effective, used)
 }
 
+const fn provider_adapter_label(adapter: ProviderAdapterId) -> &'static str {
+    match adapter {
+        ProviderAdapterId::OpenAiCompatible => "openai_compatible",
+        ProviderAdapterId::AnthropicMessages => "anthropic_messages",
+    }
+}
+
+const fn provider_wire_label(wire: ProviderWireRevision) -> &'static str {
+    match wire {
+        ProviderWireRevision::OpenAiChatCompletionsV1 => "openai_chat_completions_v1",
+        ProviderWireRevision::AnthropicMessages2023_06_01 => "anthropic_messages_2023_06_01",
+    }
+}
+
+const fn provider_capability_label(capability: ProviderCapability) -> &'static str {
+    match capability {
+        ProviderCapability::Streaming => "streaming",
+        ProviderCapability::Tools => "tools",
+        ProviderCapability::ImageInput => "image_input",
+        ProviderCapability::StructuredOutput => "structured_output",
+        ProviderCapability::Usage => "usage",
+        ProviderCapability::ModelCatalog => "model_catalog",
+    }
+}
+
+const fn provider_auth_source_label(source: ProviderAuthSource) -> &'static str {
+    match source {
+        ProviderAuthSource::None => "none",
+        ProviderAuthSource::StaticConfiguration => "static_configuration",
+        ProviderAuthSource::Environment => "environment",
+        ProviderAuthSource::ManagedCredential => "managed_credential",
+    }
+}
+
+const fn provider_catalog_policy_label(policy: ProviderCatalogPolicy) -> &'static str {
+    match policy {
+        ProviderCatalogPolicy::Unavailable => "unavailable",
+        ProviderCatalogPolicy::Configured => "configured",
+    }
+}
+
+const fn provider_retry_generation_label(policy: ProviderRetryGenerationPolicy) -> &'static str {
+    match policy {
+        ProviderRetryGenerationPolicy::BoundGeneration => "bound_generation",
+    }
+}
+
+const fn provider_replay_generation_label(policy: ProviderReplayGenerationPolicy) -> &'static str {
+    match policy {
+        ProviderReplayGenerationPolicy::CurrentGeneration => "current_generation",
+    }
+}
+
+const fn provider_fallback_label(policy: ProviderFallbackPolicy) -> &'static str {
+    match policy {
+        ProviderFallbackPolicy::Disabled => "disabled",
+    }
+}
+
+fn provider_duration_label(receipt: kitsu_providers::ProviderRouteDurationReceipt) -> String {
+    if receipt.nanoseconds() == 0 {
+        format!("{}s", receipt.seconds())
+    } else {
+        format!("{}s+{}ns", receipt.seconds(), receipt.nanoseconds())
+    }
+}
+
 fn format_session_status(
     model: &str,
     messages: &[ChatMessage],
@@ -7391,6 +7495,7 @@ fn format_session_status(
     perms: &Permissions,
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
+    provider_route: &ProviderRouteReceipt,
 ) -> String {
     let model = terminal_inline(model);
     let gateway = terminal_inline(&session.gateway);
@@ -7480,11 +7585,40 @@ fn format_session_status(
             session.artifact_policy_source.as_str()
         ),
     };
+    let route = provider_route.route();
+    let route_profile = terminal_inline(route.profile().as_str());
+    let route_capabilities = {
+        let labels = route
+            .capabilities()
+            .supported()
+            .map(provider_capability_label)
+            .collect::<Vec<_>>();
+        if labels.is_empty() {
+            "none".to_string()
+        } else {
+            labels.join(", ")
+        }
+    };
+    let route_policy = provider_route.policy();
+    let route_inference_timeout = provider_duration_label(route_policy.inference_timeout());
+    let route_catalog_timeout = provider_duration_label(route_policy.catalog_timeout());
+    let route_discovery_timeout =
+        provider_duration_label(route_policy.advisory_discovery_timeout());
 
     format!(
-        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
+        "kitsu        {}\nsession:\n  id           {session_id}\n  autosave     {autosave}\n  gateway      {}\n  model        {model}\n  provider     {} | generation {}\n  profile      {route_profile}\n  wire         {}\n  capabilities {route_capabilities}\n  route auth   {}\n  route retry  {} inference | {} catalog | {}\n  route policy catalog {} | replay {} | fallback {}\n  route timeout inference {route_inference_timeout} | catalog {route_catalog_timeout} | discovery {route_discovery_timeout}\n  reasoning    {}\n  directory    {}\n  git          {git}\n  config       {}\n  private state {}\n  endpoint     {}\n  auth         {}\n  project ctx  {project_context}\n  context      {used} / {effective} used ({pct}%, {} left; window {window_note})\n  context src  {window_source}\n  context cache {window_cache}\n  context probe {window_discovery}\n  conversation {user_turns} user | {assistant_turns} assistant | {tool_results} tool\n  compaction   {} run(s) | {} tokens saved | {} exchange(s) removed | {} tool result(s) elided\n  compact last {compaction_last}\n  tools        {} enabled\n  permissions  {mode} | {} read root(s) | {} write root(s)\n  commands     {}\n  artifacts    {artifacts}\n  agents       {} running",
         crate::cli::LONG_VERSION,
         gateway,
+        provider_adapter_label(route.adapter()),
+        route.generation().get(),
+        provider_wire_label(route.wire_revision()),
+        provider_auth_source_label(provider_route.auth_source()),
+        route_policy.inference_retries(),
+        route_policy.catalog_retries(),
+        provider_retry_generation_label(route_policy.retry_generation()),
+        provider_catalog_policy_label(route_policy.catalog()),
+        provider_replay_generation_label(route_policy.semantic_replay_generation()),
+        provider_fallback_label(route_policy.fallback()),
         reasoning_effort_label(session.reasoning_effort.get()),
         shorten_home(&session.directory),
         shorten_home(&session.config_path),
@@ -7507,6 +7641,11 @@ fn format_session_status(
     )
 }
 
+struct RenderedSessionStatus<'a> {
+    provider_route: &'a ProviderRouteReceipt,
+    text: String,
+}
+
 fn session_status_payload(
     model: &str,
     messages: &[ChatMessage],
@@ -7514,8 +7653,12 @@ fn session_status_payload(
     perms: &Permissions,
     registry: &subagent::AgentRegistry,
     state: &kitsu_core::AgentSessionState,
-    text: String,
+    rendered: RenderedSessionStatus<'_>,
 ) -> serde_json::Value {
+    let RenderedSessionStatus {
+        provider_route,
+        text,
+    } = rendered;
     let (window, effective, used) = context_totals(messages, session, state);
     let user_turns = messages
         .iter()
@@ -7549,6 +7692,7 @@ fn session_status_payload(
         "kind": "status",
         "text": text,
         "version": crate::cli::LONG_VERSION,
+        "provider_route": provider_route,
         "session": {
             "id": session_id,
             "gateway": session.gateway,
@@ -9224,7 +9368,11 @@ async fn run_models(cli: &Cli, filter: &str) -> Result<(), CliError> {
     if cli.jsonl {
         emit_jsonl(
             "run_started",
-            serde_json::json!({"mode": "models", "gateway": gateway_name}),
+            serde_json::json!({
+                "mode": "models",
+                "gateway": gateway_name,
+                "provider_route": provider.receipt(),
+            }),
         )?;
         emit_jsonl(
             "provider_request",
@@ -9356,12 +9504,16 @@ async fn run_ask(cli: &Cli, prompt: &str) -> Result<(), CliError> {
         live_agent_event_log_capturing(cli.jsonl, "ask:1", Some(partial_answer.clone()));
     agent_cfg.event_log = Some(event_log.clone());
     if cli.jsonl {
+        let provider_route = provider.receipt().map_err(|error| {
+            CliError::user(format!("cannot inspect current provider route: {error}"))
+        })?;
         emit_jsonl(
             "run_started",
             serde_json::json!({
                 "mode": "ask",
                 "gateway": setup.gateway_name,
                 "model": model.clone(),
+                "provider_route": provider_route,
                 "artifact_policy": artifact_policy_receipt(
                     setup.artifact_policy,
                     setup.artifact_policy_source,
@@ -15125,6 +15277,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
 
     if cli.jsonl {
+        let provider_route = provider.receipt().map_err(|error| {
+            CliError::user(format!("cannot inspect current provider route: {error}"))
+        })?;
         emit_jsonl(
             "run_started",
             serde_json::json!({
@@ -15137,6 +15292,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 },
                 "gateway": setup.gateway_name,
                 "model": model,
+                "provider_route": provider_route,
                 "session_id": session.session_id.borrow().clone(),
                 "resumed": resumed_existing,
                 "durable_session": durable_session,
@@ -17639,12 +17795,36 @@ async fn handle_slash(
             })));
         }
         "status" => {
-            let text = format_session_status(model, messages, session, perms, registry, state);
+            let provider_route = match provider.receipt() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    eprintln!("cannot inspect current provider route: {error}");
+                    return SlashResult::Error;
+                }
+            };
+            let text = format_session_status(
+                model,
+                messages,
+                session,
+                perms,
+                registry,
+                state,
+                &provider_route,
+            );
             if !cli.jsonl {
                 eprintln!("{text}");
             }
             return SlashResult::Continue(Some(session_status_payload(
-                model, messages, session, perms, registry, state, text,
+                model,
+                messages,
+                session,
+                perms,
+                registry,
+                state,
+                RenderedSessionStatus {
+                    provider_route: &provider_route,
+                    text,
+                },
             )));
         }
         "permissions" => {
