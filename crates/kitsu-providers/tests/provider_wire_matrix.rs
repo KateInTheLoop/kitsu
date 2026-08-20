@@ -10,7 +10,7 @@ use kitsu_providers::anthropic_messages::{
 use kitsu_providers::auth::NoAuth;
 use kitsu_providers::openai_compat::{OpenAICompatConfig, OpenAICompatProvider};
 use kitsu_providers::{
-    ChatMessage, ChatRequest, Provider, ProviderAdapterId, ProviderAttemptCategory,
+    ChatDelta, ChatMessage, ChatRequest, Provider, ProviderAdapterId, ProviderAttemptCategory,
     ProviderAttemptOutcome, ProviderCapabilities, ProviderCapability, ProviderError,
     ProviderProfileId, ProviderResponsePart, ProviderRouteContractError, ProviderRouteGeneration,
     ProviderRouteIdentity, ProviderTelemetrySink, ProviderWireRevision, ToolCall, ToolDescriptor,
@@ -513,6 +513,25 @@ async fn send_http_fault(fixture: &HttpFaultFixture) -> ProviderError {
     }
 }
 
+async fn send_native_http_fault(fixture: &HttpFaultFixture) -> ProviderError {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path(fixture.path))
+        .respond_with(
+            ResponseTemplate::new(fixture.status)
+                .insert_header("content-type", "application/json")
+                .set_body_string(fixture.body.clone()),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    match provider.chat_stream(neutral_text_request()).await {
+        Ok(_) => panic!("native HTTP fault unexpectedly started a stream"),
+        Err(error) => error,
+    }
+}
+
 #[tokio::test]
 async fn dialect_specific_http_faults_preserve_typed_status_and_bounded_body() {
     for fixture in [
@@ -528,6 +547,136 @@ async fn dialect_specific_http_faults_preserve_typed_status_and_bounded_body() {
             other => panic!("unexpected HTTP fault: {other}"),
         }
     }
+}
+
+#[tokio::test]
+async fn native_messages_preserves_http_status_and_bounds_error_body() {
+    let overloaded = anthropic_messages_overloaded_error();
+    let error = send_native_http_fault(&overloaded).await;
+    assert!(matches!(
+        error,
+        ProviderError::Http { status: 529, body } if body == overloaded.body
+    ));
+
+    let error = send_native_http_fault(&anthropic_messages_oversized_error()).await;
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::ErrorBody,
+            limit_bytes: KITSU_ERROR_BODY_LIMIT_BYTES,
+        }
+    ));
+}
+
+async fn send_native_stream_fault(
+    fixture: &support::provider_wire_fixture::WireFixture,
+) -> ProviderError {
+    let server = MockServer::start().await;
+    mount_capture(&server, fixture).await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(2));
+    let mut stream = provider
+        .chat_stream(neutral_text_request())
+        .await
+        .expect("native HTTP success starts bounded decoding");
+    loop {
+        match stream.next().await {
+            Some(Err(error)) => return error,
+            Some(Ok(ChatDelta::Done(reason))) => {
+                panic!("native fault synthesized terminal success: {reason:?}")
+            }
+            Some(Ok(_)) => {}
+            None => panic!("native fault reached EOF without a typed error"),
+        }
+    }
+}
+
+#[tokio::test]
+async fn native_messages_rejects_malformed_midstream_and_size_faults() {
+    for fixture in [
+        anthropic_messages_malformed_event(),
+        anthropic_messages_midstream_error(),
+    ] {
+        assert!(matches!(
+            send_native_stream_fault(&fixture).await,
+            ProviderError::InvalidResponse(_)
+        ));
+    }
+
+    let error = send_native_stream_fault(&anthropic_messages_oversized_sse_line()).await;
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseLine,
+            limit_bytes: KITSU_SSE_LINE_LIMIT_BYTES,
+        }
+    ));
+
+    let aggregate = openai_chat_oversized_aggregate("/v1/messages");
+    let error = send_native_stream_fault(&aggregate).await;
+    assert!(matches!(
+        error,
+        ProviderError::ResponseTooLarge {
+            part: ProviderResponsePart::SseStream,
+            limit_bytes: KITSU_SSE_STREAM_LIMIT_BYTES,
+        }
+    ));
+}
+
+#[tokio::test]
+async fn native_messages_timeout_sends_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(1))
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_messages_text().stream),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_millis(100));
+
+    let error = match provider.chat_stream(neutral_text_request()).await {
+        Ok(_) => panic!("native delayed response exceeded its deadline"),
+        Err(error) => error,
+    };
+    assert!(matches!(error, ProviderError::Timeout));
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+}
+
+#[tokio::test]
+async fn native_messages_cancel_sends_once() {
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .and(path("/v1/messages"))
+        .respond_with(
+            ResponseTemplate::new(200)
+                .set_delay(Duration::from_secs(5))
+                .insert_header("content-type", "text/event-stream")
+                .set_body_string(anthropic_messages_text().stream),
+        )
+        .expect(1)
+        .mount(&server)
+        .await;
+    let provider = messages_provider_for(server.uri(), Duration::from_secs(10));
+    let request = tokio::spawn(async move { provider.chat_stream(neutral_text_request()).await });
+    for _ in 0..100 {
+        if !server.received_requests().await.unwrap().is_empty() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
+    request.abort();
+    match request.await {
+        Err(error) => assert!(error.is_cancelled()),
+        Ok(_) => panic!("cancelled native request completed"),
+    }
+    tokio::time::sleep(Duration::from_millis(25)).await;
+    assert_eq!(server.received_requests().await.unwrap().len(), 1);
 }
 
 #[tokio::test]

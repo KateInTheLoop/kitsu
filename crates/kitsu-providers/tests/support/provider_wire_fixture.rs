@@ -381,9 +381,8 @@ pub fn anthropic_messages_oversized_sse_line() -> WireFixture {
 }
 
 /// Current compatible-Chat decoding is selected by the configured adapter,
-/// not by the URL spelling. Exercise its aggregate ceiling at both the Chat
-/// and Messages paths while the native Messages decoder remains an E04-S04
-/// obligation.
+/// not by the URL spelling. The comment-only body is also dialect-neutral
+/// input for exercising the native Messages aggregate ceiling.
 pub fn openai_chat_oversized_aggregate(path: &'static str) -> WireFixture {
     let mut fixture = openai_chat_text();
     fixture.path = path;
@@ -420,9 +419,9 @@ pub fn openai_chat_oversized_tool_arguments(path: &'static str) -> WireFixture {
     fixture
 }
 
-/// Pin the structurally distinct Messages `input_json_delta` case now. The
-/// future native decoder must reject it as `ToolArguments`, not as an SSE-line
-/// overflow and not after emitting a partial neutral call.
+/// The native decoder must reject this structurally distinct Messages
+/// `input_json_delta` as `ToolArguments`, not as an SSE-line overflow and not
+/// after emitting a partial neutral call.
 pub fn anthropic_messages_oversized_tool_arguments() -> WireFixture {
     let mut fixture = anthropic_messages_tool_round();
     let chunk = json!({
