@@ -96,7 +96,7 @@ The following cells are deliberately **not** satisfied by the tests above:
 | X002 tool/source | Fallible deterministic admission first, then frozen source identity, authority before acquisition/import/spawn, bounded supervisor, atomic withdrawal, incarnation/no-replay, disabled parity, and built-in plus real source conformance | E01 and E06 |
 | X003 host/protocol | A real named second host/principal plus identity-preserving control/event/outcome port, version/delivery/auth/backpressure negotiation, disconnect behavior, and shared carrier suite | E02 and future named-host proposal |
 | X004 automation/runtime | Default Kitsu runtime now has common run/outcome types and an independent provider-free seven-carrier exit matrix; a named alternate runtime adapter has not executed the same suite | E10 or a separately approved alternate-runtime proposal |
-| X005 persistence/session | Canonical opaque revision/logical HEAD, whole-turn publication, K01-K12 fault matrix, disposable projection rebuild, last-good recovery, and a named second store | E03 |
+| X005 persistence/session | Cycle 050 fixes the ADR and stable K01-K12 vocabulary, but production still lacks canonical opaque revision/logical HEAD, whole-operation publication, expected-revision CAS, disposable projection rebuild, verified last-good recovery, branch-at-turn, complete current-file execution, and a named second store | E03 |
 
 No epic may cite the broad workspace pass as closure of one of these missing
 cells. The owning fixture must execute against both the default and named
