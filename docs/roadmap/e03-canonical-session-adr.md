@@ -618,8 +618,17 @@ cannot weaken or replace any backend-neutral assertion.
    branch turn equal to the committed selected HEAD. The historical creation
    anchor is retained so carried SHA-bound legacy evidence remains chronological;
    destination commit time is new and monotonic. Source compaction and recovery
-   ledgers are cleared, and no authority state exists to copy. Next add bounded
-   no-overwrite artifact copying and create-only destination publication cuts.
+   ledgers are cleared, and no authority state exists to copy. The next bounded
+   steps are no-overwrite artifact copying and create-only publication cuts.
+   **Verified branch artifact copying complete in Cycle 078:** the physical
+   store first opens and verifies the immutable source manifest and content,
+   then preserves schema, artifact identity, media type, and exact bytes while
+   rewriting only the destination session identity through its existing atomic
+   create-only installer. Same-session copy is rejected. Missing or tampered
+   source leaves no destination; collision preserves the first exact artifact.
+   The bounded review deliberately leaves multi-artifact rollback and branch
+   candidate/HEAD publication to Cycle 079 under separate source/destination
+   fences.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

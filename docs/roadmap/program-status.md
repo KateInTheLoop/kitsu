@@ -2,7 +2,7 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C21, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 077;
+through Cycle 078;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 77 / 77 |
+| Accepted cycles/commits after this cycle | 78 / 78 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S05-C2 (Cycle 078) — add no-overwrite artifact copying and create-only branch publication cuts |
+| Active epic/card | E03 / E03-S05-C3 (Cycle 079) — publish a branch create-only under source/destination fences with exact cuts |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C21, E03-S05 through C1 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. A pure branch assembler now accepts only a committed operation boundary, creates fresh destination session/revision identity with `Missing` parent, binds source store/session/revision/current HEAD plus branch turn, copies the exact chronological closed prefix and only its referenced artifact facts, preserves the historical creation anchor, and clears source-only compaction/recovery state. No authority is stored or copied. Branch artifact copying/publication, production mounting, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C21, E03-S05 through C2 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. A pure branch assembler accepts only a committed operation boundary, creates fresh destination session/revision identity with `Missing` parent, binds source store/session/revision/current HEAD plus branch turn, copies the exact chronological closed prefix and only its referenced artifact facts, preserves the historical creation anchor, and clears source-only compaction/recovery state. A physical primitive now verifies immutable source bytes and metadata before installing an identity-rewritten destination artifact through create-only publication; missing/tampered source, same-session copy, and destination collision fail closed. No authority is stored or copied. Whole-branch publication, production mounting, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -113,7 +113,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 074 | `54dd67d` | HEAD-bound manifest-envelope recovery across physical payload faults |
 | 075 | `e886f5c` | Causal recovery revision assembly and complete plan evidence |
 | 076 | `fef69d2` | Fenced new-revision recovery publication and exact cut truth |
-| 077 | this document's commit | Pure branch-at-committed-turn prefix and closure assembly |
+| 077 | `bd00774` | Pure branch-at-committed-turn prefix and closure assembly |
+| 078 | this document's commit | Verified destination-scoped no-overwrite branch artifact copying |
 
 ## Current green gates
 
@@ -461,8 +462,14 @@ filters the immutable artifact manifest to facts referenced by that prefix, and
 binds source store/session/revision/current HEAD plus branch turn into fresh
 destination lineage. The historical creation anchor remains valid for a carried
 legacy baseline, while the new commit time is monotonic. Compaction and recovery
-logs are source-only derived/provenance state and are cleared. Cycle 078 next
-adds no-overwrite artifact copying and create-only branch publication cuts.
+logs are source-only derived/provenance state and are cleared. Cycle 078 adds a
+verified destination-scoped artifact-copy primitive: it rejects same-session
+copy, fully verifies source manifest/content before effects, preserves schema,
+media type, and bytes while rewriting session identity, and publishes only via
+the existing atomic no-overwrite installer. Missing or tampered source creates
+nothing; destination collision preserves the first exact artifact. Review split
+whole-branch transaction ownership into Cycle 079, which next adds source and
+destination fencing plus create-only candidate/HEAD publication cuts.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

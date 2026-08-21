@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 077.
+updates through Cycle 078.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -128,6 +128,9 @@ kernel.
   published-unconfirmed cut truth without ever selecting the old source.
   Cycle 077 adds pure branch-at-committed-turn assembly with exact prefix,
   lineage, referenced-artifact filtering, and fresh destination identity.
+  Cycle 078 adds verified destination-scoped artifact copying: source bytes and
+  metadata must verify before any effect, destination publication is atomic and
+  no-overwrite, and missing/tampered/same-session/collision cases fail closed.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
