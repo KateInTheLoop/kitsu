@@ -86,6 +86,8 @@ pub(super) struct McpSerialChildOwnerV1<'effects, E: SerialChildTransportEffects
     payload_limit: usize,
     state: McpSerialChildStateV1,
     event: Option<ClientEvent>,
+    #[cfg(test)]
+    response_frames_for_test: Vec<Vec<u8>>,
 }
 
 impl<'effects, E> McpSerialChildOwnerV1<'effects, E>
@@ -119,6 +121,8 @@ where
             payload_limit,
             state: McpSerialChildStateV1::Ready,
             event: None,
+            #[cfg(test)]
+            response_frames_for_test: Vec::new(),
         })
     }
 
@@ -441,6 +445,8 @@ where
                 return;
             }
         };
+        #[cfg(test)]
+        self.response_frames_for_test.push(response.clone());
         let mut messages = match self.decoder.push(&response) {
             Ok(messages) => messages,
             Err(error) => {
@@ -551,8 +557,18 @@ where
     }
 
     #[cfg(test)]
-    fn effects_for_test(&mut self) -> &mut E {
+    pub(super) fn effects_for_test(&mut self) -> &mut E {
         self.transport.effects_for_test()
+    }
+
+    #[cfg(test)]
+    pub(super) fn transport_state_for_test(&self) -> &SerialChildTransportStateV1 {
+        self.transport.state()
+    }
+
+    #[cfg(test)]
+    pub(super) fn response_frames_for_test(&self) -> &[Vec<u8>] {
+        &self.response_frames_for_test
     }
 
     #[cfg(test)]
