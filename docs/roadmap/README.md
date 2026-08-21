@@ -709,6 +709,7 @@ gates merely because a card appears attractive.
 | 098 | E03-S02-C39 | Admit only snapshot-writable bound-current resume and reject canonical state before product routing |
 | 099 | E03-S02-C40 | Mount durable startup resume on the pinned bound-current route with explicit canonical refusal |
 | 100 | E03-S02-C41 | Stage an exact bound-current in-process target and swap the active owner only after every fallible precommit step |
+| 101 | E06-S02-C1 | Freeze one non-cloneable request inventory that owns exact descriptor order and immutable handler identities through provider response execution |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -874,6 +875,12 @@ performs one infallible active-owner swap. The polished checkpoint then feeds
 the dependency-safe candidate branches in the
 [parallel delivery plan](parallel-delivery-plan.md); integration acceptance and
 cycle numbering remain serialized.
+Cycle 101 begins E06 by freezing the exact tool descriptors and handler
+identities used by each provider request. Structured calls, recovered text
+calls, and output-offload eligibility all resolve through that same owned,
+non-cloneable inventory until the response is complete. Descriptor-free and
+static-registry behavior remain byte-compatible. This foundation introduces no
+external tool source, child process, MCP configuration, or product route.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
