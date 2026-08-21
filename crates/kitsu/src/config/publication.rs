@@ -147,6 +147,7 @@ impl RenderedConfigBytes {
 pub(super) enum ConfigPublicationFailureKind {
     ParentMissing,
     UnsafeParent,
+    WriterBusy,
     InvalidTarget,
     StageCreate,
     Write,
@@ -272,6 +273,10 @@ struct ConfigFileSnapshot {
     #[cfg(unix)]
     mode: u32,
     #[cfg(unix)]
+    user: u32,
+    #[cfg(unix)]
+    group: u32,
+    #[cfg(unix)]
     changed_seconds: i64,
     #[cfg(unix)]
     changed_nanoseconds: i64,
@@ -300,6 +305,8 @@ impl ConfigFileSnapshot {
                 device: metadata.dev(),
                 inode: metadata.ino(),
                 mode: metadata.mode(),
+                user: metadata.uid(),
+                group: metadata.gid(),
                 changed_seconds: metadata.ctime(),
                 changed_nanoseconds: metadata.ctime_nsec(),
                 links: metadata.nlink(),
@@ -325,6 +332,8 @@ impl ConfigFileSnapshot {
             self.device == other.device
                 && self.inode == other.inode
                 && self.mode == other.mode
+                && self.user == other.user
+                && self.group == other.group
                 && self.changed_seconds == other.changed_seconds
                 && self.changed_nanoseconds == other.changed_nanoseconds
                 && self.links == other.links
@@ -342,7 +351,23 @@ impl ConfigFileSnapshot {
             && self.device == other.device
             && self.inode == other.inode
             && self.mode == other.mode
+            && self.user == other.user
+            && self.group == other.group
             && self.links == other.links.saturating_add(1)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn same_owned_inode_after_rename(&self, other: &Self) -> bool {
+        // The owned rename advances ctime. The tracked identity, content,
+        // mode, uid/gid, and link-count facts remain exact across it.
+        self.size == other.size
+            && self.digest == other.digest
+            && self.device == other.device
+            && self.inode == other.inode
+            && self.mode == other.mode
+            && self.user == other.user
+            && self.group == other.group
+            && self.links == other.links
     }
 
     #[cfg(target_os = "linux")]
@@ -399,6 +424,8 @@ impl ConfigFileSnapshot {
             device: metadata.dev(),
             inode: metadata.ino(),
             mode: metadata.mode(),
+            user: metadata.uid(),
+            group: metadata.gid(),
             changed_seconds: metadata.ctime(),
             changed_nanoseconds: metadata.ctime_nsec(),
             links: metadata.nlink(),
@@ -426,6 +453,7 @@ impl fmt::Debug for PinnedConfigTarget {
 enum PinTargetError {
     Missing,
     Unsafe,
+    Busy,
     Invalid,
 }
 
@@ -478,6 +506,21 @@ impl PinnedConfigTarget {
                     parent = unsafe { File::from_raw_fd(fd) };
                 }
                 Component::ParentDir | Component::Prefix(_) => return Err(PinTargetError::Invalid),
+            }
+        }
+        #[cfg(target_os = "linux")]
+        {
+            // Advisory serialization covers Kitsu config publishers that use
+            // this adapter. It cannot exclude non-cooperating or privileged
+            // same-UID writers from the directory namespace.
+            let result = unsafe { libc::flock(parent.as_raw_fd(), libc::LOCK_EX | libc::LOCK_NB) };
+            if result != 0 {
+                let error = std::io::Error::last_os_error();
+                return Err(if error.kind() == std::io::ErrorKind::WouldBlock {
+                    PinTargetError::Busy
+                } else {
+                    PinTargetError::Unsafe
+                });
             }
         }
         Ok(Self {
@@ -964,6 +1007,7 @@ fn cleanup_uninstalled_stage(
         .clone();
     let removal = quarantine_verified_name(
         &receipt.target,
+        &receipt.file,
         receipt.expected.as_ref(),
         &stage,
         false,
@@ -1015,6 +1059,12 @@ pub(super) fn publish_create_new(
         Err(PinTargetError::Unsafe) => {
             return ConfigPublicationOutcome::Failed {
                 kind: ConfigPublicationFailureKind::UnsafeParent,
+                residue: None,
+            }
+        }
+        Err(PinTargetError::Busy) => {
+            return ConfigPublicationOutcome::Failed {
+                kind: ConfigPublicationFailureKind::WriterBusy,
                 residue: None,
             }
         }
@@ -1609,8 +1659,9 @@ fn rollback_fault(point: RollbackFaultPoint) -> bool {
 }
 
 pub(super) enum RollbackHookPoint<'a> {
-    AfterTargetVerification { target: &'a Path },
-    AfterQuarantine { quarantine: &'a Path },
+    TargetVerified { target: &'a Path },
+    Quarantined { quarantine: &'a Path },
+    QuarantineVerified { quarantine: &'a Path },
 }
 
 fn rollback_entry<F>(
@@ -1682,6 +1733,7 @@ fn rollback_uninstalled_stage(
     if let Some(stage) = receipt.stage_name.take() {
         match quarantine_verified_name(
             &receipt.target,
+            &receipt.file,
             receipt.expected.as_ref(),
             &stage,
             false,
@@ -1741,6 +1793,7 @@ where
     if let Some(stage) = receipt.stage_name.take() {
         match quarantine_verified_name(
             &receipt.target,
+            &receipt.file,
             receipt.expected.as_ref(),
             &stage,
             false,
@@ -1791,6 +1844,7 @@ where
     let target_name = receipt.target.name.clone();
     match quarantine_verified_name(
         &receipt.target,
+        &receipt.file,
         receipt.expected.as_ref(),
         &target_name,
         true,
@@ -1842,8 +1896,45 @@ enum QuarantineRemoval {
 }
 
 #[cfg(target_os = "linux")]
+fn classify_quarantine_location(
+    target: &PinnedConfigTarget,
+    file: &File,
+    baseline: &ConfigFileSnapshot,
+    original: &CStr,
+    quarantine: &CStr,
+) -> QuarantineRemoval {
+    let Ok((current, _)) = ConfigFileSnapshot::read_owned(file) else {
+        return QuarantineRemoval::Failure;
+    };
+    let Ok(original) = target.read_named_snapshot(original) else {
+        return QuarantineRemoval::Failure;
+    };
+    let Ok(displaced) = target.read_named_snapshot(quarantine) else {
+        return QuarantineRemoval::Failure;
+    };
+
+    if displaced
+        .as_ref()
+        .is_some_and(|displaced| current.matches(displaced))
+    {
+        return QuarantineRemoval::Displaced(quarantine.to_owned());
+    }
+    if original
+        .as_ref()
+        .is_some_and(|original| current.matches(original))
+    {
+        return QuarantineRemoval::Mismatch;
+    }
+    if baseline.same_owned_inode_after_link_removal(&current) {
+        return QuarantineRemoval::Removed;
+    }
+    QuarantineRemoval::Failure
+}
+
+#[cfg(target_os = "linux")]
 fn quarantine_verified_name<F>(
     target: &PinnedConfigTarget,
+    file: &File,
     expected: Option<&ConfigFileSnapshot>,
     name: &CStr,
     observe: bool,
@@ -1864,7 +1955,7 @@ where
         return QuarantineRemoval::Mismatch;
     }
     if observe {
-        hook(RollbackHookPoint::AfterTargetVerification {
+        hook(RollbackHookPoint::TargetVerified {
             target: &target.path,
         });
     }
@@ -1884,8 +1975,15 @@ where
         Err(_) => return QuarantineRemoval::Failure,
     };
     let quarantine_path = target.named_path(&quarantine);
+    let renamed = match target.read_named_snapshot(&quarantine) {
+        Ok(Some(renamed)) if expected.same_owned_inode_after_rename(&renamed) => renamed,
+        _ => {
+            let _ = target.rename_noreplace(&quarantine, name);
+            return classify_quarantine_location(target, file, expected, name, &quarantine);
+        }
+    };
     if observe {
-        hook(RollbackHookPoint::AfterQuarantine {
+        hook(RollbackHookPoint::Quarantined {
             quarantine: &quarantine_path,
         });
     }
@@ -1894,25 +1992,19 @@ where
         .as_ref()
         .ok()
         .and_then(Option::as_ref)
-        .is_some_and(|after| expected.matches(after))
+        .is_some_and(|after| renamed.matches(after))
     {
-        return if target.unlink(&quarantine).is_ok() {
-            QuarantineRemoval::Removed
-        } else {
-            QuarantineRemoval::Displaced(quarantine)
-        };
+        if observe {
+            hook(RollbackHookPoint::QuarantineVerified {
+                quarantine: &quarantine_path,
+            });
+        }
+        let _ = target.unlink(&quarantine);
+        return classify_quarantine_location(target, file, &renamed, name, &quarantine);
     }
 
-    match target.rename_noreplace(&quarantine, name) {
-        Ok(()) => {
-            if after.is_err() {
-                QuarantineRemoval::Failure
-            } else {
-                QuarantineRemoval::Mismatch
-            }
-        }
-        Err(_) => QuarantineRemoval::Displaced(quarantine),
-    }
+    let _ = target.rename_noreplace(&quarantine, name);
+    classify_quarantine_location(target, file, &renamed, name, &quarantine)
 }
 
 #[cfg(test)]
@@ -1952,6 +2044,120 @@ mod tests {
         let preview = preview(target, "model-v1");
         let rendered = RenderedConfigBytes::render(&preview).unwrap();
         (preview, rendered)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_facts(
+        snapshot: &ConfigFileSnapshot,
+    ) -> (u64, u64, u64, u32, u32, u32, i64, i64, u64) {
+        (
+            snapshot.size,
+            snapshot.device,
+            snapshot.inode,
+            snapshot.mode,
+            snapshot.user,
+            snapshot.group,
+            snapshot.changed_seconds,
+            snapshot.changed_nanoseconds,
+            snapshot.links,
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn snapshot_result_facts(snapshot: std::io::Result<Option<ConfigFileSnapshot>>) -> String {
+        match snapshot {
+            Ok(Some(snapshot)) => format!("present:{:?}", snapshot_facts(&snapshot)),
+            Ok(None) => "missing".to_string(),
+            Err(error) => format!("error:{:?}:{:?}", error.kind(), error.raw_os_error()),
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    fn installed_receipt_facts(receipt: &InstalledConfigReceipt) -> String {
+        let expected = receipt.expected.as_ref().map(snapshot_facts);
+        let target =
+            snapshot_result_facts(receipt.target.read_named_snapshot(&receipt.target.name));
+        let stage = receipt.stage_name.as_ref().map_or_else(
+            || "none".to_string(),
+            |stage| snapshot_result_facts(receipt.target.read_named_snapshot(stage)),
+        );
+        format!(
+            "expected={expected:?},target={target},stage_retained={},stage={stage}",
+            receipt.stage_name.is_some()
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn directory_entries(directory: &Path) -> Vec<String> {
+        let mut entries = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        entries.sort();
+        entries
+    }
+
+    #[cfg(target_os = "linux")]
+    fn outcome_facts(outcome: &ConfigPublicationOutcome, directory: &Path) -> String {
+        let outcome = match outcome {
+            ConfigPublicationOutcome::Created(receipt) => {
+                format!("created: {}", installed_receipt_facts(receipt))
+            }
+            ConfigPublicationOutcome::Collision => "collision".to_string(),
+            ConfigPublicationOutcome::Failed { kind, residue } => format!(
+                "failed:{kind:?}:residue={:?}",
+                residue.as_ref().map(ConfigPublicationResidue::kind)
+            ),
+        };
+        format!("{outcome},entries={:?}", directory_entries(directory))
+    }
+
+    #[cfg(target_os = "linux")]
+    fn ledger_entry_facts(ledger: &ConfigPublicationLedger, effect_id: u64) -> String {
+        let Some(entry) = ledger.entries.get(&effect_id) else {
+            return "entry=missing".to_string();
+        };
+        let receipt = match entry {
+            LedgerEntry::Installed(receipt)
+            | LedgerEntry::Mismatch(receipt)
+            | LedgerEntry::RollbackFailure(receipt)
+            | LedgerEntry::Unsupported(receipt) => receipt,
+            LedgerEntry::InstalledUnconfirmed(InstalledUnconfirmedReceipt(receipt))
+            | LedgerEntry::StageCleanup(StageCleanupReceipt(receipt))
+            | LedgerEntry::RemovedUnconfirmed(RemovedUnconfirmedReceipt(receipt)) => receipt,
+            LedgerEntry::DisplacedEntry(receipt) => &receipt.installed,
+        };
+        format!(
+            "entry={:?},{}",
+            entry.residue_kind(),
+            installed_receipt_facts(receipt)
+        )
+    }
+
+    #[cfg(target_os = "linux")]
+    fn rollback_removed(
+        ledger: &mut ConfigPublicationLedger,
+        directory: &Path,
+    ) -> Result<(), String> {
+        let mut phases = Vec::new();
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                phases.push(match phase {
+                    RollbackHookPoint::TargetVerified { .. } => "after-target-verification",
+                    RollbackHookPoint::Quarantined { .. } => "after-quarantine",
+                    RollbackHookPoint::QuarantineVerified { .. } => "after-quarantine-verification",
+                });
+            })
+            .unwrap();
+        if rollback == ConfigRollbackResult::Removed {
+            Ok(())
+        } else {
+            Err(format!(
+                "rollback={rollback:?},phases={phases:?},{},entries={:?}",
+                ledger_entry_facts(ledger, 1),
+                directory_entries(directory)
+            ))
+        }
     }
 
     fn created_receipt(target: &Path) -> InstalledConfigReceipt {
@@ -2170,6 +2376,85 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn parallel_publication_receipts_remain_exact_until_rollback() {
+        const WORKERS: usize = 8;
+        const ROUNDS: usize = 4;
+        let armed = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let consume = std::sync::Arc::new(std::sync::Barrier::new(WORKERS));
+        let workers = (0..WORKERS)
+            .map(|worker| {
+                let armed = std::sync::Arc::clone(&armed);
+                let consume = std::sync::Arc::clone(&consume);
+                std::thread::spawn(move || {
+                    let directory = tempfile::tempdir().unwrap();
+                    let mut failures = Vec::new();
+
+                    for round in 0..ROUNDS {
+                        let retained_stage = (worker + round) % 2 == 1;
+                        let target = directory.path().join(format!("receipt-{round}.toml"));
+                        let (preview, rendered) = render(&target);
+                        let _fault_scope = retained_stage.then(|| {
+                            inject_next_publication_fault(PublicationFaultPoint::StageCleanup)
+                        });
+                        if worker == 0 {
+                            std::thread::sleep(std::time::Duration::from_millis(20));
+                        }
+                        armed.wait();
+
+                        let ledger = if retained_stage {
+                            match publish_create_new(preview.target(), &rendered) {
+                                ConfigPublicationOutcome::Failed {
+                                    kind: ConfigPublicationFailureKind::StageCleanup,
+                                    residue: Some(residue),
+                                } if residue.kind() == ConfigResidueKind::StageCleanup => {
+                                    let mut ledger = ConfigPublicationLedger::new(303).unwrap();
+                                    ledger.register_residue(1, residue).unwrap();
+                                    Ok(ledger)
+                                }
+                                outcome => Err(outcome_facts(&outcome, directory.path())),
+                            }
+                        } else {
+                            match publish_create_new(preview.target(), &rendered) {
+                                ConfigPublicationOutcome::Created(receipt) => {
+                                    let mut ledger = ConfigPublicationLedger::new(301).unwrap();
+                                    ledger.register_created(1, receipt).unwrap();
+                                    Ok(ledger)
+                                }
+                                outcome => Err(outcome_facts(&outcome, directory.path())),
+                            }
+                        };
+                        consume.wait();
+
+                        match ledger {
+                            Ok(mut ledger) => {
+                                if let Err(facts) = rollback_removed(&mut ledger, directory.path()) {
+                                    failures.push(format!(
+                                        "worker={worker},round={round},stage={retained_stage},{facts}"
+                                    ));
+                                }
+                            }
+                            Err(facts) => failures.push(format!(
+                                "worker={worker},round={round},stage={retained_stage},outcome={facts}"
+                            )),
+                        }
+                    }
+                    failures
+                })
+            })
+            .collect::<Vec<_>>();
+
+        let failures = workers
+            .into_iter()
+            .flat_map(|worker| match worker.join() {
+                Ok(failures) => failures,
+                Err(_) => vec!["parallel publication worker panicked".to_string()],
+            })
+            .collect::<Vec<_>>();
+        assert!(failures.is_empty(), "failures={failures:#?}");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn post_link_stage_mutation_is_never_accepted_as_created() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("config.toml");
@@ -2366,6 +2651,211 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    fn owned_quarantine_rename_rebaselines_its_own_ctime_change() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let mut ledger = publish_into_ledger(91, 1, &target);
+        let mut phases = Vec::new();
+
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                phases.push(match phase {
+                    RollbackHookPoint::TargetVerified { .. } => {
+                        std::thread::sleep(std::time::Duration::from_millis(20));
+                        "after-target-verification"
+                    }
+                    RollbackHookPoint::Quarantined { .. } => "after-quarantine",
+                    RollbackHookPoint::QuarantineVerified { .. } => "after-quarantine-verification",
+                });
+            })
+            .unwrap();
+
+        assert_eq!(
+            rollback,
+            ConfigRollbackResult::Removed,
+            "phases={phases:?},{},entries={:?}",
+            ledger_entry_facts(&ledger, 1),
+            directory_entries(directory.path())
+        );
+        assert_eq!(
+            phases,
+            [
+                "after-target-verification",
+                "after-quarantine",
+                "after-quarantine-verification"
+            ]
+        );
+        assert!(!target.exists());
+        assert!(ledger.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn post_quarantine_ctime_only_mutation_remains_a_mismatch() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let mut ledger = publish_into_ledger(93, 1, &target);
+
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                if let RollbackHookPoint::Quarantined { quarantine } = phase {
+                    let permissions = std::fs::symlink_metadata(quarantine).unwrap().permissions();
+                    std::thread::sleep(std::time::Duration::from_millis(20));
+                    std::fs::set_permissions(quarantine, permissions).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            rollback,
+            ConfigRollbackResult::Incomplete(ConfigResidueKind::Mismatch)
+        );
+        assert!(target.exists());
+        assert_eq!(ledger.residue_kind(1), Some(ConfigResidueKind::Mismatch));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn pinned_receipt_blocks_a_second_kitsu_writer_until_rollback_finishes() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let contender = directory.path().join("contender.toml");
+        let mut ledger = publish_into_ledger(95, 1, &target);
+        let observed = std::rc::Rc::new(std::cell::RefCell::new(None));
+        let hook_observed = std::rc::Rc::clone(&observed);
+
+        assert_eq!(
+            ledger
+                .rollback_with_hook(1, |phase| {
+                    if matches!(phase, RollbackHookPoint::TargetVerified { .. })
+                        && hook_observed.borrow().is_none()
+                    {
+                        let (preview, rendered) = render(&contender);
+                        *hook_observed.borrow_mut() =
+                            Some(publish_create_new(preview.target(), &rendered));
+                    }
+                })
+                .unwrap(),
+            ConfigRollbackResult::Removed
+        );
+
+        let outcome = observed
+            .borrow_mut()
+            .take()
+            .expect("contending Kitsu writer was attempted");
+        let facts = outcome_facts(&outcome, directory.path());
+        assert!(
+            matches!(
+                outcome,
+                ConfigPublicationOutcome::Failed {
+                    kind: ConfigPublicationFailureKind::WriterBusy,
+                    residue: None,
+                }
+            ),
+            "{facts}"
+        );
+        assert!(!contender.exists(), "busy writer had a visible effect");
+
+        let mut contender_ledger = publish_into_ledger(97, 1, &contender);
+        assert_eq!(
+            contender_ledger.rollback(1).unwrap(),
+            ConfigRollbackResult::Removed
+        );
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_quarantine_after_verification_is_removed_not_displaced() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let mut ledger = publish_into_ledger(99, 1, &target);
+        let mut cut_reached = false;
+
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                if let RollbackHookPoint::QuarantineVerified { quarantine } = phase {
+                    cut_reached = true;
+                    std::fs::remove_file(quarantine).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert!(cut_reached);
+        assert_eq!(rollback, ConfigRollbackResult::Removed);
+        assert!(ledger.is_empty());
+        assert!(directory_entries(directory.path()).is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn generic_unlink_failure_is_displaced_only_when_the_receipt_name_is_retained() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let mut ledger = publish_into_ledger(101, 1, &target);
+        let original_permissions = std::fs::symlink_metadata(directory.path())
+            .unwrap()
+            .permissions();
+        let parent = directory.path().to_path_buf();
+
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                if matches!(phase, RollbackHookPoint::QuarantineVerified { .. }) {
+                    std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o500))
+                        .unwrap();
+                }
+            })
+            .unwrap();
+        std::fs::set_permissions(directory.path(), original_permissions).unwrap();
+
+        assert_eq!(
+            rollback,
+            ConfigRollbackResult::Incomplete(ConfigResidueKind::DisplacedEntry)
+        );
+        let LedgerEntry::DisplacedEntry(displaced) = ledger.entries.get(&1).unwrap() else {
+            panic!("generic unlink failure lost its exact displaced receipt")
+        };
+        let named = displaced
+            .installed
+            .target
+            .read_named_snapshot(&displaced.displaced_name)
+            .unwrap()
+            .expect("displaced name remains present");
+        let (owned, _) = ConfigFileSnapshot::read_owned(&displaced.installed.file).unwrap();
+        assert!(owned.matches(&named));
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn missing_restore_source_with_receipt_at_unknown_name_is_a_failure() {
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let unknown = directory.path().join("actor-moved-receipt.toml");
+        let mut ledger = publish_into_ledger(103, 1, &target);
+
+        let rollback = ledger
+            .rollback_with_hook(1, |phase| {
+                if let RollbackHookPoint::Quarantined { quarantine } = phase {
+                    std::fs::rename(quarantine, &unknown).unwrap();
+                }
+            })
+            .unwrap();
+
+        assert_eq!(
+            rollback,
+            ConfigRollbackResult::Incomplete(ConfigResidueKind::RollbackFailure)
+        );
+        assert_eq!(
+            ledger.residue_kind(1),
+            Some(ConfigResidueKind::RollbackFailure)
+        );
+        assert!(!target.exists());
+        assert!(unknown.exists());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
     fn hardlink_and_content_changes_are_mismatches_and_remain_present() {
         let hardlink_dir = tempfile::tempdir().unwrap();
         let hardlink_target = hardlink_dir.path().join("config.toml");
@@ -2403,7 +2893,7 @@ mod tests {
 
         let outcome = ledger
             .rollback_with_hook(1, |point| {
-                if matches!(point, RollbackHookPoint::AfterTargetVerification { .. }) {
+                if matches!(point, RollbackHookPoint::TargetVerified { .. }) {
                     std::fs::rename(&target, &displaced_owned).unwrap();
                     std::fs::write(&target, b"raced replacement").unwrap();
                 }
@@ -2411,11 +2901,14 @@ mod tests {
             .unwrap();
         assert_eq!(
             outcome,
-            ConfigRollbackResult::Incomplete(ConfigResidueKind::Mismatch)
+            ConfigRollbackResult::Incomplete(ConfigResidueKind::RollbackFailure)
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"raced replacement");
         assert!(displaced_owned.exists());
-        assert_eq!(ledger.residue_kind(1), Some(ConfigResidueKind::Mismatch));
+        assert_eq!(
+            ledger.residue_kind(1),
+            Some(ConfigResidueKind::RollbackFailure)
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -2423,18 +2916,16 @@ mod tests {
     fn post_quarantine_mismatch_with_failed_restore_retains_displaced_entry() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("config.toml");
-        let actor_backup = directory.path().join("actor-backup.toml");
         let mut ledger = publish_into_ledger(107, 1, &target);
 
         let outcome = ledger
             .rollback_with_hook(1, |point| match point {
-                RollbackHookPoint::AfterTargetVerification { .. } => {
-                    std::fs::rename(&target, &actor_backup).unwrap();
-                    std::fs::write(&target, b"first raced replacement").unwrap();
-                }
-                RollbackHookPoint::AfterQuarantine { .. } => {
+                RollbackHookPoint::TargetVerified { .. } => {}
+                RollbackHookPoint::Quarantined { quarantine } => {
+                    std::fs::write(quarantine, b"mutated quarantined entry").unwrap();
                     std::fs::write(&target, b"second raced replacement").unwrap();
                 }
+                RollbackHookPoint::QuarantineVerified { .. } => {}
             })
             .unwrap();
         assert_eq!(
@@ -2442,13 +2933,12 @@ mod tests {
             ConfigRollbackResult::Incomplete(ConfigResidueKind::DisplacedEntry)
         );
         assert_eq!(std::fs::read(&target).unwrap(), b"second raced replacement");
-        assert!(actor_backup.exists());
         assert_eq!(
             ledger.residue_kind(1),
             Some(ConfigResidueKind::DisplacedEntry)
         );
         assert!(
-            std::fs::read_dir(directory.path()).unwrap().count() >= 3,
+            std::fs::read_dir(directory.path()).unwrap().count() >= 2,
             "the no-overwrite restoration failure lost the quarantined entry"
         );
     }
