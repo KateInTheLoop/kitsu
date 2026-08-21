@@ -8,8 +8,9 @@
 //! does not hide paths or govern stat/access, chmod/chown/xattrs/timestamps,
 //! flock/fcntl, and this backend supplies no mount namespace complement. Host
 //! signal and ptrace authority is also outside this card. It therefore remains
-//! private and unmounted from MCP/product wiring. Serial long-lived request
-//! cycling is not implemented.
+//! private and unmounted from MCP/product wiring. The serial transport below
+//! is an opaque bounded line mechanism; it is not an MCP codec or concurrent
+//! request multiplexer.
 
 #![allow(dead_code)]
 
@@ -23,7 +24,7 @@ use std::os::unix::ffi::OsStrExt;
 use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -31,10 +32,14 @@ use std::time::{Duration, Instant};
 use ring::digest::{Context, SHA256};
 
 use super::authority::{
-    AdmittedChildLaunchV1, ChildFilesystemAccessV1, ChildLaunchPreparationV1,
+    AdmittedChildLaunchV1, ChildFilesystemAccessV1, ChildLaunchPreparationV1, ChildRequestPolicyV1,
     PreparedChildContainmentTokenV1, PreparedChildLaunchV1, PreparedChildOsLaunchV1,
 };
 use super::lifecycle::ChildExitTruthV1;
+use super::serial::{
+    SerialChildCauseV1, SerialChildTransportEffectsV1, SerialFrameObservationV1,
+    SerialIoProgressV1, SerialOutputStatusV1, SerialOwnedChildResidueV1, SerialPollAllowanceV1,
+};
 use super::supervisor::{
     ChildPhaseSupervisorEffectsV1, ChildReapPollV1, ChildSupervisorCauseV1, OwnedChildResidueV1,
     OwnedChildTokenV1,
@@ -301,6 +306,58 @@ impl ActiveChildV1 {
     }
 }
 
+struct ActiveSerialChildV1 {
+    child: Child,
+    pgid: i32,
+    phase_budgets_millis: [u64; 5],
+    stdin: Option<ChildStdin>,
+    stdout: Option<ChildStdout>,
+    stderr: Option<ChildStderr>,
+    pending_stdin: Vec<u8>,
+    pending_stdin_offset: usize,
+    stdout_carry: Vec<u8>,
+    io_limits: [usize; 4],
+    max_frames: u16,
+    frame_count: u16,
+    stdin_accepted: usize,
+    stdout_accepted: usize,
+    stderr_accepted: usize,
+    exit_observed: bool,
+    observed_exit_truth: Option<ChildExitTruthV1>,
+    exit_status: Option<ExitStatus>,
+}
+
+impl ActiveSerialChildV1 {
+    fn observe_child_exit(&mut self) -> Result<(), String> {
+        if !self.exit_observed {
+            self.observed_exit_truth = child_exit_observation(self.child.id())?;
+            self.exit_observed = self.observed_exit_truth.is_some();
+        }
+        Ok(())
+    }
+
+    fn force_cleanup(&mut self) -> RealChildCleanupTruthV1 {
+        self.stdin.take();
+        self.stdout.take();
+        self.stderr.take();
+        if self.exit_status.is_none() {
+            let _ = signal_process_group(self.pgid, libc::SIGKILL);
+            self.exit_status = self.child.wait().ok();
+        }
+        let group_deadline = Instant::now()
+            .checked_add(Duration::from_millis(self.phase_budgets_millis[4]))
+            .unwrap_or_else(Instant::now);
+        while !process_group_is_gone(self.pgid) && Instant::now() < group_deadline {
+            thread::yield_now();
+        }
+        RealChildCleanupTruthV1 {
+            group_gone: process_group_is_gone(self.pgid),
+            direct_child_reaped: self.exit_status.is_some(),
+            workers_joined: true,
+        }
+    }
+}
+
 fn join_write_worker(
     worker: &mut Option<JoinHandle<PipeWriteOutcomeV1>>,
     outcome: &mut Option<PipeWriteOutcomeV1>,
@@ -449,6 +506,43 @@ impl Drop for RealChildOwnedResidueV1 {
     }
 }
 
+struct RealSerialOwnedResidueV1 {
+    _transport_residue: SerialOwnedChildResidueV1,
+    child: ActiveSerialChildV1,
+    cleaned: bool,
+}
+
+impl fmt::Debug for RealSerialOwnedResidueV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("RealSerialOwnedResidueV1")
+            .field("pgid", &self.child.pgid)
+            .field("cleaned", &self.cleaned)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RealSerialOwnedResidueV1 {
+    fn cleanup(mut self) -> Result<RealChildCleanupTruthV1, Box<Self>> {
+        let truth = self.child.force_cleanup();
+        if truth.group_gone && truth.direct_child_reaped {
+            self.cleaned = true;
+            Ok(truth)
+        } else {
+            Err(Box::new(self))
+        }
+    }
+}
+
+impl Drop for RealSerialOwnedResidueV1 {
+    fn drop(&mut self) {
+        if !self.cleaned {
+            let _ = self.child.force_cleanup();
+            self.cleaned = true;
+        }
+    }
+}
+
 struct LinuxChildBackendV1 {
     started_at: Instant,
     stdin_frame: Option<Vec<u8>>,
@@ -458,8 +552,10 @@ struct LinuxChildBackendV1 {
     pending_image: Option<PendingExecutableImageV1>,
     prepared_filesystem: Option<PreparedFilesystemContainmentV1>,
     active: Option<ActiveChildV1>,
+    serial_active: Option<ActiveSerialChildV1>,
     completion: Option<RealChildCompletionV1>,
     retained_residue: Option<RealChildOwnedResidueV1>,
+    serial_retained_residue: Option<RealSerialOwnedResidueV1>,
     retained_unstarted: Vec<PreparedChildLaunchV1>,
     os_spawn_count: usize,
     request_start_count: usize,
@@ -476,8 +572,10 @@ impl LinuxChildBackendV1 {
             pending_image: None,
             prepared_filesystem: None,
             active: None,
+            serial_active: None,
             completion: None,
             retained_residue: None,
+            serial_retained_residue: None,
             retained_unstarted: Vec::new(),
             os_spawn_count: 0,
             request_start_count: 0,
@@ -547,6 +645,15 @@ impl LinuxChildBackendV1 {
         self.retained_residue.take()
     }
 
+    fn take_serial_retained_residue(&mut self) -> Option<RealSerialOwnedResidueV1> {
+        self.serial_retained_residue.take()
+    }
+
+    #[cfg(test)]
+    fn active_pgid_for_test(&self) -> Option<i32> {
+        self.serial_active.as_ref().map(|child| child.pgid)
+    }
+
     fn active_for(&self, child: &OwnedChildTokenV1) -> Result<&ActiveChildV1, String> {
         if child.id() != CHILD_TOKEN_ID {
             return Err("unknown child ownership token".to_string());
@@ -564,6 +671,27 @@ impl LinuxChildBackendV1 {
             .as_mut()
             .ok_or_else(|| "owned child is not active".to_string())
     }
+
+    fn serial_active_for(&self, child: &OwnedChildTokenV1) -> Result<&ActiveSerialChildV1, String> {
+        if child.id() != CHILD_TOKEN_ID {
+            return Err("unknown serial child ownership token".to_string());
+        }
+        self.serial_active
+            .as_ref()
+            .ok_or_else(|| "owned serial child is not active".to_string())
+    }
+
+    fn serial_active_for_mut(
+        &mut self,
+        child: &OwnedChildTokenV1,
+    ) -> Result<&mut ActiveSerialChildV1, String> {
+        if child.id() != CHILD_TOKEN_ID {
+            return Err("unknown serial child ownership token".to_string());
+        }
+        self.serial_active
+            .as_mut()
+            .ok_or_else(|| "owned serial child is not active".to_string())
+    }
 }
 
 impl Drop for LinuxChildBackendV1 {
@@ -571,7 +699,13 @@ impl Drop for LinuxChildBackendV1 {
         if let Some(mut child) = self.active.take() {
             let _ = child.force_cleanup();
         }
+        if let Some(mut child) = self.serial_active.take() {
+            let _ = child.force_cleanup();
+        }
         if let Some(residue) = self.retained_residue.take() {
+            drop(residue);
+        }
+        if let Some(residue) = self.serial_retained_residue.take() {
             drop(residue);
         }
     }
@@ -651,7 +785,7 @@ impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
     }
 
     fn spawn(&mut self, launch: PreparedChildLaunchV1) -> Result<OwnedChildTokenV1, String> {
-        if self.active.is_some() || self.os_spawn_count != 0 {
+        if self.active.is_some() || self.serial_active.is_some() || self.os_spawn_count != 0 {
             return Err("backend permits exactly one OS spawn".to_string());
         }
         let prepared = self
@@ -660,6 +794,9 @@ impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
             .filter(|prepared| prepared.token_id == launch.containment_token().id())
             .ok_or_else(|| "launch has no matching prepared containment token".to_string())?;
         let launch = launch.into_os_launch();
+        if launch.request_policy() != ChildRequestPolicyV1::OneShot {
+            return Err("one-shot backend requires an authorized one-shot policy".to_string());
+        }
         let stdin_len = self.stdin_frame.as_ref().map_or(0, Vec::len);
         if stdin_len > launch.stdin_limit() || stdin_len > launch.frame_limit() {
             return Err("stdin frame exceeds its authorized byte limit".to_string());
@@ -675,9 +812,11 @@ impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
             }
         };
         if let Err(detail) = validate_owned_child_group(pgid) {
-            let _ = child.kill();
-            let _ = child.wait();
-            return Err(detail);
+            return Err(cleanup_spawn_failure(
+                &mut child,
+                pgid,
+                io::Error::other(detail),
+            ));
         }
         let (stdin, stdout, stderr) =
             match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
@@ -889,6 +1028,419 @@ impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
             cleaned: false,
         });
     }
+}
+
+impl SerialChildTransportEffectsV1 for LinuxChildBackendV1 {
+    fn monotonic_millis(&mut self) -> Result<u64, String> {
+        checked_duration_millis_v1(self.started_at.elapsed())
+    }
+
+    fn spawn_serial(&mut self, launch: PreparedChildLaunchV1) -> Result<OwnedChildTokenV1, String> {
+        if self.active.is_some() || self.serial_active.is_some() || self.os_spawn_count != 0 {
+            return Err("backend permits exactly one OS spawn".to_string());
+        }
+        let prepared = self
+            .prepared_filesystem
+            .take()
+            .filter(|prepared| prepared.token_id == launch.containment_token().id())
+            .ok_or_else(|| "launch has no matching prepared containment token".to_string())?;
+        let launch = launch.into_os_launch();
+        let ChildRequestPolicyV1::Serial {
+            max_frames,
+            idle_millis: _,
+        } = launch.request_policy()
+        else {
+            return Err("serial backend requires an authorized serial policy".to_string());
+        };
+        let mut child = spawn_child(&launch, prepared, self.containment_setup)?;
+        self.os_spawn_count += 1;
+        let pgid = match i32::try_from(child.id()) {
+            Ok(pgid) => pgid,
+            Err(_) => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err("child pid exceeds i32".to_string());
+            }
+        };
+        if let Err(detail) = validate_owned_child_group(pgid) {
+            return Err(cleanup_spawn_failure(
+                &mut child,
+                pgid,
+                io::Error::other(detail),
+            ));
+        }
+        let (stdin, stdout, stderr) =
+            match (child.stdin.take(), child.stdout.take(), child.stderr.take()) {
+                (Some(stdin), Some(stdout), Some(stderr)) => (stdin, stdout, stderr),
+                pipes => {
+                    drop(pipes);
+                    return Err(cleanup_spawn_failure(
+                        &mut child,
+                        pgid,
+                        io::Error::other("spawned serial child is missing an owned stdio pipe"),
+                    ));
+                }
+            };
+        if let Err(error) = set_nonblocking_stdio(&stdin, &stdout, &stderr) {
+            drop((stdin, stdout, stderr));
+            return Err(cleanup_spawn_failure(&mut child, pgid, error));
+        }
+        self.serial_active = Some(ActiveSerialChildV1 {
+            child,
+            pgid,
+            phase_budgets_millis: launch.phase_budgets_millis(),
+            stdin: Some(stdin),
+            stdout: Some(stdout),
+            stderr: Some(stderr),
+            pending_stdin: Vec::new(),
+            pending_stdin_offset: 0,
+            stdout_carry: Vec::new(),
+            io_limits: [
+                launch.stdin_limit(),
+                launch.stdout_limit(),
+                launch.stderr_limit(),
+                launch.frame_limit(),
+            ],
+            max_frames,
+            frame_count: 0,
+            stdin_accepted: 0,
+            stdout_accepted: 0,
+            stderr_accepted: 0,
+            exit_observed: false,
+            observed_exit_truth: None,
+            exit_status: None,
+        });
+        Ok(OwnedChildTokenV1::new(CHILD_TOKEN_ID))
+    }
+
+    fn startup_ready(&mut self, child: &OwnedChildTokenV1) -> Result<bool, String> {
+        self.serial_active_for(child)?;
+        Ok(true)
+    }
+
+    fn begin_frame(&mut self, child: &OwnedChildTokenV1, frame: &[u8]) -> Result<(), String> {
+        let next_request_count = self
+            .request_start_count
+            .checked_add(1)
+            .ok_or_else(|| "serial request count overflow".to_string())?;
+        let active = self.serial_active_for_mut(child)?;
+        if !active.pending_stdin.is_empty() || !active.stdout_carry.is_empty() {
+            return Err("serial backend already owns in-flight frame bytes".to_string());
+        }
+        if active.frame_count >= active.max_frames {
+            return Err("serial backend frame count is exhausted".to_string());
+        }
+        if frame.is_empty()
+            || frame.len() > active.io_limits[3]
+            || !frame.ends_with(b"\n")
+            || frame[..frame.len() - 1].contains(&b'\n')
+        {
+            return Err("serial frame violates its authorized line bound".to_string());
+        }
+        let next_stdin = active
+            .stdin_accepted
+            .checked_add(frame.len())
+            .ok_or_else(|| "serial stdin byte count overflow".to_string())?;
+        if next_stdin > active.io_limits[0] {
+            return Err("serial stdin exceeds its authorized cumulative limit".to_string());
+        }
+        active.pending_stdin.extend_from_slice(frame);
+        active.pending_stdin_offset = 0;
+        active.stdin_accepted = next_stdin;
+        self.request_start_count = next_request_count;
+        Ok(())
+    }
+
+    fn poll_frame(
+        &mut self,
+        child: &OwnedChildTokenV1,
+        allowance: SerialPollAllowanceV1,
+    ) -> Result<SerialFrameObservationV1, String> {
+        let active = self.serial_active_for_mut(child)?;
+        let exact_allowance = SerialPollAllowanceV1 {
+            stdin_bytes: active.io_limits[0].saturating_sub(active.stdin_accepted),
+            stdout_bytes: active.io_limits[1].saturating_sub(active.stdout_accepted),
+            stderr_bytes: active.io_limits[2].saturating_sub(active.stderr_accepted),
+            frame_bytes: active.io_limits[3],
+        };
+        if allowance != exact_allowance {
+            return Err("serial poll allowance diverged from the prepared policy".to_string());
+        }
+
+        let stdin_bytes_written = write_serial_pending(active)?;
+        let stdout = read_nonblocking_available(
+            active
+                .stdout
+                .as_mut()
+                .ok_or_else(|| "serial stdout is closed".to_string())?,
+            exact_allowance.stdout_bytes,
+        )?;
+        if stdout.overflow {
+            return Ok(SerialFrameObservationV1::limit_exceeded(
+                super::authority::ChildIoLimitV1::Stdout,
+            ));
+        }
+        let stderr = read_nonblocking_available(
+            active
+                .stderr
+                .as_mut()
+                .ok_or_else(|| "serial stderr is closed".to_string())?,
+            exact_allowance.stderr_bytes,
+        )?;
+        if stderr.overflow {
+            return Ok(SerialFrameObservationV1::limit_exceeded(
+                super::authority::ChildIoLimitV1::Stderr,
+            ));
+        }
+        active.stdout_accepted = active
+            .stdout_accepted
+            .checked_add(stdout.bytes.len())
+            .ok_or_else(|| "serial stdout byte count overflow".to_string())?;
+        active.stderr_accepted = active
+            .stderr_accepted
+            .checked_add(stderr.bytes.len())
+            .ok_or_else(|| "serial stderr byte count overflow".to_string())?;
+
+        let stdout_bytes_read = stdout.bytes.len();
+        let stderr_bytes_read = stderr.bytes.len();
+        let (response, extra_stdout_bytes) =
+            if let Some(newline) = stdout.bytes.iter().position(|byte| *byte == b'\n') {
+                let response_len = active
+                    .stdout_carry
+                    .len()
+                    .checked_add(newline + 1)
+                    .ok_or_else(|| "serial frame byte count overflow".to_string())?;
+                if response_len > active.io_limits[3] {
+                    return Ok(SerialFrameObservationV1::limit_exceeded(
+                        super::authority::ChildIoLimitV1::Frame,
+                    ));
+                }
+                let extra = stdout.bytes.len() - newline - 1;
+                let mut response = std::mem::take(&mut active.stdout_carry);
+                response.extend_from_slice(&stdout.bytes[..=newline]);
+                active.frame_count = active
+                    .frame_count
+                    .checked_add(1)
+                    .ok_or_else(|| "serial frame count overflow".to_string())?;
+                (Some(response), extra)
+            } else {
+                let carry_len = active
+                    .stdout_carry
+                    .len()
+                    .checked_add(stdout.bytes.len())
+                    .ok_or_else(|| "serial frame byte count overflow".to_string())?;
+                if carry_len > active.io_limits[3] {
+                    return Ok(SerialFrameObservationV1::limit_exceeded(
+                        super::authority::ChildIoLimitV1::Frame,
+                    ));
+                }
+                active.stdout_carry.extend_from_slice(&stdout.bytes);
+                (None, 0)
+            };
+        active.observe_child_exit()?;
+        let exit = active.observed_exit_truth;
+        Ok(SerialFrameObservationV1::from_backend(
+            SerialIoProgressV1 {
+                stdin_bytes_written,
+                stdout_bytes_read,
+                stderr_bytes_read,
+            },
+            SerialOutputStatusV1 {
+                response,
+                extra_stdout_bytes,
+                stdout_eof: stdout.eof,
+                stderr_eof: stderr.eof,
+                exit,
+            },
+        ))
+    }
+
+    fn begin_drain(
+        &mut self,
+        child: &OwnedChildTokenV1,
+        _: SerialChildCauseV1,
+    ) -> Result<(), String> {
+        let active = self.serial_active_for_mut(child)?;
+        active.stdin.take();
+        active.pending_stdin.clear();
+        active.pending_stdin_offset = 0;
+        Ok(())
+    }
+
+    fn drain_complete(&mut self, child: &OwnedChildTokenV1) -> Result<bool, String> {
+        let active = self.serial_active_for_mut(child)?;
+        active.observe_child_exit()?;
+        Ok(active.exit_observed)
+    }
+
+    fn terminate_process_group(&mut self, child: &OwnedChildTokenV1) -> Result<(), String> {
+        let active = self.serial_active_for(child)?;
+        if active.exit_status.is_some() {
+            return Err("refusing group signal after direct-child reap".to_string());
+        }
+        signal_process_group(active.pgid, libc::SIGKILL)
+    }
+
+    fn process_group_terminated(&mut self, child: &OwnedChildTokenV1) -> Result<bool, String> {
+        let active = self.serial_active_for_mut(child)?;
+        active.observe_child_exit()?;
+        if !active.exit_observed {
+            return Ok(false);
+        }
+        if active.exit_status.is_none() {
+            active.exit_status = active.child.try_wait().map_err(|error| error.to_string())?;
+        }
+        Ok(active.exit_status.is_some() && process_group_is_gone(active.pgid))
+    }
+
+    fn poll_reap(&mut self, child: OwnedChildTokenV1) -> ChildReapPollV1 {
+        if child.id() != CHILD_TOKEN_ID {
+            return ChildReapPollV1::Failed {
+                child,
+                detail: "unknown serial child ownership token".to_string(),
+            };
+        }
+        let Some(active) = self.serial_active.as_mut() else {
+            return ChildReapPollV1::Failed {
+                child,
+                detail: "owned serial child is not active".to_string(),
+            };
+        };
+        if let Err(detail) = active.observe_child_exit() {
+            return ChildReapPollV1::Failed { child, detail };
+        }
+        if !active.exit_observed {
+            return ChildReapPollV1::Pending(child);
+        }
+        if active.exit_status.is_none() {
+            match active.child.try_wait() {
+                Ok(Some(status)) => active.exit_status = Some(status),
+                Ok(None) => return ChildReapPollV1::Pending(child),
+                Err(error) => {
+                    return ChildReapPollV1::Failed {
+                        child,
+                        detail: error.to_string(),
+                    }
+                }
+            }
+        }
+        if !process_group_is_gone(active.pgid) {
+            return ChildReapPollV1::Pending(child);
+        }
+        let mut active = self.serial_active.take().expect("checked serial child");
+        active.stdin.take();
+        active.stdout.take();
+        active.stderr.take();
+        ChildReapPollV1::Reaped(exit_truth(
+            active.exit_status.expect("checked serial exit status"),
+        ))
+    }
+
+    fn retain_unstarted_launch(&mut self, launch: PreparedChildLaunchV1) {
+        self.retained_unstarted.push(launch);
+    }
+
+    fn retain_owned_residue(&mut self, residue: SerialOwnedChildResidueV1) {
+        assert_eq!(residue.child_id(), CHILD_TOKEN_ID);
+        let child = self
+            .serial_active
+            .take()
+            .expect("a serial residue corresponds to one active OS child");
+        assert!(
+            self.serial_retained_residue.is_none(),
+            "only one serial residue is owned"
+        );
+        self.serial_retained_residue = Some(RealSerialOwnedResidueV1 {
+            _transport_residue: residue,
+            child,
+            cleaned: false,
+        });
+    }
+}
+
+struct NonblockingReadV1 {
+    bytes: Vec<u8>,
+    eof: bool,
+    overflow: bool,
+}
+
+fn set_nonblocking_stdio(
+    stdin: &ChildStdin,
+    stdout: &ChildStdout,
+    stderr: &ChildStderr,
+) -> io::Result<()> {
+    for fd in [stdin.as_raw_fd(), stdout.as_raw_fd(), stderr.as_raw_fd()] {
+        // SAFETY: each fd is live and uniquely owned by the active child state.
+        let flags = unsafe { libc::fcntl(fd, libc::F_GETFL) };
+        if flags < 0 {
+            return Err(io::Error::last_os_error());
+        }
+        // SAFETY: F_SETFL updates only the status flags of the same live fd.
+        if unsafe { libc::fcntl(fd, libc::F_SETFL, flags | libc::O_NONBLOCK) } != 0 {
+            return Err(io::Error::last_os_error());
+        }
+    }
+    Ok(())
+}
+
+fn write_serial_pending(active: &mut ActiveSerialChildV1) -> Result<usize, String> {
+    if active.pending_stdin_offset == active.pending_stdin.len() {
+        active.pending_stdin.clear();
+        active.pending_stdin_offset = 0;
+        return Ok(0);
+    }
+    let stdin = active
+        .stdin
+        .as_mut()
+        .ok_or_else(|| "serial stdin is closed".to_string())?;
+    match stdin.write(&active.pending_stdin[active.pending_stdin_offset..]) {
+        Ok(written) => {
+            active.pending_stdin_offset += written;
+            if active.pending_stdin_offset == active.pending_stdin.len() {
+                active.pending_stdin.clear();
+                active.pending_stdin_offset = 0;
+            }
+            Ok(written)
+        }
+        Err(error) if error.kind() == io::ErrorKind::WouldBlock => Ok(0),
+        Err(error) if error.kind() == io::ErrorKind::Interrupted => Ok(0),
+        Err(error) => Err(error.to_string()),
+    }
+}
+
+fn read_nonblocking_available<R: Read>(
+    reader: &mut R,
+    remaining: usize,
+) -> Result<NonblockingReadV1, String> {
+    let detect_limit = remaining.saturating_add(1);
+    let mut bytes = Vec::with_capacity(detect_limit.min(PIPE_CHUNK_BYTES));
+    let mut eof = false;
+    for _ in 0..64 {
+        if bytes.len() == detect_limit {
+            break;
+        }
+        let mut buffer = [0_u8; PIPE_CHUNK_BYTES];
+        let read_cap = (detect_limit - bytes.len()).min(buffer.len());
+        match reader.read(&mut buffer[..read_cap]) {
+            Ok(0) => {
+                eof = true;
+                break;
+            }
+            Ok(read) => bytes.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => break,
+            Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+            Err(error) => return Err(error.to_string()),
+        }
+    }
+    let overflow = bytes.len() > remaining;
+    if overflow {
+        bytes.truncate(remaining);
+    }
+    Ok(NonblockingReadV1 {
+        bytes,
+        eof,
+        overflow,
+    })
 }
 
 fn cleanup_spawn_failure(child: &mut Child, pgid: i32, error: io::Error) -> String {
@@ -1468,6 +2020,10 @@ fn process_group_is_gone(pgid: i32) -> bool {
 }
 
 fn child_exit_is_observable(child_pid: u32) -> Result<bool, String> {
+    child_exit_observation(child_pid).map(|exit| exit.is_some())
+}
+
+fn child_exit_observation(child_pid: u32) -> Result<Option<ChildExitTruthV1>, String> {
     let mut information = MaybeUninit::<libc::siginfo_t>::zeroed();
     // SAFETY: waitid writes one siginfo_t, WNOWAIT preserves the direct-child
     // wait right, and the pid comes from the owned Child handle.
@@ -1484,7 +2040,16 @@ fn child_exit_is_observable(child_pid: u32) -> Result<bool, String> {
     }
     // SAFETY: successful waitid initializes the supplied siginfo_t. A zero
     // si_pid is the specified WNOHANG result when no child is waitable.
-    Ok(unsafe { information.assume_init().si_pid() } != 0)
+    let information = unsafe { information.assume_init() };
+    if unsafe { information.si_pid() } == 0 {
+        return Ok(None);
+    }
+    let truth = if information.si_code == libc::CLD_EXITED {
+        ChildExitTruthV1::Exited(unsafe { information.si_status() })
+    } else {
+        ChildExitTruthV1::Signalled
+    };
+    Ok(Some(truth))
 }
 
 fn checked_duration_millis_v1(duration: Duration) -> Result<u64, String> {
@@ -1764,10 +2329,14 @@ mod tests {
         ChildEnvironmentVariableV1, ChildFilesystemAccessV1, ChildFilesystemGrantV1,
         ChildFilesystemPolicyV1, ChildIoLimitsV1, ChildLaunchAdmissionErrorV1,
         ChildLaunchAuthorityDecisionV1, ChildLaunchModeV1, ChildLaunchRequestV1,
-        ChildNetworkPolicyV1, ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRuntimePolicyV1,
-        ChildTimeoutDispositionV1, PreparedChildLaunchV1,
+        ChildNetworkPolicyV1, ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRequestPolicyV1,
+        ChildRuntimePolicyV1, ChildTimeoutDispositionV1, PreparedChildLaunchV1,
     };
     use crate::external::lifecycle::ChildExitTruthV1;
+    use crate::external::serial::{
+        SerialChildCauseV1, SerialChildTransportFailureV1, SerialChildTransportStateV1,
+        SerialChildTransportV1,
+    };
     use crate::external::supervisor::{
         ChildPhaseSupervisorFailureV1, ChildPhaseSupervisorStateV1, ChildPhaseSupervisorV1,
         ChildSupervisorCauseV1,
@@ -1866,6 +2435,36 @@ mod tests {
         )
     }
 
+    fn serial_runtime_policy(
+        limits: TestLimits,
+        environment: Vec<ChildEnvironmentVariableV1>,
+        filesystem: ChildFilesystemPolicyV1,
+        max_frames: u16,
+        idle_millis: u64,
+    ) -> ChildRuntimePolicyV1 {
+        ChildRuntimePolicyV1::new(
+            ChildPhaseBudgetsV1::new(
+                limits.startup_millis,
+                limits.request_millis,
+                limits.drain_millis,
+                limits.kill_millis,
+                limits.reap_millis,
+            ),
+            ChildIoLimitsV1::new(
+                limits.stdin_bytes,
+                limits.stdout_bytes,
+                limits.stderr_bytes,
+                limits.stdin_bytes.min(limits.stdout_bytes),
+            ),
+            ChildProcessGroupPolicyV1::Owned,
+            ChildEnvironmentPolicyV1::new(true, environment),
+            filesystem,
+            ChildNetworkPolicyV1::Deny,
+            ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
+        )
+        .with_request_policy(ChildRequestPolicyV1::serial(max_frames, idle_millis))
+    }
+
     fn confined_filesystem_policy(
         cwd: &Path,
         mut grants: Vec<ChildFilesystemGrantV1>,
@@ -1940,6 +2539,142 @@ mod tests {
             ChildLaunchAuthorityDecisionV1::Admit(&authority),
             backend,
         )
+    }
+
+    fn prepared_serial_program(
+        cwd: &Path,
+        executable: &Path,
+        arguments: Vec<String>,
+        limits: TestLimits,
+        max_frames: u16,
+        idle_millis: u64,
+    ) -> (PreparedChildLaunchV1, LinuxChildBackendV1) {
+        let filesystem = confined_filesystem_policy(cwd, Vec::new());
+        let policy = serial_runtime_policy(
+            limits,
+            vec![ChildEnvironmentVariableV1::new("LC_ALL", "C")],
+            filesystem,
+            max_frames,
+            idle_millis,
+        );
+        let request = ChildLaunchRequestV1::new(
+            1,
+            ChildLaunchModeV1::Enabled,
+            executable,
+            digest_hex(executable),
+            arguments.clone(),
+            cwd,
+            policy.clone(),
+        );
+        let authority =
+            AuthorityProfileV1::exact(executable, digest_hex(executable), arguments, cwd, policy)
+                .unwrap();
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let prepared = prepare_child_launch_request_v1(
+            request,
+            ChildLaunchAuthorityDecisionV1::Admit(&authority),
+            &mut backend,
+        )
+        .unwrap();
+        (prepared, backend)
+    }
+
+    fn start_real_serial(transport: &mut SerialChildTransportV1<'_, LinuxChildBackendV1>) {
+        transport.start().unwrap();
+        let wall_deadline = Instant::now() + Duration::from_secs(5);
+        while !matches!(transport.state(), SerialChildTransportStateV1::Idle { .. }) {
+            assert!(
+                Instant::now() < wall_deadline,
+                "serial startup hung: {:?}",
+                transport.state()
+            );
+            transport.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn poll_real_serial_response(
+        transport: &mut SerialChildTransportV1<'_, LinuxChildBackendV1>,
+    ) -> Vec<u8> {
+        let wall_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < wall_deadline,
+                "serial response hung: {:?}",
+                transport.state()
+            );
+            match transport.state() {
+                SerialChildTransportStateV1::FrameInFlight { .. } => {
+                    transport.poll().unwrap();
+                }
+                SerialChildTransportStateV1::ResponseReady { .. } => {
+                    return transport.take_response().unwrap()
+                }
+                state => panic!("serial response failed: {state:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn finish_real_serial(
+        transport: &mut SerialChildTransportV1<'_, LinuxChildBackendV1>,
+        cause: SerialChildCauseV1,
+    ) -> SerialChildTransportStateV1 {
+        match cause {
+            SerialChildCauseV1::Cancel => {
+                transport.cancel().unwrap();
+            }
+            SerialChildCauseV1::Shutdown => {
+                transport.shutdown().unwrap();
+            }
+            _ => unreachable!("fixture uses an explicit host stop cause"),
+        }
+        let wall_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < wall_deadline,
+                "serial cleanup hung: {:?}",
+                transport.state()
+            );
+            match transport.state() {
+                SerialChildTransportStateV1::Draining { .. }
+                | SerialChildTransportStateV1::Killing { .. }
+                | SerialChildTransportStateV1::Reaping { .. } => {
+                    transport.poll().unwrap();
+                }
+                SerialChildTransportStateV1::Stopped { .. }
+                | SerialChildTransportStateV1::Failed(_) => return transport.state().clone(),
+                state => panic!("unexpected serial cleanup state: {state:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn drive_real_serial_failure(
+        transport: &mut SerialChildTransportV1<'_, LinuxChildBackendV1>,
+    ) -> SerialChildTransportStateV1 {
+        let wall_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            assert!(
+                Instant::now() < wall_deadline,
+                "serial failure cleanup hung: {:?}",
+                transport.state()
+            );
+            match transport.state() {
+                SerialChildTransportStateV1::FrameInFlight { .. }
+                | SerialChildTransportStateV1::Draining { .. }
+                | SerialChildTransportStateV1::Killing { .. }
+                | SerialChildTransportStateV1::Reaping { .. } => {
+                    transport.poll().unwrap();
+                }
+                SerialChildTransportStateV1::Failed(_) => return transport.state().clone(),
+                SerialChildTransportStateV1::ResponseReady { .. } => {
+                    panic!("EOF/crash/idle became response success")
+                }
+                state => panic!("unexpected serial failure state: {state:?}"),
+            }
+            std::thread::sleep(Duration::from_millis(1));
+        }
     }
 
     fn drive_one_shot(
@@ -2807,6 +3542,198 @@ mod tests {
         assert!(backend.pending_image.is_none());
         assert_eq!(backend.prepared_containment_count_for_test(), 0);
         assert_eq!(backend.os_spawn_count(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_serial_transport_reuses_one_sealed_child_for_three_frames() {
+        let cwd = tempfile::tempdir().unwrap();
+        let executable = Path::new("/usr/bin/bash");
+        let arguments = vec![
+            "--noprofile".to_string(),
+            "--norc".to_string(),
+            "-c".to_string(),
+            "while IFS= read -r line; do printf '%s\\n' \"$line\"; done".to_string(),
+        ];
+        let (prepared, mut backend) = prepared_serial_program(
+            cwd.path(),
+            executable,
+            arguments,
+            TestLimits::default(),
+            3,
+            250,
+        );
+        {
+            let mut transport = SerialChildTransportV1::new(prepared, &mut backend);
+            start_real_serial(&mut transport);
+            let pgid = transport
+                .effects_for_test()
+                .active_pgid_for_test()
+                .expect("one child group");
+            for frame in [b"one\n".to_vec(), b"two\n".to_vec(), b"three\n".to_vec()] {
+                transport.begin_frame(frame.clone()).unwrap();
+                assert_eq!(poll_real_serial_response(&mut transport), frame);
+                assert_eq!(
+                    transport.effects_for_test().active_pgid_for_test(),
+                    Some(pgid)
+                );
+            }
+            assert!(matches!(
+                finish_real_serial(&mut transport, SerialChildCauseV1::Shutdown),
+                SerialChildTransportStateV1::Stopped {
+                    cause: SerialChildCauseV1::Shutdown,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(backend.os_spawn_count(), 1);
+        assert_eq!(backend.request_start_count(), 3);
+        assert!(backend.take_serial_retained_residue().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_serial_partial_line_hits_idle_timeout_and_reaps_without_response() {
+        let cwd = tempfile::tempdir().unwrap();
+        let executable = Path::new("/usr/bin/bash");
+        let arguments = vec![
+            "--noprofile".to_string(),
+            "--norc".to_string(),
+            "-c".to_string(),
+            "IFS= read -r line; printf partial; IFS= read -r blocked".to_string(),
+        ];
+        let limits = TestLimits {
+            request_millis: 500,
+            ..TestLimits::default()
+        };
+        let (prepared, mut backend) =
+            prepared_serial_program(cwd.path(), executable, arguments, limits, 2, 20);
+        let terminal;
+        {
+            let mut transport = SerialChildTransportV1::new(prepared, &mut backend);
+            start_real_serial(&mut transport);
+            transport.begin_frame(b"request\n".to_vec()).unwrap();
+            terminal = drive_real_serial_failure(&mut transport);
+        }
+        assert!(matches!(
+            terminal,
+            SerialChildTransportStateV1::Failed(SerialChildTransportFailureV1::Transport {
+                cause: SerialChildCauseV1::IdleTimeout,
+                ..
+            })
+        ));
+        assert_eq!(backend.os_spawn_count(), 1);
+        assert!(backend.take_serial_retained_residue().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_serial_eof_and_crash_after_line_are_never_response_success() {
+        let cases = [
+            ("IFS= read -r line; exit 0", SerialChildCauseV1::Eof),
+            (
+                "IFS= read -r line; printf 'not-success\\n'; exit 17",
+                SerialChildCauseV1::Crash,
+            ),
+        ];
+        for (script, expected_cause) in cases {
+            let cwd = tempfile::tempdir().unwrap();
+            let executable = Path::new("/usr/bin/bash");
+            let arguments = vec![
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-c".to_string(),
+                script.to_string(),
+            ];
+            let (prepared, mut backend) = prepared_serial_program(
+                cwd.path(),
+                executable,
+                arguments,
+                TestLimits::default(),
+                2,
+                250,
+            );
+            let terminal;
+            {
+                let mut transport = SerialChildTransportV1::new(prepared, &mut backend);
+                start_real_serial(&mut transport);
+                transport.begin_frame(b"request\n".to_vec()).unwrap();
+                terminal = drive_real_serial_failure(&mut transport);
+            }
+            assert!(
+                matches!(
+                    terminal,
+                    SerialChildTransportStateV1::Failed(
+                        SerialChildTransportFailureV1::Transport { cause, .. }
+                    ) if cause == expected_cause
+                ),
+                "script={script:?}, expected={expected_cause:?}, terminal={terminal:?}"
+            );
+            assert_eq!(backend.os_spawn_count(), 1);
+            assert!(backend.take_serial_retained_residue().is_none());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_serial_cancel_and_shutdown_reap_the_owned_descendant_group() {
+        for cause in [SerialChildCauseV1::Cancel, SerialChildCauseV1::Shutdown] {
+            let cwd = tempfile::tempdir().unwrap();
+            let marker = cwd.path().join("serial-descendant-pids");
+            let executable = Path::new("/usr/bin/bash");
+            let arguments = vec![
+                "--noprofile".to_string(),
+                "--norc".to_string(),
+                "-c".to_string(),
+                "sleep 30 & descendant=$!; printf '%s %s\\n' \"$$\" \"$descendant\" > \"$1\"; wait"
+                    .to_string(),
+                "kitsu-serial-fixture".to_string(),
+                marker.to_string_lossy().into_owned(),
+            ];
+            let (prepared, mut backend) = prepared_serial_program(
+                cwd.path(),
+                executable,
+                arguments,
+                TestLimits::default(),
+                2,
+                250,
+            );
+            {
+                let mut transport = SerialChildTransportV1::new(prepared, &mut backend);
+                start_real_serial(&mut transport);
+                let wall_deadline = Instant::now() + Duration::from_secs(5);
+                while !marker.exists() {
+                    assert!(Instant::now() < wall_deadline, "descendant marker missing");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                assert!(matches!(
+                    finish_real_serial(&mut transport, cause),
+                    SerialChildTransportStateV1::Stopped {
+                        cause: observed,
+                        ..
+                    } if observed == cause
+                ));
+            }
+            let pids = std::fs::read_to_string(&marker).unwrap();
+            let mut pids = pids
+                .split_whitespace()
+                .map(|value| value.parse::<i32>().unwrap());
+            let pgid = pids.next().unwrap();
+            let descendant = pids.next().unwrap();
+            assert!(
+                process_group_is_gone(pgid),
+                "group {pgid} survived {cause:?}"
+            );
+            assert!(
+                process_is_gone(descendant),
+                "descendant {descendant} survived {cause:?}"
+            );
+            assert!(backend.take_serial_retained_residue().is_none());
+        }
     }
 
     #[test]
