@@ -718,6 +718,7 @@ gates merely because a card appears attractive.
 | 107 | E06-S02-C3 | Publish complete validated external inventories through exact source-lifetime/revision fences with atomic successor, replacement, and withdrawal truth |
 | 108 | E06-S01-C3 | Bind exact bounded phase, I/O, process-group, environment, network, and timeout/reap policy into request, host authority, and prepared child identity |
 | 109 | E08-S05-C2 | Retain reported/missing provider-response coverage and cached-token presence per fixed request purpose, then adapt it without inventing missing telemetry |
+| 110 | E08-S05-C3 | Render only typed current-session facts through adaptive wide/stacked/narrow and stable redirected/plain/no-color/screen-reader decks |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -954,6 +955,15 @@ retained even if the stream later fails. Cached prompt tokens preserve explicit
 zero versus absence. Fixed all/inference/compaction/model-catalog buckets feed a
 pure session-usage adapter, but catalog remains unpopulated and no slash command,
 renderer, JSONL field, persistence, cost, or account lookup is mounted.
+Cycle 110 adds a private, presentation-only renderer for the typed status,
+context, and current-session usage snapshot. Styled output uses bounded wide,
+stacked, and narrow layouts; tiny one-cell terminals and double-width Unicode
+remain width-safe. Redirected, plain, no-color, and screen-reader destinations
+share one stable escape-free projection independent of terminal width. Every
+rendered value retains truth/provenance, unavailable facts stay explicit, and
+cost appears only when already provider-reported. Snapshot collection, slash
+routing, JSONL, persistence/history, provider/account/MCP calls, credits, rate
+limits, and inferred pricing remain absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
