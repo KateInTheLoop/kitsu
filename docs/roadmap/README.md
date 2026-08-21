@@ -710,6 +710,7 @@ gates merely because a card appears attractive.
 | 099 | E03-S02-C40 | Mount durable startup resume on the pinned bound-current route with explicit canonical refusal |
 | 100 | E03-S02-C41 | Stage an exact bound-current in-process target and swap the active owner only after every fallible precommit step |
 | 101 | E06-S02-C1 | Freeze one non-cloneable request inventory that owns exact descriptor order and immutable handler identities through provider response execution |
+| 102 | E06-S01-C1 | Admit one exact versioned child identity and containment preflight only after disabled, denied, malformed, and authority-mismatched requests fail without host effects |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -881,6 +882,13 @@ calls, and output-offload eligibility all resolve through that same owned,
 non-cloneable inventory until the response is complete. Descriptor-free and
 static-registry behavior remain byte-compatible. This foundation introduces no
 external tool source, child process, MCP configuration, or product route.
+Cycle 102 adds the private, provider-free admission half of the future bounded
+child owner. A host-authored profile must exactly match version, normalized
+absolute executable and working directory, lowercase SHA-256 identity, and
+bounded literal argv before executable canonicalization, hashing, or
+containment preflight may occur. Disabled and denied entries fail first. The
+prepared result remains unspawned: there is no process API, configuration
+surface, runtime composition, or new product authority in this cycle.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
