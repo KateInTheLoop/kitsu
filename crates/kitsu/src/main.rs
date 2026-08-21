@@ -14375,16 +14375,25 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )));
         }
     }
-    let mut session_store = if durable_session {
-        Some(match resumed.as_ref() {
-            Some(saved) => session::ActiveSessionStore::from_saved(sessions_dir.clone(), saved)
-                .map_err(CliError::user)?,
-            None => {
-                session::ActiveSessionStore::create(sessions_dir.clone()).map_err(CliError::user)?
+    let (mut session_store, resumed) = if durable_session {
+        match resumed {
+            Some(saved) => {
+                let handoff =
+                    session::ActiveSessionStore::resume_current_v1(sessions_dir.clone(), saved)
+                        .map_err(CliError::user)?;
+                let (store, saved) = handoff.into_parts();
+                (Some(store), Some(saved))
             }
-        })
+            None => (
+                Some(
+                    session::ActiveSessionStore::create(sessions_dir.clone())
+                        .map_err(CliError::user)?,
+                ),
+                None,
+            ),
+        }
     } else {
-        None
+        (None, resumed)
     };
     if let Some(requested_name) = session_name {
         let Some(store) = session_store.as_mut() else {
@@ -16554,12 +16563,17 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     report_write_checkpoints(write_journal.drain_and_take_reports().await);
-                    let resumed_store = if no_session {
-                        None
+                    let (resumed_store, saved) = if no_session {
+                        (None, saved)
                     } else {
-                        match session::ActiveSessionStore::from_saved(sessions_dir.clone(), &saved)
-                        {
-                            Ok(store) => Some(store),
+                        match session::ActiveSessionStore::resume_current_v1(
+                            sessions_dir.clone(),
+                            saved,
+                        ) {
+                            Ok(handoff) => {
+                                let (store, saved) = handoff.into_parts();
+                                (Some(store), saved)
+                            }
                             Err(error) => {
                                 eprintln!("cannot autosave resumed session: {error}");
                                 continue;
