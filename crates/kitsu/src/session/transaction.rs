@@ -16,7 +16,8 @@ use super::canonical::CanonicalToolRoundV1;
 use super::canonical::{
     append_complete_operation, decode_canonical_payload_classified, encode_canonical_payload,
     prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalPayloadDecodeErrorV1,
-    CanonicalSessionRevisionV1, ImmutableArtifactRefV1, LOGICAL_SCHEMA_V1,
+    CanonicalRecoverySkipV1, CanonicalSessionRevisionV1, ImmutableArtifactRefV1,
+    LOGICAL_SCHEMA_REVISION,
 };
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
@@ -289,10 +290,42 @@ enum CanonicalRecoveryPlanV1 {
         selected_state: SessionLookupState,
         recovery: RevisionId,
         recovery_head: kitsu_core::session::LogicalHead,
+        skipped: Vec<CanonicalRecoverySkipV1>,
     },
     Unavailable {
         selected: Option<RevisionId>,
         selected_state: SessionLookupState,
+        skipped: Vec<CanonicalRecoverySkipV1>,
+        blocker: CanonicalRecoveryBlockerV1,
+    },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum CanonicalRecoveryBlockerV1 {
+    SelectedState,
+    ExhaustedAtRoot {
+        revision: RevisionId,
+    },
+    MissingParentDigest {
+        child: RevisionId,
+    },
+    AncestorState {
+        revision: RevisionId,
+        state: SessionLookupState,
+    },
+    ManifestDigestMismatch {
+        revision: RevisionId,
+    },
+    UnsupportedLogicalManifest {
+        revision: RevisionId,
+        observed: u32,
+        supported: u32,
+    },
+    Cycle {
+        revision: RevisionId,
+    },
+    Limit {
+        max_revisions: usize,
     },
 }
 
@@ -531,6 +564,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: error.observed_revision(),
                     selected_state: error.lookup_state(session_id),
+                    skipped: Vec::new(),
+                    blocker: CanonicalRecoveryBlockerV1::SelectedState,
                 };
             }
         };
@@ -553,12 +588,23 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             Err(error) => CanonicalHeadReadErrorV1::from_physical_revision(selected.clone(), error),
         };
         let selected_state = selected_error.lookup_state(session_id);
+        let mut skipped = Vec::new();
+        if let SessionLookupState::Corrupt {
+            observed_revision: Some(revision),
+            reason,
+            ..
+        } = &selected_state
+        {
+            skipped.push(CanonicalRecoverySkipV1::new(revision.clone(), *reason));
+        }
         if matches!(selected_state, SessionLookupState::Unsupported { .. })
-            || selected_head.manifest().logical_schema_revision() != LOGICAL_SCHEMA_V1
+            || selected_head.manifest().logical_schema_revision() != LOGICAL_SCHEMA_REVISION
         {
             return CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(selected),
                 selected_state,
+                skipped,
+                blocker: CanonicalRecoveryBlockerV1::SelectedState,
             };
         }
 
@@ -572,26 +618,43 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             .map(|digest| digest.as_str().to_string());
         let mut seen = HashSet::new();
         seen.insert(selected.clone());
+        let mut frontier = selected.clone();
 
         loop {
             let ExpectedRevision::Exact(parent_revision) = parent else {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: Some(selected),
                     selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::ExhaustedAtRoot { revision: frontier },
                 };
             };
-            if seen.len() >= MAX_CANONICAL_LINEAGE_REVISIONS
-                || !seen.insert(parent_revision.clone())
-            {
+            if seen.len() >= MAX_CANONICAL_LINEAGE_REVISIONS {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: Some(selected),
                     selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::Limit {
+                        max_revisions: MAX_CANONICAL_LINEAGE_REVISIONS,
+                    },
+                };
+            }
+            if !seen.insert(parent_revision.clone()) {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::Cycle {
+                        revision: parent_revision,
+                    },
                 };
             }
             let Some(expected_manifest_sha256) = parent_manifest_sha256.as_deref() else {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: Some(selected),
                     selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::MissingParentDigest { child: frontier },
                 };
             };
             let envelope = match self
@@ -599,50 +662,103 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 .open_revision_envelope(session_id, &parent_revision)
             {
                 Ok(envelope) => envelope,
-                Err(_) => {
+                Err(error) => {
+                    let state = CanonicalHeadReadErrorV1::from_physical_revision(
+                        parent_revision.clone(),
+                        error,
+                    )
+                    .lookup_state(session_id);
                     return CanonicalRecoveryPlanV1::Unavailable {
                         selected: Some(selected),
                         selected_state,
+                        skipped,
+                        blocker: CanonicalRecoveryBlockerV1::AncestorState {
+                            revision: parent_revision,
+                            state,
+                        },
                     };
                 }
             };
-            if envelope.manifest_sha256().as_str() != expected_manifest_sha256
-                || envelope.manifest().logical_schema_revision() != LOGICAL_SCHEMA_V1
-            {
+            if envelope.manifest_sha256().as_str() != expected_manifest_sha256 {
                 return CanonicalRecoveryPlanV1::Unavailable {
                     selected: Some(selected),
                     selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::ManifestDigestMismatch {
+                        revision: parent_revision,
+                    },
+                };
+            }
+            let observed_schema = envelope.manifest().logical_schema_revision();
+            if observed_schema != LOGICAL_SCHEMA_REVISION {
+                return CanonicalRecoveryPlanV1::Unavailable {
+                    selected: Some(selected),
+                    selected_state,
+                    skipped,
+                    blocker: CanonicalRecoveryBlockerV1::UnsupportedLogicalManifest {
+                        revision: parent_revision,
+                        observed: observed_schema,
+                        supported: LOGICAL_SCHEMA_REVISION,
+                    },
                 };
             }
 
-            if let Ok(candidate) = self.store.verify_revision_candidate(&envelope) {
-                match self.decode_canonical_candidate(
-                    session_id,
-                    parent_revision.clone(),
-                    &candidate,
-                ) {
-                    Ok(verified) => {
-                        return CanonicalRecoveryPlanV1::Available {
-                            selected,
-                            selected_state,
-                            recovery: parent_revision,
-                            recovery_head: verified.payload.selected_head().clone(),
-                        };
+            let candidate = match self.store.verify_revision_candidate(&envelope) {
+                Ok(candidate) => candidate,
+                Err(error) => {
+                    let state = CanonicalHeadReadErrorV1::from_physical_revision(
+                        parent_revision.clone(),
+                        error,
+                    )
+                    .lookup_state(session_id);
+                    if let SessionLookupState::Corrupt { reason, .. } = state {
+                        skipped.push(CanonicalRecoverySkipV1::new(
+                            parent_revision.clone(),
+                            reason,
+                        ));
                     }
-                    Err(error)
-                        if matches!(
-                            error.lookup_state(session_id),
-                            SessionLookupState::Unsupported { .. }
-                        ) =>
-                    {
+                    frontier = parent_revision;
+                    parent = envelope.manifest().parent_revision().clone();
+                    parent_manifest_sha256 = envelope
+                        .manifest()
+                        .parent_manifest_sha256()
+                        .map(|digest| digest.as_str().to_string());
+                    continue;
+                }
+            };
+            match self.decode_canonical_candidate(session_id, parent_revision.clone(), &candidate) {
+                Ok(verified) => {
+                    return CanonicalRecoveryPlanV1::Available {
+                        selected,
+                        selected_state,
+                        recovery: parent_revision,
+                        recovery_head: verified.payload.selected_head().clone(),
+                        skipped,
+                    };
+                }
+                Err(error) => {
+                    let state = error.lookup_state(session_id);
+                    if matches!(state, SessionLookupState::Unsupported { .. }) {
                         return CanonicalRecoveryPlanV1::Unavailable {
                             selected: Some(selected),
                             selected_state,
+                            skipped,
+                            blocker: CanonicalRecoveryBlockerV1::AncestorState {
+                                revision: parent_revision,
+                                state,
+                            },
                         };
                     }
-                    Err(_) => {}
+                    let SessionLookupState::Corrupt { reason, .. } = state else {
+                        unreachable!("canonical candidate errors are corrupt or unsupported")
+                    };
+                    skipped.push(CanonicalRecoverySkipV1::new(
+                        parent_revision.clone(),
+                        reason,
+                    ));
                 }
             }
+            frontier = parent_revision;
             parent = envelope.manifest().parent_revision().clone();
             parent_manifest_sha256 = envelope
                 .manifest()
@@ -1186,7 +1302,7 @@ mod tests {
             })
             .collect::<Vec<_>>();
         let value = serde_json::json!({
-            "logical_schema": 1,
+            "logical_schema": 2,
             "store_id": store,
             "session_id": session,
             "revision_id": revision,
@@ -1204,7 +1320,8 @@ mod tests {
             "operations": operations,
             "selected_head": {"kind":"turn","turn":format!("turn-{turns}")},
             "artifact_manifest": [],
-            "compaction_binding": null
+            "compaction_binding": null,
+            "recovery_log": []
         });
         crate::session::canonical::decode_canonical_payload(&serde_json::to_vec(&value).unwrap())
             .unwrap()
@@ -1217,6 +1334,19 @@ mod tests {
             RevisionId::new("rev-a").unwrap(),
             RevisionId::new("rev-b").unwrap(),
         )
+    }
+
+    fn recovery_skips_match(
+        actual: &[CanonicalRecoverySkipV1],
+        expected: &[(&RevisionId, CorruptSessionReason)],
+    ) -> bool {
+        actual.len() == expected.len()
+            && actual
+                .iter()
+                .zip(expected)
+                .all(|(actual, (revision, reason))| {
+                    actual.revision() == *revision && actual.reason() == *reason
+                })
     }
 
     fn current_v1(messages: serde_json::Value) -> Vec<u8> {
@@ -1361,7 +1491,7 @@ mod tests {
         let mismatched_bytes = encode_canonical_payload(&mismatched).unwrap();
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Missing,
@@ -1392,7 +1522,7 @@ mod tests {
                 .unwrap();
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Missing,
@@ -1427,7 +1557,7 @@ mod tests {
             serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Missing,
@@ -1632,6 +1762,7 @@ mod tests {
                     CanonicalRecoveryPlanV1::Unavailable {
                         selected: Some(ref selected),
                         ref selected_state,
+                        ..
                     } if selected == &rev_a && selected_state == &expected_state
                 ),
                 "recovery fault: {fault}"
@@ -1657,7 +1788,7 @@ mod tests {
         let orphan = payload("store-1", "session-1", "rev-c", Some("rev-b"), 3);
         store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_c.clone(),
                 ExpectedRevision::Exact(rev_b.clone()),
@@ -1792,7 +1923,7 @@ mod tests {
         )
         .unwrap();
         let replacement_manifest = crate::session::physical::RevisionManifestV1::new(
-            1,
+            LOGICAL_SCHEMA_REVISION,
             store_id,
             session_id.clone(),
             rev_a.clone(),
@@ -1848,7 +1979,7 @@ mod tests {
 
         let error = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_a.clone(),
                 ExpectedRevision::Exact(rev_b),
@@ -1896,7 +2027,7 @@ mod tests {
             serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Exact(rev_a.clone()),
@@ -1925,6 +2056,7 @@ mod tests {
                 ref selected_state,
                 ref recovery,
                 ref recovery_head,
+                ref skipped,
             } if selected == &rev_b
                 && selected_state == &SessionLookupState::Corrupt {
                     session: session_id.clone(),
@@ -1934,6 +2066,10 @@ mod tests {
                 && recovery == &rev_a
                 && recovery_head == &kitsu_core::session::LogicalHead::Turn(
                     kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+                && recovery_skips_match(
+                    skipped,
+                    &[(&rev_b, CorruptSessionReason::InvalidHead)]
                 )
         ));
         assert_eq!(
@@ -1968,7 +2104,7 @@ mod tests {
             serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Missing,
@@ -1987,12 +2123,19 @@ mod tests {
             CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(ref selected),
                 ref selected_state,
+                ref skipped,
+                blocker: CanonicalRecoveryBlockerV1::ExhaustedAtRoot { ref revision },
             } if selected == &rev_b
                 && selected_state == &SessionLookupState::Corrupt {
                     session: session_id.clone(),
                     observed_revision: Some(rev_b.clone()),
                     reason: CorruptSessionReason::InvalidHead,
                 }
+                && revision == &rev_b
+                && recovery_skips_match(
+                    skipped,
+                    &[(&rev_b, CorruptSessionReason::InvalidHead)]
+                )
         ));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
@@ -2025,10 +2168,10 @@ mod tests {
         let mut future =
             serde_json::to_value(payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
                 .unwrap();
-        future["logical_schema"] = serde_json::json!(2);
+        future["logical_schema"] = serde_json::json!(3);
         let candidate = store
             .install_revision_candidate(
-                2,
+                3,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Exact(rev_a.clone()),
@@ -2047,12 +2190,15 @@ mod tests {
             CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(ref selected),
                 ref selected_state,
+                ref skipped,
+                blocker: CanonicalRecoveryBlockerV1::SelectedState,
             } if selected == &rev_b
                 && selected_state == &SessionLookupState::Unsupported {
                     dimension: SchemaDimension::Logical,
-                    observed_revision: 2,
-                    supported_revision: 1,
+                    observed_revision: 3,
+                    supported_revision: 2,
                 }
+                && skipped.is_empty()
         ));
         assert_eq!(
             store.read_head(&session_id).unwrap().unwrap().revision_id(),
@@ -2089,7 +2235,7 @@ mod tests {
                 serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
             let candidate = store
                 .install_revision_candidate(
-                    1,
+                    LOGICAL_SCHEMA_REVISION,
                     session_id.clone(),
                     revision.clone(),
                     ExpectedRevision::Exact(parent.clone()),
@@ -2109,6 +2255,7 @@ mod tests {
                 ref selected_state,
                 ref recovery,
                 ref recovery_head,
+                ref skipped,
             } if selected == &rev_c
                 && selected_state == &SessionLookupState::Corrupt {
                     session: session_id.clone(),
@@ -2118,6 +2265,13 @@ mod tests {
                 && recovery == &rev_a
                 && recovery_head == &kitsu_core::session::LogicalHead::Turn(
                     kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+                && recovery_skips_match(
+                    skipped,
+                    &[
+                        (&rev_c, CorruptSessionReason::InvalidHead),
+                        (&rev_b, CorruptSessionReason::InvalidHead),
+                    ]
                 )
         ));
         assert_eq!(
@@ -2182,12 +2336,14 @@ mod tests {
                     selected_state: ref observed_state,
                     ref recovery,
                     ref recovery_head,
+                    ref skipped,
                 } if selected == &rev_b
                     && observed_state == &selected_state
                     && recovery == &rev_a
                     && recovery_head == &kitsu_core::session::LogicalHead::Turn(
                         kitsu_core::session::TurnId::new("turn-1").unwrap()
                     )
+                    && recovery_skips_match(skipped, &[(&rev_b, expected_reason)])
             ));
             assert_eq!(
                 store
@@ -2246,11 +2402,19 @@ mod tests {
                 selected_state: ref observed_state,
                 ref recovery,
                 ref recovery_head,
+                ref skipped,
             } if selected == &rev_c
                 && observed_state == &selected_state
                 && recovery == &rev_a
                 && recovery_head == &kitsu_core::session::LogicalHead::Turn(
                     kitsu_core::session::TurnId::new("turn-1").unwrap()
+                )
+                && recovery_skips_match(
+                    skipped,
+                    &[
+                        (&rev_c, CorruptSessionReason::DigestMismatch),
+                        (&rev_b, CorruptSessionReason::DigestMismatch),
+                    ]
                 )
         ));
         assert_eq!(
@@ -2293,7 +2457,11 @@ mod tests {
             CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(ref selected),
                 selected_state: ref observed_state,
-            } if selected == &rev_b && observed_state == &selected_state
+                ref skipped,
+                blocker: CanonicalRecoveryBlockerV1::SelectedState,
+            } if selected == &rev_b
+                && observed_state == &selected_state
+                && skipped.is_empty()
         ));
         assert_eq!(
             transaction.lookup_canonical_head(&session_id).state(),
@@ -2316,10 +2484,10 @@ mod tests {
         let mut future =
             serde_json::to_value(payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
                 .unwrap();
-        future["logical_schema"] = serde_json::json!(2);
+        future["logical_schema"] = serde_json::json!(3);
         let candidate_b = store
             .install_revision_candidate(
-                2,
+                3,
                 session_id.clone(),
                 rev_b.clone(),
                 ExpectedRevision::Exact(rev_a.clone()),
@@ -2333,7 +2501,7 @@ mod tests {
         drop(fence);
         let candidate_c = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_c.clone(),
                 ExpectedRevision::Exact(rev_b.clone()),
@@ -2349,7 +2517,7 @@ mod tests {
             .unwrap();
         let fence = store.acquire_writer_fence(&session_id).unwrap();
         store
-            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_b), &candidate_c)
+            .compare_and_swap_head(&fence, ExpectedRevision::Exact(rev_b.clone()), &candidate_c)
             .unwrap();
         std::fs::write(
             crate::session::physical::PhysicalLayoutV1::canonical_payload(
@@ -2371,7 +2539,19 @@ mod tests {
             CanonicalRecoveryPlanV1::Unavailable {
                 selected: Some(ref selected),
                 selected_state: ref observed_state,
-            } if selected == &rev_c && observed_state == &selected_state
+                ref skipped,
+                blocker: CanonicalRecoveryBlockerV1::UnsupportedLogicalManifest {
+                    revision: ref blocker_revision,
+                    observed: 3,
+                    supported: 2,
+                },
+            } if selected == &rev_c
+                && observed_state == &selected_state
+                && blocker_revision == &rev_b
+                && recovery_skips_match(
+                    skipped,
+                    &[(&rev_c, CorruptSessionReason::DigestMismatch)]
+                )
         ));
         assert_eq!(
             transaction.lookup_canonical_head(&session_id).state(),
@@ -2441,7 +2621,7 @@ mod tests {
             .unwrap();
             let candidate = store
                 .install_revision_candidate(
-                    1,
+                    LOGICAL_SCHEMA_REVISION,
                     session_id.clone(),
                     rev_b.clone(),
                     ExpectedRevision::Missing,
@@ -2561,11 +2741,11 @@ mod tests {
                 .unwrap();
         let mut future =
             serde_json::to_value(payload("store-1", "session-1", "rev-b", None, 1)).unwrap();
-        future["logical_schema"] = serde_json::json!(2);
+        future["logical_schema"] = serde_json::json!(3);
         let future_bytes = serde_json::to_vec(&future).unwrap();
         let candidate = store
             .install_revision_candidate(
-                2,
+                3,
                 session_id.clone(),
                 rev_b,
                 ExpectedRevision::Missing,
@@ -2581,8 +2761,8 @@ mod tests {
             transaction.lookup_canonical_head(&session_id).state(),
             &SessionLookupState::Unsupported {
                 dimension: SchemaDimension::Logical,
-                observed_revision: 2,
-                supported_revision: 1
+                observed_revision: 3,
+                supported_revision: 2
             }
         );
 
@@ -2681,7 +2861,7 @@ mod tests {
         .unwrap();
         let candidate = store
             .install_revision_candidate(
-                1,
+                LOGICAL_SCHEMA_REVISION,
                 session_id.clone(),
                 rev_b,
                 ExpectedRevision::Exact(rev_a.clone()),

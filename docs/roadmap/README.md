@@ -263,7 +263,7 @@ cutting an incomplete exchange.
 Dependencies: E02 terminal outcome model.
 
 Status: E03-S01 is accepted, E03-S02 is implemented through C21, and E03-S04 is
-in progress through Cycle 074. The
+in progress through Cycle 075. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -338,7 +338,14 @@ future-schema outcomes stay explicit. A descriptor-pinned manifest envelope is
 now verified separately from canonical payload bytes. Missing or digest-broken
 selected and intermediate payloads may be crossed only through exact HEAD/child-
 bound manifest digests; an unverified or future-logical manifest stops the plan.
-Ordinary lookup remains corrupt and no recovery revision is published yet.
+Canonical logical schema revision 2 now owns a bounded recovery ledger. An
+available plan retains every skipped corrupt revision and reason in exact
+selected-to-source order; an unavailable plan retains that prefix plus the exact
+root, digest, schema, ancestor-state, cycle, or bound blocker. Pure recovery
+assembly copies only the fully verified source state into a fresh revision whose
+exact parent is the corrupt selected revision, clears stale compaction, and
+binds source revision/HEAD, selection, ordered evidence, and time. Ordinary
+lookup remains corrupt and no recovery revision is published yet.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -699,7 +706,9 @@ verifies retained selected lineage in Cycle 072. Cycle 073 begins recovery with
 a mutation-free last-good plan for logically corrupt selected ancestry; Cycle
 074 extends the trusted input split to selected and intermediate physical payload
 faults. Cycle 075 defines a pure new recovery revision and complete skipped/
-blocker evidence before explicit fenced publication, then the queue continues
+blocker evidence. Cycle 076 composes envelope-only selected-parent admission,
+writer fencing, immutable install, HEAD CAS, and exact recovery receipts before
+production mounting; then the queue continues
 through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
