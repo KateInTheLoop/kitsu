@@ -2334,8 +2334,8 @@ mod tests {
         ChildRuntimePolicyV1, ChildTimeoutDispositionV1, PreparedChildLaunchV1,
     };
     use crate::external::handler::{
-        CallerExternalToolGrantV1, ExternalMcpEchoCompletionV1, ExternalMcpEchoSourceOwnerV1,
-        ExternalMcpEchoSourceStateV1, FixtureEchoRequestV1, HostExternalToolGrantV1,
+        ExternalMcpEchoCompletionV1, ExternalMcpEchoSourceOwnerV1, ExternalMcpEchoSourceStateV1,
+        FixtureEchoRequestV1,
     };
     use crate::external::lifecycle::ChildExitTruthV1;
     use crate::external::mcp::{
@@ -2345,6 +2345,7 @@ mod tests {
         SerialChildCauseV1, SerialChildTransportFailureV1, SerialChildTransportStateV1,
         SerialChildTransportV1,
     };
+    use crate::external::source::{CallerExternalToolGrantV1, HostExternalToolGrantV1};
     use crate::external::supervisor::{
         ChildPhaseSupervisorFailureV1, ChildPhaseSupervisorStateV1, ChildPhaseSupervisorV1,
         ChildSupervisorCauseV1,

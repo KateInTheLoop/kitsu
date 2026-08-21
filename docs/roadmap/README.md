@@ -742,6 +742,7 @@ gates merely because a card appears attractive.
 | 131 | E05-S02-C2a | Bind every model-picker proposal to exact declaration-derived profile, compiled adapter, and wire identity |
 | 132 | E05-S02-C2b | Consume one explicit namespace-equal proposal in private local setup while retaining its truth through recovery |
 | 133 | E06-S02-C4 | Bind one exact host-authored echo inventory and dual-grant no-replay call to the sealed MCP owner with atomic withdrawal |
+| 134 | E06-S02-C5 | Stage one default-disabled external echo declaration and require separate exact host/caller decisions before paired grants exist |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1179,6 +1180,13 @@ withdraws before cleanup, and exposes its validated integer only after clean
 child shutdown. Cleanup failure retains primary, response evidence, and one
 owned residue without claiming success. Grant construction, configuration,
 registry/request inventory, restart, and product mounting remain absent.
+Cycle 134 makes the private compiled echo declaration default-disabled and
+separates request facts from authority. Disabled and denied paths stop before
+version/identity validation; enabled admission requires exact host
+source/incarnation/revision/tool equality, then a distinct exact caller decision
+before one non-cloneable paired grant reaches the existing handler. The seam is
+pure and unmounted: no child preparation, spawn, registry mutation, provider
+call, filesystem lookup, product config, or request inventory is added.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
