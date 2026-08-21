@@ -856,6 +856,17 @@ cannot weaken or replace any backend-neutral assertion.
    drops both lock owners without exposing either result field. Missing source
    state remains zero-effect. No startup or in-process call site selects this
    gate yet; startup mounting is the next boundary.
+   **Bound-current startup mounting complete in Cycle 099:** durable startup
+   opens one pinned sessions descriptor, resolves exact/name/`last`/`auto` to a
+   session identity from the current catalog, then performs bound activation on
+   that same descriptor. The catalog snapshot is discarded; only the exact
+   owner-coupled value enters runtime. An exact canonical identity can resolve
+   without a legacy snapshot, but admission returns the operation-writer error
+   and no product parts. Review found that switching the owner would otherwise
+   regress `/new`; bound-current reset now acquires a fresh current-v1 owner
+   first, then replaces and drops the bound owner. Failure retains the old owner,
+   and canonical reset remains refused. In-process resume still uses the prior
+   current-v1 handoff until the staged-swap boundary.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
