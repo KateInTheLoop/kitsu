@@ -3324,7 +3324,7 @@ fn identifier_tokens(line: &str) -> Vec<&str> {
 
 /// Heuristic: is this line a *definition* of `symbol`? True when a definition
 /// keyword immediately precedes a whole-word occurrence (incl. `let mut <sym>`).
-fn is_definition_line(line: &str, symbol: &str) -> bool {
+pub(crate) fn line_defines_symbol(line: &str, symbol: &str) -> bool {
     let tokens = identifier_tokens(line);
     for (i, tok) in tokens.iter().enumerate() {
         if *tok != symbol || i == 0 {
@@ -3738,7 +3738,7 @@ fn scan_one_file_with_hook<F>(
             continue;
         }
         let line_no = idx + 1;
-        if is_definition_line(line, symbol) {
+        if line_defines_symbol(line, symbol) {
             hits.total_defs += 1;
             if hits.defs.len() < SYMBOL_MAX_DEFS_SHOWN {
                 hits.defs
@@ -8517,18 +8517,18 @@ httpx = "^0.27"
     #[test]
     fn symbol_definition_classification() {
         // Definition forms across languages.
-        assert!(is_definition_line("fn parse(input: &str) {", "parse"));
-        assert!(is_definition_line("    pub struct Config {", "Config"));
-        assert!(is_definition_line("def parse(self):", "parse"));
-        assert!(is_definition_line("class Config:", "Config"));
-        assert!(is_definition_line("let count = 0;", "count"));
-        assert!(is_definition_line("let mut total = 0;", "total"));
-        assert!(is_definition_line("type Alias = u32;", "Alias"));
+        assert!(line_defines_symbol("fn parse(input: &str) {", "parse"));
+        assert!(line_defines_symbol("    pub struct Config {", "Config"));
+        assert!(line_defines_symbol("def parse(self):", "parse"));
+        assert!(line_defines_symbol("class Config:", "Config"));
+        assert!(line_defines_symbol("let count = 0;", "count"));
+        assert!(line_defines_symbol("let mut total = 0;", "total"));
+        assert!(line_defines_symbol("type Alias = u32;", "Alias"));
         // Uses are NOT definitions.
-        assert!(!is_definition_line("self.parse();", "parse"));
-        assert!(!is_definition_line("use crate::parse;", "parse"));
-        assert!(!is_definition_line("return parse(x)", "parse"));
-        assert!(!is_definition_line("let n = count + 1;", "count"));
+        assert!(!line_defines_symbol("self.parse();", "parse"));
+        assert!(!line_defines_symbol("use crate::parse;", "parse"));
+        assert!(!line_defines_symbol("return parse(x)", "parse"));
+        assert!(!line_defines_symbol("let n = count + 1;", "count"));
     }
 
     #[test]
