@@ -640,6 +640,15 @@ cannot weaken or replace any backend-neutral assertion.
    cut selects only the complete branch with published-unconfirmed durability.
    Next make those exact pre-HEAD residues safely resumable without accepting a
    name-only collision or overwriting any byte.
+   **Exact branch-residue retry complete in Cycle 080:** artifact and candidate
+   preflight distinguishes missing, exact, and conflicting records before new
+   copying. Exact means the same store/session/revision/parent/schema, manifest
+   digest, canonical bytes, and artifact fact. Adoption holds the destination
+   fence, re-syncs target and owning namespaces, then reopens and compares again
+   before source/closure rechecks and HEAD CAS. Confirmed and previously
+   unconfirmed artifact-only or candidate-bearing cuts converge to the same
+   branch. Malformed, byte-different, or tampered residue remains unselected and
+   is never deleted or overwritten.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

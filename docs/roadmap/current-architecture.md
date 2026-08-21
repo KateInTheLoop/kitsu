@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 079.
+updates through Cycle 080.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -136,6 +136,10 @@ kernel.
   closure before create-only HEAD CAS; known stale/collision cases are zero-copy,
   pre-HEAD cuts expose no destination HEAD and report exact immutable residue,
   and HEAD-sync uncertainty exposes only the complete new branch.
+  Cycle 080 allows retry only from exact residue for the same assembled branch.
+  Existing artifacts/candidates must match every identity, digest, schema,
+  parent, and byte; their owning namespaces are re-synced and records reopened
+  before ordinary source/closure/HEAD rechecks. Tampered residue remains blocked.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
