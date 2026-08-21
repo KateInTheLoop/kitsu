@@ -595,6 +595,19 @@ cannot weaken or replace any backend-neutral assertion.
    source/selection/skips/time. Recovery never makes an old revision HEAD.
    Next publish this value through envelope-only selected-parent admission,
    immutable install, writer-fenced CAS, and exact old-or-new receipts.
+   **Fenced recovery publication complete in Cycle 076:** a private transaction
+   acquires the session writer fence, re-admits the exact selected HEAD envelope,
+   and retains both selected and verified-source manifest digests across plan
+   and reopen. Physical candidate installation may bind that verified envelope
+   without reading corrupt parent payload bytes; the recovery-only CAS rechecks
+   the same HEAD envelope immediately before selecting the new causal child.
+   Artifact closure is checked before and after candidate install. Unavailable
+   ancestry allocates nothing; the candidate cut preserves corrupt HEAD plus an
+   exact installed-unselected residue; a HEAD-sync cut exposes only the new
+   revision as `PublishedUnconfirmed`; confirmed success returns exact
+   base/new/HEAD/durability. Stale envelope CAS fails, and the verified old
+   source is never selected directly. The path remains unmounted. Next define
+   pure branch-at-committed-turn prefix, lineage, and artifact-closure assembly.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

@@ -1314,27 +1314,7 @@ impl PhysicalFileStoreV1 {
         candidate: &InstalledRevisionCandidateV1,
     ) -> Result<VerifiedRevisionHeadV1, PhysicalHeadCasError> {
         let session_id = &candidate.manifest.session_id;
-        fence
-            .confirm(self.store_id(), session_id)
-            .map_err(PhysicalHeadCasError::Fence)?;
-        if &candidate.manifest.store_id != self.store_id() {
-            return Err(PhysicalHeadCasError::Candidate(format!(
-                "revision candidate store mismatch: expected '{}', observed '{}'",
-                self.store_id().as_str(),
-                candidate.manifest.store_id.as_str()
-            )));
-        }
-        let reloaded = self
-            .open_revision_candidate(session_id, &candidate.manifest.revision_id)
-            .map_err(|error| PhysicalHeadCasError::Candidate(error.to_string()))?;
-        if reloaded.manifest != candidate.manifest
-            || reloaded.manifest_sha256 != candidate.manifest_sha256
-        {
-            return Err(PhysicalHeadCasError::Candidate(
-                "revision candidate receipt does not match the exact installed manifest"
-                    .to_string(),
-            ));
-        }
+        self.validate_head_candidate(fence, candidate)?;
 
         let current = self
             .read_head(session_id)
@@ -1371,6 +1351,100 @@ impl PhysicalFileStoreV1 {
             }
         }
 
+        self.publish_candidate_head(
+            fence,
+            candidate,
+            matches!(expected, ExpectedRevision::Exact(_)),
+        )
+    }
+
+    pub(super) fn compare_and_swap_head_against_envelope(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        selected: &VerifiedRevisionHeadEnvelopeV1,
+        candidate: &InstalledRevisionCandidateV1,
+    ) -> Result<VerifiedRevisionHeadV1, PhysicalHeadCasError> {
+        let session_id = &candidate.manifest.session_id;
+        self.validate_head_candidate(fence, candidate)?;
+        if selected.manifest().store_id() != self.store_id()
+            || selected.manifest().session_id() != session_id
+        {
+            return Err(PhysicalHeadCasError::Candidate(
+                "selected recovery envelope does not belong to the target store/session"
+                    .to_string(),
+            ));
+        }
+        let current = self
+            .read_head_envelope(session_id)
+            .map_err(|error| PhysicalHeadCasError::Candidate(error.to_string()))?;
+        let Some(current) = current else {
+            return Err(PhysicalHeadCasError::Conflict {
+                expected: ExpectedRevision::Exact(selected.revision_id().clone()),
+                observed: None,
+            });
+        };
+        if current.revision_id() != selected.revision_id() {
+            return Err(PhysicalHeadCasError::Conflict {
+                expected: ExpectedRevision::Exact(selected.revision_id().clone()),
+                observed: Some(current.revision_id().clone()),
+            });
+        }
+        if current.envelope().manifest != selected.envelope().manifest
+            || current.envelope().manifest_sha256 != selected.envelope().manifest_sha256
+        {
+            return Err(PhysicalHeadCasError::Candidate(
+                "selected recovery HEAD envelope changed before publication".to_string(),
+            ));
+        }
+        if candidate.manifest.parent_revision
+            != ExpectedRevision::Exact(selected.revision_id().clone())
+            || candidate.manifest.parent_manifest_sha256()
+                != Some(selected.envelope().manifest_sha256())
+        {
+            return Err(PhysicalHeadCasError::Candidate(
+                "recovery candidate is not bound to the exact selected HEAD envelope".to_string(),
+            ));
+        }
+        self.publish_candidate_head(fence, candidate, true)
+    }
+
+    fn validate_head_candidate(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        candidate: &InstalledRevisionCandidateV1,
+    ) -> Result<(), PhysicalHeadCasError> {
+        let session_id = &candidate.manifest.session_id;
+        fence
+            .confirm(self.store_id(), session_id)
+            .map_err(PhysicalHeadCasError::Fence)?;
+        if &candidate.manifest.store_id != self.store_id() {
+            return Err(PhysicalHeadCasError::Candidate(format!(
+                "revision candidate store mismatch: expected '{}', observed '{}'",
+                self.store_id().as_str(),
+                candidate.manifest.store_id.as_str()
+            )));
+        }
+        let reloaded = self
+            .open_revision_candidate(session_id, &candidate.manifest.revision_id)
+            .map_err(|error| PhysicalHeadCasError::Candidate(error.to_string()))?;
+        if reloaded.manifest != candidate.manifest
+            || reloaded.manifest_sha256 != candidate.manifest_sha256
+        {
+            return Err(PhysicalHeadCasError::Candidate(
+                "revision candidate receipt does not match the exact installed manifest"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
+    fn publish_candidate_head(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        candidate: &InstalledRevisionCandidateV1,
+        replace: bool,
+    ) -> Result<VerifiedRevisionHeadV1, PhysicalHeadCasError> {
+        let session_id = &candidate.manifest.session_id;
         fence
             .confirm(self.store_id(), session_id)
             .map_err(PhysicalHeadCasError::Fence)?;
@@ -1387,7 +1461,6 @@ impl PhysicalFileStoreV1 {
         if self.fail_next_head_sync.replace(false) {
             super::FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|failure| failure.set(true));
         }
-        let replace = matches!(expected, ExpectedRevision::Exact(_));
         match atomic_write_private_in_detailed(
             &self.heads,
             OsStr::new(&head_name),
@@ -1710,13 +1783,6 @@ impl PhysicalFileStoreV1 {
         parent_revision: ExpectedRevision,
         canonical_bytes: &[u8],
     ) -> Result<InstalledRevisionCandidateV1, PhysicalCandidateInstallError> {
-        let canonical_len = u64::try_from(canonical_bytes.len()).map_err(|_| {
-            PhysicalCandidateInstallError::before_install(
-                "canonical payload length cannot be represented as u64",
-            )
-        })?;
-        let canonical_sha256 =
-            digest_bytes(canonical_bytes).map_err(PhysicalCandidateInstallError::before_install)?;
         let parent_manifest_sha256 = match &parent_revision {
             ExpectedRevision::Missing => None,
             ExpectedRevision::Exact(parent) => Some(
@@ -1731,6 +1797,71 @@ impl PhysicalFileStoreV1 {
                     .clone(),
             ),
         };
+        self.install_revision_candidate_bound(
+            logical_schema_revision,
+            session_id,
+            revision_id,
+            parent_revision,
+            parent_manifest_sha256,
+            canonical_bytes,
+        )
+    }
+
+    pub(super) fn install_revision_candidate_against_envelope(
+        &self,
+        logical_schema_revision: u32,
+        session_id: SessionId,
+        revision_id: RevisionId,
+        parent: &VerifiedRevisionEnvelopeV1,
+        canonical_bytes: &[u8],
+    ) -> Result<InstalledRevisionCandidateV1, PhysicalCandidateInstallError> {
+        if parent.manifest.store_id() != self.store_id()
+            || parent.manifest.session_id() != &session_id
+        {
+            return Err(PhysicalCandidateInstallError::before_install(
+                "recovery parent envelope does not belong to the target store/session",
+            ));
+        }
+        let reloaded = self
+            .open_revision_envelope(&session_id, parent.revision_id())
+            .map_err(|error| {
+                PhysicalCandidateInstallError::before_install(format!(
+                    "cannot reverify recovery parent envelope: {error}"
+                ))
+            })?;
+        if reloaded.manifest != parent.manifest
+            || reloaded.manifest_sha256 != parent.manifest_sha256
+        {
+            return Err(PhysicalCandidateInstallError::before_install(
+                "recovery parent envelope changed before candidate installation",
+            ));
+        }
+        self.install_revision_candidate_bound(
+            logical_schema_revision,
+            session_id,
+            revision_id,
+            ExpectedRevision::Exact(parent.revision_id().clone()),
+            Some(parent.manifest_sha256.clone()),
+            canonical_bytes,
+        )
+    }
+
+    fn install_revision_candidate_bound(
+        &self,
+        logical_schema_revision: u32,
+        session_id: SessionId,
+        revision_id: RevisionId,
+        parent_revision: ExpectedRevision,
+        parent_manifest_sha256: Option<Sha256Digest>,
+        canonical_bytes: &[u8],
+    ) -> Result<InstalledRevisionCandidateV1, PhysicalCandidateInstallError> {
+        let canonical_len = u64::try_from(canonical_bytes.len()).map_err(|_| {
+            PhysicalCandidateInstallError::before_install(
+                "canonical payload length cannot be represented as u64",
+            )
+        })?;
+        let canonical_sha256 =
+            digest_bytes(canonical_bytes).map_err(PhysicalCandidateInstallError::before_install)?;
         let manifest = RevisionManifestV1::new(
             logical_schema_revision,
             self.store_id().clone(),
@@ -3008,6 +3139,77 @@ mod tests {
             ),
             Err(PhysicalHeadCasError::Conflict { observed: Some(observed), .. })
                 if observed == revision_b
+        ));
+        assert_eq!(
+            store.read_head(&session).unwrap().unwrap().revision_id(),
+            &revision_b
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn recovery_envelope_binds_an_unreadable_parent_and_stale_cas_fails() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let session = session();
+        let revision_a = revision("revision-a");
+        let candidate_a = store
+            .install_revision_candidate(
+                1,
+                session.clone(),
+                revision_a.clone(),
+                ExpectedRevision::Missing,
+                b"{\"value\":\"a\"}\n",
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(&session).unwrap();
+        store
+            .compare_and_swap_head(&fence, ExpectedRevision::Missing, &candidate_a)
+            .unwrap();
+        let selected_a = store.read_head_envelope(&session).unwrap().unwrap();
+        std::fs::remove_file(PhysicalLayoutV1::canonical_payload(
+            &session_root,
+            &session,
+            &revision_a,
+        ))
+        .unwrap();
+        assert!(store.read_head(&session).is_err());
+
+        let revision_b = revision("revision-b");
+        let candidate_b = store
+            .install_revision_candidate_against_envelope(
+                1,
+                session.clone(),
+                revision_b.clone(),
+                selected_a.envelope(),
+                b"{\"value\":\"recovered\"}\n",
+            )
+            .unwrap();
+        assert_eq!(
+            candidate_b.manifest().parent_manifest_sha256(),
+            Some(selected_a.envelope().manifest_sha256())
+        );
+        store
+            .compare_and_swap_head_against_envelope(&fence, &selected_a, &candidate_b)
+            .unwrap();
+
+        let revision_c = revision("revision-c");
+        let stale = store
+            .install_revision_candidate_against_envelope(
+                1,
+                session.clone(),
+                revision_c,
+                selected_a.envelope(),
+                b"{\"value\":\"stale\"}\n",
+            )
+            .unwrap();
+        assert!(matches!(
+            store.compare_and_swap_head_against_envelope(&fence, &selected_a, &stale),
+            Err(PhysicalHeadCasError::Conflict {
+                observed: Some(observed),
+                ..
+            }) if observed == revision_b
         ));
         assert_eq!(
             store.read_head(&session).unwrap().unwrap().revision_id(),
