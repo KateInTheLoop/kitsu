@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C31,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C32,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -696,6 +696,7 @@ gates merely because a card appears attractive.
 | 088 | E03-S02-C29 | Save canonical successors through the total activation's held fence and exact parent envelope |
 | 089 | E03-S02-C30 | Save current-v1 successors through the total activation with exact pre-install byte and canonical-absence checks |
 | 090 | E03-S02-C31 | Encapsulate both representation-aware save paths behind one non-cloneable private live-store owner |
+| 091 | E03-S02-C32 | Move production active-session ownership behind one current-v1-preserving handoff seam |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -807,8 +808,13 @@ pre-install refusals preserve it. Cycle 090 encapsulates the complete activation
 behind one non-cloneable private live-store owner. One save-intent/receipt API
 routes both representations; cross-representation intent is effect-free, both
 fences remain owned across valid writes, and both release only when the live
-store drops. Cycle 091 next defines the production active-session ownership
-handoff without switching current-v1 behavior, then continues through E03,
+store drops. Cycle 091 moves production active-session ownership behind a
+non-cloneable `ActiveSessionStore`. Autosave, clear, reset, startup resume,
+in-process resume, and artifact routing use that one slot, while its only
+implementation delegates to current-v1 and creates no canonical namespace.
+Static catalog and lifecycle operations remain separate. Cycle 092 next defines
+a stable explicit local canonical store identity before any mount can switch
+production persistence, then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
