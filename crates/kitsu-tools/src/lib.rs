@@ -6,6 +6,11 @@ pub mod builtins;
 pub mod error;
 pub mod permissions;
 
+// E06 begins with a private, provider-free admission boundary. Later cards
+// consume these values from the bounded child supervisor; they are not a
+// public extension API.
+mod external;
+
 pub use builtins::command::{
     command_exec_tool, env_name_looks_secret, execute_command, scope_command_progress,
     CommandAmbientAuthority, CommandApprovalRequest, CommandArtifactCompletion,
