@@ -26,17 +26,19 @@ strictly serial multi-frame owner through Cycle 119.
 E08-S05 mounts the same typed offline current-session observation on `/status`
 through Cycle 117 while preserving the legacy JSONL payload shape, and exact
 offline `/context window` through Cycle 121.
+Bare `/usage`, `/usage session`, and legacy `/cost` share that typed usage
+observation through Cycle 124.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 123 / 123 |
+| Accepted cycles/commits after this cycle | 124 / 124 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 124 — E08-S05-C7: unify truthful usage compatibility aliases |
+| Active epic/card | Cycle 125 — E07-S01-C3: measure selector authority and staleness refusal |
 
 ## Epic status
 
@@ -50,7 +52,7 @@ offline `/context window` through Cycle 121.
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
 | E07 semantic context | **In progress** through E07-S01-C2 | The deterministic fixed-corpus current-tool baseline and one test-only structural selector comparison pass. The selector preserves relevance while reducing rounds/bytes past the predeclared threshold, so only the next authority/stale-edit experiment is promoted; production contributor remains absent |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
-| E08 telemetry/docs | **In progress** through E08-S05-C6 | Pure current-session DTOs label every value with truth/provenance; `/usage session`, `/status`, and exact `/context window` collect coherent offline in-memory observations and render adaptive usage/full/context decks. `/status` preserves its legacy JSONL payload; context-window JSONL deliberately adds no result. Usage aliases/automation parity, account truth, and durable history remain separate; history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C7 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive full/context/usage decks. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation payloads, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -181,6 +183,7 @@ offline `/context window` through Cycle 121.
 | 121 | this document's commit | Exact offline typed `/context window` with adaptive accessible rendering |
 | 122 | this document's commit | Threshold-backed structural-selector experiment and promote decision |
 | 123 | this document's commit | Pure bounded offline model-picker snapshot, projection, and proposal truth |
+| 124 | this document's commit | One typed usage snapshot behind bare, session, and legacy-cost compatibility forms |
 
 ## Current green gates
 
@@ -894,6 +897,13 @@ membership feed bounded normalization, deterministic ranking, narrow rows, and
 a versioned proposal. It has no provider/network/filesystem/cache/credential/
 config/session/route effect, capability inference, UI, apply path, or product
 mount.
+
+Cycle 124 unifies bare `/usage`, explicit `/usage session`, and the retained
+empty-args-only `/cost` compatibility spelling behind one typed in-memory
+current-session usage snapshot and renderer. Help, invalid syntax, and original
+JSONL lifecycle command spelling remain exact; JSONL adds no result or stderr.
+No provider/account/network/filesystem/store/history or monetary source is
+consulted.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

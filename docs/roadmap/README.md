@@ -732,6 +732,7 @@ gates merely because a card appears attractive.
 | 121 | E08-S05-C6 | Mount exact offline `/context window` from one typed current-session observation and the existing adaptive renderer |
 | 122 | E07-S01-C2 | Measure a deterministic structural selector against the frozen baseline and record the threshold-backed promote decision |
 | 123 | E05-S02-C1 | Stage a deterministic offline model picker over one bounded provenance-bearing catalog snapshot without applying it |
+| 124 | E08-S05-C7 | Unify bare/session usage and legacy cost compatibility over one truthful typed current-session snapshot |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1089,6 +1090,13 @@ deduplication, filtering, deterministic ranking, current/default flags, and
 narrow projection operate without provider, network, filesystem, cache,
 credential, configuration, route, or session effects. No apply, publication,
 UI, capability inference, or product mount exists.
+Cycle 124 makes bare `/usage` and `/usage session` identical typed views and
+retains empty-args-only `/cost` as a documented compatibility alias. All forms
+share one in-memory route receipt, snapshot collector, and usage-only adaptive
+renderer. Help, invalid syntax, and original JSONL lifecycle spelling remain
+explicit; JSONL gains no result payload or stderr text. No account, provider,
+network, filesystem, persistence, history, pricing, currency, credit, or rate
+lookup is introduced.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
