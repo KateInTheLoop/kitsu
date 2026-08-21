@@ -6,18 +6,19 @@ through Cycle 080; E06-S01 and E06-S02 are implemented through C2, and E06-S03
 has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
-provider-free monotonic inventory publication through Cycle 107.
+provider-free monotonic inventory publication through Cycle 107, and E06-S01
+binds exact runtime policy into preparation through Cycle 108.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 107 / 107 |
+| Accepted cycles/commits after this cycle | 108 / 108 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 108 — E06-S01-C3: bind exact phase budgets, I/O limits, process-group, environment, network, and timeout/reap policy into child preparation |
+| Active epic/card | Cycle 109 — E08-S05-C2: retain exact provider reported/missing response coverage and cached-token presence in current-run accounting |
 
 ## Epic status
 
@@ -28,10 +29,10 @@ provider-free monotonic inventory publication through Cycle 107.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C2, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories now publish/replace/withdraw atomically through exact source-lifetime and revision fences. Single-use preparation feeds a causal, joined lifecycle owner only through injected synchronous effects. Next bind exact runtime policy before adding a real child; no product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C3, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped phase/I/O/environment/process/network/timeout policy into a causal joined lifecycle owner, but effects remain injected and synchronous. Next add a real bounded backend only behind these proofs; no product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
-| E08 telemetry/docs | **In progress** through E08-S05-C1 | Pure current-session status/context/usage DTOs consume E04 receipts and label every value with truth/provenance. Next extend run tallies with reported/missing coverage and cached tokens before any product adapter or renderer; durable history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C1 | Pure current-session status/context/usage DTOs consume E04 receipts and label every value with truth/provenance. Cycle 109 next retains reported/missing response coverage and cached-token presence before any product adapter or renderer; durable history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -145,7 +146,8 @@ provider-free monotonic inventory publication through Cycle 107.
 | 104 | `74ba671` | Closed external source identities and descriptor fingerprints |
 | 105 | `a8462e6` | Single-use joined external child lifecycle truth |
 | 106 | `0b7b882` | Typed current-session telemetry truth and provenance |
-| 107 | this document's commit | Exact atomic external-inventory publication and withdrawal |
+| 107 | `6dec4c4` | Exact atomic external-inventory publication and withdrawal |
+| 108 | this document's commit | Exact bounded child runtime policy identity and preparation |
 
 ## Current green gates
 
@@ -717,6 +719,14 @@ withdrawal require the exact current fence. Refused transitions preserve the
 same allocated snapshot, and maximum revision cannot wrap. This remains
 provider-free and unmounted: it owns no handlers, child, transport, MCP codec,
 configuration, or product authority.
+Cycle 108 binds the complete bounded runtime policy into the same inert request,
+host profile, and prepared-launch proof. Startup, request, drain, kill, and reap
+budgets plus stdin, stdout, stderr, and frame limits are non-zero and capped;
+the frame must fit both protocol streams. The ordered environment projection is
+clear-only, unique, aggregate-bounded, NUL-free, and debug-redacted. Owned
+process group, denied network, and terminate-group-then-reap timeout behavior
+are mandatory. No real process consumes these values yet, so this is exact
+admission truth rather than a containment claim.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

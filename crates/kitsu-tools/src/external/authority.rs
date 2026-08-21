@@ -7,6 +7,8 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashSet;
+use std::fmt;
 use std::path::{Component, Path, PathBuf};
 
 const CHILD_LAUNCH_REQUEST_VERSION_V1: u32 = 1;
@@ -14,11 +16,195 @@ const SHA256_HEX_BYTES: usize = 64;
 const MAX_ARGUMENT_COUNT: usize = 256;
 const MAX_ARGUMENT_BYTES: usize = 16 * 1024;
 const MAX_TOTAL_ARGUMENT_BYTES: usize = 64 * 1024;
+const MAX_STARTUP_BUDGET_MILLIS: u64 = 30_000;
+const MAX_REQUEST_BUDGET_MILLIS: u64 = 5 * 60_000;
+const MAX_DRAIN_BUDGET_MILLIS: u64 = 30_000;
+const MAX_KILL_BUDGET_MILLIS: u64 = 10_000;
+const MAX_REAP_BUDGET_MILLIS: u64 = 30_000;
+const MAX_STDIN_BYTES: usize = 1024 * 1024;
+const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
+const MAX_STDERR_BYTES: usize = 1024 * 1024;
+const MAX_FRAME_BYTES: usize = 256 * 1024;
+const MAX_ENVIRONMENT_VARIABLES: usize = 64;
+const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
+const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4 * 1024;
+const MAX_ENVIRONMENT_PROJECTION_BYTES: usize = 16 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildLaunchModeV1 {
     Disabled,
     Enabled,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildPhaseBudgetsV1 {
+    startup_millis: u64,
+    request_millis: u64,
+    drain_millis: u64,
+    kill_millis: u64,
+    reap_millis: u64,
+}
+
+impl ChildPhaseBudgetsV1 {
+    pub(crate) fn new(
+        startup_millis: u64,
+        request_millis: u64,
+        drain_millis: u64,
+        kill_millis: u64,
+        reap_millis: u64,
+    ) -> Self {
+        Self {
+            startup_millis,
+            request_millis,
+            drain_millis,
+            kill_millis,
+            reap_millis,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct ChildIoLimitsV1 {
+    stdin_bytes: usize,
+    stdout_bytes: usize,
+    stderr_bytes: usize,
+    frame_bytes: usize,
+}
+
+impl ChildIoLimitsV1 {
+    pub(crate) fn new(
+        stdin_bytes: usize,
+        stdout_bytes: usize,
+        stderr_bytes: usize,
+        frame_bytes: usize,
+    ) -> Self {
+        Self {
+            stdin_bytes,
+            stdout_bytes,
+            stderr_bytes,
+            frame_bytes,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildProcessGroupPolicyV1 {
+    Inherited,
+    Owned,
+}
+
+#[derive(Clone, PartialEq, Eq)]
+pub(crate) struct ChildEnvironmentValueV1(String);
+
+impl fmt::Debug for ChildEnvironmentValueV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("\"[REDACTED]\"")
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildEnvironmentVariableV1 {
+    name: String,
+    value: ChildEnvironmentValueV1,
+}
+
+impl ChildEnvironmentVariableV1 {
+    pub(crate) fn new(name: impl Into<String>, value: impl Into<String>) -> Self {
+        Self {
+            name: name.into(),
+            value: ChildEnvironmentValueV1(value.into()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildEnvironmentPolicyV1 {
+    clear_inherited: bool,
+    projection: Vec<ChildEnvironmentVariableV1>,
+}
+
+impl ChildEnvironmentPolicyV1 {
+    pub(crate) fn new(clear_inherited: bool, projection: Vec<ChildEnvironmentVariableV1>) -> Self {
+        Self {
+            clear_inherited,
+            projection,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum ChildNetworkPolicyV1 {
+    #[default]
+    Deny,
+    Allow,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildTimeoutDispositionV1 {
+    Abandon,
+    TerminateProcessGroupAndReap,
+}
+
+/// Exact, inert runtime facts supplied independently by a request and host.
+/// Validation happens during profile construction or pure admission; neither
+/// path observes the filesystem or a containment backend.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildRuntimePolicyV1 {
+    phase_budgets: ChildPhaseBudgetsV1,
+    io_limits: ChildIoLimitsV1,
+    process_group: ChildProcessGroupPolicyV1,
+    environment: ChildEnvironmentPolicyV1,
+    network: ChildNetworkPolicyV1,
+    timeout_disposition: ChildTimeoutDispositionV1,
+}
+
+impl ChildRuntimePolicyV1 {
+    pub(crate) fn new(
+        phase_budgets: ChildPhaseBudgetsV1,
+        io_limits: ChildIoLimitsV1,
+        process_group: ChildProcessGroupPolicyV1,
+        environment: ChildEnvironmentPolicyV1,
+        network: ChildNetworkPolicyV1,
+        timeout_disposition: ChildTimeoutDispositionV1,
+    ) -> Self {
+        Self {
+            phase_budgets,
+            io_limits,
+            process_group,
+            environment,
+            network,
+            timeout_disposition,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildRuntimePhaseV1 {
+    Startup,
+    Request,
+    Drain,
+    Kill,
+    Reap,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildIoLimitV1 {
+    Stdin,
+    Stdout,
+    Stderr,
+    Frame,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildRuntimePolicyErrorV1 {
+    InvalidPhaseBudget(ChildRuntimePhaseV1),
+    InvalidIoLimit(ChildIoLimitV1),
+    FrameExceedsStreamLimit(ChildIoLimitV1),
+    ProcessGroupNotOwned,
+    InheritedEnvironmentNotCleared,
+    InvalidEnvironmentProjection,
+    NetworkNotDenied,
+    TimeoutMayAbandon,
 }
 
 /// Inert, untrusted launch facts. Constructing this value performs no I/O.
@@ -30,6 +216,7 @@ pub(crate) struct ChildLaunchRequestV1 {
     executable_sha256: String,
     arguments: Vec<String>,
     working_directory: PathBuf,
+    runtime_policy: ChildRuntimePolicyV1,
 }
 
 impl ChildLaunchRequestV1 {
@@ -40,6 +227,7 @@ impl ChildLaunchRequestV1 {
         executable_sha256: impl Into<String>,
         arguments: Vec<String>,
         working_directory: impl Into<PathBuf>,
+        runtime_policy: ChildRuntimePolicyV1,
     ) -> Self {
         Self {
             version,
@@ -48,6 +236,7 @@ impl ChildLaunchRequestV1 {
             executable_sha256: executable_sha256.into(),
             arguments,
             working_directory: working_directory.into(),
+            runtime_policy,
         }
     }
 }
@@ -68,6 +257,7 @@ impl AuthorityProfileV1 {
         executable_sha256: impl Into<String>,
         arguments: Vec<String>,
         working_directory: impl Into<PathBuf>,
+        runtime_policy: ChildRuntimePolicyV1,
     ) -> Result<Self, ChildLaunchAdmissionErrorV1> {
         Ok(Self {
             spec: ValidatedChildLaunchSpecV1::new(
@@ -75,6 +265,7 @@ impl AuthorityProfileV1 {
                 executable_sha256.into(),
                 arguments,
                 working_directory.into(),
+                runtime_policy,
             )?,
         })
     }
@@ -92,6 +283,7 @@ pub(crate) enum AuthorityMismatchFieldV1 {
     ExecutableSha256,
     Arguments,
     WorkingDirectory,
+    RuntimePolicy,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -103,6 +295,7 @@ pub(crate) enum ChildLaunchAdmissionErrorV1 {
     InvalidExecutableSha256,
     InvalidArguments,
     InvalidWorkingDirectory,
+    InvalidRuntimePolicy(ChildRuntimePolicyErrorV1),
     AuthorityMismatch(AuthorityMismatchFieldV1),
     ExecutableCanonicalization(String),
     ExecutablePathChanged,
@@ -146,6 +339,7 @@ struct ValidatedChildLaunchSpecV1 {
     executable_sha256: ExecutableSha256V1,
     arguments: Vec<String>,
     working_directory: PathBuf,
+    runtime_policy: ChildRuntimePolicyV1,
 }
 
 impl ValidatedChildLaunchSpecV1 {
@@ -154,6 +348,7 @@ impl ValidatedChildLaunchSpecV1 {
         executable_sha256: String,
         arguments: Vec<String>,
         working_directory: PathBuf,
+        runtime_policy: ChildRuntimePolicyV1,
     ) -> Result<Self, ChildLaunchAdmissionErrorV1> {
         if !is_normalized_absolute_path(&executable) {
             return Err(ChildLaunchAdmissionErrorV1::InvalidExecutablePath);
@@ -163,11 +358,14 @@ impl ValidatedChildLaunchSpecV1 {
         if !is_normalized_absolute_path(&working_directory) {
             return Err(ChildLaunchAdmissionErrorV1::InvalidWorkingDirectory);
         }
+        validate_runtime_policy(&runtime_policy)
+            .map_err(ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy)?;
         Ok(Self {
             executable,
             executable_sha256,
             arguments,
             working_directory,
+            runtime_policy,
         })
     }
 }
@@ -202,6 +400,128 @@ fn validate_arguments(arguments: &[String]) -> Result<(), ChildLaunchAdmissionEr
     Ok(())
 }
 
+fn validate_runtime_policy(policy: &ChildRuntimePolicyV1) -> Result<(), ChildRuntimePolicyErrorV1> {
+    for (phase, observed, maximum) in [
+        (
+            ChildRuntimePhaseV1::Startup,
+            policy.phase_budgets.startup_millis,
+            MAX_STARTUP_BUDGET_MILLIS,
+        ),
+        (
+            ChildRuntimePhaseV1::Request,
+            policy.phase_budgets.request_millis,
+            MAX_REQUEST_BUDGET_MILLIS,
+        ),
+        (
+            ChildRuntimePhaseV1::Drain,
+            policy.phase_budgets.drain_millis,
+            MAX_DRAIN_BUDGET_MILLIS,
+        ),
+        (
+            ChildRuntimePhaseV1::Kill,
+            policy.phase_budgets.kill_millis,
+            MAX_KILL_BUDGET_MILLIS,
+        ),
+        (
+            ChildRuntimePhaseV1::Reap,
+            policy.phase_budgets.reap_millis,
+            MAX_REAP_BUDGET_MILLIS,
+        ),
+    ] {
+        if observed == 0 || observed > maximum {
+            return Err(ChildRuntimePolicyErrorV1::InvalidPhaseBudget(phase));
+        }
+    }
+
+    for (limit, observed, maximum) in [
+        (
+            ChildIoLimitV1::Stdin,
+            policy.io_limits.stdin_bytes,
+            MAX_STDIN_BYTES,
+        ),
+        (
+            ChildIoLimitV1::Stdout,
+            policy.io_limits.stdout_bytes,
+            MAX_STDOUT_BYTES,
+        ),
+        (
+            ChildIoLimitV1::Stderr,
+            policy.io_limits.stderr_bytes,
+            MAX_STDERR_BYTES,
+        ),
+        (
+            ChildIoLimitV1::Frame,
+            policy.io_limits.frame_bytes,
+            MAX_FRAME_BYTES,
+        ),
+    ] {
+        if observed == 0 || observed > maximum {
+            return Err(ChildRuntimePolicyErrorV1::InvalidIoLimit(limit));
+        }
+    }
+    if policy.io_limits.frame_bytes > policy.io_limits.stdin_bytes {
+        return Err(ChildRuntimePolicyErrorV1::FrameExceedsStreamLimit(
+            ChildIoLimitV1::Stdin,
+        ));
+    }
+    if policy.io_limits.frame_bytes > policy.io_limits.stdout_bytes {
+        return Err(ChildRuntimePolicyErrorV1::FrameExceedsStreamLimit(
+            ChildIoLimitV1::Stdout,
+        ));
+    }
+
+    if policy.process_group != ChildProcessGroupPolicyV1::Owned {
+        return Err(ChildRuntimePolicyErrorV1::ProcessGroupNotOwned);
+    }
+    if !policy.environment.clear_inherited {
+        return Err(ChildRuntimePolicyErrorV1::InheritedEnvironmentNotCleared);
+    }
+    validate_environment_projection(&policy.environment.projection)?;
+    if policy.network != ChildNetworkPolicyV1::Deny {
+        return Err(ChildRuntimePolicyErrorV1::NetworkNotDenied);
+    }
+    if policy.timeout_disposition != ChildTimeoutDispositionV1::TerminateProcessGroupAndReap {
+        return Err(ChildRuntimePolicyErrorV1::TimeoutMayAbandon);
+    }
+    Ok(())
+}
+
+fn validate_environment_projection(
+    projection: &[ChildEnvironmentVariableV1],
+) -> Result<(), ChildRuntimePolicyErrorV1> {
+    if projection.len() > MAX_ENVIRONMENT_VARIABLES {
+        return Err(ChildRuntimePolicyErrorV1::InvalidEnvironmentProjection);
+    }
+
+    let mut names = HashSet::with_capacity(projection.len());
+    let mut total_bytes = 0_usize;
+    for variable in projection {
+        if !is_environment_name(&variable.name)
+            || variable.value.0.as_bytes().contains(&0)
+            || variable.value.0.len() > MAX_ENVIRONMENT_VALUE_BYTES
+            || !names.insert(variable.name.as_str())
+        {
+            return Err(ChildRuntimePolicyErrorV1::InvalidEnvironmentProjection);
+        }
+        total_bytes = total_bytes
+            .saturating_add(variable.name.len())
+            .saturating_add(variable.value.0.len());
+        if total_bytes > MAX_ENVIRONMENT_PROJECTION_BYTES {
+            return Err(ChildRuntimePolicyErrorV1::InvalidEnvironmentProjection);
+        }
+    }
+    Ok(())
+}
+
+fn is_environment_name(name: &str) -> bool {
+    if name.is_empty() || name.len() > MAX_ENVIRONMENT_NAME_BYTES {
+        return false;
+    }
+    let mut bytes = name.bytes();
+    matches!(bytes.next(), Some(b'A'..=b'Z' | b'_'))
+        && bytes.all(|byte| byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_')
+}
+
 /// Pure admission result. Possessing it proves only that inert request facts
 /// matched host policy; it does not prove that an executable exists or that
 /// containment is available.
@@ -228,6 +548,7 @@ pub(crate) struct PreparedChildLaunchV1 {
     executable_sha256: ExecutableSha256V1,
     arguments: Vec<String>,
     working_directory: PathBuf,
+    runtime_policy: ChildRuntimePolicyV1,
 }
 
 pub(crate) fn admit_child_launch_v1(
@@ -256,6 +577,7 @@ pub(crate) fn admit_child_launch_v1(
         request.executable_sha256,
         request.arguments,
         request.working_directory,
+        request.runtime_policy,
     )?;
     if requested.executable != profile.spec.executable {
         return Err(ChildLaunchAdmissionErrorV1::AuthorityMismatch(
@@ -275,6 +597,11 @@ pub(crate) fn admit_child_launch_v1(
     if requested.working_directory != profile.spec.working_directory {
         return Err(ChildLaunchAdmissionErrorV1::AuthorityMismatch(
             AuthorityMismatchFieldV1::WorkingDirectory,
+        ));
+    }
+    if requested.runtime_policy != profile.spec.runtime_policy {
+        return Err(ChildLaunchAdmissionErrorV1::AuthorityMismatch(
+            AuthorityMismatchFieldV1::RuntimePolicy,
         ));
     }
     Ok(AdmittedChildLaunchV1 { spec: requested })
@@ -308,6 +635,7 @@ where
         executable_sha256: admitted.spec.executable_sha256,
         arguments: admitted.spec.arguments,
         working_directory: admitted.spec.working_directory,
+        runtime_policy: admitted.spec.runtime_policy,
     })
 }
 
@@ -335,7 +663,24 @@ mod tests {
         [0xab; 32]
     }
 
-    fn valid_request() -> ChildLaunchRequestV1 {
+    fn runtime_policy() -> ChildRuntimePolicyV1 {
+        ChildRuntimePolicyV1::new(
+            ChildPhaseBudgetsV1::new(5_000, 30_000, 5_000, 2_000, 5_000),
+            ChildIoLimitsV1::new(64 * 1024, 256 * 1024, 64 * 1024, 32 * 1024),
+            ChildProcessGroupPolicyV1::Owned,
+            ChildEnvironmentPolicyV1::new(
+                true,
+                vec![
+                    ChildEnvironmentVariableV1::new("LANG", "C.UTF-8"),
+                    ChildEnvironmentVariableV1::new("KITSU_EXTERNAL_TOKEN", "fixture-secret"),
+                ],
+            ),
+            ChildNetworkPolicyV1::Deny,
+            ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
+        )
+    }
+
+    fn valid_request_with_policy(policy: ChildRuntimePolicyV1) -> ChildLaunchRequestV1 {
         ChildLaunchRequestV1::new(
             CHILD_LAUNCH_REQUEST_VERSION_V1,
             ChildLaunchModeV1::Enabled,
@@ -343,17 +688,28 @@ mod tests {
             DIGEST,
             vec!["--stdio".to_string()],
             WORKING_DIRECTORY,
+            policy,
         )
     }
 
-    fn profile() -> AuthorityProfileV1 {
+    fn valid_request() -> ChildLaunchRequestV1 {
+        valid_request_with_policy(runtime_policy())
+    }
+
+    fn profile_with_policy(
+        policy: ChildRuntimePolicyV1,
+    ) -> Result<AuthorityProfileV1, ChildLaunchAdmissionErrorV1> {
         AuthorityProfileV1::exact(
             EXECUTABLE,
             DIGEST,
             vec!["--stdio".to_string()],
             WORKING_DIRECTORY,
+            policy,
         )
-        .unwrap()
+    }
+
+    fn profile() -> AuthorityProfileV1 {
+        profile_with_policy(runtime_policy()).unwrap()
     }
 
     #[derive(Default)]
@@ -430,6 +786,8 @@ mod tests {
 
     #[test]
     fn disabled_request_is_inert_even_when_every_other_field_is_invalid() {
+        let mut invalid_policy = runtime_policy();
+        invalid_policy.phase_budgets.startup_millis = 0;
         let request = ChildLaunchRequestV1::new(
             99,
             ChildLaunchModeV1::Disabled,
@@ -437,6 +795,7 @@ mod tests {
             "not-a-digest",
             vec!["bad\0argument".to_string()],
             "relative-cwd",
+            invalid_policy,
         );
         let profile = profile();
         assert_rejected_without_effects(
@@ -448,6 +807,8 @@ mod tests {
 
     #[test]
     fn authority_denial_precedes_version_or_syntax_inspection() {
+        let mut invalid_policy = runtime_policy();
+        invalid_policy.network = ChildNetworkPolicyV1::Allow;
         let request = ChildLaunchRequestV1::new(
             99,
             ChildLaunchModeV1::Enabled,
@@ -455,6 +816,7 @@ mod tests {
             "bad",
             Vec::new(),
             "relative-cwd",
+            invalid_policy,
         );
         assert_rejected_without_effects(
             request,
@@ -535,6 +897,239 @@ mod tests {
     }
 
     #[test]
+    fn every_phase_budget_is_nonzero_and_capped_before_preparation() {
+        let cases = [
+            (
+                ChildRuntimePhaseV1::Startup,
+                0,
+                MAX_STARTUP_BUDGET_MILLIS + 1,
+            ),
+            (
+                ChildRuntimePhaseV1::Request,
+                1,
+                MAX_REQUEST_BUDGET_MILLIS + 1,
+            ),
+            (ChildRuntimePhaseV1::Drain, 2, MAX_DRAIN_BUDGET_MILLIS + 1),
+            (ChildRuntimePhaseV1::Kill, 3, MAX_KILL_BUDGET_MILLIS + 1),
+            (ChildRuntimePhaseV1::Reap, 4, MAX_REAP_BUDGET_MILLIS + 1),
+        ];
+
+        for (phase, index, excessive) in cases {
+            for observed in [0, excessive] {
+                let mut policy = runtime_policy();
+                let values = [
+                    &mut policy.phase_budgets.startup_millis,
+                    &mut policy.phase_budgets.request_millis,
+                    &mut policy.phase_budgets.drain_millis,
+                    &mut policy.phase_budgets.kill_millis,
+                    &mut policy.phase_budgets.reap_millis,
+                ];
+                *values.into_iter().nth(index).unwrap() = observed;
+                let profile = profile();
+                assert_rejected_without_effects(
+                    valid_request_with_policy(policy),
+                    ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                    ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                        ChildRuntimePolicyErrorV1::InvalidPhaseBudget(phase),
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn every_io_limit_is_nonzero_and_capped_before_preparation() {
+        let cases = [
+            (ChildIoLimitV1::Stdin, 0, MAX_STDIN_BYTES + 1),
+            (ChildIoLimitV1::Stdout, 1, MAX_STDOUT_BYTES + 1),
+            (ChildIoLimitV1::Stderr, 2, MAX_STDERR_BYTES + 1),
+            (ChildIoLimitV1::Frame, 3, MAX_FRAME_BYTES + 1),
+        ];
+
+        for (limit, index, excessive) in cases {
+            for observed in [0, excessive] {
+                let mut policy = runtime_policy();
+                let values = [
+                    &mut policy.io_limits.stdin_bytes,
+                    &mut policy.io_limits.stdout_bytes,
+                    &mut policy.io_limits.stderr_bytes,
+                    &mut policy.io_limits.frame_bytes,
+                ];
+                *values.into_iter().nth(index).unwrap() = observed;
+                let profile = profile();
+                assert_rejected_without_effects(
+                    valid_request_with_policy(policy),
+                    ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                    ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                        ChildRuntimePolicyErrorV1::InvalidIoLimit(limit),
+                    ),
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn frame_limit_must_fit_both_protocol_stream_budgets() {
+        for stream in [ChildIoLimitV1::Stdin, ChildIoLimitV1::Stdout] {
+            let mut policy = runtime_policy();
+            policy.io_limits.frame_bytes = 2_048;
+            match stream {
+                ChildIoLimitV1::Stdin => policy.io_limits.stdin_bytes = 1_024,
+                ChildIoLimitV1::Stdout => policy.io_limits.stdout_bytes = 1_024,
+                ChildIoLimitV1::Stderr | ChildIoLimitV1::Frame => unreachable!(),
+            }
+            let profile = profile();
+            assert_rejected_without_effects(
+                valid_request_with_policy(policy),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                    ChildRuntimePolicyErrorV1::FrameExceedsStreamLimit(stream),
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn containment_and_cleanup_truths_are_mandatory_before_preparation() {
+        let mut inherited_group = runtime_policy();
+        inherited_group.process_group = ChildProcessGroupPolicyV1::Inherited;
+        let mut inherited_environment = runtime_policy();
+        inherited_environment.environment.clear_inherited = false;
+        let mut network_allowed = runtime_policy();
+        network_allowed.network = ChildNetworkPolicyV1::Allow;
+        let mut abandonment = runtime_policy();
+        abandonment.timeout_disposition = ChildTimeoutDispositionV1::Abandon;
+
+        for (policy, reason) in [
+            (
+                inherited_group,
+                ChildRuntimePolicyErrorV1::ProcessGroupNotOwned,
+            ),
+            (
+                inherited_environment,
+                ChildRuntimePolicyErrorV1::InheritedEnvironmentNotCleared,
+            ),
+            (network_allowed, ChildRuntimePolicyErrorV1::NetworkNotDenied),
+            (abandonment, ChildRuntimePolicyErrorV1::TimeoutMayAbandon),
+        ] {
+            let profile = profile();
+            assert_rejected_without_effects(
+                valid_request_with_policy(policy),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(reason),
+            );
+        }
+        assert_eq!(ChildNetworkPolicyV1::default(), ChildNetworkPolicyV1::Deny);
+    }
+
+    #[test]
+    fn environment_projection_is_explicit_unique_and_bounded() {
+        let mut too_many = runtime_policy();
+        too_many.environment.projection = (0..=MAX_ENVIRONMENT_VARIABLES)
+            .map(|index| ChildEnvironmentVariableV1::new(format!("KITSU_{index}"), "value"))
+            .collect();
+        let mut duplicate = runtime_policy();
+        duplicate
+            .environment
+            .projection
+            .push(ChildEnvironmentVariableV1::new("LANG", "other"));
+        let mut invalid_name = runtime_policy();
+        invalid_name.environment.projection[0].name = "BAD-NAME".to_string();
+        let mut oversized_value = runtime_policy();
+        oversized_value.environment.projection[0].value =
+            ChildEnvironmentValueV1("x".repeat(MAX_ENVIRONMENT_VALUE_BYTES + 1));
+        let mut aggregate_too_large = runtime_policy();
+        aggregate_too_large.environment.projection = (0..5)
+            .map(|index| {
+                ChildEnvironmentVariableV1::new(
+                    format!("KITSU_{index}"),
+                    "x".repeat(MAX_ENVIRONMENT_VALUE_BYTES),
+                )
+            })
+            .collect();
+        let mut nul_value = runtime_policy();
+        nul_value.environment.projection[0].value =
+            ChildEnvironmentValueV1("before\0after".to_string());
+
+        for policy in [
+            too_many,
+            duplicate,
+            invalid_name,
+            oversized_value,
+            aggregate_too_large,
+            nul_value,
+        ] {
+            let profile = profile();
+            assert_rejected_without_effects(
+                valid_request_with_policy(policy),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                    ChildRuntimePolicyErrorV1::InvalidEnvironmentProjection,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn host_profile_rejects_an_invalid_runtime_policy_without_observation() {
+        let mut policy = runtime_policy();
+        policy.phase_budgets.reap_millis = 0;
+        assert_eq!(
+            profile_with_policy(policy),
+            Err(ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                ChildRuntimePolicyErrorV1::InvalidPhaseBudget(ChildRuntimePhaseV1::Reap)
+            ))
+        );
+    }
+
+    #[test]
+    fn every_valid_runtime_policy_fact_requires_an_exact_authority_match() {
+        let mut changed_budget = runtime_policy();
+        changed_budget.phase_budgets.request_millis += 1;
+        let mut changed_limit = runtime_policy();
+        changed_limit.io_limits.frame_bytes += 1;
+        let mut changed_value = runtime_policy();
+        changed_value.environment.projection[1].value =
+            ChildEnvironmentValueV1("different-secret".to_string());
+        let mut changed_order = runtime_policy();
+        changed_order.environment.projection.reverse();
+
+        for authority_policy in [changed_budget, changed_limit, changed_value, changed_order] {
+            let profile = profile_with_policy(authority_policy).unwrap();
+            assert_rejected_without_effects(
+                valid_request(),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::AuthorityMismatch(
+                    AuthorityMismatchFieldV1::RuntimePolicy,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn environment_values_are_redacted_from_all_debug_projections() {
+        let request = valid_request();
+        let profile = profile();
+        let mut probe = EffectProbe::successful();
+        let prepared = prepare_child_launch_request_v1(
+            request.clone(),
+            ChildLaunchAuthorityDecisionV1::Admit(&profile),
+            &mut probe,
+        )
+        .unwrap();
+
+        for projection in [
+            format!("{request:?}"),
+            format!("{profile:?}"),
+            format!("{prepared:?}"),
+        ] {
+            assert!(projection.contains("KITSU_EXTERNAL_TOKEN"));
+            assert!(projection.contains("[REDACTED]"));
+            assert!(!projection.contains("fixture-secret"));
+        }
+    }
+
+    #[test]
     fn every_authority_mismatch_is_inert() {
         let cases = [
             (
@@ -543,6 +1138,7 @@ mod tests {
                     DIGEST,
                     vec!["--stdio".to_string()],
                     WORKING_DIRECTORY,
+                    runtime_policy(),
                 )
                 .unwrap(),
                 AuthorityMismatchFieldV1::Executable,
@@ -553,6 +1149,7 @@ mod tests {
                     "cdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcdcd",
                     vec!["--stdio".to_string()],
                     WORKING_DIRECTORY,
+                    runtime_policy(),
                 )
                 .unwrap(),
                 AuthorityMismatchFieldV1::ExecutableSha256,
@@ -563,6 +1160,7 @@ mod tests {
                     DIGEST,
                     vec!["--different".to_string()],
                     WORKING_DIRECTORY,
+                    runtime_policy(),
                 )
                 .unwrap(),
                 AuthorityMismatchFieldV1::Arguments,
@@ -573,6 +1171,7 @@ mod tests {
                     DIGEST,
                     vec!["--stdio".to_string()],
                     "/tmp/other",
+                    runtime_policy(),
                 )
                 .unwrap(),
                 AuthorityMismatchFieldV1::WorkingDirectory,

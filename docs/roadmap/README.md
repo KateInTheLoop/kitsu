@@ -716,6 +716,7 @@ gates merely because a card appears attractive.
 | 105 | E06-S01-C2 | Own one single-use prepared child through causal ready/start/running/draining/terminal truth, joined natural exit, idempotent shutdown, and typed cleanup residue |
 | 106 | E08-S05-C1 | Type one presentation-neutral current-session status, context, usage, and cost snapshot whose every value carries bounded truth and provenance |
 | 107 | E06-S02-C3 | Publish complete validated external inventories through exact source-lifetime/revision fences with atomic successor, replacement, and withdrawal truth |
+| 108 | E06-S01-C3 | Bind exact bounded phase, I/O, process-group, environment, network, and timeout/reap policy into request, host authority, and prepared child identity |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -936,6 +937,14 @@ replacement and withdrawal require an exact fence for the currently published
 source lifetime and revision. Every refusal preserves the same borrowed old
 snapshot, while success swaps the whole boxed value once. No handler registry,
 child, transport, MCP, configuration, or product path consumes the owner yet.
+Cycle 108 makes the prepared child proof retain one exact runtime policy shared
+with its host authority profile. Five non-zero phase budgets and four non-zero
+I/O ceilings are independently capped; a frame must fit both protocol stream
+budgets. The environment is clear-only with a bounded, ordered, unique literal
+projection whose values are redacted from debug output. Owned process group,
+denied network, and terminate-group-then-reap timeout disposition are mandatory.
+Validation remains inert and unmounted: no process backend enforces the policy
+yet, and the card does not claim containment from the typed values alone.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
