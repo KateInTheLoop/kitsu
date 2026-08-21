@@ -243,7 +243,17 @@ kernel.
   identity, activation, and session evidence plus the closed save API. Existing
   identity/physical mismatches and corrupt identity bytes are never repaired;
   exact create, save, drop, and reopen preserve one binding. Product persistence
-  remains current-v1 because no product constructor calls this factory.
+  remains current-v1 because no product constructor calls this factory. Cycle
+  094 makes `ActiveSessionStore` a closed current-v1/bound-local sum. A private
+  constructor can retain the bound local owner, stable id/name staging, and
+  sessions root. Its current representation maps snapshot commits and
+  installed-unconfirmed warnings back to the exact existing product contract.
+  Its canonical representation explicitly refuses legacy snapshot save, rename,
+  reset, and sidecar artifact routing before effects. Artifact-path and rename
+  calls are fallible so no canonical state can masquerade as current-v1. Both
+  lock domains remain held until the active owner drops. Public create and
+  resume constructors still build only the current-v1 variant, so this cycle
+  changes no product persistence route.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

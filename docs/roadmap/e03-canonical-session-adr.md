@@ -799,6 +799,20 @@ cannot weaken or replace any backend-neutral assertion.
    save and exact reopen prove the same identity on both records. This owner is
    still private and no production constructor selects it; the next boundary
    must place it beneath `ActiveSessionStore` without creating a second route.
+   **Closed production-owner variant complete in Cycle 094:** the existing
+   `ActiveSessionStore` is now a closed current-v1/bound-local sum with one
+   private bound constructor. The bound variant retains the Cycle 093 owner,
+   stable session identity/name staging, and sessions root. Current-bound saves
+   preserve exact `SnapshotCommit` behavior and turn a directory-sync warning
+   back into the existing installed-commit error instead of claiming success.
+   Canonical-bound rename, reset, legacy sidecar allocation, and snapshot save
+   refuse explicitly and leave selected HEAD unchanged. Artifact routing and
+   rename became fallible at this boundary so callers cannot infer a legacy path
+   for canonical state. Both fences release only when the active owner drops.
+   Public create and resume constructors remain current-v1, and their parity
+   fixture still creates no composition or physical namespace. Before routing
+   can switch, a private constructor must return the exact selected resume value
+   with this owner so callers cannot retain a stale pre-activation snapshot.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

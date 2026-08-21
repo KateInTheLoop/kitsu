@@ -6374,9 +6374,10 @@ fn artifact_directory_for_boundary(
     if !enabled {
         return Ok(None);
     }
-    let base = store
-        .map(session::ActiveSessionStore::artifacts_dir)
-        .unwrap_or_else(|| stateless_base.to_path_buf());
+    let base = match store {
+        Some(store) => store.artifacts_dir()?,
+        None => stateless_base.to_path_buf(),
+    };
     allocator.allocate(&base).map(Some)
 }
 
@@ -14404,7 +14405,9 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 "another session is already named '{requested_name}' — pick a different --name or rename it via `kitsu sessions rename`"
             )));
         }
-        store.set_name(Some(requested_name.to_string()));
+        store
+            .set_name(Some(requested_name.to_string()))
+            .map_err(CliError::user)?;
         eprintln!("~ session name: {}", terminal_inline(requested_name));
     }
     let mode = if cli.dangerously_skip_permissions || cli.dangerously_allow_all_filesystem {

@@ -6,6 +6,7 @@
 
 use std::ffi::OsStr;
 use std::io::Read;
+use std::path::{Path, PathBuf};
 
 use kitsu_core::session::{
     LogicalHead, RevisionId, SessionCommitOutcome, SessionId, SessionLookupState, StoreId,
@@ -214,6 +215,7 @@ pub(super) struct SessionLiveStoreV1 {
 /// extracted, so the identity, selected value, and both fences share a lifetime.
 #[derive(Debug)]
 pub(super) struct LocalSessionLiveStoreV1 {
+    sessions_dir: PathBuf,
     identity: LocalStoreIdentityReceiptV1,
     live: SessionLiveStoreV1,
 }
@@ -271,6 +273,10 @@ impl SessionLiveStoreV1 {
 }
 
 impl LocalSessionLiveStoreV1 {
+    pub(super) fn sessions_dir(&self) -> &Path {
+        &self.sessions_dir
+    }
+
     pub(super) fn identity_receipt(&self) -> &LocalStoreIdentityReceiptV1 {
         &self.identity
     }
@@ -400,6 +406,10 @@ impl CurrentV1MountSaveReceiptV1 {
 
     pub(super) fn durability_warning(&self) -> Option<&str> {
         self.durability_warning.as_deref()
+    }
+
+    pub(super) fn into_parts(self) -> (SnapshotCommit, Option<String>) {
+        (self.commit, self.durability_warning)
     }
 }
 
@@ -895,7 +905,11 @@ pub(super) fn activate_local_session_live_store_v1(
     if live.receipt().store() != identity.store_id() {
         return Err(LocalSessionLiveStoreActivationErrorV1::IdentityBindingMismatch);
     }
-    Ok(LocalSessionLiveStoreV1 { identity, live })
+    Ok(LocalSessionLiveStoreV1 {
+        sessions_dir: session_root.path.clone(),
+        identity,
+        live,
+    })
 }
 
 fn observe_current_v1(
