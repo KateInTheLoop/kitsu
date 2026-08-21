@@ -711,6 +711,7 @@ gates merely because a card appears attractive.
 | 100 | E03-S02-C41 | Stage an exact bound-current in-process target and swap the active owner only after every fallible precommit step |
 | 101 | E06-S02-C1 | Freeze one non-cloneable request inventory that owns exact descriptor order and immutable handler identities through provider response execution |
 | 102 | E06-S01-C1 | Admit one exact versioned child identity and containment preflight only after disabled, denied, malformed, and authority-mismatched requests fail without host effects |
+| 103 | E06-S03-C1 | Decode and emit bounded newline JSON-RPC through one pinned, one-request-at-a-time initialize/list/call state machine that rejects every ambient MCP capability |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -889,6 +890,14 @@ bounded literal argv before executable canonicalization, hashing, or
 containment preflight may occur. Disabled and denied entries fail first. The
 prepared result remains unspawned: there is no process API, configuration
 surface, runtime composition, or new product authority in this cycle.
+Cycle 103 adds a pure tools-only MCP codec. It pins revision `2025-11-25`,
+advertises no client capabilities, requires only a non-changing server tools
+capability, and admits just initialize/initialized, tools/list, and tools/call
+with one positive integer request ID in flight. Newline framing is explicitly
+bounded and fail-stop. The codec returns raw list/call results only after
+envelope validation; later inventory work owns descriptor validation and
+publication. It still owns no process, transport, deadline, configuration,
+inventory, or product route.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

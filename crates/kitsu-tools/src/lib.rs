@@ -4,6 +4,7 @@
 
 pub mod builtins;
 pub mod error;
+pub mod mcp_codec;
 pub mod permissions;
 
 // E06 begins with a private, provider-free admission boundary. Later cards
