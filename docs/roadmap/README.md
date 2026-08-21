@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C26,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C27,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -691,6 +691,7 @@ gates merely because a card appears attractive.
 | 083 | E03-S02-C24 | Retain exactly one admitted current-v1 or verified canonical value from the same observation without a second path read |
 | 084 | E03-S02-C25 | Derive a revision/HEAD-bound artifact-free resume value from exact selected ancestry without changing production routing |
 | 085 | E03-S02-C26 | Own legacy and canonical fences while revalidating the exact selected canonical value before activation |
+| 086 | E03-S02-C27 | Initialize the canonical lock domain through the pinned root and dual-fence exact current-v1 activation |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -782,8 +783,12 @@ bearing history refuses because the current resume DTO cannot preserve its
 immutable identity. Cycle 085 adds fence-bound canonical activation: it owns the
 legacy lease and canonical fence in one order, keeps the store descriptor-pinned,
 rechecks current-v1 absence, and accepts only the same fully verified canonical
-payload. Cycle 086 next defines the corresponding current-v1 dual-domain
-activation before any production route changes, then continues through E03,
+payload. Cycle 086 adds corresponding current-v1 activation: under the legacy
+lease it exclusively initializes or strictly adopts the canonical store, owns
+that fence, rechecks exact current bytes, and requires canonical HEAD absence.
+Partial concurrent stores refuse without repair. Cycle 087 next unifies both
+activation variants behind one total owner before any production route changes,
+then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

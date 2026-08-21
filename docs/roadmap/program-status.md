@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C26, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C27, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 85 / 85 |
+| Accepted cycles/commits after this cycle | 86 / 86 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C27 (Cycle 086) — define dual-domain current-v1 activation before production routing |
+| Active epic/card | E03 / E03-S02-C28 (Cycle 087) — unify both exact activation variants before production routing |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C26, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact lineage, recovery, and branch publication/retry. One pinned-root mount selection retains exact current bytes/parsed snapshot or a verified canonical payload. Pure canonical projection follows selected ancestry and refuses lossy artifacts. Canonical activation owns the legacy lease and canonical fence plus pinned store, then rechecks current absence and full canonical equality before exposing context. No session bytes or authority change. Current-v1 dual-domain activation, production routing, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C27, E03-S05 through C4 | Current-v1 behavior remains unchanged. Pinned selection retains exact current or verified canonical value. Each activation owns the legacy lease, canonical fence, and pinned store. Canonical rechecks current absence/full equality; current exclusively initializes or strictly adopts the canonical domain, byte-compares current, and requires HEAD absence. Partial/raced state refuses without repair; no session truth or authority changes. A unified activation owner, production routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -121,7 +121,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 082 | `f72d483` | Pinned mutation-free dual-representation observation |
 | 083 | `206ecd4` | Exact single-pass selected session value |
 | 084 | `b527552` | Pure revision/HEAD-bound canonical resume projection |
-| 085 | this document's commit | Dual-fenced exact canonical activation revalidation |
+| 085 | `dfcfc26` | Dual-fenced exact canonical activation revalidation |
+| 086 | this document's commit | Pinned dual-fenced exact current-v1 activation |
 
 ## Current green gates
 
@@ -531,6 +532,13 @@ A newly published HEAD, corrupt payload replacement, newly present current-v1
 snapshot, wrong/missing store, or busy fence refuses. Cycle 086 next supplies
 the corresponding two-domain current-v1 activation; production routes still do
 not consume either private activation.
+Cycle 086 acquires the legacy lease, exclusively initializes the missing
+canonical namespace relative to the pinned root (or strictly verifies a complete
+concurrent store), then owns the canonical fence. It byte-compares the selected
+current snapshot and requires canonical HEAD absence. Valid current replacement,
+canonical publication, partial/wrong store, lock contention, and ancestor
+retargeting fail closed without repair or session-byte changes. Cycle 087 next
+normalizes both private variants into one activation owner before live routing.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
