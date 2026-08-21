@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C27, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C28, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 86 / 86 |
+| Accepted cycles/commits after this cycle | 87 / 87 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C28 (Cycle 087) — unify both exact activation variants before production routing |
+| Active epic/card | E03 / E03-S02-C29 (Cycle 088) — transfer activation into a representation-aware live-store boundary |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C27, E03-S05 through C4 | Current-v1 behavior remains unchanged. Pinned selection retains exact current or verified canonical value. Each activation owns the legacy lease, canonical fence, and pinned store. Canonical rechecks current absence/full equality; current exclusively initializes or strictly adopts the canonical domain, byte-compares current, and requires HEAD absence. Partial/raced state refuses without repair; no session truth or authority changes. A unified activation owner, production routing, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C28, E03-S05 through C4 | Current-v1 behavior remains unchanged. Pinned selection and dual-fenced revalidation feed one boxed total activation owner. It exposes borrowed resume data plus exact store/session/source and canonical revision/HEAD receipt; empty/rejected evidence is effect-free and concrete faults stay typed. Partial/raced state refuses without repair; no session truth or authority changes. Live-store/save ownership, production routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -122,7 +122,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 083 | `206ecd4` | Exact single-pass selected session value |
 | 084 | `b527552` | Pure revision/HEAD-bound canonical resume projection |
 | 085 | `dfcfc26` | Dual-fenced exact canonical activation revalidation |
-| 086 | this document's commit | Pinned dual-fenced exact current-v1 activation |
+| 086 | `232c611` | Pinned dual-fenced exact current-v1 activation |
+| 087 | this document's commit | Total lock-owning activation and exact source receipt |
 
 ## Current green gates
 
@@ -539,6 +540,13 @@ current snapshot and requires canonical HEAD absence. Valid current replacement,
 canonical publication, partial/wrong store, lock contention, and ancestor
 retargeting fail closed without repair or session-byte changes. Cycle 087 next
 normalizes both private variants into one activation owner before live routing.
+Cycle 087 provides that total dispatcher. Current and canonical activations are
+boxed under one owner that exposes only borrowed resume data and an exact store/
+session/source receipt; canonical receipts include revision and selected HEAD.
+Empty and rejected selections return their original typed evidence without
+effects, and concrete activation failures remain nested. Both fences stay owned
+until the total activation drops. Cycle 088 next transfers this owner into a
+representation-aware live-store/save boundary; production remains unchanged.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
