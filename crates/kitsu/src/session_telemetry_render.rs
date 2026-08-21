@@ -104,6 +104,17 @@ pub(crate) fn render_current_session_usage(
     render_sections(vec![usage], options)
 }
 
+pub(crate) fn render_current_session_context(
+    snapshot: &CurrentSessionSnapshot,
+    options: TelemetryDeckOptions,
+) -> String {
+    let context = sections(snapshot, None, options.destination.styled())
+        .into_iter()
+        .nth(1)
+        .expect("current-session telemetry always has a context section");
+    render_sections(vec![context], options)
+}
+
 fn render_sections(sections: Vec<Section>, options: TelemetryDeckOptions) -> String {
     if !options.destination.styled() {
         return render_plain(&sections);
@@ -658,8 +669,9 @@ fn context_window_source_label(value: kitsu_core::ContextWindowSource) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::{
-        render_current_session_usage, render_current_status_observation, CurrentStatusObservation,
-        TelemetryDeckDestination, TelemetryDeckOptions,
+        render_current_session_context, render_current_session_usage,
+        render_current_status_observation, CurrentStatusObservation, TelemetryDeckDestination,
+        TelemetryDeckOptions,
     };
     use kitsu_core::{
         ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
@@ -762,6 +774,20 @@ mod tests {
         columns: usize,
     ) -> String {
         render_current_session_usage(
+            snapshot,
+            TelemetryDeckOptions {
+                destination,
+                columns,
+            },
+        )
+    }
+
+    fn render_context(
+        snapshot: &CurrentSessionSnapshot,
+        destination: TelemetryDeckDestination,
+        columns: usize,
+    ) -> String {
+        render_current_session_context(
             snapshot,
             TelemetryDeckOptions {
                 destination,
@@ -1000,5 +1026,53 @@ mod tests {
                 assert_lines_fit(&output, columns);
             }
         }
+    }
+
+    #[test]
+    fn context_only_mount_reuses_every_adaptive_and_accessible_destination() {
+        let snapshot = snapshot(SessionCostInput::unavailable());
+        for columns in [24, 40, 60, 80, 120] {
+            let output =
+                render_context(&snapshot, TelemetryDeckDestination::StyledTerminal, columns);
+            let plain = kitsu_render::sanitize_terminal_text(&output);
+            assert!(plain.contains("context"), "{plain}");
+            assert!(plain.contains("12,345"), "{plain}");
+            assert!(plain.contains("40%"), "{plain}");
+            assert!(!plain.contains("[status]"), "{plain}");
+            assert!(!plain.contains("[usage]"), "{plain}");
+            assert!(!plain.contains("status.adapter"), "{plain}");
+            assert!(!plain.contains("usage.prompt tokens"), "{plain}");
+            assert_lines_fit(&output, columns);
+        }
+
+        let expected = render_context(&snapshot, TelemetryDeckDestination::Redirected, 24);
+        for destination in [
+            TelemetryDeckDestination::Redirected,
+            TelemetryDeckDestination::Plain,
+            TelemetryDeckDestination::NoColor,
+            TelemetryDeckDestination::ScreenReader,
+        ] {
+            for columns in [24, 120] {
+                let output = render_context(&snapshot, destination, columns);
+                assert_eq!(output, expected, "{destination:?} changed at {columns}");
+                assert!(!output.contains('\u{1b}'), "{output}");
+                assert!(output.is_ascii(), "fixture output must be ASCII: {output}");
+            }
+        }
+        assert!(expected.contains("[context]"), "{expected}");
+        assert!(
+            expected.contains("context.window tokens: 32,768"),
+            "{expected}"
+        );
+        assert!(
+            expected.contains("authoritative; context window: gateway profile"),
+            "{expected}"
+        );
+        assert!(
+            expected.contains("context.available tokens: 18,375"),
+            "{expected}"
+        );
+        assert!(!expected.contains("[status]"), "{expected}");
+        assert!(!expected.contains("[usage]"), "{expected}");
     }
 }
