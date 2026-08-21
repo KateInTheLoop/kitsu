@@ -161,6 +161,27 @@ enum BoundActiveSessionResumeErrorV1 {
     SelectionIdentityMismatch,
 }
 
+#[derive(Debug)]
+#[allow(dead_code)]
+struct ProductWritableBoundResumeV1 {
+    resume: ActiveSessionResume,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum ProductWritableBoundResumeAdmissionErrorV1 {
+    Activation(BoundActiveSessionResumeErrorV1),
+    OwnerInUse,
+    CanonicalOperationWriterUnavailable,
+}
+
+#[allow(dead_code)]
+impl ProductWritableBoundResumeV1 {
+    fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
+        (self.resume.store, self.resume.saved)
+    }
+}
+
 /// Evidence for one atomically installed session snapshot. On Unix the file
 /// descriptor is the exact inode created by the commit and remains valid even
 /// if another same-user process immediately renames, hard-links, or unlinks the
@@ -3257,6 +3278,37 @@ fn activate_bound_session_resume_v1(
     Ok(resume)
 }
 
+#[allow(dead_code)]
+fn admit_product_writable_bound_resume_v1(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
+    let resume = activate_bound_session_resume_v1(sessions_dir, session_id)
+        .map_err(ProductWritableBoundResumeAdmissionErrorV1::Activation)?;
+    let source = match &resume.store.inner {
+        ActiveSessionStoreInner::CurrentV1(_) => {
+            return Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(
+                BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch,
+            ));
+        }
+        ActiveSessionStoreInner::BoundLocal(store) => store
+            .live
+            .try_borrow()
+            .map_err(|_| ProductWritableBoundResumeAdmissionErrorV1::OwnerInUse)?
+            .activation_receipt()
+            .source()
+            .clone(),
+    };
+    match source {
+        mount::SessionMountActivatedSourceV1::CurrentV1 => {
+            Ok(ProductWritableBoundResumeV1 { resume })
+        }
+        mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+            Err(ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable)
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -5200,5 +5252,109 @@ mod tests {
         assert!(error.contains("explicit product admission"));
         drop(competing.acquire_writer_fence(&session_id).unwrap());
         drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_returns_only_current_v1_and_saves_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("bound product source")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        let admitted = admit_product_writable_bound_resume_v1(&dir, &id).unwrap();
+        let (active, saved) = admitted.into_parts();
+        assert_eq!(active.id(), saved.id);
+        assert_eq!(saved.messages, [ChatMessage::user("bound product source")]);
+        active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("bound product successor")],
+            )
+            .unwrap();
+        let exact = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(exact.gateway, "gateway-b");
+        assert_eq!(exact.model, "model-b");
+        assert_eq!(
+            exact.messages,
+            [ChatMessage::user("bound product successor")]
+        );
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+        let directory = PrivateDirectory::open(&dir, "bound product fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_rejects_canonical_and_releases_both_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound product canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-product-canonical").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T11:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T11:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("product-canonical".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical product source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-product-canonical").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        assert!(matches!(
+            admit_product_writable_bound_resume_v1(&dir, session_id.as_str()),
+            Err(ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable)
+        ));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn product_writable_bound_admission_keeps_missing_state_effect_free() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        std::fs::create_dir(&dir).unwrap();
+        assert!(matches!(
+            admit_product_writable_bound_resume_v1(&dir, "session-missing"),
+            Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(_))
+        ));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 }
