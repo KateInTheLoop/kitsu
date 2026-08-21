@@ -1,4 +1,4 @@
-//! Read-only workspace inspection used by `/diff`, `/review`, and `/status`.
+//! Read-only workspace inspection used by `/diff` and `/review`.
 //!
 //! Git is invoked directly (never through a shell) and every command is scoped
 //! to the current repository. Model-authored diff text is not evidence; this
@@ -27,14 +27,6 @@ fn cap_diff(diff: &mut String) -> bool {
     diff.truncate(boundary);
     diff.push_str(DIFF_TRUNCATION_MARKER);
     true
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct WorkspaceStatus {
-    pub root: PathBuf,
-    pub branch: String,
-    pub changed: usize,
-    pub untracked: usize,
 }
 
 /// Verified evidence scope for `/diff`, `/review`, and future noninteractive
@@ -158,29 +150,6 @@ pub fn pathspec_from_directory(
         relative.to_string_lossy().to_string()
     };
     Ok(Some(pathspec))
-}
-
-pub fn status(start: &Path) -> Option<WorkspaceStatus> {
-    let root = repository_root(start).ok()?;
-    let branch = git(&root, &["branch", "--show-current"])
-        .ok()
-        .and_then(|output| stdout(output, "read the branch").ok())
-        .filter(|branch| !branch.is_empty())
-        .unwrap_or_else(|| "detached".to_string());
-    let porcelain = git(
-        &root,
-        &["status", "--porcelain=v1", "--untracked-files=all"],
-    )
-    .ok()
-    .and_then(|output| stdout(output, "read status").ok())?;
-    let lines: Vec<_> = porcelain.lines().collect();
-    let untracked = lines.iter().filter(|line| line.starts_with("?? ")).count();
-    Some(WorkspaceStatus {
-        root,
-        branch,
-        changed: lines.len(),
-        untracked,
-    })
 }
 
 fn append_untracked(diff: &mut String, root: &Path, relative: &Path) {
@@ -860,10 +829,6 @@ mod tests {
         assert!(rendered.contains("+new"));
         assert!(rendered.contains("new file (untracked)"));
         assert!(rendered.contains("+hello"));
-
-        let state = status(repo.path()).unwrap();
-        assert_eq!(state.changed, 2);
-        assert_eq!(state.untracked, 1);
     }
 
     #[test]

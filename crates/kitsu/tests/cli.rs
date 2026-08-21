@@ -13262,9 +13262,9 @@ fn test_project_context_source_is_disclosed_and_can_be_disabled() {
     disabled
         .assert()
         .success()
-        .stderr(predicate::str::contains(
-            "project ctx  disabled / not found",
-        ))
+        .stderr(predicate::str::contains("status.adapter:"))
+        .stderr(predicate::str::contains("context.window tokens:"))
+        .stderr(predicate::str::contains("project ctx").not())
         .stderr(predicate::str::contains("loaded project context from").not());
 }
 
@@ -14242,8 +14242,8 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
     .expect("join");
 }
 
-/// `/status` and `/permissions` expose the live session without making a model
-/// request, including the selected gateway (not an ambiguous "default" label).
+/// `/status` and `/permissions` expose typed route and authority facts without
+/// making a model request.
 #[tokio::test]
 #[serial]
 async fn test_status_and_permissions_slash_commands() {
@@ -14275,16 +14275,15 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
         cmd.args(["--gateway", "example", "chat", "--script", &script_str]);
         cmd.assert()
             .success()
-            .stderr(predicate::str::contains("session:"))
-            .stderr(predicate::str::contains("gateway      example"))
-            .stderr(predicate::str::contains("model        test-model"))
             .stderr(predicate::str::contains(
-                "provider     openai_compatible | generation 1",
+                "status.adapter: openai_compatible",
             ))
+            .stderr(predicate::str::contains("status.model: test-model"))
+            .stderr(predicate::str::contains("status.generation: 1"))
             .stderr(predicate::str::contains(
-                "wire         openai_chat_completions_v1",
+                "status.wire revision: openai_chat_completions_v1",
             ))
-            .stderr(predicate::str::contains("context"))
+            .stderr(predicate::str::contains("context.occupancy:"))
             .stderr(predicate::str::contains("permissions:"))
             .stderr(predicate::str::contains("mode         deny"))
             .stderr(predicate::str::contains("read roots   none"))
@@ -14292,6 +14291,217 @@ auth = { method = "bearer-env", env = "ANTHROPIC_AUTH_TOKEN" }
     })
     .await
     .expect("join");
+}
+
+/// A redirected `/status` is a local observation only: it renders the typed
+/// deck without terminal escapes and cannot turn into a provider request.
+#[tokio::test]
+#[serial]
+async fn test_status_redirected_deck_is_offline_and_includes_runtime_identity() {
+    use wiremock::MockServer;
+
+    let server = MockServer::start().await;
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("status.txt");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+    let home_path = home.path().to_path_buf();
+
+    let output = tokio::task::spawn_blocking(move || {
+        base_cmd(&home_path)
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .current_dir(&home_path)
+            .args([
+                "--gateway",
+                "example",
+                "chat",
+                "--no-session",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("redirected status")
+    })
+    .await
+    .expect("join redirected status");
+
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stdout.is_empty(), "{output:?}");
+    let text = String::from_utf8(output.stderr).unwrap();
+    assert!(!text.contains('\u{1b}'), "{text}");
+    for required in [
+        "status.version:",
+        "status.cwd:",
+        "status.adapter: openai_compatible",
+        "status.model: example-model-v1",
+        "status.generation: 1",
+        "status.run:",
+        "status.authority: deny",
+        "context.occupancy:",
+        "usage.coverage:",
+    ] {
+        assert!(text.contains(required), "missing {required:?}: {text}");
+    }
+    assert!(
+        text.contains(home.path().to_string_lossy().as_ref()),
+        "cwd missing from typed deck: {text}"
+    );
+    for unavailable_account_fact in ["email", "credits", "rate limit", "price"] {
+        assert!(
+            !text.to_ascii_lowercase().contains(unavailable_account_fact),
+            "invented {unavailable_account_fact}: {text}"
+        );
+    }
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "/status sent a provider request"
+    );
+}
+
+#[test]
+#[serial]
+fn test_status_rejects_nonempty_arguments_with_registered_syntax() {
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("status-args.txt");
+    fs::write(&script, "/status unexpected\n").unwrap();
+
+    base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .assert()
+        .failure()
+        .code(1)
+        .stderr(predicate::str::contains("usage: /status"))
+        .stderr(predicate::str::contains("status.adapter:").not());
+}
+
+#[cfg(unix)]
+#[test]
+#[serial]
+fn test_status_styled_deck_uses_narrow_layout_on_a_thirty_two_column_pty() {
+    use std::io::Read as _;
+    use std::os::fd::FromRawFd as _;
+    use std::process::Stdio;
+    use std::time::{Duration, Instant};
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("narrow-status.txt");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+
+    let mut master = -1;
+    let mut slave = -1;
+    let size = libc::winsize {
+        ws_row: 40,
+        ws_col: 32,
+        ws_xpixel: 0,
+        ws_ypixel: 0,
+    };
+    // SAFETY: output pointers and the initialized winsize remain valid for the
+    // call; openpty initializes both descriptors on success.
+    assert_eq!(
+        unsafe {
+            libc::openpty(
+                &mut master,
+                &mut slave,
+                std::ptr::null_mut(),
+                std::ptr::null(),
+                &size,
+            )
+        },
+        0,
+        "allocate narrow status PTY"
+    );
+    // SAFETY: the live master descriptor remains owned by this test.
+    let flags = unsafe { libc::fcntl(master, libc::F_GETFL) };
+    assert!(flags >= 0);
+    assert_eq!(
+        unsafe { libc::fcntl(master, libc::F_SETFL, flags | libc::O_NONBLOCK) },
+        0
+    );
+
+    let mut command = std::process::Command::new(assert_cmd::cargo::cargo_bin!("kitsu"));
+    command
+        .env("HOME", home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .env("KITSU_NO_PROJECT_CONTEXT", "1")
+        .env("TERM", "xterm-256color")
+        .env_remove("ANTHROPIC_TOKEN_EXPIRES")
+        .env_remove("NO_COLOR")
+        .env_remove("KITSU_PLAIN")
+        .env_remove("KITSU_SCREEN_READER")
+        .current_dir(home.path())
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        // SAFETY: ownership of the live slave descriptor transfers once.
+        .stderr(unsafe { Stdio::from_raw_fd(slave) })
+        .args([
+            "--gateway",
+            "example",
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+    let mut child = command.spawn().expect("spawn narrow status script");
+    // SAFETY: ownership of the remaining master descriptor transfers once.
+    let mut terminal = unsafe { fs::File::from_raw_fd(master) };
+    let mut output = Vec::new();
+    let deadline = Instant::now() + Duration::from_secs(8);
+    let status = loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => {}
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {}
+            Err(error) if error.raw_os_error() == Some(libc::EIO) => {}
+            Err(error) => panic!("read narrow status PTY: {error}"),
+        }
+        if let Some(status) = child.try_wait().expect("poll narrow status script") {
+            break status;
+        }
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            panic!(
+                "narrow status script timed out: {}",
+                String::from_utf8_lossy(&output)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(10));
+    };
+    loop {
+        let mut buffer = [0_u8; 4096];
+        match terminal.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(read) => output.extend_from_slice(&buffer[..read]),
+            Err(error)
+                if error.kind() == std::io::ErrorKind::WouldBlock
+                    || error.raw_os_error() == Some(libc::EIO) =>
+            {
+                break;
+            }
+            Err(error) => panic!("drain narrow status PTY: {error}"),
+        }
+    }
+
+    let text = kitsu_render::sanitize_terminal_text(&String::from_utf8_lossy(&output));
+    assert!(status.success(), "{text}");
+    for required in ["[status]", "version", "cwd", "[context]", "[usage]"] {
+        assert!(text.contains(required), "missing {required:?}: {text}");
+    }
+    assert!(
+        !text.contains("git          "),
+        "legacy Git formatter mounted: {text}"
+    );
 }
 
 #[test]
@@ -14404,6 +14614,185 @@ fn test_jsonl_script_query_results_are_structured_and_framed() {
         .count();
     assert_eq!(started, 10);
     assert_eq!(finished, started, "every slash frame must close");
+}
+
+#[test]
+#[serial]
+fn test_status_jsonl_keeps_legacy_shape_and_uses_the_same_typed_observation() {
+    fn sorted_keys(value: &serde_json::Value) -> Vec<String> {
+        let mut keys = value
+            .as_object()
+            .expect("JSONL status member is an object")
+            .keys()
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.sort();
+        keys
+    }
+
+    fn assert_keys(value: &serde_json::Value, expected: &[&str]) {
+        let mut expected = expected
+            .iter()
+            .map(|key| (*key).to_string())
+            .collect::<Vec<_>>();
+        expected.sort();
+        assert_eq!(sorted_keys(value), expected);
+    }
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), "http://127.0.0.1:1");
+    let script = home.path().join("status-jsonl.txt");
+    fs::write(&script, "/status\n/quit\n").unwrap();
+    let output = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .current_dir(home.path())
+        .args([
+            "--gateway",
+            "example",
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("JSONL status observation");
+    assert!(output.status.success(), "{output:?}");
+    assert!(output.stderr.is_empty(), "{output:?}");
+
+    let events = String::from_utf8(output.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+        .collect::<Vec<_>>();
+    let status = &events
+        .iter()
+        .find(|event| event["type"] == "command_result" && event["result"]["kind"] == "status")
+        .expect("status command result")["result"];
+
+    assert_keys(
+        status,
+        &[
+            "agents",
+            "artifact_policy",
+            "commands",
+            "compaction",
+            "context",
+            "conversation",
+            "kind",
+            "permissions",
+            "provider_route",
+            "session",
+            "text",
+            "tools",
+            "version",
+        ],
+    );
+    assert_keys(
+        &status["session"],
+        &[
+            "auth_status",
+            "autosave_dirty",
+            "autosave_enabled",
+            "config_path",
+            "cwd",
+            "endpoint",
+            "gateway",
+            "id",
+            "model",
+            "project_context",
+            "reasoning_effort",
+            "state_dir",
+        ],
+    );
+    assert_keys(
+        &status["context"],
+        &[
+            "cache",
+            "configured_window",
+            "discovery",
+            "effective",
+            "remaining",
+            "source",
+            "used",
+            "window",
+        ],
+    );
+    assert_keys(
+        &status["conversation"],
+        &["assistant_turns", "messages", "tool_results", "user_turns"],
+    );
+    assert_keys(
+        &status["compaction"],
+        &[
+            "exchanges_removed",
+            "runs",
+            "tokens_saved",
+            "tool_results_elided",
+        ],
+    );
+    assert_keys(&status["tools"], &["count", "names"]);
+    assert_keys(
+        &status["permissions"],
+        &["behavior", "mode", "read_roots", "write_roots"],
+    );
+    assert_keys(
+        &status["commands"],
+        &["cwd_roots", "enabled", "exact_grants", "mode"],
+    );
+    assert_keys(
+        &status["agents"],
+        &["cancelled", "done", "failed", "running", "total"],
+    );
+
+    // `text` intentionally changes presentation to the deterministic
+    // redirected deck. Its overlapping facts must be the same observation as
+    // the legacy structured fields, rather than a second calculation.
+    let text = status["text"].as_str().expect("status text");
+    let text_without_grouping = text.replace(',', "");
+    for expected in [
+        format!("status.version: {}", status["version"].as_str().unwrap()),
+        format!("status.cwd: {}", status["session"]["cwd"].as_str().unwrap()),
+        format!(
+            "status.model: {}",
+            status["session"]["model"].as_str().unwrap()
+        ),
+        format!(
+            "status.generation: {}",
+            status["provider_route"]["route"]["generation"]
+                .as_u64()
+                .unwrap()
+        ),
+        format!(
+            "context.effective tokens: {}",
+            status["context"]["effective"].as_u64().unwrap()
+        ),
+        format!(
+            "context.used tokens: {}",
+            status["context"]["used"].as_u64().unwrap()
+        ),
+        format!(
+            "status.read roots: {}",
+            status["permissions"]["read_roots"].as_u64().unwrap()
+        ),
+        format!(
+            "status.write roots: {}",
+            status["permissions"]["write_roots"].as_u64().unwrap()
+        ),
+    ] {
+        let expected_without_grouping = expected.replace(',', "");
+        assert!(
+            text_without_grouping.contains(&expected_without_grouping),
+            "typed text disagrees with JSONL field {expected:?}: {text}"
+        );
+    }
+    assert!(text.contains("status.authority: deny"), "{text}");
+    for forbidden_key in ["account", "email", "credits", "rate_limits", "prices"] {
+        assert!(
+            status.get(forbidden_key).is_none(),
+            "invented {forbidden_key}"
+        );
+    }
 }
 
 #[test]

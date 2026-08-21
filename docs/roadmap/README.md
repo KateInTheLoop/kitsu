@@ -725,6 +725,7 @@ gates merely because a card appears attractive.
 | 114 | E05-S01-C1 | Stage a private effect-free guided-setup transaction with explicit consent, create-new publication, reverse owned rollback, and transferable residue |
 | 115 | E06-S01-C5 | Execute one prepared child through a private Linux backend with bounded pipes, real clocks, process-group cleanup, and truthful completion |
 | 116 | E05-S01-C2 | Publish secret-free guided-setup configuration create-new through descriptor-relative durability and exact owned rollback |
+| 117 | E08-S05-C5 | Mount one typed offline current-session observation on adaptive `/status` while preserving the legacy JSONL payload shape |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1025,6 +1026,15 @@ and removes only that verified object; mutation, cleanup uncertainty, or a
 registration/transfer failure retains a consuming retry owner. The mechanism is
 Linux-only and unmounted: it creates no parents, contacts no provider or
 credential store, prompts no user, selects no model, and activates no config.
+Cycle 117 replaces the legacy human `/status` formatter with the staged typed
+current-session deck. One route receipt and one synchronous observation drive
+route/runtime/session identity, effective authority, context occupancy, and
+current usage coverage across wide, stacked, narrow, tiny, plain, no-color,
+screen-reader, and redirected destinations. The command performs no provider,
+account, Git, or filesystem probe. Its legacy JSONL keys and nesting stay
+unchanged, with deterministic text rendered from the same observation. Credits,
+rates, prices, inferred cost, durable history, `/context` migration, and a new
+automation schema remain absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

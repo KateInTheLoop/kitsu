@@ -17,17 +17,19 @@ E05-S01 has a private effect-free transactional setup model through Cycle 114
 and descriptor-relative no-clobber configuration publication through Cycle 116.
 E06-S01 now composes its prepared policy and phase owner with a private real
 Linux one-process backend through Cycle 115.
+E08-S05 mounts the same typed offline current-session observation on `/status`
+through Cycle 117 while preserving the legacy JSONL payload shape.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 116 / 116 |
+| Accepted cycles/commits after this cycle | 117 / 117 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 117 — E08-S05-C5: mount the typed offline current-session observation on `/status` while preserving JSONL shape |
+| Active epic/card | Cycle 118 — E06-S01-C6: seal exact child executable bytes and bind a bounded filesystem-content policy before spawn |
 
 ## Epic status
 
@@ -41,7 +43,7 @@ Linux one-process backend through Cycle 115.
 | E06 child/MCP spine | **In progress** through E06-S01-C5, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux backend now consumes the prepared policy through the accepted phase owner and proves bounded joined pipes, real clocks, process-group termination, direct wait, EOF/exit/crash truth, and retryable residue. It remains one-process/one-request and unmounted because filesystem confinement, immutable exec identity, long-lived MCP composition, and a product route are absent |
 | E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
 | E05 onboarding | **In progress** through E05-S01-C2 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
-| E08 telemetry/docs | **In progress** through E08-S05-C4 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; exact offline `/usage session` now collects one coherent in-memory observation and renders only its usage section adaptively. Full status/context migration, JSONL automation parity, aliases, and durable history remain separate; history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C5 | Pure current-session DTOs label every value with truth/provenance; `/usage session` and `/status` each collect one coherent offline in-memory observation and render adaptive usage/full decks. `/status` preserves its legacy JSONL payload. `/context` migration, usage automation parity, aliases, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -165,6 +167,7 @@ Linux one-process backend through Cycle 115.
 | 114 | this document's commit | Pure transactional guided-setup proposal and owned rollback truth |
 | 115 | this document's commit | Private bounded Linux child backend and real cleanup truth |
 | 116 | this document's commit | Descriptor-relative no-clobber setup configuration publication and rollback ownership |
+| 117 | this document's commit | Typed adaptive offline `/status` with legacy JSONL shape preservation |
 
 ## Current green gates
 
@@ -814,6 +817,23 @@ drop retain causal cleanup truth. This remains a one-process/one-request proof,
 not a product or general sandbox: filesystem confinement, immutable executable
 identity, serial MCP transport, configuration, inventory composition, and every
 X002 acceptance route remain absent.
+
+Cycle 116 composes E05's pure transaction with a private Linux create-new
+configuration publisher. Bounded secret-free TOML is installed relative to an
+existing parent through a mode-0600 same-directory stage, no-overwrite link,
+and explicit file/parent durability truth. The concrete ledger rolls back only
+the exact verified created object; stage cleanup, mutation, receipt-capture,
+registration, and terminal-transfer uncertainty retains consuming residue.
+The publisher is unmounted and performs no parent creation, prompting,
+credential, provider/catalog, model-selection, activation, or non-Linux effect.
+
+Cycle 117 mounts the typed current-session observation on exact `/status`.
+One route receipt and one synchronous snapshot drive adaptive status, context,
+and usage sections across terminal and accessibility destinations. The legacy
+human Git/config-heavy formatter and its filesystem probe are gone. JSONL keeps
+the same keys and nesting, using deterministic redirected text from the same
+observation. No provider/account/fs/persistence request, inferred cost, credit,
+rate-limit, price, durable history, or new automation schema is introduced.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful
