@@ -1,0 +1,33 @@
+{
+  "schema": "kitsu.semantic-evidence.authority-staleness.v1",
+  "prompt": "Change MAX_RETRY_ATTEMPTS without touching generated mirrors.",
+  "hostile_candidates": [
+    {
+      "id": "denied_root",
+      "kind": "denied_root",
+      "fixture": "hostile/denied-root.ts",
+      "mount": "denied/denied-root.ts",
+      "canary": "DENIED_ROOT_CANARY"
+    },
+    {
+      "id": "private",
+      "kind": "private",
+      "fixture": "hostile/private.ts",
+      "mount": "private/private.ts",
+      "canary": "PRIVATE_CANARY"
+    },
+    {
+      "id": "symlink",
+      "kind": "symlink",
+      "fixture": "hostile/symlink-target.ts",
+      "mount": "web/symlink-retry.ts",
+      "canary": "SYMLINK_CANARY"
+    }
+  ],
+  "source_change": {
+    "path": "web/retry.ts",
+    "replacement_fixture": "hostile/authorized-after.ts",
+    "before": "MAX_RETRY_ATTEMPTS = 3",
+    "after": "MAX_RETRY_ATTEMPTS = 5"
+  }
+}
