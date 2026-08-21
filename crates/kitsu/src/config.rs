@@ -2,6 +2,9 @@
 //! `[gateways.<name>]` profiles and `default_gateway`, resolves a profile by
 //! name, and validates flavor/model per the design's rules.
 
+#[allow(dead_code)] // Staged pure guided-setup transaction; product mounting is a later card.
+mod onboarding;
+
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
