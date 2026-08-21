@@ -6,3 +6,4 @@
 pub(crate) mod authority;
 pub(crate) mod identity;
 mod lifecycle;
+mod publication;

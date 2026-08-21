@@ -715,6 +715,7 @@ gates merely because a card appears attractive.
 | 104 | E06-S02-C2 | Bind every proposed external tool to closed source, incarnation, revision, and tool identities plus one bounded canonical descriptor fingerprint before publication |
 | 105 | E06-S01-C2 | Own one single-use prepared child through causal ready/start/running/draining/terminal truth, joined natural exit, idempotent shutdown, and typed cleanup residue |
 | 106 | E08-S05-C1 | Type one presentation-neutral current-session status, context, usage, and cost snapshot whose every value carries bounded truth and provenance |
+| 107 | E06-S02-C3 | Publish complete validated external inventories through exact source-lifetime/revision fences with atomic successor, replacement, and withdrawal truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -928,6 +929,13 @@ portable cost is unavailable unless the provider explicitly reported currency.
 Existing slash output is unchanged. Run tallies do not yet retain per-response
 usage coverage or cached tokens, so a product adapter and renderer would still
 be dishonest; those are separate prerequisite cards.
+Cycle 107 adds one private, non-cloneable publication owner for a complete
+validated external inventory. Initial publication refuses overwrite;
+same-incarnation updates require the exact next non-wrapping revision; explicit
+replacement and withdrawal require an exact fence for the currently published
+source lifetime and revision. Every refusal preserves the same borrowed old
+snapshot, while success swaps the whole boxed value once. No handler registry,
+child, transport, MCP, configuration, or product path consumes the owner yet.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
