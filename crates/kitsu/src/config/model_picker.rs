@@ -1,6 +1,10 @@
 use std::cmp::Ordering;
 use std::collections::BTreeMap;
 
+use kitsu_providers::route::{
+    ProviderAdapterId, ProviderProfileId, ProviderRouteDeclaration, ProviderWireRevision,
+};
+
 pub(super) const MODEL_SELECTION_PROPOSAL_REVISION: u16 = 1;
 pub(super) const MAX_RAW_CATALOG_ROWS: usize = 1_024;
 pub(super) const MAX_MODEL_ID_BYTES: usize = 512;
@@ -10,6 +14,39 @@ pub(super) const MAX_FILTER_BYTES: usize = 128;
 pub(super) const MIN_TERMINAL_COLUMNS: usize = 8;
 pub(super) const MAX_TERMINAL_COLUMNS: usize = 512;
 pub(super) const MAX_PROJECTED_ROWS: usize = 64;
+
+/// Exact compiled namespace in which model identifiers have meaning. A
+/// declaration proves the adapter/wire pair and supplies its opaque profile;
+/// mutable capabilities, route generation, endpoint, auth, and model values
+/// deliberately do not enter this identity.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct ModelNamespaceBinding {
+    profile: ProviderProfileId,
+    adapter: ProviderAdapterId,
+    wire_revision: ProviderWireRevision,
+}
+
+impl ModelNamespaceBinding {
+    pub(super) fn from_declaration(declaration: &ProviderRouteDeclaration) -> Self {
+        Self {
+            profile: declaration.profile().clone(),
+            adapter: declaration.adapter(),
+            wire_revision: declaration.wire_revision(),
+        }
+    }
+
+    pub(super) const fn profile(&self) -> &ProviderProfileId {
+        &self.profile
+    }
+
+    pub(super) const fn adapter(&self) -> ProviderAdapterId {
+        self.adapter
+    }
+
+    pub(super) const fn wire_revision(&self) -> ProviderWireRevision {
+        self.wire_revision
+    }
+}
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) enum CatalogUnavailableReason {
@@ -168,6 +205,7 @@ pub(super) enum ModelPickerError {
 /// Untrusted catalog input deliberately has no `Debug` or serialization.
 /// Construction stops consuming rows at the first resource violation.
 pub(super) struct CatalogSnapshotInput {
+    binding: ModelNamespaceBinding,
     truth: CatalogTruth,
     catalog_ids: Vec<String>,
     current_model: Option<String>,
@@ -177,6 +215,7 @@ pub(super) struct CatalogSnapshotInput {
 
 impl CatalogSnapshotInput {
     pub(super) fn new<I, S>(
+        binding: ModelNamespaceBinding,
         truth: CatalogTruth,
         catalog_ids: I,
         current_model: Option<&str>,
@@ -240,6 +279,7 @@ impl CatalogSnapshotInput {
         }
 
         Self {
+            binding,
             truth,
             catalog_ids: ids,
             current_model: current_model_owned,
@@ -294,6 +334,7 @@ impl CatalogSnapshotInput {
             })
             .collect();
         Ok(ModelPickerSnapshot {
+            binding: self.binding,
             truth: self.truth,
             candidates,
             current_model,
@@ -321,6 +362,7 @@ struct ModelCandidate {
 /// exposes no mutation or publication operation.
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ModelPickerSnapshot {
+    binding: ModelNamespaceBinding,
     truth: CatalogTruth,
     candidates: Vec<ModelCandidate>,
     current_model: Option<String>,
@@ -328,6 +370,10 @@ pub(super) struct ModelPickerSnapshot {
 }
 
 impl ModelPickerSnapshot {
+    pub(super) const fn binding(&self) -> &ModelNamespaceBinding {
+        &self.binding
+    }
+
     pub(super) const fn truth(&self) -> CatalogTruth {
         self.truth
     }
@@ -380,6 +426,7 @@ impl ModelPickerSnapshot {
             .collect::<Vec<_>>();
         let omitted_count = included_count.saturating_sub(rows.len());
         ModelPickerView {
+            binding: self.binding.clone(),
             truth: self.truth,
             rows,
             candidate_count: self.candidates.len(),
@@ -432,6 +479,7 @@ impl ModelPickerSnapshot {
         basis: SelectionBasis,
     ) -> ModelSelectionProposal {
         ModelSelectionProposal {
+            binding: self.binding.clone(),
             model_id: candidate.id.clone(),
             basis,
             was_current: candidate.is_current,
@@ -470,6 +518,7 @@ impl ModelSelectionInput {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ModelSelectionProposal {
+    binding: ModelNamespaceBinding,
     model_id: String,
     basis: SelectionBasis,
     was_current: bool,
@@ -479,6 +528,10 @@ pub(super) struct ModelSelectionProposal {
 }
 
 impl ModelSelectionProposal {
+    pub(super) const fn binding(&self) -> &ModelNamespaceBinding {
+        &self.binding
+    }
+
     pub(super) const fn revision(&self) -> u16 {
         MODEL_SELECTION_PROPOSAL_REVISION
     }
@@ -574,6 +627,7 @@ impl ModelPickerRow {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) struct ModelPickerView {
+    binding: ModelNamespaceBinding,
     truth: CatalogTruth,
     rows: Vec<ModelPickerRow>,
     candidate_count: usize,
@@ -583,6 +637,10 @@ pub(super) struct ModelPickerView {
 }
 
 impl ModelPickerView {
+    pub(super) const fn binding(&self) -> &ModelNamespaceBinding {
+        &self.binding
+    }
+
     pub(super) const fn truth(&self) -> CatalogTruth {
         self.truth
     }
@@ -707,6 +765,14 @@ fn truncate_identifier(model_id: &str, columns: usize) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use kitsu_providers::route::ProviderRouteGeneration;
+
+    fn fixture_binding() -> ModelNamespaceBinding {
+        ModelNamespaceBinding::from_declaration(&ProviderRouteDeclaration::compatible_chat_v1(
+            profile(b"model-picker-fixture", b"primary"),
+            true,
+        ))
+    }
 
     fn live_input(
         ids: &[&str],
@@ -714,6 +780,7 @@ mod tests {
         default: Option<&str>,
     ) -> CatalogSnapshotInput {
         CatalogSnapshotInput::new(
+            fixture_binding(),
             CatalogTruth::new(
                 CatalogAvailability::Available,
                 CatalogSource::Live,
@@ -769,9 +836,15 @@ mod tests {
             ),
         ];
         for truth in valid {
-            CatalogSnapshotInput::new(truth, std::iter::empty::<&str>(), Some("configured"), None)
-                .normalize()
-                .unwrap();
+            CatalogSnapshotInput::new(
+                fixture_binding(),
+                truth,
+                std::iter::empty::<&str>(),
+                Some("configured"),
+                None,
+            )
+            .normalize()
+            .unwrap();
         }
 
         let invalid = [
@@ -802,7 +875,7 @@ mod tests {
         ];
         for truth in invalid {
             assert_eq!(
-                CatalogSnapshotInput::new(truth, ["model"], None, None)
+                CatalogSnapshotInput::new(fixture_binding(), truth, ["model"], None, None)
                     .normalize()
                     .unwrap_err(),
                 ModelPickerError::ContradictoryCatalogTruth,
@@ -819,13 +892,14 @@ mod tests {
             CatalogProvenance::None,
         );
         assert_eq!(
-            CatalogSnapshotInput::new(unavailable, ["invented"], None, None)
+            CatalogSnapshotInput::new(fixture_binding(), unavailable, ["invented"], None, None,)
                 .normalize()
                 .unwrap_err(),
             ModelPickerError::CatalogRowsWithoutSource,
         );
 
         let snapshot = CatalogSnapshotInput::new(
+            fixture_binding(),
             unavailable,
             std::iter::empty::<&str>(),
             Some("current-model"),
@@ -841,6 +915,7 @@ mod tests {
         );
 
         let offline = CatalogSnapshotInput::new(
+            fixture_binding(),
             cached_truth(CatalogAvailability::Offline, CatalogFreshness::Stale),
             ["cached-b", "cached-a"],
             None,
@@ -963,6 +1038,7 @@ mod tests {
     #[test]
     fn empty_preferred_selection_is_truthful() {
         let snapshot = CatalogSnapshotInput::new(
+            fixture_binding(),
             CatalogTruth::new(
                 CatalogAvailability::Unavailable(CatalogUnavailableReason::NotObserved),
                 CatalogSource::None,
@@ -987,6 +1063,7 @@ mod tests {
     #[test]
     fn catalog_membership_is_unobserved_when_catalog_truth_cannot_prove_absence() {
         let unavailable = CatalogSnapshotInput::new(
+            fixture_binding(),
             CatalogTruth::new(
                 CatalogAvailability::Unavailable(CatalogUnavailableReason::FetchFailed),
                 CatalogSource::None,
@@ -1004,6 +1081,7 @@ mod tests {
         assert_eq!(proposal.catalog_truth(), unavailable.truth());
 
         let offline = CatalogSnapshotInput::new(
+            fixture_binding(),
             cached_truth(CatalogAvailability::Offline, CatalogFreshness::Stale),
             ["cached-model"],
             Some("configured-current"),
@@ -1024,6 +1102,7 @@ mod tests {
         assert_eq!(rows.truth().freshness(), CatalogFreshness::Stale);
 
         let stale_available = CatalogSnapshotInput::new(
+            fixture_binding(),
             cached_truth(CatalogAvailability::Available, CatalogFreshness::Stale),
             ["retained-model"],
             None,
@@ -1069,6 +1148,7 @@ mod tests {
         let too_many = (0..=MAX_RAW_CATALOG_ROWS).map(|index| format!("model-{index}"));
         assert_eq!(
             CatalogSnapshotInput::new(
+                fixture_binding(),
                 CatalogTruth::new(
                     CatalogAvailability::Available,
                     CatalogSource::Live,
@@ -1094,6 +1174,7 @@ mod tests {
         let total_overflow = (0..MAX_RAW_CATALOG_ROWS).map(|index| format!("{each}{index}"));
         assert_eq!(
             CatalogSnapshotInput::new(
+                fixture_binding(),
                 CatalogTruth::new(
                     CatalogAvailability::Available,
                     CatalogSource::Live,
@@ -1112,6 +1193,7 @@ mod tests {
         let at_candidate_cap = (0..MAX_NORMALIZED_MODELS).map(|index| format!("m{index:04}"));
         assert_eq!(
             CatalogSnapshotInput::new(
+                fixture_binding(),
                 CatalogTruth::new(
                     CatalogAvailability::Available,
                     CatalogSource::Live,
@@ -1189,5 +1271,93 @@ mod tests {
             .normalize()
             .unwrap();
         assert_eq!(real.stage_preferred().unwrap().model_id(), "org/model:tag");
+    }
+
+    fn profile(namespace: &[u8], name: &[u8]) -> ProviderProfileId {
+        ProviderProfileId::derive_v1(namespace, name).unwrap()
+    }
+
+    #[test]
+    fn namespace_binding_distinguishes_exact_profiles_and_compiled_wires() {
+        let first_profile = profile(b"fixture-config-a", b"local");
+        let second_profile = profile(b"fixture-config-b", b"local");
+        let first_chat = ProviderRouteDeclaration::compatible_chat_v1(first_profile.clone(), true);
+        let second_chat =
+            ProviderRouteDeclaration::compatible_chat_v1(second_profile.clone(), true);
+        let first_messages = ProviderRouteDeclaration::native_messages_v1(first_profile.clone());
+
+        let first = ModelNamespaceBinding::from_declaration(&first_chat);
+        let second = ModelNamespaceBinding::from_declaration(&second_chat);
+        let messages = ModelNamespaceBinding::from_declaration(&first_messages);
+
+        assert_eq!(first.profile(), &first_profile);
+        assert_eq!(first.adapter(), first_chat.adapter());
+        assert_eq!(first.wire_revision(), first_chat.wire_revision());
+        assert_ne!(
+            first, second,
+            "same label in another config is not identity"
+        );
+        assert_ne!(
+            first, messages,
+            "one profile cannot collapse distinct adapter/wire namespaces"
+        );
+    }
+
+    #[test]
+    fn namespace_binding_excludes_capabilities_and_has_no_generation_input() {
+        let profile = profile(b"fixture-config", b"primary");
+        let inference = ProviderRouteDeclaration::compatible_chat_v1(profile.clone(), false);
+        let catalog = ProviderRouteDeclaration::compatible_chat_v1(profile, true);
+
+        assert_ne!(inference.capabilities(), catalog.capabilities());
+        assert_eq!(
+            ModelNamespaceBinding::from_declaration(&inference),
+            ModelNamespaceBinding::from_declaration(&catalog),
+            "mutable capability sets are not model-namespace identity"
+        );
+
+        let _generation_is_deliberately_unrelated = ProviderRouteGeneration::new(91).unwrap();
+    }
+
+    #[test]
+    fn snapshot_view_and_proposals_retain_one_exact_namespace_binding() {
+        let declaration = ProviderRouteDeclaration::compatible_chat_v1(
+            profile(b"fixture-config", b"offline"),
+            true,
+        );
+        let binding = ModelNamespaceBinding::from_declaration(&declaration);
+        let truth = cached_truth(CatalogAvailability::Offline, CatalogFreshness::Stale);
+        let snapshot = CatalogSnapshotInput::new(
+            binding.clone(),
+            truth,
+            ["catalog-a", "catalog-b"],
+            None,
+            Some("configured-default"),
+        )
+        .normalize()
+        .unwrap();
+
+        assert_eq!(snapshot.binding(), &binding);
+        let view = snapshot.project(&query("", 8, 1));
+        assert!(view.is_truncated());
+        assert_eq!(view.binding(), &binding);
+        assert_eq!(view.truth(), truth);
+
+        let explicit = snapshot
+            .stage_exact(ModelSelectionInput::new("catalog-a"))
+            .unwrap();
+        assert_eq!(explicit.binding(), &binding);
+        assert_eq!(explicit.catalog_membership(), CatalogMembership::Present);
+        assert_eq!(explicit.catalog_truth(), truth);
+
+        let preferred = snapshot.stage_preferred().unwrap();
+        assert_eq!(preferred.binding(), &binding);
+        assert_eq!(preferred.model_id(), "configured-default");
+        assert_eq!(preferred.basis(), SelectionBasis::ConfiguredDefault);
+        assert_eq!(
+            preferred.catalog_membership(),
+            CatalogMembership::Unobserved
+        );
+        assert_eq!(preferred.catalog_truth(), truth);
     }
 }
