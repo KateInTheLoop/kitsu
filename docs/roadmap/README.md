@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C29,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C30,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -694,6 +694,7 @@ gates merely because a card appears attractive.
 | 086 | E03-S02-C27 | Initialize the canonical lock domain through the pinned root and dual-fence exact current-v1 activation |
 | 087 | E03-S02-C28 | Dispatch every selected representation into one lock-owning activation and exact source receipt |
 | 088 | E03-S02-C29 | Save canonical successors through the total activation's held fence and exact parent envelope |
+| 089 | E03-S02-C30 | Save current-v1 successors through the total activation with exact pre-install byte and canonical-absence checks |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -796,9 +797,14 @@ Canonical activations retain their exact logical base, reuse their already-held
 writer fence, bind a successor to the exact selected parent envelope, and update
 their borrowed resume projection only after old-or-new publication truth is
 known. Current-v1 activation returns a typed snapshot-writer requirement, and
-artifact-bearing projection refuses before allocation. Cycle 089 next supplies
-the exact current-v1 save half of that owner before production route changes,
-then continues through E03,
+artifact-bearing projection refuses before allocation. Cycle 089 supplies the
+current-v1 half: activation retains a clone of the pinned directory descriptor,
+validates stable snapshot identity, stages atomic bytes, and immediately before
+rename rechecks both the exact retained source and canonical-HEAD absence.
+Confirmed and installed-unconfirmed results advance the retained value; all
+pre-install refusals preserve it. Cycle 090 next encapsulates this complete
+representation-aware owner behind a private live-store boundary before
+production route changes, then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

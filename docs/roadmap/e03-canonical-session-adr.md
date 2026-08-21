@@ -735,6 +735,21 @@ cannot weaken or replace any backend-neutral assertion.
    for its snapshot writer, and artifact-bearing projection refuses with zero
    allocation. The next boundary must implement exact current-v1 save ownership
    before production routing can consume the total activation.
+   **Pinned current-v1 save boundary complete in Cycle 089:** activation clones
+   the pinned session-directory descriptor before lock ownership and retains it
+   with the exact selected bytes. A candidate must preserve snapshot version,
+   session identity, and creation anchor, and must encode before write effects.
+   Save rechecks both exact retained bytes and canonical-HEAD absence before
+   staging, then repeats those checks after temporary-file sync immediately
+   before descriptor-relative atomic install. A clean install advances retained
+   data and bytes. If install is visible but directory sync fails, the owner also
+   advances and returns a durability warning; it never claims rollback. Invalid
+   input, pre-install replacement, or canonical appearance refuses without
+   installation and leaves retained state unchanged. Ancestor replacement
+   cannot retarget the pinned write, and canonical activation rejects the
+   current-snapshot operation without effects. The next boundary encapsulates
+   this complete representation-aware activation as one private live store;
+   production routing remains unchanged.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

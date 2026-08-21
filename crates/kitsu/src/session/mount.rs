@@ -21,8 +21,8 @@ use super::transaction::{
     CanonicalTransactionErrorV1,
 };
 use super::{
-    PrivateDirectory, PrivateEntryKind, SavedSession, SessionLease, MAX_SESSION_BYTES,
-    SESSION_VERSION,
+    encode_saved, write_saved_file_if, PrivateDirectory, PrivateEntryKind, SavedSession,
+    SessionLease, SnapshotCommit, SnapshotSaveError, MAX_SESSION_BYTES, SESSION_VERSION,
 };
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -100,9 +100,12 @@ pub(super) struct CanonicalMountActivationV1 {
 #[derive(Debug)]
 pub(super) struct CurrentV1MountActivationV1 {
     value: CurrentV1MountValueV1,
+    directory: PrivateDirectory,
     _legacy_lease: SessionLease,
     _canonical_fence: PhysicalWriterFenceV1,
-    _store: PhysicalFileStoreV1,
+    store: PhysicalFileStoreV1,
+    #[cfg(test)]
+    replace_current_before_install: std::cell::RefCell<Option<Vec<u8>>>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -178,12 +181,139 @@ impl SessionMountActivationV1 {
                 .map_err(SessionMountSaveErrorV1::Canonical),
         }
     }
+
+    pub(super) fn save_current_v1_snapshot(
+        &mut self,
+        saved: SavedSession,
+    ) -> Result<CurrentV1MountSaveReceiptV1, SessionMountSaveErrorV1> {
+        match &mut self.inner {
+            SessionMountActivationInnerV1::CurrentV1(activation) => activation
+                .save_snapshot(saved)
+                .map_err(SessionMountSaveErrorV1::CurrentV1),
+            SessionMountActivationInnerV1::Canonical(_) => {
+                Err(SessionMountSaveErrorV1::CanonicalOperationRequired)
+            }
+        }
+    }
 }
 
 impl CurrentV1MountActivationV1 {
     pub(super) fn value(&self) -> &CurrentV1MountValueV1 {
         &self.value
     }
+
+    fn save_snapshot(
+        &mut self,
+        saved: SavedSession,
+    ) -> Result<CurrentV1MountSaveReceiptV1, CurrentV1MountSaveErrorV1> {
+        if saved.version != SESSION_VERSION
+            || saved.id != self.value.saved().id
+            || saved.created_at != self.value.saved().created_at
+        {
+            return Err(CurrentV1MountSaveErrorV1::InvalidCandidate(
+                "current-v1 successor must preserve version, session id, and creation time"
+                    .to_string(),
+            ));
+        }
+        let source_bytes =
+            encode_saved(&saved).map_err(CurrentV1MountSaveErrorV1::InvalidCandidate)?;
+        self.revalidate_save_base()
+            .map_err(CurrentV1MountSaveErrorV1::Admission)?;
+        let result = write_saved_file_if(&self.directory, &saved, true, || {
+            #[cfg(test)]
+            if let Some(replacement) = self.replace_current_before_install.borrow_mut().take() {
+                std::fs::write(
+                    self.directory.path.join(format!("{}.json", saved.id)),
+                    replacement,
+                )
+                .map_err(|error| format!("cannot inject current-v1 replacement: {error}"))?;
+            }
+            self.revalidate_save_base()
+        });
+        let (commit, durability_warning) = match result {
+            Ok((path, commit)) => (
+                SnapshotCommit {
+                    path,
+                    #[cfg(unix)]
+                    file: commit.file,
+                },
+                None,
+            ),
+            Err(error) => match error.into_installed_parts() {
+                Ok((commit, warning)) => (commit, Some(warning)),
+                Err(error) => return Err(CurrentV1MountSaveErrorV1::Write(error)),
+            },
+        };
+        self.value = CurrentV1MountValueV1 {
+            saved,
+            source_bytes,
+        };
+        Ok(CurrentV1MountSaveReceiptV1 {
+            commit,
+            durability_warning,
+        })
+    }
+
+    #[cfg(test)]
+    fn inject_current_replacement_before_install(&self, replacement: Vec<u8>) {
+        assert!(
+            self.replace_current_before_install
+                .borrow_mut()
+                .replace(replacement)
+                .is_none(),
+            "a current-v1 pre-install replacement is already queued"
+        );
+    }
+
+    fn revalidate_save_base(&self) -> Result<(), String> {
+        let session = SessionId::new(self.value.saved().id.clone())
+            .map_err(|error| format!("invalid activated current-v1 session id: {error}"))?;
+        let observed = observe_current_v1(&self.directory, &session);
+        if observed.observation != CurrentV1MountObservationV1::Present
+            || observed
+                .value
+                .as_ref()
+                .map(CurrentV1MountValueV1::source_bytes)
+                != Some(self.value.source_bytes())
+        {
+            return Err("activated current-v1 base changed before save publication".to_string());
+        }
+        let (canonical, value) = lookup_canonical_mount_value_v1(&self.store, &session);
+        if canonical
+            != (SessionLookupState::Missing {
+                tombstone_revision: None,
+            })
+            || value.is_some()
+        {
+            return Err(format!(
+                "canonical session state changed before current-v1 save publication: {canonical:?}"
+            ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug)]
+pub(super) struct CurrentV1MountSaveReceiptV1 {
+    commit: SnapshotCommit,
+    durability_warning: Option<String>,
+}
+
+impl CurrentV1MountSaveReceiptV1 {
+    pub(super) fn commit(&self) -> &SnapshotCommit {
+        &self.commit
+    }
+
+    pub(super) fn durability_warning(&self) -> Option<&str> {
+        self.durability_warning.as_deref()
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum CurrentV1MountSaveErrorV1 {
+    InvalidCandidate(String),
+    Admission(String),
+    Write(SnapshotSaveError),
 }
 
 impl CanonicalMountActivationV1 {
@@ -246,7 +376,9 @@ pub(super) enum CanonicalMountSaveErrorV1 {
 #[derive(Debug)]
 pub(super) enum SessionMountSaveErrorV1 {
     CurrentV1SnapshotRequired,
+    CanonicalOperationRequired,
     Canonical(CanonicalMountSaveErrorV1),
+    CurrentV1(CurrentV1MountSaveErrorV1),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -269,6 +401,7 @@ pub(super) enum CanonicalMountActivationErrorV1 {
 pub(super) enum CurrentV1MountActivationErrorV1 {
     WrongSelection,
     SelectionIdentityMismatch,
+    SessionRoot(String),
     LegacyFence(String),
     StoreInitialization(String),
     CanonicalFence(String),
@@ -498,6 +631,9 @@ pub(super) fn activate_current_v1_mount_v1(
     if selected.saved().id != session_id.as_str() {
         return Err(CurrentV1MountActivationErrorV1::SelectionIdentityMismatch);
     }
+    let directory = session_root
+        .try_clone_pinned("session activation")
+        .map_err(CurrentV1MountActivationErrorV1::SessionRoot)?;
 
     let legacy_lease = SessionLease::acquire(session_root, session_id.as_str())
         .map_err(CurrentV1MountActivationErrorV1::LegacyFence)?;
@@ -536,9 +672,12 @@ pub(super) fn activate_current_v1_mount_v1(
 
     Ok(CurrentV1MountActivationV1 {
         value: selected,
+        directory,
         _legacy_lease: legacy_lease,
         _canonical_fence: canonical_fence,
-        _store: store,
+        store,
+        #[cfg(test)]
+        replace_current_before_install: std::cell::RefCell::new(None),
     })
 }
 
@@ -717,8 +856,9 @@ mod tests {
         admit_session_mount_v1, observe_session_mount_v1, select_session_mount_v1,
         CanonicalMountActivationErrorV1, CanonicalMountSaveErrorV1,
         CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1, CurrentV1MountObservationV1,
-        SessionMountActivatedSourceV1, SessionMountActivationErrorV1, SessionMountAdmissionV1,
-        SessionMountRejectionV1, SessionMountSaveErrorV1, SessionMountSelectionV1,
+        CurrentV1MountSaveErrorV1, SessionMountActivatedSourceV1, SessionMountActivationErrorV1,
+        SessionMountAdmissionV1, SessionMountRejectionV1, SessionMountSaveErrorV1,
+        SessionMountSelectionV1,
     };
 
     fn revision(value: &str) -> RevisionId {
@@ -2032,5 +2172,252 @@ mod tests {
             )
             .unwrap();
         assert_eq!(activation.saved().updated_at, "2026-08-20T10:04:00.000Z");
+    }
+
+    #[test]
+    fn current_total_activation_saves_exact_successor_under_both_owned_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        std::fs::write(
+            session_root.join("session-a.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let mut activation =
+            activate_session_mount_v1(&directory, store_id.clone(), &session, selection).unwrap();
+
+        let mut next = activation.saved().clone();
+        next.updated_at = "2026-08-20T10:02:00.000Z".to_string();
+        next.name = Some("first-save".to_string());
+        let receipt = activation.save_current_v1_snapshot(next.clone()).unwrap();
+        assert_eq!(receipt.durability_warning(), None);
+        assert_eq!(receipt.commit().path(), session_root.join("session-a.json"));
+        assert_eq!(
+            super::super::encode_saved(activation.saved()).unwrap(),
+            super::super::encode_saved(&next).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(session_root.join("session-a.json")).unwrap(),
+            super::super::encode_saved(&next).unwrap()
+        );
+
+        let mut second = activation.saved().clone();
+        second.updated_at = "2026-08-20T10:03:00.000Z".to_string();
+        second.model = "gpt-next".to_string();
+        activation.save_current_v1_snapshot(second.clone()).unwrap();
+        assert_eq!(
+            super::super::encode_saved(activation.saved()).unwrap(),
+            super::super::encode_saved(&second).unwrap()
+        );
+        assert!(super::super::SessionLease::acquire(&directory, session.as_str()).is_err());
+        let competing_store =
+            super::super::physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+                .unwrap()
+                .unwrap();
+        assert!(competing_store.acquire_writer_fence(&session).is_err());
+        assert!(competing_store.read_head(&session).unwrap().is_none());
+    }
+
+    #[test]
+    fn current_save_refuses_invalid_raced_and_canonical_changed_state_before_install() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let original = current_v1_bytes(1, session.as_str());
+        let snapshot_path = session_root.join("session-a.json");
+        std::fs::write(&snapshot_path, &original).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id, &session);
+        let mut activation = activate_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+            selection,
+        )
+        .unwrap();
+
+        let mut invalid = activation.saved().clone();
+        invalid.id = "session-other".to_string();
+        let before_invalid = tree_snapshot(&session_root);
+        assert!(matches!(
+            activation.save_current_v1_snapshot(invalid),
+            Err(SessionMountSaveErrorV1::CurrentV1(
+                CurrentV1MountSaveErrorV1::InvalidCandidate(_)
+            ))
+        ));
+        assert_eq!(tree_snapshot(&session_root), before_invalid);
+
+        let retained = super::super::encode_saved(activation.saved()).unwrap();
+        let mut replacement = activation.saved().clone();
+        replacement.model = "external-replacement".to_string();
+        let replacement = super::super::encode_saved(&replacement).unwrap();
+        let super::SessionMountActivationInnerV1::CurrentV1(current) = &activation.inner else {
+            panic!("fixture must activate current-v1");
+        };
+        current.inject_current_replacement_before_install(replacement.clone());
+        let mut candidate = activation.saved().clone();
+        candidate.updated_at = "2026-08-20T10:02:00.000Z".to_string();
+        let error = activation
+            .save_current_v1_snapshot(candidate.clone())
+            .unwrap_err();
+        let SessionMountSaveErrorV1::CurrentV1(CurrentV1MountSaveErrorV1::Write(error)) = error
+        else {
+            panic!("pre-install replacement must refuse the physical write");
+        };
+        assert!(error.installed_commit().is_none());
+        assert!(error.to_string().contains("base changed"));
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), replacement);
+        assert_eq!(
+            super::super::encode_saved(activation.saved()).unwrap(),
+            retained
+        );
+        assert!(!std::fs::read_dir(&session_root).unwrap().any(|entry| entry
+            .unwrap()
+            .file_name()
+            .to_string_lossy()
+            .ends_with(".tmp")));
+
+        std::fs::write(&snapshot_path, &retained).unwrap();
+        let head = super::super::physical::PhysicalLayoutV1::head_pointer(&session_root, &session);
+        std::fs::write(&head, b"{").unwrap();
+        let before_canonical = std::fs::read(&snapshot_path).unwrap();
+        assert!(matches!(
+            activation.save_current_v1_snapshot(candidate),
+            Err(SessionMountSaveErrorV1::CurrentV1(
+                CurrentV1MountSaveErrorV1::Admission(_)
+            ))
+        ));
+        assert_eq!(std::fs::read(&snapshot_path).unwrap(), before_canonical);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_save_sync_cut_is_installed_unconfirmed_and_advances_retained_value() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        std::fs::write(
+            session_root.join("session-a.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id, &session);
+        let mut activation = activate_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+            selection,
+        )
+        .unwrap();
+        let mut next = activation.saved().clone();
+        next.updated_at = "2026-08-20T10:02:00.000Z".to_string();
+        next.model = "installed-unconfirmed".to_string();
+        super::super::FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|fail| {
+            assert!(!fail.replace(true));
+        });
+        let receipt = activation.save_current_v1_snapshot(next.clone()).unwrap();
+        assert!(receipt.durability_warning().is_some());
+        assert_eq!(
+            std::fs::read(session_root.join("session-a.json")).unwrap(),
+            super::super::encode_saved(&next).unwrap()
+        );
+        assert_eq!(
+            super::super::encode_saved(activation.saved()).unwrap(),
+            super::super::encode_saved(&next).unwrap()
+        );
+    }
+
+    #[test]
+    fn canonical_activation_rejects_current_snapshot_save_without_effects() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id, &session);
+        let mut activation = activate_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+            selection,
+        )
+        .unwrap();
+        let candidate = activation.saved().clone();
+        let before = tree_snapshot(&session_root);
+        assert!(matches!(
+            activation.save_current_v1_snapshot(candidate),
+            Err(SessionMountSaveErrorV1::CanonicalOperationRequired)
+        ));
+        assert_eq!(tree_snapshot(&session_root), before);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn current_save_stays_on_pinned_directory_after_ancestor_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let moved_root = root.path().join("sessions-original");
+        std::fs::create_dir(&session_root).unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let original = current_v1_bytes(1, session.as_str());
+        std::fs::write(session_root.join("session-a.json"), &original).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection =
+            select_session_mount_v1(&directory, StoreId::new("store-a").unwrap(), &session);
+        let mut activation = activate_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+            selection,
+        )
+        .unwrap();
+
+        std::fs::rename(&session_root, &moved_root).unwrap();
+        std::fs::create_dir(&session_root).unwrap();
+        let replacement = b"replacement namespace";
+        std::fs::write(session_root.join("session-a.json"), replacement).unwrap();
+        let mut next = activation.saved().clone();
+        next.updated_at = "2026-08-20T10:02:00.000Z".to_string();
+        next.model = "pinned-save".to_string();
+        activation.save_current_v1_snapshot(next.clone()).unwrap();
+
+        assert_eq!(
+            std::fs::read(moved_root.join("session-a.json")).unwrap(),
+            super::super::encode_saved(&next).unwrap()
+        );
+        assert_eq!(
+            std::fs::read(session_root.join("session-a.json")).unwrap(),
+            replacement
+        );
     }
 }

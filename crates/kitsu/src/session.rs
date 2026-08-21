@@ -141,6 +141,20 @@ impl SnapshotSaveError {
     pub fn installed_commit(&self) -> Option<&SnapshotCommit> {
         self.installed_commit.as_ref()
     }
+
+    fn into_installed_parts(self) -> Result<(SnapshotCommit, String), Self> {
+        let Self {
+            message,
+            installed_commit,
+        } = self;
+        match installed_commit {
+            Some(commit) => Ok((commit, message)),
+            None => Err(Self {
+                message,
+                installed_commit: None,
+            }),
+        }
+    }
 }
 
 impl std::fmt::Display for SnapshotSaveError {
@@ -519,6 +533,29 @@ fn open_directory_path(path: &Path, create: bool) -> std::io::Result<std::fs::Fi
 }
 
 impl PrivateDirectory {
+    fn try_clone_pinned(&self, context: &str) -> Result<Self, String> {
+        #[cfg(unix)]
+        {
+            let file = self.file.try_clone().map_err(|error| {
+                format!(
+                    "cannot retain pinned {context} directory '{}': {error}",
+                    self.path.display()
+                )
+            })?;
+            Ok(Self {
+                path: self.path.clone(),
+                file,
+            })
+        }
+
+        #[cfg(not(unix))]
+        {
+            Ok(Self {
+                path: self.path.clone(),
+            })
+        }
+    }
+
     fn prepare(path: &Path, context: &str) -> Result<Self, String> {
         #[cfg(unix)]
         {
@@ -1704,6 +1741,20 @@ fn atomic_write_private_in_detailed(
     replace: bool,
     context: &str,
 ) -> Result<AtomicWriteCommit, AtomicWriteFailure> {
+    atomic_write_private_in_detailed_if(directory, target_name, bytes, replace, context, || Ok(()))
+}
+
+fn atomic_write_private_in_detailed_if<F>(
+    directory: &PrivateDirectory,
+    target_name: &OsStr,
+    bytes: &[u8],
+    replace: bool,
+    context: &str,
+    before_install: F,
+) -> Result<AtomicWriteCommit, AtomicWriteFailure>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     let target = directory.path.join(target_name);
 
     #[cfg(unix)]
@@ -1727,6 +1778,10 @@ fn atomic_write_private_in_detailed(
                 "cannot write {context} '{}': {error}",
                 target.display()
             )));
+        }
+        if let Err(message) = before_install() {
+            let _ = unlinkat(&directory.file, OsStr::new(&temporary_name));
+            return Err(AtomicWriteFailure::before_install(message));
         }
         if replace {
             if let Err(error) = renameat(
@@ -1777,6 +1832,7 @@ fn atomic_write_private_in_detailed(
 
     #[cfg(not(unix))]
     {
+        before_install().map_err(AtomicWriteFailure::before_install)?;
         atomic_write_private_detailed(&target, bytes, replace, context)
     }
 }
@@ -2057,6 +2113,18 @@ fn write_saved_file(
     saved: &SavedSession,
     replace: bool,
 ) -> Result<(PathBuf, AtomicWriteCommit), SnapshotSaveError> {
+    write_saved_file_if(dir, saved, replace, || Ok(()))
+}
+
+fn write_saved_file_if<F>(
+    dir: &PrivateDirectory,
+    saved: &SavedSession,
+    replace: bool,
+    before_install: F,
+) -> Result<(PathBuf, AtomicWriteCommit), SnapshotSaveError>
+where
+    F: FnOnce() -> Result<(), String>,
+{
     if !valid_id(&saved.id) {
         return Err(SnapshotSaveError {
             message: "saved session has an invalid id".to_string(),
@@ -2069,9 +2137,15 @@ fn write_saved_file(
         message,
         installed_commit: None,
     })?;
-    let commit =
-        atomic_write_private_in_detailed(dir, OsStr::new(&name), &bytes, replace, "session")
-            .map_err(|error| error.into_snapshot_save_error(target.clone()))?;
+    let commit = atomic_write_private_in_detailed_if(
+        dir,
+        OsStr::new(&name),
+        &bytes,
+        replace,
+        "session",
+        before_install,
+    )
+    .map_err(|error| error.into_snapshot_save_error(target.clone()))?;
     Ok((target, commit))
 }
 
