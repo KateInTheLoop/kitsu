@@ -1005,6 +1005,15 @@ after effects moves only adapter-reported owned receipts into reverse rollback;
 incomplete cleanup transfers non-cloneable residue with the primary cause. No
 prompt, model picker, provider/catalog call, credential entry/store, config write,
 CLI route, or first-success claim is mounted yet.
+Cycle 115 adds one private real Linux backend behind the exact prepared launch
+and phase supervisor. It builds seccomp state before fork, closes inherited
+descriptors, clears capabilities, denies network and process-group/namespace
+escape, bounds and joins every pipe worker, and uses real monotonic deadlines.
+Real fixtures prove exit/EOF/crash truth, overflow, timeout, cancellation,
+shutdown, descendant-group death, direct wait, drop cleanup, and retryable owned
+residue. It remains unmounted and one-process/one-request: filesystem
+confinement, immutable executable identity, serial MCP transport, inventory
+composition, configuration, and product acceptance are still absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

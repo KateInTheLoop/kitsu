@@ -551,6 +551,88 @@ pub(crate) struct PreparedChildLaunchV1 {
     runtime_policy: ChildRuntimePolicyV1,
 }
 
+/// Exact OS-launch projection of one consumed preparation proof.
+///
+/// This value stays private to the external runtime. It is intentionally
+/// neither `Clone` nor `Copy`, and its custom debug output preserves
+/// environment names while redacting every value.
+pub(super) struct PreparedChildOsLaunchV1 {
+    executable: PathBuf,
+    executable_sha256: ExecutableSha256V1,
+    arguments: Vec<String>,
+    working_directory: PathBuf,
+    phase_budgets: ChildPhaseBudgetsV1,
+    io_limits: ChildIoLimitsV1,
+    environment: ChildEnvironmentPolicyV1,
+}
+
+impl fmt::Debug for PreparedChildOsLaunchV1 {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter
+            .debug_struct("PreparedChildOsLaunchV1")
+            .field("executable", &self.executable)
+            .field("executable_sha256", &self.executable_sha256)
+            .field("arguments", &self.arguments)
+            .field("working_directory", &self.working_directory)
+            .field("phase_budgets", &self.phase_budgets)
+            .field("io_limits", &self.io_limits)
+            .field("environment", &self.environment)
+            .finish()
+    }
+}
+
+impl PreparedChildOsLaunchV1 {
+    pub(super) fn executable(&self) -> &Path {
+        &self.executable
+    }
+
+    pub(super) fn arguments(&self) -> &[String] {
+        &self.arguments
+    }
+
+    pub(super) fn working_directory(&self) -> &Path {
+        &self.working_directory
+    }
+
+    pub(super) fn environment(&self) -> impl Iterator<Item = (&str, &str)> {
+        self.environment
+            .projection
+            .iter()
+            .map(|variable| (variable.name.as_str(), variable.value.0.as_str()))
+    }
+
+    #[cfg(test)]
+    pub(super) fn environment_for_test(&self) -> Vec<(&str, &str)> {
+        self.environment().collect()
+    }
+
+    pub(super) fn phase_budgets_millis(&self) -> [u64; 5] {
+        [
+            self.phase_budgets.startup_millis,
+            self.phase_budgets.request_millis,
+            self.phase_budgets.drain_millis,
+            self.phase_budgets.kill_millis,
+            self.phase_budgets.reap_millis,
+        ]
+    }
+
+    pub(super) fn stdin_limit(&self) -> usize {
+        self.io_limits.stdin_bytes
+    }
+
+    pub(super) fn stdout_limit(&self) -> usize {
+        self.io_limits.stdout_bytes
+    }
+
+    pub(super) fn stderr_limit(&self) -> usize {
+        self.io_limits.stderr_bytes
+    }
+
+    pub(super) fn frame_limit(&self) -> usize {
+        self.io_limits.frame_bytes
+    }
+}
+
 impl PreparedChildLaunchV1 {
     /// Exposes only the already-authorized phase budgets to the private
     /// supervisor. Callers cannot replace them or reconstruct a launch proof.
@@ -562,6 +644,27 @@ impl PreparedChildLaunchV1 {
             self.runtime_policy.phase_budgets.kill_millis,
             self.runtime_policy.phase_budgets.reap_millis,
         ]
+    }
+
+    /// Consumes the one-shot preparation proof into the exact private launch
+    /// values. The runtime cannot accept caller-supplied replacements.
+    pub(super) fn into_os_launch(self) -> PreparedChildOsLaunchV1 {
+        let Self {
+            canonical_executable,
+            executable_sha256,
+            arguments,
+            working_directory,
+            runtime_policy,
+        } = self;
+        PreparedChildOsLaunchV1 {
+            executable: canonical_executable,
+            executable_sha256,
+            arguments,
+            working_directory,
+            phase_budgets: runtime_policy.phase_budgets,
+            io_limits: runtime_policy.io_limits,
+            environment: runtime_policy.environment,
+        }
     }
 }
 

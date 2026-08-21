@@ -14,17 +14,19 @@ adaptive presentation-only decks through Cycle 110, and exact offline
 `/usage session` collection/routing through Cycle 112. E07-S01 now has its first
 provider-free fixed-corpus measurement baseline through Cycle 113.
 E05-S01 has a private effect-free transactional setup model through Cycle 114.
+E06-S01 now composes its prepared policy and phase owner with a private real
+Linux one-process backend through Cycle 115.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 114 / 114 |
+| Accepted cycles/commits after this cycle | 115 / 115 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 115 — E06-S01-C5: prove a private Linux real-child backend behind exact preparation and supervisor ownership without mounting MCP |
+| Active epic/card | Cycle 116 — E05-S01-C2: prove descriptor-relative create-new setup configuration publication and owned rollback |
 
 ## Epic status
 
@@ -35,7 +37,7 @@ E05-S01 has a private effect-free transactional setup model through Cycle 114.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C4, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped runtime policy into a provider-free phase supervisor with checked deadlines, idempotent drain, termination-before-kill/reap clocks, and owned residue. Effects remain injected; next add a real bounded backend only behind these proofs. No product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C5, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux backend now consumes the prepared policy through the accepted phase owner and proves bounded joined pipes, real clocks, process-group termination, direct wait, EOF/exit/crash truth, and retryable residue. It remains one-process/one-request and unmounted because filesystem confinement, immutable exec identity, long-lived MCP composition, and a product route are absent |
 | E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
 | E05 onboarding | **In progress** through E05-S01-C1 | Pure consent/fenced-stage/create-new/reverse-rollback transaction is staged; real adapters, guided UI, picker, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C4 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; exact offline `/usage session` now collects one coherent in-memory observation and renders only its usage section adaptively. Full status/context migration, JSONL automation parity, aliases, and durable history remain separate; history still consumes E03 fencing |
@@ -160,6 +162,7 @@ E05-S01 has a private effect-free transactional setup model through Cycle 114.
 | 112 | this document's commit | Exact offline truthful `/usage session` collection and rendering |
 | 113 | this document's commit | Deterministic bounded mixed-language current-tool evidence baseline |
 | 114 | this document's commit | Pure transactional guided-setup proposal and owned rollback truth |
+| 115 | this document's commit | Private bounded Linux child backend and real cleanup truth |
 
 ## Current green gates
 
@@ -798,6 +801,17 @@ owned adapter receipts can roll back, and incomplete cleanup moves exact
 non-cloneable residue plus its primary cause to a recovery owner. The model is
 private and unmounted: no prompt, network/catalog execution, secret entry/store,
 config publication, picker, first-success workflow, JSONL, or PF-10 claim exists.
+
+Cycle 115 composes the exact prepared launch and phase-supervisor contracts with
+one private Linux process backend. Parent-built seccomp state, inherited-FD
+closure, capability clearing, denied network and group/namespace escape, bounded
+joined pipes, real monotonic deadlines, and direct-child wait plus group-ESRCH
+truth are exercised by real subprocess fixtures. Exit zero plus both EOFs is the
+only success; early output, idle, crash, overflow, cancellation, shutdown, and
+drop retain causal cleanup truth. This remains a one-process/one-request proof,
+not a product or general sandbox: filesystem confinement, immutable executable
+identity, serial MCP transport, configuration, inventory composition, and every
+X002 acceptance route remain absent.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful
