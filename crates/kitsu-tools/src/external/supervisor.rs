@@ -55,6 +55,10 @@ impl OwnedChildTokenV1 {
     pub(crate) fn new(value: u64) -> Self {
         Self(value)
     }
+
+    pub(super) fn id(&self) -> u64 {
+        self.0
+    }
 }
 
 /// A child which could not be reaped inside the authorized deadline. The
