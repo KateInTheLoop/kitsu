@@ -1647,6 +1647,43 @@ impl PhysicalFileStoreV1 {
         )
     }
 
+    pub(super) fn confirm_existing_artifact(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        session_id: &SessionId,
+        artifact_id: &str,
+        expected_manifest_sha256: &str,
+    ) -> Result<VerifiedArtifactV1, String> {
+        fence.confirm(self.store_id(), session_id)?;
+        let verified = self
+            .open_artifact(session_id, artifact_id)
+            .map_err(|error| error.to_string())?;
+        if verified.manifest_sha256().as_str() != expected_manifest_sha256 {
+            return Err(format!(
+                "physical artifact '{artifact_id}' changed before durability confirmation"
+            ));
+        }
+
+        let session_name = encode_component(session_id.as_str());
+        let session_artifacts = self.artifacts.open_child(
+            OsStr::new(&session_name),
+            "physical session artifact namespace",
+        )?;
+        session_artifacts.sync("physical session artifact namespace")?;
+        self.artifacts.sync("physical artifact namespace")?;
+        self.staging.sync("physical artifact staging namespace")?;
+
+        let confirmed = self
+            .open_artifact(session_id, artifact_id)
+            .map_err(|error| error.to_string())?;
+        if confirmed.manifest_sha256().as_str() != expected_manifest_sha256 {
+            return Err(format!(
+                "physical artifact '{artifact_id}' changed during durability confirmation"
+            ));
+        }
+        Ok(confirmed)
+    }
+
     pub(super) fn open_artifact(
         &self,
         session_id: &SessionId,
@@ -2026,6 +2063,64 @@ impl PhysicalFileStoreV1 {
                 self.revisions.path.join(&session_name).display()
             )),
         }
+    }
+
+    pub(super) fn adopt_revision_candidate_exact(
+        &self,
+        fence: &PhysicalWriterFenceV1,
+        expected: &VerifiedRevisionCandidateV1,
+        canonical_bytes: &[u8],
+    ) -> Result<InstalledRevisionCandidateV1, String> {
+        let session_id = expected.manifest().session_id();
+        let revision_id = expected.manifest().revision_id();
+        fence.confirm(self.store_id(), session_id)?;
+        let candidate = self
+            .open_revision_candidate(session_id, revision_id)
+            .map_err(|error| error.to_string())?;
+        if candidate.manifest() != expected.manifest()
+            || candidate.manifest_sha256() != expected.manifest_sha256()
+            || candidate.canonical_bytes() != canonical_bytes
+            || expected.canonical_bytes() != canonical_bytes
+        {
+            return Err(
+                "physical revision candidate does not exactly match the requested adoption"
+                    .to_string(),
+            );
+        }
+
+        let session_name = encode_component(session_id.as_str());
+        let session_revisions = self.revisions.open_child(
+            OsStr::new(&session_name),
+            "physical session revision namespace",
+        )?;
+        session_revisions.sync("physical session revision namespace")?;
+        self.revisions.sync("physical revision namespace")?;
+        self.staging.sync("physical revision staging namespace")?;
+
+        let confirmed = self
+            .open_revision_candidate(session_id, revision_id)
+            .map_err(|error| error.to_string())?;
+        if confirmed.manifest() != candidate.manifest()
+            || confirmed.manifest_sha256() != candidate.manifest_sha256()
+            || confirmed.canonical_bytes() != canonical_bytes
+        {
+            return Err(
+                "physical revision candidate changed during durability confirmation".to_string(),
+            );
+        }
+        let manifest = confirmed.manifest().clone();
+        let manifest_bytes = encode_revision_manifest(&manifest)?;
+        let manifest_sha256 = digest_bytes(&manifest_bytes)?;
+        if &manifest_sha256 != expected.manifest_sha256() {
+            return Err(
+                "physical revision candidate manifest digest changed during adoption".to_string(),
+            );
+        }
+        Ok(InstalledRevisionCandidateV1 {
+            manifest,
+            manifest_bytes,
+            manifest_sha256,
+        })
     }
 
     pub(super) fn open_revision_candidate(

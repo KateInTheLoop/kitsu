@@ -1065,7 +1065,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 CandidateResidueV1::None,
             ));
         }
-        if !self
+        let existing_candidate_manifest = if self
             .store
             .revision_candidate_is_absent(&destination_session, &destination_revision)
             .map_err(|error| {
@@ -1076,29 +1076,61 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                     &expected,
                     CandidateResidueV1::None,
                 )
-            })?
-        {
-            return Err(CanonicalTransactionErrorV1::not_published(
-                "canonical branch destination revision already exists; refusing to overwrite it",
-                self.store,
-                &destination_session,
-                &expected,
-                CandidateResidueV1::None,
-            ));
-        }
+            })? {
+            None
+        } else {
+            let existing = self
+                .store
+                .open_revision_candidate(&destination_session, &destination_revision)
+                .map_err(|error| {
+                    CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "canonical branch destination revision already exists but cannot be verified: {error}"
+                        ),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::PreexistingCollision {
+                            revision: destination_revision.clone(),
+                        },
+                    )
+                })?;
+            if existing.manifest().logical_schema_revision() != payload.logical_schema()
+                || existing.manifest().parent_revision() != &expected
+                || existing.canonical_bytes() != canonical_bytes
+            {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    "canonical branch destination revision already exists with different bytes; refusing to overwrite it",
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::PreexistingCollision {
+                        revision: destination_revision.clone(),
+                    },
+                ));
+            }
+            Some(existing)
+        };
 
         // Preflight the complete destination artifact set before copying the
         // first byte. The destination fence excludes every conformant writer.
+        let mut existing_artifact_manifests = Vec::with_capacity(payload.artifact_count());
         for fact in payload.artifacts() {
             match self
                 .store
                 .open_artifact(&destination_session, fact.artifact_id())
             {
-                Err(PhysicalArtifactReadErrorV1::Missing(_)) => {}
+                Err(PhysicalArtifactReadErrorV1::Missing(_)) => {
+                    existing_artifact_manifests.push(None)
+                }
+                Ok(existing) if artifact_fact_matches_physical(fact, existing.manifest()) => {
+                    existing_artifact_manifests
+                        .push(Some(existing.manifest_sha256().as_str().to_string()));
+                }
                 Ok(_) => {
                     return Err(CanonicalTransactionErrorV1::not_published(
                         format!(
-                            "canonical branch destination artifact '{}' already exists; refusing to overwrite it",
+                            "canonical branch destination artifact '{}' already exists with different bytes; refusing to overwrite it",
                             fact.artifact_id()
                         ),
                         self.store,
@@ -1110,7 +1142,7 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 Err(error) => {
                     return Err(CanonicalTransactionErrorV1::not_published(
                         format!(
-                            "cannot prove canonical branch destination artifact '{}' absent: {error}",
+                            "canonical branch destination artifact '{}' already exists but cannot be verified: {error}",
                             fact.artifact_id()
                         ),
                         self.store,
@@ -1123,26 +1155,34 @@ impl<'a> CanonicalFileTransactionV1<'a> {
         }
 
         let mut artifact_residue = Vec::with_capacity(payload.artifact_count());
-        for fact in payload.artifacts() {
-            match self.store.copy_artifact_no_overwrite(
-                source.session_id(),
-                &destination_session,
-                fact.artifact_id(),
-            ) {
-                Ok(_) => artifact_residue.push(ArtifactResidueV1::Installed {
-                    artifact_id: fact.artifact_id().to_string(),
-                    durability: CandidateDurabilityV1::Confirmed,
-                }),
-                Err(error) => {
-                    if error.installed() {
-                        artifact_residue.push(ArtifactResidueV1::Installed {
-                            artifact_id: fact.artifact_id().to_string(),
-                            durability: CandidateDurabilityV1::Unconfirmed,
-                        });
-                    }
+        for (fact, existing_manifest) in payload.artifacts().iter().zip(existing_artifact_manifests)
+        {
+            if let Some(existing_manifest) = existing_manifest {
+                let confirmed = self
+                    .store
+                    .confirm_existing_artifact(
+                        &destination_fence,
+                        &destination_session,
+                        fact.artifact_id(),
+                        &existing_manifest,
+                    )
+                    .map_err(|error| {
+                        CanonicalTransactionErrorV1::not_published(
+                            format!(
+                                "cannot confirm canonical branch destination artifact '{}': {error}",
+                                fact.artifact_id()
+                            ),
+                            self.store,
+                            &destination_session,
+                            &expected,
+                            CandidateResidueV1::None,
+                        )
+                        .with_artifact_residue(artifact_residue.clone())
+                    })?;
+                if !artifact_fact_matches_physical(fact, confirmed.manifest()) {
                     return Err(CanonicalTransactionErrorV1::not_published(
                         format!(
-                            "cannot copy canonical branch artifact '{}': {error}",
+                            "canonical branch destination artifact '{}' changed during exact adoption",
                             fact.artifact_id()
                         ),
                         self.store,
@@ -1151,6 +1191,40 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                         CandidateResidueV1::None,
                     )
                     .with_artifact_residue(artifact_residue));
+                }
+                artifact_residue.push(ArtifactResidueV1::Installed {
+                    artifact_id: fact.artifact_id().to_string(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                });
+            } else {
+                match self.store.copy_artifact_no_overwrite(
+                    source.session_id(),
+                    &destination_session,
+                    fact.artifact_id(),
+                ) {
+                    Ok(_) => artifact_residue.push(ArtifactResidueV1::Installed {
+                        artifact_id: fact.artifact_id().to_string(),
+                        durability: CandidateDurabilityV1::Confirmed,
+                    }),
+                    Err(error) => {
+                        if error.installed() {
+                            artifact_residue.push(ArtifactResidueV1::Installed {
+                                artifact_id: fact.artifact_id().to_string(),
+                                durability: CandidateDurabilityV1::Unconfirmed,
+                            });
+                        }
+                        return Err(CanonicalTransactionErrorV1::not_published(
+                            format!(
+                                "cannot copy canonical branch artifact '{}': {error}",
+                                fact.artifact_id()
+                            ),
+                            self.store,
+                            &destination_session,
+                            &expected,
+                            CandidateResidueV1::None,
+                        )
+                        .with_artifact_residue(artifact_residue));
+                    }
                 }
             }
         }
@@ -1169,19 +1243,41 @@ impl<'a> CanonicalFileTransactionV1<'a> {
 
         self.verify_artifact_closure(&payload, CandidateResidueV1::None)
             .map_err(|error| error.with_artifact_residue(artifact_residue.clone()))?;
-        let candidate = self
-            .store
-            .install_revision_candidate(
-                payload.logical_schema(),
-                destination_session.clone(),
-                destination_revision.clone(),
-                expected.clone(),
-                &canonical_bytes,
-            )
-            .map_err(|error| {
-                self.install_error(&payload, &canonical_bytes, error)
+        let candidate = if let Some(existing_candidate) = existing_candidate_manifest {
+            self.store
+                .adopt_revision_candidate_exact(
+                    &destination_fence,
+                    &existing_candidate,
+                    &canonical_bytes,
+                )
+                .map_err(|error| {
+                    CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "cannot adopt exact canonical branch destination revision: {error}"
+                        ),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::PreexistingCollision {
+                            revision: destination_revision.clone(),
+                        },
+                    )
                     .with_artifact_residue(artifact_residue.clone())
-            })?;
+                })?
+        } else {
+            self.store
+                .install_revision_candidate(
+                    payload.logical_schema(),
+                    destination_session.clone(),
+                    destination_revision.clone(),
+                    expected.clone(),
+                    &canonical_bytes,
+                )
+                .map_err(|error| {
+                    self.install_error(&payload, &canonical_bytes, error)
+                        .with_artifact_residue(artifact_residue.clone())
+                })?
+        };
 
         #[cfg(test)]
         if self.fail_next_artifact_recheck.replace(false) {
@@ -2420,6 +2516,196 @@ mod tests {
             }
         );
         assert!(store.read_head(&recheck_cut_session).unwrap().is_none());
+    }
+
+    #[test]
+    fn branch_transaction_retries_only_exact_verified_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            PhysicalFileStoreV1::create_or_open(root.path(), StoreId::new("store-1").unwrap())
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let source = committed_artifact_source(&store, &transaction);
+        let branch_turn = TurnId::new("turn-artifact").unwrap();
+
+        let artifact_session = SessionId::new("session-retry-artifact").unwrap();
+        let artifact_revision = RevisionId::new("rev-retry-artifact").unwrap();
+        transaction.inject_next_after_branch_artifacts_failure();
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                artifact_session.clone(),
+                artifact_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        let artifact_retry = transaction
+            .commit_branch_at_turn(
+                &source,
+                artifact_session.clone(),
+                artifact_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap();
+        assert_eq!(receipt(&artifact_retry).new_revision(), &artifact_revision);
+        assert_eq!(
+            store
+                .read_head(&artifact_session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &artifact_revision
+        );
+
+        let candidate_session = SessionId::new("session-retry-candidate").unwrap();
+        let candidate_revision = RevisionId::new("rev-retry-candidate").unwrap();
+        transaction.inject_next_after_candidate_failure();
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_session.clone(),
+                candidate_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_session.clone(),
+                candidate_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read_head(&candidate_session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &candidate_revision
+        );
+
+        let candidate_sync_session = SessionId::new("session-retry-candidate-sync").unwrap();
+        let candidate_sync_revision = RevisionId::new("rev-retry-candidate-sync").unwrap();
+        transaction.inject_next_after_branch_artifacts_failure();
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_sync_session.clone(),
+                candidate_sync_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        store.inject_next_target_sync_failure();
+        let candidate_sync = transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_sync_session.clone(),
+                candidate_sync_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            candidate_sync.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: candidate_sync_revision.clone(),
+                durability: CandidateDurabilityV1::Unconfirmed,
+            }
+        );
+        assert!(store.read_head(&candidate_sync_session).unwrap().is_none());
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_sync_session.clone(),
+                candidate_sync_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read_head(&candidate_sync_session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &candidate_sync_revision
+        );
+
+        let unconfirmed_session = SessionId::new("session-retry-unconfirmed").unwrap();
+        let unconfirmed_revision = RevisionId::new("rev-retry-unconfirmed").unwrap();
+        store.inject_next_target_sync_failure();
+        let unconfirmed = transaction
+            .commit_branch_at_turn(
+                &source,
+                unconfirmed_session.clone(),
+                unconfirmed_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        assert!(matches!(
+            unconfirmed.artifact_residue(),
+            [ArtifactResidueV1::Installed {
+                durability: CandidateDurabilityV1::Unconfirmed,
+                ..
+            }]
+        ));
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                unconfirmed_session.clone(),
+                unconfirmed_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap();
+        assert_eq!(
+            store
+                .read_head(&unconfirmed_session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &unconfirmed_revision
+        );
+
+        let tampered_session = SessionId::new("session-retry-tampered").unwrap();
+        let tampered_revision = RevisionId::new("rev-retry-tampered").unwrap();
+        transaction.inject_next_after_candidate_failure();
+        transaction
+            .commit_branch_at_turn(
+                &source,
+                tampered_session.clone(),
+                tampered_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn.clone(),
+            )
+            .unwrap_err();
+        std::fs::write(
+            crate::session::physical::PhysicalLayoutV1::artifact_content(
+                root.path(),
+                &tampered_session,
+                "artifact-branch",
+            ),
+            b"tampered residue",
+        )
+        .unwrap();
+        let tampered = transaction
+            .commit_branch_at_turn(
+                &source,
+                tampered_session.clone(),
+                tampered_revision,
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn,
+            )
+            .unwrap_err();
+        assert!(tampered.to_string().contains("destination artifact"));
+        assert!(store.read_head(&tampered_session).unwrap().is_none());
     }
 
     #[test]

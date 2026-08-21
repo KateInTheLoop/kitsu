@@ -2,7 +2,7 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C21, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 079;
+through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 79 / 79 |
+| Accepted cycles/commits after this cycle | 80 / 80 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S05-C4 (Cycle 080) — resume only exact branch artifact/candidate residue after a cut |
+| Active epic/card | E03 / E03-S02-C22 (Cycle 081) — define deterministic current-v1/canonical mount admission before routing production writes |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C21, E03-S05 through C3 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. Branch assembly and private publication now accept only a committed boundary, bind the exact source revision/HEAD, copy only referenced verified artifacts into a fresh destination, and publish a complete create-only candidate under deterministically ordered source/destination fences. Destination HEAD/artifact/revision collision and stale source fail before copying; artifact/candidate/recheck cuts report exact immutable residue without exposing destination HEAD; HEAD-sync failure selects only the complete new branch as published-unconfirmed. No authority is stored or copied. Exact residue retry/recovery, production mounting, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C21, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. Branch assembly/publication accepts only a committed boundary, binds exact source revision/HEAD, copies only referenced verified artifacts into a fresh destination, and publishes a complete root under ordered dual fences. A retry now adopts only a byte/digest/identity-exact artifact or candidate, re-syncs its owning namespaces, and reopens it before the ordinary source/closure/HEAD checks; tampered or name-only residue remains a collision. No authority is stored or copied. Production mounting, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -115,7 +115,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 076 | `fef69d2` | Fenced new-revision recovery publication and exact cut truth |
 | 077 | `bd00774` | Pure branch-at-committed-turn prefix and closure assembly |
 | 078 | `617b836` | Verified destination-scoped no-overwrite branch artifact copying |
-| 079 | this document's commit | Dual-fenced create-only branch transaction and exact cut residue |
+| 079 | `6c5c109` | Dual-fenced create-only branch transaction and exact cut residue |
+| 080 | this document's commit | Exact verified branch-residue adoption and retry |
 
 ## Current green gates
 
@@ -480,6 +481,15 @@ CAS. Known stale/collision cases copy nothing. Post-copy/candidate/recheck cuts
 retain exact artifact/candidate residue but no destination HEAD; a HEAD-sync cut
 selects the fully verifiable branch as `PublishedUnconfirmed`. Cycle 080 next
 admits only exact matching residue for safe retry after those pre-HEAD cuts.
+Cycle 080 makes those cuts restartable without deletion or overwrite. A retry
+preflights the complete destination set, accepts only physical records whose
+identity, schema, parent, manifest digest, canonical bytes, and artifact facts
+match the same assembled branch, re-syncs the target plus owning namespaces,
+and reopens before adoption. Artifact-only, confirmed-candidate, unconfirmed-
+artifact, and unconfirmed-candidate residue all converge to the same complete
+branch; tampering remains blocked with HEAD missing. Cycle 081 returns to the
+production-mount prerequisite and defines deterministic current-v1/canonical
+admission before any live write routing changes.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
