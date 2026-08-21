@@ -2334,6 +2334,9 @@ mod tests {
         ChildRuntimePolicyV1, ChildTimeoutDispositionV1, PreparedChildLaunchV1,
     };
     use crate::external::lifecycle::ChildExitTruthV1;
+    use crate::external::mcp::{
+        McpSerialChildFailureV1, McpSerialChildOwnerV1, McpSerialChildStateV1,
+    };
     use crate::external::serial::{
         SerialChildCauseV1, SerialChildTransportFailureV1, SerialChildTransportStateV1,
         SerialChildTransportV1,
@@ -2342,6 +2345,7 @@ mod tests {
         ChildPhaseSupervisorFailureV1, ChildPhaseSupervisorStateV1, ChildPhaseSupervisorV1,
         ChildSupervisorCauseV1,
     };
+    use crate::mcp_codec::{ClientError, ClientEvent, CodecError};
 
     const HELPER_TEST: &str = "external::backend::tests::real_child_fixture_entry";
 
@@ -2578,6 +2582,437 @@ mod tests {
         )
         .unwrap();
         (prepared, backend)
+    }
+
+    const MCP_PEER_ENV_V1: &str = "KITSU_INTERNAL_TEST_MCP_PEER_V1";
+    const MCP_INITIALIZE_RESPONSE_LINE_V1: &[u8] = b"{\"id\":1,\"jsonrpc\":\"2.0\",\"result\":{\"capabilities\":{\"tools\":{\"listChanged\":false}},\"protocolVersion\":\"2025-11-25\",\"serverInfo\":{\"name\":\"kitsu-test-peer\",\"version\":\"1\"}}}\n";
+    const MCP_LIST_RESPONSE_LINE_V1: &[u8] = b"{\"id\":2,\"jsonrpc\":\"2.0\",\"result\":{\"tools\":[{\"description\":\"Returns one integer as text.\",\"inputSchema\":{\"additionalProperties\":false,\"properties\":{\"value\":{\"type\":\"integer\"}},\"required\":[\"value\"],\"type\":\"object\"},\"name\":\"fixture.echo\"}]}}\n";
+    const MCP_CALL_RESPONSE_LINE_V1: &[u8] = b"{\"id\":3,\"jsonrpc\":\"2.0\",\"result\":{\"content\":[{\"text\":\"7\",\"type\":\"text\"}],\"isError\":false}}\n";
+
+    #[derive(Debug, Clone, Copy)]
+    enum RealMcpPeerModeV1 {
+        Exact,
+        Eof,
+        Crash,
+        WrongId,
+        Malformed,
+        Descendant,
+    }
+
+    impl RealMcpPeerModeV1 {
+        fn discriminator(self) -> &'static str {
+            match self {
+                Self::Exact => "exact",
+                Self::Eof => "eof",
+                Self::Crash => "crash",
+                Self::WrongId => "wrong-id",
+                Self::Malformed => "malformed",
+                Self::Descendant => "descendant",
+            }
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[used]
+    #[link_section = ".init_array"]
+    static KITSU_TEST_MCP_PEER_PREMAIN_V1: unsafe extern "C" fn() = kitsu_test_mcp_peer_premain_v1;
+
+    // This test-only ELF entry runs after the admitted exec has installed the
+    // prepared Landlock/seccomp state but before libtest can write to stdout.
+    // The absent discriminator path only reads `environ` and returns. Every
+    // selected path below uses fixed buffers and async-signal-safe libc calls;
+    // it never enters Rust stdio, allocation, discovery, or panic machinery.
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe extern "C" fn kitsu_test_mcp_peer_premain_v1() {
+        let value = unsafe { libc::getenv(c"KITSU_INTERNAL_TEST_MCP_PEER_V1".as_ptr()) };
+        if value.is_null() {
+            return;
+        }
+        let mode = [
+            RealMcpPeerModeV1::Exact,
+            RealMcpPeerModeV1::Eof,
+            RealMcpPeerModeV1::Crash,
+            RealMcpPeerModeV1::WrongId,
+            RealMcpPeerModeV1::Malformed,
+            RealMcpPeerModeV1::Descendant,
+        ]
+        .into_iter()
+        .find(|mode| unsafe { raw_c_value_equals_v1(value, mode.discriminator().as_bytes()) });
+        let Some(mode) = mode else {
+            unsafe { libc::_exit(89) };
+        };
+        let exit = unsafe { run_raw_mcp_peer_v1(mode) };
+        unsafe { libc::_exit(exit) };
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_c_value_equals_v1(value: *const libc::c_char, expected: &[u8]) -> bool {
+        for (index, expected) in expected.iter().enumerate() {
+            if unsafe { *value.add(index).cast::<u8>() } != *expected {
+                return false;
+            }
+        }
+        unsafe { *value.add(expected.len()).cast::<u8>() == 0 }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn run_raw_mcp_peer_v1(mode: RealMcpPeerModeV1) -> i32 {
+        const INITIALIZE: &[u8] = b"{\"id\":1,\"jsonrpc\":\"2.0\",\"method\":\"initialize\",\"params\":{\"capabilities\":{},\"clientInfo\":{\"name\":\"kitsu-tools\",\"version\":\"0.1.0\"},\"protocolVersion\":\"2025-11-25\"}}\n";
+        const INITIALIZED: &[u8] =
+            b"{\"jsonrpc\":\"2.0\",\"method\":\"notifications/initialized\"}\n";
+        const TOOLS_LIST: &[u8] = b"{\"id\":2,\"jsonrpc\":\"2.0\",\"method\":\"tools/list\"}\n";
+        const TOOLS_CALL: &[u8] = b"{\"id\":3,\"jsonrpc\":\"2.0\",\"method\":\"tools/call\",\"params\":{\"arguments\":{\"value\":7},\"name\":\"fixture.echo\"}}\n";
+        const WRONG_ID: &[u8] = b"{\"id\":99,\"jsonrpc\":\"2.0\",\"result\":{\"capabilities\":{\"tools\":{\"listChanged\":false}},\"protocolVersion\":\"2025-11-25\",\"serverInfo\":{\"name\":\"kitsu-test-peer\",\"version\":\"1\"}}}\n";
+
+        if matches!(mode, RealMcpPeerModeV1::Descendant)
+            && !unsafe { raw_mcp_descendant_marker_v1() }
+        {
+            return 90;
+        }
+        if !unsafe { raw_expect_stdin_v1(INITIALIZE) } {
+            return 91;
+        }
+        match mode {
+            RealMcpPeerModeV1::Eof => return 0,
+            RealMcpPeerModeV1::Crash => {
+                // Keep the stdio descriptors live in the same owned process
+                // group so direct-child exit 17 is observable before pipe EOF.
+                // SAFETY: the pre-main process is single-threaded, and the
+                // fork child performs only the async-signal-safe pause loop.
+                let descriptor_holder = unsafe { libc::fork() };
+                if descriptor_holder < 0 {
+                    return 18;
+                }
+                if descriptor_holder == 0 {
+                    unsafe { raw_pause_forever_v1() }
+                }
+                return 17;
+            }
+            RealMcpPeerModeV1::WrongId => {
+                if !unsafe { raw_write_all_v1(libc::STDOUT_FILENO, WRONG_ID) } {
+                    return 92;
+                }
+                unsafe { raw_pause_forever_v1() }
+            }
+            RealMcpPeerModeV1::Malformed => {
+                if !unsafe { raw_write_all_v1(libc::STDOUT_FILENO, b"{]\n") } {
+                    return 93;
+                }
+                unsafe { raw_pause_forever_v1() }
+            }
+            RealMcpPeerModeV1::Exact | RealMcpPeerModeV1::Descendant => {}
+        }
+        if !unsafe { raw_write_all_v1(libc::STDOUT_FILENO, MCP_INITIALIZE_RESPONSE_LINE_V1) }
+            || !unsafe { raw_expect_stdin_v1(INITIALIZED) }
+            || !unsafe { raw_expect_stdin_v1(TOOLS_LIST) }
+            || !unsafe { raw_write_all_v1(libc::STDOUT_FILENO, MCP_LIST_RESPONSE_LINE_V1) }
+            || !unsafe { raw_expect_stdin_v1(TOOLS_CALL) }
+            || !unsafe { raw_write_all_v1(libc::STDOUT_FILENO, MCP_CALL_RESPONSE_LINE_V1) }
+        {
+            return 94;
+        }
+        unsafe { raw_pause_forever_v1() }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_expect_stdin_v1(expected: &[u8]) -> bool {
+        for expected in expected {
+            let mut observed = 0_u8;
+            loop {
+                let read =
+                    unsafe { libc::read(libc::STDIN_FILENO, (&mut observed as *mut u8).cast(), 1) };
+                if read == 1 {
+                    break;
+                }
+                if read == 0 {
+                    return false;
+                }
+                if read < 0 && unsafe { raw_errno_v1() } == libc::EINTR {
+                    continue;
+                }
+                return false;
+            }
+            if observed != *expected {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_write_all_v1(fd: RawFd, mut bytes: &[u8]) -> bool {
+        while !bytes.is_empty() {
+            let written = unsafe { libc::write(fd, bytes.as_ptr().cast(), bytes.len()) };
+            if written > 0 {
+                let Ok(written) = usize::try_from(written) else {
+                    return false;
+                };
+                let Some(remaining) = bytes.get(written..) else {
+                    return false;
+                };
+                bytes = remaining;
+            } else if written < 0 && unsafe { raw_errno_v1() } == libc::EINTR {
+                continue;
+            } else {
+                return false;
+            }
+        }
+        true
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_mcp_descendant_marker_v1() -> bool {
+        let descendant = unsafe { libc::fork() };
+        if descendant < 0 {
+            return false;
+        }
+        if descendant == 0 {
+            unsafe { raw_pause_forever_v1() }
+        }
+        let fd = unsafe {
+            libc::openat(
+                libc::AT_FDCWD,
+                c"mcp-descendant-pids".as_ptr(),
+                libc::O_WRONLY | libc::O_CREAT | libc::O_EXCL | libc::O_CLOEXEC,
+                0o600,
+            )
+        };
+        if fd < 0 {
+            return false;
+        }
+        let mut bytes = [0_u8; 96];
+        let mut length = 0_usize;
+        let formatted =
+            raw_push_positive_i32_v1(&mut bytes, &mut length, unsafe { libc::getpid() })
+                && raw_push_byte_v1(&mut bytes, &mut length, b' ')
+                && raw_push_positive_i32_v1(&mut bytes, &mut length, unsafe { libc::getpgrp() })
+                && raw_push_byte_v1(&mut bytes, &mut length, b' ')
+                && raw_push_positive_i32_v1(&mut bytes, &mut length, descendant)
+                && raw_push_byte_v1(&mut bytes, &mut length, b'\n');
+        let written = formatted
+            && bytes
+                .get(..length)
+                .is_some_and(|bytes| unsafe { raw_write_all_v1(fd, bytes) });
+        let closed = unsafe { libc::close(fd) } == 0;
+        written && closed
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn raw_push_positive_i32_v1(bytes: &mut [u8], length: &mut usize, value: i32) -> bool {
+        let Ok(mut value) = u32::try_from(value) else {
+            return false;
+        };
+        let mut reversed = [0_u8; 10];
+        let mut digits = 0_usize;
+        loop {
+            let Some(digit) = reversed.get_mut(digits) else {
+                return false;
+            };
+            let Some(decimal) = b"0123456789".get((value % 10) as usize) else {
+                return false;
+            };
+            *digit = *decimal;
+            digits += 1;
+            value /= 10;
+            if value == 0 {
+                break;
+            }
+        }
+        if bytes.len().saturating_sub(*length) < digits {
+            return false;
+        }
+        let Some(reversed) = reversed.get(..digits) else {
+            return false;
+        };
+        for digit in reversed.iter().rev() {
+            let Some(output) = bytes.get_mut(*length) else {
+                return false;
+            };
+            *output = *digit;
+            *length += 1;
+        }
+        true
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    fn raw_push_byte_v1(bytes: &mut [u8], length: &mut usize, value: u8) -> bool {
+        if *length == bytes.len() {
+            return false;
+        }
+        let Some(output) = bytes.get_mut(*length) else {
+            return false;
+        };
+        *output = value;
+        *length += 1;
+        true
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_pause_forever_v1() -> ! {
+        loop {
+            unsafe { libc::pause() };
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    unsafe fn raw_errno_v1() -> i32 {
+        unsafe { *libc::__errno_location() }
+    }
+
+    fn prepared_real_mcp_peer(
+        cwd: &Path,
+        mode: RealMcpPeerModeV1,
+    ) -> (PreparedChildLaunchV1, LinuxChildBackendV1) {
+        let executable = helper_executable();
+        let arguments = helper_arguments();
+        let cwd_access = if matches!(mode, RealMcpPeerModeV1::Descendant) {
+            ChildFilesystemAccessV1::ReadWrite
+        } else {
+            ChildFilesystemAccessV1::ReadOnly
+        };
+        let filesystem = ChildFilesystemPolicyV1::new(vec![
+            ChildFilesystemGrantV1::new(
+                "/usr/lib/x86_64-linux-gnu",
+                ChildFilesystemAccessV1::ReadOnly,
+            ),
+            ChildFilesystemGrantV1::new(cwd, cwd_access),
+        ]);
+        assert_eq!(filesystem.grants().len(), 2);
+        assert_eq!(
+            filesystem.grants()[0],
+            ChildFilesystemGrantV1::new(
+                "/usr/lib/x86_64-linux-gnu",
+                ChildFilesystemAccessV1::ReadOnly,
+            )
+        );
+        assert_eq!(
+            filesystem.grants()[1],
+            ChildFilesystemGrantV1::new(cwd, cwd_access)
+        );
+        let limits = TestLimits {
+            stdin_bytes: 2 * 1024,
+            stdout_bytes: 2 * 1024,
+            stderr_bytes: 256,
+            ..TestLimits::default()
+        };
+        let policy = serial_runtime_policy(
+            limits,
+            vec![ChildEnvironmentVariableV1::new(
+                MCP_PEER_ENV_V1,
+                mode.discriminator(),
+            )],
+            filesystem,
+            4,
+            250,
+        );
+        let request = ChildLaunchRequestV1::new(
+            1,
+            ChildLaunchModeV1::Enabled,
+            &executable,
+            digest_hex(&executable),
+            arguments.clone(),
+            cwd,
+            policy.clone(),
+        );
+        let authority =
+            AuthorityProfileV1::exact(&executable, digest_hex(&executable), arguments, cwd, policy)
+                .unwrap();
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let prepared = prepare_child_launch_request_v1(
+            request,
+            ChildLaunchAuthorityDecisionV1::Admit(&authority),
+            &mut backend,
+        )
+        .unwrap();
+        (prepared, backend)
+    }
+
+    fn drive_real_mcp_until(
+        owner: &mut McpSerialChildOwnerV1<'_, LinuxChildBackendV1>,
+        expected: fn(&McpSerialChildStateV1) -> bool,
+    ) {
+        let wall_deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if expected(owner.state()) {
+                return;
+            }
+            assert!(
+                Instant::now() < wall_deadline,
+                "MCP fixture hung before expected state: {:?}",
+                owner.state()
+            );
+            assert!(
+                !matches!(
+                    owner.state(),
+                    McpSerialChildStateV1::Stopped | McpSerialChildStateV1::Failed { .. }
+                ),
+                "MCP fixture stopped before expected state: {:?}",
+                owner.state()
+            );
+            owner.poll().unwrap();
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    fn start_real_mcp(owner: &mut McpSerialChildOwnerV1<'_, LinuxChildBackendV1>) {
+        owner.start().unwrap();
+        drive_real_mcp_until(owner, |state| {
+            matches!(state, McpSerialChildStateV1::ReadyForToolsList)
+        });
+    }
+
+    fn drive_real_mcp_event(
+        owner: &mut McpSerialChildOwnerV1<'_, LinuxChildBackendV1>,
+    ) -> ClientEvent {
+        drive_real_mcp_until(owner, |state| {
+            matches!(state, McpSerialChildStateV1::EventReady)
+        });
+        owner.take_event().unwrap()
+    }
+
+    fn drive_real_mcp_terminal(owner: &mut McpSerialChildOwnerV1<'_, LinuxChildBackendV1>) {
+        drive_real_mcp_until(owner, |state| {
+            matches!(
+                state,
+                McpSerialChildStateV1::Stopped | McpSerialChildStateV1::Failed { .. }
+            )
+        });
+    }
+
+    fn complete_real_mcp_exchange(owner: &mut McpSerialChildOwnerV1<'_, LinuxChildBackendV1>) {
+        start_real_mcp(owner);
+        let pgid = owner
+            .effects_for_test()
+            .active_pgid_for_test()
+            .expect("one live MCP process group");
+        owner.begin_tools_list(None).unwrap();
+        assert_eq!(
+            drive_real_mcp_event(owner),
+            ClientEvent::ToolsListed(serde_json::json!({
+                "tools": [{
+                    "description": "Returns one integer as text.",
+                    "inputSchema": {
+                        "additionalProperties": false,
+                        "properties": {"value": {"type": "integer"}},
+                        "required": ["value"],
+                        "type": "object"
+                    },
+                    "name": "fixture.echo"
+                }]
+            }))
+        );
+        assert_eq!(owner.effects_for_test().active_pgid_for_test(), Some(pgid));
+        owner
+            .begin_tools_call("fixture.echo", serde_json::json!({"value": 7}))
+            .unwrap();
+        assert_eq!(
+            drive_real_mcp_event(owner),
+            ClientEvent::ToolCalled(serde_json::json!({
+                "content": [{"text": "7", "type": "text"}],
+                "isError": false
+            }))
+        );
+        assert_eq!(owner.effects_for_test().active_pgid_for_test(), Some(pgid));
     }
 
     fn start_real_serial(transport: &mut SerialChildTransportV1<'_, LinuxChildBackendV1>) {
@@ -3725,6 +4160,298 @@ mod tests {
                 .map(|value| value.parse::<i32>().unwrap());
             let pgid = pids.next().unwrap();
             let descendant = pids.next().unwrap();
+            assert!(
+                process_group_is_gone(pgid),
+                "group {pgid} survived {cause:?}"
+            );
+            assert!(
+                process_is_gone(descendant),
+                "descendant {descendant} survived {cause:?}"
+            );
+            assert!(backend.take_serial_retained_residue().is_none());
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_mcp_tools_only_exchange_is_exact_and_one_sealed_pid() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (prepared, mut backend) = prepared_real_mcp_peer(cwd.path(), RealMcpPeerModeV1::Exact);
+        assert_eq!(backend.prepared_containment_count_for_test(), 1);
+        assert_eq!(
+            backend.prepared_executable_seals_for_test(),
+            Some(libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL)
+        );
+        let pgid;
+        {
+            let mut owner = McpSerialChildOwnerV1::new(prepared, &mut backend).unwrap();
+            complete_real_mcp_exchange(&mut owner);
+            pgid = owner
+                .effects_for_test()
+                .active_pgid_for_test()
+                .expect("one live MCP process group");
+            assert_eq!(owner.effects_for_test().os_spawn_count(), 1);
+            assert_eq!(owner.effects_for_test().request_start_count(), 4);
+            assert_eq!(
+                owner.response_frames_for_test(),
+                &[
+                    MCP_INITIALIZE_RESPONSE_LINE_V1.to_vec(),
+                    MCP_LIST_RESPONSE_LINE_V1.to_vec(),
+                    MCP_CALL_RESPONSE_LINE_V1.to_vec(),
+                ]
+            );
+            owner.shutdown().unwrap();
+            drive_real_mcp_terminal(&mut owner);
+            assert_eq!(owner.state(), &McpSerialChildStateV1::Stopped);
+            assert!(matches!(
+                owner.transport_state_for_test(),
+                SerialChildTransportStateV1::Stopped {
+                    cause: SerialChildCauseV1::Shutdown,
+                    ..
+                }
+            ));
+        }
+        assert_eq!(backend.os_spawn_count(), 1);
+        assert_eq!(backend.request_start_count(), 4);
+        assert!(process_group_is_gone(pgid));
+        assert!(backend.take_serial_retained_residue().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_mcp_peer_eof_crash_wrong_id_and_malformed_fail_closed_and_reap() {
+        for mode in [
+            RealMcpPeerModeV1::Eof,
+            RealMcpPeerModeV1::Crash,
+            RealMcpPeerModeV1::WrongId,
+            RealMcpPeerModeV1::Malformed,
+        ] {
+            let cwd = tempfile::tempdir().unwrap();
+            let (prepared, mut backend) = prepared_real_mcp_peer(cwd.path(), mode);
+            let pgid;
+            {
+                let mut owner = McpSerialChildOwnerV1::new(prepared, &mut backend).unwrap();
+                owner.start().unwrap();
+                pgid = owner
+                    .effects_for_test()
+                    .active_pgid_for_test()
+                    .expect("one live MCP process group");
+                drive_real_mcp_terminal(&mut owner);
+                assert!(owner.take_event().is_err(), "mode={mode:?}");
+                match mode {
+                    RealMcpPeerModeV1::Eof => {
+                        assert!(
+                            matches!(
+                                owner.state(),
+                                McpSerialChildStateV1::Failed {
+                                    failure: McpSerialChildFailureV1::Cleanup {
+                                        primary,
+                                        transport: SerialChildTransportFailureV1::Transport {
+                                            cause: SerialChildCauseV1::Eof,
+                                            exit: ChildExitTruthV1::Exited(0),
+                                        },
+                                    }
+                                } if matches!(
+                                    primary.as_ref(),
+                                    McpSerialChildFailureV1::TransportCause(SerialChildCauseV1::Eof)
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                        assert!(
+                            matches!(
+                                owner.transport_state_for_test(),
+                                SerialChildTransportStateV1::Failed(
+                                    SerialChildTransportFailureV1::Transport {
+                                        cause: SerialChildCauseV1::Eof,
+                                        exit: ChildExitTruthV1::Exited(0),
+                                    }
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                    }
+                    RealMcpPeerModeV1::Crash => {
+                        assert!(
+                            matches!(
+                                owner.state(),
+                                McpSerialChildStateV1::Failed {
+                                    failure: McpSerialChildFailureV1::Cleanup {
+                                        primary,
+                                        transport: SerialChildTransportFailureV1::Transport {
+                                            cause: SerialChildCauseV1::Crash,
+                                            exit: ChildExitTruthV1::Exited(17),
+                                        },
+                                    }
+                                } if matches!(
+                                    primary.as_ref(),
+                                    McpSerialChildFailureV1::TransportCause(SerialChildCauseV1::Crash)
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                        assert!(
+                            matches!(
+                                owner.transport_state_for_test(),
+                                SerialChildTransportStateV1::Failed(
+                                    SerialChildTransportFailureV1::Transport {
+                                        cause: SerialChildCauseV1::Crash,
+                                        exit: ChildExitTruthV1::Exited(17),
+                                    }
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                    }
+                    RealMcpPeerModeV1::WrongId => {
+                        assert!(
+                            matches!(
+                                owner.state(),
+                                McpSerialChildStateV1::Failed {
+                                    failure: McpSerialChildFailureV1::Cleanup {
+                                        primary,
+                                        transport: SerialChildTransportFailureV1::Transport {
+                                            cause: SerialChildCauseV1::ProtocolViolation,
+                                            exit: ChildExitTruthV1::Signalled,
+                                        },
+                                    }
+                                } if matches!(
+                                    primary.as_ref(),
+                                    McpSerialChildFailureV1::Client(
+                                        ClientError::UnexpectedResponseId {
+                                            expected: Some(1),
+                                            actual: 99,
+                                        }
+                                    )
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                        assert!(
+                            matches!(
+                                owner.transport_state_for_test(),
+                                SerialChildTransportStateV1::Failed(
+                                    SerialChildTransportFailureV1::Transport {
+                                        cause: SerialChildCauseV1::ProtocolViolation,
+                                        exit: ChildExitTruthV1::Signalled,
+                                    }
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                    }
+                    RealMcpPeerModeV1::Malformed => {
+                        assert!(
+                            matches!(
+                                owner.state(),
+                                McpSerialChildStateV1::Failed {
+                                    failure: McpSerialChildFailureV1::Cleanup {
+                                        primary,
+                                        transport: SerialChildTransportFailureV1::Transport {
+                                            cause: SerialChildCauseV1::ProtocolViolation,
+                                            exit: ChildExitTruthV1::Signalled,
+                                        },
+                                    }
+                                } if matches!(
+                                    primary.as_ref(),
+                                    McpSerialChildFailureV1::Codec(CodecError::InvalidJson { .. })
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                        assert!(
+                            matches!(
+                                owner.transport_state_for_test(),
+                                SerialChildTransportStateV1::Failed(
+                                    SerialChildTransportFailureV1::Transport {
+                                        cause: SerialChildCauseV1::ProtocolViolation,
+                                        exit: ChildExitTruthV1::Signalled,
+                                    }
+                                )
+                            ),
+                            "mode={mode:?}, owner={:?}, transport={:?}",
+                            owner.state(),
+                            owner.transport_state_for_test()
+                        );
+                    }
+                    _ => unreachable!("closed failure-mode table"),
+                }
+                assert_eq!(owner.effects_for_test().os_spawn_count(), 1);
+                assert_eq!(owner.effects_for_test().request_start_count(), 1);
+            }
+            assert!(process_group_is_gone(pgid), "mode={mode:?}, pgid={pgid}");
+            assert!(
+                backend.take_serial_retained_residue().is_none(),
+                "mode={mode:?}"
+            );
+        }
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_mcp_cancel_and_shutdown_reap_owned_descendant_group() {
+        for cause in [SerialChildCauseV1::Cancel, SerialChildCauseV1::Shutdown] {
+            let cwd = tempfile::tempdir().unwrap();
+            let marker = cwd.path().join("mcp-descendant-pids");
+            let (prepared, mut backend) =
+                prepared_real_mcp_peer(cwd.path(), RealMcpPeerModeV1::Descendant);
+            let (pgid, descendant);
+            {
+                let mut owner = McpSerialChildOwnerV1::new(prepared, &mut backend).unwrap();
+                complete_real_mcp_exchange(&mut owner);
+                let wall_deadline = Instant::now() + Duration::from_secs(5);
+                while !marker.exists() {
+                    assert!(Instant::now() < wall_deadline, "MCP PID marker missing");
+                    std::thread::sleep(Duration::from_millis(1));
+                }
+                let pids = std::fs::read_to_string(&marker).unwrap();
+                let pids = pids
+                    .split_whitespace()
+                    .map(|value| value.parse::<i32>().unwrap())
+                    .collect::<Vec<_>>();
+                assert_eq!(pids.len(), 3);
+                let direct = pids[0];
+                pgid = pids[1];
+                descendant = pids[2];
+                assert_eq!(direct, pgid);
+                assert_ne!(descendant, direct);
+                assert_eq!(owner.effects_for_test().active_pgid_for_test(), Some(pgid));
+                match cause {
+                    SerialChildCauseV1::Cancel => {
+                        owner.cancel().unwrap();
+                    }
+                    SerialChildCauseV1::Shutdown => {
+                        owner.shutdown().unwrap();
+                    }
+                    _ => unreachable!("closed explicit-stop table"),
+                }
+                drive_real_mcp_terminal(&mut owner);
+                assert_eq!(owner.state(), &McpSerialChildStateV1::Stopped);
+                assert!(matches!(
+                    owner.transport_state_for_test(),
+                    SerialChildTransportStateV1::Stopped {
+                        cause: observed,
+                        ..
+                    } if *observed == cause
+                ));
+            }
             assert!(
                 process_group_is_gone(pgid),
                 "group {pgid} survived {cause:?}"
