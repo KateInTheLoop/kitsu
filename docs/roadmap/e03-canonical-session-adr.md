@@ -689,6 +689,18 @@ cannot weaken or replace any backend-neutral assertion.
    function performs no I/O or authority restoration and remains unmounted;
    activation must next revalidate its revision/HEAD binding under the owning
    fence.
+   **Dual-fenced canonical activation complete in Cycle 085:** the compatibility
+   boundary owns the legacy session lease and then the canonical writer fence in
+   one stable order, retaining both and the pinned physical store for the entire
+   activation lifetime. After both exclusions are held it requires current-v1
+   to remain absent, reruns ordinary canonical HEAD/payload/artifact verification,
+   and compares the complete observed payload with the selected value. A newer
+   HEAD, corrupt replacement, newly present legacy snapshot, missing/wrong store,
+   or busy fence fails closed. Projection refusal happens before lock effects;
+   successful and post-lock failure paths create only the existing bounded lock
+   records and never change session bytes, HEAD, artifacts, or authority. This
+   path remains private. Current-v1 activation must receive the same two-domain
+   exclusion before production routing can change.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

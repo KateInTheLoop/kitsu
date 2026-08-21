@@ -1982,6 +1982,32 @@ pub(super) fn publish_current_v1_mount_fixture_v1(
 }
 
 #[cfg(test)]
+pub(super) fn publish_mount_successor_fixture_v1(
+    store: &PhysicalFileStoreV1,
+    base: &CanonicalSessionRevisionV1,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<(), String> {
+    let terminal = kitsu_core::RunSpec::new(
+        kitsu_core::RunId::new("run-mount-activation").map_err(|error| error.to_string())?,
+    )
+    .terminal(
+        kitsu_core::RunOutcomeClass::Succeeded,
+        kitsu_core::RunAssistantDisposition::Committed,
+    );
+    let input = CanonicalOperationInputV1::artifact_free_text(
+        TurnId::new("turn-mount-activation").map_err(|error| error.to_string())?,
+        terminal,
+        "activation race".to_string(),
+        Some("new selected value".to_string()),
+    );
+    CanonicalFileTransactionV1::new(store)
+        .commit_artifact_free_operation(base, revision_id, committed_at, input)
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use kitsu_core::session::{

@@ -9,10 +9,16 @@ use std::io::Read;
 
 use kitsu_core::session::{LogicalHead, RevisionId, SessionId, SessionLookupState, StoreId};
 
-use super::canonical::CanonicalSessionRevisionV1;
-use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1};
+use super::canonical::{
+    project_canonical_resume_v1, CanonicalResumeProjectionErrorV1, CanonicalResumeProjectionV1,
+    CanonicalSessionRevisionV1,
+};
+use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1, PhysicalWriterFenceV1};
 use super::transaction::lookup_canonical_mount_value_v1;
-use super::{PrivateDirectory, PrivateEntryKind, SavedSession, MAX_SESSION_BYTES, SESSION_VERSION};
+use super::{
+    PrivateDirectory, PrivateEntryKind, SavedSession, SessionLease, MAX_SESSION_BYTES,
+    SESSION_VERSION,
+};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) enum CurrentV1MountFaultV1 {
@@ -72,6 +78,39 @@ pub(super) enum SessionMountSelectionV1 {
     CurrentV1(CurrentV1MountValueV1),
     Canonical(Box<CanonicalSessionRevisionV1>),
     Rejected(SessionMountAdmissionV1),
+}
+
+/// A canonical resume value whose exact source remains selected while both the
+/// legacy session lease and canonical writer fence are owned. The physical
+/// store stays descriptor-pinned for the activation lifetime.
+#[derive(Debug)]
+pub(super) struct CanonicalMountActivationV1 {
+    projection: CanonicalResumeProjectionV1,
+    _legacy_lease: SessionLease,
+    _canonical_fence: PhysicalWriterFenceV1,
+    _store: PhysicalFileStoreV1,
+}
+
+impl CanonicalMountActivationV1 {
+    pub(super) fn projection(&self) -> &CanonicalResumeProjectionV1 {
+        &self.projection
+    }
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CanonicalMountActivationErrorV1 {
+    WrongSelection,
+    SelectionIdentityMismatch,
+    Projection(CanonicalResumeProjectionErrorV1),
+    LegacyFence(String),
+    StoreUnavailable(SessionLookupState),
+    CanonicalFence(String),
+    CurrentV1Changed(CurrentV1MountObservationV1),
+    CanonicalChanged(SessionLookupState),
+    CanonicalValueChanged {
+        revision: RevisionId,
+        head: LogicalHead,
+    },
 }
 
 impl SessionMountSelectionV1 {
@@ -200,6 +239,80 @@ pub(super) fn select_session_mount_v1(
     }
 }
 
+pub(super) fn activate_canonical_mount_v1(
+    session_root: &PrivateDirectory,
+    expected_store: StoreId,
+    session_id: &SessionId,
+    selection: SessionMountSelectionV1,
+) -> Result<CanonicalMountActivationV1, CanonicalMountActivationErrorV1> {
+    let SessionMountSelectionV1::Canonical(selected) = selection else {
+        return Err(CanonicalMountActivationErrorV1::WrongSelection);
+    };
+    if selected.store_id() != &expected_store || selected.session_id() != session_id {
+        return Err(CanonicalMountActivationErrorV1::SelectionIdentityMismatch);
+    }
+    // Projection is pure and runs before either lock file can be created. In
+    // particular, unsupported artifact-bearing history fails with zero effects.
+    let projection = project_canonical_resume_v1(&selected)
+        .map_err(CanonicalMountActivationErrorV1::Projection)?;
+
+    // Every dual-format activation acquires these in one stable order. The
+    // legacy lease excludes current-v1 writers; the canonical fence excludes
+    // HEAD/revision writers. Both remain owned by the returned activation.
+    let legacy_lease = SessionLease::acquire(session_root, session_id.as_str())
+        .map_err(CanonicalMountActivationErrorV1::LegacyFence)?;
+    let store = match PhysicalFileStoreV1::open_existing(session_root, expected_store) {
+        Ok(Some(store)) => store,
+        Ok(None) => {
+            return Err(CanonicalMountActivationErrorV1::StoreUnavailable(
+                SessionLookupState::Missing {
+                    tombstone_revision: None,
+                },
+            ));
+        }
+        Err(error) => {
+            return Err(CanonicalMountActivationErrorV1::StoreUnavailable(
+                physical_store_error_state(session_id, error),
+            ));
+        }
+    };
+    let canonical_fence = store
+        .acquire_writer_fence(session_id)
+        .map_err(CanonicalMountActivationErrorV1::CanonicalFence)?;
+
+    let current_v1 = observe_current_v1(session_root, session_id).observation;
+    if current_v1 != CurrentV1MountObservationV1::Missing {
+        return Err(CanonicalMountActivationErrorV1::CurrentV1Changed(
+            current_v1,
+        ));
+    }
+
+    let (state, observed) = lookup_canonical_mount_value_v1(&store, session_id);
+    let expected_state = SessionLookupState::Present {
+        revision: selected.revision_id().clone(),
+        head: selected.selected_head().clone(),
+    };
+    if state != expected_state {
+        return Err(CanonicalMountActivationErrorV1::CanonicalChanged(state));
+    }
+    let Some(observed) = observed else {
+        return Err(CanonicalMountActivationErrorV1::CanonicalChanged(state));
+    };
+    if observed != *selected {
+        return Err(CanonicalMountActivationErrorV1::CanonicalValueChanged {
+            revision: observed.revision_id().clone(),
+            head: observed.selected_head().clone(),
+        });
+    }
+
+    Ok(CanonicalMountActivationV1 {
+        projection,
+        _legacy_lease: legacy_lease,
+        _canonical_fence: canonical_fence,
+        _store: store,
+    })
+}
+
 fn observe_current_v1(
     session_root: &PrivateDirectory,
     session_id: &SessionId,
@@ -316,9 +429,10 @@ mod tests {
     };
 
     use super::{
-        admit_session_mount_v1, observe_session_mount_v1, select_session_mount_v1,
-        CurrentV1MountFaultV1, CurrentV1MountObservationV1, SessionMountAdmissionV1,
-        SessionMountRejectionV1, SessionMountSelectionV1,
+        activate_canonical_mount_v1, admit_session_mount_v1, observe_session_mount_v1,
+        select_session_mount_v1, CanonicalMountActivationErrorV1, CurrentV1MountFaultV1,
+        CurrentV1MountObservationV1, SessionMountAdmissionV1, SessionMountRejectionV1,
+        SessionMountSelectionV1,
     };
 
     fn revision(value: &str) -> RevisionId {
@@ -883,6 +997,168 @@ mod tests {
                 reason: SessionMountRejectionV1::AmbiguousDualPresence,
                 ..
             })
+        ));
+    }
+
+    #[test]
+    fn canonical_activation_revalidates_selection_under_both_session_fences() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+
+        let activation =
+            activate_canonical_mount_v1(&directory, store_id.clone(), &session, selection).unwrap();
+        assert_eq!(activation.projection().source_revision().as_str(), "rev-a");
+        assert_eq!(activation.projection().source_head(), &LogicalHead::Genesis);
+        assert_eq!(activation.projection().saved().id, "session-a");
+        assert!(
+            super::super::SessionLease::acquire(&directory, session.as_str())
+                .unwrap_err()
+                .contains("already active")
+        );
+        let competing_store = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &directory,
+            store_id.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert!(competing_store
+            .acquire_writer_fence(&session)
+            .unwrap_err()
+            .contains("already active"));
+
+        drop(activation);
+        let legacy = super::super::SessionLease::acquire(&directory, session.as_str()).unwrap();
+        drop(legacy);
+        let canonical = competing_store.acquire_writer_fence(&session).unwrap();
+        drop(canonical);
+    }
+
+    #[test]
+    fn canonical_activation_refuses_current_or_canonical_change_after_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let revision = revision("rev-a");
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision.clone(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+
+        let current_race = select_session_mount_v1(&directory, store_id.clone(), &session);
+        std::fs::write(session_root.join("session-a.json"), &source).unwrap();
+        assert_eq!(
+            activate_canonical_mount_v1(&directory, store_id.clone(), &session, current_race)
+                .unwrap_err(),
+            CanonicalMountActivationErrorV1::CurrentV1Changed(CurrentV1MountObservationV1::Present)
+        );
+        assert_eq!(
+            std::fs::read(session_root.join("session-a.json")).unwrap(),
+            source
+        );
+        std::fs::remove_file(session_root.join("session-a.json")).unwrap();
+
+        let canonical_race = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let payload_path = super::super::physical::PhysicalLayoutV1::canonical_payload(
+            &session_root,
+            &session,
+            &revision,
+        );
+        std::fs::write(&payload_path, b"{").unwrap();
+        assert!(matches!(
+            activate_canonical_mount_v1(&directory, store_id, &session, canonical_race),
+            Err(CanonicalMountActivationErrorV1::CanonicalChanged(
+                SessionLookupState::Corrupt {
+                    observed_revision: Some(ref observed),
+                    ..
+                }
+            )) if observed == &revision
+        ));
+        assert_eq!(std::fs::read(payload_path).unwrap(), b"{");
+    }
+
+    #[test]
+    fn canonical_activation_refuses_a_new_head_published_after_selection() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let SessionMountSelectionV1::Canonical(selected) = &selection else {
+            panic!("expected selected canonical value")
+        };
+
+        let store = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &directory,
+            store_id.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        super::super::transaction::publish_mount_successor_fixture_v1(
+            &store,
+            selected,
+            revision("rev-b"),
+            "2026-08-20T10:03:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+
+        assert!(matches!(
+            activate_canonical_mount_v1(&directory, store_id, &session, selection),
+            Err(CanonicalMountActivationErrorV1::CanonicalChanged(
+                SessionLookupState::Present { revision, head }
+            )) if revision.as_str() == "rev-b"
+                && head == LogicalHead::Turn(TurnId::new("turn-mount-activation").unwrap())
         ));
     }
 }
