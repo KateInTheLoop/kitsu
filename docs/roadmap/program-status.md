@@ -4,19 +4,19 @@ Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080; E06-S01 and E06-S02 are implemented through C2, and E06-S03
 has begun through C1;
-E08 telemetry observability was scoped in Cycle 030 on
-`improvements/harness-roadmap`.
+E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
+current-session snapshot is implemented through Cycle 106.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 105 / 105 |
+| Accepted cycles/commits after this cycle | 106 / 106 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 106 — E08-S05-C1: integrate typed presentation-neutral current-session status, context, and usage truth without product rendering |
+| Active epic/card | Cycle 107 — E06-S02-C3: add provider-free monotonic inventory publication, atomic replacement/withdrawal, and stale-incarnation refusal |
 
 ## Epic status
 
@@ -30,7 +30,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E06 child/MCP spine | **In progress** through E06-S01-C2, E06-S02-C2, and E06-S03-C1; depends only on accepted E01/E02 | Single-use preparation now feeds a causal, joined lifecycle owner with typed residue, but only through injected synchronous effects. Next add bounded real-child phase ownership and monotonic inventory publication; no product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
-| E08 telemetry/docs | **Scoped** through Cycle 030; implementation waits on owned inputs | E08-S05 live telemetry consumes E04 receipts; E08-S06 durable usage consumes E03 fencing; progressive docs follow stable surfaces |
+| E08 telemetry/docs | **In progress** through E08-S05-C1 | Pure current-session status/context/usage DTOs consume E04 receipts and label every value with truth/provenance. Next extend run tallies with reported/missing coverage and cached tokens before any product adapter or renderer; durable history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -142,7 +142,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 102 | `fc90c30` | Exact zero-effect child admission and ordered preparation |
 | 103 | `d87119f` | Pinned bounded tools-only MCP codec |
 | 104 | `74ba671` | Closed external source identities and descriptor fingerprints |
-| 105 | this document's commit | Single-use joined external child lifecycle truth |
+| 105 | `a8462e6` | Single-use joined external child lifecycle truth |
+| 106 | this document's commit | Typed current-session telemetry truth and provenance |
 
 ## Current green gates
 
@@ -697,6 +698,15 @@ non-zero/signal becomes crash. Cancel and shutdown signal then join once and
 become idempotent after terminal state. Join residue keeps the child token owned
 so drop retries cleanup and records exact signal/join truth. The current effects
 are synchronous fixtures and the drop report is not yet durably retained.
+Cycle 106 adds the neutral data contract behind the requested status, context,
+and usage decks. A closed tagged value ensures missing data carries provenance
+but no value. The snapshot safely projects the existing provider route receipt,
+optional session/run IDs, explicit effective-authority counts, context window
+source and arithmetic, provider usage coverage and token categories, and
+portable cost. Review removed the generic cost escape hatch: only an explicit
+provider-reported currency observation can populate cost, and Kitsu never
+derives it from a model name or token count. The module has no renderer, CLI,
+JSONL, persistence, provider call, filesystem, or process dependency.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
