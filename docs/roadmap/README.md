@@ -698,6 +698,7 @@ gates merely because a card appears attractive.
 | 090 | E03-S02-C31 | Encapsulate both representation-aware save paths behind one non-cloneable private live-store owner |
 | 091 | E03-S02-C32 | Move production active-session ownership behind one current-v1-preserving handoff seam |
 | 092 | E03-S02-C33 | Publish and reopen one explicit owner-private local canonical store identity without mounting it |
+| 093 | E03-S02-C34 | Bind the local composition identity to exact physical-store selection and total live activation without product routing |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -819,9 +820,16 @@ record is create-only beneath the pinned sessions descriptor; valid concurrent
 winners are adopted, corruption/future schema/unknown fields/symlinks/shared or
 permissive files fail closed, and installed-unconfirmed durability stays
 explicit. It remains unmounted and creates no canonical namespace. Cycle 093
-next binds this composition identity to the physical store record and total
-activation without switching product routing, then continues through E03,
-E06, E07, E05/E08, and E09 in the dependency-safe order above.
+binds it through one private local factory. The factory rejects an orphan
+physical namespace before identity publication, uses the same `StoreId` for
+dual-representation selection and activation, and retains identity evidence
+beside the non-cloneable live owner. Empty, unavailable, mismatched, and corrupt
+state remains effect-free or unchanged; valid current-v1 activation creates or
+reopens only the exactly matching physical store. Product constructors still
+select current-v1. Cycle 094 next admits this bound owner as a closed private
+`ActiveSessionStore` variant without selecting it in product routing, then
+continues through E03, E06, E07, E05/E08, and E09 in the dependency-safe order
+above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

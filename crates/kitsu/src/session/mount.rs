@@ -15,6 +15,10 @@ use super::canonical::{
     append_complete_operation, project_canonical_resume_v1, CanonicalOperationInputV1,
     CanonicalResumeProjectionErrorV1, CanonicalResumeProjectionV1, CanonicalSessionRevisionV1,
 };
+use super::identity::{
+    acquire_local_store_identity_for_activation_v1, open_local_store_identity_v1,
+    LocalStoreIdentityErrorV1, LocalStoreIdentityReceiptV1,
+};
 use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1, PhysicalWriterFenceV1};
 use super::transaction::{
     commit_canonical_mount_payload_under_fence_v1, lookup_canonical_mount_value_v1,
@@ -205,6 +209,22 @@ pub(super) struct SessionLiveStoreV1 {
     activation: SessionMountActivationV1,
 }
 
+/// Local composition owner that binds the stable identity record to the exact
+/// physical store used by the total live activation. Neither owner can be
+/// extracted, so the identity, selected value, and both fences share a lifetime.
+#[derive(Debug)]
+pub(super) struct LocalSessionLiveStoreV1 {
+    identity: LocalStoreIdentityReceiptV1,
+    live: SessionLiveStoreV1,
+}
+
+#[derive(Debug)]
+pub(super) enum LocalSessionLiveStoreActivationErrorV1 {
+    Identity(LocalStoreIdentityErrorV1),
+    Activation(SessionMountActivationErrorV1),
+    IdentityBindingMismatch,
+}
+
 pub(super) enum SessionLiveStoreSaveV1 {
     CurrentV1Snapshot(SavedSession),
     CanonicalOperation {
@@ -247,6 +267,27 @@ impl SessionLiveStoreV1 {
                 .save_canonical_operation(revision_id, committed_at, input)
                 .map(SessionLiveStoreSaveReceiptV1::Canonical),
         }
+    }
+}
+
+impl LocalSessionLiveStoreV1 {
+    pub(super) fn identity_receipt(&self) -> &LocalStoreIdentityReceiptV1 {
+        &self.identity
+    }
+
+    pub(super) fn activation_receipt(&self) -> &SessionMountActivationReceiptV1 {
+        self.live.receipt()
+    }
+
+    pub(super) fn saved(&self) -> &SavedSession {
+        self.live.saved()
+    }
+
+    pub(super) fn save(
+        &mut self,
+        intent: SessionLiveStoreSaveV1,
+    ) -> Result<SessionLiveStoreSaveReceiptV1, SessionMountSaveErrorV1> {
+        self.live.save(intent)
     }
 }
 
@@ -797,6 +838,64 @@ pub(super) fn activate_session_live_store_v1(
 ) -> Result<SessionLiveStoreV1, SessionMountActivationErrorV1> {
     activate_session_mount_v1(session_root, expected_store, session_id, selection)
         .map(|activation| SessionLiveStoreV1 { activation })
+}
+
+/// Resolve one stable local composition identity, select both representations
+/// with that identity, and consume the selection into the total live owner.
+/// Production does not call this seam yet.
+pub(super) fn activate_local_session_live_store_v1(
+    session_root: &PrivateDirectory,
+    session_id: &SessionId,
+) -> Result<LocalSessionLiveStoreV1, LocalSessionLiveStoreActivationErrorV1> {
+    let identity = match open_local_store_identity_v1(session_root)
+        .map_err(LocalSessionLiveStoreActivationErrorV1::Identity)?
+    {
+        Some(identity) => identity,
+        None => {
+            if PhysicalFileStoreV1::namespace_entry_present(session_root).map_err(|error| {
+                LocalSessionLiveStoreActivationErrorV1::Identity(LocalStoreIdentityErrorV1::Read(
+                    error.to_string(),
+                ))
+            })? {
+                return Err(LocalSessionLiveStoreActivationErrorV1::Identity(
+                    LocalStoreIdentityErrorV1::UnboundPhysicalNamespace,
+                ));
+            }
+            let current = observe_current_v1(session_root, session_id).observation;
+            let admission = admit_session_mount_v1(
+                current,
+                SessionLookupState::Missing {
+                    tombstone_revision: None,
+                },
+            );
+            match admission {
+                SessionMountAdmissionV1::Empty => {
+                    return Err(LocalSessionLiveStoreActivationErrorV1::Activation(
+                        SessionMountActivationErrorV1::Empty,
+                    ));
+                }
+                admission @ SessionMountAdmissionV1::Rejected { .. } => {
+                    return Err(LocalSessionLiveStoreActivationErrorV1::Activation(
+                        SessionMountActivationErrorV1::Rejected(admission),
+                    ));
+                }
+                SessionMountAdmissionV1::CurrentV1Only => {}
+                SessionMountAdmissionV1::CanonicalOnly { .. } => {
+                    return Err(LocalSessionLiveStoreActivationErrorV1::IdentityBindingMismatch);
+                }
+            }
+            acquire_local_store_identity_for_activation_v1(session_root)
+                .map_err(LocalSessionLiveStoreActivationErrorV1::Identity)?
+        }
+    };
+    let store_id = identity.store_id().clone();
+    let selection = select_session_mount_v1(session_root, store_id.clone(), session_id);
+    let live = activate_session_live_store_v1(session_root, store_id, session_id, selection)
+        .map_err(LocalSessionLiveStoreActivationErrorV1::Activation)?;
+    if live.receipt().store() != identity.store_id() {
+        return Err(LocalSessionLiveStoreActivationErrorV1::IdentityBindingMismatch);
+    }
+    Ok(LocalSessionLiveStoreV1 { identity, live })
 }
 
 fn observe_current_v1(
@@ -2665,5 +2764,201 @@ mod tests {
             super::super::SessionLease::acquire(&canonical_directory, canonical_session.as_str())
                 .unwrap(),
         );
+    }
+
+    #[test]
+    fn local_live_store_binds_created_identity_to_physical_activation_and_reopens_exactly() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let session = SessionId::new("session-local").unwrap();
+        std::fs::write(
+            sessions.join("session-local.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&sessions, "local live-store fixture").unwrap();
+
+        let mut local = super::activate_local_session_live_store_v1(&directory, &session).unwrap();
+        let store_id = local.identity_receipt().store_id().clone();
+        assert_eq!(
+            local.identity_receipt().source(),
+            super::super::identity::LocalStoreIdentitySourceV1::Created
+        );
+        assert_eq!(local.identity_receipt().durability_warning(), None);
+        assert_eq!(local.activation_receipt().store(), &store_id);
+        assert_eq!(local.activation_receipt().session(), &session);
+        assert_eq!(
+            local.activation_receipt().source(),
+            &SessionMountActivatedSourceV1::CurrentV1
+        );
+        assert_eq!(local.saved().id, session.as_str());
+
+        let mut successor = local.saved().clone();
+        successor.updated_at = "2026-08-20T10:02:00.000Z".to_string();
+        successor.model = "local-bound".to_string();
+        assert!(matches!(
+            local
+                .save(super::SessionLiveStoreSaveV1::CurrentV1Snapshot(
+                    successor.clone()
+                ))
+                .unwrap(),
+            super::SessionLiveStoreSaveReceiptV1::CurrentV1(_)
+        ));
+        assert_eq!(local.saved().model, "local-bound");
+        drop(local);
+
+        let physical = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &directory,
+            store_id.clone(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(physical.store_id(), &store_id);
+        drop(physical);
+        let reopened = super::activate_local_session_live_store_v1(&directory, &session).unwrap();
+        assert_eq!(reopened.identity_receipt().store_id(), &store_id);
+        assert_eq!(
+            reopened.identity_receipt().source(),
+            super::super::identity::LocalStoreIdentitySourceV1::Existing
+        );
+        assert_eq!(reopened.activation_receipt().store(), &store_id);
+        assert_eq!(reopened.saved().model, successor.model);
+    }
+
+    #[test]
+    fn local_live_store_refuses_unbound_physical_namespace_without_publishing_identity() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let session = SessionId::new("session-orphan").unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session-orphan.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        drop(
+            super::super::physical::PhysicalFileStoreV1::create_or_open(
+                &sessions,
+                StoreId::new("store-orphan").unwrap(),
+            )
+            .unwrap(),
+        );
+        let directory =
+            super::super::PrivateDirectory::open(&sessions, "local live-store fixture").unwrap();
+        let before = tree_snapshot(&sessions);
+
+        assert!(matches!(
+            super::activate_local_session_live_store_v1(&directory, &session),
+            Err(super::LocalSessionLiveStoreActivationErrorV1::Identity(
+                super::super::identity::LocalStoreIdentityErrorV1::UnboundPhysicalNamespace
+            ))
+        ));
+        assert_eq!(tree_snapshot(&sessions), before);
+        assert!(!sessions
+            .join(super::super::identity::LOCAL_STORE_IDENTITY_NAME)
+            .exists());
+    }
+
+    #[test]
+    fn local_live_store_keeps_empty_and_unavailable_selection_effect_free() {
+        for current in [None, Some(b"{".as_slice())] {
+            let root = tempfile::tempdir().unwrap();
+            let sessions = root.path().join("sessions");
+            let session = SessionId::new("session-unavailable").unwrap();
+            std::fs::create_dir(&sessions).unwrap();
+            if let Some(bytes) = current {
+                std::fs::write(sessions.join("session-unavailable.json"), bytes).unwrap();
+            }
+            let directory = super::super::PrivateDirectory::open(
+                &sessions,
+                "local live-store no-effect fixture",
+            )
+            .unwrap();
+            let before = tree_snapshot(&sessions);
+
+            let result = super::activate_local_session_live_store_v1(&directory, &session);
+            if current.is_some() {
+                assert!(matches!(
+                    result,
+                    Err(super::LocalSessionLiveStoreActivationErrorV1::Activation(
+                        SessionMountActivationErrorV1::Rejected(
+                            SessionMountAdmissionV1::Rejected {
+                                reason: SessionMountRejectionV1::UnavailableRepresentation,
+                                ..
+                            }
+                        )
+                    ))
+                ));
+            } else {
+                assert!(matches!(
+                    result,
+                    Err(super::LocalSessionLiveStoreActivationErrorV1::Activation(
+                        SessionMountActivationErrorV1::Empty
+                    ))
+                ));
+            }
+            assert_eq!(tree_snapshot(&sessions), before);
+            assert!(!sessions
+                .join(super::super::identity::LOCAL_STORE_IDENTITY_NAME)
+                .exists());
+            assert!(!sessions.join(".kitsu-store-v1").exists());
+        }
+    }
+
+    #[test]
+    fn local_live_store_rejects_mismatched_or_corrupt_identity_without_repair() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        let session = SessionId::new("session-mismatch").unwrap();
+        std::fs::create_dir(&sessions).unwrap();
+        std::fs::write(
+            sessions.join("session-mismatch.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&sessions, "local live-store fixture").unwrap();
+        let identity = super::super::identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let identity_bytes =
+            std::fs::read(sessions.join(super::super::identity::LOCAL_STORE_IDENTITY_NAME))
+                .unwrap();
+        let wrong = StoreId::new("store-wrong").unwrap();
+        assert_ne!(identity.store_id(), &wrong);
+        drop(
+            super::super::physical::PhysicalFileStoreV1::create_or_open(&sessions, wrong).unwrap(),
+        );
+        let before_mismatch = tree_snapshot(&sessions);
+
+        assert!(matches!(
+            super::activate_local_session_live_store_v1(&directory, &session),
+            Err(super::LocalSessionLiveStoreActivationErrorV1::Activation(
+                SessionMountActivationErrorV1::Rejected(SessionMountAdmissionV1::Rejected {
+                    reason: SessionMountRejectionV1::UnavailableRepresentation,
+                    ..
+                })
+            ))
+        ));
+        assert_eq!(tree_snapshot(&sessions), before_mismatch);
+        assert_eq!(
+            std::fs::read(sessions.join(super::super::identity::LOCAL_STORE_IDENTITY_NAME))
+                .unwrap(),
+            identity_bytes
+        );
+
+        std::fs::write(
+            sessions.join(super::super::identity::LOCAL_STORE_IDENTITY_NAME),
+            b"{",
+        )
+        .unwrap();
+        let before_corrupt = tree_snapshot(&sessions);
+        assert!(matches!(
+            super::activate_local_session_live_store_v1(&directory, &session),
+            Err(super::LocalSessionLiveStoreActivationErrorV1::Identity(
+                super::super::identity::LocalStoreIdentityErrorV1::Malformed
+            ))
+        ));
+        assert_eq!(tree_snapshot(&sessions), before_corrupt);
     }
 }

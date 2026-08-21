@@ -1152,6 +1152,23 @@ impl fmt::Display for PhysicalCandidateInstallError {
 impl std::error::Error for PhysicalCandidateInstallError {}
 
 impl PhysicalFileStoreV1 {
+    /// Observe only whether any physical-store root entry exists beneath the
+    /// pinned sessions directory. Local composition binding uses this before
+    /// publishing its identity so an orphaned or partial physical namespace is
+    /// never silently adopted or assigned a new identity.
+    pub(super) fn namespace_entry_present(
+        session_root: &PrivateDirectory,
+    ) -> Result<bool, PhysicalReadErrorV1> {
+        match session_root.entry_kind(OsStr::new(ROOT_COMPONENT)) {
+            Ok(_) => Ok(true),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(false),
+            Err(error) => Err(PhysicalReadErrorV1::Malformed(format!(
+                "cannot inspect physical session store namespace '{}': {error}",
+                session_root.path.join(ROOT_COMPONENT).display()
+            ))),
+        }
+    }
+
     pub(super) fn create_or_open(session_root: &Path, store_id: StoreId) -> Result<Self, String> {
         let session_root = PrivateDirectory::prepare(session_root, "physical session root")?;
         let root = session_root.prepare_child(

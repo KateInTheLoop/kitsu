@@ -234,8 +234,16 @@ kernel.
   and distinguishes confirmed from installed-unconfirmed creation. Malformed,
   future, unknown-field, invalid, symlinked, permissive, or multiply linked
   records fail closed without repair; ancestor replacement cannot redirect the
-  write. The record does not create the physical canonical namespace and is not
-  yet bound to its `store.json`; product persistence remains current-v1.
+  write. Cycle 093 binds that record through one private local live-store
+  factory. With no identity, an empty/unavailable session and any orphan
+  physical namespace fail before publication. An eligible current-v1 selection
+  acquires the identity, then the same exact `StoreId` drives a fresh full
+  selection and total activation. The returned non-cloneable owner retains the
+  identity receipt beside the dual-fenced live store and exposes only borrowed
+  identity, activation, and session evidence plus the closed save API. Existing
+  identity/physical mismatches and corrupt identity bytes are never repaired;
+  exact create, save, drop, and reopen preserve one binding. Product persistence
+  remains current-v1 because no product constructor calls this factory.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
