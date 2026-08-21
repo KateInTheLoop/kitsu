@@ -15,6 +15,8 @@ adaptive presentation-only decks through Cycle 110, and exact offline
 provider-free fixed-corpus measurement baseline through Cycle 113 and a
 threshold-backed test-only structural-selector decision through Cycle 122,
 with denied/replaced/revoked authority and freshness oracles through Cycle 125.
+The measured selector is compiled as an unmounted, permission-bound read-only
+contributor through Cycle 128 while preserving the frozen benchmark bytes.
 E05-S01 has a private effect-free transactional setup model through Cycle 114,
 descriptor-relative no-clobber configuration publication through Cycle 116,
 and one private local/offline coordinator through Cycle 120.
@@ -36,11 +38,11 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 127 / 127 |
+| Accepted cycles/commits after this cycle | 128 / 128 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 128 — E07-S01-C4: compile the measured selector as an unmounted read-only contributor |
+| Active epic/card | Cycle 129 — test-only publication fault-fixture isolation before further E05 composition |
 
 ## Epic status
 
@@ -52,7 +54,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C2; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. One private composite now drives pinned tools-only initialize/notification/list/call ordering with proof-derived bounds and typed cleanup. It remains unmounted; no real peer, handler/inventory mount, config, alternate enforcement, or product route exists, so X002 stays open |
-| E07 semantic context | **In progress** through E07-S01-C3 | The deterministic fixed-corpus baseline and test-only selector comparison pass. Current permission-gated reads reconstruct emitted evidence after ranking; hostile denied/private/symlink candidates, source replacement, later re-observation, and revocation pass canonical oracles without stale or denied leakage. Production contributor remains absent |
+| E07 semantic context | **In progress** through E07-S01-C4 | The deterministic fixed-corpus baseline and selector comparison pass. A compiled but unmounted contributor uses only current permission-gated reads, reconstructs emitted lines and current role counts after ranking, and preserves the frozen 5-to-3-round / 1,456-to-1,134-byte result. No trigger, config, context projection, provider path, cache, mutation, or user-visible mount exists |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C8 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, `/context sources`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive decks. Source rows distinguish coarse estimates, derived budget, authoritative counts, and unavailable sub-buckets without an additive total. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation, account truth, exact tokenizer attribution, and durable history remain separate |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
@@ -189,6 +191,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | 125 | this document's commit | Selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 | 126 | this document's commit | Pinned tools-only MCP codec composed with one proof-bounded serial child owner |
 | 127 | this document's commit | Offline typed context-source estimates, unavailable sub-buckets, and adaptive view |
+| 128 | this document's commit | Bounded unmounted structural contributor with current authority/source/role reconstruction |
 
 ## Current green gates
 
@@ -930,6 +933,16 @@ Attachments, on-demand skill bodies, memory, and response schema remain
 structurally unavailable; estimated rows are not presented as an additive
 provider total. Adaptive human modes and lifecycle-only JSONL add no provider,
 account, network, command-time filesystem, persistence, or history work.
+
+Cycle 128 compiles the measured structural selector as a bounded read-only
+contributor without registering or invoking it. Caller paths grant no
+authority; Ask mode never prompts; discovery metadata only ranks candidates;
+current permission-gated reads reconstruct every emitted line and recompute
+definition/reference truth after the ranking interstice. Denied, protected,
+symlinked, replaced, shifted, removed, and revoked evidence fails closed with
+no partial artifact. The original canonical outputs remain 286/517/331 bytes
+and 5-to-3 rounds, while config, CLI, provider/session routing, caching,
+mutation, and automatic context injection remain absent.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

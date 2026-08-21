@@ -11,6 +11,9 @@ mod semantic_harness {
     use kitsu_tools::builtins::fs::{
         find_symbol_tool, grep_tool, outline_file_tool, read_file_tool, read_manifest_tool,
     };
+    use kitsu_tools::semantic::{
+        StructuralContextContributorV1, StructuralContextRequestV1, StructuralContextTaskV1,
+    };
     use kitsu_tools::{HandlerFn, Permissions};
     use serde::{Deserialize, Serialize};
     use serde_json::Value;
@@ -980,11 +983,6 @@ mod semantic_harness {
         prompt: &str,
         corpus_root: &Path,
     ) -> Result<String, HarnessErrorV1> {
-        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
-            return Err(HarnessErrorV1::Selector(
-                "prompt is empty or exceeds the selector bound".to_string(),
-            ));
-        }
         let corpus_root_text = corpus_root
             .to_str()
             .ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
@@ -992,14 +990,16 @@ mod semantic_harness {
             Permissions::for_roots(&[corpus_root_text.to_string()], &[])
                 .map_err(|error| HarnessErrorV1::Tool(error.to_string()))?,
         );
-        select_structural_evidence_with_policy_hook_v1(
-            task,
-            prompt,
-            corpus_root,
-            permissions,
-            |_| Ok(()),
-        )
-        .await
+        let task = match task {
+            TaskKindV1::Locate => StructuralContextTaskV1::Locate,
+            TaskKindV1::Explain => StructuralContextTaskV1::Explain,
+            TaskKindV1::Change => StructuralContextTaskV1::ChangeEvidence,
+        };
+        let evidence = StructuralContextContributorV1::new(permissions)
+            .contribute(StructuralContextRequestV1::new(task, prompt, corpus_root))
+            .await
+            .map_err(|error| HarnessErrorV1::Selector(error.to_string()))?;
+        normalize_evidence_v1(corpus_root, evidence.rendered()).map_err(HarnessErrorV1::from)
     }
 
     pub(super) async fn select_structural_evidence_with_policy_hook_v1<F>(

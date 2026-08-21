@@ -736,6 +736,7 @@ gates merely because a card appears attractive.
 | 125 | E07-S01-C3 | Prove selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 | 126 | E06-S03-C2 | Compose the pinned tools-only MCP codec with one proof-bounded strictly serial child owner and fail-closed cleanup truth |
 | 127 | E08-S05-C8 | Mount an offline typed `/context sources` deck with estimated coarse rows and explicit unavailable sub-buckets |
+| 128 | E07-S01-C4 | Compile the measured selector as an unmounted bounded read-only contributor with current authority and source revalidation |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1124,6 +1125,15 @@ schema are structurally unavailable rather than zero. Adaptive and accessible
 rendering adds no source-total claim or JSONL result. Bare context, window, and
 refresh behavior remain unchanged, and the command performs no provider,
 account, network, command-time filesystem, persistence, or history work.
+Cycle 128 compiles the measured selector into a public Rust mechanism but does
+not register, configure, or invoke it from the product. Existing permissions
+remain the sole read authority and interactive prompts are suppressed. After
+ranking, bounded current reads reconstruct every emitted line and current role
+classification; changed, shifted, removed, revoked, protected, and symlinked
+evidence cannot yield a partial artifact. The frozen 286/517/331-byte outputs,
+10,000-basis-point relevance, and 5-to-3-round result remain unchanged. No
+tree-sitter/index/cache, provider call, edit, automatic context injection, or
+user-visible semantic feature is claimed.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
