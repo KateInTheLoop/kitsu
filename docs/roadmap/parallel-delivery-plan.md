@@ -1,10 +1,10 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave plus Cycles 126-131 are accepted on
+Status: the first post-118 wave plus Cycles 126-132 are accepted on
 `improvements/post-118`. Cycle 129 required one additional acceptance-repair
 commit after a clean parallel run exposed a real quarantine timestamp and
-result-classification defect. The active implementation card is Cycle 132's
-explicit namespace-matched model-selection/local-setup composition.
+result-classification defect. The active implementation card is Cycle 133's
+private exact-inventory MCP echo-handler composition.
 
 ## Objective
 
@@ -115,9 +115,11 @@ a separate future card.
 Cycle 130 proves the existing private MCP composition against one real sealed
 test-only peer without mounting inventory or configuration. Cycle 131 adds the
 exact profile/compiled-adapter/wire namespace value required before a model
-proposal can be consumed. Cycle 132 may now compose only an explicit
-namespace-equal proposal with the private local setup coordinator; it may not
-add UI, catalog/network access, credentials, activation, or product routing.
+proposal can be consumed. Cycle 132 composes only an explicit namespace-equal
+proposal with the private local setup coordinator and retains its truth through
+recovery without adding UI, catalog/network access, credentials, activation,
+or product routing. Cycle 133 may now bind the real-peer owner to exact atomic
+inventory identity and one no-replay echo handler while remaining unmounted.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
@@ -127,7 +129,7 @@ file tail treated as canonical HEAD.
 ## Checkpoint and acceleration measure
 
 Cycle 118 is the stable pushed review base and `improvements/post-118` is the
-clean next integration branch through Cycle 131. Parallel work accelerates
+clean next integration branch through Cycle 132. Parallel work accelerates
 discovery and implementation latency, while serialized acceptance preserves
 bisectability and one truthful roadmap. Numbered cycles, integration commits,
 tests, and replaceability gates are reported separately: Cycle 129 legitimately
