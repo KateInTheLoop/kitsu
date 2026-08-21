@@ -9,9 +9,10 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use futures::stream;
+use kitsu_providers::types::PromptTokensDetails;
 use kitsu_providers::{
     ChatDelta, ChatRequest, ChatStream, FinishReason, JsonSchemaFormat, Provider, ProviderError,
-    ToolCall,
+    ToolCall, Usage,
 };
 use kitsu_tools::{HandlerFn, Registry, ToolError, ToolInterruption};
 
@@ -166,6 +167,83 @@ impl Provider for TelemetryProvider {
                 retry_delay_ms: None,
                 retry_after_used: false,
                 remaining_deadline_ms: 9_700,
+            });
+        }
+        self.chat_stream(req).await
+    }
+
+    async fn list_models(&self) -> Result<Option<Vec<String>>, ProviderError> {
+        Ok(None)
+    }
+}
+
+/// A provider-free fixture for the coverage boundary where one accepted HTTP
+/// rejection is retried, the adapter repeats a terminal disposition for that
+/// same physical attempt, and the successful response later reports usage
+/// before its stream fails. The duplicate disposition must not become a
+/// second missing-usage response, and the reported partial response must not
+/// be erased by its later failure.
+#[derive(Clone)]
+struct RetryThenPartialUsageProvider;
+
+impl Provider for RetryThenPartialUsageProvider {
+    async fn healthcheck(&self) -> Result<(), ProviderError> {
+        Ok(())
+    }
+
+    async fn chat_stream(&self, _req: ChatRequest) -> Result<ChatStream, ProviderError> {
+        Ok(Box::pin(stream::iter(vec![
+            Ok(ChatDelta::Usage(Usage {
+                prompt_tokens: 13,
+                completion_tokens: 2,
+                total_tokens: 15,
+                prompt_tokens_details: None,
+            })),
+            Err(ProviderError::Connection(
+                "fixture stream failed after usage".to_string(),
+            )),
+        ])))
+    }
+
+    async fn chat_stream_with_telemetry(
+        &self,
+        req: ChatRequest,
+        telemetry: Option<kitsu_providers::ProviderTelemetrySink>,
+    ) -> Result<ChatStream, ProviderError> {
+        if let Some(telemetry) = telemetry {
+            let retry = kitsu_providers::ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 2,
+                category: kitsu_providers::ProviderAttemptCategory::RateLimited,
+                status: Some(429),
+                outcome: kitsu_providers::ProviderAttemptOutcome::RetryScheduled,
+                terminal: false,
+                retry_delay_ms: Some(5),
+                retry_after_used: false,
+                remaining_deadline_ms: 1_000,
+            };
+            let _ = telemetry.record(retry);
+            let _ = telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                attempt: 1,
+                max_attempts: 2,
+                category: kitsu_providers::ProviderAttemptCategory::RateLimited,
+                status: Some(429),
+                outcome: kitsu_providers::ProviderAttemptOutcome::Rejected,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: 995,
+            });
+            let _ = telemetry.record(kitsu_providers::ProviderAttemptEvent {
+                attempt: 2,
+                max_attempts: 2,
+                category: kitsu_providers::ProviderAttemptCategory::InvalidResponse,
+                status: Some(200),
+                outcome: kitsu_providers::ProviderAttemptOutcome::BodyFailed,
+                terminal: true,
+                retry_delay_ms: None,
+                retry_after_used: false,
+                remaining_deadline_ms: 990,
             });
         }
         self.chat_stream(req).await
@@ -1901,6 +1979,125 @@ async fn run_tallies_count_reads_failures_and_denials() {
     assert_eq!(tallies.reads.load(Ordering::Acquire), 0);
 }
 
+#[tokio::test]
+async fn run_usage_coverage_counts_all_reported_responses_and_cached_presence() {
+    use crate::orchestrator::RunTallies;
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::Usage(Usage {
+                prompt_tokens: 10,
+                completion_tokens: 2,
+                total_tokens: 12,
+                prompt_tokens_details: None,
+            }),
+            ChatDelta::ToolCall(tc("missing_tool", "c1", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Usage(Usage {
+                prompt_tokens: 20,
+                completion_tokens: 3,
+                total_tokens: 23,
+                prompt_tokens_details: Some(PromptTokensDetails {
+                    cached_tokens: Some(0),
+                }),
+            }),
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let tallies = Arc::new(RunTallies::default());
+    let mut config = cfg(2);
+    config.run_tallies = Some(Arc::clone(&tallies));
+
+    run_agent_turn(
+        &provider,
+        &Registry::new(),
+        &mut initial_messages(),
+        &config,
+    )
+    .await
+    .expect("fixture turn");
+
+    let usage = tallies.usage_snapshot();
+    assert_eq!(usage.prompt_tokens, 30);
+    assert_eq!(usage.completion_tokens, 5);
+    assert_eq!(usage.total_tokens, 35);
+    assert_eq!(usage.coverage.all.responses_reporting_usage, 2);
+    assert_eq!(usage.coverage.all.responses_missing_usage, 0);
+    assert_eq!(usage.coverage.all.cached_prompt_tokens, Some(0));
+    assert_eq!(usage.coverage.inference, usage.coverage.all);
+    assert_eq!(usage.coverage.compaction.responses_reporting_usage, 0);
+}
+
+#[tokio::test]
+async fn run_usage_coverage_keeps_mixed_omission_and_cached_absence_explicit() {
+    use crate::orchestrator::RunTallies;
+
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("missing_tool", "c1", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Usage(Usage {
+                prompt_tokens: 9,
+                completion_tokens: 4,
+                total_tokens: 13,
+                prompt_tokens_details: None,
+            }),
+            ChatDelta::Text("done".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let tallies = Arc::new(RunTallies::default());
+    let mut config = cfg(2);
+    config.run_tallies = Some(Arc::clone(&tallies));
+
+    run_agent_turn(
+        &provider,
+        &Registry::new(),
+        &mut initial_messages(),
+        &config,
+    )
+    .await
+    .expect("fixture turn");
+
+    let usage = tallies.usage_snapshot();
+    assert_eq!(usage.coverage.all.responses_reporting_usage, 1);
+    assert_eq!(usage.coverage.all.responses_missing_usage, 1);
+    assert_eq!(usage.coverage.all.cached_prompt_tokens, None);
+}
+
+#[tokio::test]
+async fn run_usage_coverage_deduplicates_retry_terminal_and_keeps_partial_report() {
+    use crate::orchestrator::RunTallies;
+
+    let tallies = Arc::new(RunTallies::default());
+    let mut config = cfg(1);
+    config.run_tallies = Some(Arc::clone(&tallies));
+
+    let error = run_agent_turn(
+        &RetryThenPartialUsageProvider,
+        &Registry::new(),
+        &mut initial_messages(),
+        &config,
+    )
+    .await
+    .expect_err("partial stream must fail the turn");
+    assert!(matches!(
+        error,
+        crate::orchestrator::AgentError::Provider(_)
+    ));
+
+    let usage = tallies.usage_snapshot();
+    assert_eq!(usage.prompt_tokens, 13);
+    assert_eq!(usage.coverage.all.responses_reporting_usage, 1);
+    assert_eq!(usage.coverage.all.responses_missing_usage, 1);
+    assert_eq!(usage.coverage.inference, usage.coverage.all);
+}
+
 /// Cycle-23 audit: after SPAWN_REFUSAL_LIMIT cap refusals the spawn tools
 /// are withheld for the rest of the turn — later rounds advertise fewer
 /// tools, and the model gets an explicit withdrawal notice.
@@ -3604,6 +3801,8 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
     cfg.context_window = Some(1_200);
     cfg.max_tokens = Some(64);
     cfg.compaction = CompactionMode::Summarize;
+    let tallies = Arc::new(crate::orchestrator::RunTallies::default());
+    cfg.run_tallies = Some(Arc::clone(&tallies));
     let log = AgentEventLog::default();
     cfg.event_log = Some(log.clone());
     let mut meter = ContextMeter::new();
@@ -3638,6 +3837,10 @@ async fn compact_conversation_folds_summarizer_usage_into_turn_usage() {
         "the summarizer call's real usage must be folded into the turn's usage"
     );
     assert_eq!(turn_usage.completion_tokens, 22);
+    let usage = tallies.usage_snapshot();
+    assert_eq!(usage.coverage.compaction.responses_reporting_usage, 1);
+    assert_eq!(usage.coverage.compaction.responses_missing_usage, 0);
+    assert_eq!(usage.coverage.inference.responses_reporting_usage, 0);
 
     let events = log.take();
     assert!(events.iter().any(|event| matches!(

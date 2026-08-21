@@ -306,6 +306,34 @@ pub struct SessionUsageInput {
 }
 
 impl SessionUsageInput {
+    /// Adapt the neutral in-process run snapshot without inferring omitted
+    /// provider values. Any reported response makes the accumulated token
+    /// totals available; cached prompt tokens remain absent until at least one
+    /// response explicitly itemizes that category.
+    pub fn from_run_usage(
+        usage: &crate::orchestrator::RunUsageSnapshot,
+        cost: SessionCostInput,
+    ) -> Self {
+        if usage.coverage.all.responses_reporting_usage == 0 {
+            Self::no_provider_usage(
+                usage.turns,
+                usage.coverage.all.responses_missing_usage,
+                cost,
+            )
+        } else {
+            Self::provider_reported(
+                usage.coverage.all.responses_reporting_usage,
+                usage.coverage.all.responses_missing_usage,
+                usage.turns,
+                usage.prompt_tokens,
+                usage.completion_tokens,
+                usage.total_tokens,
+                usage.coverage.all.cached_prompt_tokens,
+                cost,
+            )
+        }
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub fn provider_reported(
         responses_reporting_usage: u64,
