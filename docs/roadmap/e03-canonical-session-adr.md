@@ -762,6 +762,17 @@ cannot weaken or replace any backend-neutral assertion.
    activation constructor and save methods are module-private. Production
    ownership and persistence routing remain unchanged; the next card defines
    that handoff before mounting either representation.
+   **Production active-owner handoff complete in Cycle 091:** the runtime now
+   stores one non-cloneable `ActiveSessionStore` rather than a concrete
+   `SessionStore`. Startup creation/resume, in-process resume, autosave and
+   required-save paths, clear/reset, and artifact-directory selection all use
+   that owner. Its only implementation is a private current-v1 delegation, so
+   the same bytes, exact installed-inode evidence, lease lifetime, names,
+   reset, and resume revalidation remain authoritative; it creates no canonical
+   namespace. Catalog/list/fork/export/archive/delete stay on the static
+   lifecycle surface and cannot become a second active save owner. Before the
+   private live store can occupy this slot, production needs one stable explicit
+   local canonical store identity; path or display name must not substitute.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

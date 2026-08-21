@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 090.
+updates through Cycle 091.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -219,7 +219,14 @@ kernel.
   canonical-operation save intent. Receipts preserve the representation; a
   mismatched intent is effect-free. The wrapper retains both fences across
   successful saves and releases them only on drop, and exposes no activation
-  extractor. Production `SessionStore` routing remains unchanged.
+  extractor. Cycle 091 moves the production active lifetime behind one
+  non-cloneable `ActiveSessionStore`. Autosave, required save, clear/reset,
+  startup and in-process resume, and artifact routing own that type; its sole
+  implementation delegates exactly to `SessionStore`, creates no canonical
+  namespace, and preserves current-v1 bytes, installed-inode evidence, leases,
+  names, and reset behavior. Catalog/list/export/archive/delete remain static
+  lifecycle operations rather than active save authority. A stable explicit
+  local canonical store identity and production mount routing remain open.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

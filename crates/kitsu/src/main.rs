@@ -6077,7 +6077,7 @@ fn context_window_provenance(
 }
 
 fn persist_session(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -6146,7 +6146,7 @@ fn persist_session(
 }
 
 fn persist_session_required(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -6161,7 +6161,7 @@ fn persist_session_required(
 }
 
 fn persist_started_session(
-    store: &Option<session::SessionStore>,
+    store: &Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &[ChatMessage],
@@ -6244,7 +6244,7 @@ impl ClearSessionReceipt {
 /// conversation usable under its original id.
 #[allow(clippy::too_many_arguments)]
 async fn clear_session_boundary(
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     session: &SessionInfo,
     model: &str,
     messages: &mut Vec<ChatMessage>,
@@ -6368,14 +6368,14 @@ fn activate_offload_dir(
 fn artifact_directory_for_boundary(
     allocator: &mut ArtifactDirectoryAllocator,
     enabled: bool,
-    store: Option<&session::SessionStore>,
+    store: Option<&session::ActiveSessionStore>,
     stateless_base: &std::path::Path,
 ) -> Result<Option<std::path::PathBuf>, String> {
     if !enabled {
         return Ok(None);
     }
     let base = store
-        .map(session::SessionStore::artifacts_dir)
+        .map(session::ActiveSessionStore::artifacts_dir)
         .unwrap_or_else(|| stateless_base.to_path_buf());
     allocator.allocate(&base).map(Some)
 }
@@ -12355,7 +12355,7 @@ async fn run_scripted(
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     artifact_directories: &mut ArtifactDirectoryAllocator,
     artifact_storage_enabled: bool,
     stateless_artifact_base: &std::path::Path,
@@ -12417,7 +12417,7 @@ async fn run_scripted_body(
     context_window: &Rc<Cell<Option<u64>>>,
     live_mw: &subagent::LiveModelWindow,
     registry: &Arc<subagent::AgentRegistry>,
-    session_store: &mut Option<session::SessionStore>,
+    session_store: &mut Option<session::ActiveSessionStore>,
     artifact_directories: &mut ArtifactDirectoryAllocator,
     artifact_storage_enabled: bool,
     stateless_artifact_base: &std::path::Path,
@@ -14376,9 +14376,11 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     }
     let mut session_store = if durable_session {
         Some(match resumed.as_ref() {
-            Some(saved) => session::SessionStore::from_saved(sessions_dir.clone(), saved)
+            Some(saved) => session::ActiveSessionStore::from_saved(sessions_dir.clone(), saved)
                 .map_err(CliError::user)?,
-            None => session::SessionStore::create(sessions_dir.clone()).map_err(CliError::user)?,
+            None => {
+                session::ActiveSessionStore::create(sessions_dir.clone()).map_err(CliError::user)?
+            }
         })
     } else {
         None
@@ -16552,7 +16554,8 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                     let resumed_store = if no_session {
                         None
                     } else {
-                        match session::SessionStore::from_saved(sessions_dir.clone(), &saved) {
+                        match session::ActiveSessionStore::from_saved(sessions_dir.clone(), &saved)
+                        {
                             Ok(store) => Some(store),
                             Err(error) => {
                                 eprintln!("cannot autosave resumed session: {error}");

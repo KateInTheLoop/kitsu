@@ -105,6 +105,15 @@ pub struct SessionStore {
     lease: SessionLease,
 }
 
+/// Production owner for one durable active session. Today it delegates only to
+/// the current-v1 store, preserving existing bytes and behavior while giving
+/// the runtime one ownership slot that can later receive an activated canonical
+/// live store. Static catalog/lifecycle operations remain on [`SessionStore`].
+#[derive(Debug)]
+pub struct ActiveSessionStore {
+    current_v1: SessionStore,
+}
+
 /// Evidence for one atomically installed session snapshot. On Unix the file
 /// descriptor is the exact inode created by the commit and remains valid even
 /// if another same-user process immediately renames, hard-links, or unlinks the
@@ -3000,6 +3009,48 @@ impl SessionStore {
     }
 }
 
+impl ActiveSessionStore {
+    pub fn create(dir: PathBuf) -> Result<Self, String> {
+        SessionStore::create(dir).map(|current_v1| Self { current_v1 })
+    }
+
+    pub fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
+        SessionStore::from_saved(dir, saved).map(|current_v1| Self { current_v1 })
+    }
+
+    pub fn id(&self) -> &str {
+        self.current_v1.id()
+    }
+
+    pub fn name(&self) -> Option<&str> {
+        self.current_v1.name()
+    }
+
+    pub fn set_name(&mut self, name: Option<String>) {
+        self.current_v1.set_name(name);
+    }
+
+    pub fn artifacts_dir(&self) -> PathBuf {
+        self.current_v1.artifacts_dir()
+    }
+
+    pub fn reset(&mut self) -> Result<(), String> {
+        self.current_v1.reset()
+    }
+
+    pub fn save(
+        &self,
+        directory: &Path,
+        gateway: &str,
+        model: &str,
+        project_context: Option<&Path>,
+        messages: &[ChatMessage],
+    ) -> Result<SnapshotCommit, SnapshotSaveError> {
+        self.current_v1
+            .save(directory, gateway, model, project_context, messages)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -4574,5 +4625,54 @@ mod tests {
         assert!(SessionStore::delete(&dir, "linked", None).is_err());
         assert!(linked.exists());
         assert_eq!(std::fs::read_to_string(outside).unwrap(), "outside");
+    }
+
+    #[test]
+    fn active_session_owner_preserves_current_v1_route_and_identity_lifetime() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let mut active = ActiveSessionStore::create(dir.clone()).unwrap();
+        let first_id = active.id().to_string();
+        active.set_name(Some("first-owner".to_string()));
+        let commit = active
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("preserve current-v1")],
+            )
+            .unwrap();
+        assert_eq!(commit.path(), dir.join(format!("{first_id}.json")));
+        assert!(!dir.join(".kitsu-store-v1").exists());
+        let first = SessionStore::load(&dir, &first_id).unwrap();
+        assert_eq!(first.name.as_deref(), Some("first-owner"));
+        assert_eq!(first.messages, [ChatMessage::user("preserve current-v1")]);
+        assert_eq!(
+            active.artifacts_dir(),
+            dir.join(format!("{first_id}.artifacts"))
+        );
+        let directory = PrivateDirectory::open(&dir, "active owner fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        active.reset().unwrap();
+        let second_id = active.id().to_string();
+        assert_ne!(second_id, first_id);
+        assert_eq!(active.name(), None);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        assert_eq!(
+            encode_saved(&SessionStore::load(&dir, &first_id).unwrap()).unwrap(),
+            encode_saved(&first).unwrap()
+        );
+
+        drop(active);
+        let resumed = SessionStore::load(&dir, &first_id).unwrap();
+        let active = ActiveSessionStore::from_saved(dir.clone(), &resumed).unwrap();
+        assert_eq!(active.id(), first_id);
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(!dir.join(".kitsu-store-v1").exists());
     }
 }
