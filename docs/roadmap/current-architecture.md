@@ -273,7 +273,12 @@ kernel.
   while the result owns its active store. Its consuming split is current-v1
   specific and rejects either bound source, so neither bound current nor
   canonical state can expose a product store before an explicit admission card.
-  No product constructor or on-disk route changes.
+  No product constructor or on-disk route changes. Cycle 098 adds a private
+  type-state gate over that result. It admits only bound-current activation,
+  whose snapshot save path is already supported, and yields its owner/data pair.
+  Bound canonical activation returns a typed missing-operation-writer refusal,
+  changes no HEAD, and releases both fences without yielding either field.
+  Missing state remains effect-free. Product routing is still current-v1.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

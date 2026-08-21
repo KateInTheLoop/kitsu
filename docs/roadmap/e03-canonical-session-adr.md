@@ -847,6 +847,15 @@ cannot weaken or replace any backend-neutral assertion.
    still obtain only the current-v1 constructor. Before bound selection can be
    exposed, admission must distinguish its snapshot-writable current source from
    canonical state that requires an operation writer.
+   **Product-writable bound-source admission complete in Cycle 098:** a private
+   type-state wrapper is constructed only after exact bound activation reports a
+   current-v1 source. It can then yield the active owner and exact snapshot; a
+   save through that owner publishes the exact current successor while retaining
+   composition identity and both fences. A canonical source instead returns
+   `CanonicalOperationWriterUnavailable`, leaves selected HEAD byte-exact, and
+   drops both lock owners without exposing either result field. Missing source
+   state remains zero-effect. No startup or in-process call site selects this
+   gate yet; startup mounting is the next boundary.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
