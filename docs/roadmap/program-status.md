@@ -13,7 +13,8 @@ truthful current-run usage coverage and cached-token presence through Cycle 109,
 adaptive presentation-only decks through Cycle 110, and exact offline
 `/usage session` collection/routing through Cycle 112. E07-S01 has its first
 provider-free fixed-corpus measurement baseline through Cycle 113 and a
-threshold-backed test-only structural-selector decision through Cycle 122.
+threshold-backed test-only structural-selector decision through Cycle 122,
+with denied/replaced/revoked authority and freshness oracles through Cycle 125.
 E05-S01 has a private effect-free transactional setup model through Cycle 114,
 descriptor-relative no-clobber configuration publication through Cycle 116,
 and one private local/offline coordinator through Cycle 120.
@@ -34,11 +35,11 @@ observation through Cycle 124.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 124 / 124 |
+| Accepted cycles/commits after this cycle | 125 / 125 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 125 — E07-S01-C3: measure selector authority and staleness refusal |
+| Active epic/card | Cycle 126 — E06-S03-C2: compose the pinned MCP codec with the bounded serial child owner |
 
 ## Epic status
 
@@ -50,7 +51,7 @@ observation through Cycle 124.
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
-| E07 semantic context | **In progress** through E07-S01-C2 | The deterministic fixed-corpus current-tool baseline and one test-only structural selector comparison pass. The selector preserves relevance while reducing rounds/bytes past the predeclared threshold, so only the next authority/stale-edit experiment is promoted; production contributor remains absent |
+| E07 semantic context | **In progress** through E07-S01-C3 | The deterministic fixed-corpus baseline and test-only selector comparison pass. Current permission-gated reads reconstruct emitted evidence after ranking; hostile denied/private/symlink candidates, source replacement, later re-observation, and revocation pass canonical oracles without stale or denied leakage. Production contributor remains absent |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C7 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive full/context/usage decks. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation payloads, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
@@ -184,6 +185,7 @@ observation through Cycle 124.
 | 122 | this document's commit | Threshold-backed structural-selector experiment and promote decision |
 | 123 | this document's commit | Pure bounded offline model-picker snapshot, projection, and proposal truth |
 | 124 | this document's commit | One typed usage snapshot behind bare, session, and legacy-cost compatibility forms |
+| 125 | this document's commit | Selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 
 ## Current green gates
 
@@ -904,6 +906,13 @@ current-session usage snapshot and renderer. Help, invalid syntax, and original
 JSONL lifecycle command spelling remain exact; JSONL adds no result or stderr.
 No provider/account/network/filesystem/store/history or monetary source is
 consulted.
+
+Cycle 125 requires the promoted test-only structural selector to reconstruct
+all emitted lines from current permission-gated reads after ranking. Hostile
+denied, private, and symlink candidates leak no path or canary; source
+replacement yields only revalidated current truth; a later invocation observes
+fresh truth; and revoked authority yields no evidence. The prior promotion
+metrics remain unchanged and no production contributor or mutation path exists.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

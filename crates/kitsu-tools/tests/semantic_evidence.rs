@@ -17,6 +17,7 @@ mod semantic_harness {
     use thiserror::Error;
 
     const VECTOR_SCHEMA_V1: &str = "kitsu.semantic-evidence.v1";
+    const AUTHORITY_VECTOR_SCHEMA_V1: &str = "kitsu.semantic-evidence.authority-staleness.v1";
     const ARTIFACT_SCHEMA_V1: &str = "kitsu.semantic-evidence.artifact.v1";
     const BASELINE_ADAPTER_V1: &str = "current-read-only-tools.v1";
     const SELECTOR_ADAPTER_V1: &str = "bounded-structural-selector.v1";
@@ -346,6 +347,127 @@ mod semantic_harness {
         vectors: Vec<BenchmarkVectorV1>,
     }
 
+    #[derive(Debug, Clone, Copy, Deserialize, PartialEq, Eq)]
+    #[serde(rename_all = "snake_case")]
+    pub(super) enum HostileCandidateKindV1 {
+        DeniedRoot,
+        Private,
+        Symlink,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct HostileCandidateV1 {
+        pub(super) id: String,
+        pub(super) kind: HostileCandidateKindV1,
+        pub(super) fixture: String,
+        pub(super) mount: String,
+        pub(super) canary: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct SourceChangeV1 {
+        pub(super) path: String,
+        pub(super) replacement_fixture: String,
+        pub(super) before: String,
+        pub(super) after: String,
+    }
+
+    #[derive(Debug, Clone, Deserialize)]
+    #[serde(deny_unknown_fields)]
+    pub(super) struct AuthorityStalenessVectorV1 {
+        schema: String,
+        pub(super) prompt: String,
+        pub(super) hostile_candidates: Vec<HostileCandidateV1>,
+        pub(super) source_change: SourceChangeV1,
+    }
+
+    impl AuthorityStalenessVectorV1 {
+        pub(super) fn parse_and_validate(input: &str) -> Result<Self, ContractErrorV1> {
+            if input.len() > MAX_VECTOR_INPUT_BYTES {
+                return Err(ContractErrorV1::ResourceLimitExceeded);
+            }
+            let vector: Self =
+                serde_json::from_str(input).map_err(|_| ContractErrorV1::MalformedVector)?;
+            if vector.schema != AUTHORITY_VECTOR_SCHEMA_V1 {
+                return Err(ContractErrorV1::UnsupportedSchema);
+            }
+            let expected_candidates = [
+                (
+                    "denied_root",
+                    HostileCandidateKindV1::DeniedRoot,
+                    "hostile/denied-root.ts",
+                    "denied/denied-root.ts",
+                    "DENIED_ROOT_CANARY",
+                ),
+                (
+                    "private",
+                    HostileCandidateKindV1::Private,
+                    "hostile/private.ts",
+                    "private/private.ts",
+                    "PRIVATE_CANARY",
+                ),
+                (
+                    "symlink",
+                    HostileCandidateKindV1::Symlink,
+                    "hostile/symlink-target.ts",
+                    "web/symlink-retry.ts",
+                    "SYMLINK_CANARY",
+                ),
+            ];
+            let valid_path = |path: &str| valid_relative_observation_path_v1(path);
+            let candidates_are_closed = vector.hostile_candidates.len()
+                == expected_candidates.len()
+                && vector
+                    .hostile_candidates
+                    .iter()
+                    .zip(expected_candidates)
+                    .all(|(candidate, expected)| {
+                        candidate.id == expected.0
+                            && candidate.kind == expected.1
+                            && candidate.fixture == expected.2
+                            && candidate.mount == expected.3
+                            && candidate.canary == expected.4
+                            && candidate.id.bytes().all(|byte| {
+                                byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'
+                            })
+                            && valid_path(&candidate.fixture)
+                            && valid_path(&candidate.mount)
+                            && candidate.fixture.len() <= MAX_RUBRIC_NEEDLE_BYTES
+                            && candidate.mount.len() <= MAX_RUBRIC_NEEDLE_BYTES
+                            && candidate.canary.bytes().all(|byte| {
+                                byte.is_ascii_uppercase() || byte.is_ascii_digit() || byte == b'_'
+                            })
+                            && candidate.canary.len() <= MAX_RUBRIC_NEEDLE_BYTES
+                    });
+            let mut ids = HashSet::new();
+            let unique_ids = vector
+                .hostile_candidates
+                .iter()
+                .all(|candidate| ids.insert(candidate.id.as_str()));
+            if vector.prompt.trim().is_empty()
+                || vector.prompt.len() > MAX_PROMPT_BYTES
+                || !candidates_are_closed
+                || !unique_ids
+                || !valid_path(&vector.source_change.path)
+                || !valid_path(&vector.source_change.replacement_fixture)
+                || vector.source_change.before.is_empty()
+                || vector.source_change.after.is_empty()
+                || vector.source_change.before == vector.source_change.after
+                || vector.source_change.before.len() > MAX_RUBRIC_NEEDLE_BYTES
+                || vector.source_change.after.len() > MAX_RUBRIC_NEEDLE_BYTES
+                || vector.source_change.path != "web/retry.ts"
+                || vector.source_change.replacement_fixture != "hostile/authorized-after.ts"
+                || vector.source_change.before != "MAX_RETRY_ATTEMPTS = 3"
+                || vector.source_change.after != "MAX_RETRY_ATTEMPTS = 5"
+            {
+                return Err(ContractErrorV1::MalformedVector);
+            }
+            Ok(vector)
+        }
+    }
+
     impl BenchmarkSuiteV1 {
         pub(super) fn parse_and_validate(input: &str) -> Result<Self, ContractErrorV1> {
             if input.len() > MAX_VECTOR_INPUT_BYTES {
@@ -557,7 +679,6 @@ mod semantic_harness {
         role: StructuralRoleV1,
         path: String,
         line: usize,
-        text: String,
     }
 
     #[derive(Debug, Default)]
@@ -664,7 +785,7 @@ mod semantic_harness {
                 continue;
             }
             let mut fields = candidate.splitn(3, ':');
-            let (Some(path), Some(line), Some(text)) =
+            let (Some(path), Some(line), Some(_text)) =
                 (fields.next(), fields.next(), fields.next())
             else {
                 continue;
@@ -681,7 +802,6 @@ mod semantic_harness {
                 role: hit_role,
                 path: path.to_string(),
                 line,
-                text: text.trim().to_string(),
             });
             if hits.len() > MAX_SELECTOR_HITS {
                 return Err(HarnessErrorV1::Selector(
@@ -872,6 +992,34 @@ mod semantic_harness {
             Permissions::for_roots(&[corpus_root_text.to_string()], &[])
                 .map_err(|error| HarnessErrorV1::Tool(error.to_string()))?,
         );
+        select_structural_evidence_with_policy_hook_v1(
+            task,
+            prompt,
+            corpus_root,
+            permissions,
+            |_| Ok(()),
+        )
+        .await
+    }
+
+    pub(super) async fn select_structural_evidence_with_policy_hook_v1<F>(
+        task: TaskKindV1,
+        prompt: &str,
+        corpus_root: &Path,
+        permissions: Arc<Permissions>,
+        after_discovery: F,
+    ) -> Result<String, HarnessErrorV1>
+    where
+        F: FnOnce(&Permissions) -> Result<(), HarnessErrorV1>,
+    {
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(HarnessErrorV1::Selector(
+                "prompt is empty or exceeds the selector bound".to_string(),
+            ));
+        }
+        let corpus_root_text = corpus_root
+            .to_str()
+            .ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
         let (symbol, hits) =
             discover_symbol_v1(prompt, corpus_root_text, permissions.clone()).await?;
         let selected = rank_structural_files_v1(&hits);
@@ -885,6 +1033,10 @@ mod semantic_harness {
             .iter()
             .filter(|hit| selected_set.contains(hit.path.as_str()))
             .collect();
+        // The ranked graph is candidate metadata, never evidence. Tests place
+        // source and authority changes here; every output line below must come
+        // from a new permission-gated read under the resulting state.
+        after_discovery(&permissions)?;
         let definitions = selected_hits
             .iter()
             .filter(|hit| hit.role == StructuralRoleV1::Definition)
@@ -894,46 +1046,80 @@ mod semantic_harness {
             .filter(|hit| hit.role == StructuralRoleV1::Reference)
             .count();
         let mut evidence_lines = BTreeMap::<(String, usize), String>::new();
-        for hit in &selected_hits {
-            evidence_lines
-                .entry((hit.path.clone(), hit.line))
-                .or_insert_with(|| hit.text.clone());
-        }
         for path in &selected {
-            let definition_lines: Vec<usize> = selected_hits
+            let path_hits: Vec<&StructuralHitV1> = selected_hits
                 .iter()
-                .filter(|hit| hit.path == *path && hit.role == StructuralRoleV1::Definition)
-                .map(|hit| hit.line)
+                .copied()
+                .filter(|hit| hit.path == *path)
                 .collect();
-            let (Some(first), Some(last)) =
-                (definition_lines.iter().min(), definition_lines.iter().max())
-            else {
-                continue;
-            };
-            let start = first.saturating_sub(3).max(1);
-            let end = last.saturating_add(3);
             let absolute = corpus_root.join(path);
             let absolute = absolute.to_str().ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
-            let snippet = call_selector_observer_v1(
-                ReadOnlyToolV1::FsReadFile,
-                permissions.clone(),
-                serde_json::json!({
-                    "path": absolute,
-                    "start_line": start,
-                    "end_line": end,
-                }),
-            )
-            .await?;
-            for (offset, line) in snippet.lines().enumerate() {
-                let line_number = start + offset;
-                let numbered_prefix = format!("{line_number}\t");
-                let line = line.strip_prefix(&numbered_prefix).unwrap_or(line).trim();
-                if !line.is_empty() {
-                    evidence_lines
-                        .entry((path.clone(), line_number))
-                        .or_insert_with(|| line.to_string());
+            let mut requested_windows: Vec<(usize, usize)> = path_hits
+                .iter()
+                .map(|hit| match hit.role {
+                    StructuralRoleV1::Definition => (
+                        hit.line.saturating_sub(3).max(1),
+                        hit.line.saturating_add(3),
+                    ),
+                    StructuralRoleV1::Reference => (hit.line, hit.line),
+                })
+                .collect();
+            requested_windows.sort_unstable();
+            let mut windows = Vec::<(usize, usize)>::new();
+            for (start, end) in requested_windows {
+                if let Some((_, previous_end)) = windows.last_mut() {
+                    if start <= previous_end.saturating_add(1) {
+                        *previous_end = (*previous_end).max(end);
+                        continue;
+                    }
+                }
+                windows.push((start, end));
+            }
+
+            let mut current_lines = BTreeMap::<usize, String>::new();
+            for (start, end) in windows {
+                let snippet = call_selector_observer_v1(
+                    ReadOnlyToolV1::FsReadFile,
+                    permissions.clone(),
+                    serde_json::json!({
+                        "path": absolute,
+                        "start_line": start,
+                        "end_line": end,
+                    }),
+                )
+                .await?;
+                for line in snippet.lines() {
+                    let Some((number, text)) = line.split_once('\t') else {
+                        continue;
+                    };
+                    let Ok(line_number) = number.parse::<usize>() else {
+                        continue;
+                    };
+                    if (start..=end).contains(&line_number) {
+                        let text = text.trim();
+                        if !text.is_empty() {
+                            current_lines
+                                .entry(line_number)
+                                .or_insert_with(|| text.to_string());
+                        }
+                    }
                 }
             }
+            let every_hit_is_current = path_hits.iter().all(|hit| {
+                current_lines.get(&hit.line).is_some_and(|text| {
+                    identifier_words_v1(text).iter().any(|word| word == &symbol)
+                })
+            });
+            if !every_hit_is_current {
+                return Err(HarnessErrorV1::Selector(format!(
+                    "selected structural evidence changed before reading '{path}'"
+                )));
+            }
+            evidence_lines.extend(
+                current_lines
+                    .into_iter()
+                    .map(|(line, text)| ((path.clone(), line), text)),
+            );
         }
 
         let mut output = format!(
@@ -1450,6 +1636,192 @@ mod semantic_harness {
         encoded.push(b'\n');
         Ok(encoded)
     }
+
+    #[derive(Serialize)]
+    pub(super) struct CandidateDenialObservationV1 {
+        pub(super) id: String,
+        pub(super) outcome: String,
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct BaselineHostileObservationV1 {
+        adapter: &'static str,
+        pub(super) direct_reads: Vec<CandidateDenialObservationV1>,
+        pub(super) leaked_candidates: Vec<String>,
+    }
+
+    impl BaselineHostileObservationV1 {
+        pub(super) fn new(
+            direct_reads: Vec<CandidateDenialObservationV1>,
+            leaked_candidates: Vec<String>,
+        ) -> Self {
+            Self {
+                adapter: BASELINE_ADAPTER_V1,
+                direct_reads,
+                leaked_candidates,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct SelectorHostileObservationV1 {
+        adapter: &'static str,
+        pub(super) outcome: String,
+        pub(super) leaked_candidates: Vec<String>,
+        pub(super) authorized_truth_present: bool,
+    }
+
+    impl SelectorHostileObservationV1 {
+        pub(super) fn new(
+            outcome: String,
+            leaked_candidates: Vec<String>,
+            authorized_truth_present: bool,
+        ) -> Self {
+            Self {
+                adapter: SELECTOR_ADAPTER_V1,
+                outcome,
+                leaked_candidates,
+                authorized_truth_present,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct HostileComparisonV1 {
+        pub(super) baseline: BaselineHostileObservationV1,
+        pub(super) selector: SelectorHostileObservationV1,
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct TruthObservationV1 {
+        adapter: &'static str,
+        pub(super) outcome: String,
+        pub(super) current_truth_present: bool,
+        pub(super) stale_truth_present: bool,
+    }
+
+    impl TruthObservationV1 {
+        pub(super) fn baseline(
+            outcome: String,
+            current_truth_present: bool,
+            stale_truth_present: bool,
+        ) -> Self {
+            Self {
+                adapter: BASELINE_ADAPTER_V1,
+                outcome,
+                current_truth_present,
+                stale_truth_present,
+            }
+        }
+
+        pub(super) fn selector(
+            outcome: String,
+            current_truth_present: bool,
+            stale_truth_present: bool,
+        ) -> Self {
+            Self {
+                adapter: SELECTOR_ADAPTER_V1,
+                outcome,
+                current_truth_present,
+                stale_truth_present,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct ChangedSourceComparisonV1 {
+        pub(super) baseline: TruthObservationV1,
+        pub(super) selector: TruthObservationV1,
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct RefusalObservationV1 {
+        adapter: &'static str,
+        pub(super) outcome: String,
+        pub(super) emitted_bytes: usize,
+        pub(super) leaked_candidates: Vec<String>,
+    }
+
+    impl RefusalObservationV1 {
+        pub(super) fn baseline(outcome: String) -> Self {
+            Self {
+                adapter: BASELINE_ADAPTER_V1,
+                outcome,
+                emitted_bytes: 0,
+                leaked_candidates: Vec::new(),
+            }
+        }
+
+        pub(super) fn selector(
+            outcome: String,
+            emitted_bytes: usize,
+            leaked_candidates: Vec<String>,
+        ) -> Self {
+            Self {
+                adapter: SELECTOR_ADAPTER_V1,
+                outcome,
+                emitted_bytes,
+                leaked_candidates,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct RevokedComparisonV1 {
+        pub(super) baseline: RefusalObservationV1,
+        pub(super) selector: RefusalObservationV1,
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct AuthorityAggregateV1 {
+        pub(super) decision: &'static str,
+        pub(super) rejection_conditions: [&'static str; 4],
+    }
+
+    #[derive(Serialize)]
+    pub(super) struct AuthorityStalenessComparisonV1 {
+        schema: &'static str,
+        evaluation_scope: EvidenceScopeV1,
+        pub(super) hostile_candidates: HostileComparisonV1,
+        pub(super) changed_between_discovery_and_read: ChangedSourceComparisonV1,
+        pub(super) fresh_later_invocation: TruthObservationV1,
+        pub(super) revoked_after_discovery: RevokedComparisonV1,
+        pub(super) aggregate: AuthorityAggregateV1,
+    }
+
+    impl AuthorityStalenessComparisonV1 {
+        pub(super) fn new(
+            hostile_candidates: HostileComparisonV1,
+            changed_between_discovery_and_read: ChangedSourceComparisonV1,
+            fresh_later_invocation: TruthObservationV1,
+            revoked_after_discovery: RevokedComparisonV1,
+            decision: &'static str,
+        ) -> Self {
+            Self {
+                schema: "kitsu.semantic-evidence.authority-staleness.comparison.v1",
+                evaluation_scope: EvidenceScopeV1::LocateReadOnlyEvidence,
+                hostile_candidates,
+                changed_between_discovery_and_read,
+                fresh_later_invocation,
+                revoked_after_discovery,
+                aggregate: AuthorityAggregateV1 {
+                    decision,
+                    rejection_conditions: [
+                        "candidate_canary_or_path_leaked",
+                        "stale_source_truth_emitted",
+                        "current_source_truth_missing",
+                        "evidence_emitted_after_revocation",
+                    ],
+                },
+            }
+        }
+
+        pub(super) fn encode(&self) -> Result<Vec<u8>, HarnessErrorV1> {
+            let mut encoded = serde_json::to_vec(self)?;
+            encoded.push(b'\n');
+            Ok(encoded)
+        }
+    }
 }
 
 use semantic_harness::*;
@@ -1460,6 +1832,17 @@ const EXPECTED_SELECTOR_JSONL: &str =
     include_str!("fixtures/semantic_evidence/vectors/selector-experiment-v1.jsonl");
 const EXPECTED_COMPARISON_JSON: &str =
     include_str!("fixtures/semantic_evidence/vectors/selector-comparison-v1.json");
+const AUTHORITY_VECTOR_JSON: &str =
+    include_str!("fixtures/semantic_evidence/vectors/authority-staleness-v1.json");
+const EXPECTED_AUTHORITY_COMPARISON_JSON: &str =
+    include_str!("fixtures/semantic_evidence/vectors/authority-staleness-comparison-v1.json");
+const AUTHORIZED_AFTER: &str =
+    include_str!("fixtures/semantic_evidence/corpus/hostile/authorized-after.ts");
+const DENIED_ROOT_HOSTILE: &str =
+    include_str!("fixtures/semantic_evidence/corpus/hostile/denied-root.ts");
+const PRIVATE_HOSTILE: &str = include_str!("fixtures/semantic_evidence/corpus/hostile/private.ts");
+const SYMLINK_HOSTILE: &str =
+    include_str!("fixtures/semantic_evidence/corpus/hostile/symlink-target.ts");
 
 const CORPUS: &[(&str, &str)] = &[
     (
@@ -1504,6 +1887,264 @@ fn materialize_corpus(root: &Path) {
     }
 }
 
+#[cfg(unix)]
+struct MaterializedHostileVector {
+    corpus: tempfile::TempDir,
+    _outside: tempfile::TempDir,
+    permissions: std::sync::Arc<kitsu_tools::Permissions>,
+    candidate_paths: Vec<(String, std::path::PathBuf)>,
+}
+
+#[cfg(unix)]
+fn materialize_hostile_vector(vector: &AuthorityStalenessVectorV1) -> MaterializedHostileVector {
+    let corpus = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    materialize_corpus(corpus.path());
+    let mut candidate_paths = Vec::new();
+    let mut private_paths = Vec::new();
+
+    for candidate in &vector.hostile_candidates {
+        let mounted = corpus.path().join(&candidate.mount);
+        let path = match candidate.kind {
+            HostileCandidateKindV1::DeniedRoot => {
+                let denied = outside.path().join(&candidate.mount);
+                std::fs::create_dir_all(denied.parent().unwrap()).unwrap();
+                std::fs::write(&denied, DENIED_ROOT_HOSTILE).unwrap();
+                denied
+            }
+            HostileCandidateKindV1::Private => {
+                std::fs::create_dir_all(mounted.parent().unwrap()).unwrap();
+                std::fs::write(&mounted, PRIVATE_HOSTILE).unwrap();
+                private_paths.push(mounted.clone());
+                mounted
+            }
+            HostileCandidateKindV1::Symlink => {
+                let target = outside.path().join(&candidate.fixture);
+                std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+                std::fs::write(&target, SYMLINK_HOSTILE).unwrap();
+                std::fs::create_dir_all(mounted.parent().unwrap()).unwrap();
+                std::os::unix::fs::symlink(target, &mounted).unwrap();
+                mounted
+            }
+        };
+        candidate_paths.push((candidate.id.clone(), path));
+    }
+
+    let root = corpus.path().display().to_string();
+    let permissions = std::sync::Arc::new(
+        kitsu_tools::Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap(),
+    );
+    for private in private_paths {
+        permissions
+            .protect_read_path(&private.display().to_string())
+            .unwrap();
+    }
+    MaterializedHostileVector {
+        corpus,
+        _outside: outside,
+        permissions,
+        candidate_paths,
+    }
+}
+
+fn leaked_candidate_ids(output: &str, vector: &AuthorityStalenessVectorV1) -> Vec<String> {
+    vector
+        .hostile_candidates
+        .iter()
+        .filter(|candidate| output.contains(&candidate.canary) || output.contains(&candidate.mount))
+        .map(|candidate| candidate.id.clone())
+        .collect()
+}
+
+fn baseline_denial_outcome(result: Result<String, kitsu_tools::ToolError>) -> String {
+    match result {
+        Err(kitsu_tools::ToolError::PolicyDenied(_)) => "policy_denied",
+        Err(_) => "unexpected_error",
+        Ok(_) => "evidence_emitted",
+    }
+    .to_string()
+}
+
+#[cfg(unix)]
+async fn authority_staleness_comparison_artifact() -> Vec<u8> {
+    let vector = AuthorityStalenessVectorV1::parse_and_validate(AUTHORITY_VECTOR_JSON).unwrap();
+
+    let hostile = materialize_hostile_vector(&vector);
+    let baseline_root = kitsu_tools::builtins::fs::find_symbol_tool(hostile.permissions.clone()).1;
+    let baseline_root_output = baseline_root(
+        json!({
+            "symbol": "MAX_RETRY_ATTEMPTS",
+            "path": hostile.corpus.path(),
+            "max_results": 64,
+        })
+        .to_string(),
+    )
+    .await
+    .unwrap();
+    let mut direct_reads = Vec::new();
+    for (id, path) in &hostile.candidate_paths {
+        let read = kitsu_tools::builtins::fs::read_file_tool(hostile.permissions.clone()).1;
+        let outcome = baseline_denial_outcome(read(json!({"path": path}).to_string()).await);
+        direct_reads.push(CandidateDenialObservationV1 {
+            id: id.clone(),
+            outcome,
+        });
+    }
+    let selector_hostile = select_structural_evidence_with_policy_hook_v1(
+        TaskKindV1::Change,
+        &vector.prompt,
+        hostile.corpus.path(),
+        hostile.permissions,
+        |_| Ok(()),
+    )
+    .await;
+    let (selector_hostile_outcome, selector_hostile_output) = match selector_hostile {
+        Ok(output) => ("evidence_emitted".to_string(), output),
+        Err(_) => ("selector_error".to_string(), String::new()),
+    };
+    let hostile_comparison = HostileComparisonV1 {
+        baseline: BaselineHostileObservationV1::new(
+            direct_reads,
+            leaked_candidate_ids(&baseline_root_output, &vector),
+        ),
+        selector: SelectorHostileObservationV1::new(
+            selector_hostile_outcome,
+            leaked_candidate_ids(&selector_hostile_output, &vector),
+            selector_hostile_output.contains(&vector.source_change.before),
+        ),
+    };
+
+    let changed_corpus = tempfile::tempdir().unwrap();
+    materialize_corpus(changed_corpus.path());
+    let changed_root = changed_corpus.path().display().to_string();
+    let changed_permissions = std::sync::Arc::new(
+        kitsu_tools::Permissions::for_roots(std::slice::from_ref(&changed_root), &[]).unwrap(),
+    );
+    let changed_path = changed_corpus.path().join(&vector.source_change.path);
+    let changed_selector = select_structural_evidence_with_policy_hook_v1(
+        TaskKindV1::Change,
+        &vector.prompt,
+        changed_corpus.path(),
+        changed_permissions.clone(),
+        |_| {
+            std::fs::write(&changed_path, AUTHORIZED_AFTER)
+                .map_err(|error| HarnessErrorV1::Selector(error.to_string()))
+        },
+    )
+    .await;
+    let (changed_selector_outcome, changed_selector_output) = match changed_selector {
+        Ok(output) => {
+            let outcome = if output.contains(&vector.source_change.after)
+                && !output.contains(&vector.source_change.before)
+            {
+                "revalidated_current_truth"
+            } else {
+                "stale_or_incomplete_evidence"
+            };
+            (outcome.to_string(), output)
+        }
+        Err(_) => ("selector_error".to_string(), String::new()),
+    };
+    let baseline_read = kitsu_tools::builtins::fs::read_file_tool(changed_permissions).1;
+    let baseline_changed_output = baseline_read(json!({"path": changed_path}).to_string())
+        .await
+        .unwrap();
+    let changed_comparison = ChangedSourceComparisonV1 {
+        baseline: TruthObservationV1::baseline(
+            "fresh_read".to_string(),
+            baseline_changed_output.contains(&vector.source_change.after),
+            baseline_changed_output.contains(&vector.source_change.before),
+        ),
+        selector: TruthObservationV1::selector(
+            changed_selector_outcome,
+            changed_selector_output.contains(&vector.source_change.after),
+            changed_selector_output.contains(&vector.source_change.before),
+        ),
+    };
+    let fresh_selector =
+        select_structural_evidence_v1(TaskKindV1::Change, &vector.prompt, changed_corpus.path())
+            .await
+            .unwrap();
+    let fresh_later_invocation = TruthObservationV1::selector(
+        "fresh_reobservation".to_string(),
+        fresh_selector.contains(&vector.source_change.after),
+        fresh_selector.contains(&vector.source_change.before),
+    );
+
+    let revoked_corpus = tempfile::tempdir().unwrap();
+    materialize_corpus(revoked_corpus.path());
+    let revoked_root = revoked_corpus.path().display().to_string();
+    let revoked_permissions = std::sync::Arc::new(
+        kitsu_tools::Permissions::for_roots(std::slice::from_ref(&revoked_root), &[]).unwrap(),
+    );
+    let revoked_selector = select_structural_evidence_with_policy_hook_v1(
+        TaskKindV1::Change,
+        &vector.prompt,
+        revoked_corpus.path(),
+        revoked_permissions.clone(),
+        |permissions| {
+            permissions
+                .revoke_read_root(&revoked_root)
+                .map(|_| ())
+                .map_err(|error| HarnessErrorV1::Selector(error.to_string()))
+        },
+    )
+    .await;
+    let (revoked_selector_outcome, revoked_selector_output) = match revoked_selector {
+        Err(HarnessErrorV1::Tool(_)) => ("authority_refused".to_string(), String::new()),
+        Err(_) => ("selector_error".to_string(), String::new()),
+        Ok(output) => ("evidence_emitted".to_string(), output),
+    };
+    let baseline_revoked_read = kitsu_tools::builtins::fs::read_file_tool(revoked_permissions).1;
+    let baseline_revoked_outcome = baseline_denial_outcome(
+        baseline_revoked_read(
+            json!({"path": revoked_corpus.path().join(&vector.source_change.path)}).to_string(),
+        )
+        .await,
+    );
+    let revoked_comparison = RevokedComparisonV1 {
+        baseline: RefusalObservationV1::baseline(baseline_revoked_outcome),
+        selector: RefusalObservationV1::selector(
+            revoked_selector_outcome,
+            revoked_selector_output.len(),
+            leaked_candidate_ids(&revoked_selector_output, &vector),
+        ),
+    };
+
+    let pass = hostile_comparison
+        .baseline
+        .direct_reads
+        .iter()
+        .all(|observation| observation.outcome == "policy_denied")
+        && hostile_comparison.baseline.leaked_candidates.is_empty()
+        && hostile_comparison.selector.outcome == "evidence_emitted"
+        && hostile_comparison.selector.leaked_candidates.is_empty()
+        && hostile_comparison.selector.authorized_truth_present
+        && changed_comparison.baseline.outcome == "fresh_read"
+        && changed_comparison.baseline.current_truth_present
+        && !changed_comparison.baseline.stale_truth_present
+        && changed_comparison.selector.outcome == "revalidated_current_truth"
+        && changed_comparison.selector.current_truth_present
+        && !changed_comparison.selector.stale_truth_present
+        && fresh_later_invocation.outcome == "fresh_reobservation"
+        && fresh_later_invocation.current_truth_present
+        && !fresh_later_invocation.stale_truth_present
+        && revoked_comparison.baseline.outcome == "policy_denied"
+        && revoked_comparison.selector.outcome == "authority_refused"
+        && revoked_comparison.selector.emitted_bytes == 0
+        && revoked_comparison.selector.leaked_candidates.is_empty();
+
+    AuthorityStalenessComparisonV1::new(
+        hostile_comparison,
+        changed_comparison,
+        fresh_later_invocation,
+        revoked_comparison,
+        if pass { "pass" } else { "reject" },
+    )
+    .encode()
+    .unwrap()
+}
+
 #[test]
 fn vectors_are_closed_versioned_unique_and_budgeted() {
     let suite = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
@@ -1520,6 +2161,59 @@ fn vectors_are_closed_versioned_unique_and_budgeted() {
         .iter()
         .flat_map(|vector| vector.calls())
         .all(|call| call.is_read_only()));
+}
+
+#[test]
+fn authority_staleness_vector_is_closed_and_rejects_schema_or_path_drift() {
+    let vector = AuthorityStalenessVectorV1::parse_and_validate(AUTHORITY_VECTOR_JSON).unwrap();
+    assert_eq!(vector.hostile_candidates.len(), 3);
+    assert_eq!(vector.source_change.path, "web/retry.ts");
+    assert_eq!(
+        AuthorityStalenessVectorV1::parse_and_validate(&" ".repeat(64 * 1024 + 1)).unwrap_err(),
+        ContractErrorV1::ResourceLimitExceeded
+    );
+
+    let mut unknown_schema: serde_json::Value =
+        serde_json::from_str(AUTHORITY_VECTOR_JSON).unwrap();
+    unknown_schema["schema"] = json!("kitsu.semantic-evidence.authority-staleness.v2");
+    assert_eq!(
+        AuthorityStalenessVectorV1::parse_and_validate(&unknown_schema.to_string()).unwrap_err(),
+        ContractErrorV1::UnsupportedSchema
+    );
+
+    let base: serde_json::Value = serde_json::from_str(AUTHORITY_VECTOR_JSON).unwrap();
+    let mut malformed = Vec::new();
+
+    let mut escaping_path = base.clone();
+    escaping_path["hostile_candidates"][0]["mount"] = json!("../denied-root.ts");
+    malformed.push(escaping_path);
+
+    let mut unknown_fixture = base.clone();
+    unknown_fixture["hostile_candidates"][0]["fixture"] = json!("hostile/unknown.ts");
+    malformed.push(unknown_fixture);
+
+    let mut unsafe_canary = base.clone();
+    unsafe_canary["hostile_candidates"][1]["canary"] = json!("private canary");
+    malformed.push(unsafe_canary);
+
+    let mut unknown_replacement = base.clone();
+    unknown_replacement["source_change"]["replacement_fixture"] = json!("hostile/unknown-after.ts");
+    malformed.push(unknown_replacement);
+
+    let mut oversized_before = base.clone();
+    oversized_before["source_change"]["before"] = json!("x".repeat(513));
+    malformed.push(oversized_before);
+
+    let mut oversized_after = base;
+    oversized_after["source_change"]["after"] = json!("x".repeat(513));
+    malformed.push(oversized_after);
+
+    for candidate in malformed {
+        assert_eq!(
+            AuthorityStalenessVectorV1::parse_and_validate(&candidate.to_string()).unwrap_err(),
+            ContractErrorV1::MalformedVector
+        );
+    }
 }
 
 #[test]
@@ -1881,4 +2575,80 @@ async fn selector_is_bounded_and_reobserves_changed_source_without_a_cache() {
     assert!(before.contains("MAX_RETRY_ATTEMPTS = 3"));
     assert!(after.contains("MAX_RETRY_ATTEMPTS = 5"));
     assert!(!after.contains("MAX_RETRY_ATTEMPTS = 3"));
+}
+
+#[tokio::test]
+async fn selector_reobserves_a_source_changed_between_discovery_and_read() {
+    let vector: serde_json::Value = serde_json::from_str(AUTHORITY_VECTOR_JSON).unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    materialize_corpus(corpus.path());
+    let root = corpus.path().display().to_string();
+    let permissions = std::sync::Arc::new(
+        kitsu_tools::Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap(),
+    );
+    let changed_path = corpus.path().join(
+        vector["source_change"]["path"]
+            .as_str()
+            .expect("fixed source-change path"),
+    );
+
+    let output = select_structural_evidence_with_policy_hook_v1(
+        TaskKindV1::Change,
+        vector["prompt"].as_str().expect("fixed prompt"),
+        corpus.path(),
+        permissions,
+        |_| {
+            std::fs::write(&changed_path, AUTHORIZED_AFTER)
+                .map_err(|error| HarnessErrorV1::Selector(error.to_string()))
+        },
+    )
+    .await
+    .unwrap();
+
+    assert!(output.contains("MAX_RETRY_ATTEMPTS = 5"));
+    assert!(!output.contains("MAX_RETRY_ATTEMPTS = 3"));
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn authority_and_staleness_comparison_is_canonical_and_passes_exact_oracles() {
+    let first = authority_staleness_comparison_artifact().await;
+    let second = authority_staleness_comparison_artifact().await;
+
+    assert_eq!(first, second);
+    let first = String::from_utf8(first).unwrap();
+    assert_eq!(first, EXPECTED_AUTHORITY_COMPARISON_JSON);
+    let report: serde_json::Value = serde_json::from_str(&first).unwrap();
+    assert_eq!(report["aggregate"]["decision"], "pass");
+    assert_eq!(
+        report["hostile_candidates"]["baseline"]["leaked_candidates"],
+        json!([])
+    );
+    assert_eq!(
+        report["hostile_candidates"]["selector"]["leaked_candidates"],
+        json!([])
+    );
+    assert_eq!(
+        report["changed_between_discovery_and_read"]["selector"]["outcome"],
+        "revalidated_current_truth"
+    );
+    assert_eq!(
+        report["fresh_later_invocation"]["outcome"],
+        "fresh_reobservation"
+    );
+    assert_eq!(
+        report["revoked_after_discovery"]["selector"]["outcome"],
+        "authority_refused"
+    );
+    assert_eq!(
+        report["revoked_after_discovery"]["selector"]["emitted_bytes"],
+        0
+    );
+    for candidate in &AuthorityStalenessVectorV1::parse_and_validate(AUTHORITY_VECTOR_JSON)
+        .unwrap()
+        .hostile_candidates
+    {
+        assert!(!first.contains(&candidate.canary));
+        assert!(!first.contains(&candidate.mount));
+    }
 }

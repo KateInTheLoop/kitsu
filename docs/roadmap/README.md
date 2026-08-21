@@ -733,6 +733,7 @@ gates merely because a card appears attractive.
 | 122 | E07-S01-C2 | Measure a deterministic structural selector against the frozen baseline and record the threshold-backed promote decision |
 | 123 | E05-S02-C1 | Stage a deterministic offline model picker over one bounded provenance-bearing catalog snapshot without applying it |
 | 124 | E08-S05-C7 | Unify bare/session usage and legacy cost compatibility over one truthful typed current-session snapshot |
+| 125 | E07-S01-C3 | Prove selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1097,6 +1098,14 @@ renderer. Help, invalid syntax, and original JSONL lifecycle spelling remain
 explicit; JSONL gains no result payload or stderr text. No account, provider,
 network, filesystem, persistence, history, pricing, currency, credit, or rate
 lookup is introduced.
+Cycle 125 hardens the promoted test-only structural selector at its authority
+and staleness boundary. Discovery hits now rank candidates but never supply
+emitted text; every selected path and line is reconstructed through bounded
+current permission-gated reads after the test interstice. Denied, private, and
+symlink candidates leak no canary or path, replacement emits only revalidated
+current truth, and revocation returns no evidence. The original 5-to-3-round and
+1,456-to-1,134-byte promotion result remains byte-stable. This still adds no
+production contributor, cache, provider, mutation, or completed-task claim.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
