@@ -325,6 +325,13 @@ kernel.
   exit, signals before joining cancel/shutdown, and retains typed residue plus a
   drop-cleanup report. The effect backend remains a synchronous provider-free
   fixture; no production process or durable report sink exists.
+- Cycle 106 adds a presentation-neutral, current-session telemetry snapshot.
+  Route/profile/generation, optional session/run identity, effective authority,
+  context occupancy, usage coverage and categories, and portable cost are each
+  one truth-class/provenance value. Unavailable has no value. Provider-reported
+  currency is the only admitted cost; Kitsu does not derive price. The DTO is
+  unmounted, and current run tallies cannot yet populate complete response
+  coverage or cached-token facts.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -336,7 +343,7 @@ kernel.
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
 | External runtime tools | Static request inventory; closed external identities/fingerprints; exact child admission plus provider-free lifecycle truth; pure bounded tools-only MCP codec | Same-process compiled handlers only; external candidate is unpublishable; lifecycle effects are injected fixtures; codec owns no transport | E06 identity, admission, lifecycle-truth, and wire foundations begun; no real child, phase budgets, monotonic publication, MCP composition, or product configuration |
-| Host/UI protocol | CLI carriers plus one-way JSONL | Consumer cannot service synchronous calls | No named second host; X003/X004 fail |
+| Host/UI protocol | CLI carriers plus one-way JSONL; pure unmounted current-session telemetry DTO | Consumer cannot service synchronous calls; snapshot performs no discovery or rendering | No named second host and slash output is unchanged; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
 ## Three spines and extraction order
