@@ -222,7 +222,7 @@ pub(crate) trait ChildLaunchPreparationV1 {
 }
 
 /// Prepared, still-unspawned identity for the future lifecycle owner.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub(crate) struct PreparedChildLaunchV1 {
     canonical_executable: PathBuf,
     executable_sha256: ExecutableSha256V1,
