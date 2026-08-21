@@ -113,7 +113,21 @@ pub struct SessionStore {
 /// live store. Static catalog/lifecycle operations remain on [`SessionStore`].
 #[derive(Debug)]
 pub struct ActiveSessionStore {
-    current_v1: SessionStore,
+    inner: ActiveSessionStoreInner,
+}
+
+#[derive(Debug)]
+enum ActiveSessionStoreInner {
+    CurrentV1(SessionStore),
+    BoundLocal(BoundLocalActiveSessionStore),
+}
+
+#[derive(Debug)]
+struct BoundLocalActiveSessionStore {
+    sessions_dir: PathBuf,
+    id: String,
+    name: Option<String>,
+    live: std::cell::RefCell<mount::LocalSessionLiveStoreV1>,
 }
 
 /// Evidence for one atomically installed session snapshot. On Unix the file
@@ -3013,31 +3027,99 @@ impl SessionStore {
 
 impl ActiveSessionStore {
     pub fn create(dir: PathBuf) -> Result<Self, String> {
-        SessionStore::create(dir).map(|current_v1| Self { current_v1 })
+        SessionStore::create(dir).map(|current_v1| Self {
+            inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+        })
     }
 
     pub fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
-        SessionStore::from_saved(dir, saved).map(|current_v1| Self { current_v1 })
+        SessionStore::from_saved(dir, saved).map(|current_v1| Self {
+            inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+        })
+    }
+
+    #[allow(dead_code)]
+    fn from_bound_local(live: mount::LocalSessionLiveStoreV1) -> Self {
+        let sessions_dir = live.sessions_dir().to_path_buf();
+        let id = live.saved().id.clone();
+        let name = live.saved().name.clone();
+        Self {
+            inner: ActiveSessionStoreInner::BoundLocal(BoundLocalActiveSessionStore {
+                sessions_dir,
+                id,
+                name,
+                live: std::cell::RefCell::new(live),
+            }),
+        }
     }
 
     pub fn id(&self) -> &str {
-        self.current_v1.id()
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.id(),
+            ActiveSessionStoreInner::BoundLocal(store) => &store.id,
+        }
     }
 
     pub fn name(&self) -> Option<&str> {
-        self.current_v1.name()
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.name(),
+            ActiveSessionStoreInner::BoundLocal(store) => store.name.as_deref(),
+        }
     }
 
-    pub fn set_name(&mut self, name: Option<String>) {
-        self.current_v1.set_name(name);
+    pub fn set_name(&mut self, name: Option<String>) -> Result<(), String> {
+        match &mut self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => {
+                store.set_name(name);
+                Ok(())
+            }
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let live = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?;
+                match live.activation_receipt().source() {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        drop(live);
+                        store.name = name;
+                        Ok(())
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+                        Err("canonical session rename is not mounted yet".to_string())
+                    }
+                }
+            }
+        }
     }
 
-    pub fn artifacts_dir(&self) -> PathBuf {
-        self.current_v1.artifacts_dir()
+    pub fn artifacts_dir(&self) -> Result<PathBuf, String> {
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => Ok(store.artifacts_dir()),
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let live = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?;
+                match live.activation_receipt().source() {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        Ok(store.sessions_dir.join(format!("{}.artifacts", store.id)))
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => Err(
+                        "canonical session artifacts require the physical artifact store"
+                            .to_string(),
+                    ),
+                }
+            }
+        }
     }
 
     pub fn reset(&mut self) -> Result<(), String> {
-        self.current_v1.reset()
+        match &mut self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => store.reset(),
+            ActiveSessionStoreInner::BoundLocal(_) => {
+                Err("bound local session reset is not mounted yet".to_string())
+            }
+        }
     }
 
     pub fn save(
@@ -3048,8 +3130,71 @@ impl ActiveSessionStore {
         project_context: Option<&Path>,
         messages: &[ChatMessage],
     ) -> Result<SnapshotCommit, SnapshotSaveError> {
-        self.current_v1
-            .save(directory, gateway, model, project_context, messages)
+        match &self.inner {
+            ActiveSessionStoreInner::CurrentV1(store) => {
+                store.save(directory, gateway, model, project_context, messages)
+            }
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let mut live = store.live.try_borrow_mut().map_err(|_| SnapshotSaveError {
+                    message: "bound local session store is already in use".to_string(),
+                    installed_commit: None,
+                })?;
+                let saved = SavedSession {
+                    version: SESSION_VERSION,
+                    id: live.saved().id.clone(),
+                    created_at: live.saved().created_at.clone(),
+                    updated_at: now(),
+                    directory: directory.display().to_string(),
+                    gateway: gateway.to_string(),
+                    model: model.to_string(),
+                    name: store.name.clone(),
+                    project_context: project_context.map(|path| path.display().to_string()),
+                    messages: messages.to_vec(),
+                };
+                match live.save(mount::SessionLiveStoreSaveV1::CurrentV1Snapshot(saved)) {
+                    Ok(mount::SessionLiveStoreSaveReceiptV1::CurrentV1(receipt)) => {
+                        let (commit, warning) = receipt.into_parts();
+                        match warning {
+                            Some(message) => Err(SnapshotSaveError {
+                                message,
+                                installed_commit: Some(commit),
+                            }),
+                            None => Ok(commit),
+                        }
+                    }
+                    Ok(mount::SessionLiveStoreSaveReceiptV1::Canonical(_)) => {
+                        Err(SnapshotSaveError {
+                            message: "snapshot save returned a canonical receipt".to_string(),
+                            installed_commit: None,
+                        })
+                    }
+                    Err(mount::SessionMountSaveErrorV1::CurrentV1(
+                        mount::CurrentV1MountSaveErrorV1::Write(error),
+                    )) => Err(error),
+                    Err(mount::SessionMountSaveErrorV1::CurrentV1(
+                        mount::CurrentV1MountSaveErrorV1::InvalidCandidate(message)
+                        | mount::CurrentV1MountSaveErrorV1::Admission(message),
+                    )) => Err(SnapshotSaveError {
+                        message,
+                        installed_commit: None,
+                    }),
+                    Err(mount::SessionMountSaveErrorV1::CanonicalOperationRequired) => {
+                        Err(SnapshotSaveError {
+                            message: "canonical session save requires a canonical operation"
+                                .to_string(),
+                            installed_commit: None,
+                        })
+                    }
+                    Err(
+                        mount::SessionMountSaveErrorV1::CurrentV1SnapshotRequired
+                        | mount::SessionMountSaveErrorV1::Canonical(_),
+                    ) => Err(SnapshotSaveError {
+                        message: "bound local session rejected the snapshot save".to_string(),
+                        installed_commit: None,
+                    }),
+                }
+            }
+        }
     }
 }
 
@@ -4635,7 +4780,7 @@ mod tests {
         let dir = root.path().join("sessions");
         let mut active = ActiveSessionStore::create(dir.clone()).unwrap();
         let first_id = active.id().to_string();
-        active.set_name(Some("first-owner".to_string()));
+        active.set_name(Some("first-owner".to_string())).unwrap();
         let commit = active
             .save(
                 root.path(),
@@ -4651,7 +4796,7 @@ mod tests {
         assert_eq!(first.name.as_deref(), Some("first-owner"));
         assert_eq!(first.messages, [ChatMessage::user("preserve current-v1")]);
         assert_eq!(
-            active.artifacts_dir(),
+            active.artifacts_dir().unwrap(),
             dir.join(format!("{first_id}.artifacts"))
         );
         let directory = PrivateDirectory::open(&dir, "active owner fixture").unwrap();
@@ -4676,5 +4821,157 @@ mod tests {
         drop(active);
         drop(SessionLease::acquire(&directory, &first_id).unwrap());
         assert!(!dir.join(".kitsu-store-v1").exists());
+    }
+
+    #[test]
+    fn bound_local_active_variant_preserves_current_save_and_durability_truth() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let mut legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy.set_name(Some("local-source".to_string()));
+        legacy
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("local source")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        let directory = PrivateDirectory::open(&dir, "bound active fixture").unwrap();
+        let session_id = kitsu_core::session::SessionId::new(id.clone()).unwrap();
+        let local = mount::activate_local_session_live_store_v1(&directory, &session_id).unwrap();
+        let store_id = local.identity_receipt().store_id().clone();
+        let mut active = ActiveSessionStore::from_bound_local(local);
+        assert_eq!(active.id(), id);
+        assert_eq!(active.name(), Some("local-source"));
+        assert_eq!(
+            active.artifacts_dir().unwrap(),
+            dir.join(format!("{id}.artifacts"))
+        );
+        active.set_name(Some("local-bound".to_string())).unwrap();
+        let commit = active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("saved through active variant")],
+            )
+            .unwrap();
+        assert_eq!(commit.path(), dir.join(format!("{id}.json")));
+        let saved = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(saved.name.as_deref(), Some("local-bound"));
+        assert_eq!(saved.gateway, "gateway-b");
+        assert_eq!(saved.model, "model-b");
+        assert_eq!(
+            saved.messages,
+            [ChatMessage::user("saved through active variant")]
+        );
+
+        FAIL_NEXT_PRIVATE_DIRECTORY_SYNC.with(|fail| assert!(!fail.replace(true)));
+        let error = active
+            .save(
+                root.path(),
+                "gateway-c",
+                "model-c",
+                None,
+                &[ChatMessage::user("installed unconfirmed")],
+            )
+            .unwrap_err();
+        assert!(error.installed_commit().is_some());
+        let installed = SessionStore::load(&dir, &id).unwrap();
+        assert_eq!(installed.model, "model-c");
+        assert_eq!(
+            installed.messages,
+            [ChatMessage::user("installed unconfirmed")]
+        );
+        assert!(active.reset().unwrap_err().contains("not mounted"));
+        assert_eq!(active.id(), id);
+
+        let physical = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(physical.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        drop(active);
+        drop(physical.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn bound_local_active_variant_refuses_legacy_projection_of_canonical_state() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-canonical-active").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T10:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T10:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("canonical-source".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-canonical-active").unwrap(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let local = mount::activate_local_session_live_store_v1(&directory, &session_id).unwrap();
+        let mut active = ActiveSessionStore::from_bound_local(local);
+        assert_eq!(active.id(), session_id.as_str());
+        assert_eq!(active.name(), Some("canonical-source"));
+        assert!(active
+            .artifacts_dir()
+            .unwrap_err()
+            .contains("physical artifact"));
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        assert!(active
+            .set_name(Some("must-not-project".to_string()))
+            .unwrap_err()
+            .contains("not mounted"));
+        assert_eq!(active.name(), Some("canonical-source"));
+        let error = active
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("must not become current-v1")],
+            )
+            .unwrap_err();
+        assert!(error.to_string().contains("canonical operation"));
+        assert!(error.installed_commit().is_none());
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        assert!(active.reset().unwrap_err().contains("not mounted"));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(competing.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
+        drop(active);
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
     }
 }

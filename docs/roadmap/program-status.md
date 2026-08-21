@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C34, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C35, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 93 / 93 |
+| Accepted cycles/commits after this cycle | 94 / 94 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C35 (Cycle 094) — admit the bound local owner beneath `ActiveSessionStore` without selecting it in product routing |
+| Active epic/card | E03 / E03-S02-C36 (Cycle 095) — couple private bound activation with its exact selected resume snapshot before product routing |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C34, E03-S05 through C4 | One private local factory now resolves the owner-private composition `StoreId`, uses it for exact selection and total activation, and retains identity evidence with the dual-fenced live owner. Orphan, mismatch, corruption, empty, and unavailable cases remain no-publish/no-repair. Product constructors still choose current-v1; production routing, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C35, E03-S05 through C4 | `ActiveSessionStore` is now a closed current-v1/bound-local sum. Current-bound saves preserve commit/durability truth; canonical-bound legacy rename, sidecar, reset, and snapshot routes refuse before effects. Public constructors remain current-v1. Exact selected-resume coupling, product routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -129,7 +129,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 090 | `4f87e0b` | Non-cloneable total private live-store owner |
 | 091 | `dcfd108` | Current-v1-preserving production active-session ownership handoff |
 | 092 | `632a198` | Stable explicit local canonical store identity |
-| 093 | this document's commit | Exact local composition/physical activation binding |
+| 093 | `fafe58f` | Exact local composition/physical activation binding |
+| 094 | this document's commit | Closed bound-local production-owner variant |
 
 ## Current green gates
 
@@ -598,9 +599,15 @@ uses the same exact `StoreId` for a fresh selection and total activation, then
 retains the identity receipt beside the non-cloneable dual-fenced live owner.
 Current-v1 save and reopen preserve the same composition and `store.json`
 identity. Existing mismatch and corrupt identity bytes remain unchanged. Product
-constructors still select only the current-v1 `ActiveSessionStore`; Cycle 094
-next adds the bound owner as a closed private variant without selecting it in
-product routing.
+constructors still select only the current-v1 `ActiveSessionStore`. Cycle 094
+adds the bound owner as a closed private variant. Current-bound state maps clean
+and installed-unconfirmed snapshot commits to the existing product contract and
+retains both fences. Canonical-bound state refuses legacy rename, reset, sidecar
+artifact paths, and snapshot saves without moving HEAD. Rename and artifact
+routing are fallible at the owner boundary, while public create/resume
+constructors remain byte-exact current-v1 and create no canonical namespace.
+Cycle 095 next couples a private bound owner with the exact resume snapshot it
+selected so no caller can keep stale pre-activation data.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
