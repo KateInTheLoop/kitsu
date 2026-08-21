@@ -25,5 +25,6 @@ zip = { version = "2.4", default-features = false, features = ["deflate"] }
 quick-xml = "0.41"
 
 [dev-dependencies]
+serial_test = { workspace = true }
 tempfile = { workspace = true }
 tokio = { workspace = true }

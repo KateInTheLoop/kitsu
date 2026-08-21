@@ -2,7 +2,7 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S01 is implemented through C4, E06-S02 through C3, and
+through Cycle 080; E06-S01 is implemented through C6, E06-S02 through C3, and
 E06-S03 has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
@@ -16,7 +16,8 @@ provider-free fixed-corpus measurement baseline through Cycle 113.
 E05-S01 has a private effect-free transactional setup model through Cycle 114
 and descriptor-relative no-clobber configuration publication through Cycle 116.
 E06-S01 now composes its prepared policy and phase owner with a private real
-Linux one-process backend through Cycle 115.
+Linux one-process backend through Cycle 115 and exact sealed native execution
+plus bounded Landlock filesystem-content authority through Cycle 118.
 E08-S05 mounts the same typed offline current-session observation on `/status`
 through Cycle 117 while preserving the legacy JSONL payload shape.
 
@@ -25,11 +26,11 @@ through Cycle 117 while preserving the legacy JSONL payload shape.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 117 / 117 |
+| Accepted cycles/commits after this cycle | 118 / 118 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 118 — E06-S01-C6: seal exact child executable bytes and bind a bounded filesystem-content policy before spawn |
+| Active epic/card | Cycle 119 — E06-S01-C7: prove bounded serial multi-frame pipe ownership before MCP composition |
 
 ## Epic status
 
@@ -40,7 +41,7 @@ through Cycle 117 while preserving the legacy JSONL payload shape.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C5, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux backend now consumes the prepared policy through the accepted phase owner and proves bounded joined pipes, real clocks, process-group termination, direct wait, EOF/exit/crash truth, and retryable residue. It remains one-process/one-request and unmounted because filesystem confinement, immutable exec identity, long-lived MCP composition, and a product route are absent |
+| E06 child/MCP spine | **In progress** through E06-S01-C6, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and proves bounded pipes, clocks, group cleanup, direct wait, EOF/exit/crash truth, and retryable residue. It remains one-process/one-request and unmounted; Landlock limitations, serial MCP composition, alternate enforcement, and product routing keep X002 open |
 | E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
 | E05 onboarding | **In progress** through E05-S01-C2 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C5 | Pure current-session DTOs label every value with truth/provenance; `/usage session` and `/status` each collect one coherent offline in-memory observation and render adaptive usage/full decks. `/status` preserves its legacy JSONL payload. `/context` migration, usage automation parity, aliases, account truth, and durable history remain separate; history still consumes E03 fencing |
@@ -168,6 +169,7 @@ through Cycle 117 while preserving the legacy JSONL payload shape.
 | 115 | this document's commit | Private bounded Linux child backend and real cleanup truth |
 | 116 | this document's commit | Descriptor-relative no-clobber setup configuration publication and rollback ownership |
 | 117 | this document's commit | Typed adaptive offline `/status` with legacy JSONL shape preservation |
+| 118 | this document's commit | Exact sealed native child execution and bounded Landlock content authority |
 
 ## Current green gates
 
@@ -834,6 +836,16 @@ human Git/config-heavy formatter and its filesystem probe are gone. JSONL keeps
 the same keys and nesting, using deterministic redirected text from the same
 observation. No provider/account/fs/persistence request, inferred cost, credit,
 rate-limit, price, durable history, or new automation schema is introduced.
+
+Cycle 118 closes the external child's disclosed executable-path race and adds a
+bounded filesystem-content policy. Exact reviewed native bytes are capped,
+hashed into a fully sealed executable memfd, and invoked only through raw
+`execveat`; descriptor-pinned cwd/roots and a unique linear preparation token
+bind a Landlock ABI>=3 ruleset through spawn. Unsupported platform/ABI,
+non-ELF input, seal/ruleset/descriptor/token failure, and authority mismatch
+execute no target code. The backend remains private, Linux x86-64, unmounted,
+and one-shot. Landlock's path/stat/access/metadata and host signal/ptrace gaps
+are explicit, so this is not general sandbox or X002 acceptance.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful
