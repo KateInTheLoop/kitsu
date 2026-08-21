@@ -726,6 +726,86 @@ pub(super) fn assemble_recovery_revision(
     Ok(next)
 }
 
+pub(super) fn assemble_branch_at_committed_turn(
+    source: &CanonicalSessionRevisionV1,
+    destination_store: StoreId,
+    destination_session: SessionId,
+    destination_revision: RevisionId,
+    committed_at: String,
+    branch_turn: TurnId,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(source)?;
+    validate_timestamp(&committed_at, "canonical branch committed_at")?;
+    validate_timestamp_order(&source.committed_at, &committed_at, "canonical branch")?;
+    if destination_session == source.session_id {
+        return Err("canonical branch destination session must be fresh".to_string());
+    }
+    if destination_revision == source.revision_id {
+        return Err("canonical branch destination revision must be fresh".to_string());
+    }
+
+    let branch_index = source
+        .operations
+        .iter()
+        .position(|operation| operation.operation.turn_id() == &branch_turn)
+        .ok_or_else(|| format!("canonical branch turn '{branch_turn}' does not exist"))?;
+    let boundary = &source.operations[branch_index].operation;
+    if !matches!(
+        boundary.terminal().assistant(),
+        SessionAssistantDisposition::Committed | SessionAssistantDisposition::CommittedPartial
+    ) || boundary.after_head() != &LogicalHead::Turn(branch_turn.clone())
+    {
+        return Err(format!(
+            "canonical branch turn '{branch_turn}' is not a committed operation boundary"
+        ));
+    }
+
+    let operations = source.operations[..=branch_index].to_vec();
+    let mut referenced_artifacts = HashSet::new();
+    for operation in &operations {
+        for message in &operation.messages {
+            if let CanonicalMessageV1::Tool { artifact_ids, .. } = message {
+                referenced_artifacts.extend(artifact_ids.iter().map(String::as_str));
+            }
+        }
+        for effect in &operation.retained_effects {
+            referenced_artifacts.extend(effect.artifact_ids.iter().map(String::as_str));
+        }
+    }
+    let artifact_manifest = source
+        .artifact_manifest
+        .iter()
+        .filter(|artifact| referenced_artifacts.contains(artifact.artifact_id.as_str()))
+        .cloned()
+        .collect();
+    let branch_head = LogicalHead::Turn(branch_turn);
+    let payload = CanonicalSessionRevisionV1 {
+        logical_schema: LOGICAL_SCHEMA_REVISION,
+        store_id: destination_store,
+        session_id: destination_session,
+        revision_id: destination_revision,
+        parent_revision: ExpectedRevision::Missing,
+        created_at: source.created_at.clone(),
+        committed_at,
+        metadata: source.metadata.clone(),
+        lineage: CanonicalLineageV1::Fork {
+            source_store: source.store_id.clone(),
+            source_session: source.session_id.clone(),
+            source_revision: source.revision_id.clone(),
+            source_head: source.selected_head.clone(),
+            branch_turn: branch_head.clone(),
+        },
+        legacy_baseline: source.legacy_baseline.clone(),
+        operations,
+        selected_head: branch_head,
+        artifact_manifest,
+        compaction_binding: None,
+        recovery_log: Vec::new(),
+    };
+    validate_canonical_payload(&payload)?;
+    Ok(payload)
+}
+
 fn convert_current_message(
     index: usize,
     message: CurrentV1MessageWire,
@@ -911,10 +991,26 @@ fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<()
     if let Some(baseline) = &payload.legacy_baseline {
         validate_legacy_baseline(payload, baseline)?;
     }
-    if matches!(payload.lineage, CanonicalLineageV1::Fork { .. })
-        && !matches!(payload.parent_revision, ExpectedRevision::Missing)
+    if let CanonicalLineageV1::Fork {
+        source_session,
+        source_revision,
+        branch_turn,
+        ..
+    } = &payload.lineage
     {
-        return Err("fork lineage must begin with a missing destination revision".to_string());
+        if !matches!(payload.parent_revision, ExpectedRevision::Missing) {
+            return Err("fork lineage must begin with a missing destination revision".to_string());
+        }
+        if source_session == &payload.session_id || source_revision == &payload.revision_id {
+            return Err(
+                "fork lineage source and destination identities must be distinct".to_string(),
+            );
+        }
+        if branch_turn != &payload.selected_head || matches!(branch_turn, LogicalHead::Genesis) {
+            return Err(
+                "fork lineage branch turn must equal a committed selected HEAD".to_string(),
+            );
+        }
     }
     if payload.operations.len() > kitsu_core::session::MAX_CANONICAL_OPERATIONS {
         return Err(format!(
@@ -1634,6 +1730,236 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    fn three_artifact_source() -> CanonicalSessionRevisionV1 {
+        let mut source = legacy_base("revision-1");
+        for (index, revision, committed_at) in [
+            (1, "revision-2", "2026-08-20T11:01:00.000Z"),
+            (2, "revision-3", "2026-08-20T11:02:00.000Z"),
+            (3, "revision-4", "2026-08-20T11:03:00.000Z"),
+        ] {
+            let artifact_id = format!("artifact-{index}");
+            source = append_complete_operation(
+                &source,
+                RevisionId::new(revision).unwrap(),
+                committed_at.to_string(),
+                operation_input(
+                    &format!("turn-{index}"),
+                    &format!("run-{index}"),
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    serde_json::json!([
+                        {"role":"user","content":format!("question {index}")},
+                        {"role":"assistant","content":"","tool_calls":[{
+                            "tool_name":"fs_read_file",
+                            "args":"{\"path\":\"a.rs\"}",
+                            "call_id":format!("call-{index}")
+                        }]},
+                        {
+                            "role":"tool",
+                            "call_id":format!("call-{index}"),
+                            "content":format!("contents {index}"),
+                            "artifact_ids":[artifact_id.clone()]
+                        },
+                        {"role":"assistant","content":format!("answer {index}"),"tool_calls":[]}
+                    ]),
+                    serde_json::json!([{
+                        "effect_id":format!("effect-{index}"),
+                        "artifact_ids":[artifact_id.clone()]
+                    }]),
+                    serde_json::json!([{
+                        "artifact_schema":1,
+                        "artifact_id":artifact_id,
+                        "sha256":format!("{:064x}", index),
+                        "bytes":index,
+                        "media_type":"text/plain"
+                    }]),
+                ),
+            )
+            .unwrap();
+        }
+        source
+    }
+
+    #[test]
+    fn branch_assembler_copies_exact_prefix_lineage_and_artifact_closure() {
+        let mut source = assemble_recovery_revision(
+            &three_artifact_source(),
+            RevisionId::new("revision-5").unwrap(),
+            RevisionId::new("revision-6").unwrap(),
+            "2026-08-20T11:03:30.000Z".to_string(),
+            vec![CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-5").unwrap(),
+                CorruptSessionReason::InvalidHead,
+            )],
+        )
+        .unwrap();
+        source.compaction_binding = Some(ContextProjectionRefV1 {
+            projection_schema: PROJECTION_SCHEMA_V1,
+            projection_id: "projection-branch-source".to_string(),
+            source_revision: source.revision_id.clone(),
+            source_head: source.selected_head.clone(),
+            included_operations: ["turn-1", "turn-2", "turn-3"]
+                .into_iter()
+                .map(|turn| TurnId::new(turn).unwrap())
+                .collect(),
+            route_generation: "route-1".to_string(),
+            capability_generation: "capability-1".to_string(),
+            model_generation: "model-1".to_string(),
+            estimator_generation: "estimator-1".to_string(),
+            budget_tokens: 4096,
+            loss_manifest: vec!["derived summary".to_string()],
+        });
+        assert!(!source.recovery_log.is_empty());
+        assert!(source.compaction_binding.is_some());
+
+        let branch = assemble_branch_at_committed_turn(
+            &source,
+            StoreId::new("store-2").unwrap(),
+            SessionId::new("session-branch").unwrap(),
+            RevisionId::new("revision-branch-1").unwrap(),
+            "2026-08-20T11:04:00.000Z".to_string(),
+            TurnId::new("turn-2").unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(branch.store_id.as_str(), "store-2");
+        assert_eq!(branch.session_id.as_str(), "session-branch");
+        assert_eq!(branch.revision_id.as_str(), "revision-branch-1");
+        assert_eq!(branch.parent_revision, ExpectedRevision::Missing);
+        assert_eq!(branch.created_at, source.created_at);
+        assert_eq!(branch.committed_at, "2026-08-20T11:04:00.000Z");
+        assert_eq!(branch.operations.len(), 2);
+        assert_eq!(
+            branch.selected_head,
+            LogicalHead::Turn(TurnId::new("turn-2").unwrap())
+        );
+        assert_eq!(
+            branch
+                .artifact_manifest
+                .iter()
+                .map(|artifact| artifact.artifact_id.as_str())
+                .collect::<Vec<_>>(),
+            ["artifact-1", "artifact-2"]
+        );
+        assert!(branch.compaction_binding.is_none());
+        assert!(branch.recovery_log.is_empty());
+        assert!(matches!(
+            branch.lineage,
+            CanonicalLineageV1::Fork {
+                ref source_store,
+                ref source_session,
+                ref source_revision,
+                source_head: LogicalHead::Turn(ref source_head),
+                branch_turn: LogicalHead::Turn(ref branch_head),
+            } if source_store.as_str() == "store-1"
+                && source_session.as_str() == "s-source"
+                && source_revision.as_str() == "revision-6"
+                && source_head.as_str() == "turn-3"
+                && branch_head.as_str() == "turn-2"
+        ));
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&branch).unwrap()).unwrap(),
+            branch
+        );
+
+        for (label, field, value) in [
+            (
+                "branch-head",
+                "branch_turn",
+                serde_json::json!({"kind":"turn","turn":"turn-1"}),
+            ),
+            (
+                "source-session",
+                "source_session",
+                serde_json::json!("session-branch"),
+            ),
+        ] {
+            let mut invalid = serde_json::to_value(&branch).unwrap();
+            invalid["lineage"][field] = value;
+            assert!(
+                decode_canonical_payload(&serde_json::to_vec(&invalid).unwrap()).is_err(),
+                "case: {label}"
+            );
+        }
+    }
+
+    #[test]
+    fn branch_assembler_rejects_noncommitted_or_nonfresh_boundaries() {
+        let source = three_artifact_source();
+        let destination_store = StoreId::new("store-2").unwrap();
+        let destination_session = SessionId::new("session-branch").unwrap();
+        let destination_revision = RevisionId::new("revision-branch-1").unwrap();
+
+        for (label, session, revision, committed_at, turn) in [
+            (
+                "same-session",
+                source.session_id.clone(),
+                destination_revision.clone(),
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "same-revision",
+                destination_session.clone(),
+                source.revision_id.clone(),
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "old-time",
+                destination_session.clone(),
+                destination_revision.clone(),
+                "2026-08-20T11:02:00.000Z",
+                TurnId::new("turn-2").unwrap(),
+            ),
+            (
+                "unknown-turn",
+                destination_session,
+                destination_revision,
+                "2026-08-20T11:04:00.000Z",
+                TurnId::new("turn-unknown").unwrap(),
+            ),
+        ] {
+            assert!(
+                assemble_branch_at_committed_turn(
+                    &source,
+                    destination_store.clone(),
+                    session,
+                    revision,
+                    committed_at.to_string(),
+                    turn,
+                )
+                .is_err(),
+                "case: {label}"
+            );
+        }
+
+        let failed = append_complete_operation(
+            &source,
+            RevisionId::new("revision-5").unwrap(),
+            "2026-08-20T11:04:00.000Z".to_string(),
+            operation_input(
+                "turn-failed",
+                "run-failed",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Absent,
+                serde_json::json!([{"role":"user","content":"failed"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        assert!(assemble_branch_at_committed_turn(
+            &failed,
+            destination_store,
+            SessionId::new("session-branch-2").unwrap(),
+            RevisionId::new("revision-branch-2").unwrap(),
+            "2026-08-20T11:05:00.000Z".to_string(),
+            TurnId::new("turn-failed").unwrap(),
+        )
+        .is_err());
     }
 
     #[test]

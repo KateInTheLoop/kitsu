@@ -608,6 +608,18 @@ cannot weaken or replace any backend-neutral assertion.
    base/new/HEAD/durability. Stale envelope CAS fails, and the verified old
    source is never selected directly. The path remains unmounted. Next define
    pure branch-at-committed-turn prefix, lineage, and artifact-closure assembly.
+   **Pure branch assembly complete in Cycle 077:** the assembler accepts only an
+   operation whose terminal committed an assistant boundary. It validates the
+   complete source, truncates the exact chronological operation prefix through
+   that turn, filters immutable artifact facts to IDs referenced by retained
+   messages/effects, and creates a fresh destination session/revision with a
+   missing parent. Fork lineage binds source store/session/revision/current HEAD
+   and the branch turn; decoded payload validation requires fresh identities and
+   branch turn equal to the committed selected HEAD. The historical creation
+   anchor is retained so carried SHA-bound legacy evidence remains chronological;
+   destination commit time is new and monotonic. Source compaction and recovery
+   ledgers are cleared, and no authority state exists to copy. Next add bounded
+   no-overwrite artifact copying and create-only destination publication cuts.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

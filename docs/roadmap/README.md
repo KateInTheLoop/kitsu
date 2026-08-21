@@ -262,8 +262,8 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, and E03-S02 is implemented through
-C21. Cycle 076 completes the private recovery path. The
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C21,
+and E03-S05 is in progress through Cycle 077. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -354,6 +354,13 @@ Confirmed publication, installed-unselected candidate cuts, and
 published-unconfirmed HEAD-sync cuts retain exact receipts; unavailable or stale
 plans allocate/select nothing. This path remains unmounted, so production
 current-v1 behavior and rollback bytes are unchanged.
+A pure branch-at-committed-turn assembler now accepts only a committed operation
+boundary, creates a fresh destination session/revision with `Missing` parent,
+copies the exact chronological closed prefix and only its referenced artifact
+facts, and binds source store/session/revision/current HEAD plus branch turn.
+It preserves the historical creation anchor needed by carried legacy evidence,
+uses a monotonic destination commit time, and clears source-only compaction and
+recovery state. No permission/grant state exists in the canonical payload.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -642,6 +649,7 @@ gates merely because a card appears attractive.
 | 074 | E03-S04-C2 | Split trusted manifest envelopes from payload verification and recover-plan across physical payload faults |
 | 075 | E03-S04-C3 | Assemble a fresh causal recovery revision with ordered skip evidence and exact unavailable blockers |
 | 076 | E03-S04-C4 | Publish recovery under the writer fence and exact selected envelope with old-or-new receipt truth |
+| 077 | E03-S05-C1 | Assemble a fresh branch revision with exact committed prefix, lineage, and referenced artifact closure |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -719,7 +727,8 @@ faults. Cycle 075 defines a pure new recovery revision and complete skipped/
 blocker evidence. Cycle 076 composes envelope-only selected-parent admission,
 writer fencing, immutable install, HEAD CAS, and exact recovery receipts before
 production mounting. Cycle 077 begins pure branch-at-committed-turn prefix,
-lineage, and artifact-closure assembly; then the queue continues
+lineage, and artifact-closure assembly. Cycle 078 adds no-overwrite artifact
+copying and create-only branch publication cuts; then the queue continues
 through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
