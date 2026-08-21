@@ -126,8 +126,15 @@ pub struct ActiveSessionResume {
 }
 
 impl ActiveSessionResume {
-    pub fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
-        (self.store, self.saved)
+    fn saved(&self) -> &SavedSession {
+        &self.saved
+    }
+
+    pub fn into_current_v1_parts(self) -> Result<(ActiveSessionStore, SavedSession), String> {
+        if !matches!(&self.store.inner, ActiveSessionStoreInner::CurrentV1(_)) {
+            return Err("bound local resume requires explicit product admission".to_string());
+        }
+        Ok((self.store, self.saved))
     }
 }
 
@@ -145,15 +152,6 @@ struct BoundLocalActiveSessionStore {
     live: std::cell::RefCell<mount::LocalSessionLiveStoreV1>,
 }
 
-/// One exact resume value coupled to the bound active owner that selected and
-/// fenced it. There is deliberately no consuming extractor for either field.
-#[derive(Debug)]
-#[allow(dead_code)]
-struct BoundActiveSessionResumeV1 {
-    store: ActiveSessionStore,
-    saved: SavedSession,
-}
-
 #[derive(Debug)]
 #[allow(dead_code)]
 enum BoundActiveSessionResumeErrorV1 {
@@ -161,25 +159,6 @@ enum BoundActiveSessionResumeErrorV1 {
     SessionRoot(String),
     Activation(mount::LocalSessionLiveStoreActivationErrorV1),
     SelectionIdentityMismatch,
-}
-
-#[allow(dead_code)]
-impl BoundActiveSessionResumeV1 {
-    fn id(&self) -> &str {
-        self.store.id()
-    }
-
-    fn name(&self) -> Option<&str> {
-        self.store.name()
-    }
-
-    fn artifacts_dir(&self) -> Result<PathBuf, String> {
-        self.store.artifacts_dir()
-    }
-
-    fn saved(&self) -> &SavedSession {
-        &self.saved
-    }
 }
 
 /// Evidence for one atomically installed session snapshot. On Unix the file
@@ -3260,7 +3239,7 @@ impl ActiveSessionStore {
 fn activate_bound_session_resume_v1(
     sessions_dir: &Path,
     session_id: &str,
-) -> Result<BoundActiveSessionResumeV1, BoundActiveSessionResumeErrorV1> {
+) -> Result<ActiveSessionResume, BoundActiveSessionResumeErrorV1> {
     let session_id = kitsu_core::session::SessionId::new(session_id.to_string())
         .map_err(|error| BoundActiveSessionResumeErrorV1::InvalidSessionId(error.to_string()))?;
     let directory = open_session_directory(sessions_dir)
@@ -3268,13 +3247,14 @@ fn activate_bound_session_resume_v1(
     let live = mount::activate_local_session_live_store_v1(&directory, &session_id)
         .map_err(BoundActiveSessionResumeErrorV1::Activation)?;
     let saved = live.saved().clone();
-    if saved.id != session_id.as_str() {
-        return Err(BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch);
-    }
-    Ok(BoundActiveSessionResumeV1 {
+    let resume = ActiveSessionResume {
         store: ActiveSessionStore::from_bound_local(live),
         saved,
-    })
+    };
+    if resume.saved().id != session_id.as_str() {
+        return Err(BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch);
+    }
+    Ok(resume)
 }
 
 #[cfg(test)]
@@ -4895,7 +4875,7 @@ mod tests {
         drop(active);
         let resumed = SessionStore::load(&dir, &first_id).unwrap();
         let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), resumed.clone()).unwrap();
-        let (active, exact_resumed) = handoff.into_parts();
+        let (active, exact_resumed) = handoff.into_current_v1_parts().unwrap();
         assert_eq!(
             encode_saved(&exact_resumed).unwrap(),
             encode_saved(&resumed).unwrap()
@@ -4942,7 +4922,7 @@ mod tests {
         let error = ActiveSessionStore::resume_current_v1(dir.clone(), stale).unwrap_err();
         assert!(error.contains("changed while it was being resumed"));
         let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), exact.clone()).unwrap();
-        let (active, saved) = handoff.into_parts();
+        let (active, saved) = handoff.into_current_v1_parts().unwrap();
         assert_eq!(encode_saved(&saved).unwrap(), encode_saved(&exact).unwrap());
         let directory = PrivateDirectory::open(&dir, "active resume handoff fixture").unwrap();
         assert!(SessionLease::acquire(&directory, &id).is_err());
@@ -5143,8 +5123,8 @@ mod tests {
             encode_saved(resume.saved()).unwrap(),
             encode_saved(&exact).unwrap()
         );
-        assert_eq!(resume.id(), id);
-        assert_eq!(resume.name(), exact.name.as_deref());
+        assert_eq!(resume.saved().id, id);
+        assert_eq!(resume.saved().name, exact.name);
         assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
         assert!(dir.join(".kitsu-store-v1").is_dir());
         let directory = PrivateDirectory::open(&dir, "bound resume fixture").unwrap();
@@ -5165,7 +5145,8 @@ mod tests {
             .collect::<Vec<_>>();
         after_invalid.sort();
         assert_eq!(after_invalid, before_invalid);
-        drop(resume);
+        let error = resume.into_current_v1_parts().unwrap_err();
+        assert!(error.contains("explicit product admission"));
         drop(SessionLease::acquire(&directory, &id).unwrap());
     }
 
@@ -5207,8 +5188,7 @@ mod tests {
         assert_eq!(resume.saved().id, saved.id);
         assert_eq!(resume.saved().messages, saved.messages);
         assert_eq!(resume.saved().name, saved.name);
-        assert_eq!(resume.id(), session_id.as_str());
-        assert!(resume.artifacts_dir().is_err());
+        assert_eq!(resume.saved().id, session_id.as_str());
         assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
         assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
         let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
@@ -5216,7 +5196,8 @@ mod tests {
             .unwrap();
         assert!(competing.acquire_writer_fence(&session_id).is_err());
         assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
-        drop(resume);
+        let error = resume.into_current_v1_parts().unwrap_err();
+        assert!(error.contains("explicit product admission"));
         drop(competing.acquire_writer_fence(&session_id).unwrap());
         drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
     }
