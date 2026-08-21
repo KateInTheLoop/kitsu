@@ -985,7 +985,7 @@ pub(super) struct PhysicalWriterFenceV1 {
 }
 
 impl PhysicalWriterFenceV1 {
-    fn confirm(&self, store_id: &StoreId, session_id: &SessionId) -> Result<(), String> {
+    pub(super) fn confirm(&self, store_id: &StoreId, session_id: &SessionId) -> Result<(), String> {
         if &self.store_id != store_id {
             return Err(format!(
                 "writer fence store mismatch: expected '{}', observed '{}'",
