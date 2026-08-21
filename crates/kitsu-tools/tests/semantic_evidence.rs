@@ -3,8 +3,8 @@ use std::path::Path;
 use serde_json::json;
 
 mod semantic_harness {
-    use std::collections::HashSet;
-    use std::path::Path;
+    use std::collections::{BTreeMap, BTreeSet, HashSet};
+    use std::path::{Component, Path};
     use std::sync::Arc;
     use std::time::Duration;
 
@@ -19,6 +19,7 @@ mod semantic_harness {
     const VECTOR_SCHEMA_V1: &str = "kitsu.semantic-evidence.v1";
     const ARTIFACT_SCHEMA_V1: &str = "kitsu.semantic-evidence.artifact.v1";
     const BASELINE_ADAPTER_V1: &str = "current-read-only-tools.v1";
+    const SELECTOR_ADAPTER_V1: &str = "bounded-structural-selector.v1";
     const CORPUS_PLACEHOLDER: &str = "$CORPUS";
     const MAX_VECTOR_INPUT_BYTES: usize = 64 * 1024;
     const MAX_VECTORS: usize = 32;
@@ -33,6 +34,10 @@ mod semantic_harness {
     const MAX_TOOL_BYTES: usize = 64 * 1024;
     const MAX_ROUNDS: usize = 8;
     const MAX_LATENCY_MILLIS: u64 = 10_000;
+    const MAX_SELECTOR_TERMS: usize = 12;
+    const MAX_SELECTOR_FILES: usize = 4;
+    const MAX_SELECTOR_HITS: usize = 64;
+    const MAX_SELECTOR_OUTPUT_BYTES: usize = 4 * 1024;
 
     #[derive(Debug, Clone, Copy, Deserialize, Serialize, PartialEq, Eq)]
     #[serde(rename_all = "snake_case")]
@@ -70,6 +75,7 @@ mod semantic_harness {
         FsReadFile,
         RepoGrep,
         ReadManifest,
+        SemanticSelector,
     }
 
     impl ReadOnlyToolV1 {
@@ -80,6 +86,9 @@ mod semantic_harness {
                 Self::FsReadFile => read_file_tool(permissions).1,
                 Self::RepoGrep => grep_tool(permissions).1,
                 Self::ReadManifest => read_manifest_tool(permissions).1,
+                Self::SemanticSelector => {
+                    unreachable!("the test-only selector is never registered as a tool")
+                }
             }
         }
     }
@@ -287,6 +296,10 @@ mod semantic_harness {
             &self.budget
         }
 
+        pub(super) fn prompt(&self) -> &str {
+            &self.prompt
+        }
+
         pub(super) fn budget_mut_for_test(&mut self) -> &mut BudgetV1 {
             &mut self.budget
         }
@@ -448,6 +461,7 @@ mod semantic_harness {
                     | ReadOnlyToolV1::FsReadFile
                     | ReadOnlyToolV1::RepoGrep
                     | ReadOnlyToolV1::ReadManifest
+                    | ReadOnlyToolV1::SemanticSelector
             )
         }
 
@@ -507,6 +521,8 @@ mod semantic_harness {
         Tool(String),
         #[error("artifact serialization failed: {0}")]
         Serialization(#[from] serde_json::Error),
+        #[error("structural selector failed: {0}")]
+        Selector(String),
     }
 
     pub(super) fn estimated_tokens_v1(bytes: &[u8]) -> usize {
@@ -528,6 +544,425 @@ mod semantic_harness {
             return Err(ArtifactErrorV1::UnnormalizedAbsolutePath);
         }
         Ok(normalized)
+    }
+
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum StructuralRoleV1 {
+        Definition,
+        Reference,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    struct StructuralHitV1 {
+        role: StructuralRoleV1,
+        path: String,
+        line: usize,
+        text: String,
+    }
+
+    #[derive(Debug, Default)]
+    struct RankedFileV1 {
+        score: usize,
+        definitions: usize,
+        references: usize,
+    }
+
+    fn identifier_words_v1(input: &str) -> Vec<String> {
+        let mut words = Vec::new();
+        let mut current = String::new();
+        for character in input.chars() {
+            if character.is_ascii_alphanumeric() || character == '_' {
+                current.push(character);
+            } else if !current.is_empty() {
+                words.push(std::mem::take(&mut current));
+            }
+        }
+        if !current.is_empty() {
+            words.push(current);
+        }
+        words
+    }
+
+    fn is_selector_stop_word_v1(word: &str) -> bool {
+        matches!(
+            word,
+            "a" | "an"
+                | "and"
+                | "are"
+                | "authoritative"
+                | "called"
+                | "change"
+                | "definition"
+                | "defined"
+                | "evidence"
+                | "explain"
+                | "for"
+                | "from"
+                | "how"
+                | "identify"
+                | "in"
+                | "is"
+                | "it"
+                | "limit"
+                | "locate"
+                | "mirrors"
+                | "needed"
+                | "of"
+                | "production"
+                | "the"
+                | "to"
+                | "touching"
+                | "use"
+                | "where"
+                | "without"
+        )
+    }
+
+    fn prompt_terms_v1(prompt: &str) -> Vec<String> {
+        let mut seen = BTreeSet::new();
+        identifier_words_v1(prompt)
+            .into_iter()
+            .filter(|word| word.len() >= 3)
+            .filter(|word| {
+                let lower = word.to_ascii_lowercase();
+                !is_selector_stop_word_v1(&lower) && seen.insert(lower)
+            })
+            .take(MAX_SELECTOR_TERMS)
+            .collect()
+    }
+
+    fn valid_relative_observation_path_v1(path: &str) -> bool {
+        !path.is_empty()
+            && !Path::new(path).is_absolute()
+            && Path::new(path)
+                .components()
+                .all(|component| matches!(component, Component::Normal(_)))
+    }
+
+    fn parse_structural_hits_v1(raw: &str) -> Result<Vec<StructuralHitV1>, HarnessErrorV1> {
+        let mut role = None;
+        let mut hits = Vec::new();
+        for line in raw.lines() {
+            match line {
+                "definitions:" => {
+                    role = Some(StructuralRoleV1::Definition);
+                    continue;
+                }
+                "references:" => {
+                    role = Some(StructuralRoleV1::Reference);
+                    continue;
+                }
+                _ => {}
+            }
+            let Some(hit_role) = role else {
+                continue;
+            };
+            let Some(candidate) = line.strip_prefix("  ") else {
+                continue;
+            };
+            if candidate.starts_with('[') {
+                continue;
+            }
+            let mut fields = candidate.splitn(3, ':');
+            let (Some(path), Some(line), Some(text)) =
+                (fields.next(), fields.next(), fields.next())
+            else {
+                continue;
+            };
+            let Ok(line) = line.parse::<usize>() else {
+                continue;
+            };
+            if !valid_relative_observation_path_v1(path) {
+                return Err(HarnessErrorV1::Selector(
+                    "tool observation contained an unsafe path".to_string(),
+                ));
+            }
+            hits.push(StructuralHitV1 {
+                role: hit_role,
+                path: path.to_string(),
+                line,
+                text: text.trim().to_string(),
+            });
+            if hits.len() > MAX_SELECTOR_HITS {
+                return Err(HarnessErrorV1::Selector(
+                    "symbol graph exceeded its hit bound".to_string(),
+                ));
+            }
+        }
+        Ok(hits)
+    }
+
+    fn path_is_generated_or_build_output_v1(path: &str) -> bool {
+        Path::new(path).components().any(|component| {
+            let Component::Normal(name) = component else {
+                return true;
+            };
+            let lower = name.to_string_lossy().to_ascii_lowercase();
+            matches!(
+                lower.as_str(),
+                "generated" | "target" | "node_modules" | "dist" | "build" | "vendor"
+            ) || lower.contains(".generated.")
+        })
+    }
+
+    fn rank_structural_files_v1(hits: &[StructuralHitV1]) -> Vec<String> {
+        let mut graph = BTreeMap::<String, RankedFileV1>::new();
+        for hit in hits {
+            if path_is_generated_or_build_output_v1(&hit.path) {
+                continue;
+            }
+            let node = graph.entry(hit.path.clone()).or_default();
+            match hit.role {
+                StructuralRoleV1::Definition => {
+                    node.definitions += 1;
+                    node.score += 100;
+                }
+                StructuralRoleV1::Reference => {
+                    node.references += 1;
+                    node.score += 60;
+                }
+            }
+        }
+        for node in graph.values_mut() {
+            if node.definitions > 0 && node.references > 0 {
+                node.score += 20;
+            }
+        }
+        let mut ranked: Vec<(String, usize)> = graph
+            .into_iter()
+            .map(|(path, node)| (path, node.score))
+            .collect();
+        ranked.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+        ranked
+            .into_iter()
+            .take(MAX_SELECTOR_FILES)
+            .map(|(path, _)| path)
+            .collect()
+    }
+
+    async fn call_selector_observer_v1(
+        tool: ReadOnlyToolV1,
+        permissions: Arc<Permissions>,
+        args: Value,
+    ) -> Result<String, HarnessErrorV1> {
+        tool.handler(permissions)(serde_json::to_string(&args)?)
+            .await
+            .map_err(|error| HarnessErrorV1::Tool(error.to_string()))
+    }
+
+    fn choose_identifier_from_search_v1(raw: &str, term: &str) -> Option<String> {
+        let term = term.to_ascii_lowercase();
+        let mut counts = BTreeMap::<String, usize>::new();
+        for word in identifier_words_v1(raw) {
+            let lower = word.to_ascii_lowercase();
+            if lower != term
+                && lower.contains(&term)
+                && word.len() <= 128
+                && word
+                    .bytes()
+                    .any(|byte| byte == b'_' || byte.is_ascii_uppercase())
+            {
+                *counts.entry(word).or_default() += 1;
+            }
+        }
+        counts
+            .into_iter()
+            .max_by(|left, right| {
+                let score = |(word, count): &(String, usize)| {
+                    count * 100
+                        + word.bytes().filter(|byte| *byte == b'_').count() * 20
+                        + word.bytes().filter(u8::is_ascii_uppercase).count()
+                };
+                score(left)
+                    .cmp(&score(right))
+                    .then_with(|| right.0.cmp(&left.0))
+            })
+            .map(|(word, _)| word)
+    }
+
+    async fn discover_symbol_v1(
+        prompt: &str,
+        corpus_root: &str,
+        permissions: Arc<Permissions>,
+    ) -> Result<(String, Vec<StructuralHitV1>), HarnessErrorV1> {
+        let terms = prompt_terms_v1(prompt);
+        for candidate in terms.iter().filter(|term| term.contains('_')) {
+            let raw = call_selector_observer_v1(
+                ReadOnlyToolV1::FindSymbol,
+                permissions.clone(),
+                serde_json::json!({
+                    "symbol": candidate,
+                    "path": corpus_root,
+                    "max_results": MAX_SELECTOR_HITS,
+                }),
+            )
+            .await?;
+            let hits = parse_structural_hits_v1(&raw)?;
+            if !hits.is_empty() {
+                return Ok((candidate.clone(), hits));
+            }
+        }
+
+        for term in terms.iter().filter(|term| !term.contains('_')) {
+            let raw = call_selector_observer_v1(
+                ReadOnlyToolV1::RepoGrep,
+                permissions.clone(),
+                serde_json::json!({
+                    "pattern": format!("(?i){}", regex::escape(term)),
+                    "path": corpus_root,
+                    "max_count": MAX_SELECTOR_HITS,
+                }),
+            )
+            .await?;
+            let Some(candidate) = choose_identifier_from_search_v1(&raw, term) else {
+                continue;
+            };
+            let symbol_raw = call_selector_observer_v1(
+                ReadOnlyToolV1::FindSymbol,
+                permissions.clone(),
+                serde_json::json!({
+                    "symbol": candidate,
+                    "path": corpus_root,
+                    "max_results": MAX_SELECTOR_HITS,
+                }),
+            )
+            .await?;
+            let hits = parse_structural_hits_v1(&symbol_raw)?;
+            if !hits.is_empty() {
+                return Ok((candidate, hits));
+            }
+        }
+        Err(HarnessErrorV1::Selector(
+            "no prompt-derived symbol was observed".to_string(),
+        ))
+    }
+
+    fn selector_manifest_name_v1(task: TaskKindV1, selected: &[String]) -> Option<&'static str> {
+        if task != TaskKindV1::Change {
+            return None;
+        }
+        if selected
+            .iter()
+            .any(|path| path.ends_with(".ts") || path.ends_with(".js"))
+        {
+            Some("package.json")
+        } else if selected.iter().any(|path| path.ends_with(".rs")) {
+            Some("Cargo.toml")
+        } else if selected.iter().any(|path| path.ends_with(".py")) {
+            Some("pyproject.toml")
+        } else {
+            None
+        }
+    }
+
+    pub(super) async fn select_structural_evidence_v1(
+        task: TaskKindV1,
+        prompt: &str,
+        corpus_root: &Path,
+    ) -> Result<String, HarnessErrorV1> {
+        if prompt.is_empty() || prompt.len() > MAX_PROMPT_BYTES {
+            return Err(HarnessErrorV1::Selector(
+                "prompt is empty or exceeds the selector bound".to_string(),
+            ));
+        }
+        let corpus_root_text = corpus_root
+            .to_str()
+            .ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
+        let permissions = Arc::new(
+            Permissions::for_roots(&[corpus_root_text.to_string()], &[])
+                .map_err(|error| HarnessErrorV1::Tool(error.to_string()))?,
+        );
+        let (symbol, hits) =
+            discover_symbol_v1(prompt, corpus_root_text, permissions.clone()).await?;
+        let selected = rank_structural_files_v1(&hits);
+        if selected.is_empty() {
+            return Err(HarnessErrorV1::Selector(
+                "all observed symbol files were excluded".to_string(),
+            ));
+        }
+        let selected_set: BTreeSet<&str> = selected.iter().map(String::as_str).collect();
+        let selected_hits: Vec<&StructuralHitV1> = hits
+            .iter()
+            .filter(|hit| selected_set.contains(hit.path.as_str()))
+            .collect();
+        let definitions = selected_hits
+            .iter()
+            .filter(|hit| hit.role == StructuralRoleV1::Definition)
+            .count();
+        let references = selected_hits
+            .iter()
+            .filter(|hit| hit.role == StructuralRoleV1::Reference)
+            .count();
+        let mut evidence_lines = BTreeMap::<(String, usize), String>::new();
+        for hit in &selected_hits {
+            evidence_lines
+                .entry((hit.path.clone(), hit.line))
+                .or_insert_with(|| hit.text.clone());
+        }
+        for path in &selected {
+            let definition_lines: Vec<usize> = selected_hits
+                .iter()
+                .filter(|hit| hit.path == *path && hit.role == StructuralRoleV1::Definition)
+                .map(|hit| hit.line)
+                .collect();
+            let (Some(first), Some(last)) =
+                (definition_lines.iter().min(), definition_lines.iter().max())
+            else {
+                continue;
+            };
+            let start = first.saturating_sub(3).max(1);
+            let end = last.saturating_add(3);
+            let absolute = corpus_root.join(path);
+            let absolute = absolute.to_str().ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
+            let snippet = call_selector_observer_v1(
+                ReadOnlyToolV1::FsReadFile,
+                permissions.clone(),
+                serde_json::json!({
+                    "path": absolute,
+                    "start_line": start,
+                    "end_line": end,
+                }),
+            )
+            .await?;
+            for (offset, line) in snippet.lines().enumerate() {
+                let line_number = start + offset;
+                let numbered_prefix = format!("{line_number}\t");
+                let line = line.strip_prefix(&numbered_prefix).unwrap_or(line).trim();
+                if !line.is_empty() {
+                    evidence_lines
+                        .entry((path.clone(), line_number))
+                        .or_insert_with(|| line.to_string());
+                }
+            }
+        }
+
+        let mut output = format!(
+            "structural_selector> \"{symbol}\" — {definitions} definition(s), {references} reference(s)\n"
+        );
+        for ((path, line), text) in evidence_lines {
+            output.push_str(&format!("{path}:{line}: {text}\n"));
+        }
+        if let Some(manifest) = selector_manifest_name_v1(task, &selected) {
+            let path = corpus_root.join(manifest);
+            let path = path.to_str().ok_or(HarnessErrorV1::InvalidCorpusRoot)?;
+            let manifest_output = call_selector_observer_v1(
+                ReadOnlyToolV1::ReadManifest,
+                permissions,
+                serde_json::json!({"path": path}),
+            )
+            .await?;
+            if let Some(header) = manifest_output.lines().next() {
+                output.push_str(header);
+                output.push('\n');
+            }
+        }
+        let output = normalize_evidence_v1(corpus_root, &output)?;
+        if output.len() > MAX_SELECTOR_OUTPUT_BYTES {
+            return Err(HarnessErrorV1::Selector(
+                "rendered evidence exceeded the selector output bound".to_string(),
+            ));
+        }
+        Ok(output)
     }
 
     fn replace_corpus_placeholder(value: &mut Value, corpus_root: &str) {
@@ -691,12 +1126,340 @@ mod semantic_harness {
         }
         Ok(jsonl)
     }
+
+    pub(super) async fn run_structural_selector_records_v1(
+        suite: &BenchmarkSuiteV1,
+        corpus_root: &Path,
+    ) -> Result<Vec<BenchmarkArtifactV1>, HarnessErrorV1> {
+        let mut artifacts = Vec::with_capacity(suite.vectors.len());
+        for vector in &suite.vectors {
+            let prompt_tokens = estimated_tokens_v1(vector.prompt.as_bytes());
+            let mut rounds = 0;
+            let mut latency_deadline = LatencyClassV1::WithinDeadline;
+            let mut calls = Vec::new();
+            let mut tool_bytes = 0;
+            let mut evidence = String::new();
+            if prompt_tokens <= vector.budget.prompt_tokens {
+                rounds = 1;
+                let deadline = Duration::from_millis(vector.budget.latency_millis);
+                let raw_output = match tokio::time::timeout(
+                    deadline,
+                    select_structural_evidence_v1(vector.task, &vector.prompt, corpus_root),
+                )
+                .await
+                {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        latency_deadline = LatencyClassV1::TimedOut;
+                        "(structural selector exceeded latency deadline)".to_string()
+                    }
+                };
+                tool_bytes = raw_output.len();
+                let mut retained_output = raw_output;
+                if retained_output.len() > vector.budget.tool_bytes {
+                    let mut end = vector.budget.tool_bytes;
+                    while !retained_output.is_char_boundary(end) {
+                        end = end.saturating_sub(1);
+                    }
+                    retained_output.truncate(end);
+                }
+                evidence.push_str(&retained_output);
+                calls.push(ArtifactCallV1 {
+                    round: 1,
+                    tool: ReadOnlyToolV1::SemanticSelector,
+                    args: serde_json::json!({
+                        "path": CORPUS_PLACEHOLDER,
+                        "prompt": vector.prompt,
+                        "task": vector.task,
+                    }),
+                    output: retained_output,
+                });
+            }
+
+            let rubric = vector.rubric.evaluate(&evidence);
+            let mut reasons = Vec::new();
+            if prompt_tokens > vector.budget.prompt_tokens {
+                reasons.push(FailureReasonV1::PromptTokenBudgetExceeded);
+            }
+            if tool_bytes > vector.budget.tool_bytes {
+                reasons.push(FailureReasonV1::ToolByteBudgetExceeded);
+            }
+            if rounds > vector.budget.rounds {
+                reasons.push(FailureReasonV1::RoundBudgetExceeded);
+            }
+            if latency_deadline == LatencyClassV1::TimedOut {
+                reasons.push(FailureReasonV1::LatencyDeadlineExceeded);
+            }
+            if reasons.is_empty() {
+                if rubric.has_missing() {
+                    reasons.push(FailureReasonV1::MissingEvidence);
+                }
+                if rubric.has_forbidden() {
+                    reasons.push(FailureReasonV1::ForbiddenEvidence);
+                }
+            }
+            let evidence_outcome = if reasons.is_empty() {
+                EvaluationOutcomeV1::Passed
+            } else {
+                EvaluationOutcomeV1::Failed { reasons }
+            };
+            artifacts.push(BenchmarkArtifactV1 {
+                schema: ARTIFACT_SCHEMA_V1,
+                vector_id: vector.id.clone(),
+                task: vector.task,
+                evaluation_scope: EvidenceScopeV1::LocateReadOnlyEvidence,
+                adapter: SELECTOR_ADAPTER_V1,
+                evidence_outcome,
+                relevance_basis_points: rubric.relevance_basis_points(),
+                metrics: MetricObservationV1 {
+                    rounds,
+                    prompt_tokens,
+                    tool_bytes,
+                    latency_deadline,
+                },
+                calls,
+            });
+        }
+        Ok(artifacts)
+    }
+
+    pub(super) async fn run_structural_selector_experiment_v1(
+        suite: &BenchmarkSuiteV1,
+        corpus_root: &Path,
+    ) -> Result<Vec<u8>, HarnessErrorV1> {
+        let artifacts = run_structural_selector_records_v1(suite, corpus_root).await?;
+        let mut jsonl = Vec::new();
+        for artifact in artifacts {
+            serde_json::to_writer(&mut jsonl, &artifact)?;
+            jsonl.push(b'\n');
+        }
+        Ok(jsonl)
+    }
+
+    #[derive(Debug, PartialEq, Eq)]
+    pub(super) enum PromotionDecisionV1 {
+        Promote {
+            baseline_rounds: usize,
+            selector_rounds: usize,
+            baseline_tool_bytes: usize,
+            selector_tool_bytes: usize,
+        },
+        Reject {
+            baseline_rounds: usize,
+            selector_rounds: usize,
+            baseline_tool_bytes: usize,
+            selector_tool_bytes: usize,
+            reasons: Vec<String>,
+        },
+    }
+
+    fn selector_decision_from_records_v1(
+        baseline: &[BenchmarkArtifactV1],
+        selector: &[BenchmarkArtifactV1],
+    ) -> PromotionDecisionV1 {
+        let baseline_rounds: usize = baseline
+            .iter()
+            .map(|artifact| artifact.metrics.rounds)
+            .sum();
+        let selector_rounds: usize = selector
+            .iter()
+            .map(|artifact| artifact.metrics.rounds)
+            .sum();
+        let baseline_tool_bytes: usize = baseline
+            .iter()
+            .map(|artifact| artifact.metrics.tool_bytes)
+            .sum();
+        let selector_tool_bytes: usize = selector
+            .iter()
+            .map(|artifact| artifact.metrics.tool_bytes)
+            .sum();
+        let mut reasons = Vec::new();
+        for (index, (baseline, selector)) in baseline.iter().zip(selector).enumerate() {
+            if selector.evidence_outcome != EvaluationOutcomeV1::Passed
+                || selector.relevance_basis_points != 10_000
+                || selector.metrics.latency_deadline != LatencyClassV1::WithinDeadline
+                || !selector.calls.iter().all(ArtifactCallV1::is_read_only)
+            {
+                reasons.push(format!("vector {index} failed a relevance/authority gate"));
+            }
+            if selector.metrics.tool_bytes > baseline.metrics.tool_bytes {
+                reasons.push(format!("vector {index} regressed tool bytes"));
+            }
+        }
+        if selector.len() != baseline.len() {
+            reasons.push("selector did not produce one record per frozen vector".to_string());
+        }
+        if selector_rounds > 3 {
+            reasons.push(
+                "selector did not reduce the five frozen rounds to at most three".to_string(),
+            );
+        }
+        let byte_threshold = baseline_tool_bytes.saturating_mul(80) / 100;
+        if selector_tool_bytes > byte_threshold {
+            reasons.push(format!(
+                "selector emitted {selector_tool_bytes} bytes, above the {byte_threshold}-byte threshold"
+            ));
+        }
+        if reasons.is_empty() {
+            PromotionDecisionV1::Promote {
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+            }
+        } else {
+            PromotionDecisionV1::Reject {
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+                reasons,
+            }
+        }
+    }
+
+    pub(super) async fn compare_selector_to_frozen_baseline_v1(
+        suite: &BenchmarkSuiteV1,
+        corpus_root: &Path,
+    ) -> Result<PromotionDecisionV1, HarnessErrorV1> {
+        let baseline = run_current_tools_baseline_records_v1(suite, corpus_root).await?;
+        let selector = run_structural_selector_records_v1(suite, corpus_root).await?;
+        Ok(selector_decision_from_records_v1(&baseline, &selector))
+    }
+
+    #[derive(Serialize)]
+    struct ComparisonObservationV1 {
+        outcome: EvaluationOutcomeV1,
+        relevance_basis_points: u16,
+        rounds: usize,
+        prompt_tokens: usize,
+        tool_bytes: usize,
+        latency_deadline: LatencyClassV1,
+    }
+
+    impl From<&BenchmarkArtifactV1> for ComparisonObservationV1 {
+        fn from(artifact: &BenchmarkArtifactV1) -> Self {
+            Self {
+                outcome: artifact.evidence_outcome.clone(),
+                relevance_basis_points: artifact.relevance_basis_points,
+                rounds: artifact.metrics.rounds,
+                prompt_tokens: artifact.metrics.prompt_tokens,
+                tool_bytes: artifact.metrics.tool_bytes,
+                latency_deadline: artifact.metrics.latency_deadline,
+            }
+        }
+    }
+
+    #[derive(Serialize)]
+    struct ComparedVectorV1 {
+        vector_id: String,
+        baseline: ComparisonObservationV1,
+        selector: ComparisonObservationV1,
+    }
+
+    #[derive(Serialize)]
+    struct AggregateComparisonV1 {
+        decision: &'static str,
+        reasons: Vec<String>,
+        baseline_rounds: usize,
+        selector_rounds: usize,
+        maximum_selector_rounds: usize,
+        baseline_tool_bytes: usize,
+        selector_tool_bytes: usize,
+        maximum_selector_tool_bytes: usize,
+        minimum_relevance_basis_points: u16,
+        per_vector_byte_regression_allowed: bool,
+    }
+
+    #[derive(Serialize)]
+    struct SelectorComparisonV1 {
+        schema: &'static str,
+        vectors: Vec<ComparedVectorV1>,
+        aggregate: AggregateComparisonV1,
+    }
+
+    pub(super) async fn run_selector_comparison_report_v1(
+        suite: &BenchmarkSuiteV1,
+        corpus_root: &Path,
+    ) -> Result<Vec<u8>, HarnessErrorV1> {
+        let baseline = run_current_tools_baseline_records_v1(suite, corpus_root).await?;
+        let selector = run_structural_selector_records_v1(suite, corpus_root).await?;
+        let vectors = baseline
+            .iter()
+            .zip(&selector)
+            .map(|(baseline, selector)| ComparedVectorV1 {
+                vector_id: baseline.vector_id.clone(),
+                baseline: baseline.into(),
+                selector: selector.into(),
+            })
+            .collect();
+        let decision = selector_decision_from_records_v1(&baseline, &selector);
+        let (
+            decision,
+            reasons,
+            baseline_rounds,
+            selector_rounds,
+            baseline_tool_bytes,
+            selector_tool_bytes,
+        ) = match decision {
+            PromotionDecisionV1::Promote {
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+            } => (
+                "promote",
+                Vec::new(),
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+            ),
+            PromotionDecisionV1::Reject {
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+                reasons,
+            } => (
+                "reject",
+                reasons,
+                baseline_rounds,
+                selector_rounds,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+            ),
+        };
+        let report = SelectorComparisonV1 {
+            schema: "kitsu.semantic-evidence.comparison.v1",
+            vectors,
+            aggregate: AggregateComparisonV1 {
+                decision,
+                reasons,
+                baseline_rounds,
+                selector_rounds,
+                maximum_selector_rounds: 3,
+                baseline_tool_bytes,
+                selector_tool_bytes,
+                maximum_selector_tool_bytes: baseline_tool_bytes.saturating_mul(80) / 100,
+                minimum_relevance_basis_points: 10_000,
+                per_vector_byte_regression_allowed: false,
+            },
+        };
+        let mut encoded = serde_json::to_vec(&report)?;
+        encoded.push(b'\n');
+        Ok(encoded)
+    }
 }
 
 use semantic_harness::*;
 
 const VECTOR_JSON: &str = include_str!("fixtures/semantic_evidence/vectors/baseline-v1.json");
 const EXPECTED_JSONL: &str = include_str!("fixtures/semantic_evidence/vectors/baseline-v1.jsonl");
+const EXPECTED_SELECTOR_JSONL: &str =
+    include_str!("fixtures/semantic_evidence/vectors/selector-experiment-v1.jsonl");
+const EXPECTED_COMPARISON_JSON: &str =
+    include_str!("fixtures/semantic_evidence/vectors/selector-comparison-v1.json");
 
 const CORPUS: &[(&str, &str)] = &[
     (
@@ -951,4 +1714,171 @@ async fn byte_overflow_and_forbidden_evidence_fail_without_claiming_success() {
             .sum::<usize>()
             <= 1
     );
+}
+
+#[tokio::test]
+async fn structural_selector_is_repeatable_and_truthfully_beats_the_frozen_threshold() {
+    let suite = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    materialize_corpus(first.path());
+    materialize_corpus(second.path());
+
+    let first_artifact = run_structural_selector_experiment_v1(&suite, first.path())
+        .await
+        .unwrap();
+    let second_artifact = run_structural_selector_experiment_v1(&suite, second.path())
+        .await
+        .unwrap();
+
+    assert_eq!(first_artifact, second_artifact);
+    assert_eq!(
+        String::from_utf8(first_artifact).unwrap(),
+        EXPECTED_SELECTOR_JSONL
+    );
+    assert_eq!(
+        compare_selector_to_frozen_baseline_v1(&suite, first.path())
+            .await
+            .unwrap(),
+        PromotionDecisionV1::Promote {
+            baseline_rounds: 5,
+            selector_rounds: 3,
+            baseline_tool_bytes: 1_456,
+            selector_tool_bytes: 1_134,
+        }
+    );
+}
+
+#[tokio::test]
+async fn selector_input_excludes_ids_plans_and_rubric_needles() {
+    let original = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
+    let mut changed: serde_json::Value = serde_json::from_str(VECTOR_JSON).unwrap();
+    changed["vectors"][0]["id"] = json!("unrelated-id");
+    changed["vectors"][0]["calls"] = changed["vectors"][2]["calls"].clone();
+    for call in changed["vectors"][0]["calls"].as_array_mut().unwrap() {
+        call["round"] = json!(1);
+    }
+    changed["vectors"][0]["rubric"] = changed["vectors"][2]["rubric"].clone();
+    let changed = BenchmarkSuiteV1::parse_and_validate(&changed.to_string()).unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    materialize_corpus(corpus.path());
+
+    let original_output = select_structural_evidence_v1(
+        original.vectors()[0].task(),
+        original.vectors()[0].prompt(),
+        corpus.path(),
+    )
+    .await
+    .unwrap();
+    let changed_output = select_structural_evidence_v1(
+        changed.vectors()[0].task(),
+        changed.vectors()[0].prompt(),
+        corpus.path(),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(original_output, changed_output);
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn selector_skips_a_relevant_decoy_and_cannot_follow_a_denied_candidate() {
+    let suite = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    let outside = tempfile::tempdir().unwrap();
+    materialize_corpus(corpus.path());
+    std::fs::write(
+        outside.path().join("denied_retry.ts"),
+        "export const MAX_RETRY_ATTEMPTS = 777; // DENIED_CANARY\n",
+    )
+    .unwrap();
+    std::os::unix::fs::symlink(
+        outside.path().join("denied_retry.ts"),
+        corpus.path().join("web/denied_retry.ts"),
+    )
+    .unwrap();
+
+    let output = select_structural_evidence_v1(
+        suite.vectors()[2].task(),
+        suite.vectors()[2].prompt(),
+        corpus.path(),
+    )
+    .await
+    .unwrap();
+    let denied_policy = std::sync::Arc::new(
+        kitsu_tools::Permissions::for_roots(&[corpus.path().display().to_string()], &[]).unwrap(),
+    );
+    let denied_read = kitsu_tools::builtins::fs::read_file_tool(denied_policy).1;
+    let denied =
+        denied_read(json!({"path": outside.path().join("denied_retry.ts")}).to_string()).await;
+
+    assert!(matches!(
+        denied,
+        Err(kitsu_tools::ToolError::PolicyDenied(_))
+    ));
+    assert!(!output.contains("DENIED_CANARY"));
+    assert!(!output.contains("777"));
+    assert!(!output.contains("MAX_RETRY_ATTEMPTS = 99"));
+    assert!(output.contains("MAX_RETRY_ATTEMPTS = 3"));
+}
+
+#[tokio::test]
+async fn selector_comparison_report_is_canonical_and_records_the_aggregate_decision() {
+    let suite = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
+    let first = tempfile::tempdir().unwrap();
+    let second = tempfile::tempdir().unwrap();
+    materialize_corpus(first.path());
+    materialize_corpus(second.path());
+
+    let first = run_selector_comparison_report_v1(&suite, first.path())
+        .await
+        .unwrap();
+    let second = run_selector_comparison_report_v1(&suite, second.path())
+        .await
+        .unwrap();
+
+    assert_eq!(first, second);
+    assert_eq!(String::from_utf8(first).unwrap(), EXPECTED_COMPARISON_JSON);
+}
+
+#[tokio::test]
+async fn selector_is_bounded_and_reobserves_changed_source_without_a_cache() {
+    let suite = BenchmarkSuiteV1::parse_and_validate(VECTOR_JSON).unwrap();
+    let corpus = tempfile::tempdir().unwrap();
+    materialize_corpus(corpus.path());
+
+    assert!(matches!(
+        select_structural_evidence_v1(
+            TaskKindV1::Locate,
+            &"x".repeat(4 * 1024 + 1),
+            corpus.path(),
+        )
+        .await,
+        Err(HarnessErrorV1::Selector(_))
+    ));
+
+    let before = select_structural_evidence_v1(
+        suite.vectors()[2].task(),
+        suite.vectors()[2].prompt(),
+        corpus.path(),
+    )
+    .await
+    .unwrap();
+    std::fs::write(
+        corpus.path().join("web/retry.ts"),
+        "export const MAX_RETRY_ATTEMPTS = 5;\n\nexport function shouldRetry(attempt: number): boolean {\n  return attempt < MAX_RETRY_ATTEMPTS;\n}\n",
+    )
+    .unwrap();
+    let after = select_structural_evidence_v1(
+        suite.vectors()[2].task(),
+        suite.vectors()[2].prompt(),
+        corpus.path(),
+    )
+    .await
+    .unwrap();
+
+    assert!(before.contains("MAX_RETRY_ATTEMPTS = 3"));
+    assert!(after.contains("MAX_RETRY_ATTEMPTS = 5"));
+    assert!(!after.contains("MAX_RETRY_ATTEMPTS = 3"));
 }
