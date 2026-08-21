@@ -263,7 +263,7 @@ cutting an incomplete exchange.
 Dependencies: E02 terminal outcome model.
 
 Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C21,
-and E03-S05 is in progress through Cycle 078. The
+and E03-S05 is in progress through Cycle 079. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -365,6 +365,13 @@ A physical copy primitive now opens and verifies an immutable source artifact
 before effects, rewrites only its destination session identity, and delegates
 publication to the descriptor-pinned create-only installer. Missing/tampered
 source, same-session copy, and destination collision create no replacement.
+A private whole-branch transaction now holds both session fences in stable
+identity order, rebinds the exact caller-observed source, preflights destination
+HEAD/revision/artifact absence, copies only the assembled closure, installs the
+root candidate, and rechecks source plus destination closure before HEAD CAS.
+Known stale/collision cases are zero-copy. Injected artifact/candidate/recheck
+cuts retain typed immutable residue but no destination HEAD; a HEAD-sync cut
+selects only the complete branch as published-unconfirmed.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -655,6 +662,7 @@ gates merely because a card appears attractive.
 | 076 | E03-S04-C4 | Publish recovery under the writer fence and exact selected envelope with old-or-new receipt truth |
 | 077 | E03-S05-C1 | Assemble a fresh branch revision with exact committed prefix, lineage, and referenced artifact closure |
 | 078 | E03-S05-C2 | Copy referenced physical artifacts through verified destination-scoped no-overwrite publication |
+| 079 | E03-S05-C3 | Publish a complete branch create-only under ordered source/destination fences with exact cut residue |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -734,8 +742,9 @@ writer fencing, immutable install, HEAD CAS, and exact recovery receipts before
 production mounting. Cycle 077 begins pure branch-at-committed-turn prefix,
 lineage, and artifact-closure assembly. Cycle 078 adds verified no-overwrite
 artifact copying as a separately accepted effect boundary. Cycle 079 adds the
-source/destination-fenced create-only branch publication transaction; then the
-queue continues
+source/destination-fenced create-only branch publication transaction. Cycle 080
+adds exact residue recovery/idempotent retry for pre-HEAD cuts; then the queue
+continues
 through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

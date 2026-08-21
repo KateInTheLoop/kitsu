@@ -629,6 +629,17 @@ cannot weaken or replace any backend-neutral assertion.
    The bounded review deliberately leaves multi-artifact rollback and branch
    candidate/HEAD publication to Cycle 079 under separate source/destination
    fences.
+   **Create-only branch publication complete in Cycle 079:** one private
+   transaction acquires both session fences in stable identity order, reopens
+   and exactly compares the caller-observed source, proves destination HEAD,
+   requested revision, and every target artifact absent, copies only assembled
+   closure, installs the root candidate, and rechecks source plus destination
+   closure before destination HEAD CAS. Stale source and known destination
+   collisions are zero-copy. Artifact-copy, candidate, and closure-recheck cuts
+   expose no destination HEAD and retain exact immutable residue; a HEAD-sync
+   cut selects only the complete branch with published-unconfirmed durability.
+   Next make those exact pre-HEAD residues safely resumable without accepting a
+   name-only collision or overwriting any byte.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
