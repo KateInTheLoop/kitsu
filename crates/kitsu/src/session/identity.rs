@@ -6,6 +6,7 @@ use std::io::Read;
 use kitsu_core::session::StoreId;
 use serde::{Deserialize, Serialize};
 
+use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1};
 use super::{atomic_write_private_in_detailed, fresh_id, PrivateDirectory, PrivateEntryKind};
 
 const LOCAL_STORE_IDENTITY_SCHEMA_REVISION: u32 = 1;
@@ -49,12 +50,43 @@ impl LocalStoreIdentityReceiptV1 {
 
 #[derive(Debug, PartialEq, Eq)]
 pub(super) enum LocalStoreIdentityErrorV1 {
+    UnboundPhysicalNamespace,
     UnsafeEntry,
     Malformed,
     Unsupported { observed: u32, supported: u32 },
     InvalidStoreIdentity,
     Read(String),
     Write { message: String, installed: bool },
+}
+
+/// Resolve the composition identity for live activation. If no composition
+/// identity exists, any physical namespace entry is an orphan and blocks
+/// publication. Supported initializers therefore converge through the
+/// create-only identity before any physical store can be created.
+pub(super) fn acquire_local_store_identity_for_activation_v1(
+    directory: &PrivateDirectory,
+) -> Result<LocalStoreIdentityReceiptV1, LocalStoreIdentityErrorV1> {
+    if let Some(receipt) = open_local_store_identity_v1(directory)? {
+        return Ok(receipt);
+    }
+    if PhysicalFileStoreV1::namespace_entry_present(directory)
+        .map_err(|error: PhysicalReadErrorV1| LocalStoreIdentityErrorV1::Read(error.to_string()))?
+    {
+        return Err(LocalStoreIdentityErrorV1::UnboundPhysicalNamespace);
+    }
+    acquire_local_store_identity_v1(directory)
+}
+
+pub(super) fn open_local_store_identity_v1(
+    directory: &PrivateDirectory,
+) -> Result<Option<LocalStoreIdentityReceiptV1>, LocalStoreIdentityErrorV1> {
+    read_local_store_identity_v1(directory).map(|identity| {
+        identity.map(|store_id| LocalStoreIdentityReceiptV1 {
+            store_id,
+            source: LocalStoreIdentitySourceV1::Existing,
+            durability_warning: None,
+        })
+    })
 }
 
 pub(super) fn acquire_local_store_identity_v1(

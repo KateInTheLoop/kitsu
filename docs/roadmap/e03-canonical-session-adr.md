@@ -786,6 +786,19 @@ cannot weaken or replace any backend-neutral assertion.
    next boundary must bind it exactly to the physical `store.json` identity;
    neither pathname nor this composition record may substitute for canonical
    session HEAD.
+   **Local composition/activation binding complete in Cycle 093:** one private
+   factory resolves the explicit composition record and uses its exact
+   `StoreId` for both pinned dual-representation selection and total live-store
+   activation. When no identity exists, an orphan physical root refuses before
+   publication; empty and unavailable current state likewise retain the prior
+   zero-effect result. An eligible current-v1 value may create the identity and
+   exactly matching physical namespace, while an existing mismatch or corrupt
+   record remains byte-for-byte unchanged. The returned non-cloneable owner
+   retains identity receipt, selected value, physical store, and both writer
+   exclusions for one lifetime and delegates only the closed save boundary. A
+   save and exact reopen prove the same identity on both records. This owner is
+   still private and no production constructor selects it; the next boundary
+   must place it beneath `ActiveSessionStore` without creating a second route.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
