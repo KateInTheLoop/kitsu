@@ -2,7 +2,7 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S02 has begun through C1;
+through Cycle 080; E06-S01 and E06-S02 have begun through C1;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 101 / 101 |
+| Accepted cycles/commits after this cycle | 102 / 102 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 102 — E06-S01-C1: integrate pre-spawn child authority admission without constructing or starting a process |
+| Active epic/card | Cycle 103 — E06-S03-C1: integrate the fail-stop, bounded tools-only MCP envelope codec without process, inventory, or product wiring |
 
 ## Epic status
 
@@ -26,7 +26,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S02-C1; depends only on accepted E01/E02 | Every provider request now owns one exact schema/handler inventory. Pre-spawn authority and bounded codec candidates await serialized integration; no external source, child, or product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C1 and E06-S02-C1; depends only on accepted E01/E02 | Provider requests own exact schema/handler inventories, and child launch facts must pass exact pure authority admission before ordered host preparation. The bounded codec candidate awaits integration; no process API, external source, or product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **Scoped** through Cycle 030; implementation waits on owned inputs | E08-S05 live telemetry consumes E04 receipts; E08-S06 durable usage consumes E03 fencing; progressive docs follow stable surfaces |
@@ -137,7 +137,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 098 | `9f08a50` | Snapshot-writable bound-current admission |
 | 099 | `bc2569d` | Pinned bound-current startup resume route |
 | 100 | `6c250fe` | Staged bound-current in-process owner swap and parallel checkpoint |
-| 101 | this document's commit | Frozen provider-request tool schema and handler inventory |
+| 101 | `379512e` | Frozen provider-request tool schema and handler inventory |
+| 102 | this document's commit | Exact zero-effect child admission and ordered preparation |
 
 ## Current green gates
 
@@ -660,6 +661,13 @@ request. The inventory is deliberately non-cloneable at its public boundary;
 static and descriptor-free routes retain their existing behavior. No external
 source identity, process, protocol, configuration, or product authority is
 introduced.
+Cycle 102 adds only the private admission and preparation seam for the future
+child supervisor. Disabled and denied entries short-circuit before version or
+syntax inspection; invalid paths, digest, argv, working directory, and every
+profile mismatch cause zero injected host operations. An exact admitted value
+then permits canonicalization, digest verification, and containment preflight
+in that order, stopping at the first fault. The prepared identity exposes no
+spawn operation and is not connected to configuration or product composition.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

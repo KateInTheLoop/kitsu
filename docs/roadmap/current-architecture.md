@@ -299,6 +299,12 @@ kernel.
   identities used for structured calls, recovered text calls, and output
   offload remain the same snapshot for the whole response. It does not yet add
   source identity, generations, withdrawal, external processes, or MCP.
+- Cycle 102 adds an inert private child-launch request, exact host-authored
+  authority profile, and staged preparation boundary. Disabled, denied,
+  unsupported, malformed, and profile-mismatched inputs return before any host
+  observation. An admitted identity is then canonicalized, hash-verified, and
+  containment-preflighted in order. The resulting value is still unspawned;
+  no production process API or external-tool composition exists.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -309,7 +315,7 @@ kernel.
 | Native behavior | Compiled Rust modules registered by product composition | Same process, binary authority | Retain; no dylib/runtime loader |
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
-| External runtime tools | Static registry plus a request-scoped, non-cloneable `ToolInventory`; no external source | Same-process compiled handlers only | E06 inventory foundation begun; no child, MCP, or product configuration |
+| External runtime tools | Static registry plus a request-scoped, non-cloneable `ToolInventory`; private inert child admission/preparation seam; no external source | Same-process compiled handlers only; prepared child identity cannot spawn | E06 inventory and pre-spawn authority foundations begun; no child lifecycle, MCP, or product configuration |
 | Host/UI protocol | CLI carriers plus one-way JSONL | Consumer cannot service synchronous calls | No named second host; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
