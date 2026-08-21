@@ -336,13 +336,26 @@ mod tests {
     use super::*;
     use crate::external::authority::{
         prepare_child_launch_request_v1, AdmittedChildLaunchV1, AuthorityProfileV1,
-        ChildLaunchAuthorityDecisionV1, ChildLaunchModeV1, ChildLaunchPreparationV1,
-        ChildLaunchRequestV1,
+        ChildEnvironmentPolicyV1, ChildIoLimitsV1, ChildLaunchAuthorityDecisionV1,
+        ChildLaunchModeV1, ChildLaunchPreparationV1, ChildLaunchRequestV1, ChildNetworkPolicyV1,
+        ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRuntimePolicyV1,
+        ChildTimeoutDispositionV1,
     };
 
     const EXECUTABLE: &str = "/opt/kitsu-fixtures/stdio-peer";
     const WORKING_DIRECTORY: &str = "/tmp/kitsu-external";
     const DIGEST: &str = "abababababababababababababababababababababababababababababababab";
+
+    fn runtime_policy() -> ChildRuntimePolicyV1 {
+        ChildRuntimePolicyV1::new(
+            ChildPhaseBudgetsV1::new(5_000, 30_000, 5_000, 2_000, 5_000),
+            ChildIoLimitsV1::new(64 * 1024, 256 * 1024, 64 * 1024, 32 * 1024),
+            ChildProcessGroupPolicyV1::Owned,
+            ChildEnvironmentPolicyV1::new(true, Vec::new()),
+            ChildNetworkPolicyV1::Deny,
+            ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
+        )
+    }
 
     #[derive(Default)]
     struct PreparationFixture;
@@ -369,12 +382,14 @@ mod tests {
             DIGEST,
             vec!["--stdio".to_string()],
             WORKING_DIRECTORY,
+            runtime_policy(),
         );
         let profile = AuthorityProfileV1::exact(
             EXECUTABLE,
             DIGEST,
             vec!["--stdio".to_string()],
             WORKING_DIRECTORY,
+            runtime_policy(),
         )
         .unwrap();
         prepare_child_launch_request_v1(
