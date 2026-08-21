@@ -21,6 +21,7 @@ const MAX_REQUEST_BUDGET_MILLIS: u64 = 5 * 60_000;
 const MAX_DRAIN_BUDGET_MILLIS: u64 = 30_000;
 const MAX_KILL_BUDGET_MILLIS: u64 = 10_000;
 const MAX_REAP_BUDGET_MILLIS: u64 = 30_000;
+const MAX_SERIAL_FRAMES: u16 = 1_024;
 const MAX_STDIN_BYTES: usize = 1024 * 1024;
 const MAX_STDOUT_BYTES: usize = 4 * 1024 * 1024;
 const MAX_STDERR_BYTES: usize = 1024 * 1024;
@@ -72,6 +73,21 @@ pub(crate) struct ChildIoLimitsV1 {
     stdout_bytes: usize,
     stderr_bytes: usize,
     frame_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildRequestPolicyV1 {
+    OneShot,
+    Serial { max_frames: u16, idle_millis: u64 },
+}
+
+impl ChildRequestPolicyV1 {
+    pub(crate) fn serial(max_frames: u16, idle_millis: u64) -> Self {
+        Self::Serial {
+            max_frames,
+            idle_millis,
+        }
+    }
 }
 
 impl ChildIoLimitsV1 {
@@ -199,6 +215,7 @@ pub(crate) enum ChildTimeoutDispositionV1 {
 pub(crate) struct ChildRuntimePolicyV1 {
     phase_budgets: ChildPhaseBudgetsV1,
     io_limits: ChildIoLimitsV1,
+    request: ChildRequestPolicyV1,
     process_group: ChildProcessGroupPolicyV1,
     environment: ChildEnvironmentPolicyV1,
     filesystem: ChildFilesystemPolicyV1,
@@ -219,12 +236,18 @@ impl ChildRuntimePolicyV1 {
         Self {
             phase_budgets,
             io_limits,
+            request: ChildRequestPolicyV1::OneShot,
             process_group,
             environment,
             filesystem,
             network,
             timeout_disposition,
         }
+    }
+
+    pub(crate) fn with_request_policy(mut self, request: ChildRequestPolicyV1) -> Self {
+        self.request = request;
+        self
     }
 }
 
@@ -250,6 +273,7 @@ pub(crate) enum ChildRuntimePolicyErrorV1 {
     InvalidPhaseBudget(ChildRuntimePhaseV1),
     InvalidIoLimit(ChildIoLimitV1),
     FrameExceedsStreamLimit(ChildIoLimitV1),
+    InvalidRequestPolicy,
     ProcessGroupNotOwned,
     InheritedEnvironmentNotCleared,
     InvalidEnvironmentProjection,
@@ -532,6 +556,21 @@ fn validate_runtime_policy(policy: &ChildRuntimePolicyV1) -> Result<(), ChildRun
         ));
     }
 
+    match policy.request {
+        ChildRequestPolicyV1::OneShot => {}
+        ChildRequestPolicyV1::Serial {
+            max_frames,
+            idle_millis,
+        } => {
+            if !(2..=MAX_SERIAL_FRAMES).contains(&max_frames)
+                || idle_millis == 0
+                || idle_millis > policy.phase_budgets.request_millis
+            {
+                return Err(ChildRuntimePolicyErrorV1::InvalidRequestPolicy);
+            }
+        }
+    }
+
     if policy.process_group != ChildProcessGroupPolicyV1::Owned {
         return Err(ChildRuntimePolicyErrorV1::ProcessGroupNotOwned);
     }
@@ -695,6 +734,7 @@ pub(super) struct PreparedChildOsLaunchV1 {
     working_directory: PathBuf,
     phase_budgets: ChildPhaseBudgetsV1,
     io_limits: ChildIoLimitsV1,
+    request: ChildRequestPolicyV1,
     environment: ChildEnvironmentPolicyV1,
     filesystem: ChildFilesystemPolicyV1,
     containment_token: PreparedChildContainmentTokenV1,
@@ -710,6 +750,7 @@ impl fmt::Debug for PreparedChildOsLaunchV1 {
             .field("working_directory", &self.working_directory)
             .field("phase_budgets", &self.phase_budgets)
             .field("io_limits", &self.io_limits)
+            .field("request", &self.request)
             .field("environment", &self.environment)
             .field("filesystem", &self.filesystem)
             .field("containment_token", &self.containment_token)
@@ -781,6 +822,10 @@ impl PreparedChildOsLaunchV1 {
     pub(super) fn frame_limit(&self) -> usize {
         self.io_limits.frame_bytes
     }
+
+    pub(super) fn request_policy(&self) -> ChildRequestPolicyV1 {
+        self.request
+    }
 }
 
 impl PreparedChildLaunchV1 {
@@ -798,6 +843,28 @@ impl PreparedChildLaunchV1 {
             self.runtime_policy.phase_budgets.kill_millis,
             self.runtime_policy.phase_budgets.reap_millis,
         ]
+    }
+
+    pub(super) fn serial_transport_policy(&self) -> Option<super::serial::SerialTransportPolicyV1> {
+        let ChildRequestPolicyV1::Serial {
+            max_frames,
+            idle_millis,
+        } = self.runtime_policy.request
+        else {
+            return None;
+        };
+        Some(super::serial::SerialTransportPolicyV1 {
+            max_frames,
+            line_millis: self.runtime_policy.phase_budgets.request_millis,
+            idle_millis,
+            stdin_bytes: self.runtime_policy.io_limits.stdin_bytes,
+            stdout_bytes: self.runtime_policy.io_limits.stdout_bytes,
+            stderr_bytes: self.runtime_policy.io_limits.stderr_bytes,
+            frame_bytes: self.runtime_policy.io_limits.frame_bytes,
+            drain_millis: self.runtime_policy.phase_budgets.drain_millis,
+            kill_millis: self.runtime_policy.phase_budgets.kill_millis,
+            reap_millis: self.runtime_policy.phase_budgets.reap_millis,
+        })
     }
 
     /// Consumes the one-shot preparation proof into the exact private launch
@@ -818,6 +885,7 @@ impl PreparedChildLaunchV1 {
             working_directory,
             phase_budgets: runtime_policy.phase_budgets,
             io_limits: runtime_policy.io_limits,
+            request: runtime_policy.request,
             environment: runtime_policy.environment,
             filesystem: runtime_policy.filesystem,
             containment_token,
@@ -1760,5 +1828,84 @@ mod tests {
         let launch = prepared.into_os_launch();
         assert_eq!(launch.containment_token_for_test().id_for_test(), 7);
         assert_eq!(launch.filesystem_for_test(), &filesystem_policy());
+    }
+
+    fn serial_runtime_policy(max_frames: u16, idle_millis: u64) -> ChildRuntimePolicyV1 {
+        ChildRuntimePolicyV1::new(
+            ChildPhaseBudgetsV1::new(5_000, 30_000, 5_000, 2_000, 5_000),
+            ChildIoLimitsV1::new(64 * 1024, 256 * 1024, 64 * 1024, 32 * 1024),
+            ChildProcessGroupPolicyV1::Owned,
+            ChildEnvironmentPolicyV1::new(true, Vec::new()),
+            filesystem_policy(),
+            ChildNetworkPolicyV1::Deny,
+            ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
+        )
+        .with_request_policy(ChildRequestPolicyV1::serial(max_frames, idle_millis))
+    }
+
+    #[test]
+    fn serial_request_policy_is_mandatory_bounded_and_inert_when_invalid() {
+        for policy in [
+            serial_runtime_policy(0, 1),
+            serial_runtime_policy(1, 1),
+            serial_runtime_policy(MAX_SERIAL_FRAMES + 1, 1),
+            serial_runtime_policy(2, 0),
+            serial_runtime_policy(2, 30_001),
+        ] {
+            let mut probe = EffectProbe::successful();
+            assert_eq!(
+                prepare_child_launch_request_v1(
+                    valid_request_with_policy(policy),
+                    ChildLaunchAuthorityDecisionV1::Admit(&profile()),
+                    &mut probe,
+                ),
+                Err(ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                    ChildRuntimePolicyErrorV1::InvalidRequestPolicy,
+                ))
+            );
+            probe.assert_zero_effects();
+        }
+    }
+
+    #[test]
+    fn every_serial_policy_fact_matches_authority_before_observation() {
+        for authority_policy in [
+            serial_runtime_policy(3, 5_000),
+            serial_runtime_policy(2, 4_999),
+        ] {
+            let profile = profile_with_policy(authority_policy).unwrap();
+            assert_rejected_without_effects(
+                valid_request_with_policy(serial_runtime_policy(2, 5_000)),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::AuthorityMismatch(
+                    AuthorityMismatchFieldV1::RuntimePolicy,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn prepared_proof_projects_exact_serial_deadlines_counts_and_byte_caps() {
+        let policy = serial_runtime_policy(3, 5_000);
+        let profile = profile_with_policy(policy.clone()).unwrap();
+        let mut probe = EffectProbe::successful();
+        let prepared = prepare_child_launch_request_v1(
+            valid_request_with_policy(policy),
+            ChildLaunchAuthorityDecisionV1::Admit(&profile),
+            &mut probe,
+        )
+        .unwrap();
+        let serial = prepared.serial_transport_policy().unwrap();
+
+        assert_eq!(serial.max_frames, 3);
+        assert_eq!(serial.line_millis, 30_000);
+        assert_eq!(serial.idle_millis, 5_000);
+        assert_eq!(serial.stdin_bytes, 64 * 1024);
+        assert_eq!(serial.stdout_bytes, 256 * 1024);
+        assert_eq!(serial.stderr_bytes, 64 * 1024);
+        assert_eq!(serial.frame_bytes, 32 * 1024);
+        assert_eq!(serial.drain_millis, 5_000);
+        assert_eq!(serial.kill_millis, 2_000);
+        assert_eq!(serial.reap_millis, 5_000);
     }
 }

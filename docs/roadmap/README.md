@@ -727,6 +727,7 @@ gates merely because a card appears attractive.
 | 116 | E05-S01-C2 | Publish secret-free guided-setup configuration create-new through descriptor-relative durability and exact owned rollback |
 | 117 | E08-S05-C5 | Mount one typed offline current-session observation on adaptive `/status` while preserving the legacy JSONL payload shape |
 | 118 | E06-S01-C6 | Execute exact sealed native bytes under one bounded Landlock filesystem-content policy with no pathname fallback |
+| 119 | E06-S01-C7 | Retain one sealed authorized child across strictly serial bounded line frames with exact deadlines, caps, and owned cleanup |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1046,6 +1047,15 @@ non-ELF input, seal/ruleset/descriptor/token failure, or authority mismatch
 fails closed before target code. This is still unmounted and one-shot. Landlock
 does not provide mount isolation, path/stat/access secrecy, metadata-family or
 host signal/ptrace confinement; no general sandbox, MCP, or X002 claim follows.
+Cycle 119 retains that exact sealed and Landlock-bound child across multiple
+strictly serial newline frames. One in-flight frame, full request write before
+response, fixed line and progress-reset idle deadlines, cumulative pipe caps,
+bounded frame count, and response consumption once are enforced by one private
+owner. EOF, crash, extra carry, overflow, clock/effect fault, cancellation,
+shutdown, and drop all converge on the existing group-termination/direct-reap
+path or transfer typed retry residue. This is opaque line transport only: MCP
+codec composition, inventory publication, configuration, and product routing
+remain absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
