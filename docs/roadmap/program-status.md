@@ -21,18 +21,19 @@ Linux one-process backend through Cycle 115, exact sealed native execution plus
 bounded Landlock filesystem-content authority through Cycle 118, and one
 strictly serial multi-frame owner through Cycle 119.
 E08-S05 mounts the same typed offline current-session observation on `/status`
-through Cycle 117 while preserving the legacy JSONL payload shape.
+through Cycle 117 while preserving the legacy JSONL payload shape, and exact
+offline `/context window` through Cycle 121.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 120 / 120 |
+| Accepted cycles/commits after this cycle | 121 / 121 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 121 — E08-S05-C6: mount typed offline `/context window` |
+| Active epic/card | Cycle 122 — E07-S01-C2: record the measured structural-selector decision |
 
 ## Epic status
 
@@ -46,7 +47,7 @@ through Cycle 117 while preserving the legacy JSONL payload shape.
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
 | E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
 | E05 onboarding | **In progress** through E05-S01-C3 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger for one local/offline path. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
-| E08 telemetry/docs | **In progress** through E08-S05-C5 | Pure current-session DTOs label every value with truth/provenance; `/usage session` and `/status` each collect one coherent offline in-memory observation and render adaptive usage/full decks. `/status` preserves its legacy JSONL payload. `/context` migration, usage automation parity, aliases, account truth, and durable history remain separate; history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C6 | Pure current-session DTOs label every value with truth/provenance; `/usage session`, `/status`, and exact `/context window` collect coherent offline in-memory observations and render adaptive usage/full/context decks. `/status` preserves its legacy JSONL payload; context-window JSONL deliberately adds no result. Usage aliases/automation parity, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -174,6 +175,7 @@ through Cycle 117 while preserving the legacy JSONL payload shape.
 | 118 | this document's commit | Exact sealed native child execution and bounded Landlock content authority |
 | 119 | this document's commit | One sealed child across strictly serial bounded line frames with owned cleanup |
 | 120 | this document's commit | Private local/offline setup transaction and create-new publication composition |
+| 121 | this document's commit | Exact offline typed `/context window` with adaptive accessible rendering |
 
 ## Current green gates
 
@@ -867,6 +869,12 @@ logical config effect can exist; collision, missing parent, installed rollback,
 pre-install cleanup, and incomplete recovery keep distinct exact owners. It is
 still unmounted and adds no prompt, UI, activation, provider, catalog,
 credential, hosted, custom, or non-Linux path.
+
+Cycle 121 adds exact `/context window` beside the unchanged bare and refresh
+commands. One already-bound route receipt and one synchronous typed snapshot
+feed only the adaptive context section across terminal and accessibility
+destinations. It performs no provider/account/filesystem/persistence effect and
+adds no JSONL result schema; lifecycle framing retains the original command.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

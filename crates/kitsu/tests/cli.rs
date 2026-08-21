@@ -1531,6 +1531,122 @@ async fn test_usage_session_is_offline_exact_and_leaves_jsonl_payloads_unmounted
     }
 }
 
+#[tokio::test]
+#[serial]
+async fn test_context_window_is_offline_exact_accessible_and_leaves_jsonl_unmounted() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().expect("context-window home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("context-window.script");
+    fs::write(&script, "/context window\n/quit\n").unwrap();
+
+    for (mode, args, env) in [
+        ("plain", vec!["--plain"], None),
+        ("no-color", vec![], Some(("NO_COLOR", "1"))),
+        ("screen-reader", vec!["--screen-reader"], None),
+        ("redirected", vec![], None),
+    ] {
+        let mut command = base_cmd(home.path());
+        command.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        } else {
+            command.env_remove("NO_COLOR");
+        }
+        command.args(args).args([
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+        let output = command.output().expect("run context-window mode");
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        assert!(stderr.contains("[context]"), "{mode}: {stderr}");
+        assert!(stderr.contains("context.occupancy:"), "{mode}: {stderr}");
+        assert!(
+            stderr.contains("context.window tokens:"),
+            "{mode}: {stderr}"
+        );
+        assert!(
+            stderr.contains("context.available tokens:"),
+            "{mode}: {stderr}"
+        );
+        assert!(!stderr.contains("[status]"), "{mode}: {stderr}");
+        assert!(!stderr.contains("[usage]"), "{mode}: {stderr}");
+        assert!(!stderr.contains("status.adapter:"), "{mode}: {stderr}");
+        assert!(!stderr.contains("usage.prompt tokens:"), "{mode}: {stderr}");
+        assert!(!stderr.contains('\u{1b}'), "{mode}: {stderr}");
+    }
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run JSONL context-window command");
+    assert!(jsonl.status.success(), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events: Vec<serde_json::Value> = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["type"] == "command_finished"
+            && event["command"] == "/context window"
+            && event["status"] == "ok"
+    }));
+    assert!(!events.iter().any(|event| {
+        event["type"] == "command_result" && event["command"] == "/context window"
+    }));
+
+    for (name, contents) in [
+        ("context-windows.script", "/context windows\n/quit\n"),
+        (
+            "context-window-extra.script",
+            "/context window extra\n/quit\n",
+        ),
+    ] {
+        let inexact = home.path().join(name);
+        fs::write(&inexact, contents).unwrap();
+        let rejected = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--plain",
+                "chat",
+                "--no-session",
+                "--script",
+                &inexact.to_string_lossy(),
+            ])
+            .output()
+            .expect("reject inexact context-window form");
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        assert!(String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("usage: /context [window|refresh]"));
+    }
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "/context window sent a provider request"
+    );
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]
