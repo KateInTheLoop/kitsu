@@ -6,6 +6,7 @@
 pub(crate) mod authority;
 #[cfg(target_os = "linux")]
 mod backend;
+mod handler;
 pub(crate) mod identity;
 mod lifecycle;
 mod mcp;

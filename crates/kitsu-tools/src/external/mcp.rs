@@ -265,6 +265,19 @@ where
         self.request_stop(true)
     }
 
+    /// Move the exact terminal protocol/transport failure into a higher-level
+    /// private owner. Non-terminal states remain unchanged.
+    pub(super) fn take_terminal_failure(&mut self) -> Option<McpSerialChildFailureV1> {
+        let previous = std::mem::replace(&mut self.state, McpSerialChildStateV1::Stopped);
+        match previous {
+            McpSerialChildStateV1::Failed { failure } => Some(failure),
+            state => {
+                self.state = state;
+                None
+            }
+        }
+    }
+
     fn request_stop(
         &mut self,
         shutdown: bool,

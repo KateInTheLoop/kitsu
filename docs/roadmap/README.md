@@ -738,6 +738,10 @@ gates merely because a card appears attractive.
 | 127 | E08-S05-C8 | Mount an offline typed `/context sources` deck with estimated coarse rows and explicit unavailable sub-buckets |
 | 128 | E07-S01-C4 | Compile the measured selector as an unmounted bounded read-only contributor with current authority and source revalidation |
 | 129 | E05-S01-C4 | Isolate test-only publication, rollback, and hook fault plans with generation-scoped unwind-safe guards |
+| 130 | E06-S03-C3 | Prove the bounded tools-only composition against one exact test-only sealed peer with typed failure and reap truth |
+| 131 | E05-S02-C2a | Bind every model-picker proposal to exact declaration-derived profile, compiled adapter, and wire identity |
+| 132 | E05-S02-C2b | Consume one explicit namespace-equal proposal in private local setup while retaining its truth through recovery |
+| 133 | E06-S02-C4 | Bind one exact host-authored echo inventory and dual-grant no-replay call to the sealed MCP owner with atomic withdrawal |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1167,6 +1171,14 @@ identity before replacing the already-normalized preview model; rejection,
 completion, collision, execution error, rollback recovery, and retry retain the
 whole proposal. The card adds no UI, catalog/provider request, credential,
 activation, current-route publication, or product mount.
+Cycle 133 binds the sealed tools-only MCP owner to one exact host-authored echo
+inventory. Exact non-paginated child list truth must match the compiled
+descriptor before atomic publication. One call requires both host and caller
+identity/fingerprint grants, becomes non-replayable once possibly accepted,
+withdraws before cleanup, and exposes its validated integer only after clean
+child shutdown. Cleanup failure retains primary, response evidence, and one
+owned residue without claiming success. Grant construction, configuration,
+registry/request inventory, restart, and product mounting remain absent.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
