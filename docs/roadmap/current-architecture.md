@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 121.
+updates through Cycle 122.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -426,6 +426,11 @@ kernel.
   synchronous snapshot feed a context-only adaptive renderer; existing bare
   and refresh behavior is unchanged, and no provider/account/filesystem/store
   effect or new JSONL result schema is introduced.
+- Cycle 122 measures a test-only deterministic structural selector against the
+  frozen mixed-language baseline. It preserves 10,000-basis-point relevance
+  and forbidden-evidence refusal while reducing aggregate rounds from 5 to 3
+  and canonical tool bytes from 1,456 to 1,134. The result promotes only a
+  further authority/staleness experiment; no production contributor exists.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

@@ -2,7 +2,7 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S01 is implemented through C6, E06-S02 through C3, and
+through Cycle 080; E06-S01 is implemented through C7, E06-S02 through C3, and
 E06-S03 has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
@@ -11,8 +11,9 @@ binds exact runtime policy into preparation through Cycle 108 and consumes its
 phase budgets in a provider-free supervisor through Cycle 111. E08-S05 now has
 truthful current-run usage coverage and cached-token presence through Cycle 109,
 adaptive presentation-only decks through Cycle 110, and exact offline
-`/usage session` collection/routing through Cycle 112. E07-S01 now has its first
-provider-free fixed-corpus measurement baseline through Cycle 113.
+`/usage session` collection/routing through Cycle 112. E07-S01 has its first
+provider-free fixed-corpus measurement baseline through Cycle 113 and a
+threshold-backed test-only structural-selector decision through Cycle 122.
 E05-S01 has a private effect-free transactional setup model through Cycle 114,
 descriptor-relative no-clobber configuration publication through Cycle 116,
 and one private local/offline coordinator through Cycle 120.
@@ -29,11 +30,11 @@ offline `/context window` through Cycle 121.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 121 / 121 |
+| Accepted cycles/commits after this cycle | 122 / 122 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 122 — E07-S01-C2: record the measured structural-selector decision |
+| Active epic/card | Cycle 123 — E05-S02-C1: stage the bounded offline model picker |
 
 ## Epic status
 
@@ -45,7 +46,7 @@ offline `/context window` through Cycle 121.
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
-| E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
+| E07 semantic context | **In progress** through E07-S01-C2 | The deterministic fixed-corpus current-tool baseline and one test-only structural selector comparison pass. The selector preserves relevance while reducing rounds/bytes past the predeclared threshold, so only the next authority/stale-edit experiment is promoted; production contributor remains absent |
 | E05 onboarding | **In progress** through E05-S01-C3 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger for one local/offline path. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C6 | Pure current-session DTOs label every value with truth/provenance; `/usage session`, `/status`, and exact `/context window` collect coherent offline in-memory observations and render adaptive usage/full/context decks. `/status` preserves its legacy JSONL payload; context-window JSONL deliberately adds no result. Usage aliases/automation parity, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
@@ -176,6 +177,7 @@ offline `/context window` through Cycle 121.
 | 119 | this document's commit | One sealed child across strictly serial bounded line frames with owned cleanup |
 | 120 | this document's commit | Private local/offline setup transaction and create-new publication composition |
 | 121 | this document's commit | Exact offline typed `/context window` with adaptive accessible rendering |
+| 122 | this document's commit | Threshold-backed structural-selector experiment and promote decision |
 
 ## Current green gates
 
@@ -875,6 +877,13 @@ commands. One already-bound route receipt and one synchronous typed snapshot
 feed only the adaptive context section across terminal and accessibility
 destinations. It performs no provider/account/filesystem/persistence effect and
 adds no JSONL result schema; lifecycle framing retains the original command.
+
+Cycle 122 compares one test-only deterministic structural selector with the
+frozen current-tool baseline. All three vectors retain 10,000 relevance basis
+points and forbidden-evidence refusal while aggregate rounds improve from 5 to
+3 and canonical tool bytes from 1,456 to 1,134, below the declared 1,164-byte
+threshold. This promotes only the next authority/staleness experiment, not a
+production contributor, cache, provider path, mutation, or completed task.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

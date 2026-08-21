@@ -730,6 +730,7 @@ gates merely because a card appears attractive.
 | 119 | E06-S01-C7 | Retain one sealed authorized child across strictly serial bounded line frames with exact deadlines, caps, and owned cleanup |
 | 120 | E05-S01-C3 | Compose the pure local setup transaction with descriptor-relative create-new publication and exact concrete recovery ownership |
 | 121 | E08-S05-C6 | Mount exact offline `/context window` from one typed current-session observation and the existing adaptive renderer |
+| 122 | E07-S01-C2 | Measure a deterministic structural selector against the frozen baseline and record the threshold-backed promote decision |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1072,6 +1073,14 @@ using the same adaptive and accessible destination policy as the status and
 usage decks. Bare `/context` and `/context refresh` remain unchanged. The new
 view is offline and side-effect-free; JSONL keeps lifecycle framing but gains no
 new result payload or misleading reuse of the legacy context schema.
+Cycle 122 records a test-only structural-selector experiment against the same
+three frozen locate/explain/change-evidence vectors. All relevance remains
+10,000 basis points with no forbidden evidence, while aggregate rounds fall
+from 5 to 3 and canonical tool bytes from 1,456 to 1,134, below the predeclared
+1,164-byte promotion threshold. Anti-gaming, permission, denied-symlink,
+overflow, determinism, and fresh-read cases pass. The decision promotes only
+the next authority/staleness experiment; no production contributor, cache,
+provider, mutation, or completed-task claim is added.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
