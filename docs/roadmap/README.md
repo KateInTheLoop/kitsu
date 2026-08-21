@@ -700,6 +700,7 @@ gates merely because a card appears attractive.
 | 092 | E03-S02-C33 | Publish and reopen one explicit owner-private local canonical store identity without mounting it |
 | 093 | E03-S02-C34 | Bind the local composition identity to exact physical-store selection and total live activation without product routing |
 | 094 | E03-S02-C35 | Admit the bound local live owner as a closed ActiveSessionStore variant while product constructors remain current-v1 |
+| 095 | E03-S02-C36 | Couple one private bound active owner to the exact current/canonical resume snapshot selected under its fences |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -834,9 +835,15 @@ the existing product-shaped API. Canonical bound state refuses legacy rename,
 sidecar allocation, reset, and snapshot projection without changing HEAD.
 Artifact routing and rename are now fallible at the owner boundary. Public
 create/resume constructors still select current-v1 and create no canonical
-namespace. Cycle 095 next couples one private bound activation with the exact
-resume snapshot it selected before any product switch, then continues through
-E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
+namespace. Cycle 095 adds an exact-id-only private activation that returns the
+current or canonical resume snapshot selected under the same retained owner.
+The coupled value exposes no consuming owner or writable-store accessor;
+invalid identities fail before I/O, current replacement cannot return a stale
+pre-activation value, and canonical projection remains bound to the owned HEAD.
+Cycle 096 next moves product resume handoff behind one owner-plus-snapshot
+activation result while its only selected implementation remains current-v1,
+then continues through E03, E06, E07, E05/E08, and E09 in the dependency-safe
+order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
