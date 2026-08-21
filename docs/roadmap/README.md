@@ -728,6 +728,7 @@ gates merely because a card appears attractive.
 | 117 | E08-S05-C5 | Mount one typed offline current-session observation on adaptive `/status` while preserving the legacy JSONL payload shape |
 | 118 | E06-S01-C6 | Execute exact sealed native bytes under one bounded Landlock filesystem-content policy with no pathname fallback |
 | 119 | E06-S01-C7 | Retain one sealed authorized child across strictly serial bounded line frames with exact deadlines, caps, and owned cleanup |
+| 120 | E05-S01-C3 | Compose the pure local setup transaction with descriptor-relative create-new publication and exact concrete recovery ownership |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1056,6 +1057,14 @@ shutdown, and drop all converge on the existing group-termination/direct-reap
 path or transfer typed retry residue. This is opaque line transport only: MCP
 codec composition, inventory publication, configuration, and product routing
 remain absent.
+Cycle 120 composes the pure guided-setup transaction with the accepted
+descriptor-relative publisher for one private local/offline path. Exact
+transaction fences, a same-ID concrete effect ledger, and create-new
+publication ensure no logical config receipt exists before installation.
+Collision, missing parent, publication failure, rollback, and incomplete stage
+cleanup retain distinct ownership and never overwrite existing configuration.
+The coordinator remains private and unmounted: no prompt, UI, activation,
+provider, catalog, credential, hosted, or custom path is added.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
