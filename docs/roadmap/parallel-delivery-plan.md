@@ -1,7 +1,8 @@
 # Parallel delivery after Cycle 118
 
-Status: refreshed launch topology from the accepted and pushed Cycle 118
-checkpoint `2bfa0dd`.
+Status: the first post-118 wave is accepted through Cycle 125 on
+`improvements/post-118`; the next active packets are Cycle 126 MCP/serial
+composition and Cycle 127 context-source telemetry.
 
 ## Objective
 
@@ -83,6 +84,14 @@ Guided UI and model-picker effect integration follow only after the local
 coordinator and pure picker are accepted. No more than one integration commit is
 prepared at a time; every accepted commit rebases or cherry-picks the remaining
 candidates and reruns their focused gates plus the final workspace gate.
+
+That seven-packet order is now accepted through Cycle 125. The next parallel
+wave keeps the same serialized integration rule: E06 composes the pinned
+tools-only codec with the accepted serial owner privately, while E08 may add an
+offline coarse context-source deck whose unsupported buckets remain explicitly
+unavailable. Neither packet may mount an external tool, invent an automation
+payload, or consume an unowned provider, account, filesystem, or persistence
+truth.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
