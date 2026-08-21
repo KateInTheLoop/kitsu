@@ -701,6 +701,18 @@ cannot weaken or replace any backend-neutral assertion.
    records and never change session bytes, HEAD, artifacts, or authority. This
    path remains private. Current-v1 activation must receive the same two-domain
    exclusion before production routing can change.
+   **Dual-fenced current-v1 activation complete in Cycle 086:** after acquiring
+   the legacy lease, activation creates the missing canonical lock domain only
+   through the already-pinned session descriptor. It uses exclusive root
+   creation; an existing or concurrently won root is adopted only through the
+   complete mutation-free store verifier, so partial state is never filled in or
+   repaired. With the canonical fence held, activation re-reads and byte-compares
+   the exact selected current snapshot and requires canonical HEAD absence. A
+   replaced valid snapshot, newly published HEAD, wrong store, partial namespace,
+   or busy lock fails closed. Ancestor replacement cannot redirect creation.
+   The returned owner retains both locks and the store; initialization changes
+   only the bounded store/lock namespace, not session truth or authority. Next a
+   total private owner must normalize both activation variants before routing.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 085.
+updates through Cycle 086.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -175,7 +175,17 @@ kernel.
   file, newer HEAD, corrupt/replaced payload, busy fence, missing store, or
   identity mismatch refuses activation. Only bounded existing lock-file effects
   occur; no session payload, HEAD, artifact, or authority changes. Production
-  routing remains unchanged.
+  routing remains unchanged. Cycle 086 supplies current-v1 activation with the
+  same lock order. While the legacy lease is held, it initializes the missing
+  canonical namespace relative to the pinned session descriptor, or adopts only
+  a fully valid existing store, then acquires the canonical fence. It re-reads
+  and byte-compares the selected current snapshot and requires canonical HEAD to
+  remain absent. A valid byte replacement, published canonical HEAD, wrong
+  store, busy fence, or partial concurrent namespace refuses. Exclusive root
+  creation plus strict reopen prevents fail-open repair, and an ancestor-swap
+  fixture proves initialization cannot be redirected. Store/lock initialization
+  is the only effect; current bytes and canonical HEAD remain unchanged. The
+  private variants are not yet a production activation owner.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

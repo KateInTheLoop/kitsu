@@ -1158,6 +1158,45 @@ impl PhysicalFileStoreV1 {
             OsStr::new(ROOT_COMPONENT),
             "physical session store namespace",
         )?;
+        Self::finish_store_initialization(&session_root, root, store_id)
+    }
+
+    /// Initialize or open the physical namespace relative to an already-pinned
+    /// session directory. This is the activation-safe form: replacing the
+    /// visible ancestor path cannot redirect store creation.
+    pub(super) fn create_or_open_pinned(
+        session_root: &PrivateDirectory,
+        store_id: StoreId,
+    ) -> Result<Self, String> {
+        match Self::open_existing(session_root, store_id.clone()) {
+            Ok(Some(store)) => return Ok(store),
+            Ok(None) => {}
+            Err(error) => return Err(error.to_string()),
+        }
+        let root = match session_root.create_child_exclusive(
+            OsStr::new(ROOT_COMPONENT),
+            "physical session store namespace",
+        ) {
+            Ok(root) => root,
+            Err(create_error) => {
+                // A concurrent initializer may have won after the absence
+                // observation. Adopt it only if the entire closed namespace is
+                // already valid; never fill in or repair a partial winner.
+                return match Self::open_existing(session_root, store_id) {
+                    Ok(Some(store)) => Ok(store),
+                    Ok(None) => Err(create_error),
+                    Err(error) => Err(error.to_string()),
+                };
+            }
+        };
+        Self::finish_store_initialization(session_root, root, store_id)
+    }
+
+    fn finish_store_initialization(
+        session_root: &PrivateDirectory,
+        root: PrivateDirectory,
+        store_id: StoreId,
+    ) -> Result<Self, String> {
         session_root.sync("physical session root")?;
 
         let record = open_or_create_store_record(&root, store_id)?;
@@ -2704,6 +2743,23 @@ mod tests {
             PhysicalLayoutV1::head_install_mode(),
             PhysicalInstallMode::ReplaceAfterFenceAndRevisionRecheck
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pinned_store_initialization_cannot_be_redirected_by_ancestor_replacement() {
+        let root = tempfile::tempdir().unwrap();
+        let visible = root.path().join("sessions");
+        let original = root.path().join("sessions-original");
+        std::fs::create_dir(&visible).unwrap();
+        let pinned = PrivateDirectory::open(&visible, "pinned store fixture").unwrap();
+        std::fs::rename(&visible, &original).unwrap();
+        std::fs::create_dir(&visible).unwrap();
+
+        drop(PhysicalFileStoreV1::create_or_open_pinned(&pinned, store()).unwrap());
+
+        assert!(original.join(ROOT_COMPONENT).is_dir());
+        assert!(!visible.join(ROOT_COMPONENT).exists());
     }
 
     #[test]

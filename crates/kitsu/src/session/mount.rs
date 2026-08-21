@@ -91,6 +91,20 @@ pub(super) struct CanonicalMountActivationV1 {
     _store: PhysicalFileStoreV1,
 }
 
+#[derive(Debug)]
+pub(super) struct CurrentV1MountActivationV1 {
+    value: CurrentV1MountValueV1,
+    _legacy_lease: SessionLease,
+    _canonical_fence: PhysicalWriterFenceV1,
+    _store: PhysicalFileStoreV1,
+}
+
+impl CurrentV1MountActivationV1 {
+    pub(super) fn value(&self) -> &CurrentV1MountValueV1 {
+        &self.value
+    }
+}
+
 impl CanonicalMountActivationV1 {
     pub(super) fn projection(&self) -> &CanonicalResumeProjectionV1 {
         &self.projection
@@ -111,6 +125,18 @@ pub(super) enum CanonicalMountActivationErrorV1 {
         revision: RevisionId,
         head: LogicalHead,
     },
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum CurrentV1MountActivationErrorV1 {
+    WrongSelection,
+    SelectionIdentityMismatch,
+    LegacyFence(String),
+    StoreInitialization(String),
+    CanonicalFence(String),
+    CurrentV1Changed(CurrentV1MountObservationV1),
+    CurrentV1ValueChanged,
+    CanonicalChanged(SessionLookupState),
 }
 
 impl SessionMountSelectionV1 {
@@ -313,6 +339,62 @@ pub(super) fn activate_canonical_mount_v1(
     })
 }
 
+pub(super) fn activate_current_v1_mount_v1(
+    session_root: &PrivateDirectory,
+    expected_store: StoreId,
+    session_id: &SessionId,
+    selection: SessionMountSelectionV1,
+) -> Result<CurrentV1MountActivationV1, CurrentV1MountActivationErrorV1> {
+    let SessionMountSelectionV1::CurrentV1(selected) = selection else {
+        return Err(CurrentV1MountActivationErrorV1::WrongSelection);
+    };
+    if selected.saved().id != session_id.as_str() {
+        return Err(CurrentV1MountActivationErrorV1::SelectionIdentityMismatch);
+    }
+
+    let legacy_lease = SessionLease::acquire(session_root, session_id.as_str())
+        .map_err(CurrentV1MountActivationErrorV1::LegacyFence)?;
+    // Creating the disjoint store while the legacy lease is held gives a
+    // current-only session a canonical lock domain. A concurrent canonical
+    // publisher either wins before the fence and is observed below, holds the
+    // fence and blocks activation, or loses after this activation owns it.
+    let store = PhysicalFileStoreV1::create_or_open_pinned(session_root, expected_store)
+        .map_err(CurrentV1MountActivationErrorV1::StoreInitialization)?;
+    let canonical_fence = store
+        .acquire_writer_fence(session_id)
+        .map_err(CurrentV1MountActivationErrorV1::CanonicalFence)?;
+
+    let current = observe_current_v1(session_root, session_id);
+    if current.observation != CurrentV1MountObservationV1::Present {
+        return Err(CurrentV1MountActivationErrorV1::CurrentV1Changed(
+            current.observation,
+        ));
+    }
+    let Some(observed) = current.value else {
+        return Err(CurrentV1MountActivationErrorV1::CurrentV1Changed(
+            CurrentV1MountObservationV1::Present,
+        ));
+    };
+    if observed.source_bytes() != selected.source_bytes() {
+        return Err(CurrentV1MountActivationErrorV1::CurrentV1ValueChanged);
+    }
+
+    let (canonical, value) = lookup_canonical_mount_value_v1(&store, session_id);
+    let expected = SessionLookupState::Missing {
+        tombstone_revision: None,
+    };
+    if canonical != expected || value.is_some() {
+        return Err(CurrentV1MountActivationErrorV1::CanonicalChanged(canonical));
+    }
+
+    Ok(CurrentV1MountActivationV1 {
+        value: selected,
+        _legacy_lease: legacy_lease,
+        _canonical_fence: canonical_fence,
+        _store: store,
+    })
+}
+
 fn observe_current_v1(
     session_root: &PrivateDirectory,
     session_id: &SessionId,
@@ -429,10 +511,10 @@ mod tests {
     };
 
     use super::{
-        activate_canonical_mount_v1, admit_session_mount_v1, observe_session_mount_v1,
-        select_session_mount_v1, CanonicalMountActivationErrorV1, CurrentV1MountFaultV1,
-        CurrentV1MountObservationV1, SessionMountAdmissionV1, SessionMountRejectionV1,
-        SessionMountSelectionV1,
+        activate_canonical_mount_v1, activate_current_v1_mount_v1, admit_session_mount_v1,
+        observe_session_mount_v1, select_session_mount_v1, CanonicalMountActivationErrorV1,
+        CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1, CurrentV1MountObservationV1,
+        SessionMountAdmissionV1, SessionMountRejectionV1, SessionMountSelectionV1,
     };
 
     fn revision(value: &str) -> RevisionId {
@@ -1160,5 +1242,141 @@ mod tests {
             )) if revision.as_str() == "rev-b"
                 && head == LogicalHead::Turn(TurnId::new("turn-mount-activation").unwrap())
         ));
+    }
+
+    #[test]
+    fn current_activation_initializes_pinned_store_and_revalidates_both_domains() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        std::fs::write(session_root.join("session-a.json"), &source).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        assert!(!session_root.join(".kitsu-store-v1").exists());
+
+        let activation =
+            activate_current_v1_mount_v1(&directory, store_id.clone(), &session, selection)
+                .unwrap();
+        assert_eq!(activation.value().saved().id, "session-a");
+        assert_eq!(activation.value().source_bytes(), source);
+        assert!(session_root.join(".kitsu-store-v1").is_dir());
+        assert!(
+            super::super::SessionLease::acquire(&directory, session.as_str())
+                .unwrap_err()
+                .contains("already active")
+        );
+        let competing_store =
+            super::super::physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+                .unwrap()
+                .unwrap();
+        assert!(competing_store
+            .acquire_writer_fence(&session)
+            .unwrap_err()
+            .contains("already active"));
+        assert_eq!(
+            std::fs::read(session_root.join("session-a.json")).unwrap(),
+            source
+        );
+
+        drop(activation);
+        let legacy = super::super::SessionLease::acquire(&directory, session.as_str()).unwrap();
+        drop(legacy);
+        drop(competing_store.acquire_writer_fence(&session).unwrap());
+    }
+
+    #[test]
+    fn current_activation_refuses_replaced_bytes_or_new_canonical_head() {
+        let root = tempfile::tempdir().unwrap();
+        let replaced_root = root.path().join("replaced");
+        std::fs::create_dir(&replaced_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let current_path = replaced_root.join("session-a.json");
+        std::fs::write(&current_path, &source).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&replaced_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let mut replacement: serde_json::Value = serde_json::from_slice(&source).unwrap();
+        replacement["model"] = serde_json::json!("model-replaced");
+        let replacement = serde_json::to_vec(&replacement).unwrap();
+        std::fs::write(&current_path, &replacement).unwrap();
+        assert_eq!(
+            activate_current_v1_mount_v1(&directory, store_id.clone(), &session, selection)
+                .unwrap_err(),
+            CurrentV1MountActivationErrorV1::CurrentV1ValueChanged
+        );
+        assert_eq!(std::fs::read(&current_path).unwrap(), replacement);
+
+        let canonical_root = root.path().join("canonical-appeared");
+        std::fs::create_dir(&canonical_root).unwrap();
+        std::fs::write(canonical_root.join("session-a.json"), &source).unwrap();
+        let canonical_directory =
+            super::super::PrivateDirectory::open(&canonical_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&canonical_directory, store_id.clone(), &session);
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open_pinned(
+            &canonical_directory,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        assert!(matches!(
+            activate_current_v1_mount_v1(
+                &canonical_directory,
+                store_id,
+                &session,
+                selection
+            ),
+            Err(CurrentV1MountActivationErrorV1::CanonicalChanged(
+                SessionLookupState::Present { revision, head }
+            )) if revision.as_str() == "rev-a" && head == LogicalHead::Genesis
+        ));
+        assert_eq!(
+            std::fs::read(canonical_root.join("session-a.json")).unwrap(),
+            source
+        );
+
+        let partial_root = root.path().join("partial-appeared");
+        std::fs::create_dir(&partial_root).unwrap();
+        std::fs::write(
+            partial_root.join("session-a.json"),
+            current_v1_bytes(1, "session-a"),
+        )
+        .unwrap();
+        let partial_directory =
+            super::super::PrivateDirectory::open(&partial_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(
+            &partial_directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+        );
+        let store_root = partial_root.join(".kitsu-store-v1");
+        std::fs::create_dir(&store_root).unwrap();
+        assert!(matches!(
+            activate_current_v1_mount_v1(
+                &partial_directory,
+                StoreId::new("store-a").unwrap(),
+                &session,
+                selection
+            ),
+            Err(CurrentV1MountActivationErrorV1::StoreInitialization(_))
+        ));
+        assert_eq!(
+            std::fs::read_dir(&store_root).unwrap().count(),
+            0,
+            "activation must not repair a partial concurrent canonical root"
+        );
     }
 }
