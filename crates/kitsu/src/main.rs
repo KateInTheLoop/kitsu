@@ -5278,10 +5278,10 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     SlashCommandSpec {
         name: "cost",
         args: "",
-        description: "cumulative session token usage across all turns",
-        details: "Cumulative session usage: prompt + completion = total tokens across all completed turns, plus the live context-window position. Kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire.",
+        description: "compatibility alias for current-session usage",
+        details: "",
         group: CommandGroup::ContextHistory,
-        alias_of: None,
+        alias_of: Some("usage"),
     },
     SlashCommandSpec {
         name: "delete",
@@ -5549,9 +5549,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "usage",
-        args: "session",
+        args: "[session]",
         description: "show observed provider token usage for this session",
-        details: "Shows current-process provider usage and exact response coverage. Missing usage and cached-token attribution stay unavailable; no prices, credits, rate limits, or account data are inferred.",
+        details: "Shows current-process provider usage and exact response coverage. Bare `/usage` means `/usage session`; `/cost` is retained as an empty-args-only compatibility alias for the identical snapshot. Missing usage and cached-token attribution stay unavailable; no prices, credits, rate limits, or account data are inferred.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -18057,8 +18057,8 @@ async fn handle_slash(
                 return SlashResult::Error;
             }
         },
-        "usage" => {
-            if arg != "session" {
+        "usage" | "cost" => {
+            if name == "usage" && !matches!(arg, "" | "session") {
                 eprintln!("usage: {}", slash_syntax("usage"));
                 return SlashResult::Error;
             }
@@ -18082,7 +18082,9 @@ async fn handle_slash(
                     )
                 );
             }
-            // Deliberately no JSONL command_result contract in this card.
+            // Both spellings deliberately retain the existing lifecycle-only
+            // JSONL contract: the script driver keeps the original command
+            // text in command_started/command_finished and receives no result.
             return SlashResult::Continue(None);
         }
         "compact" => {
@@ -18383,47 +18385,6 @@ async fn handle_slash(
                     SlashResult::Error
                 }
             };
-        }
-        "cost" => {
-            // Billed truth lives in the shared tallies: they survive turn
-            // rollback and include subagent spend (cycle-23 audit #3).
-            let tallies = &session.run_tallies;
-            eprintln!(
-                "session usage: {} prompt + {} completion = {} total token(s) across {} turn(s), subagent spend included ({} via {})",
-                tallies.prompt_tokens.load(Ordering::Acquire),
-                tallies.completion_tokens.load(Ordering::Acquire),
-                tallies.total_tokens.load(Ordering::Acquire),
-                tallies.turns.load(Ordering::Acquire),
-                terminal_inline(model),
-                terminal_inline(&session.gateway),
-            );
-            {
-                let per_model = tallies
-                    .per_model
-                    .lock()
-                    .unwrap_or_else(std::sync::PoisonError::into_inner);
-                if per_model.len() > 1 {
-                    for (bin_model, (prompt, completion, total)) in per_model.iter() {
-                        eprintln!(
-                            "  {}: {prompt} prompt + {completion} completion = {total} total",
-                            terminal_inline(bin_model)
-                        );
-                    }
-                }
-            }
-            if let Some(window) = context_window.get() {
-                let budget = kitsu_core::ContextBudget::new(window, cli.max_output_tokens);
-                let (used, _) = session_context_used(messages, session, state);
-                let percent = (used.saturating_mul(100)) / budget.effective.max(1);
-                eprintln!(
-                    "context window: {used} of {} effective token(s) used ({percent}%), window {window} — /context for provenance",
-                    budget.effective,
-                );
-            }
-            eprintln!(
-                "~ kitsu meters tokens, not currency — multiply by your gateway's rates; provider-side prompt-cache discounts are not itemized on the OpenAI-compatible wire"
-            );
-            return SlashResult::Continue(None);
         }
         "loop" => {
             let mut parts = arg.splitn(2, char::is_whitespace);
@@ -20811,7 +20772,13 @@ mod tests {
                 Some(parent) => {
                     assert!(help.contains(&format!("(alias: /{})", spec.name)));
                     assert!(
-                        !help.contains(&spec.syntax()),
+                        !help.lines().any(|line| {
+                            let row = line.trim_start();
+                            row == spec.syntax()
+                                || row
+                                    .strip_prefix(&spec.syntax())
+                                    .is_some_and(|rest| rest.starts_with("  "))
+                        }),
                         "alias {} has own row",
                         spec.name
                     );
@@ -20831,16 +20798,35 @@ mod tests {
     }
 
     #[test]
-    fn usage_registry_exposes_only_the_exact_session_form() {
+    fn usage_registry_exposes_session_default_and_cost_compatibility_alias() {
         let usage = SLASH_COMMANDS
             .iter()
             .find(|spec| spec.name == "usage")
             .expect("/usage is registered");
-        assert_eq!(usage.args, "session");
-        assert_eq!(usage.syntax(), "/usage session");
+        assert_eq!(usage.args, "[session]");
+        assert_eq!(usage.syntax(), "/usage [session]");
         assert!(!usage.description.contains("daily"));
         assert!(!usage.description.contains("weekly"));
-        assert!(!usage.description.contains("cost"));
+
+        let cost = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "cost")
+            .expect("/cost remains registered for compatibility");
+        assert_eq!(cost.args, "");
+        assert_eq!(cost.syntax(), "/cost");
+        assert_eq!(cost.alias_of, Some("usage"));
+        assert!(cost.description.contains("compatibility"));
+
+        let help = slash_help("test-model", false);
+        assert!(help.contains("/usage [session]"));
+        assert!(help.contains("(alias: /cost)"));
+        assert!(!help
+            .lines()
+            .any(|line| line.trim_start().starts_with("/cost ")));
+
+        let cost_help = slash_command_help("cost");
+        assert!(cost_help.starts_with("/usage [session]"));
+        assert!(cost_help.contains("/cost is an alias of /usage"));
     }
 
     #[test]
