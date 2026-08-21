@@ -729,6 +729,7 @@ gates merely because a card appears attractive.
 | 118 | E06-S01-C6 | Execute exact sealed native bytes under one bounded Landlock filesystem-content policy with no pathname fallback |
 | 119 | E06-S01-C7 | Retain one sealed authorized child across strictly serial bounded line frames with exact deadlines, caps, and owned cleanup |
 | 120 | E05-S01-C3 | Compose the pure local setup transaction with descriptor-relative create-new publication and exact concrete recovery ownership |
+| 121 | E08-S05-C6 | Mount exact offline `/context window` from one typed current-session observation and the existing adaptive renderer |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1065,6 +1066,12 @@ Collision, missing parent, publication failure, rollback, and incomplete stage
 cleanup retain distinct ownership and never overwrite existing configuration.
 The coordinator remains private and unmounted: no prompt, UI, activation,
 provider, catalog, credential, hosted, or custom path is added.
+Cycle 121 mounts exact `/context window` from one bound route receipt and one
+synchronous typed current-session snapshot. Only the context section renders,
+using the same adaptive and accessible destination policy as the status and
+usage decks. Bare `/context` and `/context refresh` remain unchanged. The new
+view is offline and side-effect-free; JSONL keeps lifecycle framing but gains no
+new result payload or misleading reuse of the legacy context schema.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

@@ -5269,9 +5269,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "context",
-        args: "[refresh]",
-        description: "show context utilization or refresh discovered window metadata",
-        details: "Source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `refresh` re-discovers window metadata from the gateway.",
+        args: "[window|refresh]",
+        description: "show context details/window or refresh discovered metadata",
+        details: "Bare `/context` shows source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `window` shows the focused typed occupancy view. `refresh` re-discovers window metadata from the gateway.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -18008,6 +18008,37 @@ async fn handle_slash(
                 return SlashResult::Continue(Some(context_command_payload(
                     model, messages, session, state,
                 )));
+            }
+            "window" => {
+                // This reads the immutable receipt for the already-bound route;
+                // neither receipt capture nor the typed session observation has
+                // an await point or a provider/account/filesystem operation.
+                let provider_route = match provider.receipt() {
+                    Ok(receipt) => receipt,
+                    Err(error) => {
+                        eprintln!("cannot inspect current provider route: {error}");
+                        return SlashResult::Error;
+                    }
+                };
+                let snapshot = collect_current_session_snapshot(
+                    provider_route,
+                    messages,
+                    session,
+                    perms,
+                    state,
+                );
+                if !cli.jsonl {
+                    eprintln!(
+                        "{}",
+                        session_telemetry_render::render_current_session_context(
+                            &snapshot,
+                            current_session_deck_options(cli),
+                        )
+                    );
+                }
+                // The legacy bare `/context` payload describes its detailed
+                // source/compaction view, not this typed focused projection.
+                return SlashResult::Continue(None);
             }
             "refresh" => {
                 return refresh_session_context_window(
