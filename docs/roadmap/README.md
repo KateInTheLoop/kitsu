@@ -1142,6 +1142,25 @@ returns and panics cannot poison a later libtest worker, and an older live guard
 cannot erase a newer injected plan. Deterministic regressions cover all three
 channels; create-new, collision, durability, cleanup, ledger, and rollback
 semantics are unchanged.
+The Cycle 129 acceptance repair then fixes the production rollback defect that
+the clean full suite exposed. The pinned parent now carries a nonblocking
+advisory Kitsu-writer lock through publication and rollback; quarantine rename
+rebaselines only its own ctime transition, and exact receipt-fd/name evidence
+classifies removed, restored, displaced, or unknown ownership. This is not a
+conditional unlink primitive and does not contain arbitrary noncooperating or
+privileged same-UID writers; a private transaction namespace/authority remains
+a later hardening gate.
+Cycle 130 runs the private MCP composition against an exact test-only raw peer
+inside the sealed memfd, Landlock, seccomp, serial-transport lifecycle. The
+fixture proves one-child initialize/notification/list/call framing, exact
+typed protocol failures, cancellation, shutdown, and descendant reaping. It
+adds no product configuration, inventory, handler, provider, or user-visible
+MCP surface.
+Cycle 131 binds private model-picker snapshots, views, and proposals to exact
+typed provider profile, adapter, and wire-revision identity derived from a
+validated route declaration. Capabilities and route generations deliberately
+do not define the model namespace, and offline/stale membership truth remains
+unchanged. Selection still has no apply/publication/UI/product mount.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

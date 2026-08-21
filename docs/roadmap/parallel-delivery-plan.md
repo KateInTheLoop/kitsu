@@ -1,8 +1,10 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave plus Cycles 126-129 are accepted on
-`improvements/post-118`; active lanes are Cycle 130's real-child MCP peer proof
-and Cycle 131's model-picker namespace binding.
+Status: the first post-118 wave plus Cycles 126-131 are accepted on
+`improvements/post-118`. Cycle 129 required one additional acceptance-repair
+commit after a clean parallel run exposed a real quarantine timestamp and
+result-classification defect. The active implementation card is Cycle 132's
+explicit namespace-matched model-selection/local-setup composition.
 
 ## Objective
 
@@ -99,10 +101,23 @@ emitted line and current definition/reference classification after ranking;
 the frozen 5-to-3-round and 1,456-to-1,134-byte result remains unchanged. A
 later product mount still requires explicit trigger/root ownership,
 cancellation/deadlines, context accounting, and canonical projection rules.
-Cycle 129 separately hardens test-only publication fault injection so parallel
+Cycle 129 first hardens test-only publication fault injection so parallel
 acceptance cannot be misclassified by a stale thread-local fault or hook left
-after an early return or unwind. It changes no production publication,
-rollback, or no-clobber semantics.
+after an early return or unwind. A completely clean full-suite run then exposed
+a distinct production rollback defect: Kitsu's own quarantine rename changed
+ctime and a pathname result could be misclassified as displaced. The repair
+retains a nonblocking advisory Kitsu-writer lock on the pinned parent, exact
+receipt-fd/name classification, and a strict post-rename baseline. It does not
+claim a Linux conditional unlink primitive or containment of non-cooperating
+same-UID writers; a private transaction-directory/authority mechanism remains
+a separate future card.
+
+Cycle 130 proves the existing private MCP composition against one real sealed
+test-only peer without mounting inventory or configuration. Cycle 131 adds the
+exact profile/compiled-adapter/wire namespace value required before a model
+proposal can be consumed. Cycle 132 may now compose only an explicit
+namespace-equal proposal with the private local setup coordinator; it may not
+add UI, catalog/network access, credentials, activation, or product routing.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
@@ -112,8 +127,9 @@ file tail treated as canonical HEAD.
 ## Checkpoint and acceleration measure
 
 Cycle 118 is the stable pushed review base and `improvements/post-118` is the
-clean next integration branch. Parallel work accelerates discovery and
-implementation latency, while serialized acceptance preserves bisectability and
-one truthful roadmap. Progress is measured by accepted gates and integrated
-packets—not by multiplying the estimated gate matrix into hundreds of supposed
-features.
+clean next integration branch through Cycle 131. Parallel work accelerates
+discovery and implementation latency, while serialized acceptance preserves
+bisectability and one truthful roadmap. Numbered cycles, integration commits,
+tests, and replaceability gates are reported separately: Cycle 129 legitimately
+has one extra repair commit. Progress is measured by accepted outcomes—not by
+multiplying the estimated gate matrix into hundreds of supposed features.
