@@ -8278,6 +8278,19 @@ fn test_help_exposes_screen_reader_mode() {
         .stdout(predicate::str::contains("KITSU_SCREEN_READER"));
 }
 
+#[test]
+fn test_help_exposes_yolo_as_the_dangerous_skip_permissions_alias() {
+    let home = TempDir::new().unwrap();
+    let mut cmd = base_cmd(home.path());
+    cmd.arg("--help");
+    cmd.assert()
+        .success()
+        .stdout(predicate::str::contains("--dangerously-skip-permissions"))
+        .stdout(predicate::str::contains("--yolo"))
+        .stdout(predicate::str::contains("DANGER"))
+        .stdout(predicate::str::contains("Hard guards survive"));
+}
+
 #[cfg(unix)]
 #[tokio::test]
 #[serial]
@@ -16959,6 +16972,137 @@ fn test_dangerously_skip_permissions_discloses_and_protect_guards() {
         text.contains("secrets"),
         "protected path missing from disclosure: {text}"
     );
+}
+
+/// The short spelling is only a CLI alias: both spellings take the same
+/// existing non-prompting filesystem path, emit the same truthful warning and
+/// machine policy, and do not disclose ambient secret-shaped values.
+#[tokio::test]
+#[serial]
+async fn test_yolo_matches_dangerous_skip_permissions_without_a_prompt() {
+    use wiremock::matchers::{body_string_contains, method, path};
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    let work = TempDir::new().expect("ungranted work dir");
+    let target = work.path().join("created-without-a-prompt.txt");
+    let tool_args = serde_json::json!({
+        "path": target.to_string_lossy(),
+        "content": "same existing authority path"
+    })
+    .to_string();
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .and(body_string_contains("\"role\":\"tool\""))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {"role": "assistant", "content": "done"},
+                "finish_reason": "stop"
+            }]
+        })))
+        .with_priority(1)
+        .expect(2)
+        .mount(&server)
+        .await;
+    Mock::given(method("POST"))
+        .and(path(CHAT_PATH))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": null,
+                    "tool_calls": [{
+                        "id": "write_outside_roots",
+                        "type": "function",
+                        "function": {"name": "fs_write_file", "arguments": tool_args}
+                    }]
+                },
+                "finish_reason": "tool_calls"
+            }]
+        })))
+        .with_priority(10)
+        .expect(2)
+        .mount(&server)
+        .await;
+
+    let home = TempDir::new().expect("temp home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("unattended.script");
+    fs::write(&script, "create the requested file\n/permissions\n/quit\n").unwrap();
+
+    let mut policy_receipts = Vec::new();
+    for flag in ["--dangerously-skip-permissions", "--yolo"] {
+        if target.exists() {
+            fs::remove_file(&target).unwrap();
+        }
+        let home_path = home.path().to_path_buf();
+        let script_path = script.clone();
+        let output = tokio::task::spawn_blocking(move || {
+            let mut cmd = base_cmd(&home_path);
+            cmd.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+                .env("DO_NOT_DISCLOSE_SECRET", "top-secret-fixture-value")
+                .args([
+                    "--gateway",
+                    "example",
+                    "--jsonl",
+                    "--no-stream",
+                    flag,
+                    "chat",
+                    "--no-session",
+                    "--script",
+                    &script_path.to_string_lossy(),
+                ])
+                .output()
+                .expect("run unattended alias fixture")
+        })
+        .await
+        .unwrap();
+        assert!(
+            output.status.success(),
+            "flag {flag}; stderr: {}; stdout: {}",
+            String::from_utf8_lossy(&output.stderr),
+            String::from_utf8_lossy(&output.stdout)
+        );
+        assert_eq!(
+            fs::read_to_string(&target).unwrap(),
+            "same existing authority path",
+            "flag: {flag}"
+        );
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        let stdout = String::from_utf8(output.stdout).unwrap();
+        assert!(stderr.contains("DANGEROUSLY SKIPPING PERMISSIONS"));
+        assert!(!stderr.contains("permission —"), "flag {flag}: {stderr}");
+        assert!(!stderr.contains("top-secret-fixture-value"));
+        assert!(!stdout.contains("top-secret-fixture-value"));
+        let events = stdout
+            .lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .collect::<Vec<_>>();
+        assert!(events
+            .iter()
+            .all(|event| event["type"] != "permission_prompt"));
+        let permissions = events
+            .iter()
+            .rfind(|event| event["result"]["kind"] == "permissions")
+            .expect("permissions payload");
+        policy_receipts.push(serde_json::json!({
+            "mode": permissions["result"]["mode"],
+            "dangerous_global_bypass": permissions["result"]["dangerous_global_bypass"],
+            "command_mode": permissions["result"]["commands"]["mode"],
+        }));
+    }
+
+    assert_eq!(policy_receipts[0], policy_receipts[1]);
+    assert_eq!(
+        policy_receipts[0]["mode"],
+        "DANGER: global filesystem bypass"
+    );
+    assert_eq!(policy_receipts[0]["dangerous_global_bypass"], true);
+    assert!(
+        policy_receipts[0]["command_mode"].is_null(),
+        "the bypass alias must not enable command capability by itself"
+    );
+    server.verify().await;
 }
 
 /// When the legacy form is unsatisfiable because the launch directory sits

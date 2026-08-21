@@ -188,6 +188,7 @@ pub struct Cli {
     /// <path>` can fence off more paths for the session.
     #[arg(
         long = "dangerously-skip-permissions",
+        visible_alias = "yolo",
         global = true,
         conflicts_with_all = ["yes", "dangerously_allow_all_filesystem"]
     )]
