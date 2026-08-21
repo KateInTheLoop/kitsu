@@ -773,6 +773,19 @@ cannot weaken or replace any backend-neutral assertion.
    lifecycle surface and cannot become a second active save owner. Before the
    private live store can occupy this slot, production needs one stable explicit
    local canonical store identity; path or display name must not substitute.
+   **Explicit local composition identity complete in Cycle 092:** a separate
+   bounded schema-1 record supplies one opaque `StoreId` beneath the pinned
+   sessions directory. Creation is owner-private and no-clobber; exact reopen is
+   stable, and a create loser adopts only a completely validated concurrent
+   winner. Malformed/zero/future/unknown-field/invalid identities plus symlink,
+   permissive-mode, and shared-link entries fail closed without repair. A
+   descriptor-relative install cannot follow an ancestor replacement. If the
+   identity becomes visible but directory sync fails, acquisition returns the
+   exact installed identity with an explicit durability warning. This mechanism
+   is unmounted and creates no physical canonical namespace. Before use, the
+   next boundary must bind it exactly to the physical `store.json` identity;
+   neither pathname nor this composition record may substitute for canonical
+   session HEAD.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
