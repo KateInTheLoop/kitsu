@@ -723,6 +723,8 @@ gates merely because a card appears attractive.
 | 112 | E08-S05-C4 | Collect one coherent in-memory snapshot and mount exact offline `/usage session` through the typed usage-only adaptive renderer |
 | 113 | E07-S01-C1 | Freeze a bounded provider-free mixed-language locate/explain/change-evidence baseline over the current read-only repository tools |
 | 114 | E05-S01-C1 | Stage a private effect-free guided-setup transaction with explicit consent, create-new publication, reverse owned rollback, and transferable residue |
+| 115 | E06-S01-C5 | Execute one prepared child through a private Linux backend with bounded pipes, real clocks, process-group cleanup, and truthful completion |
+| 116 | E05-S01-C2 | Publish secret-free guided-setup configuration create-new through descriptor-relative durability and exact owned rollback |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1014,6 +1016,15 @@ shutdown, descendant-group death, direct wait, drop cleanup, and retryable owned
 residue. It remains unmounted and one-process/one-request: filesystem
 confinement, immutable executable identity, serial MCP transport, inventory
 composition, configuration, and product acceptance are still absent.
+Cycle 116 gives the pure guided-setup transaction one private real configuration
+publication adapter. It renders bounded secret-free TOML, traverses an existing
+parent through no-follow descriptors, installs a same-directory mode-0600 stage
+with no-overwrite link publication and explicit durability truth, and records
+the exact installed object in a bounded concrete ledger. Rollback quarantines
+and removes only that verified object; mutation, cleanup uncertainty, or a
+registration/transfer failure retains a consuming retry owner. The mechanism is
+Linux-only and unmounted: it creates no parents, contacts no provider or
+credential store, prompts no user, selects no model, and activates no config.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
