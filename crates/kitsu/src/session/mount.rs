@@ -155,18 +155,18 @@ pub(super) struct SessionMountActivationV1 {
 }
 
 impl SessionMountActivationV1 {
-    pub(super) fn saved(&self) -> &SavedSession {
+    fn saved(&self) -> &SavedSession {
         match &self.inner {
             SessionMountActivationInnerV1::CurrentV1(activation) => activation.value().saved(),
             SessionMountActivationInnerV1::Canonical(activation) => activation.projection().saved(),
         }
     }
 
-    pub(super) fn receipt(&self) -> &SessionMountActivationReceiptV1 {
+    fn receipt(&self) -> &SessionMountActivationReceiptV1 {
         &self.receipt
     }
 
-    pub(super) fn save_canonical_operation(
+    fn save_canonical_operation(
         &mut self,
         revision_id: RevisionId,
         committed_at: String,
@@ -182,7 +182,7 @@ impl SessionMountActivationV1 {
         }
     }
 
-    pub(super) fn save_current_v1_snapshot(
+    fn save_current_v1_snapshot(
         &mut self,
         saved: SavedSession,
     ) -> Result<CurrentV1MountSaveReceiptV1, SessionMountSaveErrorV1> {
@@ -193,6 +193,59 @@ impl SessionMountActivationV1 {
             SessionMountActivationInnerV1::Canonical(_) => {
                 Err(SessionMountSaveErrorV1::CanonicalOperationRequired)
             }
+        }
+    }
+}
+
+/// The only private live session store boundary. It owns the total activation,
+/// so its borrowed resume value and all writes remain under the same legacy and
+/// canonical fences. It has no activation extractor or clone implementation.
+#[derive(Debug)]
+pub(super) struct SessionLiveStoreV1 {
+    activation: SessionMountActivationV1,
+}
+
+pub(super) enum SessionLiveStoreSaveV1 {
+    CurrentV1Snapshot(SavedSession),
+    CanonicalOperation {
+        revision_id: RevisionId,
+        committed_at: String,
+        input: CanonicalOperationInputV1,
+    },
+}
+
+#[derive(Debug)]
+pub(super) enum SessionLiveStoreSaveReceiptV1 {
+    CurrentV1(CurrentV1MountSaveReceiptV1),
+    Canonical(CanonicalMountSaveReceiptV1),
+}
+
+impl SessionLiveStoreV1 {
+    pub(super) fn saved(&self) -> &SavedSession {
+        self.activation.saved()
+    }
+
+    pub(super) fn receipt(&self) -> &SessionMountActivationReceiptV1 {
+        self.activation.receipt()
+    }
+
+    pub(super) fn save(
+        &mut self,
+        intent: SessionLiveStoreSaveV1,
+    ) -> Result<SessionLiveStoreSaveReceiptV1, SessionMountSaveErrorV1> {
+        match intent {
+            SessionLiveStoreSaveV1::CurrentV1Snapshot(saved) => self
+                .activation
+                .save_current_v1_snapshot(saved)
+                .map(SessionLiveStoreSaveReceiptV1::CurrentV1),
+            SessionLiveStoreSaveV1::CanonicalOperation {
+                revision_id,
+                committed_at,
+                input,
+            } => self
+                .activation
+                .save_canonical_operation(revision_id, committed_at, input)
+                .map(SessionLiveStoreSaveReceiptV1::Canonical),
         }
     }
 }
@@ -681,7 +734,7 @@ pub(super) fn activate_current_v1_mount_v1(
     })
 }
 
-pub(super) fn activate_session_mount_v1(
+fn activate_session_mount_v1(
     session_root: &PrivateDirectory,
     expected_store: StoreId,
     session_id: &SessionId,
@@ -734,6 +787,16 @@ pub(super) fn activate_session_mount_v1(
         },
         inner,
     })
+}
+
+pub(super) fn activate_session_live_store_v1(
+    session_root: &PrivateDirectory,
+    expected_store: StoreId,
+    session_id: &SessionId,
+    selection: SessionMountSelectionV1,
+) -> Result<SessionLiveStoreV1, SessionMountActivationErrorV1> {
+    activate_session_mount_v1(session_root, expected_store, session_id, selection)
+        .map(|activation| SessionLiveStoreV1 { activation })
 }
 
 fn observe_current_v1(
@@ -2418,6 +2481,189 @@ mod tests {
         assert_eq!(
             std::fs::read(session_root.join("session-a.json")).unwrap(),
             replacement
+        );
+    }
+
+    #[test]
+    fn live_store_owner_routes_current_and_canonical_without_releasing_fences() {
+        let current_root = tempfile::tempdir().unwrap();
+        let current_sessions = current_root.path().join("sessions");
+        std::fs::create_dir(&current_sessions).unwrap();
+        let current_store_id = StoreId::new("store-current").unwrap();
+        let current_session = SessionId::new("session-current").unwrap();
+        std::fs::write(
+            current_sessions.join("session-current.json"),
+            current_v1_bytes(1, current_session.as_str()),
+        )
+        .unwrap();
+        let current_directory =
+            super::super::PrivateDirectory::open(&current_sessions, "live-store fixture").unwrap();
+        let current_selection = select_session_mount_v1(
+            &current_directory,
+            current_store_id.clone(),
+            &current_session,
+        );
+        let mut current = super::activate_session_live_store_v1(
+            &current_directory,
+            current_store_id.clone(),
+            &current_session,
+            current_selection,
+        )
+        .unwrap();
+        assert_eq!(current.receipt().store(), &current_store_id);
+        assert_eq!(current.receipt().session(), &current_session);
+        assert_eq!(
+            current.receipt().source(),
+            &SessionMountActivatedSourceV1::CurrentV1
+        );
+
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-live-current-mismatch").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let mismatched = super::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-mismatch").unwrap(),
+            terminal,
+            "wrong representation".to_string(),
+            Some("must not publish".to_string()),
+        );
+        let before_mismatch = tree_snapshot(&current_sessions);
+        assert!(matches!(
+            current.save(super::SessionLiveStoreSaveV1::CanonicalOperation {
+                revision_id: revision("rev-wrong"),
+                committed_at: "2026-08-20T10:02:00.000Z".to_string(),
+                input: mismatched,
+            }),
+            Err(SessionMountSaveErrorV1::CurrentV1SnapshotRequired)
+        ));
+        assert_eq!(tree_snapshot(&current_sessions), before_mismatch);
+
+        let mut current_next = current.saved().clone();
+        current_next.updated_at = "2026-08-20T10:03:00.000Z".to_string();
+        current_next.model = "live-current".to_string();
+        let current_receipt = current
+            .save(super::SessionLiveStoreSaveV1::CurrentV1Snapshot(
+                current_next.clone(),
+            ))
+            .unwrap();
+        let super::SessionLiveStoreSaveReceiptV1::CurrentV1(receipt) = current_receipt else {
+            panic!("current live store must return a current-v1 receipt");
+        };
+        assert_eq!(receipt.durability_warning(), None);
+        assert_eq!(current.saved().model, "live-current");
+        assert!(
+            super::super::SessionLease::acquire(&current_directory, current_session.as_str())
+                .is_err()
+        );
+        let current_physical = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &current_directory,
+            current_store_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(current_physical
+            .acquire_writer_fence(&current_session)
+            .is_err());
+        drop(current);
+        drop(
+            super::super::SessionLease::acquire(&current_directory, current_session.as_str())
+                .unwrap(),
+        );
+        drop(
+            current_physical
+                .acquire_writer_fence(&current_session)
+                .unwrap(),
+        );
+
+        let canonical_root = tempfile::tempdir().unwrap();
+        let canonical_sessions = canonical_root.path().join("sessions");
+        let canonical_store_id = StoreId::new("store-canonical").unwrap();
+        let canonical_session = SessionId::new("session-canonical").unwrap();
+        let canonical_physical = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &canonical_sessions,
+            canonical_store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &canonical_physical,
+            &current_v1_bytes(1, canonical_session.as_str()),
+            &canonical_session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(canonical_physical);
+        let canonical_directory =
+            super::super::PrivateDirectory::open(&canonical_sessions, "live-store fixture")
+                .unwrap();
+        let canonical_selection = select_session_mount_v1(
+            &canonical_directory,
+            canonical_store_id.clone(),
+            &canonical_session,
+        );
+        let mut canonical = super::activate_session_live_store_v1(
+            &canonical_directory,
+            canonical_store_id.clone(),
+            &canonical_session,
+            canonical_selection,
+        )
+        .unwrap();
+        let before_mismatch = tree_snapshot(&canonical_sessions);
+        assert!(matches!(
+            canonical.save(super::SessionLiveStoreSaveV1::CurrentV1Snapshot(
+                canonical.saved().clone(),
+            )),
+            Err(SessionMountSaveErrorV1::CanonicalOperationRequired)
+        ));
+        assert_eq!(tree_snapshot(&canonical_sessions), before_mismatch);
+
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-live-canonical").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let input = super::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-a").unwrap(),
+            terminal,
+            "canonical live input".to_string(),
+            Some("canonical live answer".to_string()),
+        );
+        let canonical_receipt = canonical
+            .save(super::SessionLiveStoreSaveV1::CanonicalOperation {
+                revision_id: revision("rev-b"),
+                committed_at: "2026-08-20T10:03:00.000Z".to_string(),
+                input,
+            })
+            .unwrap();
+        let super::SessionLiveStoreSaveReceiptV1::Canonical(receipt) = canonical_receipt else {
+            panic!("canonical live store must return a canonical receipt");
+        };
+        let kitsu_core::session::SessionCommitOutcome::Published { receipt } = receipt.outcome()
+        else {
+            panic!("canonical live store must publish the successor");
+        };
+        assert_eq!(receipt.new_revision(), &revision("rev-b"));
+        assert_eq!(canonical.saved().updated_at, "2026-08-20T10:03:00.000Z");
+        let competing = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &canonical_directory,
+            canonical_store_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(competing.acquire_writer_fence(&canonical_session).is_err());
+        assert!(super::super::SessionLease::acquire(
+            &canonical_directory,
+            canonical_session.as_str(),
+        )
+        .is_err());
+        drop(canonical);
+        drop(competing.acquire_writer_fence(&canonical_session).unwrap());
+        drop(
+            super::super::SessionLease::acquire(&canonical_directory, canonical_session.as_str())
+                .unwrap(),
         );
     }
 }
