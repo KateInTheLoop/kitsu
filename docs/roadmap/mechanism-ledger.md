@@ -72,6 +72,16 @@ spines. It is not a fourth integration plane: E02 prevents a provider, store,
 child, or carrier from redefining success through EOF, idle, UI state, or a
 failed delivery.
 
+Cycle 129 also sharpens the writer-lock lesson. An advisory lock on a
+descriptor-pinned config parent is a useful physical fence for cooperating
+Kitsu publishers and can be retained by the exact publication/rollback owner.
+It is not conditional unlink, containment, or authority over arbitrary
+same-UID namespace writers. Linux exposes no unprivileged unlink-by-fd or
+inode-CAS operation; absolute quarantine deletion safety therefore requires a
+separately authorized private transaction directory/helper design or an honest
+retained residue. Random names, repeated stat checks, and process separation do
+not close that boundary.
+
 The telemetry deck is likewise not a fourth spine. It is a read-only projection
 of facts owned by E02/E03/E04/E06. A renderer, cache, aggregate, or file tail
 cannot become canonical run, route, session, authority, or usage truth.
