@@ -253,7 +253,15 @@ kernel.
   calls are fallible so no canonical state can masquerade as current-v1. Both
   lock domains remain held until the active owner drops. Public create and
   resume constructors still build only the current-v1 variant, so this cycle
-  changes no product persistence route.
+  changes no product persistence route. Cycle 095 adds one private exact-id
+  activation result that owns both this bound active owner and the exact resume
+  snapshot selected after activation. Current replacement between an earlier
+  load and activation cannot leak the stale value; canonical projection remains
+  bound to the exact owned HEAD. Invalid identity fails before opening the
+  sessions root. The coupled result exposes only read-only identity, name,
+  artifact-route, and saved-value views, with no consuming extractor or store
+  reference that could mutate behind the saved value. Product construction and
+  routing remain current-v1.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

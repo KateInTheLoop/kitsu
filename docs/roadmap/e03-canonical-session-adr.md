@@ -813,6 +813,19 @@ cannot weaken or replace any backend-neutral assertion.
    fixture still creates no composition or physical namespace. Before routing
    can switch, a private constructor must return the exact selected resume value
    with this owner so callers cannot retain a stale pre-activation snapshot.
+   **Exact selected-resume coupling complete in Cycle 095:** one private factory
+   accepts only an exact session identity, opens the pinned sessions root, binds
+   the explicit local store identity, activates under both fences, and only then
+   clones the selected current or canonical resume value. The result owns both
+   that value and its `ActiveSessionStore`; it exposes no consuming extractor or
+   store reference, because even an `&ActiveSessionStore` could save through
+   interior mutability and make the retained value stale. A current snapshot
+   replaced after a prior load returns only the exact replacement selected at
+   activation. Canonical projection matches the owned HEAD and both locks remain
+   held until the result drops. Invalid identity returns a typed error before
+   filesystem access. The factory is private and all product constructors still
+   choose current-v1. The next boundary can therefore unify product resume data
+   and owner handoff without yet selecting the bound route.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

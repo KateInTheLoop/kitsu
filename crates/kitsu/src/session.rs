@@ -130,6 +130,43 @@ struct BoundLocalActiveSessionStore {
     live: std::cell::RefCell<mount::LocalSessionLiveStoreV1>,
 }
 
+/// One exact resume value coupled to the bound active owner that selected and
+/// fenced it. There is deliberately no consuming extractor for either field.
+#[derive(Debug)]
+#[allow(dead_code)]
+struct BoundActiveSessionResumeV1 {
+    store: ActiveSessionStore,
+    saved: SavedSession,
+}
+
+#[derive(Debug)]
+#[allow(dead_code)]
+enum BoundActiveSessionResumeErrorV1 {
+    InvalidSessionId(String),
+    SessionRoot(String),
+    Activation(mount::LocalSessionLiveStoreActivationErrorV1),
+    SelectionIdentityMismatch,
+}
+
+#[allow(dead_code)]
+impl BoundActiveSessionResumeV1 {
+    fn id(&self) -> &str {
+        self.store.id()
+    }
+
+    fn name(&self) -> Option<&str> {
+        self.store.name()
+    }
+
+    fn artifacts_dir(&self) -> Result<PathBuf, String> {
+        self.store.artifacts_dir()
+    }
+
+    fn saved(&self) -> &SavedSession {
+        &self.saved
+    }
+}
+
 /// Evidence for one atomically installed session snapshot. On Unix the file
 /// descriptor is the exact inode created by the commit and remains valid even
 /// if another same-user process immediately renames, hard-links, or unlinks the
@@ -3038,7 +3075,6 @@ impl ActiveSessionStore {
         })
     }
 
-    #[allow(dead_code)]
     fn from_bound_local(live: mount::LocalSessionLiveStoreV1) -> Self {
         let sessions_dir = live.sessions_dir().to_path_buf();
         let id = live.saved().id.clone();
@@ -3196,6 +3232,27 @@ impl ActiveSessionStore {
             }
         }
     }
+}
+
+#[allow(dead_code)]
+fn activate_bound_session_resume_v1(
+    sessions_dir: &Path,
+    session_id: &str,
+) -> Result<BoundActiveSessionResumeV1, BoundActiveSessionResumeErrorV1> {
+    let session_id = kitsu_core::session::SessionId::new(session_id.to_string())
+        .map_err(|error| BoundActiveSessionResumeErrorV1::InvalidSessionId(error.to_string()))?;
+    let directory = open_session_directory(sessions_dir)
+        .map_err(BoundActiveSessionResumeErrorV1::SessionRoot)?;
+    let live = mount::activate_local_session_live_store_v1(&directory, &session_id)
+        .map_err(BoundActiveSessionResumeErrorV1::Activation)?;
+    let saved = live.saved().clone();
+    if saved.id != session_id.as_str() {
+        return Err(BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch);
+    }
+    Ok(BoundActiveSessionResumeV1 {
+        store: ActiveSessionStore::from_bound_local(live),
+        saved,
+    })
 }
 
 #[cfg(test)]
@@ -4971,6 +5028,121 @@ mod tests {
         assert!(competing.acquire_writer_fence(&session_id).is_err());
         assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
         drop(active);
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn bound_resume_returns_the_exact_current_value_selected_with_its_owner() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let initial = SessionStore::create(dir.clone()).unwrap();
+        initial
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("stale pre-activation value")],
+            )
+            .unwrap();
+        let id = initial.id().to_string();
+        drop(initial);
+        let stale = SessionStore::load(&dir, &id).unwrap();
+
+        let replacement = SessionStore::from_saved(dir.clone(), &stale).unwrap();
+        replacement
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("exact selected value")],
+            )
+            .unwrap();
+        drop(replacement);
+        let exact = SessionStore::load(&dir, &id).unwrap();
+        assert_ne!(encode_saved(&stale).unwrap(), encode_saved(&exact).unwrap());
+
+        let resume = activate_bound_session_resume_v1(&dir, &id).unwrap();
+        assert_eq!(
+            encode_saved(resume.saved()).unwrap(),
+            encode_saved(&exact).unwrap()
+        );
+        assert_eq!(resume.id(), id);
+        assert_eq!(resume.name(), exact.name.as_deref());
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+        let directory = PrivateDirectory::open(&dir, "bound resume fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+
+        let mut before_invalid = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        before_invalid.sort();
+        assert!(matches!(
+            activate_bound_session_resume_v1(&dir, "../unsafe"),
+            Err(BoundActiveSessionResumeErrorV1::InvalidSessionId(_))
+        ));
+        let mut after_invalid = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        after_invalid.sort();
+        assert_eq!(after_invalid, before_invalid);
+        drop(resume);
+        drop(SessionLease::acquire(&directory, &id).unwrap());
+    }
+
+    #[test]
+    fn bound_resume_returns_canonical_projection_with_the_head_owning_store() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "bound resume canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("session-bound-resume").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T10:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T10:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: Some("bound-canonical".to_string()),
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical resume")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-bound-resume").unwrap(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        let resume = activate_bound_session_resume_v1(&dir, session_id.as_str()).unwrap();
+        assert_eq!(resume.saved().id, saved.id);
+        assert_eq!(resume.saved().messages, saved.messages);
+        assert_eq!(resume.saved().name, saved.name);
+        assert_eq!(resume.id(), session_id.as_str());
+        assert!(resume.artifacts_dir().is_err());
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        assert!(competing.acquire_writer_fence(&session_id).is_err());
+        assert!(SessionLease::acquire(&directory, session_id.as_str()).is_err());
+        drop(resume);
         drop(competing.acquire_writer_fence(&session_id).unwrap());
         drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
     }
