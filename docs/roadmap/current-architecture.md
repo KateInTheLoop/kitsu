@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 113.
+updates through Cycle 114.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -382,6 +382,13 @@ kernel.
   points with exact round/token/tool-byte observations. Parser and runner caps
   bound every vector dimension and stop later calls on output overflow. This is
   neither a production contributor nor evidence that a semantic selector helps.
+- Cycle 114 stages a private effect-free guided-setup transaction under the
+  configuration owner. Bounded local, hosted, and custom inputs normalize into
+  non-secret previews; explicit consent is the first effect directive. Fenced
+  acquire, validate, create-new publish, and reverse rollback receipts preserve
+  primary failure/cancellation/collision truth and transfer incomplete owned
+  residue to a recovery owner. No UI, provider/catalog/credential adapter,
+  config write, model picker, or product route exists.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

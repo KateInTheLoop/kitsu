@@ -722,6 +722,7 @@ gates merely because a card appears attractive.
 | 111 | E06-S01-C4 | Consume exact authorized phase budgets in a provider-free supervisor with checked monotonic deadlines, ordered terminate/kill/reap transitions, and owned residue truth |
 | 112 | E08-S05-C4 | Collect one coherent in-memory snapshot and mount exact offline `/usage session` through the typed usage-only adaptive renderer |
 | 113 | E07-S01-C1 | Freeze a bounded provider-free mixed-language locate/explain/change-evidence baseline over the current read-only repository tools |
+| 114 | E05-S01-C1 | Stage a private effect-free guided-setup transaction with explicit consent, create-new publication, reverse owned rollback, and transferable residue |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -995,6 +996,15 @@ overflow stops later calls. The change vector proves only read-only evidence
 acquisition; it does not edit or claim task completion. Tree-sitter, reference
 graphs, PageRank, caching, provider calls, production registration, and any
 semantic-selector benefit remain unimplemented and require measured comparison.
+Cycle 114 begins E05 with a pure private transaction rather than a UI or effect
+adapter. Local, hosted, and custom proposals normalize bounded non-secret route
+facts offline; malformed endpoint/target shapes fail before a transaction.
+Explicit consent is the first effect-capable boundary, and exact fenced receipts
+advance acquire, validate, and create-new publish stages. Cancellation or failure
+after effects moves only adapter-reported owned receipts into reverse rollback;
+incomplete cleanup transfers non-cloneable residue with the primary cause. No
+prompt, model picker, provider/catalog call, credential entry/store, config write,
+CLI route, or first-success claim is mounted yet.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
