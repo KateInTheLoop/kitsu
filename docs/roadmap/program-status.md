@@ -11,18 +11,19 @@ binds exact runtime policy into preparation through Cycle 108 and consumes its
 phase budgets in a provider-free supervisor through Cycle 111. E08-S05 now has
 truthful current-run usage coverage and cached-token presence through Cycle 109,
 adaptive presentation-only decks through Cycle 110, and exact offline
-`/usage session` collection/routing through Cycle 112.
+`/usage session` collection/routing through Cycle 112. E07-S01 now has its first
+provider-free fixed-corpus measurement baseline through Cycle 113.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 112 / 112 |
+| Accepted cycles/commits after this cycle | 113 / 113 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 113 — E07-S01-C1: establish a deterministic provider-free mixed-language repository-task benchmark over current read-only tools |
+| Active epic/card | Cycle 114 — E05-S01-C1: stage a pure transactional no-clobber guided-setup proposal and rollback owner before mounting effects |
 
 ## Epic status
 
@@ -34,7 +35,7 @@ adaptive presentation-only decks through Cycle 110, and exact offline
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C4, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped runtime policy into a provider-free phase supervisor with checked deadlines, idempotent drain, termination-before-kill/reap clocks, and owned residue. Effects remain injected; next add a real bounded backend only behind these proofs. No product MCP route exists |
-| E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
+| E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **In progress** through E08-S05-C4 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; exact offline `/usage session` now collects one coherent in-memory observation and renders only its usage section adaptively. Full status/context migration, JSONL automation parity, aliases, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
@@ -156,6 +157,7 @@ adaptive presentation-only decks through Cycle 110, and exact offline
 | 110 | this document's commit | Adaptive truthful current-session telemetry decks |
 | 111 | this document's commit | Authorized monotonic child-phase supervision and owned residue truth |
 | 112 | this document's commit | Exact offline truthful `/usage session` collection and rendering |
+| 113 | this document's commit | Deterministic bounded mixed-language current-tool evidence baseline |
 
 ## Current green gates
 
@@ -772,6 +774,17 @@ zero, and portable cost is unavailable. Bare `/usage`, `/cost` compatibility,
 calendar aggregates, status/context migration, JSONL command-result/schema
 parity, and durable history remain unimplemented.
 
-No provider, session, MCP, semantic-context, onboarding, or multimodal feature
+Cycle 113 begins E07 with measurement rather than a production context change.
+One test-only harness embeds a tiny Rust/Python/TypeScript corpus and three
+versioned locate, explain, and change-evidence vectors. Fixed read-only plans
+produce one canonical 3,279-byte JSONL artifact that is byte-identical across
+independent temporary roots. The plans pass at 10,000 relevance basis points
+with exact `(rounds, estimated prompt tokens, canonical tool bytes)` values of
+`(1, 15, 298)`, `(2, 21, 783)`, and `(2, 29, 375)`. Inputs, calls, rubrics,
+arguments, outputs, and deadlines are capped; overflow stops later calls. No
+production registration, provider, cache, tree-sitter graph, ranking, mutation,
+or claim of semantic-selector benefit is added.
+
+No provider, session, MCP, production semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
 cleanup.
