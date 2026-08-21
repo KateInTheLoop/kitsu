@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 108.
+updates through Cycle 109.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -347,6 +347,14 @@ kernel.
   aggregate-bounded, NUL-free, and debug-redacted. Owned process group, denied
   network, and terminate-group-and-reap timeout behavior are mandatory. These
   are admission facts only; no production spawn or backend enforcement exists.
+- Cycle 109 extends current-run tallies with reported/missing provider-response
+  coverage and cached-prompt-token presence. One request-local tracker uses
+  physical attempt ordinals to deduplicate retry and terminal observations;
+  HTTP rejections are completed missing-usage responses, transport-only faults
+  are not, and usage remains reported if a later stream item fails. Fixed all,
+  inference, compaction, and future model-catalog buckets project through a pure
+  session-usage adapter. Catalog population, product snapshot mounting, slash
+  routing, rendering, JSONL, cost, and durable history remain absent.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -358,7 +366,7 @@ kernel.
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
 | External runtime tools | Static request inventory; closed external identities/fingerprints; exact atomic external-inventory publication; exact bounded child policy/admission plus provider-free lifecycle truth; pure bounded tools-only MCP codec | Same-process compiled handlers only; external snapshot has no live handler composition; runtime policy has no real enforcing backend; lifecycle effects are injected fixtures; codec owns no transport | E06 identity, admission/policy, publication-truth, lifecycle-truth, and wire foundations begun; no real child, MCP composition, or product configuration |
-| Host/UI protocol | CLI carriers plus one-way JSONL; pure unmounted current-session telemetry DTO | Consumer cannot service synchronous calls; snapshot performs no discovery or rendering | No named second host and slash output is unchanged; X003/X004 fail |
+| Host/UI protocol | CLI carriers plus one-way JSONL; pure unmounted current-session telemetry DTO plus truthful current-run usage coverage input | Consumer cannot service synchronous calls; snapshot performs no discovery or rendering; coverage makes no account/provider request | No named second host and slash output is unchanged; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
 ## Three spines and extraction order

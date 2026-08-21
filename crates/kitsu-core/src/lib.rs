@@ -20,7 +20,8 @@ pub use orchestrator::{
     ArtifactStoragePolicy, BoundedInlineOutput, CommandRuntimeInvocation, CommandRuntimeResult,
     CompactionLedger, CompactionMode, CompactionOutcome, CompactionReason, CompactionRecord,
     CompactionReport, ContextUnit, ContextWindowEvidence, ProviderDeadlineScope,
-    ProviderRequestPurpose, RunTallies, SpawnBudget, StructuredFinalizationGate,
+    ProviderRequestPurpose, ProviderUsageCoverageSnapshot, RunProviderUsageCoverageSnapshot,
+    RunTallies, RunUsageSnapshot, SpawnBudget, StructuredFinalizationGate,
     StructuredFinalizationRepair, StructuredFinalizationRepairTarget, SummaryFallbackReason,
     ToolArtifactStatus, TurnCompletion,
 };

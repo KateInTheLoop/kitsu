@@ -1,7 +1,9 @@
 use crate::{
     ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
-    CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode, SessionCostInput,
-    SessionId, SessionUsageInput, TelemetryProvenance, TelemetryValue, TruthClass,
+    CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode,
+    ProviderUsageCoverageSnapshot, RunProviderUsageCoverageSnapshot, RunUsageSnapshot,
+    SessionCostInput, SessionId, SessionUsageInput, TelemetryProvenance, TelemetryValue,
+    TruthClass, UsageSnapshot,
 };
 use kitsu_providers::{ProviderAdapterId, ProviderRouteReceipt, ProviderWireRevision};
 
@@ -191,6 +193,41 @@ fn provider_reported_usage_keeps_coverage_and_does_not_invent_currency_cost() {
     assert_eq!(
         snapshot.usage.monetary_cost.provenance(),
         TelemetryProvenance::PortableCostUnavailable
+    );
+}
+
+#[test]
+fn run_usage_adapter_preserves_partial_coverage_and_explicit_cached_zero() {
+    let all = ProviderUsageCoverageSnapshot {
+        responses_reporting_usage: 1,
+        responses_missing_usage: 2,
+        cached_prompt_tokens: Some(0),
+    };
+    let run = RunUsageSnapshot {
+        turns: 2,
+        prompt_tokens: 17,
+        completion_tokens: 3,
+        total_tokens: 20,
+        coverage: RunProviderUsageCoverageSnapshot {
+            all,
+            inference: all,
+            compaction: ProviderUsageCoverageSnapshot::default(),
+            model_catalog: ProviderUsageCoverageSnapshot::default(),
+        },
+    };
+
+    let usage = UsageSnapshot::from(SessionUsageInput::from_run_usage(
+        &run,
+        SessionCostInput::unavailable(),
+    ));
+
+    assert_eq!(usage.responses_reporting_usage.value(), Some(&1));
+    assert_eq!(usage.responses_missing_usage.value(), Some(&2));
+    assert_eq!(usage.prompt_tokens.value(), Some(&17));
+    assert_eq!(usage.cached_prompt_tokens.value(), Some(&0));
+    assert_eq!(
+        usage.cached_prompt_tokens.truth_class(),
+        TruthClass::ProviderReported
     );
 }
 
