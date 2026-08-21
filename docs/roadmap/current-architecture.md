@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 082.
+updates through Cycle 083.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -151,6 +151,13 @@ kernel.
   partial, wrong-store, future-schema, corrupt-HEAD, and symlinked layouts are
   typed refusal. It creates no namespace, record, permission change, sync,
   repair, staging entry, or lock. Production read/write routing remains unchanged.
+  Cycle 083 makes selection single-pass. A current-only result owns its parsed
+  snapshot plus exact observed bytes; a canonical-only result owns the already-
+  verified logical payload. Empty owns nothing, and rejection owns only typed
+  admission evidence, so dual/corrupt state cannot leak a selectable value.
+  Later pathname mutation does not rewrite the selection, while a new selection
+  sees the new fault. The large canonical value is boxed privately. Production
+  resume projection, activation revalidation, and routing remain unchanged.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
