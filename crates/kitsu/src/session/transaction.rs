@@ -23,7 +23,7 @@ use super::canonical::{
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
     PhysicalFileStoreV1, PhysicalHeadCasError, PhysicalHeadReadErrorV1, PhysicalReadErrorV1,
-    VerifiedRevisionCandidateV1,
+    PhysicalWriterFenceV1, VerifiedRevisionCandidateV1, VerifiedRevisionHeadEnvelopeV1,
 };
 
 const MAX_CANONICAL_LINEAGE_REVISIONS: usize = 4_096;
@@ -66,7 +66,7 @@ enum ArtifactResidueV1 {
 }
 
 #[derive(Debug)]
-struct CanonicalTransactionErrorV1 {
+pub(super) struct CanonicalTransactionErrorV1 {
     message: String,
     candidate_residue: CandidateResidueV1,
     artifact_residue: Vec<ArtifactResidueV1>,
@@ -413,17 +413,17 @@ impl CanonicalLineageLookupV1 {
 }
 
 #[derive(Debug)]
-struct CanonicalTransactionCommitV1 {
+pub(super) struct CanonicalTransactionCommitV1 {
     outcome: SessionCommitOutcome,
     durability_warning: Option<String>,
 }
 
 impl CanonicalTransactionCommitV1 {
-    fn outcome(&self) -> &SessionCommitOutcome {
+    pub(super) fn outcome(&self) -> &SessionCommitOutcome {
         &self.outcome
     }
 
-    fn durability_warning(&self) -> Option<&str> {
+    pub(super) fn durability_warning(&self) -> Option<&str> {
         self.durability_warning.as_deref()
     }
 }
@@ -1628,18 +1628,9 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
         // Validate and deterministically encode before a lock file, candidate,
         // or HEAD can be touched. The transaction stores these exact bytes.
-        let canonical_bytes = encode_canonical_payload(payload)
-            .map_err(CanonicalTransactionErrorV1::before_identity)?;
-        if payload.store_id() != self.store.store_id() {
-            return Err(CanonicalTransactionErrorV1::before_identity(format!(
-                "canonical store identity '{}' does not match physical store '{}'",
-                payload.store_id(),
-                self.store.store_id()
-            )));
-        }
+        let canonical_bytes = self.prepare_commit_payload(payload)?;
 
         let session = payload.session_id();
-        let revision = payload.revision_id();
         let expected = payload.parent_revision();
         let confirmed_receipt = self.receipt(payload, CommitDurability::Confirmed)?;
         let unconfirmed_receipt = self.receipt(payload, CommitDurability::PublishedUnconfirmed)?;
@@ -1655,6 +1646,168 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                     CandidateResidueV1::None,
                 )
             })?;
+
+        self.commit_prepared_under_fence(
+            payload,
+            &canonical_bytes,
+            &fence,
+            confirmed_receipt,
+            unconfirmed_receipt,
+            None,
+        )
+    }
+
+    fn commit_under_fence(
+        &self,
+        base: &CanonicalSessionRevisionV1,
+        payload: &CanonicalSessionRevisionV1,
+        fence: &PhysicalWriterFenceV1,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        // Activated mounts already own the exact session fence. Reacquiring it
+        // would self-conflict, so validate the supplied capability before any
+        // candidate allocation and execute the identical publication core.
+        let canonical_bytes = self.prepare_commit_payload(payload)?;
+        let session = payload.session_id();
+        let expected = payload.parent_revision();
+        if base.store_id() != self.store.store_id()
+            || base.session_id() != session
+            || expected != &ExpectedRevision::Exact(base.revision_id().clone())
+        {
+            return Err(CanonicalTransactionErrorV1::before_identity(
+                "activated canonical successor does not bind its exact retained base",
+            ));
+        }
+        fence
+            .confirm(self.store.store_id(), session)
+            .map_err(|message| {
+                CanonicalTransactionErrorV1::not_published(
+                    message,
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        let selected = self
+            .store
+            .read_head_envelope(session)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    error.to_string(),
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+            .ok_or_else(|| {
+                CanonicalTransactionErrorV1::not_published(
+                    "activated canonical HEAD disappeared before save admission",
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if selected.revision_id() != base.revision_id() {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                format!(
+                    "activated canonical revision conflict: expected '{}', observed '{}'",
+                    base.revision_id(),
+                    selected.revision_id()
+                ),
+                self.store,
+                session,
+                expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let selected_candidate = self
+            .store
+            .open_revision_candidate(session, selected.revision_id())
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("cannot reverify activated canonical base: {error}"),
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if selected_candidate.manifest_sha256() != selected.envelope().manifest_sha256() {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "activated canonical base no longer matches its selected HEAD envelope",
+                self.store,
+                session,
+                expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let observed_base = self
+            .decode_canonical_candidate(
+                session,
+                selected.revision_id().clone(),
+                &selected_candidate,
+            )
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("activated canonical base no longer verifies: {error}"),
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+            .payload;
+        if &observed_base != base {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "activated canonical base value changed before save admission",
+                self.store,
+                session,
+                expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let confirmed_receipt = self.receipt(payload, CommitDurability::Confirmed)?;
+        let unconfirmed_receipt = self.receipt(payload, CommitDurability::PublishedUnconfirmed)?;
+        self.commit_prepared_under_fence(
+            payload,
+            &canonical_bytes,
+            fence,
+            confirmed_receipt,
+            unconfirmed_receipt,
+            Some(&selected),
+        )
+    }
+
+    fn prepare_commit_payload(
+        &self,
+        payload: &CanonicalSessionRevisionV1,
+    ) -> Result<Vec<u8>, CanonicalTransactionErrorV1> {
+        let canonical_bytes = encode_canonical_payload(payload)
+            .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        if payload.store_id() != self.store.store_id() {
+            return Err(CanonicalTransactionErrorV1::before_identity(format!(
+                "canonical store identity '{}' does not match physical store '{}'",
+                payload.store_id(),
+                self.store.store_id()
+            )));
+        }
+        Ok(canonical_bytes)
+    }
+
+    fn commit_prepared_under_fence(
+        &self,
+        payload: &CanonicalSessionRevisionV1,
+        canonical_bytes: &[u8],
+        fence: &PhysicalWriterFenceV1,
+        confirmed_receipt: SessionCommitReceipt,
+        unconfirmed_receipt: SessionCommitReceipt,
+        exact_parent: Option<&VerifiedRevisionHeadEnvelopeV1>,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        let session = payload.session_id();
+        let revision = payload.revision_id();
+        let expected = payload.parent_revision();
 
         // Pre-admission under the exact session fence keeps an already-stale
         // transaction from allocating even an immutable orphan. The physical
@@ -1684,19 +1837,49 @@ impl<'a> CanonicalFileTransactionV1<'a> {
                 CandidateResidueV1::None,
             ));
         }
+        if let Some(exact_parent) = exact_parent {
+            let Some(current) = current.as_ref() else {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    "activated canonical HEAD disappeared during exact admission",
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                ));
+            };
+            if current.candidate().manifest() != exact_parent.manifest()
+                || current.candidate().manifest_sha256()
+                    != exact_parent.envelope().manifest_sha256()
+            {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    "activated canonical HEAD envelope changed during exact admission",
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::None,
+                ));
+            }
+        }
 
         self.verify_artifact_closure(payload, CandidateResidueV1::None)?;
 
-        let candidate = self
-            .store
-            .install_revision_candidate(
+        let candidate = match exact_parent {
+            Some(exact_parent) => self.store.install_revision_candidate_against_envelope(
+                payload.logical_schema(),
+                session.clone(),
+                revision.clone(),
+                exact_parent.envelope(),
+                canonical_bytes,
+            ),
+            None => self.store.install_revision_candidate(
                 payload.logical_schema(),
                 session.clone(),
                 revision.clone(),
                 expected.clone(),
-                &canonical_bytes,
-            )
-            .map_err(|error| self.install_error(payload, &canonical_bytes, error))?;
+                canonical_bytes,
+            ),
+        }
+        .map_err(|error| self.install_error(payload, canonical_bytes, error))?;
 
         #[cfg(test)]
         if self.fail_next_artifact_recheck.replace(false) {
@@ -1734,29 +1917,34 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             ));
         }
 
-        let (receipt, durability_warning) =
-            match self
+        let publication = match exact_parent {
+            Some(exact_parent) => {
+                self.store
+                    .compare_and_swap_head_against_envelope(fence, exact_parent, &candidate)
+            }
+            None => self
                 .store
-                .compare_and_swap_head(&fence, expected.clone(), &candidate)
-            {
-                Ok(_) => (confirmed_receipt, None),
-                Err(PhysicalHeadCasError::Publication {
-                    message,
-                    installed: true,
-                }) => (unconfirmed_receipt, Some(message)),
-                Err(error) => {
-                    return Err(CanonicalTransactionErrorV1::not_published(
-                        error.to_string(),
-                        self.store,
-                        session,
-                        expected,
-                        CandidateResidueV1::InstalledUnselected {
-                            revision: revision.clone(),
-                            durability: CandidateDurabilityV1::Confirmed,
-                        },
-                    ));
-                }
-            };
+                .compare_and_swap_head(fence, expected.clone(), &candidate),
+        };
+        let (receipt, durability_warning) = match publication {
+            Ok(_) => (confirmed_receipt, None),
+            Err(PhysicalHeadCasError::Publication {
+                message,
+                installed: true,
+            }) => (unconfirmed_receipt, Some(message)),
+            Err(error) => {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    error.to_string(),
+                    self.store,
+                    session,
+                    expected,
+                    CandidateResidueV1::InstalledUnselected {
+                        revision: revision.clone(),
+                        durability: CandidateDurabilityV1::Confirmed,
+                    },
+                ));
+            }
+        };
         Ok(CanonicalTransactionCommitV1 {
             outcome: SessionCommitOutcome::Published { receipt },
             durability_warning,
@@ -1960,6 +2148,15 @@ pub(super) fn lookup_canonical_mount_value_v1(
 ) -> (SessionLookupState, Option<CanonicalSessionRevisionV1>) {
     let lookup = CanonicalFileTransactionV1::new(store).lookup_canonical_head(session_id);
     (lookup.state, lookup.payload)
+}
+
+pub(super) fn commit_canonical_mount_payload_under_fence_v1(
+    store: &PhysicalFileStoreV1,
+    fence: &PhysicalWriterFenceV1,
+    base: &CanonicalSessionRevisionV1,
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+    CanonicalFileTransactionV1::new(store).commit_under_fence(base, payload, fence)
 }
 
 #[cfg(test)]
@@ -5775,6 +5972,255 @@ mod tests {
                 &rev_a
             )
             .exists()
+        );
+    }
+
+    #[test]
+    fn held_fence_commit_refuses_wrong_session_before_candidate_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            root.path(),
+            StoreId::new("store-1").unwrap(),
+        )
+        .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("rev-b").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            text_operation_input(
+                "turn-b",
+                "run-b",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                "input",
+                Some("answer"),
+            ),
+        )
+        .unwrap();
+        let wrong_session = SessionId::new("session-other").unwrap();
+        let wrong_fence = store.acquire_writer_fence(&wrong_session).unwrap();
+
+        let error = transaction
+            .commit_under_fence(&base, &next, &wrong_fence)
+            .unwrap_err();
+        assert!(error.to_string().contains("writer fence session mismatch"));
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            error.not_published_outcome(),
+            Some(&SessionCommitOutcome::NotPublished {
+                store: StoreId::new("store-1").unwrap(),
+                session: SessionId::new("session-1").unwrap(),
+                base_revision: ExpectedRevision::Exact(RevisionId::new("rev-a").unwrap()),
+            })
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &SessionId::new("session-1").unwrap(),
+                &RevisionId::new("rev-b").unwrap(),
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn held_fence_commit_refuses_same_revision_with_replaced_exact_envelope() {
+        let target_root = tempfile::tempdir().unwrap();
+        let replacement_root = tempfile::tempdir().unwrap();
+        let target = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            target_root.path(),
+            StoreId::new("store-1").unwrap(),
+        )
+        .unwrap();
+        let replacement = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            replacement_root.path(),
+            StoreId::new("store-1").unwrap(),
+        )
+        .unwrap();
+        let target_transaction = CanonicalFileTransactionV1::new(&target);
+        let replacement_transaction = CanonicalFileTransactionV1::new(&replacement);
+        let base = legacy_payload("rev-a");
+        target_transaction.commit(&base).unwrap();
+        replacement_transaction.commit(&base).unwrap();
+        let retained = append_complete_operation(
+            &base,
+            RevisionId::new("rev-b").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            text_operation_input(
+                "turn-b",
+                "run-b",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                "retained input",
+                Some("retained answer"),
+            ),
+        )
+        .unwrap();
+        let replacement_value = append_complete_operation(
+            &base,
+            RevisionId::new("rev-b").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            text_operation_input(
+                "turn-b",
+                "run-b",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                "replacement input",
+                Some("replacement answer"),
+            ),
+        )
+        .unwrap();
+        target_transaction.commit(&retained).unwrap();
+        replacement_transaction.commit(&replacement_value).unwrap();
+
+        let session = SessionId::new("session-1").unwrap();
+        let rev_b = RevisionId::new("rev-b").unwrap();
+        let fence = target.acquire_writer_fence(&session).unwrap();
+        for source_and_target in [
+            (
+                crate::session::physical::PhysicalLayoutV1::revision_manifest(
+                    replacement_root.path(),
+                    &session,
+                    &rev_b,
+                ),
+                crate::session::physical::PhysicalLayoutV1::revision_manifest(
+                    target_root.path(),
+                    &session,
+                    &rev_b,
+                ),
+            ),
+            (
+                crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                    replacement_root.path(),
+                    &session,
+                    &rev_b,
+                ),
+                crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                    target_root.path(),
+                    &session,
+                    &rev_b,
+                ),
+            ),
+            (
+                crate::session::physical::PhysicalLayoutV1::head_pointer(
+                    replacement_root.path(),
+                    &session,
+                ),
+                crate::session::physical::PhysicalLayoutV1::head_pointer(
+                    target_root.path(),
+                    &session,
+                ),
+            ),
+        ] {
+            std::fs::copy(source_and_target.0, source_and_target.1).unwrap();
+        }
+
+        let successor = append_complete_operation(
+            &retained,
+            RevisionId::new("rev-c").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            text_operation_input(
+                "turn-c",
+                "run-c",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                "new input",
+                Some("new answer"),
+            ),
+        )
+        .unwrap();
+        let error = target_transaction
+            .commit_under_fence(&retained, &successor, &fence)
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("base value changed before save admission"));
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                target_root.path(),
+                &session,
+                &RevisionId::new("rev-c").unwrap(),
+            )
+            .exists()
+        );
+    }
+
+    #[test]
+    fn held_fence_commit_preserves_candidate_and_head_sync_cut_truth() {
+        let candidate_root = tempfile::tempdir().unwrap();
+        let candidate_store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            candidate_root.path(),
+            StoreId::new("store-1").unwrap(),
+        )
+        .unwrap();
+        let candidate_transaction = CanonicalFileTransactionV1::new(&candidate_store);
+        let base = legacy_payload("rev-a");
+        candidate_transaction.commit(&base).unwrap();
+        let next = append_complete_operation(
+            &base,
+            RevisionId::new("rev-b").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            text_operation_input(
+                "turn-b",
+                "run-b",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                "input",
+                Some("answer"),
+            ),
+        )
+        .unwrap();
+        let session = SessionId::new("session-1").unwrap();
+        let fence = candidate_store.acquire_writer_fence(&session).unwrap();
+        candidate_transaction.inject_next_after_candidate_failure();
+        let error = candidate_transaction
+            .commit_under_fence(&base, &next, &fence)
+            .unwrap_err();
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: RevisionId::new("rev-b").unwrap(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }
+        );
+        assert_eq!(
+            candidate_store
+                .read_head(&session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &RevisionId::new("rev-a").unwrap()
+        );
+
+        let head_root = tempfile::tempdir().unwrap();
+        let head_store = crate::session::physical::PhysicalFileStoreV1::create_or_open(
+            head_root.path(),
+            StoreId::new("store-1").unwrap(),
+        )
+        .unwrap();
+        let head_transaction = CanonicalFileTransactionV1::new(&head_store);
+        head_transaction.commit(&base).unwrap();
+        let fence = head_store.acquire_writer_fence(&session).unwrap();
+        head_store.inject_next_head_sync_failure();
+        let commit = head_transaction
+            .commit_under_fence(&base, &next, &fence)
+            .unwrap();
+        assert_eq!(
+            receipt(&commit).durability(),
+            CommitDurability::PublishedUnconfirmed
+        );
+        assert!(commit.durability_warning().is_some());
+        assert_eq!(
+            head_store
+                .read_head(&session)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &RevisionId::new("rev-b").unwrap()
         );
     }
 }

@@ -7,14 +7,19 @@
 use std::ffi::OsStr;
 use std::io::Read;
 
-use kitsu_core::session::{LogicalHead, RevisionId, SessionId, SessionLookupState, StoreId};
+use kitsu_core::session::{
+    LogicalHead, RevisionId, SessionCommitOutcome, SessionId, SessionLookupState, StoreId,
+};
 
 use super::canonical::{
-    project_canonical_resume_v1, CanonicalResumeProjectionErrorV1, CanonicalResumeProjectionV1,
-    CanonicalSessionRevisionV1,
+    append_complete_operation, project_canonical_resume_v1, CanonicalOperationInputV1,
+    CanonicalResumeProjectionErrorV1, CanonicalResumeProjectionV1, CanonicalSessionRevisionV1,
 };
 use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1, PhysicalWriterFenceV1};
-use super::transaction::lookup_canonical_mount_value_v1;
+use super::transaction::{
+    commit_canonical_mount_payload_under_fence_v1, lookup_canonical_mount_value_v1,
+    CanonicalTransactionErrorV1,
+};
 use super::{
     PrivateDirectory, PrivateEntryKind, SavedSession, SessionLease, MAX_SESSION_BYTES,
     SESSION_VERSION,
@@ -86,9 +91,10 @@ pub(super) enum SessionMountSelectionV1 {
 #[derive(Debug)]
 pub(super) struct CanonicalMountActivationV1 {
     projection: CanonicalResumeProjectionV1,
+    base: CanonicalSessionRevisionV1,
     _legacy_lease: SessionLease,
-    _canonical_fence: PhysicalWriterFenceV1,
-    _store: PhysicalFileStoreV1,
+    canonical_fence: PhysicalWriterFenceV1,
+    store: PhysicalFileStoreV1,
 }
 
 #[derive(Debug)]
@@ -156,6 +162,22 @@ impl SessionMountActivationV1 {
     pub(super) fn receipt(&self) -> &SessionMountActivationReceiptV1 {
         &self.receipt
     }
+
+    pub(super) fn save_canonical_operation(
+        &mut self,
+        revision_id: RevisionId,
+        committed_at: String,
+        input: CanonicalOperationInputV1,
+    ) -> Result<CanonicalMountSaveReceiptV1, SessionMountSaveErrorV1> {
+        match &mut self.inner {
+            SessionMountActivationInnerV1::CurrentV1(_) => {
+                Err(SessionMountSaveErrorV1::CurrentV1SnapshotRequired)
+            }
+            SessionMountActivationInnerV1::Canonical(activation) => activation
+                .save_operation(revision_id, committed_at, input)
+                .map_err(SessionMountSaveErrorV1::Canonical),
+        }
+    }
 }
 
 impl CurrentV1MountActivationV1 {
@@ -168,6 +190,63 @@ impl CanonicalMountActivationV1 {
     pub(super) fn projection(&self) -> &CanonicalResumeProjectionV1 {
         &self.projection
     }
+
+    fn save_operation(
+        &mut self,
+        revision_id: RevisionId,
+        committed_at: String,
+        input: CanonicalOperationInputV1,
+    ) -> Result<CanonicalMountSaveReceiptV1, CanonicalMountSaveErrorV1> {
+        // Assembly and projection are pure. In particular, an operation that
+        // introduces artifacts is refused before a candidate can be installed.
+        let next = append_complete_operation(&self.base, revision_id, committed_at, input)
+            .map_err(CanonicalMountSaveErrorV1::Assembly)?;
+        let next_projection =
+            project_canonical_resume_v1(&next).map_err(CanonicalMountSaveErrorV1::Projection)?;
+        let commit = commit_canonical_mount_payload_under_fence_v1(
+            &self.store,
+            &self.canonical_fence,
+            &self.base,
+            &next,
+        )
+        .map_err(CanonicalMountSaveErrorV1::Transaction)?;
+        let receipt = CanonicalMountSaveReceiptV1 {
+            outcome: commit.outcome().clone(),
+            durability_warning: commit.durability_warning().map(str::to_string),
+        };
+        self.base = next;
+        self.projection = next_projection;
+        Ok(receipt)
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct CanonicalMountSaveReceiptV1 {
+    outcome: SessionCommitOutcome,
+    durability_warning: Option<String>,
+}
+
+impl CanonicalMountSaveReceiptV1 {
+    pub(super) fn outcome(&self) -> &SessionCommitOutcome {
+        &self.outcome
+    }
+
+    pub(super) fn durability_warning(&self) -> Option<&str> {
+        self.durability_warning.as_deref()
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum CanonicalMountSaveErrorV1 {
+    Assembly(String),
+    Projection(CanonicalResumeProjectionErrorV1),
+    Transaction(CanonicalTransactionErrorV1),
+}
+
+#[derive(Debug)]
+pub(super) enum SessionMountSaveErrorV1 {
+    CurrentV1SnapshotRequired,
+    Canonical(CanonicalMountSaveErrorV1),
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -400,9 +479,10 @@ pub(super) fn activate_canonical_mount_v1(
 
     Ok(CanonicalMountActivationV1 {
         projection,
+        base: *selected,
         _legacy_lease: legacy_lease,
-        _canonical_fence: canonical_fence,
-        _store: store,
+        canonical_fence,
+        store,
     })
 }
 
@@ -635,9 +715,10 @@ mod tests {
     use super::{
         activate_canonical_mount_v1, activate_current_v1_mount_v1, activate_session_mount_v1,
         admit_session_mount_v1, observe_session_mount_v1, select_session_mount_v1,
-        CanonicalMountActivationErrorV1, CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1,
-        CurrentV1MountObservationV1, SessionMountActivatedSourceV1, SessionMountActivationErrorV1,
-        SessionMountAdmissionV1, SessionMountRejectionV1, SessionMountSelectionV1,
+        CanonicalMountActivationErrorV1, CanonicalMountSaveErrorV1,
+        CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1, CurrentV1MountObservationV1,
+        SessionMountActivatedSourceV1, SessionMountActivationErrorV1, SessionMountAdmissionV1,
+        SessionMountRejectionV1, SessionMountSaveErrorV1, SessionMountSelectionV1,
     };
 
     fn revision(value: &str) -> RevisionId {
@@ -1621,5 +1702,335 @@ mod tests {
             ))
         ));
         assert_eq!(tree_snapshot(&session_root), before_rejected);
+    }
+
+    #[test]
+    fn canonical_total_activation_publishes_successor_under_its_owned_fence() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let mut activation =
+            activate_session_mount_v1(&directory, store_id.clone(), &session, selection).unwrap();
+
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-mounted-save-a").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-a").unwrap(),
+            terminal,
+            "first mounted input".to_string(),
+            Some("first mounted answer".to_string()),
+        );
+        let saved = activation
+            .save_canonical_operation(
+                revision("rev-b"),
+                "2026-08-20T10:03:00.000Z".to_string(),
+                input,
+            )
+            .unwrap();
+        assert_eq!(saved.durability_warning(), None);
+        let kitsu_core::session::SessionCommitOutcome::Published { receipt } = saved.outcome()
+        else {
+            panic!("mounted canonical save must publish");
+        };
+        assert_eq!(receipt.store(), &store_id);
+        assert_eq!(receipt.session(), &session);
+        assert_eq!(
+            receipt.base_revision(),
+            &ExpectedRevision::Exact(revision("rev-a"))
+        );
+        assert_eq!(receipt.new_revision(), &revision("rev-b"));
+        assert_eq!(
+            receipt.head(),
+            &LogicalHead::Turn(TurnId::new("turn-a").unwrap())
+        );
+        assert_eq!(activation.saved().updated_at, "2026-08-20T10:03:00.000Z");
+
+        // The activation advances its exact base after publication, so a
+        // second save chains from rev-b while the same fences remain owned.
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-mounted-save-b").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-b").unwrap(),
+            terminal,
+            "second mounted input".to_string(),
+            Some("second mounted answer".to_string()),
+        );
+        let saved = activation
+            .save_canonical_operation(
+                revision("rev-c"),
+                "2026-08-20T10:04:00.000Z".to_string(),
+                input,
+            )
+            .unwrap();
+        let kitsu_core::session::SessionCommitOutcome::Published { receipt } = saved.outcome()
+        else {
+            panic!("second mounted canonical save must publish");
+        };
+        assert_eq!(
+            receipt.base_revision(),
+            &ExpectedRevision::Exact(revision("rev-b"))
+        );
+        assert_eq!(receipt.new_revision(), &revision("rev-c"));
+        assert_eq!(activation.saved().updated_at, "2026-08-20T10:04:00.000Z");
+
+        let competing_store =
+            super::super::physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+                .unwrap()
+                .unwrap();
+        assert!(competing_store.acquire_writer_fence(&session).is_err());
+        let (state, value) =
+            super::super::transaction::lookup_canonical_mount_value_v1(&competing_store, &session);
+        assert_eq!(
+            state,
+            SessionLookupState::Present {
+                revision: revision("rev-c"),
+                head: LogicalHead::Turn(TurnId::new("turn-b").unwrap()),
+            }
+        );
+        assert_eq!(value.unwrap().revision_id(), &revision("rev-c"));
+    }
+
+    #[test]
+    fn total_activation_routes_current_v1_save_without_creating_canonical_state() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        std::fs::write(
+            session_root.join("session-a.json"),
+            current_v1_bytes(1, session.as_str()),
+        )
+        .unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id, &session);
+        let mut activation = activate_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &session,
+            selection,
+        )
+        .unwrap();
+        let before = tree_snapshot(&session_root);
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-current-save").unwrap()).terminal(
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+            );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-a").unwrap(),
+            terminal,
+            "must remain current-v1".to_string(),
+            Some("not canonically published".to_string()),
+        );
+        assert!(matches!(
+            activation.save_canonical_operation(
+                revision("rev-a"),
+                "2026-08-20T10:02:00.000Z".to_string(),
+                input,
+            ),
+            Err(SessionMountSaveErrorV1::CurrentV1SnapshotRequired)
+        ));
+        assert_eq!(tree_snapshot(&session_root), before);
+    }
+
+    #[test]
+    fn canonical_activation_refuses_artifact_projection_before_allocation() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let mut activation =
+            activate_session_mount_v1(&directory, store_id, &session, selection).unwrap();
+        let artifact = super::super::canonical::ImmutableArtifactRefV1::new(
+            1,
+            "artifact-a".to_string(),
+            "00".repeat(32),
+            7,
+            Some("text/plain".to_string()),
+        )
+        .unwrap();
+        let round = super::super::canonical::CanonicalToolRoundV1::new(
+            "fs_read_file".to_string(),
+            "{\"path\":\"a.txt\"}".to_string(),
+            "call-a".to_string(),
+            "content".to_string(),
+            "effect-a".to_string(),
+            artifact,
+        );
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-artifact-save").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_tool_round(
+            TurnId::new("turn-a").unwrap(),
+            terminal,
+            "read artifact".to_string(),
+            "done".to_string(),
+            round,
+        );
+        let before = tree_snapshot(&session_root);
+        assert!(matches!(
+            activation.save_canonical_operation(
+                revision("rev-b"),
+                "2026-08-20T10:03:00.000Z".to_string(),
+                input,
+            ),
+            Err(SessionMountSaveErrorV1::Canonical(
+                CanonicalMountSaveErrorV1::Projection(
+                    super::super::canonical::CanonicalResumeProjectionErrorV1::ArtifactClosureRequired {
+                        artifact_count: 1
+                    }
+                )
+            ))
+        ));
+        assert_eq!(tree_snapshot(&session_root), before);
+        assert_eq!(activation.saved().updated_at, "2026-08-20T10:02:00.000Z");
+    }
+
+    #[test]
+    fn canonical_activation_refuses_stale_head_without_allocating_a_candidate() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        let head_path =
+            super::super::physical::PhysicalLayoutV1::head_pointer(&session_root, &session);
+        let head_a = std::fs::read(&head_path).unwrap();
+        let (_, base) =
+            super::super::transaction::lookup_canonical_mount_value_v1(&store, &session);
+        super::super::transaction::publish_mount_successor_fixture_v1(
+            &store,
+            &base.unwrap(),
+            revision("rev-b"),
+            "2026-08-20T10:03:00.000Z".to_string(),
+        )
+        .unwrap();
+        let head_b = std::fs::read(&head_path).unwrap();
+        drop(store);
+
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let selection = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let mut activation =
+            activate_session_mount_v1(&directory, store_id, &session, selection).unwrap();
+        // Model a non-cooperating writer or external restore bypassing the held
+        // fence. The transaction must still compare the exact base before it
+        // allocates rev-c.
+        std::fs::write(&head_path, &head_a).unwrap();
+        let before = tree_snapshot(&session_root);
+        let terminal = kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-stale-save").unwrap())
+            .terminal(
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+            );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-stale").unwrap(),
+            terminal,
+            "stale input".to_string(),
+            Some("must not publish".to_string()),
+        );
+        let error = activation
+            .save_canonical_operation(
+                revision("rev-c"),
+                "2026-08-20T10:04:00.000Z".to_string(),
+                input,
+            )
+            .unwrap_err();
+        let SessionMountSaveErrorV1::Canonical(CanonicalMountSaveErrorV1::Transaction(
+            transaction_error,
+        )) = error
+        else {
+            panic!("stale HEAD must be a canonical transaction refusal");
+        };
+        assert!(transaction_error.to_string().contains("revision conflict"));
+        assert_eq!(tree_snapshot(&session_root), before);
+        assert_eq!(activation.saved().updated_at, "2026-08-20T10:03:00.000Z");
+
+        // A failed attempt does not advance the retained base. Restoring its
+        // exact rev-b HEAD permits the same rev-c successor to publish.
+        std::fs::write(&head_path, head_b).unwrap();
+        let terminal =
+            kitsu_core::RunSpec::new(kitsu_core::RunId::new("run-stale-save-retry").unwrap())
+                .terminal(
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                );
+        let input = super::super::canonical::CanonicalOperationInputV1::artifact_free_text(
+            TurnId::new("turn-retry").unwrap(),
+            terminal,
+            "retry input".to_string(),
+            Some("publish now".to_string()),
+        );
+        activation
+            .save_canonical_operation(
+                revision("rev-c"),
+                "2026-08-20T10:04:00.000Z".to_string(),
+                input,
+            )
+            .unwrap();
+        assert_eq!(activation.saved().updated_at, "2026-08-20T10:04:00.000Z");
     }
 }

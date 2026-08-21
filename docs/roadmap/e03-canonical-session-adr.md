@@ -723,6 +723,18 @@ cannot weaken or replace any backend-neutral assertion.
    unchanged with zero effects, while current/canonical activation faults remain
    distinct nested errors. The next boundary must transfer this owner into a
    live session store whose save behavior is explicitly representation-aware.
+   **Held-fence canonical save boundary complete in Cycle 088:** the total owner
+   routes canonical operations through its retained logical base, pinned store,
+   and already-owned writer fence; it never tries to reacquire that fence.
+   Successor assembly and resume projection happen before effects. Admission
+   then verifies the supplied fence identity, exact selected parent envelope,
+   and complete retained logical value before allocating a candidate. Candidate
+   installation binds the parent manifest digest and publication uses envelope
+   CAS. Published and published-unconfirmed results advance the owner's base and
+   projection; not-published cuts do not. Current-v1 returns a typed requirement
+   for its snapshot writer, and artifact-bearing projection refuses with zero
+   allocation. The next boundary must implement exact current-v1 save ownership
+   before production routing can consume the total activation.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
