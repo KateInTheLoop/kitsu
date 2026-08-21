@@ -2,12 +2,13 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S01 and E06-S02 are implemented through C2, and E06-S03
-has begun through C1;
+through Cycle 080; E06-S01 is implemented through C4, E06-S02 through C3, and
+E06-S03 has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
 provider-free monotonic inventory publication through Cycle 107, and E06-S01
-binds exact runtime policy into preparation through Cycle 108. E08-S05 now has
+binds exact runtime policy into preparation through Cycle 108 and consumes its
+phase budgets in a provider-free supervisor through Cycle 111. E08-S05 now has
 truthful current-run usage coverage and cached-token presence through Cycle 109,
 plus adaptive presentation-only decks through Cycle 110.
 
@@ -16,11 +17,11 @@ plus adaptive presentation-only decks through Cycle 110.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 110 / 110 |
+| Accepted cycles/commits after this cycle | 111 / 111 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 111 — E06-S01-C4: consume the authorized child policy in a provider-free phase supervisor with exact timeout, terminate, reap, and residue truth |
+| Active epic/card | Cycle 112 — E08-S05-C4: collect one coherent live snapshot and mount exact offline `/usage session` without inventing JSONL/account truth |
 
 ## Epic status
 
@@ -31,7 +32,7 @@ plus adaptive presentation-only decks through Cycle 110.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C3, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped phase/I/O/environment/process/network/timeout policy into a causal joined lifecycle owner, but effects remain injected and synchronous. Next add a real bounded backend only behind these proofs; no product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C4, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped runtime policy into a provider-free phase supervisor with checked deadlines, idempotent drain, termination-before-kill/reap clocks, and owned residue. Effects remain injected; next add a real bounded backend only behind these proofs. No product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **In progress** through E08-S05-C3 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; a private renderer provides adaptive styled and stable accessible/plain projections. Product snapshot collection and slash routing remain separate; durable history still consumes E03 fencing |
@@ -152,6 +153,7 @@ plus adaptive presentation-only decks through Cycle 110.
 | 108 | `90101b0` | Exact bounded child runtime policy identity and preparation |
 | 109 | `4b9d167` | Truthful provider usage coverage and cached-token accounting |
 | 110 | this document's commit | Adaptive truthful current-session telemetry decks |
+| 111 | this document's commit | Authorized monotonic child-phase supervision and owned residue truth |
 
 ## Current green gates
 
@@ -747,6 +749,16 @@ keeps its truth/provenance label, unavailable remains explicit, and cost is
 omitted unless the snapshot already carries a provider-reported currency value.
 The helper remains unmounted and performs no collection, provider/account/MCP
 call, filesystem access, persistence, JSONL emission, or slash routing.
+Cycle 111 adds the provider-free phase owner behind the authorized preparation
+proof. Startup and one request each receive an exact deadline; timeout,
+cancellation, and shutdown enter the same bounded drain, process-group
+termination, kill, and reap sequence. Termination happens before fresh kill and
+reap clocks begin. Clock regression/overflow, injected effect faults, drop, and
+reap expiry preserve non-cloneable child ownership in typed residue; a spawn
+failure owns no child. Natural exit/EOF/crash truth still belongs to the
+existing lifecycle and future backend composition. No OS process, containment
+enforcement, configuration, MCP transport, inventory publication, or product
+route is added.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
