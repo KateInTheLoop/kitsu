@@ -704,6 +704,7 @@ gates merely because a card appears attractive.
 | 096 | E03-S02-C37 | Route startup and in-process current-v1 resume through one exact owner-plus-snapshot product handoff |
 | 097 | E03-S02-C38 | Unify current-v1 and private bound activation behind one exact resume-result shape without route selection |
 | 098 | E03-S02-C39 | Admit only snapshot-writable bound-current resume and reject canonical state before product routing |
+| 099 | E03-S02-C40 | Mount durable startup resume on the pinned bound-current route with explicit canonical refusal |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -856,9 +857,14 @@ until explicit admission. Cycle 098 adds that type-state admission. Bound-curren
 returns a private product-writable result whose save path preserves exact current
 bytes and durability truth. Canonical state returns a typed operation-writer
 refusal, leaves HEAD unchanged, and releases both fences; missing state remains
-effect-free. Cycle 099 next mounts startup selector resolution onto this
-bound-current route while keeping canonical startup unsupported, then continues
-through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
+effect-free. Cycle 099 mounts durable startup resume on one pinned selector-to-ID
+and bound-current activation. Exact/name/`last`/`auto` return only the snapshot
+selected under the owner; exact canonical state refuses before runtime parts.
+Bound-current reset atomically hands off to a fresh current-v1 owner so `/new`
+remains usable; canonical reset still refuses. Cycle 100 next applies the same
+route as a staged in-process owner swap and runs the consolidated review,
+workspace acceptance, polish, and branch checkpoint before E03, E06, E07,
+E05/E08, and E09 continue in dependency-safe parallel tracks.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

@@ -163,7 +163,7 @@ enum BoundActiveSessionResumeErrorV1 {
 
 #[derive(Debug)]
 #[allow(dead_code)]
-struct ProductWritableBoundResumeV1 {
+pub struct ProductWritableBoundResumeV1 {
     resume: ActiveSessionResume,
 }
 
@@ -177,7 +177,7 @@ enum ProductWritableBoundResumeAdmissionErrorV1 {
 
 #[allow(dead_code)]
 impl ProductWritableBoundResumeV1 {
-    fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
+    pub fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
         (self.resume.store, self.resume.saved)
     }
 }
@@ -3097,6 +3097,22 @@ impl ActiveSessionStore {
         })
     }
 
+    pub fn resume_bound_current_v1(
+        dir: PathBuf,
+        selector: &str,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
+        let directory = open_session_directory(&dir)?;
+        let summaries = CurrentV1FileReadPort {
+            directory: &directory,
+        }
+        .list()?;
+        let id = resolve_selector(&summaries, selector, None)?;
+        let session_id = kitsu_core::session::SessionId::new(id.clone())
+            .map_err(|error| format!("invalid resolved session identity: {error}"))?;
+        admit_product_writable_bound_resume_in_directory_v1(&directory, &session_id)
+            .map_err(|error| product_writable_bound_resume_error(&id, error))
+    }
+
     fn from_bound_local(live: mount::LocalSessionLiveStoreV1) -> Self {
         let sessions_dir = live.sessions_dir().to_path_buf();
         let id = live.saved().id.clone();
@@ -3174,8 +3190,24 @@ impl ActiveSessionStore {
     pub fn reset(&mut self) -> Result<(), String> {
         match &mut self.inner {
             ActiveSessionStoreInner::CurrentV1(store) => store.reset(),
-            ActiveSessionStoreInner::BoundLocal(_) => {
-                Err("bound local session reset is not mounted yet".to_string())
+            ActiveSessionStoreInner::BoundLocal(store) => {
+                let source = store
+                    .live
+                    .try_borrow()
+                    .map_err(|_| "bound local session store is already in use".to_string())?
+                    .activation_receipt()
+                    .source()
+                    .clone();
+                match source {
+                    mount::SessionMountActivatedSourceV1::CurrentV1 => {
+                        let replacement = SessionStore::create(store.sessions_dir.clone())?;
+                        self.inner = ActiveSessionStoreInner::CurrentV1(replacement);
+                        Ok(())
+                    }
+                    mount::SessionMountActivatedSourceV1::Canonical { .. } => {
+                        Err("canonical session reset is not mounted yet".to_string())
+                    }
+                }
             }
         }
     }
@@ -3265,7 +3297,14 @@ fn activate_bound_session_resume_v1(
         .map_err(|error| BoundActiveSessionResumeErrorV1::InvalidSessionId(error.to_string()))?;
     let directory = open_session_directory(sessions_dir)
         .map_err(BoundActiveSessionResumeErrorV1::SessionRoot)?;
-    let live = mount::activate_local_session_live_store_v1(&directory, &session_id)
+    activate_bound_session_resume_in_directory_v1(&directory, &session_id)
+}
+
+fn activate_bound_session_resume_in_directory_v1(
+    directory: &PrivateDirectory,
+    session_id: &kitsu_core::session::SessionId,
+) -> Result<ActiveSessionResume, BoundActiveSessionResumeErrorV1> {
+    let live = mount::activate_local_session_live_store_v1(directory, session_id)
         .map_err(BoundActiveSessionResumeErrorV1::Activation)?;
     let saved = live.saved().clone();
     let resume = ActiveSessionResume {
@@ -3285,6 +3324,21 @@ fn admit_product_writable_bound_resume_v1(
 ) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
     let resume = activate_bound_session_resume_v1(sessions_dir, session_id)
         .map_err(ProductWritableBoundResumeAdmissionErrorV1::Activation)?;
+    admit_product_writable_bound_resume_value_v1(resume)
+}
+
+fn admit_product_writable_bound_resume_in_directory_v1(
+    directory: &PrivateDirectory,
+    session_id: &kitsu_core::session::SessionId,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
+    let resume = activate_bound_session_resume_in_directory_v1(directory, session_id)
+        .map_err(ProductWritableBoundResumeAdmissionErrorV1::Activation)?;
+    admit_product_writable_bound_resume_value_v1(resume)
+}
+
+fn admit_product_writable_bound_resume_value_v1(
+    resume: ActiveSessionResume,
+) -> Result<ProductWritableBoundResumeV1, ProductWritableBoundResumeAdmissionErrorV1> {
     let source = match &resume.store.inner {
         ActiveSessionStoreInner::CurrentV1(_) => {
             return Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(
@@ -3306,6 +3360,106 @@ fn admit_product_writable_bound_resume_v1(
         mount::SessionMountActivatedSourceV1::Canonical { .. } => {
             Err(ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable)
         }
+    }
+}
+
+fn product_writable_bound_resume_error(
+    session_id: &str,
+    error: ProductWritableBoundResumeAdmissionErrorV1,
+) -> String {
+    match error {
+        ProductWritableBoundResumeAdmissionErrorV1::CanonicalOperationWriterUnavailable => {
+            format!(
+                "session '{session_id}' uses canonical history; startup resume requires the canonical operation writer"
+            )
+        }
+        ProductWritableBoundResumeAdmissionErrorV1::OwnerInUse => {
+            format!("session '{session_id}' activation owner is already in use")
+        }
+        ProductWritableBoundResumeAdmissionErrorV1::Activation(error) => {
+            bound_active_resume_error(session_id, error)
+        }
+    }
+}
+
+fn bound_active_resume_error(session_id: &str, error: BoundActiveSessionResumeErrorV1) -> String {
+    match error {
+        BoundActiveSessionResumeErrorV1::InvalidSessionId(message)
+        | BoundActiveSessionResumeErrorV1::SessionRoot(message) => message,
+        BoundActiveSessionResumeErrorV1::SelectionIdentityMismatch => {
+            format!("session '{session_id}' activation selected a different session identity")
+        }
+        BoundActiveSessionResumeErrorV1::Activation(error) => {
+            local_live_store_activation_error(session_id, error)
+        }
+    }
+}
+
+fn local_live_store_activation_error(
+    session_id: &str,
+    error: mount::LocalSessionLiveStoreActivationErrorV1,
+) -> String {
+    match error {
+        mount::LocalSessionLiveStoreActivationErrorV1::Identity(error) => match error {
+            identity::LocalStoreIdentityErrorV1::Read(message)
+            | identity::LocalStoreIdentityErrorV1::Write { message, .. } => message,
+            identity::LocalStoreIdentityErrorV1::UnboundPhysicalNamespace => {
+                "local session store has a physical namespace without an owning identity"
+                    .to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::UnsafeEntry => {
+                "local session store identity is not owner-private".to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::Malformed => {
+                "local session store identity is malformed".to_string()
+            }
+            identity::LocalStoreIdentityErrorV1::Unsupported {
+                observed,
+                supported,
+            } => format!(
+                "local session store identity schema {observed} is unsupported; this Kitsu supports {supported}"
+            ),
+            identity::LocalStoreIdentityErrorV1::InvalidStoreIdentity => {
+                "local session store identity is invalid".to_string()
+            }
+        },
+        mount::LocalSessionLiveStoreActivationErrorV1::IdentityBindingMismatch => {
+            "local session store identity does not match its physical store".to_string()
+        }
+        mount::LocalSessionLiveStoreActivationErrorV1::Activation(error) => match error {
+            mount::SessionMountActivationErrorV1::Empty => format!(
+                "session '{session_id}' disappeared while it was being resumed; retry the resume"
+            ),
+            mount::SessionMountActivationErrorV1::Rejected(_) => format!(
+                "session '{session_id}' has unavailable or conflicting durable representations"
+            ),
+            mount::SessionMountActivationErrorV1::CurrentV1(error) => match error {
+                mount::CurrentV1MountActivationErrorV1::SessionRoot(message)
+                | mount::CurrentV1MountActivationErrorV1::LegacyFence(message)
+                | mount::CurrentV1MountActivationErrorV1::StoreInitialization(message)
+                | mount::CurrentV1MountActivationErrorV1::CanonicalFence(message) => message,
+                mount::CurrentV1MountActivationErrorV1::WrongSelection
+                | mount::CurrentV1MountActivationErrorV1::SelectionIdentityMismatch
+                | mount::CurrentV1MountActivationErrorV1::CurrentV1Changed(_)
+                | mount::CurrentV1MountActivationErrorV1::CurrentV1ValueChanged
+                | mount::CurrentV1MountActivationErrorV1::CanonicalChanged(_) => format!(
+                    "session '{session_id}' changed while it was being resumed; retry the resume"
+                ),
+            },
+            mount::SessionMountActivationErrorV1::Canonical(error) => match error {
+                mount::CanonicalMountActivationErrorV1::LegacyFence(message)
+                | mount::CanonicalMountActivationErrorV1::CanonicalFence(message) => message,
+                mount::CanonicalMountActivationErrorV1::WrongSelection
+                | mount::CanonicalMountActivationErrorV1::SelectionIdentityMismatch
+                | mount::CanonicalMountActivationErrorV1::Projection(_)
+                | mount::CanonicalMountActivationErrorV1::StoreUnavailable(_)
+                | mount::CanonicalMountActivationErrorV1::CurrentV1Changed(_)
+                | mount::CanonicalMountActivationErrorV1::CanonicalChanged(_)
+                | mount::CanonicalMountActivationErrorV1::CanonicalValueChanged { .. } => format!(
+                    "session '{session_id}' canonical state changed or is unavailable; retry the resume"
+                ),
+            },
+        },
     }
 }
 
@@ -5052,17 +5206,20 @@ mod tests {
             installed.messages,
             [ChatMessage::user("installed unconfirmed")]
         );
-        assert!(active.reset().unwrap_err().contains("not mounted"));
-        assert_eq!(active.id(), id);
-
         let physical = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
             .unwrap()
             .unwrap();
         assert!(physical.acquire_writer_fence(&session_id).is_err());
         assert!(SessionLease::acquire(&directory, &id).is_err());
-        drop(active);
+        active.reset().unwrap();
+        let reset_id = active.id().to_string();
+        assert_ne!(reset_id, id);
+        assert_eq!(active.name(), None);
         drop(physical.acquire_writer_fence(&session_id).unwrap());
         drop(SessionLease::acquire(&directory, &id).unwrap());
+        assert!(SessionLease::acquire(&directory, &reset_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &reset_id).unwrap());
     }
 
     #[test]
@@ -5356,5 +5513,87 @@ mod tests {
             Err(ProductWritableBoundResumeAdmissionErrorV1::Activation(_))
         ));
         assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn startup_bound_resume_resolves_current_selectors_to_one_exact_owned_value() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let cwd = std::env::current_dir().unwrap();
+        let mut legacy = SessionStore::create(dir.clone()).unwrap();
+        legacy.set_name(Some("startup-route".to_string()));
+        legacy
+            .save(
+                &cwd,
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("startup exact value")],
+            )
+            .unwrap();
+        let id = legacy.id().to_string();
+        drop(legacy);
+
+        for selector in [id.as_str(), "startup-route", "last", "auto"] {
+            let admitted =
+                ActiveSessionStore::resume_bound_current_v1(dir.clone(), selector).unwrap();
+            let (active, saved) = admitted.into_parts();
+            assert_eq!(active.id(), id);
+            assert_eq!(saved.id, id);
+            assert_eq!(saved.name.as_deref(), Some("startup-route"));
+            assert_eq!(saved.messages, [ChatMessage::user("startup exact value")]);
+            let directory = PrivateDirectory::open(&dir, "startup route fixture").unwrap();
+            assert!(SessionLease::acquire(&directory, &id).is_err());
+            drop(active);
+            drop(SessionLease::acquire(&directory, &id).unwrap());
+        }
+        assert!(dir.join(identity::LOCAL_STORE_IDENTITY_NAME).is_file());
+        assert!(dir.join(".kitsu-store-v1").is_dir());
+    }
+
+    #[test]
+    fn startup_bound_resume_refuses_exact_canonical_before_returning_product_parts() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let directory = PrivateDirectory::prepare(&dir, "startup canonical fixture").unwrap();
+        let identity = identity::acquire_local_store_identity_v1(&directory).unwrap();
+        let store_id = identity.store_id().clone();
+        let session_id = kitsu_core::session::SessionId::new("s-startup-canonical").unwrap();
+        let saved = SavedSession {
+            version: SESSION_VERSION,
+            id: session_id.as_str().to_string(),
+            created_at: "2026-08-20T12:00:00.000Z".to_string(),
+            updated_at: "2026-08-20T12:01:00.000Z".to_string(),
+            directory: root.path().display().to_string(),
+            gateway: "gateway-a".to_string(),
+            model: "model-a".to_string(),
+            name: None,
+            project_context: None,
+            messages: vec![ChatMessage::user("canonical startup source")],
+        };
+        let physical =
+            physical::PhysicalFileStoreV1::create_or_open(&dir, store_id.clone()).unwrap();
+        transaction::publish_current_v1_mount_fixture_v1(
+            &physical,
+            &encode_saved(&saved).unwrap(),
+            &session_id,
+            kitsu_core::session::RevisionId::new("rev-startup-canonical").unwrap(),
+            "2026-08-20T12:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(physical);
+        let head_path = physical::PhysicalLayoutV1::head_pointer(&dir, &session_id);
+        let head_before = std::fs::read(&head_path).unwrap();
+
+        let error = ActiveSessionStore::resume_bound_current_v1(dir.clone(), session_id.as_str())
+            .unwrap_err();
+        assert!(error.contains("canonical operation writer"));
+        assert_eq!(std::fs::read(&head_path).unwrap(), head_before);
+        assert!(!dir.join(format!("{}.json", session_id.as_str())).exists());
+        let competing = physical::PhysicalFileStoreV1::open_existing(&directory, store_id)
+            .unwrap()
+            .unwrap();
+        drop(competing.acquire_writer_fence(&session_id).unwrap());
+        drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
     }
 }

@@ -14354,14 +14354,33 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         }
     }
     let sessions_dir = setup.state_dir.join("sessions");
-    let resumed = match resume {
-        Some(selector) => Some(
-            session::SessionStore::load(&sessions_dir, selector)
-                .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?,
+    let resumed_existing = resume.is_some();
+    let (mut session_store, resumed) = match (resume, durable_session) {
+        (Some(selector), true) => {
+            let admitted = session::ActiveSessionStore::resume_bound_current_v1(
+                sessions_dir.clone(),
+                selector,
+            )
+            .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?;
+            let (store, saved) = admitted.into_parts();
+            (Some(store), Some(saved))
+        }
+        (Some(selector), false) => (
+            None,
+            Some(
+                session::SessionStore::load(&sessions_dir, selector)
+                    .map_err(|error| CliError::user(format!("cannot resume chat: {error}")))?,
+            ),
         ),
-        None => None,
+        (None, true) => (
+            Some(
+                session::ActiveSessionStore::create(sessions_dir.clone())
+                    .map_err(CliError::user)?,
+            ),
+            None,
+        ),
+        (None, false) => (None, None),
     };
-    let resumed_existing = resumed.is_some();
     if let Some(saved) = resumed.as_ref() {
         let current = std::env::current_dir().map_err(|error| {
             CliError::user(format!("cannot resolve current directory: {error}"))
@@ -14375,26 +14394,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             )));
         }
     }
-    let (mut session_store, resumed) = if durable_session {
-        match resumed {
-            Some(saved) => {
-                let handoff =
-                    session::ActiveSessionStore::resume_current_v1(sessions_dir.clone(), saved)
-                        .map_err(CliError::user)?;
-                let (store, saved) = handoff.into_current_v1_parts().map_err(CliError::user)?;
-                (Some(store), Some(saved))
-            }
-            None => (
-                Some(
-                    session::ActiveSessionStore::create(sessions_dir.clone())
-                        .map_err(CliError::user)?,
-                ),
-                None,
-            ),
-        }
-    } else {
-        (None, resumed)
-    };
     if let Some(requested_name) = session_name {
         let Some(store) = session_store.as_mut() else {
             return Err(CliError::user(

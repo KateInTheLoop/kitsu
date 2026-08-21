@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C39, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C40, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 98 / 98 |
+| Accepted cycles/commits after this cycle | 99 / 99 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C40 (Cycle 099) — mount startup selector resume on bound-current admission while canonical remains unsupported |
+| Active epic/card | E03 / E03-S02-C41 (Cycle 100) — stage in-process bound-current owner swap, consolidate acceptance, and polish the branch checkpoint |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C39, E03-S05 through C4 | A private type-state gate now yields product parts only for snapshot-writable bound-current activation. Canonical returns a typed operation-writer refusal with unchanged HEAD and released locks; missing state is effect-free. Startup/in-process route selection, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C40, E03-S05 through C4 | Durable startup resume now resolves and activates through one pinned bound-current route; exact/name/last/auto use only the owned selected snapshot, canonical refuses, and bound-current reset preserves `/new` through an atomic fresh current-v1 handoff. In-process route selection, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -134,7 +134,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 095 | `869b40f` | Exact selected resume and bound-owner coupling |
 | 096 | `98ad3e7` | Exact current-v1 product resume handoff |
 | 097 | `db35d47` | Common exact current/bound resume result |
-| 098 | this document's commit | Snapshot-writable bound-current admission |
+| 098 | `9f08a50` | Snapshot-writable bound-current admission |
+| 099 | this document's commit | Pinned bound-current startup resume route |
 
 ## Current green gates
 
@@ -625,18 +626,24 @@ changes, while no-session resume keeps its read-only behavior. The old public
 store-only resume constructor is gone, so product call sites cannot discard the
 exact snapshot half. Cycle 097 removes the duplicate bound-only wrapper and
 returns the same `ActiveSessionResume` from exact bound activation. Its snapshot
-remains borrowed
-while the owner holds both fences. The only consuming split is explicitly
-current-v1 and rejects either bound source, releasing locks without exposing a
+remains borrowed while the owner holds both fences. The only consuming split is
+explicitly current-v1 and rejects either bound source, releasing locks without exposing a
 writable store. Product call sites remain on the current constructor. Cycle 098
 adds admission for bound-current as a private type-state wrapper. It inspects the
 exact owned activation receipt: current-v1 becomes product-writable and saves an
 exact successor through the bound owner; canonical returns
 `CanonicalOperationWriterUnavailable` before yielding either field. Refusal
 leaves HEAD unchanged and releases both lock domains, while missing state creates
-nothing. Product call sites remain current-only. Cycle 099 next resolves startup
-selectors first, then activates the exact identity through this bound-current
-gate without admitting canonical state.
+nothing. Product call sites remain current-only. Cycle 099 exposes the admitted
+route only to durable startup. A single pinned
+sessions descriptor resolves exact/name/`last`/`auto` to an ID and activates it;
+the preliminary catalog value never crosses into runtime. Product messages use
+only the exact snapshot owned under both fences. Exact canonical state returns a
+bounded operation-writer error and yields no parts. Review also closed a reset
+regression: bound-current `/new` now creates a fresh current-v1 owner before
+dropping the old bound owner, while canonical reset remains unsupported. Cycle
+100 next performs the in-process target activation and one-time owner swap, then
+runs full cross-cycle review and acceptance.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

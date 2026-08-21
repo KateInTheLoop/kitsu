@@ -279,6 +279,14 @@ kernel.
   Bound canonical activation returns a typed missing-operation-writer refusal,
   changes no HEAD, and releases both fences without yielding either field.
   Missing state remains effect-free. Product routing is still current-v1.
+  Cycle 099 selects the bound-current route for durable startup resume. Selector
+  listing/resolution and activation share one pinned sessions descriptor; only
+  the exact snapshot returned under both fences crosses into runtime. Current
+  exact/name/last/auto semantics remain, while an exact canonical ID returns the
+  operation-writer refusal before yielding product parts. Bound-current reset
+  now creates a fresh current-v1 owner before replacing and dropping the old
+  bound owner, preserving `/new`; canonical reset still refuses. In-process
+  `/resume` remains current-v1 until Cycle 100.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
