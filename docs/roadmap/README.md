@@ -737,6 +737,7 @@ gates merely because a card appears attractive.
 | 126 | E06-S03-C2 | Compose the pinned tools-only MCP codec with one proof-bounded strictly serial child owner and fail-closed cleanup truth |
 | 127 | E08-S05-C8 | Mount an offline typed `/context sources` deck with estimated coarse rows and explicit unavailable sub-buckets |
 | 128 | E07-S01-C4 | Compile the measured selector as an unmounted bounded read-only contributor with current authority and source revalidation |
+| 129 | E05-S01-C4 | Isolate test-only publication, rollback, and hook fault plans with generation-scoped unwind-safe guards |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1134,6 +1135,13 @@ evidence cannot yield a partial artifact. The frozen 286/517/331-byte outputs,
 10,000-basis-point relevance, and 5-to-3-round result remain unchanged. No
 tree-sitter/index/cache, provider call, edit, automatic context injection, or
 user-visible semantic feature is claimed.
+Cycle 129 fixes the acceptance harness rather than production behavior.
+Publication, rollback, and pre-install-hook fault plans now have must-use
+generation guards whose drop clears only the matching unconsumed plan. Early
+returns and panics cannot poison a later libtest worker, and an older live guard
+cannot erase a newer injected plan. Deterministic regressions cover all three
+channels; create-new, collision, durability, cleanup, ledger, and rollback
+semantics are unchanged.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

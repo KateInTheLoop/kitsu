@@ -742,16 +742,107 @@ pub(super) enum PublicationFaultPoint {
 }
 
 #[cfg(test)]
+struct PublicationFaultPlan {
+    generation: u64,
+    points: Vec<PublicationFaultPoint>,
+}
+
+#[cfg(test)]
+struct RollbackFaultPlan {
+    generation: u64,
+    point: RollbackFaultPoint,
+}
+
+#[cfg(test)]
+struct PublicationHookPlan {
+    generation: u64,
+    hook: PublicationHook,
+}
+
+#[cfg(test)]
 thread_local! {
-    static NEXT_PUBLICATION_FAULTS: std::cell::RefCell<Vec<PublicationFaultPoint>> = const {
-        std::cell::RefCell::new(Vec::new())
-    };
-    static NEXT_ROLLBACK_FAULT: std::cell::Cell<Option<RollbackFaultPoint>> = const {
-        std::cell::Cell::new(None)
-    };
-    static NEXT_PUBLICATION_HOOK: std::cell::RefCell<Option<PublicationHook>> = const {
+    static NEXT_PUBLICATION_FAULTS: std::cell::RefCell<Option<PublicationFaultPlan>> = const {
         std::cell::RefCell::new(None)
     };
+    static NEXT_ROLLBACK_FAULT: std::cell::RefCell<Option<RollbackFaultPlan>> = const {
+        std::cell::RefCell::new(None)
+    };
+    static NEXT_PUBLICATION_HOOK: std::cell::RefCell<Option<PublicationHookPlan>> = const {
+        std::cell::RefCell::new(None)
+    };
+}
+
+#[cfg(test)]
+static TEST_FIXTURE_GENERATION: AtomicU64 = AtomicU64::new(1);
+
+#[cfg(test)]
+fn next_test_fixture_generation() -> u64 {
+    let generation = TEST_FIXTURE_GENERATION.fetch_add(1, Ordering::Relaxed);
+    assert_ne!(generation, u64::MAX, "test fixture generation exhausted");
+    generation
+}
+
+#[cfg(test)]
+#[must_use = "retain the publication fault guard through the intended operation"]
+pub(super) struct PublicationFaultFixtureGuard {
+    generation: u64,
+}
+
+#[cfg(test)]
+impl Drop for PublicationFaultFixtureGuard {
+    fn drop(&mut self) {
+        NEXT_PUBLICATION_FAULTS.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|plan| plan.generation == self.generation)
+            {
+                *slot = None;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[must_use = "retain the rollback fault guard through the intended operation"]
+pub(super) struct RollbackFaultFixtureGuard {
+    generation: u64,
+}
+
+#[cfg(test)]
+impl Drop for RollbackFaultFixtureGuard {
+    fn drop(&mut self) {
+        NEXT_ROLLBACK_FAULT.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|plan| plan.generation == self.generation)
+            {
+                *slot = None;
+            }
+        });
+    }
+}
+
+#[cfg(test)]
+#[must_use = "retain the publication hook guard through the intended operation"]
+pub(super) struct PublicationHookFixtureGuard {
+    generation: u64,
+}
+
+#[cfg(test)]
+impl Drop for PublicationHookFixtureGuard {
+    fn drop(&mut self) {
+        NEXT_PUBLICATION_HOOK.with(|slot| {
+            let mut slot = slot.borrow_mut();
+            if slot
+                .as_ref()
+                .is_some_and(|plan| plan.generation == self.generation)
+            {
+                *slot = None;
+            }
+        });
+    }
 }
 
 #[cfg(test)]
@@ -760,24 +851,37 @@ pub(super) enum PublicationHook {
 }
 
 #[cfg(test)]
-pub(super) fn inject_publication_hook(hook: PublicationHook) {
+pub(super) fn inject_publication_hook(hook: PublicationHook) -> PublicationHookFixtureGuard {
+    let generation = next_test_fixture_generation();
     NEXT_PUBLICATION_HOOK.with(|slot| {
-        assert!(slot.replace(Some(hook)).is_none());
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none());
+        *slot = Some(PublicationHookPlan { generation, hook });
     });
+    PublicationHookFixtureGuard { generation }
 }
 
 #[cfg(test)]
-pub(super) fn inject_next_publication_fault(point: PublicationFaultPoint) {
-    inject_publication_faults(&[point]);
+pub(super) fn inject_next_publication_fault(
+    point: PublicationFaultPoint,
+) -> PublicationFaultFixtureGuard {
+    inject_publication_faults(&[point])
 }
 
 #[cfg(test)]
-pub(super) fn inject_publication_faults(points: &[PublicationFaultPoint]) {
+pub(super) fn inject_publication_faults(
+    points: &[PublicationFaultPoint],
+) -> PublicationFaultFixtureGuard {
+    let generation = next_test_fixture_generation();
     NEXT_PUBLICATION_FAULTS.with(|slot| {
         let mut slot = slot.borrow_mut();
-        assert!(slot.is_empty());
-        slot.extend_from_slice(points);
+        assert!(slot.is_none());
+        *slot = Some(PublicationFaultPlan {
+            generation,
+            points: points.to_vec(),
+        });
     });
+    PublicationFaultFixtureGuard { generation }
 }
 
 fn publication_fault(point: PublicationFaultPoint) -> bool {
@@ -785,8 +889,14 @@ fn publication_fault(point: PublicationFaultPoint) -> bool {
     {
         NEXT_PUBLICATION_FAULTS.with(|slot| {
             let mut slot = slot.borrow_mut();
-            if let Some(index) = slot.iter().position(|pending| *pending == point) {
-                slot.remove(index);
+            let Some(plan) = slot.as_mut() else {
+                return false;
+            };
+            if let Some(index) = plan.points.iter().position(|pending| *pending == point) {
+                plan.points.remove(index);
+                if plan.points.is_empty() {
+                    *slot = None;
+                }
                 true
             } else {
                 false
@@ -803,7 +913,8 @@ fn publication_fault(point: PublicationFaultPoint) -> bool {
 fn run_before_install_hook() {
     #[cfg(test)]
     NEXT_PUBLICATION_HOOK.with(|slot| {
-        if let Some(PublicationHook::BeforeInstall(hook)) = slot.borrow_mut().take() {
+        let hook = slot.borrow_mut().take().map(|plan| plan.hook);
+        if let Some(PublicationHook::BeforeInstall(hook)) = hook {
             hook();
         }
     });
@@ -1467,18 +1578,23 @@ pub(super) enum RollbackFaultPoint {
 }
 
 #[cfg(test)]
-pub(super) fn inject_next_rollback_fault(point: RollbackFaultPoint) {
+pub(super) fn inject_next_rollback_fault(point: RollbackFaultPoint) -> RollbackFaultFixtureGuard {
+    let generation = next_test_fixture_generation();
     NEXT_ROLLBACK_FAULT.with(|slot| {
-        assert!(slot.replace(Some(point)).is_none());
+        let mut slot = slot.borrow_mut();
+        assert!(slot.is_none());
+        *slot = Some(RollbackFaultPlan { generation, point });
     });
+    RollbackFaultFixtureGuard { generation }
 }
 
 fn rollback_fault(point: RollbackFaultPoint) -> bool {
     #[cfg(test)]
     {
         NEXT_ROLLBACK_FAULT.with(|slot| {
-            if slot.get() == Some(point) {
-                slot.set(None);
+            let mut slot = slot.borrow_mut();
+            if slot.as_ref().is_some_and(|plan| plan.point == point) {
+                *slot = None;
                 true
             } else {
                 false
@@ -1962,7 +2078,7 @@ mod tests {
         assert_eq!(std::fs::read(&target).unwrap(), b"preexisting");
 
         std::fs::remove_file(&target).unwrap();
-        inject_publication_hook(PublicationHook::BeforeInstall(Box::new({
+        let _hook_scope = inject_publication_hook(PublicationHook::BeforeInstall(Box::new({
             let target = target.clone();
             move || std::fs::write(&target, b"raced replacement").unwrap()
         })));
@@ -2004,7 +2120,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let target = directory.path().join("config.toml");
             let (preview, rendered) = render(&target);
-            inject_next_publication_fault(fault);
+            let _fault_scope = inject_next_publication_fault(fault);
             let outcome = publish_create_new(preview.target(), &rendered);
             assert!(matches!(
                 outcome,
@@ -2032,7 +2148,7 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let target = directory.path().join("config.toml");
             let (preview, rendered) = render(&target);
-            inject_next_publication_fault(fault);
+            let _fault_scope = inject_next_publication_fault(fault);
             let residue = match publish_create_new(preview.target(), &rendered) {
                 ConfigPublicationOutcome::Failed {
                     residue: Some(residue),
@@ -2059,19 +2175,20 @@ mod tests {
         let target = directory.path().join("config.toml");
         let (preview, rendered) = render(&target);
         let parent = directory.path().to_path_buf();
-        inject_publication_hook(PublicationHook::BeforeInstall(Box::new(move || {
-            let stage = std::fs::read_dir(&parent)
-                .unwrap()
-                .map(Result::unwrap)
-                .find(|entry| {
-                    entry
-                        .file_name()
-                        .to_string_lossy()
-                        .starts_with(".kitsu-config-")
-                })
-                .expect("same-directory stage");
-            std::fs::write(stage.path(), b"same-user stage mutation").unwrap();
-        })));
+        let _hook_scope =
+            inject_publication_hook(PublicationHook::BeforeInstall(Box::new(move || {
+                let stage = std::fs::read_dir(&parent)
+                    .unwrap()
+                    .map(Result::unwrap)
+                    .find(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(".kitsu-config-")
+                    })
+                    .expect("same-directory stage");
+                std::fs::write(stage.path(), b"same-user stage mutation").unwrap();
+            })));
 
         let residue = match publish_create_new(preview.target(), &rendered) {
             ConfigPublicationOutcome::Failed {
@@ -2105,7 +2222,10 @@ mod tests {
             let directory = tempfile::tempdir().unwrap();
             let target = directory.path().join("config.toml");
             let (preview, rendered) = render(&target);
-            inject_publication_faults(&[primary, PublicationFaultPoint::UninstalledStageCleanup]);
+            let _fault_scope = inject_publication_faults(&[
+                primary,
+                PublicationFaultPoint::UninstalledStageCleanup,
+            ]);
             let residue = match publish_create_new(preview.target(), &rendered) {
                 ConfigPublicationOutcome::Failed {
                     residue: Some(ConfigPublicationResidue::UninstalledStageCleanup(receipt)),
@@ -2138,7 +2258,8 @@ mod tests {
         let target = directory.path().join("config.toml");
         std::fs::write(&target, b"preexisting").unwrap();
         let (preview, rendered) = render(&target);
-        inject_next_publication_fault(PublicationFaultPoint::UninstalledStageCleanup);
+        let _fault_scope =
+            inject_next_publication_fault(PublicationFaultPoint::UninstalledStageCleanup);
         let residue = match publish_create_new(preview.target(), &rendered) {
             ConfigPublicationOutcome::Failed {
                 kind: ConfigPublicationFailureKind::StageCleanup,
@@ -2164,7 +2285,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("config.toml");
         let (preview, rendered) = render(&target);
-        inject_publication_faults(&[
+        let _fault_scope = inject_publication_faults(&[
             PublicationFaultPoint::Write,
             PublicationFaultPoint::UninstalledDirectorySync,
         ]);
@@ -2338,7 +2459,7 @@ mod tests {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("config.toml");
         let mut ledger = publish_into_ledger(109, 1, &target);
-        inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+        let _fault_scope = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
         assert_eq!(
             ledger.rollback(1).unwrap(),
             ConfigRollbackResult::Incomplete(ConfigResidueKind::RemovedUnconfirmed)
@@ -2350,6 +2471,159 @@ mod tests {
         );
         assert_eq!(ledger.rollback(1).unwrap(), ConfigRollbackResult::Removed);
         assert!(ledger.is_empty());
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_fault_fixture_scope_clears_an_unconsumed_future_point() {
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let missing_parent = directory.path().join("missing");
+            let target = missing_parent.join("config.toml");
+            let (preview, rendered) = render(&target);
+            let _fault_scope = inject_next_publication_fault(PublicationFaultPoint::Write);
+
+            assert!(matches!(
+                publish_create_new(preview.target(), &rendered),
+                ConfigPublicationOutcome::Failed {
+                    kind: ConfigPublicationFailureKind::ParentMissing,
+                    residue: None,
+                }
+            ));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        std::fs::write(&target, b"preexisting").unwrap();
+        let (preview, rendered) = render(&target);
+
+        assert!(matches!(
+            publish_create_new(preview.target(), &rendered),
+            ConfigPublicationOutcome::Collision
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"preexisting");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn rollback_fault_fixture_scope_clears_an_unconsumed_future_point() {
+        {
+            let mut empty = ConfigPublicationLedger::new(89).unwrap();
+            let _fault_scope = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+            assert_eq!(
+                empty.rollback_uninstalled_stage(UninstalledStageCleanupId(1)),
+                Err(ConfigLedgerError::UnknownStageCleanup { cleanup_id: 1 })
+            );
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let (preview, rendered) = render(&target);
+        let _publication_fault_scope = inject_publication_faults(&[
+            PublicationFaultPoint::Write,
+            PublicationFaultPoint::UninstalledStageCleanup,
+        ]);
+        let residue = match publish_create_new(preview.target(), &rendered) {
+            ConfigPublicationOutcome::Failed {
+                residue: Some(ConfigPublicationResidue::UninstalledStageCleanup(receipt)),
+                ..
+            } => ConfigPublicationResidue::UninstalledStageCleanup(receipt),
+            _ => panic!("injected write cleanup cut must retain its concrete stage"),
+        };
+        let mut ledger = ConfigPublicationLedger::new(90).unwrap();
+        let RegisteredConfigPublicationResidue::UninstalledStage(cleanup_id) =
+            ledger.register_residue(1, residue).unwrap()
+        else {
+            panic!("uninstalled stage must remain outside the logical effect ledger")
+        };
+
+        assert_eq!(
+            ledger.rollback_uninstalled_stage(cleanup_id).unwrap(),
+            ConfigRollbackResult::Removed
+        );
+        assert!(ledger.is_empty());
+        assert_eq!(std::fs::read_dir(directory.path()).unwrap().count(), 0);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_fault_fixture_scope_clears_during_unwind() {
+        let unwind = std::panic::catch_unwind(|| {
+            let _fault_scope = inject_next_publication_fault(PublicationFaultPoint::Write);
+            panic!("deliberate fixture unwind");
+        });
+        assert!(unwind.is_err());
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        std::fs::write(&target, b"preexisting").unwrap();
+        let (preview, rendered) = render(&target);
+        assert!(matches!(
+            publish_create_new(preview.target(), &rendered),
+            ConfigPublicationOutcome::Collision
+        ));
+        assert_eq!(std::fs::read(&target).unwrap(), b"preexisting");
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn publication_hook_fixture_scope_clears_an_unconsumed_hook() {
+        {
+            let directory = tempfile::tempdir().unwrap();
+            let target = directory.path().join("missing/config.toml");
+            let (preview, rendered) = render(&target);
+            let _hook_scope =
+                inject_publication_hook(PublicationHook::BeforeInstall(Box::new(|| {
+                    panic!("stale publication hook escaped its fixture scope")
+                })));
+
+            assert!(matches!(
+                publish_create_new(preview.target(), &rendered),
+                ConfigPublicationOutcome::Failed {
+                    kind: ConfigPublicationFailureKind::ParentMissing,
+                    residue: None,
+                }
+            ));
+        }
+
+        let directory = tempfile::tempdir().unwrap();
+        let target = directory.path().join("config.toml");
+        let (preview, rendered) = render(&target);
+        assert!(matches!(
+            publish_create_new(preview.target(), &rendered),
+            ConfigPublicationOutcome::Created(_)
+        ));
+        assert!(target.exists());
+    }
+
+    #[test]
+    fn older_fixture_guards_cannot_clear_newer_active_generations() {
+        let older_publication = inject_next_publication_fault(PublicationFaultPoint::Write);
+        assert!(publication_fault(PublicationFaultPoint::Write));
+        let newer_publication = inject_next_publication_fault(PublicationFaultPoint::FileSync);
+        drop(older_publication);
+        assert!(publication_fault(PublicationFaultPoint::FileSync));
+        drop(newer_publication);
+
+        let older_rollback = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+        assert!(rollback_fault(RollbackFaultPoint::DirectorySync));
+        let newer_rollback = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+        drop(older_rollback);
+        assert!(rollback_fault(RollbackFaultPoint::DirectorySync));
+        drop(newer_rollback);
+
+        let older_hook = inject_publication_hook(PublicationHook::BeforeInstall(Box::new(|| {})));
+        run_before_install_hook();
+        let newer_hook_ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let hook_observation = std::sync::Arc::clone(&newer_hook_ran);
+        let newer_hook =
+            inject_publication_hook(PublicationHook::BeforeInstall(Box::new(move || {
+                hook_observation.store(true, Ordering::SeqCst);
+            })));
+        drop(older_hook);
+        run_before_install_hook();
+        assert!(newer_hook_ran.load(Ordering::SeqCst));
+        drop(newer_hook);
     }
 
     #[cfg(not(target_os = "linux"))]

@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 128.
+updates through Cycle 129.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -465,6 +465,11 @@ kernel.
   benchmark artifacts and the 5-to-3-round / 1,456-to-1,134-byte result remain
   unchanged; no registry, configuration, provider, session, cache, mutation,
   or automatic context path invokes it.
+- Cycle 129 isolates test-only publication, rollback, and pre-install-hook
+  fault plans behind must-use generation guards. Early return and unwind clear
+  only their own unconsumed plan, and older guards cannot erase newer plans.
+  This removes cross-fixture full-suite contamination without changing any
+  production setup publication, collision, cleanup, ledger, or rollback path.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

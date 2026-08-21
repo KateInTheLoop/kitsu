@@ -988,7 +988,7 @@ mod tests {
     fn uninstalled_stage_residue_uses_its_nonlogical_cleanup_channel() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("kitsu.toml");
-        inject_publication_faults(&[
+        let _publication_fault_scope = inject_publication_faults(&[
             PublicationFaultPoint::Write,
             PublicationFaultPoint::UninstalledStageCleanup,
         ]);
@@ -1010,11 +1010,11 @@ mod tests {
     fn incomplete_stage_cleanup_returns_its_distinct_recovery_owner() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("kitsu.toml");
-        inject_publication_faults(&[
+        let _publication_fault_scope = inject_publication_faults(&[
             PublicationFaultPoint::Write,
             PublicationFaultPoint::UninstalledStageCleanup,
         ]);
-        inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+        let _rollback_fault_scope = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
 
         let mut completion = run_local(21, &target);
 
@@ -1037,7 +1037,8 @@ mod tests {
     fn installed_failure_is_registered_then_rolled_back_by_exact_directive() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("kitsu.toml");
-        inject_publication_faults(&[PublicationFaultPoint::DirectorySync]);
+        let _publication_fault_scope =
+            inject_publication_faults(&[PublicationFaultPoint::DirectorySync]);
 
         let completion = run_local(23, &target);
 
@@ -1058,8 +1059,9 @@ mod tests {
     fn incomplete_rollback_returns_the_matching_concrete_recovery_owner() {
         let directory = tempfile::tempdir().unwrap();
         let target = directory.path().join("kitsu.toml");
-        inject_publication_faults(&[PublicationFaultPoint::DirectorySync]);
-        inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
+        let _publication_fault_scope =
+            inject_publication_faults(&[PublicationFaultPoint::DirectorySync]);
+        let _rollback_fault_scope = inject_next_rollback_fault(RollbackFaultPoint::DirectorySync);
 
         let mut completion = run_local(29, &target);
 
