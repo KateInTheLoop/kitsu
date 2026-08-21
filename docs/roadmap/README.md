@@ -712,6 +712,7 @@ gates merely because a card appears attractive.
 | 101 | E06-S02-C1 | Freeze one non-cloneable request inventory that owns exact descriptor order and immutable handler identities through provider response execution |
 | 102 | E06-S01-C1 | Admit one exact versioned child identity and containment preflight only after disabled, denied, malformed, and authority-mismatched requests fail without host effects |
 | 103 | E06-S03-C1 | Decode and emit bounded newline JSON-RPC through one pinned, one-request-at-a-time initialize/list/call state machine that rejects every ambient MCP capability |
+| 104 | E06-S02-C2 | Bind every proposed external tool to closed source, incarnation, revision, and tool identities plus one bounded canonical descriptor fingerprint before publication |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -898,6 +899,15 @@ bounded and fail-stop. The codec returns raw list/call results only after
 envelope validation; later inventory work owns descriptor validation and
 publication. It still owns no process, transport, deadline, configuration,
 inventory, or product route.
+Cycle 104 defines the closed identity half of external inventory publication.
+Host-authored source, source-incarnation, non-zero inventory-revision, and tool
+IDs are distinct bounded types; advertised names are never identities. A
+transactional validator rejects malformed, oversized, duplicate, and colliding
+proposals before returning a complete inventory. Each descriptor is bound to a
+domain-separated SHA-256 over Kitsu's versioned canonical name, description,
+and schema bytes. This is intentionally not a general JSON canonicalization
+standard. Revision monotonicity, publication/CAS, withdrawal, configuration,
+child trust, and MCP/product composition remain for later cards.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
