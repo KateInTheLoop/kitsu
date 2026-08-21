@@ -561,7 +561,49 @@ pub(super) fn encode_store_record(record: &StoreRecordV1) -> Result<Vec<u8>, Str
 }
 
 pub(super) fn decode_store_record(bytes: &[u8]) -> Result<StoreRecordV1, String> {
-    decode_record::<StoreRecordV1>(bytes)?.validate()
+    let record = decode_record::<StoreRecordV1>(bytes)?.validate()?;
+    Ok(record)
+}
+
+fn decode_store_record_classified(
+    bytes: &[u8],
+    expected_store: &StoreId,
+) -> Result<StoreRecordV1, PhysicalReadErrorV1> {
+    if bytes.is_empty() || bytes.len() > MAX_PHYSICAL_RECORD_BYTES {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical session record is empty or exceeds its byte limit".to_string(),
+        ));
+    }
+    let record: StoreRecordV1 = serde_json::from_slice(bytes).map_err(|error| {
+        PhysicalReadErrorV1::Malformed(format!("cannot decode physical session record: {error}"))
+    })?;
+    if record.record_type != RecordType::Store {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical store record has the wrong record type".to_string(),
+        ));
+    }
+    if record.physical_schema_revision == 0 {
+        return Err(PhysicalReadErrorV1::Malformed(
+            "physical store schema must be nonzero".to_string(),
+        ));
+    }
+    if record.physical_schema_revision != PHYSICAL_SCHEMA_REVISION {
+        return Err(PhysicalReadErrorV1::UnsupportedPhysicalSchema {
+            observed: record.physical_schema_revision,
+            supported: PHYSICAL_SCHEMA_REVISION,
+            message: format!(
+                "unsupported physical store schema {}; expected {PHYSICAL_SCHEMA_REVISION}",
+                record.physical_schema_revision
+            ),
+        });
+    }
+    let record = record.validate().map_err(PhysicalReadErrorV1::Malformed)?;
+    if record.store_id() != expected_store {
+        return Err(PhysicalReadErrorV1::IdentityMismatch(
+            "physical store identity does not match the admitted store".to_string(),
+        ));
+    }
+    Ok(record)
 }
 
 pub(super) fn encode_revision_manifest(record: &RevisionManifestV1) -> Result<Vec<u8>, String> {
@@ -1148,6 +1190,56 @@ impl PhysicalFileStoreV1 {
             #[cfg(test)]
             fail_next_head_sync: Cell::new(false),
         })
+    }
+
+    /// Open a complete existing physical store without creating, securing,
+    /// syncing, repairing, or locking any path. Absence of the disjoint store
+    /// root is ordinary `None`; any partial or invalid existing namespace is a
+    /// typed fail-closed read error.
+    pub(super) fn open_existing(
+        session_root: &PrivateDirectory,
+        store_id: StoreId,
+    ) -> Result<Option<Self>, PhysicalReadErrorV1> {
+        let Some(root) = session_root
+            .open_optional_child(
+                OsStr::new(ROOT_COMPONENT),
+                "physical session store namespace",
+            )
+            .map_err(PhysicalReadErrorV1::Malformed)?
+        else {
+            return Ok(None);
+        };
+        let bytes = read_bounded_regular(
+            &root,
+            OsStr::new(STORE_RECORD_NAME),
+            MAX_PHYSICAL_RECORD_BYTES as u64,
+            "physical store record",
+        )
+        .map_err(PhysicalReadErrorV1::Malformed)?;
+        let record = decode_store_record_classified(&bytes, &store_id)?;
+        let open_namespace = |name: &str, context: &str| {
+            root.open_child(OsStr::new(name), context)
+                .map_err(PhysicalReadErrorV1::Malformed)
+        };
+        let revisions = open_namespace(REVISIONS_COMPONENT, "physical revision namespace")?;
+        let artifacts = open_namespace(ARTIFACTS_COMPONENT, "physical artifact namespace")?;
+        let heads = open_namespace(HEADS_COMPONENT, "physical HEAD namespace")?;
+        let staging = open_namespace(STAGING_COMPONENT, "physical revision staging namespace")?;
+        let locks = open_namespace(LOCKS_COMPONENT, "physical lock namespace")?;
+
+        Ok(Some(Self {
+            _root: root,
+            revisions,
+            artifacts,
+            heads,
+            staging,
+            locks,
+            record,
+            #[cfg(test)]
+            fail_next_target_sync: Cell::new(false),
+            #[cfg(test)]
+            fail_next_head_sync: Cell::new(false),
+        }))
     }
 
     pub(super) fn store_id(&self) -> &StoreId {

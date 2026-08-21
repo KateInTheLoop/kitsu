@@ -656,6 +656,16 @@ cannot weaken or replace any backend-neutral assertion.
    tombstone blocks both empty and legacy routes, and valid dual presence is a
    separate ambiguity. Rejection retains both typed observations. No store is
    opened, created, migrated, selected, or written by this card.
+   **Mutation-free observation complete in Cycle 082:** both representations
+   are inspected relative to one already-pinned session root. Current-v1 open is
+   no-follow, bounded, identity/version classified, and byte-preserving. The
+   canonical store has a distinct open-existing-only constructor that requires
+   its record and every namespace to pre-exist; it never creates, repairs,
+   secures, syncs, stages, or locks. Absent canonical root is clean missing;
+   partial, future-schema, wrong-store, corrupt selected state, and symlinked
+   roots remain typed rejection. Valid canonical-only and dual-presence paths
+   reuse the ordinary verified HEAD/closure lookup. No selected value is yet
+   returned to production.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
