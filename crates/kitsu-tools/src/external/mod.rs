@@ -8,6 +8,7 @@ pub(crate) mod authority;
 mod backend;
 pub(crate) mod identity;
 mod lifecycle;
+mod mcp;
 mod publication;
 mod serial;
 mod supervisor;
