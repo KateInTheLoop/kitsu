@@ -676,6 +676,19 @@ cannot weaken or replace any backend-neutral assertion.
    selection sees the fault. The canonical variant is boxed to keep the private
    enum bounded. Production projection and activation revalidation are still
    required before mounting.
+   **Pure canonical resume projection complete in Cycle 084:** the derived
+   current-v1-shaped value is bound to the exact canonical source revision and
+   selected HEAD; that DTO is never itself HEAD evidence. Resume metadata and
+   provider-neutral system/user/assistant/tool facts preserve exact order,
+   tool-call arguments, and correlation IDs. Only the chronological operation
+   ancestry of the selected HEAD enters model context. Discarded or otherwise
+   unselected operations remain in canonical audit history and are named by the
+   projection instead of silently reappearing as prompts. The fixed legacy loss
+   manifest stays explicit. Any immutable artifact manifest yields a typed
+   refusal because `SavedSession` has no lossless artifact-identity field. The
+   function performs no I/O or authority restoration and remains unmounted;
+   activation must next revalidate its revision/HEAD binding under the owning
+   fence.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

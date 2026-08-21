@@ -119,6 +119,67 @@ impl CanonicalSessionRevisionV1 {
     }
 }
 
+/// A derived current-v1-shaped resume value bound to the exact canonical facts
+/// that produced it. The binding is retained for activation-time revalidation;
+/// the `SavedSession` value alone is never canonical HEAD evidence.
+#[derive(Clone, Debug)]
+pub(super) struct CanonicalResumeProjectionV1 {
+    source_revision: RevisionId,
+    source_head: LogicalHead,
+    saved: super::SavedSession,
+    legacy_losses: Vec<LegacyBaselineLossV1>,
+    omitted_operations: Vec<TurnId>,
+}
+
+impl CanonicalResumeProjectionV1 {
+    pub(super) fn source_revision(&self) -> &RevisionId {
+        &self.source_revision
+    }
+
+    pub(super) fn source_head(&self) -> &LogicalHead {
+        &self.source_head
+    }
+
+    pub(super) fn saved(&self) -> &super::SavedSession {
+        &self.saved
+    }
+
+    pub(super) fn legacy_loss_count(&self) -> usize {
+        self.legacy_losses.len()
+    }
+
+    pub(super) fn omitted_operations(&self) -> &[TurnId] {
+        &self.omitted_operations
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum CanonicalResumeProjectionErrorV1 {
+    InvalidCanonical(String),
+    ArtifactClosureRequired { artifact_count: usize },
+    SelectedAncestryUnavailable { turn: TurnId },
+}
+
+impl std::fmt::Display for CanonicalResumeProjectionErrorV1 {
+    fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::InvalidCanonical(reason) => {
+                write!(formatter, "canonical resume source is invalid: {reason}")
+            }
+            Self::ArtifactClosureRequired { artifact_count } => write!(
+                formatter,
+                "canonical resume projection requires an artifact-aware DTO for {artifact_count} immutable artifacts"
+            ),
+            Self::SelectedAncestryUnavailable { turn } => write!(
+                formatter,
+                "canonical resume projection cannot resolve selected ancestor '{turn}'"
+            ),
+        }
+    }
+}
+
+impl std::error::Error for CanonicalResumeProjectionErrorV1 {}
+
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CanonicalMetadataV1 {
@@ -967,6 +1028,93 @@ pub(super) fn encode_canonical_payload(
     Ok(bytes)
 }
 
+pub(super) fn project_canonical_resume_v1(
+    payload: &CanonicalSessionRevisionV1,
+) -> Result<CanonicalResumeProjectionV1, CanonicalResumeProjectionErrorV1> {
+    validate_canonical_payload(payload)
+        .map_err(CanonicalResumeProjectionErrorV1::InvalidCanonical)?;
+    if !payload.artifact_manifest.is_empty() {
+        return Err(CanonicalResumeProjectionErrorV1::ArtifactClosureRequired {
+            artifact_count: payload.artifact_manifest.len(),
+        });
+    }
+
+    let mut selected_turns = HashSet::new();
+    let by_turn = payload
+        .operations
+        .iter()
+        .map(|operation| (operation.operation.turn_id(), operation))
+        .collect::<HashMap<_, _>>();
+    let mut cursor = payload.selected_head.clone();
+    while let LogicalHead::Turn(turn) = cursor {
+        selected_turns.insert(turn.clone());
+        let operation = by_turn.get(&turn).ok_or_else(|| {
+            CanonicalResumeProjectionErrorV1::SelectedAncestryUnavailable { turn: turn.clone() }
+        })?;
+        cursor = operation.operation.before_head().clone();
+    }
+
+    let mut messages = Vec::new();
+    let mut legacy_losses = Vec::new();
+    if let Some(baseline) = &payload.legacy_baseline {
+        messages.extend(baseline.messages.iter().map(project_resume_message));
+        legacy_losses.clone_from(&baseline.loss_manifest);
+    }
+    let mut omitted_operations = Vec::new();
+    for operation in &payload.operations {
+        if selected_turns.contains(operation.operation.turn_id()) {
+            messages.extend(operation.messages.iter().map(project_resume_message));
+        } else {
+            omitted_operations.push(operation.operation.turn_id().clone());
+        }
+    }
+
+    Ok(CanonicalResumeProjectionV1 {
+        source_revision: payload.revision_id.clone(),
+        source_head: payload.selected_head.clone(),
+        saved: super::SavedSession {
+            version: super::SESSION_VERSION,
+            id: payload.session_id.as_str().to_string(),
+            created_at: payload.created_at.clone(),
+            updated_at: payload.committed_at.clone(),
+            directory: payload.metadata.launch_directory.clone(),
+            gateway: payload.metadata.requested_gateway.clone(),
+            model: payload.metadata.requested_model.clone(),
+            name: payload.metadata.name.clone(),
+            project_context: payload.metadata.project_context_source.clone(),
+            messages,
+        },
+        legacy_losses,
+        omitted_operations,
+    })
+}
+
+fn project_resume_message(message: &CanonicalMessageV1) -> kitsu_providers::ChatMessage {
+    match message {
+        CanonicalMessageV1::System { content } => {
+            kitsu_providers::ChatMessage::system(content.clone())
+        }
+        CanonicalMessageV1::User { content } => kitsu_providers::ChatMessage::user(content.clone()),
+        CanonicalMessageV1::Assistant {
+            content,
+            tool_calls,
+        } => kitsu_providers::ChatMessage::assistant(
+            content.clone(),
+            tool_calls
+                .iter()
+                .map(|call| kitsu_providers::ToolCall {
+                    tool_name: call.tool_name.clone(),
+                    args: call.args.clone(),
+                    call_id: call.call_id.clone(),
+                })
+                .collect(),
+        ),
+        CanonicalMessageV1::Tool {
+            call_id, content, ..
+        } => kitsu_providers::ChatMessage::tool(call_id.clone(), content.clone()),
+    }
+}
+
 fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<(), String> {
     if payload.logical_schema != LOGICAL_SCHEMA_REVISION {
         return Err(format!(
@@ -1730,6 +1878,114 @@ mod tests {
             ),
         )
         .unwrap()
+    }
+
+    #[test]
+    fn canonical_resume_projection_is_bound_to_selected_head_ancestry() {
+        let second = append_complete_operation(
+            &one_operation_source(),
+            RevisionId::new("revision-3").unwrap(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            operation_input(
+                "turn-2",
+                "run-2",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"second question"},
+                    {"role":"assistant","content":"second answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+        let source = append_complete_operation(
+            &second,
+            RevisionId::new("revision-4").unwrap(),
+            "2026-08-20T11:03:00.000Z".to_string(),
+            operation_input(
+                "turn-3",
+                "run-3",
+                kitsu_core::RunOutcomeClass::ProviderFault,
+                kitsu_core::RunAssistantDisposition::Discarded,
+                serde_json::json!([{"role":"user","content":"discarded question"}]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap();
+
+        let projection = project_canonical_resume_v1(&source).unwrap();
+        let saved = projection.saved();
+        assert_eq!(projection.source_revision().as_str(), "revision-4");
+        assert_eq!(
+            projection.source_head(),
+            &LogicalHead::Turn(TurnId::new("turn-2").unwrap())
+        );
+        assert_eq!(projection.legacy_loss_count(), 3);
+        assert_eq!(
+            projection
+                .omitted_operations()
+                .iter()
+                .map(TurnId::as_str)
+                .collect::<Vec<_>>(),
+            ["turn-3"]
+        );
+        assert_eq!(saved.version, super::super::SESSION_VERSION);
+        assert_eq!(saved.id, "s-source");
+        assert_eq!(saved.created_at, "2026-08-20T10:00:00.000Z");
+        assert_eq!(saved.updated_at, "2026-08-20T11:03:00.000Z");
+        assert_eq!(saved.directory, "/work/tree");
+        assert_eq!(saved.gateway, "openai");
+        assert_eq!(saved.model, "gpt-test");
+        assert_eq!(saved.name.as_deref(), Some("kept_name"));
+        assert_eq!(
+            saved.project_context.as_deref(),
+            Some("exact historical context")
+        );
+        assert_eq!(
+            saved
+                .messages
+                .iter()
+                .map(|message| message.content.as_str())
+                .collect::<Vec<_>>(),
+            [
+                "historical system",
+                "inspect",
+                "",
+                "contents",
+                "done",
+                "recoverable question",
+                "verified answer",
+                "second question",
+                "second answer",
+            ]
+        );
+        assert_eq!(saved.messages[2].tool_calls.len(), 1);
+        assert_eq!(saved.messages[2].tool_calls[0].tool_name, "fs_read_file");
+        assert_eq!(saved.messages[2].tool_calls[0].call_id, "call-1");
+        assert_eq!(saved.messages[3].tool_call_id.as_deref(), Some("call-1"));
+        assert!(!saved
+            .messages
+            .iter()
+            .any(|message| message.content == "discarded question"));
+    }
+
+    #[test]
+    fn canonical_resume_projection_refuses_artifact_or_invalid_sources() {
+        assert_eq!(
+            project_canonical_resume_v1(&three_artifact_source()).unwrap_err(),
+            CanonicalResumeProjectionErrorV1::ArtifactClosureRequired { artifact_count: 3 }
+        );
+
+        let mut invalid = one_operation_source();
+        invalid.metadata.launch_directory.clear();
+        assert!(matches!(
+            project_canonical_resume_v1(&invalid),
+            Err(CanonicalResumeProjectionErrorV1::InvalidCanonical(reason))
+                if reason.contains("launch directory")
+        ));
     }
 
     fn three_artifact_source() -> CanonicalSessionRevisionV1 {

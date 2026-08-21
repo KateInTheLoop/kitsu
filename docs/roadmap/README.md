@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C24,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C25,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -689,6 +689,7 @@ gates merely because a card appears attractive.
 | 081 | E03-S02-C22 | Define pure deterministic current-v1/canonical mount admission with explicit unavailable, tombstone, and dual-presence refusal |
 | 082 | E03-S02-C23 | Observe both representations through one pinned root without creating, repairing, locking, or changing either store |
 | 083 | E03-S02-C24 | Retain exactly one admitted current-v1 or verified canonical value from the same observation without a second path read |
+| 084 | E03-S02-C25 | Derive a revision/HEAD-bound artifact-free resume value from exact selected ancestry without changing production routing |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -772,9 +773,13 @@ source/destination-fenced create-only branch publication transaction. Cycle 080
 adds exact residue recovery/idempotent retry for pre-HEAD cuts; then the queue
 returns to E03-S02 in Cycle 081 with a pure mount-admission oracle. Cycle 082
 observes current-v1 and canonical presence without creating or changing either
-store. Cycle 083 next retains the exact selected value from that same observation
-without a second path read. Cycle 084 next defines a pure canonical-to-resume
-projection before any production route changes, then continues through E03,
+store. Cycle 083 retains the exact selected value from that same observation
+without a second path read. Cycle 084 adds a pure canonical-to-resume projection:
+metadata and provider-neutral messages follow only selected-HEAD ancestry, the
+source revision/HEAD and omitted audit operations remain explicit, and artifact-
+bearing history refuses because the current resume DTO cannot preserve its
+immutable identity. Cycle 085 next adds fence-bound activation revalidation
+before any production route changes, then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

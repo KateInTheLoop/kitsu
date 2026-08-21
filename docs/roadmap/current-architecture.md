@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 083.
+updates through Cycle 084.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -157,7 +157,16 @@ kernel.
   admission evidence, so dual/corrupt state cannot leak a selectable value.
   Later pathname mutation does not rewrite the selection, while a new selection
   sees the new fault. The large canonical value is boxed privately. Production
-  resume projection, activation revalidation, and routing remain unchanged.
+  activation revalidation and routing remain unchanged. Cycle 084 adds the pure
+  canonical resume projection. It first revalidates the closed payload, binds
+  its result to exact source revision and selected HEAD, preserves resume
+  metadata and provider-neutral message/tool-call facts, and appends only the
+  chronological operations on selected-HEAD ancestry. Discarded or otherwise
+  unselected operations remain canonical audit facts and are reported as
+  omitted rather than reintroduced to model context. Fixed legacy losses stay
+  explicit. Artifact-bearing history is rejected because `SavedSession` cannot
+  preserve immutable artifact identity. The projection reads or writes nothing,
+  grants no authority, and is not yet mounted.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
