@@ -2,6 +2,8 @@
 //! `[gateways.<name>]` profiles and `default_gateway`, resolves a profile by
 //! name, and validates flavor/model per the design's rules.
 
+#[allow(dead_code)] // Private local/offline coordinator; product mounting is a later card.
+mod local_setup;
 #[allow(dead_code)] // Staged pure guided-setup transaction; product mounting is a later card.
 mod onboarding;
 #[allow(dead_code)] // Private create-new adapter; product mounting is a later card.
