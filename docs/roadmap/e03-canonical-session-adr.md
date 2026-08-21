@@ -584,6 +584,17 @@ cannot weaken or replace any backend-neutral assertion.
    planning performs no write. Next define a pure new recovery revision with
    complete skipped-revision and unavailable-blocker evidence; recovery remains
    a new fenced publication, never an in-place HEAD pointer rollback.
+   **Causal recovery assembly complete in Cycle 075:** canonical logical schema
+   revision 2 owns a bounded recovery ledger. The planner records every corrupt
+   selected/intermediate revision and typed reason in exact traversal order;
+   unavailable results additionally identify the exact root exhaustion,
+   missing/different digest, unsupported logical manifest, ancestor state, cycle, or
+   traversal bound. Pure assembly validates the fully verified source, creates
+   a distinct revision whose exact parent is the corrupt selected revision,
+   copies source operations/artifacts/HEAD, clears stale compaction, and binds
+   source/selection/skips/time. Recovery never makes an old revision HEAD.
+   Next publish this value through envelope-only selected-parent admission,
+   immutable install, writer-fenced CAS, and exact old-or-new receipts.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

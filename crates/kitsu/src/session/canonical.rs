@@ -4,16 +4,17 @@ use std::collections::{HashMap, HashSet};
 
 use chrono::DateTime;
 use kitsu_core::session::{
-    CanonicalHistory, CanonicalOperation, CanonicalTerminal, ExpectedRevision, LogicalHead,
-    RevisionId, SessionAssistantDisposition, SessionHistoryError, SessionId, SessionOutcomeClass,
-    StoreId, TurnId,
+    CanonicalHistory, CanonicalOperation, CanonicalTerminal, CorruptSessionReason,
+    ExpectedRevision, LogicalHead, RevisionId, SessionAssistantDisposition, SessionHistoryError,
+    SessionId, SessionOutcomeClass, StoreId, TurnId,
 };
 use kitsu_core::TerminalOutcome;
 use serde::{Deserialize, Serialize};
 
-pub(super) const LOGICAL_SCHEMA_V1: u32 = 1;
+pub(super) const LOGICAL_SCHEMA_REVISION: u32 = 2;
 const ARTIFACT_SCHEMA_V1: u32 = 1;
 const PROJECTION_SCHEMA_V1: u32 = 1;
+const RECOVERY_SCHEMA_V1: u32 = 1;
 const MAX_PAYLOAD_BYTES: usize = 16 * 1024 * 1024;
 const MAX_MESSAGES: usize = 65_536;
 const MAX_MESSAGES_PER_OPERATION: usize = 4_096;
@@ -25,6 +26,7 @@ const MAX_ARTIFACTS: usize = 16_384;
 const MAX_EFFECTS_PER_OPERATION: usize = 4_096;
 const MAX_REFERENCES_PER_FACT: usize = 4_096;
 const MAX_LOSS_ENTRIES: usize = 4_096;
+const MAX_RECOVERY_ENTRIES: usize = 4_096;
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -43,6 +45,40 @@ pub(super) struct CanonicalSessionRevisionV1 {
     selected_head: LogicalHead,
     artifact_manifest: Vec<ImmutableArtifactRefV1>,
     compaction_binding: Option<ContextProjectionRefV1>,
+    recovery_log: Vec<CanonicalRecoveryBindingV1>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub(super) struct CanonicalRecoverySkipV1 {
+    revision: RevisionId,
+    reason: CorruptSessionReason,
+}
+
+impl CanonicalRecoverySkipV1 {
+    pub(super) fn new(revision: RevisionId, reason: CorruptSessionReason) -> Self {
+        Self { revision, reason }
+    }
+
+    pub(super) fn revision(&self) -> &RevisionId {
+        &self.revision
+    }
+
+    pub(super) fn reason(&self) -> CorruptSessionReason {
+        self.reason
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CanonicalRecoveryBindingV1 {
+    recovery_schema: u32,
+    recovery_revision: RevisionId,
+    committed_at: String,
+    selected_revision: RevisionId,
+    source_revision: RevisionId,
+    source_head: LogicalHead,
+    skipped: Vec<CanonicalRecoverySkipV1>,
 }
 
 impl CanonicalSessionRevisionV1 {
@@ -553,7 +589,7 @@ fn build_current_v1_legacy_baseline(
     let session_id = SessionId::new(input.id.clone())
         .map_err(|error| format!("current-v1 session identity is not canonical: {error}"))?;
     let payload = CanonicalSessionRevisionV1 {
-        logical_schema: LOGICAL_SCHEMA_V1,
+        logical_schema: LOGICAL_SCHEMA_REVISION,
         store_id,
         session_id: session_id.clone(),
         revision_id,
@@ -580,6 +616,7 @@ fn build_current_v1_legacy_baseline(
         selected_head: LogicalHead::Genesis,
         artifact_manifest: Vec::new(),
         compaction_binding: None,
+        recovery_log: Vec::new(),
     };
     validate_canonical_payload(&payload)?;
     Ok(payload)
@@ -643,6 +680,48 @@ pub(super) fn append_complete_operation(
     // A projection is bound to the old revision and selected HEAD. It is never
     // carried forward as if it summarized the successor operation.
     next.compaction_binding = None;
+    validate_canonical_payload(&next)?;
+    Ok(next)
+}
+
+pub(super) fn assemble_recovery_revision(
+    source: &CanonicalSessionRevisionV1,
+    selected_revision: RevisionId,
+    recovery_revision: RevisionId,
+    committed_at: String,
+    skipped: Vec<CanonicalRecoverySkipV1>,
+) -> Result<CanonicalSessionRevisionV1, String> {
+    validate_canonical_payload(source)?;
+    validate_timestamp(&committed_at, "canonical recovery committed_at")?;
+    validate_timestamp_order(&source.committed_at, &committed_at, "canonical recovery")?;
+    if recovery_revision == source.revision_id
+        || recovery_revision == selected_revision
+        || selected_revision == source.revision_id
+    {
+        return Err("canonical recovery identities must be distinct".to_string());
+    }
+    validate_recovery_skips(
+        &skipped,
+        &selected_revision,
+        &source.revision_id,
+        &recovery_revision,
+    )?;
+
+    let mut next = source.clone();
+    next.logical_schema = LOGICAL_SCHEMA_REVISION;
+    next.revision_id = recovery_revision.clone();
+    next.parent_revision = ExpectedRevision::Exact(selected_revision.clone());
+    next.committed_at = committed_at.clone();
+    next.compaction_binding = None;
+    next.recovery_log.push(CanonicalRecoveryBindingV1 {
+        recovery_schema: RECOVERY_SCHEMA_V1,
+        recovery_revision,
+        committed_at,
+        selected_revision,
+        source_revision: source.revision_id.clone(),
+        source_head: source.selected_head.clone(),
+        skipped,
+    });
     validate_canonical_payload(&next)?;
     Ok(next)
 }
@@ -765,10 +844,10 @@ pub(super) fn decode_canonical_payload_classified(
             "canonical logical schema must be nonzero".to_string(),
         ));
     }
-    if payload.logical_schema != LOGICAL_SCHEMA_V1 {
+    if payload.logical_schema != LOGICAL_SCHEMA_REVISION {
         return Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
             observed: payload.logical_schema,
-            supported: LOGICAL_SCHEMA_V1,
+            supported: LOGICAL_SCHEMA_REVISION,
         });
     }
     classify_selected_head(&payload)?;
@@ -809,9 +888,9 @@ pub(super) fn encode_canonical_payload(
 }
 
 fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<(), String> {
-    if payload.logical_schema != LOGICAL_SCHEMA_V1 {
+    if payload.logical_schema != LOGICAL_SCHEMA_REVISION {
         return Err(format!(
-            "unsupported canonical logical schema {}; expected {LOGICAL_SCHEMA_V1}",
+            "unsupported canonical logical schema {}; expected {LOGICAL_SCHEMA_REVISION}",
             payload.logical_schema
         ));
     }
@@ -902,10 +981,110 @@ fn validate_canonical_payload(payload: &CanonicalSessionRevisionV1) -> Result<()
             "canonical manifest contains unreferenced artifact '{unreferenced}'"
         ));
     }
-    CanonicalHistory::new(operation_envelopes, payload.selected_head.clone())
+    CanonicalHistory::new(operation_envelopes.clone(), payload.selected_head.clone())
         .map_err(|error| format!("invalid canonical history: {error}"))?;
+    validate_recovery_log(payload, &operation_envelopes)?;
     if let Some(binding) = &payload.compaction_binding {
         validate_projection_binding(payload, binding)?;
+    }
+    Ok(())
+}
+
+fn validate_recovery_log(
+    payload: &CanonicalSessionRevisionV1,
+    operation_envelopes: &[CanonicalOperation],
+) -> Result<(), String> {
+    if payload.recovery_log.len() > MAX_RECOVERY_ENTRIES {
+        return Err(format!(
+            "canonical recovery log has {} entries; maximum is {MAX_RECOVERY_ENTRIES}",
+            payload.recovery_log.len()
+        ));
+    }
+
+    let mut recovery_revisions = HashSet::with_capacity(payload.recovery_log.len());
+    let mut prior_committed_at = payload.created_at.as_str();
+    for binding in &payload.recovery_log {
+        if binding.recovery_schema != RECOVERY_SCHEMA_V1 {
+            return Err(format!(
+                "unsupported canonical recovery schema {}; expected {RECOVERY_SCHEMA_V1}",
+                binding.recovery_schema
+            ));
+        }
+        validate_timestamp(&binding.committed_at, "canonical recovery committed_at")?;
+        validate_timestamp_order(
+            prior_committed_at,
+            &binding.committed_at,
+            "canonical recovery log",
+        )?;
+        validate_timestamp_order(
+            &binding.committed_at,
+            &payload.committed_at,
+            "canonical recovery payload",
+        )?;
+        prior_committed_at = &binding.committed_at;
+        if !recovery_revisions.insert(binding.recovery_revision.as_str()) {
+            return Err(format!(
+                "duplicate canonical recovery revision '{}'",
+                binding.recovery_revision
+            ));
+        }
+        validate_recovery_skips(
+            &binding.skipped,
+            &binding.selected_revision,
+            &binding.source_revision,
+            &binding.recovery_revision,
+        )?;
+        CanonicalHistory::new(operation_envelopes.to_vec(), binding.source_head.clone())
+            .map_err(|error| format!("invalid canonical recovery source HEAD: {error}"))?;
+
+        if binding.recovery_revision == payload.revision_id
+            && (payload.parent_revision
+                != ExpectedRevision::Exact(binding.selected_revision.clone())
+                || payload.committed_at != binding.committed_at
+                || payload.selected_head != binding.source_head)
+        {
+            return Err(
+                "current canonical recovery revision disagrees with its recovery binding"
+                    .to_string(),
+            );
+        }
+    }
+    Ok(())
+}
+
+fn validate_recovery_skips(
+    skipped: &[CanonicalRecoverySkipV1],
+    selected_revision: &RevisionId,
+    source_revision: &RevisionId,
+    recovery_revision: &RevisionId,
+) -> Result<(), String> {
+    if selected_revision == source_revision
+        || selected_revision == recovery_revision
+        || source_revision == recovery_revision
+    {
+        return Err("canonical recovery identities must be distinct".to_string());
+    }
+    if skipped.is_empty() || skipped.len() > MAX_RECOVERY_ENTRIES {
+        return Err(format!(
+            "canonical recovery skipped revisions must contain 1..={MAX_RECOVERY_ENTRIES} entries"
+        ));
+    }
+    if skipped[0].revision != *selected_revision {
+        return Err(
+            "canonical recovery evidence must begin with the selected revision".to_string(),
+        );
+    }
+    let mut revisions = HashSet::with_capacity(skipped.len());
+    for skip in skipped {
+        if skip.revision == *source_revision || skip.revision == *recovery_revision {
+            return Err("canonical recovery source and result cannot be skipped".to_string());
+        }
+        if !revisions.insert(skip.revision.as_str()) {
+            return Err(format!(
+                "duplicate canonical recovery skipped revision '{}'",
+                skip.revision
+            ));
+        }
     }
     Ok(())
 }
@@ -1436,6 +1615,160 @@ mod tests {
         }
     }
 
+    fn one_operation_source() -> CanonicalSessionRevisionV1 {
+        append_complete_operation(
+            &legacy_base("revision-1"),
+            RevisionId::new("revision-2").unwrap(),
+            "2026-08-20T11:01:00.000Z".to_string(),
+            operation_input(
+                "turn-1",
+                "run-1",
+                kitsu_core::RunOutcomeClass::Succeeded,
+                kitsu_core::RunAssistantDisposition::Committed,
+                serde_json::json!([
+                    {"role":"user","content":"recoverable question"},
+                    {"role":"assistant","content":"verified answer","tool_calls":[]}
+                ]),
+                serde_json::json!([]),
+                serde_json::json!([]),
+            ),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn recovery_assembler_creates_a_new_revision_with_complete_ordered_evidence() {
+        let source = one_operation_source();
+        let selected = RevisionId::new("revision-4").unwrap();
+        let skipped = vec![
+            CanonicalRecoverySkipV1::new(selected.clone(), CorruptSessionReason::DigestMismatch),
+            CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-3").unwrap(),
+                CorruptSessionReason::InvalidHead,
+            ),
+        ];
+
+        let recovery = assemble_recovery_revision(
+            &source,
+            selected.clone(),
+            RevisionId::new("revision-5").unwrap(),
+            "2026-08-20T11:05:00.000Z".to_string(),
+            skipped.clone(),
+        )
+        .unwrap();
+
+        assert_eq!(recovery.logical_schema, 2);
+        assert_eq!(
+            recovery.parent_revision,
+            ExpectedRevision::Exact(selected.clone())
+        );
+        assert_eq!(recovery.selected_head, source.selected_head);
+        assert_eq!(recovery.operations, source.operations);
+        assert_eq!(recovery.artifact_manifest, source.artifact_manifest);
+        assert!(recovery.compaction_binding.is_none());
+        assert_eq!(recovery.recovery_log.len(), 1);
+        let binding = &recovery.recovery_log[0];
+        assert_eq!(binding.recovery_revision, recovery.revision_id);
+        assert_eq!(binding.selected_revision, selected);
+        assert_eq!(binding.source_revision, source.revision_id);
+        assert_eq!(binding.source_head, source.selected_head);
+        assert_eq!(binding.skipped, skipped);
+        assert_eq!(binding.committed_at, recovery.committed_at);
+        assert_eq!(
+            decode_canonical_payload(&encode_canonical_payload(&recovery).unwrap()).unwrap(),
+            recovery
+        );
+    }
+
+    #[test]
+    fn recovery_assembler_rejects_ambiguous_or_incomplete_evidence() {
+        let source = one_operation_source();
+        let selected = RevisionId::new("revision-4").unwrap();
+        let new_revision = RevisionId::new("revision-5").unwrap();
+        let valid = vec![CanonicalRecoverySkipV1::new(
+            selected.clone(),
+            CorruptSessionReason::DigestMismatch,
+        )];
+
+        for (label, selected_revision, recovery_revision, skipped, committed_at) in [
+            (
+                "empty",
+                selected.clone(),
+                new_revision.clone(),
+                Vec::new(),
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "wrong-first",
+                selected.clone(),
+                new_revision.clone(),
+                vec![CanonicalRecoverySkipV1::new(
+                    RevisionId::new("revision-3").unwrap(),
+                    CorruptSessionReason::InvalidHead,
+                )],
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "source-skipped",
+                selected.clone(),
+                new_revision.clone(),
+                vec![
+                    valid[0].clone(),
+                    CanonicalRecoverySkipV1::new(
+                        source.revision_id.clone(),
+                        CorruptSessionReason::Malformed,
+                    ),
+                ],
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "identity-reuse",
+                selected.clone(),
+                selected.clone(),
+                valid.clone(),
+                "2026-08-20T11:05:00.000Z",
+            ),
+            (
+                "old-time",
+                selected.clone(),
+                new_revision.clone(),
+                valid,
+                "2026-08-20T10:59:00.000Z",
+            ),
+        ] {
+            assert!(
+                assemble_recovery_revision(
+                    &source,
+                    selected_revision,
+                    recovery_revision,
+                    committed_at.to_string(),
+                    skipped,
+                )
+                .is_err(),
+                "case: {label}"
+            );
+        }
+
+        let recovery = assemble_recovery_revision(
+            &source,
+            selected,
+            new_revision,
+            "2026-08-20T11:05:00.000Z".to_string(),
+            vec![CanonicalRecoverySkipV1::new(
+                RevisionId::new("revision-4").unwrap(),
+                CorruptSessionReason::DigestMismatch,
+            )],
+        )
+        .unwrap();
+        let mut invalid = serde_json::to_value(recovery).unwrap();
+        invalid["recovery_log"][0]["source_revision"] = serde_json::json!("revision-5");
+        assert!(
+            decode_canonical_payload(&serde_json::to_vec(&invalid).unwrap())
+                .unwrap_err()
+                .contains("identities must be distinct")
+        );
+    }
+
     #[test]
     fn strict_current_v1_is_preserved_as_non_publishable_migration_input() {
         let bytes = current_v1(closed_messages());
@@ -1878,12 +2211,12 @@ mod tests {
 
         let mut future: serde_json::Value =
             serde_json::from_slice(&complete_payload_fixture()).unwrap();
-        future["logical_schema"] = serde_json::json!(2);
+        future["logical_schema"] = serde_json::json!(3);
         assert!(matches!(
             decode_canonical_payload_classified(&serde_json::to_vec(&future).unwrap()),
             Err(CanonicalPayloadDecodeErrorV1::UnsupportedLogicalSchema {
-                observed: 2,
-                supported: 1
+                observed: 3,
+                supported: 2
             })
         ));
 
@@ -1989,7 +2322,7 @@ mod tests {
 
     fn complete_payload_fixture() -> Vec<u8> {
         serde_json::to_vec(&serde_json::json!({
-            "logical_schema": 1,
+            "logical_schema": 2,
             "store_id": "store-1",
             "session_id": "session-1",
             "revision_id": "rev-1",
@@ -2047,7 +2380,8 @@ mod tests {
                 "estimator_generation": "estimator-1",
                 "budget_tokens": 4096,
                 "loss_manifest": ["tool output elided"]
-            }
+            },
+            "recovery_log": []
         }))
         .unwrap()
     }
