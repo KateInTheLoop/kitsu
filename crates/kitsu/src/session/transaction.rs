@@ -1954,13 +1954,12 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     }
 }
 
-pub(super) fn lookup_canonical_mount_state_v1(
+pub(super) fn lookup_canonical_mount_value_v1(
     store: &PhysicalFileStoreV1,
     session_id: &SessionId,
-) -> SessionLookupState {
-    CanonicalFileTransactionV1::new(store)
-        .lookup_canonical_head(session_id)
-        .state
+) -> (SessionLookupState, Option<CanonicalSessionRevisionV1>) {
+    let lookup = CanonicalFileTransactionV1::new(store).lookup_canonical_head(session_id);
+    (lookup.state, lookup.payload)
 }
 
 #[cfg(test)]

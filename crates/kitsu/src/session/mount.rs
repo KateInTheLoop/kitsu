@@ -9,8 +9,9 @@ use std::io::Read;
 
 use kitsu_core::session::{LogicalHead, RevisionId, SessionId, SessionLookupState, StoreId};
 
+use super::canonical::CanonicalSessionRevisionV1;
 use super::physical::{PhysicalFileStoreV1, PhysicalReadErrorV1};
-use super::transaction::lookup_canonical_mount_state_v1;
+use super::transaction::lookup_canonical_mount_value_v1;
 use super::{PrivateDirectory, PrivateEntryKind, SavedSession, MAX_SESSION_BYTES, SESSION_VERSION};
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -47,6 +48,50 @@ pub(super) enum SessionMountAdmissionV1 {
         current_v1: CurrentV1MountObservationV1,
         canonical: SessionLookupState,
     },
+}
+
+#[derive(Debug)]
+pub(super) struct CurrentV1MountValueV1 {
+    saved: SavedSession,
+    source_bytes: Vec<u8>,
+}
+
+impl CurrentV1MountValueV1 {
+    pub(super) fn saved(&self) -> &SavedSession {
+        &self.saved
+    }
+
+    pub(super) fn source_bytes(&self) -> &[u8] {
+        &self.source_bytes
+    }
+}
+
+#[derive(Debug)]
+pub(super) enum SessionMountSelectionV1 {
+    Empty,
+    CurrentV1(CurrentV1MountValueV1),
+    Canonical(Box<CanonicalSessionRevisionV1>),
+    Rejected(SessionMountAdmissionV1),
+}
+
+impl SessionMountSelectionV1 {
+    fn into_admission(self) -> SessionMountAdmissionV1 {
+        match self {
+            Self::Empty => SessionMountAdmissionV1::Empty,
+            Self::CurrentV1(_) => SessionMountAdmissionV1::CurrentV1Only,
+            Self::Canonical(payload) => SessionMountAdmissionV1::CanonicalOnly {
+                revision: payload.revision_id().clone(),
+                head: payload.selected_head().clone(),
+            },
+            Self::Rejected(admission) => admission,
+        }
+    }
+}
+
+#[derive(Debug)]
+struct CurrentV1MountReadV1 {
+    observation: CurrentV1MountObservationV1,
+    value: Option<CurrentV1MountValueV1>,
 }
 
 pub(super) fn admit_session_mount_v1(
@@ -115,29 +160,66 @@ pub(super) fn observe_session_mount_v1(
     expected_store: StoreId,
     session_id: &SessionId,
 ) -> SessionMountAdmissionV1 {
+    select_session_mount_v1(session_root, expected_store, session_id).into_admission()
+}
+
+pub(super) fn select_session_mount_v1(
+    session_root: &PrivateDirectory,
+    expected_store: StoreId,
+    session_id: &SessionId,
+) -> SessionMountSelectionV1 {
     let current_v1 = observe_current_v1(session_root, session_id);
-    let canonical = match PhysicalFileStoreV1::open_existing(session_root, expected_store) {
-        Ok(None) => SessionLookupState::Missing {
-            tombstone_revision: None,
-        },
-        Ok(Some(store)) => lookup_canonical_mount_state_v1(&store, session_id),
-        Err(error) => physical_store_error_state(session_id, error),
-    };
-    admit_session_mount_v1(current_v1, canonical)
+    let (canonical_state, canonical_value) =
+        match PhysicalFileStoreV1::open_existing(session_root, expected_store) {
+            Ok(None) => (
+                SessionLookupState::Missing {
+                    tombstone_revision: None,
+                },
+                None,
+            ),
+            Ok(Some(store)) => lookup_canonical_mount_value_v1(&store, session_id),
+            Err(error) => (physical_store_error_state(session_id, error), None),
+        };
+    let admission = admit_session_mount_v1(current_v1.observation.clone(), canonical_state);
+    match admission {
+        SessionMountAdmissionV1::Empty => SessionMountSelectionV1::Empty,
+        SessionMountAdmissionV1::CurrentV1Only => SessionMountSelectionV1::CurrentV1(
+            current_v1
+                .value
+                .expect("current-v1-only admission always retains its exact parsed value"),
+        ),
+        SessionMountAdmissionV1::CanonicalOnly { .. } => {
+            SessionMountSelectionV1::Canonical(Box::new(
+                canonical_value
+                    .expect("canonical-only admission always retains its exact verified payload"),
+            ))
+        }
+        rejected @ SessionMountAdmissionV1::Rejected { .. } => {
+            SessionMountSelectionV1::Rejected(rejected)
+        }
+    }
 }
 
 fn observe_current_v1(
     session_root: &PrivateDirectory,
     session_id: &SessionId,
-) -> CurrentV1MountObservationV1 {
+) -> CurrentV1MountReadV1 {
     let name = format!("{}.json", session_id.as_str());
     match session_root.entry_kind(OsStr::new(&name)) {
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
-            return CurrentV1MountObservationV1::Missing;
+            return CurrentV1MountReadV1 {
+                observation: CurrentV1MountObservationV1::Missing,
+                value: None,
+            };
         }
         Ok(PrivateEntryKind::File) => {}
         Ok(_) | Err(_) => {
-            return CurrentV1MountObservationV1::Unavailable(CurrentV1MountFaultV1::Malformed);
+            return CurrentV1MountReadV1 {
+                observation: CurrentV1MountObservationV1::Unavailable(
+                    CurrentV1MountFaultV1::Malformed,
+                ),
+                value: None,
+            };
         }
     }
 
@@ -169,12 +251,21 @@ fn observe_current_v1(
         if saved.id != session_id.as_str() || !super::valid_id(&saved.id) {
             return Err(CurrentV1MountFaultV1::IdentityMismatch);
         }
-        Ok(())
+        Ok(CurrentV1MountValueV1 {
+            saved,
+            source_bytes: bytes,
+        })
     })();
 
     match observed {
-        Ok(()) => CurrentV1MountObservationV1::Present,
-        Err(error) => CurrentV1MountObservationV1::Unavailable(error),
+        Ok(value) => CurrentV1MountReadV1 {
+            observation: CurrentV1MountObservationV1::Present,
+            value: Some(value),
+        },
+        Err(error) => CurrentV1MountReadV1 {
+            observation: CurrentV1MountObservationV1::Unavailable(error),
+            value: None,
+        },
     }
 }
 
@@ -225,8 +316,9 @@ mod tests {
     };
 
     use super::{
-        admit_session_mount_v1, observe_session_mount_v1, CurrentV1MountFaultV1,
-        CurrentV1MountObservationV1, SessionMountAdmissionV1, SessionMountRejectionV1,
+        admit_session_mount_v1, observe_session_mount_v1, select_session_mount_v1,
+        CurrentV1MountFaultV1, CurrentV1MountObservationV1, SessionMountAdmissionV1,
+        SessionMountRejectionV1, SessionMountSelectionV1,
     };
 
     fn revision(value: &str) -> RevisionId {
@@ -691,5 +783,106 @@ mod tests {
                 .file_type()
                 .is_symlink()
         );
+    }
+
+    #[test]
+    fn selection_retains_exact_current_value_from_the_observed_descriptor() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let path = session_root.join("session-a.json");
+        let expected = current_v1_bytes(1, "session-a");
+        std::fs::write(&path, &expected).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+
+        let selection = select_session_mount_v1(
+            &directory,
+            StoreId::new("store-a").unwrap(),
+            &SessionId::new("session-a").unwrap(),
+        );
+        std::fs::write(&path, current_v1_bytes(1, "session-new")).unwrap();
+
+        let SessionMountSelectionV1::CurrentV1(value) = selection else {
+            panic!("expected selected current-v1 value")
+        };
+        assert_eq!(value.saved().id, "session-a");
+        assert_eq!(value.source_bytes(), expected);
+    }
+
+    #[test]
+    fn selection_retains_verified_canonical_value_and_rejection_retains_none() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let revision = revision("rev-a");
+        let source = current_v1_bytes(1, session.as_str());
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &session_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision.clone(),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+
+        let selected = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let SessionMountSelectionV1::Canonical(payload) = selected else {
+            panic!("expected selected canonical value")
+        };
+        std::fs::write(
+            super::super::physical::PhysicalLayoutV1::canonical_payload(
+                &session_root,
+                &session,
+                &revision,
+            ),
+            b"{",
+        )
+        .unwrap();
+        assert_eq!(payload.session_id(), &session);
+        assert_eq!(payload.revision_id(), &revision);
+        assert_eq!(payload.selected_head(), &LogicalHead::Genesis);
+        assert!(matches!(
+            select_session_mount_v1(&directory, store_id.clone(), &session),
+            SessionMountSelectionV1::Rejected(SessionMountAdmissionV1::Rejected {
+                reason: SessionMountRejectionV1::UnavailableRepresentation,
+                ..
+            })
+        ));
+
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &root.path().join("dual-sessions"),
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision,
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let dual_root = root.path().join("dual-sessions");
+        std::fs::write(dual_root.join("session-a.json"), source).unwrap();
+        let dual_directory =
+            super::super::PrivateDirectory::open(&dual_root, "mount fixture").unwrap();
+        assert!(matches!(
+            select_session_mount_v1(&dual_directory, store_id, &session),
+            SessionMountSelectionV1::Rejected(SessionMountAdmissionV1::Rejected {
+                reason: SessionMountRejectionV1::AmbiguousDualPresence,
+                ..
+            })
+        ));
     }
 }

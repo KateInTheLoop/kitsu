@@ -666,6 +666,16 @@ cannot weaken or replace any backend-neutral assertion.
    roots remain typed rejection. Valid canonical-only and dual-presence paths
    reuse the ordinary verified HEAD/closure lookup. No selected value is yet
    returned to production.
+   **Exact single-pass selection complete in Cycle 083:** the same observation
+   now retains exactly one admitted value. Current-v1 owns the parsed
+   `SavedSession` and exact bounded source bytes; canonical owns the payload that
+   passed ordinary HEAD, manifest, logical, identity, and artifact-closure
+   verification. Empty has no value. Unavailable, tombstoned, and dual-present
+   results expose only typed rejection. Tests change the backing current or
+   canonical path after selection: the retained value remains exact and a new
+   selection sees the fault. The canonical variant is boxed to keep the private
+   enum bounded. Production projection and activation revalidation are still
+   required before mounting.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
