@@ -1618,6 +1618,35 @@ impl PhysicalFileStoreV1 {
         })
     }
 
+    pub(super) fn copy_artifact_no_overwrite(
+        &self,
+        source_session: &SessionId,
+        destination_session: &SessionId,
+        artifact_id: &str,
+    ) -> Result<InstalledArtifactV1, PhysicalArtifactInstallError> {
+        if source_session == destination_session {
+            return Err(PhysicalArtifactInstallError::before_install(
+                "artifact copy destination session must be fresh",
+            ));
+        }
+
+        let source = self
+            .open_artifact(source_session, artifact_id)
+            .map_err(|error| {
+                PhysicalArtifactInstallError::before_install(format!(
+                    "cannot verify source artifact before copy: {error}"
+                ))
+            })?;
+        let manifest = source.manifest();
+        self.install_artifact(
+            manifest.artifact_schema_revision(),
+            destination_session.clone(),
+            manifest.artifact_id().to_string(),
+            manifest.media_type().map(str::to_string),
+            source.content_bytes(),
+        )
+    }
+
     pub(super) fn open_artifact(
         &self,
         session_id: &SessionId,
@@ -2809,6 +2838,78 @@ mod tests {
                 .next()
                 .is_none()
         );
+    }
+
+    #[test]
+    fn artifact_copy_is_verified_destination_scoped_and_no_overwrite() {
+        let temp = TempDir::new().unwrap();
+        let session_root = temp.path().join("sessions");
+        let store = PhysicalFileStoreV1::create_or_open(&session_root, store()).unwrap();
+        let source = SessionId::new("s-source").unwrap();
+        let destination = SessionId::new("s-destination").unwrap();
+        let content = b"branch artifact bytes";
+        store
+            .install_artifact(
+                1,
+                source.clone(),
+                "artifact-a".to_string(),
+                Some("text/plain".to_string()),
+                content,
+            )
+            .unwrap();
+
+        let copied = store
+            .copy_artifact_no_overwrite(&source, &destination, "artifact-a")
+            .unwrap();
+
+        assert_eq!(&copied.manifest().session_id, &destination);
+        assert_eq!(copied.manifest().artifact_id(), "artifact-a");
+        let opened = store.open_artifact(&destination, "artifact-a").unwrap();
+        assert_eq!(opened.content_bytes(), content);
+        assert_eq!(
+            opened.manifest().content_sha256(),
+            copied.manifest().content_sha256()
+        );
+        assert_eq!(opened.manifest().media_type(), Some("text/plain"));
+        let collision = store
+            .copy_artifact_no_overwrite(&source, &destination, "artifact-a")
+            .unwrap_err();
+        assert!(!collision.installed());
+        assert!(collision.to_string().contains("refusing to overwrite"));
+        assert_eq!(
+            store
+                .open_artifact(&destination, "artifact-a")
+                .unwrap()
+                .content_bytes(),
+            content
+        );
+        assert!(store
+            .copy_artifact_no_overwrite(&source, &source, "artifact-a")
+            .is_err());
+
+        assert!(store
+            .copy_artifact_no_overwrite(&source, &destination, "missing")
+            .is_err());
+        assert!(store.open_artifact(&destination, "missing").is_err());
+
+        store
+            .install_artifact(
+                1,
+                source.clone(),
+                "artifact-b".to_string(),
+                None,
+                b"original",
+            )
+            .unwrap();
+        std::fs::write(
+            PhysicalLayoutV1::artifact_content(&session_root, &source, "artifact-b"),
+            b"tampered",
+        )
+        .unwrap();
+        assert!(store
+            .copy_artifact_no_overwrite(&source, &destination, "artifact-b")
+            .is_err());
+        assert!(store.open_artifact(&destination, "artifact-b").is_err());
     }
 
     #[cfg(unix)]
