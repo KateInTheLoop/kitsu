@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C32, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C33, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 91 / 91 |
+| Accepted cycles/commits after this cycle | 92 / 92 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C33 (Cycle 092) — define stable explicit local canonical store identity before production mounting |
+| Active epic/card | E03 / E03-S02-C34 (Cycle 093) — bind local composition identity to physical store identity and activation without product routing |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C32, E03-S05 through C4 | Production autosave, clear/reset, resume switching, and artifact routing now hold one non-cloneable active-session owner. Its sole implementation delegates exactly to current-v1 and creates no canonical namespace; static catalog/lifecycle operations remain separate. The private live-store owner is ready behind that handoff, but explicit local store identity, production mount routing, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C33, E03-S05 through C4 | Production active persistence has one non-cloneable owner, and a separate unmounted schema-1 owner-private composition record now supplies one stable explicit local canonical `StoreId` with no-clobber, corruption, concurrent-winner, durability, and pinned-path evidence. It creates no physical canonical namespace. Binding it to the physical store record, production mount routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -127,7 +127,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 088 | `932c7e8` | Exact held-fence canonical live-save boundary |
 | 089 | `97707e1` | Exact pinned current-v1 live-save boundary |
 | 090 | `4f87e0b` | Non-cloneable total private live-store owner |
-| 091 | this document's commit | Current-v1-preserving production active-session ownership handoff |
+| 091 | `dcfd108` | Current-v1-preserving production active-session ownership handoff |
+| 092 | this document's commit | Stable explicit local canonical store identity |
 
 ## Current green gates
 
@@ -581,8 +582,16 @@ type. Its only implementation delegates to the existing current-v1 store, so
 snapshot bytes, exact installed-inode evidence, lease behavior, names, reset,
 and resume validation remain unchanged and no canonical namespace is created.
 Catalog/list/export/archive/delete stay on the static lifecycle surface. Cycle
-092 next defines an explicit stable local store identity before production can
-activate the private canonical namespace.
+092 adds that explicit stable local identity as a separate unmounted schema-1
+record. It mints one bounded opaque `StoreId`, installs owner-only bytes
+create-only beneath the pinned sessions descriptor, and exactly reopens them.
+A loser adopts only a completely valid concurrent winner. Malformed, zero,
+future, unknown-field, invalid-identity, symlink, permissive, or multiply linked
+state is never repaired. A visible install followed by directory-sync failure
+returns the exact identity with a durability warning, and ancestor replacement
+cannot redirect publication. No physical canonical namespace is created. Cycle
+093 next binds this composition identity to the physical store record before
+the active production route can change.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

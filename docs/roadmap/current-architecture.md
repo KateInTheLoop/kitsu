@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 091.
+updates through Cycle 092.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -225,8 +225,17 @@ kernel.
   implementation delegates exactly to `SessionStore`, creates no canonical
   namespace, and preserves current-v1 bytes, installed-inode evidence, leases,
   names, and reset behavior. Catalog/list/export/archive/delete remain static
-  lifecycle operations rather than active save authority. A stable explicit
-  local canonical store identity and production mount routing remain open.
+  lifecycle operations rather than active save authority. At the Cycle 091
+  boundary, a stable explicit local canonical store identity and production
+  mount routing remained open. Cycle 092 supplies the former as an unmounted,
+  owner-private schema-1
+  composition record beneath the pinned sessions directory. It mints a bounded
+  opaque `StoreId`, installs create-only, adopts only a valid concurrent winner,
+  and distinguishes confirmed from installed-unconfirmed creation. Malformed,
+  future, unknown-field, invalid, symlinked, permissive, or multiply linked
+  records fail closed without repair; ancestor replacement cannot redirect the
+  write. The record does not create the physical canonical namespace and is not
+  yet bound to its `store.json`; product persistence remains current-v1.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
