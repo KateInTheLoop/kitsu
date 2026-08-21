@@ -717,6 +717,7 @@ gates merely because a card appears attractive.
 | 106 | E08-S05-C1 | Type one presentation-neutral current-session status, context, usage, and cost snapshot whose every value carries bounded truth and provenance |
 | 107 | E06-S02-C3 | Publish complete validated external inventories through exact source-lifetime/revision fences with atomic successor, replacement, and withdrawal truth |
 | 108 | E06-S01-C3 | Bind exact bounded phase, I/O, process-group, environment, network, and timeout/reap policy into request, host authority, and prepared child identity |
+| 109 | E08-S05-C2 | Retain reported/missing provider-response coverage and cached-token presence per fixed request purpose, then adapt it without inventing missing telemetry |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -945,6 +946,14 @@ projection whose values are redacted from debug output. Owned process group,
 denied network, and terminate-group-then-reap timeout disposition are mandatory.
 Validation remains inert and unmounted: no process backend enforces the policy
 yet, and the card does not claim containment from the typed values alone.
+Cycle 109 makes current-run accounting distinguish every completed provider
+response that reported usage from one that omitted it, while transport-only and
+uncompleted partial responses are not invented. Per-logical-request physical
+attempt correlation deduplicates retry/terminal observations; a usage report is
+retained even if the stream later fails. Cached prompt tokens preserve explicit
+zero versus absence. Fixed all/inference/compaction/model-catalog buckets feed a
+pure session-usage adapter, but catalog remains unpopulated and no slash command,
+renderer, JSONL field, persistence, cost, or account lookup is mounted.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

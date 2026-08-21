@@ -7,18 +7,19 @@ has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
 provider-free monotonic inventory publication through Cycle 107, and E06-S01
-binds exact runtime policy into preparation through Cycle 108.
+binds exact runtime policy into preparation through Cycle 108. E08-S05 now has
+truthful current-run usage coverage and cached-token presence through Cycle 109.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 108 / 108 |
+| Accepted cycles/commits after this cycle | 109 / 109 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 109 — E08-S05-C2: retain exact provider reported/missing response coverage and cached-token presence in current-run accounting |
+| Active epic/card | Cycle 110 — E08-S05-C3: render the typed current-session snapshot adaptively for wide, narrow, redirected, plain, no-color, and screen-reader destinations |
 
 ## Epic status
 
@@ -32,7 +33,7 @@ binds exact runtime policy into preparation through Cycle 108.
 | E06 child/MCP spine | **In progress** through E06-S01-C3, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped phase/I/O/environment/process/network/timeout policy into a causal joined lifecycle owner, but effects remain injected and synchronous. Next add a real bounded backend only behind these proofs; no product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
-| E08 telemetry/docs | **In progress** through E08-S05-C1 | Pure current-session status/context/usage DTOs consume E04 receipts and label every value with truth/provenance. Cycle 109 next retains reported/missing response coverage and cached-token presence before any product adapter or renderer; durable history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C2 | Pure current-session DTOs label every value with truth/provenance. Current-run tallies now retain reported/missing response coverage plus cached-token presence across fixed purpose buckets and project through an unmounted adapter. Next add adaptive presentation-only rendering; product snapshot collection/slash routing and durable history remain separate |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -147,7 +148,8 @@ binds exact runtime policy into preparation through Cycle 108.
 | 105 | `a8462e6` | Single-use joined external child lifecycle truth |
 | 106 | `0b7b882` | Typed current-session telemetry truth and provenance |
 | 107 | `6dec4c4` | Exact atomic external-inventory publication and withdrawal |
-| 108 | this document's commit | Exact bounded child runtime policy identity and preparation |
+| 108 | `90101b0` | Exact bounded child runtime policy identity and preparation |
+| 109 | this document's commit | Truthful provider usage coverage and cached-token accounting |
 
 ## Current green gates
 
@@ -727,6 +729,14 @@ clear-only, unique, aggregate-bounded, NUL-free, and debug-redacted. Owned
 process group, denied network, and terminate-group-then-reap timeout behavior
 are mandatory. No real process consumes these values yet, so this is exact
 admission truth rather than a containment claim.
+Cycle 109 supplies the missing current-run accounting prerequisite for the
+telemetry decks. A request-local tracker correlates physical attempt ordinals,
+counts completed HTTP rejections once as missing usage, preserves a usage report
+through a later partial failure, and never treats a transport-only fault as a
+completed response. Totals and fixed inference/compaction/future-catalog
+coverage buckets preserve cached-token `Some(0)` versus absence. A pure adapter
+feeds the existing session usage DTO; it is not mounted into product collection,
+slash routing, rendering, JSONL, persistence, account data, pricing, or cost.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
