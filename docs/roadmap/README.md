@@ -731,6 +731,7 @@ gates merely because a card appears attractive.
 | 120 | E05-S01-C3 | Compose the pure local setup transaction with descriptor-relative create-new publication and exact concrete recovery ownership |
 | 121 | E08-S05-C6 | Mount exact offline `/context window` from one typed current-session observation and the existing adaptive renderer |
 | 122 | E07-S01-C2 | Measure a deterministic structural selector against the frozen baseline and record the threshold-backed promote decision |
+| 123 | E05-S02-C1 | Stage a deterministic offline model picker over one bounded provenance-bearing catalog snapshot without applying it |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1081,6 +1082,13 @@ from 5 to 3 and canonical tool bytes from 1,456 to 1,134, below the predeclared
 overflow, determinism, and fresh-read cases pass. The decision promotes only
 the next authority/staleness experiment; no production contributor, cache,
 provider, mutation, or completed-task claim is added.
+Cycle 123 stages a private immutable model-picker snapshot and proposal. Closed
+availability/source/freshness/provenance tuples and present/absent/unobserved
+membership preserve offline and stale uncertainty. Bounded normalization,
+deduplication, filtering, deterministic ranking, current/default flags, and
+narrow projection operate without provider, network, filesystem, cache,
+credential, configuration, route, or session effects. No apply, publication,
+UI, capability inference, or product mount exists.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
