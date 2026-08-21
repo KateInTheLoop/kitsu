@@ -1994,6 +1994,40 @@ impl PhysicalFileStoreV1 {
         self.fail_next_target_sync.set(true);
     }
 
+    pub(super) fn revision_candidate_is_absent(
+        &self,
+        session_id: &SessionId,
+        revision_id: &RevisionId,
+    ) -> Result<bool, String> {
+        let session_name = encode_component(session_id.as_str());
+        let revision_name = encode_component(revision_id.as_str());
+        match self.revisions.entry_kind(OsStr::new(&session_name)) {
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+            Ok(PrivateEntryKind::Directory) => {
+                let session_revisions = self.revisions.open_child(
+                    OsStr::new(&session_name),
+                    "physical session revision namespace",
+                )?;
+                match session_revisions.entry_kind(OsStr::new(&revision_name)) {
+                    Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(true),
+                    Ok(_) => Ok(false),
+                    Err(error) => Err(format!(
+                        "cannot inspect physical revision candidate '{}': {error}",
+                        session_revisions.path.join(&revision_name).display()
+                    )),
+                }
+            }
+            Ok(_) => Err(format!(
+                "physical session revision namespace '{}' is not a directory",
+                self.revisions.path.join(&session_name).display()
+            )),
+            Err(error) => Err(format!(
+                "cannot inspect physical session revision namespace '{}': {error}",
+                self.revisions.path.join(&session_name).display()
+            )),
+        }
+    }
+
     pub(super) fn open_revision_candidate(
         &self,
         session_id: &SessionId,

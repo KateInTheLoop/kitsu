@@ -8,16 +8,17 @@ use std::cell::Cell;
 
 use kitsu_core::session::{
     CommitDurability, CorruptSessionReason, ExpectedRevision, RevisionId, SchemaDimension,
-    SessionCommitOutcome, SessionCommitReceipt, SessionId, SessionLookupState,
+    SessionCommitOutcome, SessionCommitReceipt, SessionId, SessionLookupState, TurnId,
 };
 
 #[cfg(test)]
 use super::canonical::CanonicalToolRoundV1;
 use super::canonical::{
-    append_complete_operation, assemble_recovery_revision, decode_canonical_payload_classified,
-    encode_canonical_payload, prepare_current_v1_legacy_baseline, CanonicalOperationInputV1,
-    CanonicalPayloadDecodeErrorV1, CanonicalRecoverySkipV1, CanonicalSessionRevisionV1,
-    ImmutableArtifactRefV1, LOGICAL_SCHEMA_REVISION,
+    append_complete_operation, assemble_branch_at_committed_turn, assemble_recovery_revision,
+    decode_canonical_payload_classified, encode_canonical_payload,
+    prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalPayloadDecodeErrorV1,
+    CanonicalRecoverySkipV1, CanonicalSessionRevisionV1, ImmutableArtifactRefV1,
+    LOGICAL_SCHEMA_REVISION,
 };
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
@@ -56,10 +57,19 @@ enum CandidateResidueV1 {
     },
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ArtifactResidueV1 {
+    Installed {
+        artifact_id: String,
+        durability: CandidateDurabilityV1,
+    },
+}
+
 #[derive(Debug)]
 struct CanonicalTransactionErrorV1 {
     message: String,
     candidate_residue: CandidateResidueV1,
+    artifact_residue: Vec<ArtifactResidueV1>,
     not_published: Option<Box<SessionCommitOutcome>>,
 }
 
@@ -68,6 +78,7 @@ impl CanonicalTransactionErrorV1 {
         Self {
             message: message.into(),
             candidate_residue: CandidateResidueV1::None,
+            artifact_residue: Vec::new(),
             not_published: None,
         }
     }
@@ -82,6 +93,7 @@ impl CanonicalTransactionErrorV1 {
         Self {
             message: message.into(),
             candidate_residue,
+            artifact_residue: Vec::new(),
             not_published: Some(Box::new(SessionCommitOutcome::NotPublished {
                 store: store.store_id().clone(),
                 session: session.clone(),
@@ -92,6 +104,16 @@ impl CanonicalTransactionErrorV1 {
 
     fn candidate_residue(&self) -> CandidateResidueV1 {
         self.candidate_residue.clone()
+    }
+
+    fn with_artifact_residue(mut self, artifact_residue: Vec<ArtifactResidueV1>) -> Self {
+        self.artifact_residue = artifact_residue;
+        self
+    }
+
+    #[cfg(test)]
+    fn artifact_residue(&self) -> &[ArtifactResidueV1] {
+        &self.artifact_residue
     }
 
     #[allow(dead_code)]
@@ -412,6 +434,8 @@ struct CanonicalFileTransactionV1<'a> {
     fail_next_after_candidate: Cell<bool>,
     #[cfg(test)]
     fail_next_artifact_recheck: Cell<bool>,
+    #[cfg(test)]
+    fail_next_after_branch_artifacts: Cell<bool>,
 }
 
 impl<'a> CanonicalFileTransactionV1<'a> {
@@ -422,6 +446,8 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             fail_next_after_candidate: Cell::new(false),
             #[cfg(test)]
             fail_next_artifact_recheck: Cell::new(false),
+            #[cfg(test)]
+            fail_next_after_branch_artifacts: Cell::new(false),
         }
     }
 
@@ -931,6 +957,327 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             ));
         }
         self.commit(&payload)
+    }
+
+    fn commit_branch_at_turn(
+        &self,
+        source: &CanonicalSessionRevisionV1,
+        destination_session: SessionId,
+        destination_revision: RevisionId,
+        committed_at: String,
+        branch_turn: TurnId,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        if source.store_id() != self.store.store_id() {
+            return Err(CanonicalTransactionErrorV1::before_identity(format!(
+                "canonical branch source store identity '{}' does not match physical store '{}'",
+                source.store_id(),
+                self.store.store_id()
+            )));
+        }
+        let payload = assemble_branch_at_committed_turn(
+            source,
+            self.store.store_id().clone(),
+            destination_session.clone(),
+            destination_revision.clone(),
+            committed_at,
+            branch_turn,
+        )
+        .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        let canonical_bytes = encode_canonical_payload(&payload)
+            .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        let expected = ExpectedRevision::Missing;
+        let confirmed_receipt = self.receipt(&payload, CommitDurability::Confirmed)?;
+        let unconfirmed_receipt = self.receipt(&payload, CommitDurability::PublishedUnconfirmed)?;
+
+        // Always acquire two session fences in stable identity order. This
+        // avoids AB/BA deadlock while retaining both guards until destination
+        // HEAD publication settles.
+        let acquire = |session: &SessionId| {
+            self.store.acquire_writer_fence(session).map_err(|message| {
+                CanonicalTransactionErrorV1::not_published(
+                    message,
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })
+        };
+        let (_source_fence, destination_fence) =
+            if source.session_id().as_str() < destination_session.as_str() {
+                let source_fence = acquire(source.session_id())?;
+                let destination_fence = acquire(&destination_session)?;
+                (source_fence, destination_fence)
+            } else {
+                let destination_fence = acquire(&destination_session)?;
+                let source_fence = acquire(source.session_id())?;
+                (source_fence, destination_fence)
+            };
+
+        let admitted_source = self
+            .open_canonical_head(source.session_id())
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("canonical branch source no longer verifies: {error}"),
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+            .ok_or_else(|| {
+                CanonicalTransactionErrorV1::not_published(
+                    "canonical branch source changed: selected HEAD disappeared",
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if &admitted_source != source {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "canonical branch source changed before fenced admission",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+
+        let destination_head = self
+            .store
+            .read_head(&destination_session)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("cannot prove branch destination HEAD absent: {error}"),
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if destination_head.is_some() {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "canonical branch destination HEAD already exists; refusing to overwrite it",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        if !self
+            .store
+            .revision_candidate_is_absent(&destination_session, &destination_revision)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("cannot prove branch destination revision absent: {error}"),
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+        {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "canonical branch destination revision already exists; refusing to overwrite it",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+
+        // Preflight the complete destination artifact set before copying the
+        // first byte. The destination fence excludes every conformant writer.
+        for fact in payload.artifacts() {
+            match self
+                .store
+                .open_artifact(&destination_session, fact.artifact_id())
+            {
+                Err(PhysicalArtifactReadErrorV1::Missing(_)) => {}
+                Ok(_) => {
+                    return Err(CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "canonical branch destination artifact '{}' already exists; refusing to overwrite it",
+                            fact.artifact_id()
+                        ),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::None,
+                    ));
+                }
+                Err(error) => {
+                    return Err(CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "cannot prove canonical branch destination artifact '{}' absent: {error}",
+                            fact.artifact_id()
+                        ),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::None,
+                    ));
+                }
+            }
+        }
+
+        let mut artifact_residue = Vec::with_capacity(payload.artifact_count());
+        for fact in payload.artifacts() {
+            match self.store.copy_artifact_no_overwrite(
+                source.session_id(),
+                &destination_session,
+                fact.artifact_id(),
+            ) {
+                Ok(_) => artifact_residue.push(ArtifactResidueV1::Installed {
+                    artifact_id: fact.artifact_id().to_string(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                }),
+                Err(error) => {
+                    if error.installed() {
+                        artifact_residue.push(ArtifactResidueV1::Installed {
+                            artifact_id: fact.artifact_id().to_string(),
+                            durability: CandidateDurabilityV1::Unconfirmed,
+                        });
+                    }
+                    return Err(CanonicalTransactionErrorV1::not_published(
+                        format!(
+                            "cannot copy canonical branch artifact '{}': {error}",
+                            fact.artifact_id()
+                        ),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::None,
+                    )
+                    .with_artifact_residue(artifact_residue));
+                }
+            }
+        }
+
+        #[cfg(test)]
+        if self.fail_next_after_branch_artifacts.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected failure after canonical branch artifact copying",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::None,
+            )
+            .with_artifact_residue(artifact_residue));
+        }
+
+        self.verify_artifact_closure(&payload, CandidateResidueV1::None)
+            .map_err(|error| error.with_artifact_residue(artifact_residue.clone()))?;
+        let candidate = self
+            .store
+            .install_revision_candidate(
+                payload.logical_schema(),
+                destination_session.clone(),
+                destination_revision.clone(),
+                expected.clone(),
+                &canonical_bytes,
+            )
+            .map_err(|error| {
+                self.install_error(&payload, &canonical_bytes, error)
+                    .with_artifact_residue(artifact_residue.clone())
+            })?;
+
+        #[cfg(test)]
+        if self.fail_next_artifact_recheck.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected canonical branch artifact closure recheck failure",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: destination_revision.clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            )
+            .with_artifact_residue(artifact_residue));
+        }
+
+        #[cfg(test)]
+        if self.fail_next_after_candidate.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected failure after immutable branch candidate installation",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: destination_revision.clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            )
+            .with_artifact_residue(artifact_residue));
+        }
+
+        let source_recheck = self
+            .open_canonical_head(source.session_id())
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("canonical branch source changed before publication: {error}"),
+                    self.store,
+                    &destination_session,
+                    &expected,
+                    CandidateResidueV1::InstalledUnselected {
+                        revision: destination_revision.clone(),
+                        durability: CandidateDurabilityV1::Confirmed,
+                    },
+                )
+                .with_artifact_residue(artifact_residue.clone())
+            })?;
+        if source_recheck.as_ref() != Some(source) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "canonical branch source changed before publication",
+                self.store,
+                &destination_session,
+                &expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: destination_revision.clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            )
+            .with_artifact_residue(artifact_residue));
+        }
+        self.verify_artifact_closure(
+            &payload,
+            CandidateResidueV1::InstalledUnselected {
+                revision: destination_revision.clone(),
+                durability: CandidateDurabilityV1::Confirmed,
+            },
+        )
+        .map_err(|error| error.with_artifact_residue(artifact_residue.clone()))?;
+
+        let (receipt, durability_warning) =
+            match self
+                .store
+                .compare_and_swap_head(&destination_fence, expected.clone(), &candidate)
+            {
+                Ok(_) => (confirmed_receipt, None),
+                Err(PhysicalHeadCasError::Publication {
+                    message,
+                    installed: true,
+                }) => (unconfirmed_receipt, Some(message)),
+                Err(error) => {
+                    return Err(CanonicalTransactionErrorV1::not_published(
+                        error.to_string(),
+                        self.store,
+                        &destination_session,
+                        &expected,
+                        CandidateResidueV1::InstalledUnselected {
+                            revision: destination_revision,
+                            durability: CandidateDurabilityV1::Confirmed,
+                        },
+                    )
+                    .with_artifact_residue(artifact_residue));
+                }
+            };
+        Ok(CanonicalTransactionCommitV1 {
+            outcome: SessionCommitOutcome::Published { receipt },
+            durability_warning,
+        })
     }
 
     fn commit_last_good_recovery(
@@ -1504,6 +1851,11 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     fn inject_next_artifact_recheck_failure(&self) {
         self.fail_next_artifact_recheck.set(true);
     }
+
+    #[cfg(test)]
+    fn inject_next_after_branch_artifacts_failure(&self) {
+        self.fail_next_after_branch_artifacts.set(true);
+    }
 }
 
 #[cfg(test)]
@@ -1511,6 +1863,7 @@ mod tests {
     use super::*;
     use kitsu_core::session::{
         CommitDurability, ExpectedRevision, RevisionId, SessionCommitReceipt, SessionId, StoreId,
+        TurnId,
     };
 
     fn receipt(commit: &CanonicalTransactionCommitV1) -> &SessionCommitReceipt {
@@ -1736,6 +2089,337 @@ mod tests {
             "artifact inspected".to_string(),
             tool_round,
         )
+    }
+
+    fn committed_artifact_source(
+        store: &PhysicalFileStoreV1,
+        transaction: &CanonicalFileTransactionV1<'_>,
+    ) -> CanonicalSessionRevisionV1 {
+        let source_session = SessionId::new("session-1").unwrap();
+        let base = legacy_payload("rev-a");
+        transaction.commit(&base).unwrap();
+        let artifact_bytes = b"branch artifact bytes";
+        store
+            .install_artifact(
+                1,
+                source_session.clone(),
+                "artifact-branch".to_string(),
+                Some("text/plain".to_string()),
+                artifact_bytes,
+            )
+            .unwrap();
+        store
+            .install_artifact(
+                1,
+                source_session.clone(),
+                "artifact-unreferenced".to_string(),
+                None,
+                b"must not cross the branch boundary",
+            )
+            .unwrap();
+        transaction
+            .commit_artifact_tool_operation(
+                &base,
+                RevisionId::new("rev-b").unwrap(),
+                "2026-08-20T11:01:00.000Z".to_string(),
+                artifact_operation_input(
+                    "artifact-branch",
+                    &crate::skills::content_sha256_hex(artifact_bytes),
+                    artifact_bytes.len() as u64,
+                    Some("text/plain"),
+                ),
+            )
+            .unwrap();
+        transaction
+            .open_canonical_head(&source_session)
+            .unwrap()
+            .unwrap()
+    }
+
+    #[test]
+    fn branch_transaction_copies_exact_closure_and_publishes_create_only() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            PhysicalFileStoreV1::create_or_open(root.path(), StoreId::new("store-1").unwrap())
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let source = committed_artifact_source(&store, &transaction);
+        let destination = SessionId::new("session-branch").unwrap();
+        let destination_revision = RevisionId::new("rev-branch").unwrap();
+        let branch_turn = TurnId::new("turn-artifact").unwrap();
+        let expected = crate::session::canonical::assemble_branch_at_committed_turn(
+            &source,
+            store.store_id().clone(),
+            destination.clone(),
+            destination_revision.clone(),
+            "2026-08-20T11:02:00.000Z".to_string(),
+            branch_turn.clone(),
+        )
+        .unwrap();
+
+        store.inject_next_head_sync_failure();
+        let committed = transaction
+            .commit_branch_at_turn(
+                &source,
+                destination.clone(),
+                destination_revision.clone(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                branch_turn,
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&committed).durability(),
+            CommitDurability::PublishedUnconfirmed
+        );
+        assert!(committed.durability_warning().is_some());
+        assert_eq!(
+            transaction
+                .open_canonical_head(&destination)
+                .unwrap()
+                .unwrap(),
+            expected
+        );
+        assert_eq!(
+            store
+                .open_artifact(&destination, "artifact-branch")
+                .unwrap()
+                .content_bytes(),
+            b"branch artifact bytes"
+        );
+        assert!(store
+            .open_artifact(&destination, "artifact-unreferenced")
+            .is_err());
+        assert_eq!(
+            store
+                .read_head(source.session_id())
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            source.revision_id()
+        );
+    }
+
+    #[test]
+    fn branch_transaction_rejects_stale_and_collision_before_destination_head() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            PhysicalFileStoreV1::create_or_open(root.path(), StoreId::new("store-1").unwrap())
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let stale_source = committed_artifact_source(&store, &transaction);
+        transaction
+            .commit_artifact_tool_operation(
+                &stale_source,
+                RevisionId::new("rev-c").unwrap(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                text_operation_input(
+                    "turn-after",
+                    "run-after",
+                    kitsu_core::RunOutcomeClass::Succeeded,
+                    kitsu_core::RunAssistantDisposition::Committed,
+                    "later",
+                    Some("later answer"),
+                ),
+            )
+            .unwrap();
+        let destination = SessionId::new("session-stale-branch").unwrap();
+
+        let stale = transaction
+            .commit_branch_at_turn(
+                &stale_source,
+                destination.clone(),
+                RevisionId::new("rev-stale-branch").unwrap(),
+                "2026-08-20T11:03:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert!(stale.to_string().contains("source changed"));
+        assert!(stale.artifact_residue().is_empty());
+        assert!(store.read_head(&destination).unwrap().is_none());
+        assert!(store
+            .open_artifact(&destination, "artifact-branch")
+            .is_err());
+
+        let current_source = transaction
+            .open_canonical_head(stale_source.session_id())
+            .unwrap()
+            .unwrap();
+        let collision_destination = SessionId::new("session-collision-branch").unwrap();
+        store
+            .install_artifact(
+                1,
+                collision_destination.clone(),
+                "artifact-branch".to_string(),
+                Some("text/plain".to_string()),
+                b"preexisting",
+            )
+            .unwrap();
+
+        let collision = transaction
+            .commit_branch_at_turn(
+                &current_source,
+                collision_destination.clone(),
+                RevisionId::new("rev-collision-branch").unwrap(),
+                "2026-08-20T11:04:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert!(collision.to_string().contains("already exists"));
+        assert!(collision.artifact_residue().is_empty());
+        assert!(store.read_head(&collision_destination).unwrap().is_none());
+        assert_eq!(
+            store
+                .open_artifact(&collision_destination, "artifact-branch")
+                .unwrap()
+                .content_bytes(),
+            b"preexisting"
+        );
+
+        let candidate_destination = SessionId::new("session-candidate-collision").unwrap();
+        let candidate_revision = RevisionId::new("rev-candidate-collision").unwrap();
+        store
+            .install_revision_candidate(
+                LOGICAL_SCHEMA_REVISION,
+                candidate_destination.clone(),
+                candidate_revision.clone(),
+                ExpectedRevision::Missing,
+                b"preexisting candidate",
+            )
+            .unwrap();
+        let candidate_collision = transaction
+            .commit_branch_at_turn(
+                &current_source,
+                candidate_destination.clone(),
+                candidate_revision.clone(),
+                "2026-08-20T11:04:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert!(candidate_collision
+            .to_string()
+            .contains("destination revision already exists"));
+        assert!(candidate_collision.artifact_residue().is_empty());
+        assert!(store.read_head(&candidate_destination).unwrap().is_none());
+        assert!(store
+            .open_artifact(&candidate_destination, "artifact-branch")
+            .is_err());
+        assert_eq!(
+            store
+                .open_revision_candidate(&candidate_destination, &candidate_revision)
+                .unwrap()
+                .canonical_bytes(),
+            b"preexisting candidate"
+        );
+    }
+
+    #[test]
+    fn branch_transaction_cut_receipts_never_expose_an_incomplete_head() {
+        let root = tempfile::tempdir().unwrap();
+        let store =
+            PhysicalFileStoreV1::create_or_open(root.path(), StoreId::new("store-1").unwrap())
+                .unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        let source = committed_artifact_source(&store, &transaction);
+
+        let copy_sync_cut_session = SessionId::new("session-copy-sync-cut").unwrap();
+        store.inject_next_target_sync_failure();
+        let copy_sync_cut = transaction
+            .commit_branch_at_turn(
+                &source,
+                copy_sync_cut_session.clone(),
+                RevisionId::new("rev-copy-sync-cut").unwrap(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            copy_sync_cut.artifact_residue(),
+            [ArtifactResidueV1::Installed {
+                artifact_id: "artifact-branch".to_string(),
+                durability: CandidateDurabilityV1::Unconfirmed,
+            }]
+        );
+        assert_eq!(copy_sync_cut.candidate_residue(), CandidateResidueV1::None);
+        assert!(store.read_head(&copy_sync_cut_session).unwrap().is_none());
+        assert!(store
+            .open_artifact(&copy_sync_cut_session, "artifact-branch")
+            .is_ok());
+
+        let artifact_cut_session = SessionId::new("session-artifact-cut").unwrap();
+        transaction.inject_next_after_branch_artifacts_failure();
+        let artifact_cut = transaction
+            .commit_branch_at_turn(
+                &source,
+                artifact_cut_session.clone(),
+                RevisionId::new("rev-artifact-cut").unwrap(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            artifact_cut.artifact_residue(),
+            [ArtifactResidueV1::Installed {
+                artifact_id: "artifact-branch".to_string(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }]
+        );
+        assert_eq!(artifact_cut.candidate_residue(), CandidateResidueV1::None);
+        assert!(store.read_head(&artifact_cut_session).unwrap().is_none());
+
+        let candidate_cut_session = SessionId::new("session-candidate-cut").unwrap();
+        transaction.inject_next_after_candidate_failure();
+        let candidate_cut = transaction
+            .commit_branch_at_turn(
+                &source,
+                candidate_cut_session.clone(),
+                RevisionId::new("rev-candidate-cut").unwrap(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            candidate_cut.artifact_residue(),
+            [ArtifactResidueV1::Installed {
+                artifact_id: "artifact-branch".to_string(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }]
+        );
+        assert_eq!(
+            candidate_cut.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: RevisionId::new("rev-candidate-cut").unwrap(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }
+        );
+        assert!(store.read_head(&candidate_cut_session).unwrap().is_none());
+
+        let recheck_cut_session = SessionId::new("session-recheck-cut").unwrap();
+        transaction.inject_next_artifact_recheck_failure();
+        let recheck_cut = transaction
+            .commit_branch_at_turn(
+                &source,
+                recheck_cut_session.clone(),
+                RevisionId::new("rev-recheck-cut").unwrap(),
+                "2026-08-20T11:02:00.000Z".to_string(),
+                TurnId::new("turn-artifact").unwrap(),
+            )
+            .unwrap_err();
+        assert_eq!(
+            recheck_cut.artifact_residue(),
+            [ArtifactResidueV1::Installed {
+                artifact_id: "artifact-branch".to_string(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }]
+        );
+        assert_eq!(
+            recheck_cut.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: RevisionId::new("rev-recheck-cut").unwrap(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }
+        );
+        assert!(store.read_head(&recheck_cut_session).unwrap().is_none());
     }
 
     #[test]

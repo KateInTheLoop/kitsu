@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 078.
+updates through Cycle 079.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -131,6 +131,11 @@ kernel.
   Cycle 078 adds verified destination-scoped artifact copying: source bytes and
   metadata must verify before any effect, destination publication is atomic and
   no-overwrite, and missing/tampered/same-session/collision cases fail closed.
+  Cycle 079 composes branch assembly and artifact copying under deterministically
+  ordered source/destination fences. It rechecks exact source and destination
+  closure before create-only HEAD CAS; known stale/collision cases are zero-copy,
+  pre-HEAD cuts expose no destination HEAD and report exact immutable residue,
+  and HEAD-sync uncertainty exposes only the complete new branch.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
