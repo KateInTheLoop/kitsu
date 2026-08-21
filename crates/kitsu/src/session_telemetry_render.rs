@@ -42,16 +42,29 @@ struct Section {
     facts: Vec<Fact>,
 }
 
+#[allow(dead_code)] // Full three-section deck remains staged; /usage mounts only its usage view.
 pub(crate) fn render_current_session_snapshot(
     snapshot: &CurrentSessionSnapshot,
     options: TelemetryDeckOptions,
 ) -> String {
-    if !options.destination.styled() {
-        return render_plain(&sections(snapshot, false));
-    }
+    render_sections(sections(snapshot, options.destination.styled()), options)
+}
 
+pub(crate) fn render_current_session_usage(
+    snapshot: &CurrentSessionSnapshot,
+    options: TelemetryDeckOptions,
+) -> String {
+    let usage = sections(snapshot, options.destination.styled())
+        .pop()
+        .expect("current-session telemetry always has a usage section");
+    render_sections(vec![usage], options)
+}
+
+fn render_sections(sections: Vec<Section>, options: TelemetryDeckOptions) -> String {
+    if !options.destination.styled() {
+        return render_plain(&sections);
+    }
     let columns = options.columns.max(1);
-    let sections = sections(snapshot, true);
     if columns >= 72 {
         render_wide(&sections, columns)
     } else if columns >= 40 {
@@ -589,7 +602,10 @@ fn context_window_source_label(value: kitsu_core::ContextWindowSource) -> &'stat
 
 #[cfg(test)]
 mod tests {
-    use super::{render_current_session_snapshot, TelemetryDeckDestination, TelemetryDeckOptions};
+    use super::{
+        render_current_session_snapshot, render_current_session_usage, TelemetryDeckDestination,
+        TelemetryDeckOptions,
+    };
     use kitsu_core::{
         ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
         CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode, RunId,
@@ -666,6 +682,20 @@ mod tests {
         columns: usize,
     ) -> String {
         render_current_session_snapshot(
+            snapshot,
+            TelemetryDeckOptions {
+                destination,
+                columns,
+            },
+        )
+    }
+
+    fn render_usage(
+        snapshot: &CurrentSessionSnapshot,
+        destination: TelemetryDeckDestination,
+        columns: usize,
+    ) -> String {
+        render_current_session_usage(
             snapshot,
             TelemetryDeckOptions {
                 destination,
@@ -829,5 +859,32 @@ mod tests {
 
         assert!(output.contains("usage.monetary cost: USD 1.23"), "{output}");
         assert!(output.contains("provider reported; explicit cost observation"));
+    }
+
+    #[test]
+    fn usage_only_mount_reuses_adaptive_styled_plain_and_redirected_rendering() {
+        let snapshot = snapshot(SessionCostInput::unavailable());
+        for (destination, columns) in [
+            (TelemetryDeckDestination::StyledTerminal, 80),
+            (TelemetryDeckDestination::StyledTerminal, 24),
+            (TelemetryDeckDestination::Plain, 80),
+            (TelemetryDeckDestination::Redirected, 24),
+        ] {
+            let output = render_usage(&snapshot, destination, columns);
+            let plain = kitsu_render::sanitize_terminal_text(&output);
+            assert!(plain.contains("current-session usage") || plain.contains("[usage]"));
+            assert!(plain.contains("2 reported"), "{plain}");
+            assert!(plain.contains("1 missing"), "{plain}");
+            assert!(!plain.contains("[status]"), "{plain}");
+            assert!(!plain.contains("[context]"), "{plain}");
+            assert!(!plain.contains("status.adapter"), "{plain}");
+            assert!(!plain.contains("context.used tokens"), "{plain}");
+            if destination != TelemetryDeckDestination::StyledTerminal {
+                assert!(!output.contains('\u{1b}'), "{output}");
+            }
+            if destination == TelemetryDeckDestination::StyledTerminal {
+                assert_lines_fit(&output, columns);
+            }
+        }
     }
 }

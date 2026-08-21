@@ -10,18 +10,19 @@ provider-free monotonic inventory publication through Cycle 107, and E06-S01
 binds exact runtime policy into preparation through Cycle 108 and consumes its
 phase budgets in a provider-free supervisor through Cycle 111. E08-S05 now has
 truthful current-run usage coverage and cached-token presence through Cycle 109,
-plus adaptive presentation-only decks through Cycle 110.
+adaptive presentation-only decks through Cycle 110, and exact offline
+`/usage session` collection/routing through Cycle 112.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 111 / 111 |
+| Accepted cycles/commits after this cycle | 112 / 112 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 112 — E08-S05-C4: collect one coherent live snapshot and mount exact offline `/usage session` without inventing JSONL/account truth |
+| Active epic/card | Cycle 113 — E07-S01-C1: establish a deterministic provider-free mixed-language repository-task benchmark over current read-only tools |
 
 ## Epic status
 
@@ -35,7 +36,7 @@ plus adaptive presentation-only decks through Cycle 110.
 | E06 child/MCP spine | **In progress** through E06-S01-C4, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped runtime policy into a provider-free phase supervisor with checked deadlines, idempotent drain, termination-before-kill/reap clocks, and owned residue. Effects remain injected; next add a real bounded backend only behind these proofs. No product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
-| E08 telemetry/docs | **In progress** through E08-S05-C3 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; a private renderer provides adaptive styled and stable accessible/plain projections. Product snapshot collection and slash routing remain separate; durable history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C4 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; exact offline `/usage session` now collects one coherent in-memory observation and renders only its usage section adaptively. Full status/context migration, JSONL automation parity, aliases, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -154,6 +155,7 @@ plus adaptive presentation-only decks through Cycle 110.
 | 109 | `4b9d167` | Truthful provider usage coverage and cached-token accounting |
 | 110 | this document's commit | Adaptive truthful current-session telemetry decks |
 | 111 | this document's commit | Authorized monotonic child-phase supervision and owned residue truth |
+| 112 | this document's commit | Exact offline truthful `/usage session` collection and rendering |
 
 ## Current green gates
 
@@ -759,6 +761,16 @@ failure owns no child. Natural exit/EOF/crash truth still belongs to the
 existing lifecycle and future backend composition. No OS process, containment
 enforcement, configuration, MCP transport, inventory publication, or product
 route is added.
+Cycle 112 mounts exact `/usage session` over the already-typed telemetry
+contract. The command reads one secret-free bound route receipt and synchronously
+collects current run/session identity, minimal effective authority counts,
+context source/budget/occupancy, and one `RunUsageSnapshot`; it performs no
+provider, account, network, filesystem, or persistence effect. Only the usage
+section is rendered using the existing adaptive destination rules. Missing
+provider reports and cached attribution stay unavailable, reported zero remains
+zero, and portable cost is unavailable. Bare `/usage`, `/cost` compatibility,
+calendar aggregates, status/context migration, JSONL command-result/schema
+parity, and durable history remain unimplemented.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
