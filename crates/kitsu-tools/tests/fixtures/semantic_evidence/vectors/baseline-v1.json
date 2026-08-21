@@ -1,0 +1,116 @@
+{
+  "schema": "kitsu.semantic-evidence.v1",
+  "metric_contract": [
+    "success",
+    "relevance_basis_points",
+    "rounds",
+    "prompt_tokens",
+    "tool_bytes",
+    "latency_deadline"
+  ],
+  "vectors": [
+    {
+      "id": "locate-normalize-slug",
+      "task": "locate",
+      "prompt": "Locate the definition and production use of normalize_slug.",
+      "budget": {
+        "prompt_tokens": 32,
+        "tool_bytes": 4096,
+        "rounds": 1,
+        "latency_millis": 2000
+      },
+      "calls": [
+        {
+          "round": 1,
+          "tool": "find_symbol",
+          "args": {"symbol": "normalize_slug", "path": "$CORPUS"}
+        }
+      ],
+      "rubric": {
+        "required": [
+          "src/slug.rs:1",
+          "src/lib.rs:4",
+          "1 definition(s), 1 reference(s)"
+        ],
+        "forbidden": ["$CORPUS/generated"]
+      }
+    },
+    {
+      "id": "explain-invoice-rounding",
+      "task": "explain",
+      "prompt": "Explain where compute_total is defined, called, and how it rounds invoice totals.",
+      "budget": {
+        "prompt_tokens": 40,
+        "tool_bytes": 6144,
+        "rounds": 2,
+        "latency_millis": 2000
+      },
+      "calls": [
+        {
+          "round": 1,
+          "tool": "find_symbol",
+          "args": {"symbol": "compute_total", "path": "$CORPUS/service"}
+        },
+        {
+          "round": 2,
+          "tool": "outline_file",
+          "args": {"path": "$CORPUS/service/invoice.py"}
+        },
+        {
+          "round": 2,
+          "tool": "fs_read_file",
+          "args": {"path": "$CORPUS/service/invoice.py"}
+        }
+      ],
+      "rubric": {
+        "required": [
+          "invoice.py:4",
+          "report.py:1",
+          "subtotal + tax",
+          "ROUND_HALF_UP"
+        ],
+        "forbidden": ["MAX_RETRY_ATTEMPTS"]
+      }
+    },
+    {
+      "id": "change-retry-limit",
+      "task": "change",
+      "prompt": "Identify the authoritative evidence needed to change the retry limit from 3 to 5 without touching generated mirrors.",
+      "budget": {
+        "prompt_tokens": 48,
+        "tool_bytes": 6144,
+        "rounds": 2,
+        "latency_millis": 2000
+      },
+      "calls": [
+        {
+          "round": 1,
+          "tool": "repo_grep",
+          "args": {"pattern": "MAX_RETRY_ATTEMPTS", "path": "$CORPUS/web", "literal": true, "max_count": 10}
+        },
+        {
+          "round": 1,
+          "tool": "read_manifest",
+          "args": {"path": "$CORPUS/package.json"}
+        },
+        {
+          "round": 2,
+          "tool": "fs_read_file",
+          "args": {"path": "$CORPUS/web/retry.ts"}
+        }
+      ],
+      "rubric": {
+        "required": [
+          "retry.ts:1",
+          "MAX_RETRY_ATTEMPTS = 3",
+          "attempt < MAX_RETRY_ATTEMPTS",
+          "package.json (Node)"
+        ],
+        "forbidden": [
+          "$CORPUS/generated/retry_snapshot.ts",
+          "MAX_RETRY_ATTEMPTS = 99"
+        ]
+      }
+    }
+  ]
+}
