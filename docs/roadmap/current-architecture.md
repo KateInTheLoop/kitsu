@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 126.
+updates through Cycle 127.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -453,6 +453,11 @@ kernel.
   and calls; all client/decoder/transport/cleanup faults fail closed with exact
   primary and residue truth. It remains unmounted with no inventory, config,
   handler, product route, or wider MCP vocabulary.
+- Cycle 127 mounts exact offline `/context sources` from retained typed startup
+  entries, current role-based messages, budget arithmetic, and compaction
+  accounting. Unsupported attachment, on-demand-skill, memory, and response-
+  schema buckets remain unavailable; no aggregate/source-total or JSONL result
+  is invented. Existing context forms remain unchanged.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -464,7 +469,7 @@ kernel.
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
 | External runtime tools | Static request inventory; closed external identities/fingerprints; exact atomic external-inventory publication; exact bounded child policy/admission plus lifecycle, phase-supervisor, sealed-exec/Landlock Linux backend and strictly serial line-transport truth; pure bounded tools-only MCP codec | Same-process product handlers only; the backend/transport are private and unmounted on Linux x86-64, Landlock has explicit confinement limits, and the codec is not yet composed with the transport | E06 identity, admission/policy, publication, lifecycle, phase, exact-exec/content authority, serial real-child, and wire foundations begun; no MCP composition, live external handler, product configuration, or X002 acceptance |
-| Host/UI protocol | CLI carriers plus one-way JSONL; typed current-session telemetry DTO, truthful current-run usage coverage, adaptive renderer, typed offline `/status`, context-only `/context window`, and one usage view behind bare/session/legacy-cost forms | Consumer cannot service synchronous calls; mounted telemetry samples in-memory owners only and performs no provider/account/network/fs/persistence effect. `/status` preserves its legacy JSONL payload; context and usage forms deliberately have no new command-result contract | Truthful current status/usage/context-window slices and compatibility aliases are live, but no named second host, new usage automation schema, account data, or durable history exists; X003/X004 fail |
+| Host/UI protocol | CLI carriers plus one-way JSONL; typed current-session telemetry DTOs, truthful current-run usage coverage, adaptive renderer, typed offline `/status`, `/context window`, `/context sources`, and one usage view behind bare/session/legacy-cost forms | Consumer cannot service synchronous calls; mounted telemetry samples retained in-memory owners only and performs no provider/account/network/command-time-fs/persistence effect. `/status` preserves its legacy JSONL payload; context and usage forms deliberately have no new command-result contract. Context-source rows separate estimated, derived, authoritative, and unavailable truth without claiming an additive total | Truthful current status/usage/context-window/source slices and compatibility aliases are live, but no named second host, new usage automation schema, account data, exact tokenizer attribution, or durable history exists; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
 ## Three spines and extraction order

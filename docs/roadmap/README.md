@@ -735,6 +735,7 @@ gates merely because a card appears attractive.
 | 124 | E08-S05-C7 | Unify bare/session usage and legacy cost compatibility over one truthful typed current-session snapshot |
 | 125 | E07-S01-C3 | Prove selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 | 126 | E06-S03-C2 | Compose the pinned tools-only MCP codec with one proof-bounded strictly serial child owner and fail-closed cleanup truth |
+| 127 | E08-S05-C8 | Mount an offline typed `/context sources` deck with estimated coarse rows and explicit unavailable sub-buckets |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1115,6 +1116,14 @@ clock, and cleanup faults remain typed and cannot publish a stale event or
 success. The owner is still unmounted: no configuration, inventory, handler,
 product route, additional MCP vocabulary, or external-tool acceptance claim is
 added.
+Cycle 127 adds exact `/context sources` from retained request-assembly entries,
+current role-based messages, budget evidence, and session compaction accounting.
+Coarse source tokens remain estimated, budget fields derived, and compaction
+counts authoritative; attachments, on-demand skill bodies, memory, and response
+schema are structurally unavailable rather than zero. Adaptive and accessible
+rendering adds no source-total claim or JSONL result. Bare context, window, and
+refresh behavior remain unchanged, and the command performs no provider,
+account, network, command-time filesystem, persistence, or history work.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

@@ -5269,9 +5269,9 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
     },
     SlashCommandSpec {
         name: "context",
-        args: "[window|refresh]",
-        description: "show context details/window or refresh discovered metadata",
-        details: "Bare `/context` shows source-by-source token estimates (system, project context, skills, history, tool schemas), the resolved window and its PROVENANCE (flag/profile/discovery/default), cache state, and the compaction ledger. `window` shows the focused typed occupancy view. `refresh` re-discovers window metadata from the gateway.",
+        args: "[window|sources|refresh]",
+        description: "show context details/window/sources or refresh discovered metadata",
+        details: "Bare `/context` preserves the detailed legacy view. `window` shows focused typed occupancy. `sources` shows coarse Kitsu-owned request contributors with explicit estimates and unavailable sub-buckets; it does not reverse-parse attachments, on-demand skill bodies, memory, or response-schema tokens. `refresh` re-discovers window metadata from the gateway.",
         group: CommandGroup::ContextHistory,
         alias_of: None,
     },
@@ -6002,8 +6002,17 @@ impl rustyline::highlight::Highlighter for ChatHelper {
 
 /// A provenance entry: a static context source, why it's loaded, its estimated
 /// token cost, and the governing policy — honest accounting (design §3).
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CtxSourceKind {
+    CoreInstructions,
+    ProjectContext,
+    SkillContext,
+    ToolSchemas,
+}
+
 #[derive(Clone)]
 struct CtxEntry {
+    kind: CtxSourceKind,
     label: String,
     tokens: u64,
     policy: &'static str,
@@ -6012,12 +6021,14 @@ struct CtxEntry {
 
 impl CtxEntry {
     fn new(
+        kind: CtxSourceKind,
         label: impl Into<String>,
         tokens: u64,
         policy: &'static str,
         why: impl Into<String>,
     ) -> Self {
         Self {
+            kind,
             label: label.into(),
             tokens,
             policy,
@@ -7599,6 +7610,71 @@ fn collect_current_session_snapshot(
         context,
         usage,
     )
+}
+
+/// Capture the coarse current-request contributors already retained in memory.
+/// Static chunks are folded by their closed source kind, never by parsing
+/// display labels. Embedded attachment and on-demand skill-body text is left
+/// inside the user-message estimate and remains separately unavailable.
+fn collect_context_sources_snapshot(
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    state: &kitsu_core::AgentSessionState,
+) -> kitsu_core::ContextSourcesSnapshot {
+    let mut core_instructions_tokens = 0_u64;
+    let mut project_context_tokens = 0_u64;
+    let mut skill_context_tokens = 0_u64;
+    let mut tool_schema_tokens = 0_u64;
+    for entry in session.provenance.borrow().iter() {
+        let destination = match entry.kind {
+            CtxSourceKind::CoreInstructions => &mut core_instructions_tokens,
+            CtxSourceKind::ProjectContext => &mut project_context_tokens,
+            CtxSourceKind::SkillContext => &mut skill_context_tokens,
+            CtxSourceKind::ToolSchemas => &mut tool_schema_tokens,
+        };
+        *destination = destination.saturating_add(entry.tokens);
+    }
+
+    let meter = ContextMeter::new();
+    let breakdown = meter.breakdown(messages);
+    let initial_system_tokens = messages
+        .first()
+        .filter(|message| matches!(message.role, kitsu_providers::Role::System))
+        .map(|message| meter.breakdown(std::slice::from_ref(message)).system)
+        .unwrap_or(0);
+
+    let resolved_window = session.window.get().unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let budgeted_window = state.window_evidence.map_or(resolved_window, |evidence| {
+        if evidence.resolved_window == resolved_window {
+            clamp_window_for_shortfall(
+                resolved_window,
+                evidence.reported_prompt_tokens,
+                evidence.shortfall_count,
+            )
+        } else {
+            resolved_window
+        }
+    });
+    let budget = ContextBudget::new(budgeted_window, session.max_tokens);
+    let ledger = &state.compaction_ledger;
+    kitsu_core::ContextSourcesSnapshot::from_input(kitsu_core::ContextSourcesSnapshotInput {
+        core_instructions_tokens,
+        project_context_tokens,
+        skill_context_tokens,
+        tool_schema_tokens,
+        runtime_system_message_tokens: breakdown.system.saturating_sub(initial_system_tokens),
+        user_message_tokens: breakdown.user,
+        assistant_message_tokens: breakdown.assistant,
+        tool_result_tokens: breakdown.tool_results,
+        prompt_budget_tokens: budget.effective,
+        output_reserve_tokens: budget.reserve,
+        trim_target_tokens: budget.target,
+        estimate_buffer_tokens: budget.effective.saturating_sub(budget.target),
+        compactions: ledger.total_compactions,
+        exchanges_removed: ledger.exchanges_removed,
+        tool_results_elided: ledger.tool_results_elided,
+        compaction_tokens_saved: ledger.tokens_saved,
+    })
 }
 
 fn current_session_deck_options(cli: &Cli) -> session_telemetry_render::TelemetryDeckOptions {
@@ -15085,6 +15161,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
     };
     let base = chat_system_prompt(&tool_names, &prompt_environment);
     provenance.push(CtxEntry::new(
+        CtxSourceKind::CoreInstructions,
         "base prompt",
         estimate_str(&base),
         "always",
@@ -15095,6 +15172,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let contract = "\n\nAutomatic artifact storage is disabled for this run. Commands return bounded previews only; oversized tool results are irreversibly reduced to explicit head/tail previews. No new saved full-output path is created; historical artifact pointers may remain in resumed context, but no managed artifact read root is granted.";
         system.push_str(contract);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::CoreInstructions,
             "artifact-free policy",
             estimate_str(contract),
             "host-enforced",
@@ -15105,6 +15183,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let tokens = estimate_str(&contract);
         system.push_str(&contract);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::CoreInstructions,
             format!("required writes ({})", required_write_contracts.len()),
             tokens,
             "host-enforced",
@@ -15134,6 +15213,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 );
             }
             provenance.push(CtxEntry::new(
+                CtxSourceKind::ProjectContext,
                 format!("project ({label})"),
                 tokens,
                 "loaded",
@@ -15156,6 +15236,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         system.push_str(&chunk);
         eprintln!("~ {} skill(s) available", skillset.names().len());
         provenance.push(CtxEntry::new(
+            CtxSourceKind::SkillContext,
             format!("skill index ({})", skillset.names().len()),
             estimate_str(&chunk),
             "always",
@@ -15167,6 +15248,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let chunk = format!("\n\n---\nPreloaded skills (follow these):\n{pre}");
         system.push_str(&chunk);
         provenance.push(CtxEntry::new(
+            CtxSourceKind::SkillContext,
             format!("skills (--skill x{})", cli.skill.len()),
             estimate_str(&chunk),
             "preloaded",
@@ -15178,6 +15260,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
         let schema_tokens =
             estimate_str(&serde_json::to_string(tools.descriptors()).unwrap_or_default());
         provenance.push(CtxEntry::new(
+            CtxSourceKind::ToolSchemas,
             format!("tool schemas ({})", tool_names.len()),
             schema_tokens,
             "admitted",
@@ -18040,6 +18123,21 @@ async fn handle_slash(
                 // source/compaction view, not this typed focused projection.
                 return SlashResult::Continue(None);
             }
+            "sources" => {
+                let snapshot = collect_context_sources_snapshot(messages, session, state);
+                if !cli.jsonl {
+                    eprintln!(
+                        "{}",
+                        session_telemetry_render::render_context_sources(
+                            &snapshot,
+                            current_session_deck_options(cli),
+                        )
+                    );
+                }
+                // This observation deliberately has no public JSONL payload;
+                // the script driver retains only the original lifecycle text.
+                return SlashResult::Continue(None);
+            }
             "refresh" => {
                 return refresh_session_context_window(
                     model,
@@ -20827,6 +20925,21 @@ mod tests {
         let cost_help = slash_command_help("cost");
         assert!(cost_help.starts_with("/usage [session]"));
         assert!(cost_help.contains("/cost is an alias of /usage"));
+    }
+
+    #[test]
+    fn context_registry_exposes_only_bare_window_sources_and_refresh_forms() {
+        let context = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "context")
+            .expect("/context is registered");
+        assert_eq!(context.args, "[window|sources|refresh]");
+        assert_eq!(context.syntax(), "/context [window|sources|refresh]");
+        assert!(context.details.contains("Bare `/context` preserves"));
+        assert!(context.details.contains("`sources`"));
+        assert!(context.details.contains("`refresh`"));
+        assert!(!context.details.contains("daily"));
+        assert!(!context.details.contains("account"));
     }
 
     #[test]

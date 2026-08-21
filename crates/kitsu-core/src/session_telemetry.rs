@@ -53,6 +53,9 @@ pub enum TelemetryProvenance {
     ContextBudgetArithmetic,
     ProviderAnchoredContextMeter,
     ContextMeterEstimate,
+    RequestAssemblyEstimate,
+    ConversationMessageEstimate,
+    ContextSourceNotSeparatelyTracked,
     ProviderUsageReports,
     ProviderUsageNotReported,
     ProviderUsageNotItemized,
@@ -253,6 +256,98 @@ impl From<ContextSnapshotInput> for ContextSnapshot {
             effective_tokens: input.effective_tokens,
             used_tokens: input.used_tokens,
             available_tokens,
+        }
+    }
+}
+
+/// Presentation-neutral inputs for the current request's coarse context
+/// contributors. Values are supplied by already-owned in-memory state; this
+/// type performs no discovery and deliberately has no serialization contract.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ContextSourcesSnapshotInput {
+    pub core_instructions_tokens: u64,
+    pub project_context_tokens: u64,
+    pub skill_context_tokens: u64,
+    pub tool_schema_tokens: u64,
+    pub runtime_system_message_tokens: u64,
+    pub user_message_tokens: u64,
+    pub assistant_message_tokens: u64,
+    pub tool_result_tokens: u64,
+    pub prompt_budget_tokens: u64,
+    pub output_reserve_tokens: u64,
+    pub trim_target_tokens: u64,
+    pub estimate_buffer_tokens: u64,
+    pub compactions: u64,
+    pub exchanges_removed: u64,
+    pub tool_results_elided: u64,
+    pub compaction_tokens_saved: u64,
+}
+
+/// Coarse, truthful current-context categories. Attachments and on-demand
+/// skill bodies are already embedded in user messages, while Kitsu has no
+/// distinct memory bucket and does not retain a response-schema token tally;
+/// those values remain unavailable instead of being reverse-parsed from text.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ContextSourcesSnapshot {
+    pub core_instructions: TelemetryValue<u64>,
+    pub project_context: TelemetryValue<u64>,
+    pub skill_context: TelemetryValue<u64>,
+    pub tool_schemas: TelemetryValue<u64>,
+    pub runtime_system_messages: TelemetryValue<u64>,
+    pub user_messages: TelemetryValue<u64>,
+    pub assistant_messages: TelemetryValue<u64>,
+    pub tool_results: TelemetryValue<u64>,
+    pub attachments: TelemetryValue<u64>,
+    pub on_demand_skill_bodies: TelemetryValue<u64>,
+    pub memory: TelemetryValue<u64>,
+    pub response_schema: TelemetryValue<u64>,
+    pub prompt_budget: TelemetryValue<u64>,
+    pub output_reserve: TelemetryValue<u64>,
+    pub trim_target: TelemetryValue<u64>,
+    pub estimate_buffer: TelemetryValue<u64>,
+    pub compactions: TelemetryValue<u64>,
+    pub exchanges_removed: TelemetryValue<u64>,
+    pub tool_results_elided: TelemetryValue<u64>,
+    pub compaction_tokens_saved: TelemetryValue<u64>,
+}
+
+impl ContextSourcesSnapshot {
+    pub fn from_input(input: ContextSourcesSnapshotInput) -> Self {
+        let request_estimate =
+            |value| TelemetryValue::estimated(value, TelemetryProvenance::RequestAssemblyEstimate);
+        let message_estimate = |value| {
+            TelemetryValue::estimated(value, TelemetryProvenance::ConversationMessageEstimate)
+        };
+        let unavailable =
+            || TelemetryValue::unavailable(TelemetryProvenance::ContextSourceNotSeparatelyTracked);
+        let budget =
+            |value| TelemetryValue::derived(value, TelemetryProvenance::ContextBudgetArithmetic);
+        let accounting =
+            |value| TelemetryValue::authoritative(value, TelemetryProvenance::SessionAccounting);
+        Self {
+            core_instructions: request_estimate(input.core_instructions_tokens),
+            project_context: request_estimate(input.project_context_tokens),
+            skill_context: request_estimate(input.skill_context_tokens),
+            tool_schemas: request_estimate(input.tool_schema_tokens),
+            runtime_system_messages: message_estimate(input.runtime_system_message_tokens),
+            user_messages: message_estimate(input.user_message_tokens),
+            assistant_messages: message_estimate(input.assistant_message_tokens),
+            tool_results: message_estimate(input.tool_result_tokens),
+            attachments: unavailable(),
+            on_demand_skill_bodies: unavailable(),
+            memory: unavailable(),
+            response_schema: unavailable(),
+            prompt_budget: budget(input.prompt_budget_tokens),
+            output_reserve: budget(input.output_reserve_tokens),
+            trim_target: budget(input.trim_target_tokens),
+            estimate_buffer: budget(input.estimate_buffer_tokens),
+            compactions: accounting(input.compactions),
+            exchanges_removed: accounting(input.exchanges_removed),
+            tool_results_elided: accounting(input.tool_results_elided),
+            compaction_tokens_saved: TelemetryValue::estimated(
+                input.compaction_tokens_saved,
+                TelemetryProvenance::ContextMeterEstimate,
+            ),
         }
     }
 }

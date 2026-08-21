@@ -1,6 +1,6 @@
 use kitsu_core::{
-    CurrencyAmount, CurrentSessionSnapshot, EffectiveAuthorityMode, TelemetryProvenance,
-    TelemetryValue, TruthClass,
+    ContextSourcesSnapshot, CurrencyAmount, CurrentSessionSnapshot, EffectiveAuthorityMode,
+    TelemetryProvenance, TelemetryValue, TruthClass,
 };
 use kitsu_providers::{ProviderAdapterId, ProviderCapability, ProviderWireRevision};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
@@ -113,6 +113,98 @@ pub(crate) fn render_current_session_context(
         .nth(1)
         .expect("current-session telemetry always has a context section");
     render_sections(vec![context], options)
+}
+
+pub(crate) fn render_context_sources(
+    snapshot: &ContextSourcesSnapshot,
+    options: TelemetryDeckOptions,
+) -> String {
+    render_sections(context_source_sections(snapshot), options)
+}
+
+fn context_source_sections(snapshot: &ContextSourcesSnapshot) -> Vec<Section> {
+    let sources = vec![
+        fact(
+            "core instructions",
+            &snapshot.core_instructions,
+            grouped_count,
+        ),
+        fact("project context", &snapshot.project_context, grouped_count),
+        fact(
+            "skill index + preloads",
+            &snapshot.skill_context,
+            grouped_count,
+        ),
+        fact("tool schemas", &snapshot.tool_schemas, grouped_count),
+        fact(
+            "runtime system messages",
+            &snapshot.runtime_system_messages,
+            grouped_count,
+        ),
+        fact("user messages", &snapshot.user_messages, grouped_count),
+        fact(
+            "assistant messages",
+            &snapshot.assistant_messages,
+            grouped_count,
+        ),
+        fact("tool results", &snapshot.tool_results, grouped_count),
+        unavailable_fact(
+            "attachments",
+            &snapshot.attachments,
+            "included in user messages",
+        ),
+        unavailable_fact(
+            "on-demand skill bodies",
+            &snapshot.on_demand_skill_bodies,
+            "included in user messages",
+        ),
+        unavailable_fact(
+            "memory",
+            &snapshot.memory,
+            "no dedicated Kitsu memory bucket",
+        ),
+        unavailable_fact(
+            "response schema",
+            &snapshot.response_schema,
+            "not separately itemized",
+        ),
+    ];
+    let budget = vec![
+        fact("prompt budget", &snapshot.prompt_budget, grouped_count),
+        fact("output reserve", &snapshot.output_reserve, grouped_count),
+        fact("trim target", &snapshot.trim_target, grouped_count),
+        fact("estimate buffer", &snapshot.estimate_buffer, grouped_count),
+        fact("compactions", &snapshot.compactions, grouped_count),
+        fact(
+            "exchanges removed",
+            &snapshot.exchanges_removed,
+            grouped_count,
+        ),
+        fact(
+            "tool results elided",
+            &snapshot.tool_results_elided,
+            grouped_count,
+        ),
+        fact(
+            "tokens saved",
+            &snapshot.compaction_tokens_saved,
+            grouped_count,
+        ),
+    ];
+    vec![
+        Section {
+            title: "context sources",
+            narrow_title: "sources",
+            prefix: "source",
+            facts: sources,
+        },
+        Section {
+            title: "budget & compaction",
+            narrow_title: "budget",
+            prefix: "context",
+            facts: budget,
+        },
+    ]
 }
 
 fn render_sections(sections: Vec<Section>, options: TelemetryDeckOptions) -> String {
@@ -293,6 +385,20 @@ fn fact<T>(
         value: value
             .value()
             .map_or_else(|| "unavailable".to_string(), format_value),
+        truth: value.truth_class(),
+        provenance: value.provenance(),
+    }
+}
+
+fn unavailable_fact(
+    label: &'static str,
+    value: &TelemetryValue<u64>,
+    explanation: &'static str,
+) -> Fact {
+    debug_assert!(value.value().is_none());
+    Fact {
+        label,
+        value: format!("unavailable ({explanation})"),
         truth: value.truth_class(),
         provenance: value.provenance(),
     }
@@ -647,6 +753,13 @@ fn provenance_label(value: TelemetryProvenance) -> String {
             "provider-anchored context meter".to_string()
         }
         TelemetryProvenance::ContextMeterEstimate => "context meter estimate".to_string(),
+        TelemetryProvenance::RequestAssemblyEstimate => "request assembly estimate".to_string(),
+        TelemetryProvenance::ConversationMessageEstimate => {
+            "conversation message estimate".to_string()
+        }
+        TelemetryProvenance::ContextSourceNotSeparatelyTracked => {
+            "context source not separately tracked".to_string()
+        }
         TelemetryProvenance::ProviderUsageReports => "provider usage reports".to_string(),
         TelemetryProvenance::ProviderUsageNotReported => "provider usage not reported".to_string(),
         TelemetryProvenance::ProviderUsageNotItemized => "provider usage not itemized".to_string(),
@@ -669,14 +782,15 @@ fn context_window_source_label(value: kitsu_core::ContextWindowSource) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::{
-        render_current_session_context, render_current_session_usage,
+        render_context_sources, render_current_session_context, render_current_session_usage,
         render_current_status_observation, CurrentStatusObservation, TelemetryDeckDestination,
         TelemetryDeckOptions,
     };
     use kitsu_core::{
-        ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
-        CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode, RunId,
-        SessionCostInput, SessionId, SessionUsageInput, TelemetryProvenance, TelemetryValue,
+        ContextSnapshotInput, ContextSourcesSnapshot, ContextSourcesSnapshotInput,
+        ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot, CurrentSessionSnapshotInput,
+        EffectiveAuthorityInput, EffectiveAuthorityMode, RunId, SessionCostInput, SessionId,
+        SessionUsageInput, TelemetryProvenance, TelemetryValue,
     };
     use kitsu_providers::ProviderRouteReceipt;
     use unicode_width::UnicodeWidthStr;
@@ -794,6 +908,94 @@ mod tests {
                 columns,
             },
         )
+    }
+
+    fn context_sources() -> ContextSourcesSnapshot {
+        ContextSourcesSnapshot::from_input(ContextSourcesSnapshotInput {
+            core_instructions_tokens: 1_200,
+            project_context_tokens: 0,
+            skill_context_tokens: 320,
+            tool_schema_tokens: 640,
+            runtime_system_message_tokens: 18,
+            user_message_tokens: 2_100,
+            assistant_message_tokens: 900,
+            tool_result_tokens: 450,
+            prompt_budget_tokens: 30_720,
+            output_reserve_tokens: 2_048,
+            trim_target_tokens: 28_672,
+            estimate_buffer_tokens: 2_048,
+            compactions: 2,
+            exchanges_removed: 3,
+            tool_results_elided: 4,
+            compaction_tokens_saved: 5_000,
+        })
+    }
+
+    #[test]
+    fn context_sources_reuse_adaptive_accessible_rendering_without_inventing_sub_buckets() {
+        let sources = context_sources();
+        for columns in [24, 40, 60, 80, 120] {
+            let output = render_context_sources(
+                &sources,
+                TelemetryDeckOptions {
+                    destination: TelemetryDeckDestination::StyledTerminal,
+                    columns,
+                },
+            );
+            let plain = kitsu_render::sanitize_terminal_text(&output);
+            assert!(plain.contains("core instructions"), "{plain}");
+            assert!(plain.contains("attachments"), "{plain}");
+            assert!(plain.contains("on-demand"), "{plain}");
+            assert!(plain.matches("unavailable").count() >= 4, "{plain}");
+            assert!(plain.contains("output reserve"), "{plain}");
+            assert!(plain.contains("tokens saved"), "{plain}");
+            assert_lines_fit(&output, columns);
+        }
+
+        let expected = render_context_sources(
+            &sources,
+            TelemetryDeckOptions {
+                destination: TelemetryDeckDestination::Redirected,
+                columns: 24,
+            },
+        );
+        for destination in [
+            TelemetryDeckDestination::Redirected,
+            TelemetryDeckDestination::Plain,
+            TelemetryDeckDestination::NoColor,
+            TelemetryDeckDestination::ScreenReader,
+        ] {
+            for columns in [24, 120] {
+                let output = render_context_sources(
+                    &sources,
+                    TelemetryDeckOptions {
+                        destination,
+                        columns,
+                    },
+                );
+                assert_eq!(output, expected, "{destination:?} changed at {columns}");
+                assert!(!output.contains('\u{1b}'));
+            }
+        }
+        assert!(
+            expected.contains("source.project context: 0 [estimated; request assembly estimate]")
+        );
+        assert!(expected.contains(
+            "source.attachments: unavailable (included in user messages) [unavailable; context source not separately tracked]"
+        ));
+        assert!(expected.contains(
+            "source.on-demand skill bodies: unavailable (included in user messages) [unavailable; context source not separately tracked]"
+        ));
+        assert!(expected.contains(
+            "source.memory: unavailable (no dedicated Kitsu memory bucket) [unavailable; context source not separately tracked]"
+        ));
+        assert!(expected.contains(
+            "source.response schema: unavailable (not separately itemized) [unavailable; context source not separately tracked]"
+        ));
+        assert!(
+            expected.contains("context.tokens saved: 5,000 [estimated; context meter estimate]")
+        );
+        assert!(!expected.contains("source total"));
     }
 
     #[test]

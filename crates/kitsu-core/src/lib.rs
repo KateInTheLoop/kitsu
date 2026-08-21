@@ -39,9 +39,10 @@ pub use session::{
     SessionOutcomeClass, StoreId, TurnId, MAX_CANONICAL_OPERATIONS, SESSION_CONTRACT_REVISION,
 };
 pub use session_telemetry::{
-    ActiveProviderRouteSnapshot, ContextSnapshot, ContextSnapshotInput, ContextWindowSource,
-    CurrencyAmount, CurrentSessionSnapshot, CurrentSessionSnapshotInput, EffectiveAuthorityInput,
-    EffectiveAuthorityMode, EffectiveAuthoritySnapshot, SessionCostInput, SessionUsageInput,
-    StatusSnapshot, TelemetryProvenance, TelemetryValue, TruthClass, UsageSnapshot,
+    ActiveProviderRouteSnapshot, ContextSnapshot, ContextSnapshotInput, ContextSourcesSnapshot,
+    ContextSourcesSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
+    CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode,
+    EffectiveAuthoritySnapshot, SessionCostInput, SessionUsageInput, StatusSnapshot,
+    TelemetryProvenance, TelemetryValue, TruthClass, UsageSnapshot,
     CURRENT_SESSION_SNAPSHOT_REVISION,
 };
