@@ -2,8 +2,8 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S01 is implemented through C7, E06-S02 through C3, and
-E06-S03 through C2;
+through Cycle 080; E06-S01 is implemented through C7, E06-S02 through C4, and
+E06-S03 through C3;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
 provider-free monotonic inventory publication through Cycle 107, and E06-S01
@@ -35,6 +35,9 @@ strictly serial multi-frame owner through Cycle 119.
 E06-S03 composes the bounded tools-only MCP client with that serial owner
 through Cycle 126 and proves the exact composition against one real sealed
 test-only stdio peer through Cycle 130.
+E06-S02 now binds that exact peer to one host-authored single-tool inventory,
+dual exact identity/fingerprint grants, atomic withdrawal, and one no-replay
+echo result through Cycle 133. The binding remains private and unmounted.
 E08-S05 mounts the same typed offline current-session observation on `/status`
 through Cycle 117 while preserving the legacy JSONL payload shape, and exact
 offline `/context window` through Cycle 121.
@@ -47,12 +50,12 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted numbered cycles | 132 |
+| Accepted numbered cycles | 133 |
 | Additional acceptance-repair commits | 1 (Cycle 129 quarantine rollback) |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 133 — bind one private real-peer MCP echo handler to exact inventory identity and withdrawal |
+| Active epic/card | Cycle 134 — stage default-disabled external-source declaration and exact dual-grant admission without spawn or product mount |
 
 ## Epic status
 
@@ -63,7 +66,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C3; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. One private composite drives pinned tools-only initialize/notification/list/call ordering with proof-derived bounds and typed cleanup, and a test-only sealed real peer proves exact four-frame reuse, protocol-fault truth, cancellation, and descendant reap. It remains unmounted; no handler/inventory mount, config, alternate enforcement, or product route exists, so X002 stays open |
+| E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C4, and E06-S03-C3; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. The tools-only composite now validates one exact child list, publishes one host-authored identity/fingerprint-bound echo descriptor, intersects exact host/caller grants, performs one non-replayable call, withdraws before cleanup, and exposes success only after clean child shutdown. The sealed real-peer fixture proves exact four-frame reuse and reap. Production has no grant constructors, source config, registry/request mount, or alternate enforcement, so X002 stays open |
 | E07 semantic context | **In progress** through E07-S01-C4 | The deterministic fixed-corpus baseline and selector comparison pass. A compiled but unmounted contributor uses only current permission-gated reads, reconstructs emitted lines and current role counts after ranking, and preserves the frozen 5-to-3-round / 1,456-to-1,134-byte result. No trigger, config, context projection, provider path, cache, mutation, or user-visible mount exists |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C2b | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. Cooperating Kitsu config writers are fenced by a receipt-held advisory parent lock; rollback uses exact receipt-fd/name classification, with arbitrary same-UID mutation explicitly nonclaimed. The pure picker preserves bounded offline/stale catalog truth and binds every proposal to exact profile/compiled-adapter/wire identity; one private selected coordinator now admits only explicit exact-namespace proposals and retains them through rejection, completion, and recovery. All remain unmounted; credential/provider/catalog adapters, guided UI, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C8 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, `/context sources`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive decks. Source rows distinguish coarse estimates, derived budget, authoritative counts, and unavailable sub-buckets without an additive total. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation, account truth, exact tokenizer attribution, and durable history remain separate |
@@ -206,6 +209,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | 130 | this document's commit | Exact real sealed tools-only MCP peer lifecycle, protocol-fault, cancellation, and reap proof |
 | 131 | this document's commit | Model-picker proposals bound to exact profile, compiled adapter, and wire namespace |
 | 132 | this document's commit | Explicit exact-namespace model proposal composed with private local setup and retained through recovery |
+| 133 | this document's commit | Exact host-authored MCP echo inventory, dual-grant call attempt, withdrawal, and clean-success truth |
 
 ## Current green gates
 
@@ -993,6 +997,17 @@ untouched coordinator and proposal. Completion, collision, execution failure,
 rollback residue, and retry retain the full proposal truth. The composition
 remains unmounted and performs no provider, catalog, credential, activation, or
 current-route effect.
+
+Cycle 133 composes the sealed tools-only MCP peer with one exact host-authored
+inventory publication and a typed echo handler. The child list must be exactly
+one non-paginated descriptor matching the compiled schema; names alone grant
+nothing. One call requires current publication plus exact host and caller
+identity/fingerprint grants, records `MayHaveExecuted` after possible frame
+acceptance, never retries, and withdraws before every cleanup or Drop. A result
+is consumable only after exact response validation and clean child shutdown;
+cleanup failure retains response and residue only as non-success evidence. The
+owner remains private and production has no grant constructors, configuration,
+registry/request mount, restart, or X002 claim.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

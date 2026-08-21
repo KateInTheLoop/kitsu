@@ -1,10 +1,10 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave plus Cycles 126-132 are accepted on
+Status: the first post-118 wave plus Cycles 126-133 are accepted on
 `improvements/post-118`. Cycle 129 required one additional acceptance-repair
 commit after a clean parallel run exposed a real quarantine timestamp and
-result-classification defect. The active implementation card is Cycle 133's
-private exact-inventory MCP echo-handler composition.
+result-classification defect. The active implementation card is Cycle 134's
+default-disabled external-source declaration and exact grant-admission seam.
 
 ## Objective
 
@@ -118,8 +118,17 @@ exact profile/compiled-adapter/wire namespace value required before a model
 proposal can be consumed. Cycle 132 composes only an explicit namespace-equal
 proposal with the private local setup coordinator and retains its truth through
 recovery without adding UI, catalog/network access, credentials, activation,
-or product routing. Cycle 133 may now bind the real-peer owner to exact atomic
+or product routing. Cycle 133 binds the real-peer owner to exact atomic
 inventory identity and one no-replay echo handler while remaining unmounted.
+That owner accepts exactly one non-paginated descriptor matching the compiled
+echo schema, publishes only host-authored source/incarnation/revision/tool
+identity, and requires both host and caller identity/fingerprint grants. A
+possibly accepted call never retries; withdrawal precedes cleanup or Drop, and
+response evidence is not success until the child shuts down cleanly. Grant
+constructors remain test-only.
+Cycle 134 may now stage only the default-disabled source declaration and exact
+host/caller grant admission required by a later product mount; it must still
+perform no discovery, acquisition, spawn, registry mutation, or provider send.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
@@ -129,7 +138,7 @@ file tail treated as canonical HEAD.
 ## Checkpoint and acceleration measure
 
 Cycle 118 is the stable pushed review base and `improvements/post-118` is the
-clean next integration branch through Cycle 132. Parallel work accelerates
+clean next integration branch through Cycle 133. Parallel work accelerates
 discovery and implementation latency, while serialized acceptance preserves
 bisectability and one truthful roadmap. Numbered cycles, integration commits,
 tests, and replaceability gates are reported separately: Cycle 129 legitimately

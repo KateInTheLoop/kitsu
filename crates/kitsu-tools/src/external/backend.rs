@@ -2333,6 +2333,10 @@ mod tests {
         ChildNetworkPolicyV1, ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRequestPolicyV1,
         ChildRuntimePolicyV1, ChildTimeoutDispositionV1, PreparedChildLaunchV1,
     };
+    use crate::external::handler::{
+        CallerExternalToolGrantV1, ExternalMcpEchoCompletionV1, ExternalMcpEchoSourceOwnerV1,
+        ExternalMcpEchoSourceStateV1, FixtureEchoRequestV1, HostExternalToolGrantV1,
+    };
     use crate::external::lifecycle::ChildExitTruthV1;
     use crate::external::mcp::{
         McpSerialChildFailureV1, McpSerialChildOwnerV1, McpSerialChildStateV1,
@@ -4211,6 +4215,95 @@ mod tests {
                     ..
                 }
             ));
+        }
+        assert_eq!(backend.os_spawn_count(), 1);
+        assert_eq!(backend.request_start_count(), 4);
+        assert!(process_group_is_gone(pgid));
+        assert!(backend.take_serial_retained_residue().is_none());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn real_mcp_echo_source_publishes_calls_withdraws_and_reaps_one_sealed_peer() {
+        let cwd = tempfile::tempdir().unwrap();
+        let (prepared, mut backend) = prepared_real_mcp_peer(cwd.path(), RealMcpPeerModeV1::Exact);
+        assert_eq!(backend.prepared_containment_count_for_test(), 1);
+        assert_eq!(
+            backend.prepared_executable_seals_for_test(),
+            Some(libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL)
+        );
+        let pgid;
+        {
+            let mut owner = ExternalMcpEchoSourceOwnerV1::new(
+                prepared,
+                &mut backend,
+                "fixture-source",
+                "sealed-boot-1",
+                1,
+                "echo",
+            )
+            .unwrap();
+            owner.start().unwrap();
+            let wall_deadline = Instant::now() + Duration::from_secs(5);
+            while !matches!(owner.state(), ExternalMcpEchoSourceStateV1::PublishedReady) {
+                assert!(
+                    Instant::now() < wall_deadline,
+                    "echo source hung before publication: {:?}",
+                    owner.state()
+                );
+                assert!(
+                    !matches!(owner.state(), ExternalMcpEchoSourceStateV1::Failed { .. }),
+                    "echo source failed before publication: {:?} / {:?}",
+                    owner.state(),
+                    owner.failure()
+                );
+                owner.poll().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(owner.publication().unwrap().tools().len(), 1);
+            assert_eq!(owner.binding().unwrap().wire_name(), "fixture.echo");
+            pgid = owner
+                .effects_for_test()
+                .active_pgid_for_test()
+                .expect("one live MCP process group");
+            let host = HostExternalToolGrantV1::from_binding(owner.binding().unwrap());
+            let caller = CallerExternalToolGrantV1::from_binding(owner.binding().unwrap());
+            owner
+                .begin_echo(FixtureEchoRequestV1::new(7), &host, &caller)
+                .unwrap();
+            while !matches!(owner.state(), ExternalMcpEchoSourceStateV1::Completed) {
+                assert!(
+                    Instant::now() < wall_deadline,
+                    "echo source hung before completion: {:?}",
+                    owner.state()
+                );
+                assert!(
+                    !matches!(owner.state(), ExternalMcpEchoSourceStateV1::Failed { .. }),
+                    "echo source failed before completion: {:?} / {:?}",
+                    owner.state(),
+                    owner.failure()
+                );
+                owner.poll().unwrap();
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            assert_eq!(owner.take_result().unwrap().value(), 7);
+            assert_eq!(
+                owner.completion(),
+                Some(ExternalMcpEchoCompletionV1::EchoValidated)
+            );
+            assert!(owner.publication().is_none());
+            assert!(owner.binding().is_none());
+            assert_eq!(owner.effects_for_test().os_spawn_count(), 1);
+            assert_eq!(owner.effects_for_test().request_start_count(), 4);
+            assert_eq!(
+                owner.response_frames_for_test(),
+                &[
+                    MCP_INITIALIZE_RESPONSE_LINE_V1.to_vec(),
+                    MCP_LIST_RESPONSE_LINE_V1.to_vec(),
+                    MCP_CALL_RESPONSE_LINE_V1.to_vec(),
+                ]
+            );
         }
         assert_eq!(backend.os_spawn_count(), 1);
         assert_eq!(backend.request_start_count(), 4);
