@@ -1130,6 +1130,10 @@ impl SerialChildTransportEffectsV1 for LinuxChildBackendV1 {
         if active.frame_count >= active.max_frames {
             return Err("serial backend frame count is exhausted".to_string());
         }
+        let next_frame_count = active
+            .frame_count
+            .checked_add(1)
+            .ok_or_else(|| "serial frame count overflow".to_string())?;
         if frame.is_empty()
             || frame.len() > active.io_limits[3]
             || !frame.ends_with(b"\n")
@@ -1147,6 +1151,7 @@ impl SerialChildTransportEffectsV1 for LinuxChildBackendV1 {
         active.pending_stdin.extend_from_slice(frame);
         active.pending_stdin_offset = 0;
         active.stdin_accepted = next_stdin;
+        active.frame_count = next_frame_count;
         self.request_start_count = next_request_count;
         Ok(())
     }
@@ -1218,10 +1223,6 @@ impl SerialChildTransportEffectsV1 for LinuxChildBackendV1 {
                 let extra = stdout.bytes.len() - newline - 1;
                 let mut response = std::mem::take(&mut active.stdout_carry);
                 response.extend_from_slice(&stdout.bytes[..=newline]);
-                active.frame_count = active
-                    .frame_count
-                    .checked_add(1)
-                    .ok_or_else(|| "serial frame count overflow".to_string())?;
                 (Some(response), extra)
             } else {
                 let carry_len = active

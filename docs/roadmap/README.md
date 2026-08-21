@@ -734,6 +734,7 @@ gates merely because a card appears attractive.
 | 123 | E05-S02-C1 | Stage a deterministic offline model picker over one bounded provenance-bearing catalog snapshot without applying it |
 | 124 | E08-S05-C7 | Unify bare/session usage and legacy cost compatibility over one truthful typed current-session snapshot |
 | 125 | E07-S01-C3 | Prove selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
+| 126 | E06-S03-C2 | Compose the pinned tools-only MCP codec with one proof-bounded strictly serial child owner and fail-closed cleanup truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1106,6 +1107,14 @@ symlink candidates leak no canary or path, replacement emits only revalidated
 current truth, and revocation returns no evidence. The original 5-to-3-round and
 1,456-to-1,134-byte promotion result remains byte-stable. This still adds no
 production contributor, cache, provider, mutation, or completed-task claim.
+Cycle 126 privately composes the pinned tools-only MCP codec with one bounded
+serial child owner. Exact initialize, response-free initialized notification,
+tools/list, and strictly serial tools/call ordering share proof-derived frame,
+payload, deadline, and cumulative limits. Client, decoder, protocol, transport,
+clock, and cleanup faults remain typed and cannot publish a stale event or
+success. The owner is still unmounted: no configuration, inventory, handler,
+product route, additional MCP vocabulary, or external-tool acceptance claim is
+added.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

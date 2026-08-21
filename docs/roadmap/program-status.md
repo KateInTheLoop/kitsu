@@ -3,7 +3,7 @@
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080; E06-S01 is implemented through C7, E06-S02 through C3, and
-E06-S03 has begun through C1;
+E06-S03 through C2;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
 provider-free monotonic inventory publication through Cycle 107, and E06-S01
@@ -35,11 +35,11 @@ observation through Cycle 124.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 125 / 125 |
+| Accepted cycles/commits after this cycle | 126 / 126 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 126 — E06-S03-C2: compose the pinned MCP codec with the bounded serial child owner |
+| Active epic/card | Cycle 127 — E08-S05-C8: add a truthful offline context-source view |
 
 ## Epic status
 
@@ -50,7 +50,7 @@ observation through Cycle 124.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
+| E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C2; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. One private composite now drives pinned tools-only initialize/notification/list/call ordering with proof-derived bounds and typed cleanup. It remains unmounted; no real peer, handler/inventory mount, config, alternate enforcement, or product route exists, so X002 stays open |
 | E07 semantic context | **In progress** through E07-S01-C3 | The deterministic fixed-corpus baseline and test-only selector comparison pass. Current permission-gated reads reconstruct emitted evidence after ranking; hostile denied/private/symlink candidates, source replacement, later re-observation, and revocation pass canonical oracles without stale or denied leakage. Production contributor remains absent |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C7 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive full/context/usage decks. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation payloads, account truth, and durable history remain separate; history still consumes E03 fencing |
@@ -186,6 +186,7 @@ observation through Cycle 124.
 | 123 | this document's commit | Pure bounded offline model-picker snapshot, projection, and proposal truth |
 | 124 | this document's commit | One typed usage snapshot behind bare, session, and legacy-cost compatibility forms |
 | 125 | this document's commit | Selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
+| 126 | this document's commit | Pinned tools-only MCP codec composed with one proof-bounded serial child owner |
 
 ## Current green gates
 
@@ -913,6 +914,13 @@ denied, private, and symlink candidates leak no path or canary; source
 replacement yields only revalidated current truth; a later invocation observes
 fresh truth; and revoked authority yields no evidence. The prior promotion
 metrics remain unchanged and no production contributor or mutation path exists.
+
+Cycle 126 composes exact tools-only MCP initialize, response-free initialized
+notification, list, and call ordering with one proof-bounded strictly serial
+child. Payload/frame/count/deadline bounds come only from the prepared proof;
+codec, client, transport, clock, and cleanup faults retain exact terminal and
+residue truth. No inventory, configuration, handler, product route, real peer,
+or wider MCP vocabulary is mounted.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

@@ -154,7 +154,7 @@ impl SerialFrameObservationV1 {
     }
 
     #[cfg(test)]
-    fn response_with_extra_carry(
+    pub(super) fn response_with_extra_carry(
         response: Vec<u8>,
         stdin_bytes_written: usize,
         stdout_bytes_read: usize,
@@ -173,7 +173,7 @@ impl SerialFrameObservationV1 {
     }
 
     #[cfg(test)]
-    fn response_with_eof(
+    pub(super) fn response_with_eof(
         response: Vec<u8>,
         stdin_bytes_written: usize,
         stdout_bytes_read: usize,
@@ -191,7 +191,7 @@ impl SerialFrameObservationV1 {
     }
 
     #[cfg(test)]
-    fn response_with_exit(
+    pub(super) fn response_with_exit(
         response: Vec<u8>,
         stdin_bytes_written: usize,
         stdout_bytes_read: usize,
@@ -210,7 +210,7 @@ impl SerialFrameObservationV1 {
     }
 
     #[cfg(test)]
-    fn eof() -> Self {
+    pub(super) fn eof() -> Self {
         Self {
             stdout_eof: true,
             ..Self::pending()
@@ -218,7 +218,7 @@ impl SerialFrameObservationV1 {
     }
 
     #[cfg(test)]
-    fn exit(exit: ChildExitTruthV1) -> Self {
+    pub(super) fn exit(exit: ChildExitTruthV1) -> Self {
         Self {
             exit: Some(exit),
             ..Self::pending()
@@ -310,6 +310,11 @@ pub(crate) enum SerialChildTransportStateV1 {
         line_deadline_millis: u64,
         idle_deadline_millis: u64,
     },
+    NotificationInFlight {
+        completed_frames: u16,
+        line_deadline_millis: u64,
+        idle_deadline_millis: u64,
+    },
     ResponseReady {
         completed_frames: u16,
     },
@@ -356,6 +361,12 @@ enum SerialClockFaultV1 {
         previous_millis: u64,
         observed_millis: u64,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SerialOutboundFrameKindV1 {
+    Request,
+    Notification,
 }
 
 pub(crate) struct SerialChildTransportV1<'effects, E: SerialChildTransportEffectsV1> {
@@ -453,12 +464,30 @@ where
         &mut self,
         frame: Vec<u8>,
     ) -> Result<&SerialChildTransportStateV1, SerialChildTransportErrorV1> {
+        self.begin_outbound_frame(frame, SerialOutboundFrameKindV1::Request)
+    }
+
+    pub(super) fn begin_notification_frame(
+        &mut self,
+        frame: Vec<u8>,
+    ) -> Result<&SerialChildTransportStateV1, SerialChildTransportErrorV1> {
+        self.begin_outbound_frame(frame, SerialOutboundFrameKindV1::Notification)
+    }
+
+    fn begin_outbound_frame(
+        &mut self,
+        frame: Vec<u8>,
+        kind: SerialOutboundFrameKindV1,
+    ) -> Result<&SerialChildTransportStateV1, SerialChildTransportErrorV1> {
         let completed_frames = match self.state {
             SerialChildTransportStateV1::Idle { completed_frames } => completed_frames,
             SerialChildTransportStateV1::Starting { .. } | SerialChildTransportStateV1::Ready => {
                 return Err(SerialChildTransportErrorV1::ChildNotReady)
             }
             SerialChildTransportStateV1::FrameInFlight { .. } => {
+                return Err(SerialChildTransportErrorV1::FrameAlreadyInFlight)
+            }
+            SerialChildTransportStateV1::NotificationInFlight { .. } => {
                 return Err(SerialChildTransportErrorV1::FrameAlreadyInFlight)
             }
             SerialChildTransportStateV1::ResponseReady { .. } => {
@@ -513,10 +542,19 @@ where
         self.stdin_accepted = next_stdin;
         self.current_frame_bytes = frame.len();
         self.current_frame_written = 0;
-        self.state = SerialChildTransportStateV1::FrameInFlight {
-            completed_frames,
-            line_deadline_millis,
-            idle_deadline_millis,
+        self.state = match kind {
+            SerialOutboundFrameKindV1::Request => SerialChildTransportStateV1::FrameInFlight {
+                completed_frames,
+                line_deadline_millis,
+                idle_deadline_millis,
+            },
+            SerialOutboundFrameKindV1::Notification => {
+                SerialChildTransportStateV1::NotificationInFlight {
+                    completed_frames,
+                    line_deadline_millis,
+                    idle_deadline_millis,
+                }
+            }
         };
         Ok(&self.state)
     }
@@ -579,7 +617,33 @@ where
                 } else if now >= idle_deadline_millis {
                     self.begin_drain_at(SerialChildCauseV1::IdleTimeout, now);
                 } else {
-                    self.poll_frame(completed_frames, line_deadline_millis, idle_deadline_millis);
+                    self.poll_frame(
+                        completed_frames,
+                        line_deadline_millis,
+                        idle_deadline_millis,
+                        SerialOutboundFrameKindV1::Request,
+                    );
+                }
+            }
+            SerialChildTransportStateV1::NotificationInFlight {
+                completed_frames,
+                line_deadline_millis,
+                idle_deadline_millis,
+            } => {
+                let Some(now) = self.now_or_fail_closed() else {
+                    return Ok(&self.state);
+                };
+                if now >= line_deadline_millis {
+                    self.begin_drain_at(SerialChildCauseV1::LineTimeout, now);
+                } else if now >= idle_deadline_millis {
+                    self.begin_drain_at(SerialChildCauseV1::IdleTimeout, now);
+                } else {
+                    self.poll_frame(
+                        completed_frames,
+                        line_deadline_millis,
+                        idle_deadline_millis,
+                        SerialOutboundFrameKindV1::Notification,
+                    );
                 }
             }
             SerialChildTransportStateV1::Draining {
@@ -659,6 +723,7 @@ where
         completed_frames: u16,
         line_deadline_millis: u64,
         idle_deadline_millis: u64,
+        kind: SerialOutboundFrameKindV1,
     ) {
         let allowance = SerialPollAllowanceV1 {
             stdin_bytes: self.policy.stdin_bytes.saturating_sub(self.stdin_accepted),
@@ -723,6 +788,16 @@ where
         self.stdout_accepted = next_stdout;
         self.stderr_accepted = next_stderr;
 
+        if kind == SerialOutboundFrameKindV1::Notification
+            && (observation.stdout_bytes_read != 0
+                || observation.stderr_bytes_read != 0
+                || observation.response.is_some()
+                || observation.extra_stdout_bytes != 0)
+        {
+            self.begin_protocol_failure(SerialChildCauseV1::ProtocolViolation);
+            return;
+        }
+
         if observation
             .exit
             .is_some_and(|exit| exit != ChildExitTruthV1::Exited(0))
@@ -740,6 +815,24 @@ where
         }
         if observation.extra_stdout_bytes != 0 {
             self.begin_protocol_failure(SerialChildCauseV1::ProtocolViolation);
+            return;
+        }
+        if kind == SerialOutboundFrameKindV1::Notification
+            && self.current_frame_written == self.current_frame_bytes
+        {
+            let Some(completed_frames) = completed_frames.checked_add(1) else {
+                self.begin_protocol_failure(SerialChildCauseV1::ProtocolViolation);
+                return;
+            };
+            if completed_frames > self.policy.max_frames {
+                self.begin_protocol_failure(SerialChildCauseV1::ProtocolViolation);
+                return;
+            }
+            self.state = if completed_frames == self.policy.max_frames {
+                SerialChildTransportStateV1::Exhausted { completed_frames }
+            } else {
+                SerialChildTransportStateV1::Idle { completed_frames }
+            };
             return;
         }
         if let Some(response) = observation.response {
@@ -776,16 +869,34 @@ where
             else {
                 return;
             };
-            self.state = SerialChildTransportStateV1::FrameInFlight {
-                completed_frames,
-                line_deadline_millis,
-                idle_deadline_millis,
+            self.state = match kind {
+                SerialOutboundFrameKindV1::Request => SerialChildTransportStateV1::FrameInFlight {
+                    completed_frames,
+                    line_deadline_millis,
+                    idle_deadline_millis,
+                },
+                SerialOutboundFrameKindV1::Notification => {
+                    SerialChildTransportStateV1::NotificationInFlight {
+                        completed_frames,
+                        line_deadline_millis,
+                        idle_deadline_millis,
+                    }
+                }
             };
         } else {
-            self.state = SerialChildTransportStateV1::FrameInFlight {
-                completed_frames,
-                line_deadline_millis,
-                idle_deadline_millis,
+            self.state = match kind {
+                SerialOutboundFrameKindV1::Request => SerialChildTransportStateV1::FrameInFlight {
+                    completed_frames,
+                    line_deadline_millis,
+                    idle_deadline_millis,
+                },
+                SerialOutboundFrameKindV1::Notification => {
+                    SerialChildTransportStateV1::NotificationInFlight {
+                        completed_frames,
+                        line_deadline_millis,
+                        idle_deadline_millis,
+                    }
+                }
             };
         }
     }
@@ -817,6 +928,7 @@ where
             SerialChildTransportStateV1::Starting { .. }
             | SerialChildTransportStateV1::Idle { .. }
             | SerialChildTransportStateV1::FrameInFlight { .. }
+            | SerialChildTransportStateV1::NotificationInFlight { .. }
             | SerialChildTransportStateV1::ResponseReady { .. }
             | SerialChildTransportStateV1::Exhausted { .. } => {
                 let Some(now) = self.now_or_fail_closed() else {
@@ -841,6 +953,31 @@ where
         };
         self.response.take();
         self.begin_drain_at(cause, now);
+    }
+
+    pub(super) fn abort_protocol(
+        &mut self,
+    ) -> Result<&SerialChildTransportStateV1, SerialChildTransportErrorV1> {
+        match self.state {
+            SerialChildTransportStateV1::Starting { .. }
+            | SerialChildTransportStateV1::Idle { .. }
+            | SerialChildTransportStateV1::FrameInFlight { .. }
+            | SerialChildTransportStateV1::NotificationInFlight { .. }
+            | SerialChildTransportStateV1::ResponseReady { .. }
+            | SerialChildTransportStateV1::Exhausted { .. } => {
+                self.begin_protocol_failure(SerialChildCauseV1::ProtocolViolation);
+                Ok(&self.state)
+            }
+            _ => Err(SerialChildTransportErrorV1::NoActiveDeadline),
+        }
+    }
+
+    pub(super) fn line_payload_limit(&self) -> usize {
+        self.policy.frame_bytes.saturating_sub(1)
+    }
+
+    pub(super) fn maximum_frames(&self) -> u16 {
+        self.policy.max_frames
     }
 
     fn begin_drain_at(&mut self, cause: SerialChildCauseV1, now: u64) {
@@ -1899,5 +2036,127 @@ mod tests {
                 idle_deadline_millis: 102 + IDLE_MILLIS,
             }
         );
+    }
+
+    #[test]
+    fn notification_frame_completes_only_after_full_write_without_a_response() {
+        let mut effects = SerialFixture::with_times([0, 1, 2, 3]);
+        let mut transport = start_ready(&mut effects);
+        assert_eq!(
+            transport
+                .begin_notification_frame(b"note\n".to_vec())
+                .unwrap(),
+            &SerialChildTransportStateV1::NotificationInFlight {
+                completed_frames: 0,
+                line_deadline_millis: 2 + LINE_MILLIS,
+                idle_deadline_millis: 2 + IDLE_MILLIS,
+            }
+        );
+        transport
+            .effects_for_test()
+            .frame_polls
+            .push_back(Ok(SerialFrameObservationV1::progress(5, 0, 0)));
+        assert_eq!(
+            transport.poll().unwrap(),
+            &SerialChildTransportStateV1::Idle {
+                completed_frames: 1,
+            }
+        );
+        assert_eq!(transport.effects_for_test().spawn_count, 1);
+        assert_eq!(
+            transport
+                .effects_for_test()
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::BeginFrame(_)))
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn notification_zero_progress_does_not_reset_idle_but_nonzero_write_does() {
+        let mut effects = SerialFixture::with_times([0, 1, 2, 8, 8, 10]);
+        let mut transport = start_ready(&mut effects);
+        transport
+            .begin_notification_frame(b"notice\n".to_vec())
+            .unwrap();
+        transport.effects_for_test().frame_polls.extend([
+            Ok(SerialFrameObservationV1::pending()),
+            Ok(SerialFrameObservationV1::progress(1, 0, 0)),
+        ]);
+        transport.poll().unwrap();
+        let after_zero = transport
+            .effects_for_test()
+            .events
+            .iter()
+            .filter(|event| matches!(event, Event::Now))
+            .count();
+        transport.poll().unwrap();
+        assert_eq!(
+            transport
+                .effects_for_test()
+                .events
+                .iter()
+                .filter(|event| matches!(event, Event::Now))
+                .count(),
+            after_zero + 2
+        );
+        assert!(matches!(
+            transport.state(),
+            SerialChildTransportStateV1::NotificationInFlight {
+                idle_deadline_millis,
+                ..
+            } if *idle_deadline_millis == 10 + IDLE_MILLIS
+        ));
+    }
+
+    #[test]
+    fn notification_output_eof_or_exit_never_fabricates_completion() {
+        for (observation, expected_cause) in [
+            (
+                SerialFrameObservationV1::response(b"unexpected\n".to_vec(), 5, 11, 0),
+                SerialChildCauseV1::ProtocolViolation,
+            ),
+            (SerialFrameObservationV1::eof(), SerialChildCauseV1::Eof),
+            (
+                SerialFrameObservationV1::exit(ChildExitTruthV1::Exited(17)),
+                SerialChildCauseV1::Crash,
+            ),
+        ] {
+            let mut effects = SerialFixture::with_times(0..=5);
+            let mut transport = start_ready(&mut effects);
+            transport
+                .begin_notification_frame(b"note\n".to_vec())
+                .unwrap();
+            transport
+                .effects_for_test()
+                .frame_polls
+                .push_back(Ok(observation));
+            assert!(matches!(
+                transport.poll().unwrap(),
+                SerialChildTransportStateV1::Draining { cause, .. } if *cause == expected_cause
+            ));
+            assert!(!matches!(
+                transport.state(),
+                SerialChildTransportStateV1::Idle { .. }
+                    | SerialChildTransportStateV1::ResponseReady { .. }
+            ));
+        }
+    }
+
+    #[test]
+    fn composition_accessors_are_exact_and_protocol_abort_has_a_fixed_cause() {
+        let mut effects = SerialFixture::with_times([0, 1, 2]);
+        let mut transport = start_ready(&mut effects);
+        assert_eq!(transport.line_payload_limit(), FRAME_BYTES - 1);
+        assert_eq!(transport.maximum_frames(), MAX_FRAMES);
+        assert!(matches!(
+            transport.abort_protocol().unwrap(),
+            SerialChildTransportStateV1::Draining {
+                cause: SerialChildCauseV1::ProtocolViolation,
+                ..
+            }
+        ));
     }
 }
