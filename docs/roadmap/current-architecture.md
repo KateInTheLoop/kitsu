@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 089.
+updates through Cycle 090.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -213,8 +213,13 @@ kernel.
   pre-install races do not. A directory-sync cut therefore reports a durability
   warning without misrepresenting the installed value, while ancestor
   replacement cannot retarget publication. Canonical activation rejects this
-  snapshot operation without effects. Production `SessionStore` routing remains
-  unchanged.
+  snapshot operation without effects. Cycle 090 moves the total activation
+  behind one non-cloneable private live-store owner. Callers borrow its resume
+  snapshot and source receipt and submit one closed current-snapshot or
+  canonical-operation save intent. Receipts preserve the representation; a
+  mismatched intent is effect-free. The wrapper retains both fences across
+  successful saves and releases them only on drop, and exposes no activation
+  extractor. Production `SessionStore` routing remains unchanged.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

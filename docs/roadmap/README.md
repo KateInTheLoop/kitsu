@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C30,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C31,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -695,6 +695,7 @@ gates merely because a card appears attractive.
 | 087 | E03-S02-C28 | Dispatch every selected representation into one lock-owning activation and exact source receipt |
 | 088 | E03-S02-C29 | Save canonical successors through the total activation's held fence and exact parent envelope |
 | 089 | E03-S02-C30 | Save current-v1 successors through the total activation with exact pre-install byte and canonical-absence checks |
+| 090 | E03-S02-C31 | Encapsulate both representation-aware save paths behind one non-cloneable private live-store owner |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -802,9 +803,12 @@ current-v1 half: activation retains a clone of the pinned directory descriptor,
 validates stable snapshot identity, stages atomic bytes, and immediately before
 rename rechecks both the exact retained source and canonical-HEAD absence.
 Confirmed and installed-unconfirmed results advance the retained value; all
-pre-install refusals preserve it. Cycle 090 next encapsulates this complete
-representation-aware owner behind a private live-store boundary before
-production route changes, then continues through E03,
+pre-install refusals preserve it. Cycle 090 encapsulates the complete activation
+behind one non-cloneable private live-store owner. One save-intent/receipt API
+routes both representations; cross-representation intent is effect-free, both
+fences remain owned across valid writes, and both release only when the live
+store drops. Cycle 091 next defines the production active-session ownership
+handoff without switching current-v1 behavior, then continues through E03,
 E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

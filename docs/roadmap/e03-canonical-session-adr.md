@@ -750,6 +750,18 @@ cannot weaken or replace any backend-neutral assertion.
    current-snapshot operation without effects. The next boundary encapsulates
    this complete representation-aware activation as one private live store;
    production routing remains unchanged.
+   **Private live-store owner complete in Cycle 090:** a non-cloneable wrapper
+   consumes the total activation and is now the only module-exposed live-store
+   boundary. Resume data and the exact activation source receipt are borrowed;
+   there is no activation extractor. One closed save intent selects either a
+   current-v1 snapshot or canonical operation and returns a representation-
+   tagged receipt. Cross-representation intent returns the existing typed
+   requirement before effects, after which a valid save remains possible. Both
+   the legacy lease and canonical writer fence stay held across current and
+   canonical writes and release only when the wrapper drops. The underlying
+   activation constructor and save methods are module-private. Production
+   ownership and persistence routing remain unchanged; the next card defines
+   that handoff before mounting either representation.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
