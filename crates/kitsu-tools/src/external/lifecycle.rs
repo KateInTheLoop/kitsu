@@ -336,10 +336,11 @@ mod tests {
     use super::*;
     use crate::external::authority::{
         prepare_child_launch_request_v1, AdmittedChildLaunchV1, AuthorityProfileV1,
-        ChildEnvironmentPolicyV1, ChildIoLimitsV1, ChildLaunchAuthorityDecisionV1,
+        ChildEnvironmentPolicyV1, ChildFilesystemAccessV1, ChildFilesystemGrantV1,
+        ChildFilesystemPolicyV1, ChildIoLimitsV1, ChildLaunchAuthorityDecisionV1,
         ChildLaunchModeV1, ChildLaunchPreparationV1, ChildLaunchRequestV1, ChildNetworkPolicyV1,
         ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRuntimePolicyV1,
-        ChildTimeoutDispositionV1,
+        ChildTimeoutDispositionV1, PreparedChildContainmentTokenV1,
     };
 
     const EXECUTABLE: &str = "/opt/kitsu-fixtures/stdio-peer";
@@ -352,6 +353,10 @@ mod tests {
             ChildIoLimitsV1::new(64 * 1024, 256 * 1024, 64 * 1024, 32 * 1024),
             ChildProcessGroupPolicyV1::Owned,
             ChildEnvironmentPolicyV1::new(true, Vec::new()),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                WORKING_DIRECTORY,
+                ChildFilesystemAccessV1::ReadWrite,
+            )]),
             ChildNetworkPolicyV1::Deny,
             ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
         )
@@ -369,8 +374,11 @@ mod tests {
             Ok([0xab; 32])
         }
 
-        fn containment_preflight(&mut self, _: &AdmittedChildLaunchV1) -> Result<(), String> {
-            Ok(())
+        fn containment_preflight(
+            &mut self,
+            _: &AdmittedChildLaunchV1,
+        ) -> Result<PreparedChildContainmentTokenV1, String> {
+            Ok(PreparedChildContainmentTokenV1::new(1))
         }
     }
 

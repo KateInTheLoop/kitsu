@@ -29,6 +29,9 @@ const MAX_ENVIRONMENT_VARIABLES: usize = 64;
 const MAX_ENVIRONMENT_NAME_BYTES: usize = 128;
 const MAX_ENVIRONMENT_VALUE_BYTES: usize = 4 * 1024;
 const MAX_ENVIRONMENT_PROJECTION_BYTES: usize = 16 * 1024;
+const MAX_FILESYSTEM_GRANTS: usize = 64;
+const MAX_FILESYSTEM_PATH_BYTES: usize = 4 * 1024;
+const MAX_FILESYSTEM_POLICY_BYTES: usize = 64 * 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum ChildLaunchModeV1 {
@@ -132,6 +135,50 @@ impl ChildEnvironmentPolicyV1 {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum ChildFilesystemAccessV1 {
+    ReadOnly,
+    ReadWrite,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildFilesystemGrantV1 {
+    path: PathBuf,
+    access: ChildFilesystemAccessV1,
+}
+
+impl ChildFilesystemGrantV1 {
+    pub(crate) fn new(path: impl Into<PathBuf>, access: ChildFilesystemAccessV1) -> Self {
+        Self {
+            path: path.into(),
+            access,
+        }
+    }
+
+    pub(super) fn path(&self) -> &Path {
+        &self.path
+    }
+
+    pub(super) fn access(&self) -> ChildFilesystemAccessV1 {
+        self.access
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct ChildFilesystemPolicyV1 {
+    grants: Vec<ChildFilesystemGrantV1>,
+}
+
+impl ChildFilesystemPolicyV1 {
+    pub(crate) fn new(grants: Vec<ChildFilesystemGrantV1>) -> Self {
+        Self { grants }
+    }
+
+    pub(super) fn grants(&self) -> &[ChildFilesystemGrantV1] {
+        &self.grants
+    }
+}
+
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(crate) enum ChildNetworkPolicyV1 {
     #[default]
@@ -154,6 +201,7 @@ pub(crate) struct ChildRuntimePolicyV1 {
     io_limits: ChildIoLimitsV1,
     process_group: ChildProcessGroupPolicyV1,
     environment: ChildEnvironmentPolicyV1,
+    filesystem: ChildFilesystemPolicyV1,
     network: ChildNetworkPolicyV1,
     timeout_disposition: ChildTimeoutDispositionV1,
 }
@@ -164,6 +212,7 @@ impl ChildRuntimePolicyV1 {
         io_limits: ChildIoLimitsV1,
         process_group: ChildProcessGroupPolicyV1,
         environment: ChildEnvironmentPolicyV1,
+        filesystem: ChildFilesystemPolicyV1,
         network: ChildNetworkPolicyV1,
         timeout_disposition: ChildTimeoutDispositionV1,
     ) -> Self {
@@ -172,6 +221,7 @@ impl ChildRuntimePolicyV1 {
             io_limits,
             process_group,
             environment,
+            filesystem,
             network,
             timeout_disposition,
         }
@@ -203,6 +253,7 @@ pub(crate) enum ChildRuntimePolicyErrorV1 {
     ProcessGroupNotOwned,
     InheritedEnvironmentNotCleared,
     InvalidEnvironmentProjection,
+    InvalidFilesystemPolicy,
     NetworkNotDenied,
     TimeoutMayAbandon,
 }
@@ -295,6 +346,7 @@ pub(crate) enum ChildLaunchAdmissionErrorV1 {
     InvalidExecutableSha256,
     InvalidArguments,
     InvalidWorkingDirectory,
+    WorkingDirectoryOutsideFilesystemPolicy,
     InvalidRuntimePolicy(ChildRuntimePolicyErrorV1),
     AuthorityMismatch(AuthorityMismatchFieldV1),
     ExecutableCanonicalization(String),
@@ -360,6 +412,14 @@ impl ValidatedChildLaunchSpecV1 {
         }
         validate_runtime_policy(&runtime_policy)
             .map_err(ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy)?;
+        if !runtime_policy
+            .filesystem
+            .grants
+            .iter()
+            .any(|grant| working_directory.starts_with(&grant.path))
+        {
+            return Err(ChildLaunchAdmissionErrorV1::WorkingDirectoryOutsideFilesystemPolicy);
+        }
         Ok(Self {
             executable,
             executable_sha256,
@@ -374,8 +434,10 @@ fn is_normalized_absolute_path(path: &Path) -> bool {
     let Some(text) = path.to_str() else {
         return false;
     };
+    let normalized: PathBuf = path.components().collect();
     path.is_absolute()
         && !text.contains('\0')
+        && normalized == path
         && path.components().all(|component| match component {
             Component::Prefix(_) => cfg!(windows),
             Component::RootDir | Component::Normal(_) => true,
@@ -477,11 +539,39 @@ fn validate_runtime_policy(policy: &ChildRuntimePolicyV1) -> Result<(), ChildRun
         return Err(ChildRuntimePolicyErrorV1::InheritedEnvironmentNotCleared);
     }
     validate_environment_projection(&policy.environment.projection)?;
+    validate_filesystem_policy(&policy.filesystem)?;
     if policy.network != ChildNetworkPolicyV1::Deny {
         return Err(ChildRuntimePolicyErrorV1::NetworkNotDenied);
     }
     if policy.timeout_disposition != ChildTimeoutDispositionV1::TerminateProcessGroupAndReap {
         return Err(ChildRuntimePolicyErrorV1::TimeoutMayAbandon);
+    }
+    Ok(())
+}
+
+fn validate_filesystem_policy(
+    policy: &ChildFilesystemPolicyV1,
+) -> Result<(), ChildRuntimePolicyErrorV1> {
+    if policy.grants.is_empty() || policy.grants.len() > MAX_FILESYSTEM_GRANTS {
+        return Err(ChildRuntimePolicyErrorV1::InvalidFilesystemPolicy);
+    }
+    let mut total_bytes = 0_usize;
+    for (index, grant) in policy.grants.iter().enumerate() {
+        let path_bytes = grant.path.as_os_str().as_encoded_bytes().len();
+        total_bytes = total_bytes.saturating_add(path_bytes);
+        if grant.path.parent().is_none()
+            || !is_normalized_absolute_path(&grant.path)
+            || path_bytes > MAX_FILESYSTEM_PATH_BYTES
+            || total_bytes > MAX_FILESYSTEM_POLICY_BYTES
+        {
+            return Err(ChildRuntimePolicyErrorV1::InvalidFilesystemPolicy);
+        }
+        if policy.grants[..index]
+            .iter()
+            .any(|other| grant.path.starts_with(&other.path) || other.path.starts_with(&grant.path))
+        {
+            return Err(ChildRuntimePolicyErrorV1::InvalidFilesystemPolicy);
+        }
     }
     Ok(())
 }
@@ -530,6 +620,24 @@ pub(crate) struct AdmittedChildLaunchV1 {
     spec: ValidatedChildLaunchSpecV1,
 }
 
+impl AdmittedChildLaunchV1 {
+    pub(super) fn executable(&self) -> &Path {
+        &self.spec.executable
+    }
+
+    pub(super) fn executable_sha256(&self) -> &[u8; 32] {
+        &self.spec.executable_sha256.0
+    }
+
+    pub(super) fn working_directory(&self) -> &Path {
+        &self.spec.working_directory
+    }
+
+    pub(super) fn filesystem(&self) -> &ChildFilesystemPolicyV1 {
+        &self.spec.runtime_policy.filesystem
+    }
+}
+
 /// Preparation operations that may observe the host after pure admission.
 ///
 /// The eventual supervisor will provide the production implementation. This
@@ -538,7 +646,30 @@ pub(crate) struct AdmittedChildLaunchV1 {
 pub(crate) trait ChildLaunchPreparationV1 {
     fn canonicalize_executable(&mut self, executable: &Path) -> Result<PathBuf, String>;
     fn executable_sha256(&mut self, executable: &Path) -> Result<[u8; 32], String>;
-    fn containment_preflight(&mut self, launch: &AdmittedChildLaunchV1) -> Result<(), String>;
+    fn containment_preflight(
+        &mut self,
+        launch: &AdmittedChildLaunchV1,
+    ) -> Result<PreparedChildContainmentTokenV1, String>;
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(crate) struct PreparedChildContainmentTokenV1 {
+    id: u64,
+}
+
+impl PreparedChildContainmentTokenV1 {
+    pub(crate) fn new(id: u64) -> Self {
+        Self { id }
+    }
+
+    pub(super) fn id(&self) -> u64 {
+        self.id
+    }
+
+    #[cfg(test)]
+    fn id_for_test(&self) -> u64 {
+        self.id
+    }
 }
 
 /// Prepared, still-unspawned identity for the future lifecycle owner.
@@ -549,6 +680,7 @@ pub(crate) struct PreparedChildLaunchV1 {
     arguments: Vec<String>,
     working_directory: PathBuf,
     runtime_policy: ChildRuntimePolicyV1,
+    containment_token: PreparedChildContainmentTokenV1,
 }
 
 /// Exact OS-launch projection of one consumed preparation proof.
@@ -564,6 +696,8 @@ pub(super) struct PreparedChildOsLaunchV1 {
     phase_budgets: ChildPhaseBudgetsV1,
     io_limits: ChildIoLimitsV1,
     environment: ChildEnvironmentPolicyV1,
+    filesystem: ChildFilesystemPolicyV1,
+    containment_token: PreparedChildContainmentTokenV1,
 }
 
 impl fmt::Debug for PreparedChildOsLaunchV1 {
@@ -577,6 +711,8 @@ impl fmt::Debug for PreparedChildOsLaunchV1 {
             .field("phase_budgets", &self.phase_budgets)
             .field("io_limits", &self.io_limits)
             .field("environment", &self.environment)
+            .field("filesystem", &self.filesystem)
+            .field("containment_token", &self.containment_token)
             .finish()
     }
 }
@@ -604,6 +740,20 @@ impl PreparedChildOsLaunchV1 {
     #[cfg(test)]
     pub(super) fn environment_for_test(&self) -> Vec<(&str, &str)> {
         self.environment().collect()
+    }
+
+    #[cfg(test)]
+    pub(super) fn filesystem_for_test(&self) -> &ChildFilesystemPolicyV1 {
+        &self.filesystem
+    }
+
+    #[cfg(test)]
+    pub(super) fn containment_token_for_test(&self) -> &PreparedChildContainmentTokenV1 {
+        &self.containment_token
+    }
+
+    pub(super) fn containment_token(&self) -> &PreparedChildContainmentTokenV1 {
+        &self.containment_token
     }
 
     pub(super) fn phase_budgets_millis(&self) -> [u64; 5] {
@@ -634,6 +784,10 @@ impl PreparedChildOsLaunchV1 {
 }
 
 impl PreparedChildLaunchV1 {
+    pub(super) fn containment_token(&self) -> &PreparedChildContainmentTokenV1 {
+        &self.containment_token
+    }
+
     /// Exposes only the already-authorized phase budgets to the private
     /// supervisor. Callers cannot replace them or reconstruct a launch proof.
     pub(super) fn supervision_phase_budgets_millis(&self) -> [u64; 5] {
@@ -655,6 +809,7 @@ impl PreparedChildLaunchV1 {
             arguments,
             working_directory,
             runtime_policy,
+            containment_token,
         } = self;
         PreparedChildOsLaunchV1 {
             executable: canonical_executable,
@@ -664,6 +819,8 @@ impl PreparedChildLaunchV1 {
             phase_budgets: runtime_policy.phase_budgets,
             io_limits: runtime_policy.io_limits,
             environment: runtime_policy.environment,
+            filesystem: runtime_policy.filesystem,
+            containment_token,
         }
     }
 }
@@ -743,7 +900,7 @@ where
     if observed_sha256 != admitted.spec.executable_sha256.0 {
         return Err(ChildLaunchAdmissionErrorV1::ExecutableDigestMismatch);
     }
-    preparation
+    let containment_token = preparation
         .containment_preflight(&admitted)
         .map_err(ChildLaunchAdmissionErrorV1::ContainmentPreflight)?;
 
@@ -753,6 +910,7 @@ where
         arguments: admitted.spec.arguments,
         working_directory: admitted.spec.working_directory,
         runtime_policy: admitted.spec.runtime_policy,
+        containment_token,
     })
 }
 
@@ -792,9 +950,17 @@ mod tests {
                     ChildEnvironmentVariableV1::new("KITSU_EXTERNAL_TOKEN", "fixture-secret"),
                 ],
             ),
+            filesystem_policy(),
             ChildNetworkPolicyV1::Deny,
             ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
         )
+    }
+
+    fn filesystem_policy() -> ChildFilesystemPolicyV1 {
+        ChildFilesystemPolicyV1::new(vec![
+            ChildFilesystemGrantV1::new("/opt/kitsu-fixtures", ChildFilesystemAccessV1::ReadOnly),
+            ChildFilesystemGrantV1::new("/tmp/kitsu-external", ChildFilesystemAccessV1::ReadWrite),
+        ])
     }
 
     fn valid_request_with_policy(policy: ChildRuntimePolicyV1) -> ChildLaunchRequestV1 {
@@ -879,11 +1045,14 @@ mod tests {
             }
         }
 
-        fn containment_preflight(&mut self, _: &AdmittedChildLaunchV1) -> Result<(), String> {
+        fn containment_preflight(
+            &mut self,
+            _: &AdmittedChildLaunchV1,
+        ) -> Result<PreparedChildContainmentTokenV1, String> {
             self.preflights += 1;
             match self.preflight_error.take() {
                 Some(error) => Err(error),
-                None => Ok(()),
+                None => Ok(PreparedChildContainmentTokenV1::new(7)),
             }
         }
     }
@@ -1287,7 +1456,7 @@ mod tests {
                     EXECUTABLE,
                     DIGEST,
                     vec!["--stdio".to_string()],
-                    "/tmp/other",
+                    "/tmp/kitsu-external/other",
                     runtime_policy(),
                 )
                 .unwrap(),
@@ -1425,5 +1594,171 @@ mod tests {
         assert_eq!(preflight_failure.hashes, 1);
         assert_eq!(preflight_failure.preflights, 1);
         assert_eq!(preflight_failure.spawns, 0);
+    }
+
+    #[test]
+    fn filesystem_authority_is_mandatory_bounded_exact_and_inert_when_invalid() {
+        let too_many_grants = ChildFilesystemPolicyV1::new(
+            (0..=MAX_FILESYSTEM_GRANTS)
+                .map(|index| {
+                    ChildFilesystemGrantV1::new(
+                        format!("/reviewed-{index}"),
+                        ChildFilesystemAccessV1::ReadOnly,
+                    )
+                })
+                .collect(),
+        );
+        let oversized_path = ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+            format!("/{}", "x".repeat(MAX_FILESYSTEM_PATH_BYTES)),
+            ChildFilesystemAccessV1::ReadOnly,
+        )]);
+        let oversized_policy = ChildFilesystemPolicyV1::new(
+            (0..MAX_FILESYSTEM_GRANTS)
+                .map(|index| {
+                    ChildFilesystemGrantV1::new(
+                        format!(
+                            "/{index}-{}",
+                            "x".repeat(MAX_FILESYSTEM_POLICY_BYTES / MAX_FILESYSTEM_GRANTS)
+                        ),
+                        ChildFilesystemAccessV1::ReadOnly,
+                    )
+                })
+                .collect(),
+        );
+        let invalid = [
+            ChildFilesystemPolicyV1::new(Vec::new()),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                "/",
+                ChildFilesystemAccessV1::ReadOnly,
+            )]),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                "relative/root",
+                ChildFilesystemAccessV1::ReadOnly,
+            )]),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                "/reviewed/../escape",
+                ChildFilesystemAccessV1::ReadOnly,
+            )]),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                "/reviewed\0escape",
+                ChildFilesystemAccessV1::ReadOnly,
+            )]),
+            ChildFilesystemPolicyV1::new(vec![
+                ChildFilesystemGrantV1::new(
+                    "/opt/kitsu-fixtures",
+                    ChildFilesystemAccessV1::ReadOnly,
+                ),
+                ChildFilesystemGrantV1::new(
+                    "/opt/kitsu-fixtures",
+                    ChildFilesystemAccessV1::ReadOnly,
+                ),
+            ]),
+            ChildFilesystemPolicyV1::new(vec![
+                ChildFilesystemGrantV1::new(
+                    "/opt/kitsu-fixtures",
+                    ChildFilesystemAccessV1::ReadOnly,
+                ),
+                ChildFilesystemGrantV1::new(
+                    "/opt/kitsu-fixtures",
+                    ChildFilesystemAccessV1::ReadWrite,
+                ),
+            ]),
+            ChildFilesystemPolicyV1::new(vec![
+                ChildFilesystemGrantV1::new("/opt", ChildFilesystemAccessV1::ReadOnly),
+                ChildFilesystemGrantV1::new(
+                    "/opt/kitsu-fixtures",
+                    ChildFilesystemAccessV1::ReadWrite,
+                ),
+            ]),
+            ChildFilesystemPolicyV1::new(vec![
+                ChildFilesystemGrantV1::new("/var", ChildFilesystemAccessV1::ReadOnly),
+                ChildFilesystemGrantV1::new("/var/lib", ChildFilesystemAccessV1::ReadOnly),
+            ]),
+            too_many_grants,
+            oversized_path,
+            oversized_policy,
+        ];
+
+        for filesystem in invalid {
+            let mut policy = runtime_policy();
+            policy.filesystem = filesystem;
+            let mut probe = EffectProbe::successful();
+            assert!(matches!(
+                prepare_child_launch_request_v1(
+                    valid_request_with_policy(policy),
+                    ChildLaunchAuthorityDecisionV1::Admit(&profile()),
+                    &mut probe,
+                ),
+                Err(ChildLaunchAdmissionErrorV1::InvalidRuntimePolicy(
+                    ChildRuntimePolicyErrorV1::InvalidFilesystemPolicy
+                ))
+            ));
+            probe.assert_zero_effects();
+        }
+    }
+
+    #[test]
+    fn cwd_must_be_covered_by_an_exact_reviewed_filesystem_grant() {
+        let policy = ChildRuntimePolicyV1::new(
+            ChildPhaseBudgetsV1::new(5_000, 30_000, 5_000, 2_000, 5_000),
+            ChildIoLimitsV1::new(64 * 1024, 256 * 1024, 64 * 1024, 32 * 1024),
+            ChildProcessGroupPolicyV1::Owned,
+            ChildEnvironmentPolicyV1::new(true, Vec::new()),
+            ChildFilesystemPolicyV1::new(vec![ChildFilesystemGrantV1::new(
+                "/opt/kitsu-fixtures",
+                ChildFilesystemAccessV1::ReadOnly,
+            )]),
+            ChildNetworkPolicyV1::Deny,
+            ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
+        );
+        let mut probe = EffectProbe::successful();
+        assert_eq!(
+            prepare_child_launch_request_v1(
+                valid_request_with_policy(policy),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile()),
+                &mut probe,
+            ),
+            Err(ChildLaunchAdmissionErrorV1::WorkingDirectoryOutsideFilesystemPolicy)
+        );
+        probe.assert_zero_effects();
+    }
+
+    #[test]
+    fn every_filesystem_grant_fact_requires_exact_authority_match_before_observation() {
+        let mut changed_access = runtime_policy();
+        changed_access.filesystem.grants[1].access = ChildFilesystemAccessV1::ReadOnly;
+        let mut changed_path = runtime_policy();
+        changed_path.filesystem.grants[0].path = PathBuf::from("/opt/other-runtime");
+        let mut changed_order = runtime_policy();
+        changed_order.filesystem.grants.reverse();
+
+        for authority_policy in [changed_access, changed_path, changed_order] {
+            let profile = profile_with_policy(authority_policy).unwrap();
+            assert_rejected_without_effects(
+                valid_request(),
+                ChildLaunchAuthorityDecisionV1::Admit(&profile),
+                ChildLaunchAdmissionErrorV1::AuthorityMismatch(
+                    AuthorityMismatchFieldV1::RuntimePolicy,
+                ),
+            );
+        }
+    }
+
+    #[test]
+    fn successful_preparation_binds_one_linear_containment_token_into_the_proof() {
+        let profile = profile();
+        let mut probe = EffectProbe::successful();
+        let prepared = prepare_child_launch_request_v1(
+            valid_request(),
+            ChildLaunchAuthorityDecisionV1::Admit(&profile),
+            &mut probe,
+        )
+        .unwrap();
+
+        assert_eq!(prepared.containment_token.id_for_test(), 7);
+        assert_eq!(probe.preflights, 1);
+        let launch = prepared.into_os_launch();
+        assert_eq!(launch.containment_token_for_test().id_for_test(), 7);
+        assert_eq!(launch.filesystem_for_test(), &filesystem_policy());
     }
 }

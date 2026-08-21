@@ -726,6 +726,7 @@ gates merely because a card appears attractive.
 | 115 | E06-S01-C5 | Execute one prepared child through a private Linux backend with bounded pipes, real clocks, process-group cleanup, and truthful completion |
 | 116 | E05-S01-C2 | Publish secret-free guided-setup configuration create-new through descriptor-relative durability and exact owned rollback |
 | 117 | E08-S05-C5 | Mount one typed offline current-session observation on adaptive `/status` while preserving the legacy JSONL payload shape |
+| 118 | E06-S01-C6 | Execute exact sealed native bytes under one bounded Landlock filesystem-content policy with no pathname fallback |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -1035,6 +1036,16 @@ account, Git, or filesystem probe. Its legacy JSONL keys and nesting stay
 unchanged, with deterministic text rendered from the same observation. Credits,
 rates, prices, inferred cost, durable history, `/context` migration, and a new
 automation schema remain absent.
+Cycle 118 closes the disclosed child-executable pathname race and adds one
+bounded filesystem-content authority. After exact request/profile admission,
+the private Linux x86-64 backend copies and hashes a capped native ELF into a
+fully sealed executable memfd, pairs descriptor-pinned cwd/roots with a unique
+linear containment token, applies a parent-built Landlock ruleset, and invokes
+only those bytes through `execveat(AT_EMPTY_PATH)`. Unsupported ABI/platform,
+non-ELF input, seal/ruleset/descriptor/token failure, or authority mismatch
+fails closed before target code. This is still unmounted and one-shot. Landlock
+does not provide mount isolation, path/stat/access secrecy, metadata-family or
+host signal/ptrace confinement; no general sandbox, MCP, or X002 claim follows.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
