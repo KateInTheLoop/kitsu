@@ -4,3 +4,4 @@
 //! protocol mechanisms here instead of creating a general plugin API.
 
 pub(crate) mod authority;
+pub(crate) mod identity;

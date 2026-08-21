@@ -312,6 +312,13 @@ kernel.
   rejects non-tools server capabilities and changing inventories. Raw tool
   results remain unpublished. The codec owns no process, transport, deadline,
   configuration, inventory, or product route.
+- Cycle 104 adds closed external source, incarnation, inventory-revision, and
+  tool identity types plus a transactional candidate validator. Advertised
+  names do not participate as identities. Bounded validated descriptors receive
+  a domain-separated SHA-256 over Kitsu's versioned canonical bytes; malformed,
+  duplicate, and synthetic collision cases yield no inventory. Revision
+  monotonicity, CAS publication, withdrawal, and child-origin admission remain
+  absent.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -322,7 +329,7 @@ kernel.
 | Native behavior | Compiled Rust modules registered by product composition | Same process, binary authority | Retain; no dylib/runtime loader |
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
-| External runtime tools | Static registry plus request-scoped `ToolInventory`; private inert child admission/preparation; pure bounded tools-only MCP codec | Same-process compiled handlers only; prepared child cannot spawn; codec owns no transport or inventory | E06 inventory, pre-spawn authority, and wire foundations begun; no child lifecycle, MCP composition, or product configuration |
+| External runtime tools | Static request inventory; closed external source/tool identities and descriptor fingerprints; private inert child preparation; pure bounded tools-only MCP codec | Same-process compiled handlers only; external candidate is unpublishable; prepared child cannot spawn; codec owns no transport | E06 identity, pre-spawn authority, and wire foundations begun; no monotonic publication, child lifecycle, MCP composition, or product configuration |
 | Host/UI protocol | CLI carriers plus one-way JSONL | Consumer cannot service synchronous calls | No named second host; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 

@@ -2,7 +2,8 @@
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
 implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
-through Cycle 080; E06-S01, E06-S02, and E06-S03 have begun through C1;
+through Cycle 080; E06-S01 and E06-S03 have begun through C1, and E06-S02 is
+implemented through C2;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
 
@@ -11,11 +12,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 103 / 103 |
+| Accepted cycles/commits after this cycle | 104 / 104 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 104 — E06-S02-C2: define host-authored external source/tool identity, incarnation, inventory revision, and schema fingerprint without publication |
+| Active epic/card | Cycle 105 — E06-S01-C2: integrate the provider-free non-cloneable child lifecycle owner without a production process |
 
 ## Epic status
 
@@ -26,7 +27,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C1, E06-S02-C1, and E06-S03-C1; depends only on accepted E01/E02 | Exact request inventories, zero-effect child admission, and a pinned bounded tools-only codec now exist independently. Next add source identity/revisions and the private lifecycle owner before composition; no process API or product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C1, E06-S02-C2, and E06-S03-C1; depends only on accepted E01/E02 | External proposals now bind closed source/incarnation/revision/tool identities and canonical fingerprints before publication. Next integrate the private lifecycle owner, then add monotonic inventory publication; no production process API or product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **Scoped** through Cycle 030; implementation waits on owned inputs | E08-S05 live telemetry consumes E04 receipts; E08-S06 durable usage consumes E03 fencing; progressive docs follow stable surfaces |
@@ -139,7 +140,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 100 | `6c250fe` | Staged bound-current in-process owner swap and parallel checkpoint |
 | 101 | `379512e` | Frozen provider-request tool schema and handler inventory |
 | 102 | `fc90c30` | Exact zero-effect child admission and ordered preparation |
-| 103 | this document's commit | Pinned bounded tools-only MCP codec |
+| 103 | `d87119f` | Pinned bounded tools-only MCP codec |
+| 104 | this document's commit | Closed external source identities and descriptor fingerprints |
 
 ## Current green gates
 
@@ -677,6 +679,15 @@ integer-ID initialize/list/call request at a time. It validates the response
 envelope and minimum list/call shape but deliberately does not validate or
 publish descriptors. There is still no process, transport, deadline,
 configuration, live inventory, or product MCP path.
+Cycle 104 adds the identity values the publication layer must consume. Source,
+incarnation, revision, and tool IDs remain distinct even when display names are
+unchanged; the revision is non-zero but does not yet claim monotonic admission.
+The validator stages the whole bounded inventory, rejects duplicate host IDs and
+advertised names, validates descriptor shape and resource limits, and detects a
+synthetic digest collision before returning anything. Fingerprints use one
+domain-separated, length-framed Kitsu canonicalization with sorted object keys
+and ordered arrays. No configuration, child trust, publication, withdrawal,
+process, or MCP composition is introduced.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

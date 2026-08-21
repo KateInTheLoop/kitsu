@@ -1114,6 +1114,7 @@ dependencies = [
  "lopdf",
  "quick-xml 0.41.0",
  "regex",
+ "ring",
  "serde",
  "serde_json",
  "tempfile",
