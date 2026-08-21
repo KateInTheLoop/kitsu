@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C24, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C25, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 83 / 83 |
+| Accepted cycles/commits after this cycle | 84 / 84 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C25 (Cycle 084) — define a pure canonical-to-resume projection before production routing |
+| Active epic/card | E03 / E03-S02-C26 (Cycle 085) — revalidate canonical activation under its owning fence before production routing |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C24, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact lineage, recovery, and branch publication/retry. One pinned-root mount selection admits and retains only exact current bytes/parsed snapshot or one already-verified canonical payload; empty/rejected state has no value. Existing-only observation keeps corrupt/future/partial/symlink/dual state fail-closed without repair or mutation. No authority is stored or copied. Canonical resume projection, activation revalidation, production routing, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C25, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact lineage, recovery, and branch publication/retry. One pinned-root mount selection admits and retains only exact current bytes/parsed snapshot or one already-verified canonical payload; empty/rejected state has no value. Canonical resume projection is pure and revision/HEAD-bound, follows only selected ancestry, reports omitted audit/loss facts, and refuses artifacts the current DTO cannot preserve. Existing-only observation and projection create no effects or authority. Activation revalidation, production routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -119,7 +119,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 080 | `d94542a` | Exact verified branch-residue adoption and retry |
 | 081 | `835317c` | Pure single-truth current-v1/canonical mount admission |
 | 082 | `f72d483` | Pinned mutation-free dual-representation observation |
-| 083 | this document's commit | Exact single-pass selected session value |
+| 083 | `206ecd4` | Exact single-pass selected session value |
+| 084 | this document's commit | Pure revision/HEAD-bound canonical resume projection |
 
 ## Current green gates
 
@@ -514,6 +515,13 @@ payload. Empty and all rejected cases own no selectable value. Backing-path
 mutation after selection cannot rewrite the retained object, and a new selection
 detects the changed state. Cycle 084 next builds the pure canonical resume
 projection; production activation must still revalidate under its owning fence.
+Cycle 084 derives that value without I/O. It revalidates the closed payload,
+binds the result to exact source revision and selected HEAD, maps resume metadata
+and provider-neutral message/tool-call facts in chronological selected-ancestry
+order, and reports fixed legacy losses plus audit operations omitted from model
+context. Artifact-bearing history fails with a typed refusal because the current
+resume DTO cannot retain immutable artifact identity. Cycle 085 next adds exact
+fence-bound activation revalidation; live read/save routes remain unchanged.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
