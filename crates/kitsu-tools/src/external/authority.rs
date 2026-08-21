@@ -551,6 +551,20 @@ pub(crate) struct PreparedChildLaunchV1 {
     runtime_policy: ChildRuntimePolicyV1,
 }
 
+impl PreparedChildLaunchV1 {
+    /// Exposes only the already-authorized phase budgets to the private
+    /// supervisor. Callers cannot replace them or reconstruct a launch proof.
+    pub(super) fn supervision_phase_budgets_millis(&self) -> [u64; 5] {
+        [
+            self.runtime_policy.phase_budgets.startup_millis,
+            self.runtime_policy.phase_budgets.request_millis,
+            self.runtime_policy.phase_budgets.drain_millis,
+            self.runtime_policy.phase_budgets.kill_millis,
+            self.runtime_policy.phase_budgets.reap_millis,
+        ]
+    }
+}
+
 pub(crate) fn admit_child_launch_v1(
     request: ChildLaunchRequestV1,
     decision: ChildLaunchAuthorityDecisionV1<'_>,
