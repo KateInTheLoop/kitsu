@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C37, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C38, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 96 / 96 |
+| Accepted cycles/commits after this cycle | 97 / 97 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C38 (Cycle 097) — unify the product resume result with exact bound current/canonical activation without route selection |
+| Active epic/card | E03 / E03-S02-C39 (Cycle 098) — admit only bound-current state compatible with the product snapshot writer and reject canonical before routing |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C37, E03-S05 through C4 | Startup and in-process durable resume now consume one exact current-v1 owner-plus-snapshot handoff revalidated under the lease; stale inputs never enter runtime. Bound activation remains private and unselected. Unified result shape, writable-source admission, bound route selection, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C38, E03-S05 through C4 | Current-v1 and private bound current/canonical activation now share one exact owner-plus-snapshot result. Only the current product constructor may split it; bound results remain coupled and unselected. Writable-source admission, bound route selection, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -132,7 +132,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 093 | `fafe58f` | Exact local composition/physical activation binding |
 | 094 | `bb8118d` | Closed bound-local production-owner variant |
 | 095 | `869b40f` | Exact selected resume and bound-owner coupling |
-| 096 | this document's commit | Exact current-v1 product resume handoff |
+| 096 | `98ad3e7` | Exact current-v1 product resume handoff |
+| 097 | this document's commit | Common exact current/bound resume result |
 
 ## Current green gates
 
@@ -621,8 +622,14 @@ that owns the revalidated snapshot and its active store until a single explicit
 product split. Stale preloaded data fails under the lease before runtime state
 changes, while no-session resume keeps its read-only behavior. The old public
 store-only resume constructor is gone, so product call sites cannot discard the
-exact snapshot half. Cycle 097 next gives current and private bound activation a
-common product-shaped result without selecting the bound route.
+exact snapshot half. Cycle 097 removes the duplicate bound-only wrapper and
+returns the same
+`ActiveSessionResume` from exact bound activation. Its snapshot remains borrowed
+while the owner holds both fences. The only consuming split is explicitly
+current-v1 and rejects either bound source, releasing locks without exposing a
+writable store. Product call sites remain on the current constructor. Cycle 098
+next defines admission for bound-current only and refuses canonical state before
+any product route can discover an incompatible writer during autosave.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

@@ -837,6 +837,16 @@ cannot weaken or replace any backend-neutral assertion.
    resume remains read-only and owner-free. Bound activation remains private and
    unselected; the next boundary unifies its exact selected value with this
    product-shaped result before any writable-source admission decision.
+   **Common exact resume-result shape complete in Cycle 097:** exact private
+   bound activation now returns `ActiveSessionResume` too, eliminating a second
+   owner/snapshot wrapper. Identity validation still occurs after the bound
+   owner exists; current and canonical snapshots remain under both fences and
+   expose no store reference. The only consuming method is explicitly
+   current-v1 and rejects a bound inner owner, which drops and releases its
+   locks without yielding either half. Public startup and in-process call sites
+   still obtain only the current-v1 constructor. Before bound selection can be
+   exposed, admission must distinguish its snapshot-writable current source from
+   canonical state that requires an operation writer.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

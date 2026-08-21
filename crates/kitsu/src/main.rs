@@ -14381,7 +14381,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                 let handoff =
                     session::ActiveSessionStore::resume_current_v1(sessions_dir.clone(), saved)
                         .map_err(CliError::user)?;
-                let (store, saved) = handoff.into_parts();
+                let (store, saved) = handoff.into_current_v1_parts().map_err(CliError::user)?;
                 (Some(store), Some(saved))
             }
             None => (
@@ -16571,7 +16571,13 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                             saved,
                         ) {
                             Ok(handoff) => {
-                                let (store, saved) = handoff.into_parts();
+                                let (store, saved) = match handoff.into_current_v1_parts() {
+                                    Ok(parts) => parts,
+                                    Err(error) => {
+                                        eprintln!("cannot autosave resumed session: {error}");
+                                        continue;
+                                    }
+                                };
                                 (Some(store), saved)
                             }
                             Err(error) => {

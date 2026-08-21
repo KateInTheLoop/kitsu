@@ -268,6 +268,12 @@ kernel.
   both use this handoff, so stale preloaded bytes cannot enter runtime while an
   owner silently protects different data. Read-only no-session resume is
   unchanged, and no composition identity or physical namespace is created.
+  Cycle 097 makes the exact private bound activation return this same result
+  shape and removes its duplicate wrapper. The snapshot remains readable only
+  while the result owns its active store. Its consuming split is current-v1
+  specific and rejects either bound source, so neither bound current nor
+  canonical state can expose a product store before an explicit admission card.
+  No product constructor or on-disk route changes.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
