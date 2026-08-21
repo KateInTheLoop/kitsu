@@ -4,6 +4,8 @@
 
 #[allow(dead_code)] // Staged pure guided-setup transaction; product mounting is a later card.
 mod onboarding;
+#[allow(dead_code)] // Private create-new adapter; product mounting is a later card.
+mod publication;
 
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};

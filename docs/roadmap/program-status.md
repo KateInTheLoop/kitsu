@@ -13,7 +13,8 @@ truthful current-run usage coverage and cached-token presence through Cycle 109,
 adaptive presentation-only decks through Cycle 110, and exact offline
 `/usage session` collection/routing through Cycle 112. E07-S01 now has its first
 provider-free fixed-corpus measurement baseline through Cycle 113.
-E05-S01 has a private effect-free transactional setup model through Cycle 114.
+E05-S01 has a private effect-free transactional setup model through Cycle 114
+and descriptor-relative no-clobber configuration publication through Cycle 116.
 E06-S01 now composes its prepared policy and phase owner with a private real
 Linux one-process backend through Cycle 115.
 
@@ -22,11 +23,11 @@ Linux one-process backend through Cycle 115.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 115 / 115 |
+| Accepted cycles/commits after this cycle | 116 / 116 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 116 — E05-S01-C2: prove descriptor-relative create-new setup configuration publication and owned rollback |
+| Active epic/card | Cycle 117 — E08-S05-C5: mount the typed offline current-session observation on `/status` while preserving JSONL shape |
 
 ## Epic status
 
@@ -39,7 +40,7 @@ Linux one-process backend through Cycle 115.
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C5, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux backend now consumes the prepared policy through the accepted phase owner and proves bounded joined pipes, real clocks, process-group termination, direct wait, EOF/exit/crash truth, and retryable residue. It remains one-process/one-request and unmounted because filesystem confinement, immutable exec identity, long-lived MCP composition, and a product route are absent |
 | E07 semantic context | **In progress** through E07-S01-C1 | Deterministic fixed-corpus current-tool baseline passes; semantic selector, authority/stale-edit comparison, and production contributor remain absent |
-| E05 onboarding | **In progress** through E05-S01-C1 | Pure consent/fenced-stage/create-new/reverse-rollback transaction is staged; real adapters, guided UI, picker, first success, and PF-10 remain open |
+| E05 onboarding | **In progress** through E05-S01-C2 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C4 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; exact offline `/usage session` now collects one coherent in-memory observation and renders only its usage section adaptively. Full status/context migration, JSONL automation parity, aliases, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
@@ -163,6 +164,7 @@ Linux one-process backend through Cycle 115.
 | 113 | this document's commit | Deterministic bounded mixed-language current-tool evidence baseline |
 | 114 | this document's commit | Pure transactional guided-setup proposal and owned rollback truth |
 | 115 | this document's commit | Private bounded Linux child backend and real cleanup truth |
+| 116 | this document's commit | Descriptor-relative no-clobber setup configuration publication and rollback ownership |
 
 ## Current green gates
 
