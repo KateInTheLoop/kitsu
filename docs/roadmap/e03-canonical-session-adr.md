@@ -713,6 +713,16 @@ cannot weaken or replace any backend-neutral assertion.
    The returned owner retains both locks and the store; initialization changes
    only the bounded store/lock namespace, not session truth or authority. Next a
    total private owner must normalize both activation variants before routing.
+   **Total activation owner complete in Cycle 087:** one dispatcher consumes
+   every selection variant. Current and canonical successes are boxed beneath a
+   single owner that retains their store and both OS exclusions; callers receive
+   only borrowed resume data plus an exact store/session/source receipt. Current
+   source is explicit; canonical source additionally carries revision and
+   selected HEAD. An explicit snapshot clone remains data and cannot substitute
+   for the owner or receipt. Empty and rejected selection evidence returns
+   unchanged with zero effects, while current/canonical activation faults remain
+   distinct nested errors. The next boundary must transfer this owner into a
+   live session store whose save behavior is explicitly representation-aware.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.

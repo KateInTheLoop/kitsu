@@ -99,6 +99,65 @@ pub(super) struct CurrentV1MountActivationV1 {
     _store: PhysicalFileStoreV1,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) enum SessionMountActivatedSourceV1 {
+    CurrentV1,
+    Canonical {
+        revision: RevisionId,
+        head: LogicalHead,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(super) struct SessionMountActivationReceiptV1 {
+    store: StoreId,
+    session: SessionId,
+    source: SessionMountActivatedSourceV1,
+}
+
+impl SessionMountActivationReceiptV1 {
+    pub(super) fn store(&self) -> &StoreId {
+        &self.store
+    }
+
+    pub(super) fn session(&self) -> &SessionId {
+        &self.session
+    }
+
+    pub(super) fn source(&self) -> &SessionMountActivatedSourceV1 {
+        &self.source
+    }
+}
+
+#[derive(Debug)]
+enum SessionMountActivationInnerV1 {
+    CurrentV1(Box<CurrentV1MountActivationV1>),
+    Canonical(Box<CanonicalMountActivationV1>),
+}
+
+/// Total owner of one exact, dual-fenced resume value. It deliberately has no
+/// consuming snapshot extractor: production must retain this owner while using
+/// the borrowed resume value. An explicit snapshot clone remains data only and
+/// is never activation or HEAD evidence.
+#[derive(Debug)]
+pub(super) struct SessionMountActivationV1 {
+    receipt: SessionMountActivationReceiptV1,
+    inner: SessionMountActivationInnerV1,
+}
+
+impl SessionMountActivationV1 {
+    pub(super) fn saved(&self) -> &SavedSession {
+        match &self.inner {
+            SessionMountActivationInnerV1::CurrentV1(activation) => activation.value().saved(),
+            SessionMountActivationInnerV1::Canonical(activation) => activation.projection().saved(),
+        }
+    }
+
+    pub(super) fn receipt(&self) -> &SessionMountActivationReceiptV1 {
+        &self.receipt
+    }
+}
+
 impl CurrentV1MountActivationV1 {
     pub(super) fn value(&self) -> &CurrentV1MountValueV1 {
         &self.value
@@ -137,6 +196,14 @@ pub(super) enum CurrentV1MountActivationErrorV1 {
     CurrentV1Changed(CurrentV1MountObservationV1),
     CurrentV1ValueChanged,
     CanonicalChanged(SessionLookupState),
+}
+
+#[derive(Debug, PartialEq, Eq)]
+pub(super) enum SessionMountActivationErrorV1 {
+    Empty,
+    Rejected(SessionMountAdmissionV1),
+    CurrentV1(CurrentV1MountActivationErrorV1),
+    Canonical(CanonicalMountActivationErrorV1),
 }
 
 impl SessionMountSelectionV1 {
@@ -395,6 +462,61 @@ pub(super) fn activate_current_v1_mount_v1(
     })
 }
 
+pub(super) fn activate_session_mount_v1(
+    session_root: &PrivateDirectory,
+    expected_store: StoreId,
+    session_id: &SessionId,
+    selection: SessionMountSelectionV1,
+) -> Result<SessionMountActivationV1, SessionMountActivationErrorV1> {
+    let (source, inner) = match selection {
+        SessionMountSelectionV1::Empty => {
+            return Err(SessionMountActivationErrorV1::Empty);
+        }
+        SessionMountSelectionV1::Rejected(admission) => {
+            return Err(SessionMountActivationErrorV1::Rejected(admission));
+        }
+        SessionMountSelectionV1::CurrentV1(value) => {
+            let activation = activate_current_v1_mount_v1(
+                session_root,
+                expected_store.clone(),
+                session_id,
+                SessionMountSelectionV1::CurrentV1(value),
+            )
+            .map_err(SessionMountActivationErrorV1::CurrentV1)?;
+            (
+                SessionMountActivatedSourceV1::CurrentV1,
+                SessionMountActivationInnerV1::CurrentV1(Box::new(activation)),
+            )
+        }
+        SessionMountSelectionV1::Canonical(value) => {
+            let activation = activate_canonical_mount_v1(
+                session_root,
+                expected_store.clone(),
+                session_id,
+                SessionMountSelectionV1::Canonical(value),
+            )
+            .map_err(SessionMountActivationErrorV1::Canonical)?;
+            let source = SessionMountActivatedSourceV1::Canonical {
+                revision: activation.projection().source_revision().clone(),
+                head: activation.projection().source_head().clone(),
+            };
+            (
+                source,
+                SessionMountActivationInnerV1::Canonical(Box::new(activation)),
+            )
+        }
+    };
+
+    Ok(SessionMountActivationV1 {
+        receipt: SessionMountActivationReceiptV1 {
+            store: expected_store,
+            session: session_id.clone(),
+            source,
+        },
+        inner,
+    })
+}
+
 fn observe_current_v1(
     session_root: &PrivateDirectory,
     session_id: &SessionId,
@@ -511,9 +633,10 @@ mod tests {
     };
 
     use super::{
-        activate_canonical_mount_v1, activate_current_v1_mount_v1, admit_session_mount_v1,
-        observe_session_mount_v1, select_session_mount_v1, CanonicalMountActivationErrorV1,
-        CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1, CurrentV1MountObservationV1,
+        activate_canonical_mount_v1, activate_current_v1_mount_v1, activate_session_mount_v1,
+        admit_session_mount_v1, observe_session_mount_v1, select_session_mount_v1,
+        CanonicalMountActivationErrorV1, CurrentV1MountActivationErrorV1, CurrentV1MountFaultV1,
+        CurrentV1MountObservationV1, SessionMountActivatedSourceV1, SessionMountActivationErrorV1,
         SessionMountAdmissionV1, SessionMountRejectionV1, SessionMountSelectionV1,
     };
 
@@ -1378,5 +1501,125 @@ mod tests {
             0,
             "activation must not repair a partial concurrent canonical root"
         );
+    }
+
+    #[test]
+    fn total_activation_owner_borrows_resume_value_and_preserves_source_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let source = current_v1_bytes(1, session.as_str());
+
+        let current_root = root.path().join("current");
+        std::fs::create_dir(&current_root).unwrap();
+        std::fs::write(current_root.join("session-a.json"), &source).unwrap();
+        let current_directory =
+            super::super::PrivateDirectory::open(&current_root, "mount fixture").unwrap();
+        let current_selection =
+            select_session_mount_v1(&current_directory, store_id.clone(), &session);
+        let current = activate_session_mount_v1(
+            &current_directory,
+            store_id.clone(),
+            &session,
+            current_selection,
+        )
+        .unwrap();
+        assert_eq!(current.saved().id, "session-a");
+        assert_eq!(current.receipt().store(), &store_id);
+        assert_eq!(current.receipt().session(), &session);
+        assert_eq!(
+            current.receipt().source(),
+            &SessionMountActivatedSourceV1::CurrentV1
+        );
+        assert!(super::super::SessionLease::acquire(&current_directory, session.as_str()).is_err());
+        drop(current);
+
+        let canonical_root = root.path().join("canonical");
+        let store = super::super::physical::PhysicalFileStoreV1::create_or_open(
+            &canonical_root,
+            store_id.clone(),
+        )
+        .unwrap();
+        super::super::transaction::publish_current_v1_mount_fixture_v1(
+            &store,
+            &source,
+            &session,
+            revision("rev-a"),
+            "2026-08-20T10:02:00.000Z".to_string(),
+        )
+        .unwrap();
+        drop(store);
+        let canonical_directory =
+            super::super::PrivateDirectory::open(&canonical_root, "mount fixture").unwrap();
+        let canonical_selection =
+            select_session_mount_v1(&canonical_directory, store_id.clone(), &session);
+        let canonical = activate_session_mount_v1(
+            &canonical_directory,
+            store_id.clone(),
+            &session,
+            canonical_selection,
+        )
+        .unwrap();
+        assert_eq!(canonical.saved().id, "session-a");
+        assert_eq!(canonical.receipt().store(), &store_id);
+        assert_eq!(canonical.receipt().session(), &session);
+        assert_eq!(
+            canonical.receipt().source(),
+            &SessionMountActivatedSourceV1::Canonical {
+                revision: revision("rev-a"),
+                head: LogicalHead::Genesis,
+            }
+        );
+        let competing_store = super::super::physical::PhysicalFileStoreV1::open_existing(
+            &canonical_directory,
+            store_id,
+        )
+        .unwrap()
+        .unwrap();
+        assert!(competing_store.acquire_writer_fence(&session).is_err());
+        drop(canonical);
+        drop(competing_store.acquire_writer_fence(&session).unwrap());
+    }
+
+    #[test]
+    fn total_activation_preserves_empty_and_rejected_selection_evidence() {
+        let root = tempfile::tempdir().unwrap();
+        let session_root = root.path().join("sessions");
+        std::fs::create_dir(&session_root).unwrap();
+        let directory =
+            super::super::PrivateDirectory::open(&session_root, "mount fixture").unwrap();
+        let store_id = StoreId::new("store-a").unwrap();
+        let session = SessionId::new("session-a").unwrap();
+        let before = tree_snapshot(&session_root);
+        assert_eq!(
+            activate_session_mount_v1(
+                &directory,
+                store_id.clone(),
+                &session,
+                SessionMountSelectionV1::Empty
+            )
+            .unwrap_err(),
+            SessionMountActivationErrorV1::Empty
+        );
+        assert_eq!(tree_snapshot(&session_root), before);
+
+        std::fs::write(session_root.join("session-a.json"), b"{").unwrap();
+        let rejected = select_session_mount_v1(&directory, store_id.clone(), &session);
+        let before_rejected = tree_snapshot(&session_root);
+        assert!(matches!(
+            activate_session_mount_v1(&directory, store_id, &session, rejected),
+            Err(SessionMountActivationErrorV1::Rejected(
+                SessionMountAdmissionV1::Rejected {
+                    reason: SessionMountRejectionV1::UnavailableRepresentation,
+                    current_v1: CurrentV1MountObservationV1::Unavailable(
+                        CurrentV1MountFaultV1::Malformed
+                    ),
+                    canonical: SessionLookupState::Missing {
+                        tombstone_revision: None
+                    }
+                }
+            ))
+        ));
+        assert_eq!(tree_snapshot(&session_root), before_rejected);
     }
 }

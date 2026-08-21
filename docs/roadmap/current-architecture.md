@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 086.
+updates through Cycle 087.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -185,7 +185,15 @@ kernel.
   creation plus strict reopen prevents fail-open repair, and an ancestor-swap
   fixture proves initialization cannot be redirected. Store/lock initialization
   is the only effect; current bytes and canonical HEAD remain unchanged. The
-  private variants are not yet a production activation owner.
+  private variants are not yet a production activation owner. Cycle 087 adds
+  that total private owner and dispatcher. Current and canonical concrete
+  activations are boxed beneath one lifetime owner; its resume snapshot is
+  borrowed and an explicit clone remains data, never activation or HEAD
+  evidence. A receipt binds exact store/session and current-v1 or canonical
+  revision/selected-HEAD source. Empty and rejected selection evidence returns
+  unchanged without locks or store creation; concrete activation faults remain
+  nested and typed. Both lock domains remain held until the total owner drops.
+  Production live-store and save routing remain unchanged.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
