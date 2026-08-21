@@ -17,6 +17,8 @@ threshold-backed test-only structural-selector decision through Cycle 122.
 E05-S01 has a private effect-free transactional setup model through Cycle 114,
 descriptor-relative no-clobber configuration publication through Cycle 116,
 and one private local/offline coordinator through Cycle 120.
+E05-S02 has a private pure offline-capable model-picker snapshot and proposal
+through Cycle 123.
 E06-S01 now composes its prepared policy and phase owner with a private real
 Linux one-process backend through Cycle 115, exact sealed native execution plus
 bounded Landlock filesystem-content authority through Cycle 118, and one
@@ -30,11 +32,11 @@ offline `/context window` through Cycle 121.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 122 / 122 |
+| Accepted cycles/commits after this cycle | 123 / 123 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 123 — E05-S02-C1: stage the bounded offline model picker |
+| Active epic/card | Cycle 124 — E08-S05-C7: unify truthful usage compatibility aliases |
 
 ## Epic status
 
@@ -47,7 +49,7 @@ offline `/context window` through Cycle 121.
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy, executes capped sealed native bytes without pathname fallback, and retains one child across strictly serial bounded frames with exact clocks, caps, group cleanup, direct wait, EOF/crash truth, and retryable residue. It remains unmounted and opaque; MCP codec composition, Landlock limitations, alternate enforcement, and product routing keep X002 open |
 | E07 semantic context | **In progress** through E07-S01-C2 | The deterministic fixed-corpus current-tool baseline and one test-only structural selector comparison pass. The selector preserves relevance while reducing rounds/bytes past the predeclared threshold, so only the next authority/stale-edit experiment is promoted; production contributor remains absent |
-| E05 onboarding | **In progress** through E05-S01-C3 | Pure consent/fenced-stage/reverse-rollback truth now composes with a private Linux descriptor-relative no-clobber config publisher and exact concrete cleanup ledger for one local/offline path. It remains unmounted; credential/provider/catalog adapters, guided UI, picker, activation, first success, and PF-10 remain open |
+| E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C6 | Pure current-session DTOs label every value with truth/provenance; `/usage session`, `/status`, and exact `/context window` collect coherent offline in-memory observations and render adaptive usage/full/context decks. `/status` preserves its legacy JSONL payload; context-window JSONL deliberately adds no result. Usage aliases/automation parity, account truth, and durable history remain separate; history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
@@ -178,6 +180,7 @@ offline `/context window` through Cycle 121.
 | 120 | this document's commit | Private local/offline setup transaction and create-new publication composition |
 | 121 | this document's commit | Exact offline typed `/context window` with adaptive accessible rendering |
 | 122 | this document's commit | Threshold-backed structural-selector experiment and promote decision |
+| 123 | this document's commit | Pure bounded offline model-picker snapshot, projection, and proposal truth |
 
 ## Current green gates
 
@@ -884,6 +887,13 @@ points and forbidden-evidence refusal while aggregate rounds improve from 5 to
 3 and canonical tool bytes from 1,456 to 1,134, below the declared 1,164-byte
 threshold. This promotes only the next authority/staleness experiment, not a
 production contributor, cache, provider path, mutation, or completed task.
+
+Cycle 123 stages a private immutable offline-capable model-picker snapshot.
+Closed catalog availability, source, freshness, provenance, and three-state
+membership feed bounded normalization, deterministic ranking, narrow rows, and
+a versioned proposal. It has no provider/network/filesystem/cache/credential/
+config/session/route effect, capability inference, UI, apply path, or product
+mount.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful
