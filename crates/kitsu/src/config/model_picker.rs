@@ -46,6 +46,14 @@ impl ModelNamespaceBinding {
     pub(super) const fn wire_revision(&self) -> ProviderWireRevision {
         self.wire_revision
     }
+
+    pub(super) const fn is_compatible_chat_v1(&self) -> bool {
+        matches!(self.adapter, ProviderAdapterId::OpenAiCompatible)
+            && matches!(
+                self.wire_revision,
+                ProviderWireRevision::OpenAiChatCompletionsV1
+            )
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]

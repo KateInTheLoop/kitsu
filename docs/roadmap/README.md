@@ -1161,6 +1161,12 @@ typed provider profile, adapter, and wire-revision identity derived from a
 validated route declaration. Capabilities and route generations deliberately
 do not define the model namespace, and offline/stale membership truth remains
 unchanged. Selection still has no apply/publication/UI/product mount.
+Cycle 132 composes one explicit exact-namespace proposal with the private local
+setup owner. Admission checks explicit basis and whole profile/adapter/wire
+identity before replacing the already-normalized preview model; rejection,
+completion, collision, execution error, rollback recovery, and retry retain the
+whole proposal. The card adds no UI, catalog/provider request, credential,
+activation, current-route publication, or product mount.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

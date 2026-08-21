@@ -26,7 +26,8 @@ quarantine rollback classification without claiming conditional unlink against
 non-cooperating same-UID writers.
 E05-S02 has a private pure offline-capable model-picker snapshot and proposal
 through Cycle 123, with exact profile/compiled-adapter/wire namespace binding
-through Cycle 131.
+through Cycle 131 and explicit namespace-matched composition with the private
+local setup owner through Cycle 132.
 E06-S01 now composes its prepared policy and phase owner with a private real
 Linux one-process backend through Cycle 115, exact sealed native execution plus
 bounded Landlock filesystem-content authority through Cycle 118, and one
@@ -46,12 +47,12 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted numbered cycles | 131 |
+| Accepted numbered cycles | 132 |
 | Additional acceptance-repair commits | 1 (Cycle 129 quarantine rollback) |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 132 — compose one explicit namespace-matched model proposal with private local setup |
+| Active epic/card | Cycle 133 — bind one private real-peer MCP echo handler to exact inventory identity and withdrawal |
 
 ## Epic status
 
@@ -64,7 +65,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C3; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. One private composite drives pinned tools-only initialize/notification/list/call ordering with proof-derived bounds and typed cleanup, and a test-only sealed real peer proves exact four-frame reuse, protocol-fault truth, cancellation, and descendant reap. It remains unmounted; no handler/inventory mount, config, alternate enforcement, or product route exists, so X002 stays open |
 | E07 semantic context | **In progress** through E07-S01-C4 | The deterministic fixed-corpus baseline and selector comparison pass. A compiled but unmounted contributor uses only current permission-gated reads, reconstructs emitted lines and current role counts after ranking, and preserves the frozen 5-to-3-round / 1,456-to-1,134-byte result. No trigger, config, context projection, provider path, cache, mutation, or user-visible mount exists |
-| E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C2a | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. Cooperating Kitsu config writers are fenced by a receipt-held advisory parent lock; rollback uses exact receipt-fd/name classification, with arbitrary same-UID mutation explicitly nonclaimed. The pure picker preserves bounded offline/stale catalog truth and binds every proposal to exact profile/compiled-adapter/wire identity. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
+| E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C2b | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. Cooperating Kitsu config writers are fenced by a receipt-held advisory parent lock; rollback uses exact receipt-fd/name classification, with arbitrary same-UID mutation explicitly nonclaimed. The pure picker preserves bounded offline/stale catalog truth and binds every proposal to exact profile/compiled-adapter/wire identity; one private selected coordinator now admits only explicit exact-namespace proposals and retains them through rejection, completion, and recovery. All remain unmounted; credential/provider/catalog adapters, guided UI, activation, first success, and PF-10 remain open |
 | E08 telemetry/docs | **In progress** through E08-S05-C8 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, `/context sources`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive decks. Source rows distinguish coarse estimates, derived budget, authoritative counts, and unavailable sub-buckets without an additive total. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation, account truth, exact tokenizer attribution, and durable history remain separate |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
@@ -204,6 +205,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | 129 | this document's commit + one repair | Generation-scoped fault-fixture ownership plus Kitsu-writer-fenced exact quarantine rollback |
 | 130 | this document's commit | Exact real sealed tools-only MCP peer lifecycle, protocol-fault, cancellation, and reap proof |
 | 131 | this document's commit | Model-picker proposals bound to exact profile, compiled adapter, and wire namespace |
+| 132 | this document's commit | Explicit exact-namespace model proposal composed with private local setup and retained through recovery |
 
 ## Current green gates
 
@@ -983,6 +985,14 @@ profile, compiled adapter, and wire revision. Capabilities, generation, model,
 endpoint, auth, and runtime remain outside the binding. Offline/stale catalog
 truth and three-state membership survive projection unchanged; no proposal is
 applied or mounted yet.
+
+Cycle 132 consumes that typed proposal only inside the private local setup
+owner. Explicit basis and whole profile/adapter/wire equality are checked before
+the exact normalized preview model is replaced, and every rejection returns the
+untouched coordinator and proposal. Completion, collision, execution failure,
+rollback residue, and retry retain the full proposal truth. The composition
+remains unmounted and performs no provider, catalog, credential, activation, or
+current-route effect.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

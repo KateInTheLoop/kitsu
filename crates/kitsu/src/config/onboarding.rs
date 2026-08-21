@@ -140,6 +140,13 @@ pub(super) enum SetupProposalError {
     CatalogPathRequired,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(super) enum SetupPreviewModelError {
+    InvalidModel,
+    NotExactlyNormalized,
+    UnexpectedStage { actual: SetupStage },
+}
+
 /// Fully normalized, non-secret preview. Construction is lexical and performs
 /// no DNS, filesystem, environment, config, credential, or provider lookup.
 #[derive(Debug, PartialEq, Eq)]
@@ -1032,6 +1039,23 @@ impl GuidedSetupTransaction {
         self.completed_stages
     }
 
+    pub(super) fn replace_preview_model_exact(
+        &mut self,
+        model: &str,
+    ) -> Result<(), SetupPreviewModelError> {
+        let normalized =
+            normalize_model(model).map_err(|_| SetupPreviewModelError::InvalidModel)?;
+        if normalized != model {
+            return Err(SetupPreviewModelError::NotExactlyNormalized);
+        }
+        let actual = self.state.stage();
+        if actual != SetupStage::AwaitingConsent {
+            return Err(SetupPreviewModelError::UnexpectedStage { actual });
+        }
+        self.preview.model = normalized;
+        Ok(())
+    }
+
     pub(super) fn consent(&mut self) -> Result<(), SetupTransitionError> {
         match self.state.stage() {
             SetupStage::Terminal => return Err(SetupTransitionError::AlreadyTerminal),
@@ -1488,6 +1512,44 @@ mod tests {
             assert!(!directive.permits_effects());
             assert!(matches!(directive, SetupDirective::Preview { .. }));
         }
+    }
+
+    #[test]
+    fn preview_model_replacement_is_exact_preconsent_and_rejections_are_zero_mutation() {
+        let mut transaction = transaction(8, local_proposal());
+        assert_eq!(
+            transaction.replace_preview_model_exact("  selected/model  "),
+            Err(SetupPreviewModelError::NotExactlyNormalized),
+        );
+        match transaction.directive() {
+            SetupDirective::Preview { preview } => assert_eq!(preview.model(), "model-v1"),
+            other => panic!("expected unchanged preview, got {other:?}"),
+        }
+        assert_eq!(
+            transaction.replace_preview_model_exact("bad\nmodel"),
+            Err(SetupPreviewModelError::InvalidModel),
+        );
+        match transaction.directive() {
+            SetupDirective::Preview { preview } => assert_eq!(preview.model(), "model-v1"),
+            other => panic!("expected unchanged preview, got {other:?}"),
+        }
+
+        transaction
+            .replace_preview_model_exact("selected/model")
+            .unwrap();
+        match transaction.directive() {
+            SetupDirective::Preview { preview } => assert_eq!(preview.model(), "selected/model"),
+            other => panic!("expected replaced preview, got {other:?}"),
+        }
+
+        transaction.consent().unwrap();
+        assert_eq!(
+            transaction.replace_preview_model_exact("later/model"),
+            Err(SetupPreviewModelError::UnexpectedStage {
+                actual: SetupStage::Acquire,
+            }),
+        );
+        assert_eq!(transaction.directive().stage(), SetupStage::Acquire);
     }
 
     #[test]
