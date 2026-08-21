@@ -649,6 +649,13 @@ cannot weaken or replace any backend-neutral assertion.
    unconfirmed artifact-only or candidate-bearing cuts converge to the same
    branch. Malformed, byte-different, or tampered residue remains unselected and
    is never deleted or overwritten.
+   **Pure mount admission complete in Cycle 081:** one path-free classifier
+   admits only clean empty, current-v1-only, or canonical-only observations.
+   Current-v1 malformed/identity/future-version evidence and canonical
+   corrupt/future/conflict evidence never collapse to missing. A canonical
+   tombstone blocks both empty and legacy routes, and valid dual presence is a
+   separate ambiguity. Rejection retains both typed observations. No store is
+   opened, created, migrated, selected, or written by this card.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
