@@ -475,6 +475,7 @@ impl SetupFence {
 pub(super) enum OwnedEffectKind {
     ManagedCredential,
     CatalogCache,
+    ConfigFile,
 }
 
 /// A receipt exists only for an effect this transaction newly created and may
@@ -511,6 +512,18 @@ impl OwnedEffectReceipt {
             kind: self.kind,
         }
     }
+
+    pub(super) const fn transaction_id(&self) -> u64 {
+        self.transaction_id
+    }
+
+    pub(super) const fn id(&self) -> u64 {
+        self.id
+    }
+
+    pub(super) const fn kind(&self) -> OwnedEffectKind {
+        self.kind
+    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -545,6 +558,8 @@ pub(super) enum SetupReceiptError {
     InvalidOwnedEffect,
     TooManyOwnedEffects,
     DuplicateOwnedEffect,
+    InvalidPublicationEffect,
+    PublicationEffectWrongTransaction,
 }
 
 fn validate_owned_effects(effects: &[OwnedEffectReceipt]) -> Result<(), SetupReceiptError> {
@@ -660,35 +675,58 @@ enum PublicationDisposition {
 pub(super) struct PublicationReceipt {
     fence: SetupFence,
     disposition: PublicationDisposition,
+    owned_effect: Option<OwnedEffectReceipt>,
 }
 
 impl PublicationReceipt {
-    pub(super) const fn published(fence: SetupFence) -> Self {
-        Self {
-            fence,
-            disposition: PublicationDisposition::Published,
-        }
+    pub(super) fn published(
+        fence: SetupFence,
+        owned_effect: OwnedEffectReceipt,
+    ) -> Result<Self, SetupReceiptError> {
+        Self::with_optional_effect(fence, PublicationDisposition::Published, Some(owned_effect))
     }
 
     pub(super) const fn collision(fence: SetupFence) -> Self {
         Self {
             fence,
             disposition: PublicationDisposition::Collision,
+            owned_effect: None,
         }
     }
 
-    pub(super) const fn cancelled(fence: SetupFence) -> Self {
-        Self {
-            fence,
-            disposition: PublicationDisposition::Cancelled,
-        }
+    pub(super) fn cancelled(
+        fence: SetupFence,
+        owned_effect: Option<OwnedEffectReceipt>,
+    ) -> Result<Self, SetupReceiptError> {
+        Self::with_optional_effect(fence, PublicationDisposition::Cancelled, owned_effect)
     }
 
-    pub(super) const fn failed(fence: SetupFence, kind: SetupFailureKind) -> Self {
-        Self {
-            fence,
-            disposition: PublicationDisposition::Failed(kind),
+    pub(super) fn failed(
+        fence: SetupFence,
+        kind: SetupFailureKind,
+        owned_effect: Option<OwnedEffectReceipt>,
+    ) -> Result<Self, SetupReceiptError> {
+        Self::with_optional_effect(fence, PublicationDisposition::Failed(kind), owned_effect)
+    }
+
+    fn with_optional_effect(
+        fence: SetupFence,
+        disposition: PublicationDisposition,
+        owned_effect: Option<OwnedEffectReceipt>,
+    ) -> Result<Self, SetupReceiptError> {
+        if let Some(effect) = owned_effect.as_ref() {
+            if effect.kind != OwnedEffectKind::ConfigFile {
+                return Err(SetupReceiptError::InvalidPublicationEffect);
+            }
+            if effect.transaction_id != fence.transaction_id {
+                return Err(SetupReceiptError::PublicationEffectWrongTransaction);
+            }
         }
+        Ok(Self {
+            fence,
+            disposition,
+            owned_effect,
+        })
     }
 }
 
@@ -733,6 +771,9 @@ pub(super) enum SetupTransitionError {
         at: SetupStage,
     },
     UnknownRollbackEffect,
+    DuplicateOwnedEffect,
+    TooManyOwnedEffects,
+    InvalidPublicationEffect,
     AlreadyTerminal,
 }
 
@@ -1107,10 +1148,31 @@ impl GuidedSetupTransaction {
         receipt: PublicationReceipt,
     ) -> Result<(), SetupTransitionError> {
         self.require_fence(SetupStage::Publish, receipt.fence)?;
+        if let Some(effect) = receipt.owned_effect.as_ref() {
+            if effect.transaction_id != self.transaction_id {
+                return Err(SetupTransitionError::OwnedEffectWrongTransaction);
+            }
+            if effect.kind != OwnedEffectKind::ConfigFile {
+                return Err(SetupTransitionError::InvalidPublicationEffect);
+            }
+            let TransactionState::Publish { owned_effects, .. } = &self.state else {
+                unreachable!("fence validation proved the state")
+            };
+            if owned_effects.iter().any(|owned| owned.id == effect.id) {
+                return Err(SetupTransitionError::DuplicateOwnedEffect);
+            }
+            if owned_effects.len() == MAX_OWNED_EFFECTS {
+                return Err(SetupTransitionError::TooManyOwnedEffects);
+            }
+        }
         let owned_effects = match &mut self.state {
             TransactionState::Publish { owned_effects, .. } => std::mem::take(owned_effects),
             _ => unreachable!("fence validation proved the state"),
         };
+        let mut owned_effects = owned_effects;
+        if let Some(effect) = receipt.owned_effect {
+            owned_effects.push(effect);
+        }
         let ordinal = self.advance_ordinal();
         match receipt.disposition {
             PublicationDisposition::Published => {
@@ -1632,7 +1694,7 @@ mod tests {
         assert_eq!(publishing.directive().stage(), SetupStage::Publish);
         let fence = current_fence(&publishing, SetupStage::Publish);
         publishing
-            .accept_publication(PublicationReceipt::cancelled(fence))
+            .accept_publication(PublicationReceipt::cancelled(fence, None).unwrap())
             .unwrap();
         assert_eq!(publishing.directive().stage(), SetupStage::Rollback);
     }
@@ -1678,7 +1740,13 @@ mod tests {
 
         let publish_fence = current_fence(&transaction, SetupStage::Publish);
         transaction
-            .accept_publication(PublicationReceipt::published(publish_fence))
+            .accept_publication(
+                PublicationReceipt::published(
+                    publish_fence,
+                    owned(19, 2, OwnedEffectKind::ConfigFile),
+                )
+                .unwrap(),
+            )
             .unwrap();
         let terminal = transaction.terminal().expect("published terminal");
         assert_eq!(terminal.cause(), &SetupTerminalCause::Published);
@@ -1765,6 +1833,106 @@ mod tests {
     }
 
     #[test]
+    fn publication_receipt_combinations_are_closed_and_config_file_only() {
+        let fence = SetupFence::new(53, 3).unwrap();
+        assert_eq!(
+            PublicationReceipt::published(fence, owned(53, 1, OwnedEffectKind::ManagedCredential),)
+                .unwrap_err(),
+            SetupReceiptError::InvalidPublicationEffect
+        );
+        assert_eq!(
+            PublicationReceipt::cancelled(
+                fence,
+                Some(owned(53, 2, OwnedEffectKind::CatalogCache)),
+            )
+            .unwrap_err(),
+            SetupReceiptError::InvalidPublicationEffect
+        );
+        assert_eq!(
+            PublicationReceipt::failed(
+                fence,
+                SetupFailureKind::PublicationIo,
+                Some(owned(999, 3, OwnedEffectKind::ConfigFile)),
+            )
+            .unwrap_err(),
+            SetupReceiptError::PublicationEffectWrongTransaction
+        );
+
+        PublicationReceipt::published(fence, owned(53, 4, OwnedEffectKind::ConfigFile))
+            .expect("published requires one exact config-file effect");
+        PublicationReceipt::collision(fence);
+        PublicationReceipt::cancelled(fence, None)
+            .expect("pre-install cancellation carries no config effect");
+        PublicationReceipt::failed(
+            fence,
+            SetupFailureKind::Interrupted,
+            Some(owned(53, 5, OwnedEffectKind::ConfigFile)),
+        )
+        .expect("post-install failure may carry one config effect");
+    }
+
+    #[test]
+    fn publication_effect_is_fenced_merged_once_and_rolled_back_first() {
+        let mut transaction = transaction(59, custom_proposal());
+        advance_to_publication(
+            &mut transaction,
+            vec![owned(59, 1, OwnedEffectKind::ManagedCredential)],
+        );
+        let publish_fence = current_fence(&transaction, SetupStage::Publish);
+
+        let wrong_fence = SetupFence::new(59, publish_fence.ordinal() + 1).unwrap();
+        let wrong_receipt = PublicationReceipt::failed(
+            wrong_fence,
+            SetupFailureKind::PublicationIo,
+            Some(owned(59, 2, OwnedEffectKind::ConfigFile)),
+        )
+        .unwrap();
+        assert_eq!(
+            transaction.accept_publication(wrong_receipt),
+            Err(SetupTransitionError::FenceMismatch)
+        );
+        assert_eq!(transaction.directive().stage(), SetupStage::Publish);
+
+        let duplicate = PublicationReceipt::failed(
+            publish_fence,
+            SetupFailureKind::PublicationIo,
+            Some(owned(59, 1, OwnedEffectKind::ConfigFile)),
+        )
+        .unwrap();
+        assert_eq!(
+            transaction.accept_publication(duplicate),
+            Err(SetupTransitionError::DuplicateOwnedEffect)
+        );
+        assert_eq!(transaction.directive().stage(), SetupStage::Publish);
+
+        transaction
+            .accept_publication(
+                PublicationReceipt::failed(
+                    publish_fence,
+                    SetupFailureKind::PublicationIo,
+                    Some(owned(59, 2, OwnedEffectKind::ConfigFile)),
+                )
+                .unwrap(),
+            )
+            .unwrap();
+        match transaction.directive() {
+            SetupDirective::Rollback { effects, .. } => {
+                assert_eq!(
+                    effects
+                        .iter()
+                        .map(|effect| (effect.id(), effect.kind()))
+                        .collect::<Vec<_>>(),
+                    vec![
+                        (2, OwnedEffectKind::ConfigFile),
+                        (1, OwnedEffectKind::ManagedCredential),
+                    ]
+                );
+            }
+            other => panic!("expected rollback after partial publication, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn interrupted_publication_and_incomplete_rollback_retain_exact_residue() {
         let mut transaction = transaction(37, custom_proposal());
         advance_to_publication(
@@ -1776,10 +1944,10 @@ mod tests {
         );
         let publish_fence = current_fence(&transaction, SetupStage::Publish);
         transaction
-            .accept_publication(PublicationReceipt::failed(
-                publish_fence,
-                SetupFailureKind::Interrupted,
-            ))
+            .accept_publication(
+                PublicationReceipt::failed(publish_fence, SetupFailureKind::Interrupted, None)
+                    .unwrap(),
+            )
             .unwrap();
         finish_rollback(&mut transaction, vec![6]);
 
@@ -1826,10 +1994,10 @@ mod tests {
         );
         let publish_fence = current_fence(&incomplete, SetupStage::Publish);
         incomplete
-            .accept_publication(PublicationReceipt::failed(
-                publish_fence,
-                SetupFailureKind::Interrupted,
-            ))
+            .accept_publication(
+                PublicationReceipt::failed(publish_fence, SetupFailureKind::Interrupted, None)
+                    .unwrap(),
+            )
             .unwrap();
         finish_rollback(&mut incomplete, vec![8]);
 
@@ -1865,7 +2033,13 @@ mod tests {
         );
         let publish_fence = current_fence(&published, SetupStage::Publish);
         published
-            .accept_publication(PublicationReceipt::published(publish_fence))
+            .accept_publication(
+                PublicationReceipt::published(
+                    publish_fence,
+                    owned(45, 10, OwnedEffectKind::ConfigFile),
+                )
+                .unwrap(),
+            )
             .unwrap();
         let (cause, rollback, retained_effects) = published.into_terminal().unwrap().into_parts();
         assert_eq!(cause, SetupTerminalCause::Published);
@@ -1962,7 +2136,13 @@ mod tests {
         advance_to_publication(&mut transaction, Vec::new());
         let publish_fence = current_fence(&transaction, SetupStage::Publish);
         transaction
-            .accept_publication(PublicationReceipt::published(publish_fence))
+            .accept_publication(
+                PublicationReceipt::published(
+                    publish_fence,
+                    owned(47, 1, OwnedEffectKind::ConfigFile),
+                )
+                .unwrap(),
+            )
             .unwrap();
         assert_eq!(transaction.directive().stage(), SetupStage::Terminal);
         assert_eq!(
