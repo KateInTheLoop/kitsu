@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C40, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 99 / 99 |
+| Accepted cycles/commits after this cycle | 100 / 100 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C41 (Cycle 100) — stage in-process bound-current owner swap, consolidate acceptance, and polish the branch checkpoint |
+| Active epic/card | Parallel launch after Cycle 100 — begin E06 frozen inventory/supervisor/codec candidate packets while the integration branch retains serialized acceptance ownership |
 
 ## Epic status
 
@@ -25,8 +25,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C40, E03-S05 through C4 | Durable startup resume now resolves and activates through one pinned bound-current route; exact/name/last/auto use only the owned selected snapshot, canonical refuses, and bound-current reset preserves `/new` through an atomic fresh current-v1 handoff. In-process route selection, remaining K01-K12, and X005 remain open |
-| E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
+| E06 child/MCP spine | **Ready for parallel candidate packets**; depends only on accepted E01/E02 | Split frozen inventory, child-supervisor, and bounded stdio-codec worktrees; no production MCP composition until their independent fixtures pass |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **Scoped** through Cycle 030; implementation waits on owned inputs | E08-S05 live telemetry consumes E04 receipts; E08-S06 durable usage consumes E03 fencing; progressive docs follow stable surfaces |
@@ -135,7 +135,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 096 | `98ad3e7` | Exact current-v1 product resume handoff |
 | 097 | `db35d47` | Common exact current/bound resume result |
 | 098 | `9f08a50` | Snapshot-writable bound-current admission |
-| 099 | this document's commit | Pinned bound-current startup resume route |
+| 099 | `bc2569d` | Pinned bound-current startup resume route |
+| 100 | this document's commit | Staged bound-current in-process owner swap and parallel checkpoint |
 
 ## Current green gates
 
@@ -642,8 +643,14 @@ only the exact snapshot owned under both fences. Exact canonical state returns a
 bounded operation-writer error and yields no parts. Review also closed a reset
 regression: bound-current `/new` now creates a fresh current-v1 owner before
 dropping the old bound owner, while canonical reset remains unsupported. Cycle
-100 next performs the in-process target activation and one-time owner swap, then
-runs full cross-cycle review and acceptance.
+100 performs that in-process activation as a staged transaction. The target and
+old owners coexist while gateway/directory/system checks, current-session save,
+context discovery, and provider route publication can fail. Every refusal drops
+only the target. Success consumes the exact target once, swaps the owner without
+a second read, and preserves the read-only no-session path. The consolidated
+checkpoint then opens bounded parallel candidate packets under
+`parallel-delivery-plan.md`; only the integration branch assigns accepted cycle
+numbers and updates this ledger.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

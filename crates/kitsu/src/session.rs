@@ -116,9 +116,9 @@ pub struct ActiveSessionStore {
     inner: ActiveSessionStoreInner,
 }
 
-/// Product handoff for one exact current-v1 resume value and the active owner
-/// that revalidated it under the session lease. Selection remains explicitly
-/// current-v1 until the bound route has its own product admission gate.
+/// Coupled handoff for one exact resume value and the active owner that
+/// revalidated it under the relevant leases. Product routing must pass an
+/// explicit source-aware admission before consuming either half.
 #[derive(Debug)]
 pub struct ActiveSessionResume {
     store: ActiveSessionStore,
@@ -130,7 +130,8 @@ impl ActiveSessionResume {
         &self.saved
     }
 
-    pub fn into_current_v1_parts(self) -> Result<(ActiveSessionStore, SavedSession), String> {
+    #[cfg(test)]
+    fn into_current_v1_parts(self) -> Result<(ActiveSessionStore, SavedSession), String> {
         if !matches!(&self.store.inner, ActiveSessionStoreInner::CurrentV1(_)) {
             return Err("bound local resume requires explicit product admission".to_string());
         }
@@ -162,7 +163,6 @@ enum BoundActiveSessionResumeErrorV1 {
 }
 
 #[derive(Debug)]
-#[allow(dead_code)]
 pub struct ProductWritableBoundResumeV1 {
     resume: ActiveSessionResume,
 }
@@ -175,8 +175,11 @@ enum ProductWritableBoundResumeAdmissionErrorV1 {
     CanonicalOperationWriterUnavailable,
 }
 
-#[allow(dead_code)]
 impl ProductWritableBoundResumeV1 {
+    pub fn saved(&self) -> &SavedSession {
+        self.resume.saved()
+    }
+
     pub fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
         (self.resume.store, self.resume.saved)
     }
@@ -2507,7 +2510,8 @@ impl SessionStore {
         })
     }
 
-    pub fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
+    #[cfg(test)]
+    fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
         if !valid_id(&saved.id) {
             return Err("saved session has an invalid id".to_string());
         }
@@ -3084,10 +3088,8 @@ impl ActiveSessionStore {
         })
     }
 
-    pub fn resume_current_v1(
-        dir: PathBuf,
-        saved: SavedSession,
-    ) -> Result<ActiveSessionResume, String> {
+    #[cfg(test)]
+    fn resume_current_v1(dir: PathBuf, saved: SavedSession) -> Result<ActiveSessionResume, String> {
         let current_v1 = SessionStore::from_saved(dir, &saved)?;
         Ok(ActiveSessionResume {
             store: Self {
@@ -3101,12 +3103,31 @@ impl ActiveSessionStore {
         dir: PathBuf,
         selector: &str,
     ) -> Result<ProductWritableBoundResumeV1, String> {
+        Self::resume_bound_current_excluding_v1(dir, selector, None)
+    }
+
+    pub fn resume_other_bound_current_v1(
+        dir: PathBuf,
+        selector: &str,
+        active_id: Option<&str>,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
+        Self::resume_bound_current_excluding_v1(dir, selector, active_id)
+    }
+
+    fn resume_bound_current_excluding_v1(
+        dir: PathBuf,
+        selector: &str,
+        excluded_id: Option<&str>,
+    ) -> Result<ProductWritableBoundResumeV1, String> {
         let directory = open_session_directory(&dir)?;
         let summaries = CurrentV1FileReadPort {
             directory: &directory,
         }
         .list()?;
-        let id = resolve_selector(&summaries, selector, None)?;
+        let id = resolve_selector(&summaries, selector, excluded_id)?;
+        if excluded_id == Some(id.as_str()) {
+            return Err(format!("session '{selector}' is already active"));
+        }
         let session_id = kitsu_core::session::SessionId::new(id.clone())
             .map_err(|error| format!("invalid resolved session identity: {error}"))?;
         admit_product_writable_bound_resume_in_directory_v1(&directory, &session_id)
@@ -5595,5 +5616,75 @@ mod tests {
             .unwrap();
         drop(competing.acquire_writer_fence(&session_id).unwrap());
         drop(SessionLease::acquire(&directory, session_id.as_str()).unwrap());
+    }
+
+    #[test]
+    fn in_process_bound_resume_stages_target_and_swaps_owners_exactly_once() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let first = SessionStore::create(dir.clone()).unwrap();
+        first
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("active session")],
+            )
+            .unwrap();
+        let first_id = first.id().to_string();
+        drop(first);
+        let second = SessionStore::create(dir.clone()).unwrap();
+        second
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-b",
+                None,
+                &[ChatMessage::user("target session")],
+            )
+            .unwrap();
+        let second_id = second.id().to_string();
+        drop(second);
+
+        let admitted = ActiveSessionStore::resume_bound_current_v1(dir.clone(), &first_id).unwrap();
+        let (mut active, _) = admitted.into_parts();
+        assert_eq!(active.id(), first_id);
+        let directory = PrivateDirectory::open(&dir, "in-process swap fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        let error = ActiveSessionStore::resume_other_bound_current_v1(
+            dir.clone(),
+            &first_id,
+            Some(&first_id),
+        )
+        .unwrap_err();
+        assert!(error.contains("already active"));
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        let staged =
+            ActiveSessionStore::resume_other_bound_current_v1(dir.clone(), "last", Some(&first_id))
+                .unwrap();
+        assert_eq!(staged.saved().id, second_id);
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        drop(staged);
+        drop(SessionLease::acquire(&directory, &second_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &first_id).is_err());
+
+        let staged = ActiveSessionStore::resume_other_bound_current_v1(
+            dir.clone(),
+            &second_id,
+            Some(&first_id),
+        )
+        .unwrap();
+        let (target, saved) = staged.into_parts();
+        active = target;
+        assert_eq!(active.id(), second_id);
+        assert_eq!(saved.id, second_id);
+        assert_eq!(saved.messages, [ChatMessage::user("target session")]);
+        drop(SessionLease::acquire(&directory, &first_id).unwrap());
+        assert!(SessionLease::acquire(&directory, &second_id).is_err());
+        drop(active);
+        drop(SessionLease::acquire(&directory, &second_id).unwrap());
     }
 }

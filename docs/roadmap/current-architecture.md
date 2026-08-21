@@ -286,7 +286,14 @@ kernel.
   operation-writer refusal before yielding product parts. Bound-current reset
   now creates a fresh current-v1 owner before replacing and dropping the old
   bound owner, preserving `/new`; canonical reset still refuses. In-process
-  `/resume` remains current-v1 until Cycle 100.
+  `/resume` remains current-v1 until Cycle 100. Cycle 100 mounts the same
+  bound-current admission as a staged in-process target. The old owner remains
+  active and the target owner remains fenced while gateway/directory/system
+  validation, current-session persistence, context-window discovery, and the
+  immutable provider-generation replacement can still fail. Each refusal drops
+  the staged target and preserves the old owner. After the last fallible step,
+  the target result is consumed once and replaces the old owner without another
+  path read. Stateless no-session resume retains its read-only route.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
