@@ -116,6 +116,21 @@ pub struct ActiveSessionStore {
     inner: ActiveSessionStoreInner,
 }
 
+/// Product handoff for one exact current-v1 resume value and the active owner
+/// that revalidated it under the session lease. Selection remains explicitly
+/// current-v1 until the bound route has its own product admission gate.
+#[derive(Debug)]
+pub struct ActiveSessionResume {
+    store: ActiveSessionStore,
+    saved: SavedSession,
+}
+
+impl ActiveSessionResume {
+    pub fn into_parts(self) -> (ActiveSessionStore, SavedSession) {
+        (self.store, self.saved)
+    }
+}
+
 #[derive(Debug)]
 enum ActiveSessionStoreInner {
     CurrentV1(SessionStore),
@@ -3069,9 +3084,16 @@ impl ActiveSessionStore {
         })
     }
 
-    pub fn from_saved(dir: PathBuf, saved: &SavedSession) -> Result<Self, String> {
-        SessionStore::from_saved(dir, saved).map(|current_v1| Self {
-            inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+    pub fn resume_current_v1(
+        dir: PathBuf,
+        saved: SavedSession,
+    ) -> Result<ActiveSessionResume, String> {
+        let current_v1 = SessionStore::from_saved(dir, &saved)?;
+        Ok(ActiveSessionResume {
+            store: Self {
+                inner: ActiveSessionStoreInner::CurrentV1(current_v1),
+            },
+            saved,
         })
     }
 
@@ -4872,12 +4894,64 @@ mod tests {
 
         drop(active);
         let resumed = SessionStore::load(&dir, &first_id).unwrap();
-        let active = ActiveSessionStore::from_saved(dir.clone(), &resumed).unwrap();
+        let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), resumed.clone()).unwrap();
+        let (active, exact_resumed) = handoff.into_parts();
+        assert_eq!(
+            encode_saved(&exact_resumed).unwrap(),
+            encode_saved(&resumed).unwrap()
+        );
         assert_eq!(active.id(), first_id);
+        assert_eq!(exact_resumed.id, first_id);
         assert!(SessionLease::acquire(&directory, &first_id).is_err());
         drop(active);
         drop(SessionLease::acquire(&directory, &first_id).unwrap());
         assert!(!dir.join(".kitsu-store-v1").exists());
+    }
+
+    #[test]
+    fn active_resume_handoff_refuses_stale_input_and_returns_the_exact_current_value() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("sessions");
+        let original = SessionStore::create(dir.clone()).unwrap();
+        original
+            .save(
+                root.path(),
+                "gateway-a",
+                "model-a",
+                None,
+                &[ChatMessage::user("stale product value")],
+            )
+            .unwrap();
+        let id = original.id().to_string();
+        drop(original);
+        let stale = SessionStore::load(&dir, &id).unwrap();
+
+        let replacement = SessionStore::from_saved(dir.clone(), &stale).unwrap();
+        replacement
+            .save(
+                root.path(),
+                "gateway-b",
+                "model-b",
+                None,
+                &[ChatMessage::user("exact product value")],
+            )
+            .unwrap();
+        drop(replacement);
+        let exact = SessionStore::load(&dir, &id).unwrap();
+
+        let error = ActiveSessionStore::resume_current_v1(dir.clone(), stale).unwrap_err();
+        assert!(error.contains("changed while it was being resumed"));
+        let handoff = ActiveSessionStore::resume_current_v1(dir.clone(), exact.clone()).unwrap();
+        let (active, saved) = handoff.into_parts();
+        assert_eq!(encode_saved(&saved).unwrap(), encode_saved(&exact).unwrap());
+        let directory = PrivateDirectory::open(&dir, "active resume handoff fixture").unwrap();
+        assert!(SessionLease::acquire(&directory, &id).is_err());
+        assert!(!dir.join(identity::LOCAL_STORE_IDENTITY_NAME).exists());
+        assert!(!dir.join(".kitsu-store-v1").exists());
+        assert_eq!(active.id(), saved.id);
+        assert_eq!(saved.messages, [ChatMessage::user("exact product value")]);
+        drop(active);
+        drop(SessionLease::acquire(&directory, &id).unwrap());
     }
 
     #[test]

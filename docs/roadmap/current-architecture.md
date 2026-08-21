@@ -261,7 +261,13 @@ kernel.
   sessions root. The coupled result exposes only read-only identity, name,
   artifact-route, and saved-value views, with no consuming extractor or store
   reference that could mutate behind the saved value. Product construction and
-  routing remain current-v1.
+  routing remain current-v1. Cycle 096 replaces the old store-only public resume
+  constructor with `ActiveSessionResume`. It owns an exact current-v1 snapshot
+  beside the active owner that re-read and compared it after lease acquisition,
+  then permits one explicit product split. Startup and in-process durable resume
+  both use this handoff, so stale preloaded bytes cannot enter runtime while an
+  owner silently protects different data. Read-only no-session resume is
+  unchanged, and no composition identity or physical namespace is created.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 

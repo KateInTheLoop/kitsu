@@ -826,6 +826,17 @@ cannot weaken or replace any backend-neutral assertion.
    filesystem access. The factory is private and all product constructors still
    choose current-v1. The next boundary can therefore unify product resume data
    and owner handoff without yet selecting the bound route.
+   **Current-v1 product handoff complete in Cycle 096:** the former public
+   store-only resume constructor is replaced by `ActiveSessionResume`. It
+   consumes the preloaded current-v1 snapshot, acquires the legacy lease,
+   re-reads and byte-compares the exact durable value, then owns that value and
+   its `ActiveSessionStore` until one explicit product split. Both startup and
+   in-process durable resume use the handoff. A changed snapshot refuses before
+   runtime replacement; successful handoff preserves current-v1 bytes, lease
+   lifetime, selectors, and the absence of canonical namespaces. No-session
+   resume remains read-only and owner-free. Bound activation remains private and
+   unselected; the next boundary unifies its exact selected value with this
+   product-shaped result before any writable-source admission decision.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
