@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 088.
+updates through Cycle 089.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -203,7 +203,18 @@ kernel.
   Wrong fences, stale HEAD, a different valid value under the same revision,
   and artifact-bearing projection refuse before candidate allocation. The
   current-v1 variant returns a typed snapshot-save requirement instead of
-  creating canonical state. Production `SessionStore` routing remains unchanged.
+  creating canonical state. Cycle 089 completes the other representation-aware
+  half. Current-v1 activation retains a cloned pinned session-directory
+  descriptor, validates stable version/session/creation identity, and encodes a
+  successor before effects. It rechecks exact retained source bytes and
+  canonical-HEAD absence both before staging and after temporary-file sync,
+  immediately before descriptor-relative rename. Confirmed and
+  installed-unconfirmed writes advance retained state; invalid candidates and
+  pre-install races do not. A directory-sync cut therefore reports a durability
+  warning without misrepresenting the installed value, while ancestor
+  replacement cannot retarget publication. Canonical activation rejects this
+  snapshot operation without effects. Production `SessionStore` routing remains
+  unchanged.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
