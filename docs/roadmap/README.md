@@ -713,6 +713,7 @@ gates merely because a card appears attractive.
 | 102 | E06-S01-C1 | Admit one exact versioned child identity and containment preflight only after disabled, denied, malformed, and authority-mismatched requests fail without host effects |
 | 103 | E06-S03-C1 | Decode and emit bounded newline JSON-RPC through one pinned, one-request-at-a-time initialize/list/call state machine that rejects every ambient MCP capability |
 | 104 | E06-S02-C2 | Bind every proposed external tool to closed source, incarnation, revision, and tool identities plus one bounded canonical descriptor fingerprint before publication |
+| 105 | E06-S01-C2 | Own one single-use prepared child through causal ready/start/running/draining/terminal truth, joined natural exit, idempotent shutdown, and typed cleanup residue |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -908,6 +909,14 @@ domain-separated SHA-256 over Kitsu's versioned canonical name, description,
 and schema bytes. This is intentionally not a general JSON canonicalization
 standard. Revision monotonicity, publication/CAS, withdrawal, configuration,
 child trust, and MCP/product composition remain for later cards.
+Cycle 105 adds a non-cloneable provider-free lifecycle owner. Its only
+construction input is the now non-cloneable prepared-launch proof; spawn is an
+injected effect that consumes that proof once. EOF and idle remain observations,
+never success. Natural exit is classified only after the owner calls join, and
+cancel/shutdown signal before join. Unjoined residue remains owned for a drop
+retry and an explicit cleanup report. The effect implementation is still a
+synchronous fixture: there is no real process, pipe, deadline, phase budget,
+durable drop-report store, configuration, or MCP composition.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
