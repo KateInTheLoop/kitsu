@@ -52,7 +52,7 @@ use kitsu_providers::{
 use kitsu_tools::{
     scope_command_progress, CommandAmbientAuthority, CommandExecArgs, CommandExecutableIdentity,
     CommandExecutableResolution, CommandOutput, CommandOutputArtifact, CommandProgressSink,
-    CommandTermination, Registry,
+    CommandTermination, Registry, ToolInventory,
 };
 use serde::Serialize;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -1492,19 +1492,23 @@ where
         let is_final_round = (round == cfg.max_rounds && cfg.max_rounds > 1)
             || force_final_next
             || force_structured_final_next;
+        // Freeze schemas and handler identities together for this provider
+        // request. The response must resolve every structured or recovered call
+        // through this exact inventory, never a later registry view.
+        let request_inventory = tools.inventory();
         let offered_tools = if is_final_round {
             None
         } else if spawn_tools_withheld {
-            tool_descriptors(tools).map(|descriptors| {
+            tool_descriptors(&request_inventory).map(|descriptors| {
                 descriptors
                     .into_iter()
                     .filter(|descriptor| !descriptor.name.starts_with("spawn_agent"))
                     .collect::<Vec<_>>()
             })
         } else {
-            tool_descriptors(tools)
+            tool_descriptors(&request_inventory)
         };
-        if is_final_round && tool_descriptors(tools).is_some() {
+        if is_final_round && tool_descriptors(&request_inventory).is_some() {
             let nudge = if force_structured_final_next {
                 STRUCTURED_FINALIZATION_NUDGE
             } else if force_final_next {
@@ -1795,7 +1799,8 @@ where
         let mut malformed_text_calls = 0usize;
         let mut skill_confusion: Option<String> = None;
         if tool_calls.is_empty() && tools_were_offered {
-            let recovered = parse_text_tool_calls(&assistant_text, tools, &cfg.skill_names);
+            let recovered =
+                parse_text_tool_calls(&assistant_text, &request_inventory, &cfg.skill_names);
             if !recovered.calls.is_empty() {
                 tracing::debug!(
                     count = recovered.calls.len(),
@@ -2043,10 +2048,13 @@ where
             } else {
                 match tool_event.command_progress_sink() {
                     Some(sink) => {
-                        scope_command_progress(sink, tools.run(&tc.tool_name, tc.args.clone()))
-                            .await
+                        scope_command_progress(
+                            sink,
+                            request_inventory.run(&tc.tool_name, tc.args.clone()),
+                        )
+                        .await
                     }
-                    None => tools.run(&tc.tool_name, tc.args.clone()).await,
+                    None => request_inventory.run(&tc.tool_name, tc.args.clone()).await,
                 }
             };
             let (content, is_err) = match tool_result {
@@ -2152,7 +2160,7 @@ where
                     is_err,
                     window_evidence: *window_evidence,
                 },
-                tools,
+                &request_inventory,
                 messages,
                 cfg,
             );
@@ -2180,7 +2188,32 @@ where
 /// Build the tool descriptor list advertised to the model. Tools registered
 /// with a descriptor are surfaced; an empty set means no `tools` field is sent
 /// at all (`None`), preserving the descriptor-free `ask` path.
-fn tool_descriptors(tools: &Registry) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
+trait ToolCatalog {
+    fn descriptors(&self) -> &[ToolDescriptor];
+    fn is_registered(&self, name: &str) -> bool;
+}
+
+impl ToolCatalog for Registry {
+    fn descriptors(&self) -> &[ToolDescriptor] {
+        self.descriptors()
+    }
+
+    fn is_registered(&self, name: &str) -> bool {
+        self.is_registered(name)
+    }
+}
+
+impl ToolCatalog for ToolInventory {
+    fn descriptors(&self) -> &[ToolDescriptor] {
+        self.descriptors()
+    }
+
+    fn is_registered(&self, name: &str) -> bool {
+        self.is_registered(name)
+    }
+}
+
+fn tool_descriptors(tools: &impl ToolCatalog) -> Option<Vec<kitsu_providers::ToolDescriptor>> {
     let d = tools.descriptors();
     if d.is_empty() {
         None
@@ -2240,7 +2273,11 @@ fn relax_json_escapes(candidate: &str) -> String {
     out
 }
 
-fn parse_text_tool_calls(text: &str, tools: &Registry, skill_names: &[String]) -> TextToolRecovery {
+fn parse_text_tool_calls(
+    text: &str,
+    tools: &impl ToolCatalog,
+    skill_names: &[String],
+) -> TextToolRecovery {
     let descriptors = tools.descriptors();
     let mut calls = Vec::new();
     let mut malformed = 0usize;
@@ -3918,7 +3955,7 @@ fn offload_pressure(
 fn prepare_tool_output(
     content: String,
     request: ToolOutputRequest<'_>,
-    tools: &Registry,
+    tools: &impl ToolCatalog,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
 ) -> PreparedToolOutput {
@@ -4003,7 +4040,7 @@ fn maybe_offload_for_tools_detailed(
     content: String,
     call_id: &str,
     dir: Option<&std::path::Path>,
-    tools: &Registry,
+    tools: &impl ToolCatalog,
     messages: &[ChatMessage],
     cfg: &AgentConfig,
     window_evidence: Option<ContextWindowEvidence>,

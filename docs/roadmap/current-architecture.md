@@ -294,6 +294,11 @@ kernel.
   the staged target and preserves the old owner. After the last fallible step,
   the target result is consumed once and replaces the old owner without another
   path read. Stateless no-session resume retains its read-only route.
+- Cycle 101 freezes one owned, non-cloneable tool inventory for every provider
+  request. The schemas advertised to the provider and the immutable handler
+  identities used for structured calls, recovered text calls, and output
+  offload remain the same snapshot for the whole response. It does not yet add
+  source identity, generations, withdrawal, external processes, or MCP.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -304,7 +309,7 @@ kernel.
 | Native behavior | Compiled Rust modules registered by product composition | Same process, binary authority | Retain; no dylib/runtime loader |
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
-| External runtime tools | None | None | E06 experiment only after E02 lifecycle gates |
+| External runtime tools | Static registry plus a request-scoped, non-cloneable `ToolInventory`; no external source | Same-process compiled handlers only | E06 inventory foundation begun; no child, MCP, or product configuration |
 | Host/UI protocol | CLI carriers plus one-way JSONL | Consumer cannot service synchronous calls | No named second host; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 

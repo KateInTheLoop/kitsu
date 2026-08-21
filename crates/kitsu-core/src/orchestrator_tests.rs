@@ -1307,6 +1307,49 @@ async fn test_descriptors_advertised_to_model() {
     assert!(advertised.iter().any(|d| d.name == "fs.read_file"));
 }
 
+#[tokio::test]
+async fn provider_response_resolves_through_the_inventory_that_supplied_its_schema() {
+    let provider = MockProvider::new(vec![
+        vec![
+            ChatDelta::ToolCall(tc("snapshot_tool", "snapshot_call", "{}")),
+            ChatDelta::Done(FinishReason::ToolCalls),
+        ],
+        vec![
+            ChatDelta::Text("snapshot complete".to_string()),
+            ChatDelta::Done(FinishReason::Stop),
+        ],
+    ]);
+    let descriptor = kitsu_providers::ToolDescriptor {
+        name: "snapshot_tool".to_string(),
+        description: "prove request-local inventory pairing".to_string(),
+        parameters: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "additionalProperties": false
+        }),
+    };
+    let mut tools = Registry::new();
+    tools
+        .register_with_descriptor(descriptor.clone(), ok_handler(r#"{"snapshot":true}"#))
+        .expect("tool name must be unique");
+
+    let mut messages = initial_messages();
+    let output = run_agent_turn(&provider, &tools, &mut messages, &cfg(10))
+        .await
+        .expect("snapshot-backed tool round succeeds");
+
+    assert_eq!(output, "snapshot complete");
+    assert_eq!(
+        provider.seen_tools.lock().unwrap()[0].as_deref(),
+        Some(std::slice::from_ref(&descriptor))
+    );
+    assert!(messages.iter().any(|message| {
+        message.role == kitsu_providers::Role::Tool
+            && message.tool_call_id.as_deref() == Some("snapshot_call")
+            && message.content == r#"{"snapshot":true}"#
+    }));
+}
+
 /// A registry built only with the legacy `register` (no descriptor) advertises
 /// nothing — guards the descriptor-free `ask` path.
 #[tokio::test]
