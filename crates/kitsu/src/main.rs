@@ -11,6 +11,8 @@ mod llms;
 mod process_exit;
 mod prompt_queue;
 mod session;
+#[allow(dead_code)] // Staged typed deck renderer; slash-command mounting is a later card.
+mod session_telemetry_render;
 mod skills;
 mod structured_output;
 mod subagent;

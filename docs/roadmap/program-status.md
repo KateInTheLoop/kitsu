@@ -8,18 +8,19 @@ E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
 current-session snapshot is implemented through Cycle 106. E06-S02 now includes
 provider-free monotonic inventory publication through Cycle 107, and E06-S01
 binds exact runtime policy into preparation through Cycle 108. E08-S05 now has
-truthful current-run usage coverage and cached-token presence through Cycle 109.
+truthful current-run usage coverage and cached-token presence through Cycle 109,
+plus adaptive presentation-only decks through Cycle 110.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 109 / 109 |
+| Accepted cycles/commits after this cycle | 110 / 110 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 110 — E08-S05-C3: render the typed current-session snapshot adaptively for wide, narrow, redirected, plain, no-color, and screen-reader destinations |
+| Active epic/card | Cycle 111 — E06-S01-C4: consume the authorized child policy in a provider-free phase supervisor with exact timeout, terminate, reap, and residue truth |
 
 ## Epic status
 
@@ -33,7 +34,7 @@ truthful current-run usage coverage and cached-token presence through Cycle 109.
 | E06 child/MCP spine | **In progress** through E06-S01-C3, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories publish atomically through exact fences. Single-use preparation now carries exact capped phase/I/O/environment/process/network/timeout policy into a causal joined lifecycle owner, but effects remain injected and synchronous. Next add a real bounded backend only behind these proofs; no product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
-| E08 telemetry/docs | **In progress** through E08-S05-C2 | Pure current-session DTOs label every value with truth/provenance. Current-run tallies now retain reported/missing response coverage plus cached-token presence across fixed purpose buckets and project through an unmounted adapter. Next add adaptive presentation-only rendering; product snapshot collection/slash routing and durable history remain separate |
+| E08 telemetry/docs | **In progress** through E08-S05-C3 | Pure current-session DTOs label every value with truth/provenance; run tallies retain usage coverage/cached presence; a private renderer provides adaptive styled and stable accessible/plain projections. Product snapshot collection and slash routing remain separate; durable history still consumes E03 fencing |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -149,7 +150,8 @@ truthful current-run usage coverage and cached-token presence through Cycle 109.
 | 106 | `0b7b882` | Typed current-session telemetry truth and provenance |
 | 107 | `6dec4c4` | Exact atomic external-inventory publication and withdrawal |
 | 108 | `90101b0` | Exact bounded child runtime policy identity and preparation |
-| 109 | this document's commit | Truthful provider usage coverage and cached-token accounting |
+| 109 | `4b9d167` | Truthful provider usage coverage and cached-token accounting |
+| 110 | this document's commit | Adaptive truthful current-session telemetry decks |
 
 ## Current green gates
 
@@ -737,6 +739,14 @@ completed response. Totals and fixed inference/compaction/future-catalog
 coverage buckets preserve cached-token `Some(0)` versus absence. A pure adapter
 feeds the existing session usage DTO; it is not mounted into product collection,
 slash routing, rendering, JSONL, persistence, account data, pricing, or cost.
+Cycle 110 adds the presentation-only half without weakening that boundary. A
+private product helper renders only the already-typed snapshot into bounded
+wide, stacked, narrow, and tiny styled layouts or one stable escape-free format
+for redirected, plain, no-color, and screen-reader destinations. Every fact
+keeps its truth/provenance label, unavailable remains explicit, and cost is
+omitted unless the snapshot already carries a provider-reported currency value.
+The helper remains unmounted and performs no collection, provider/account/MCP
+call, filesystem access, persistence, JSONL emission, or slash routing.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined
