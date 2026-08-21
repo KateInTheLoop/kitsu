@@ -1,7 +1,7 @@
 # Improvement Program Status
 
 Status: E00, E01, E02, E03-S01, E03-S04, and E04 are accepted; E03-S02 is
-implemented through C21, E03-S04 through Cycle 076, and E03-S05 is in progress
+implemented through C22, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080;
 E08 telemetry observability was scoped in Cycle 030 on
 `improvements/harness-roadmap`.
@@ -11,11 +11,11 @@ E08 telemetry observability was scoped in Cycle 030 on
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 80 / 80 |
+| Accepted cycles/commits after this cycle | 81 / 81 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | E03 / E03-S02-C22 (Cycle 081) — define deterministic current-v1/canonical mount admission before routing production writes |
+| Active epic/card | E03 / E03-S02-C23 (Cycle 082) — observe both representations without creating or changing either store |
 
 ## Epic status
 
@@ -25,7 +25,7 @@ E08 telemetry observability was scoped in Cycle 030 on
 | E01 bounded defects | **Accepted** | Cycles 003-005 and 007-008; 219 tool, 308 CLI, 146 core tests at last affected-code acceptance |
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
-| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C21, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. Branch assembly/publication accepts only a committed boundary, binds exact source revision/HEAD, copies only referenced verified artifacts into a fresh destination, and publishes a complete root under ordered dual fences. A retry now adopts only a byte/digest/identity-exact artifact or candidate, re-syncs its owning namespaces, and reopens it before the ordinary source/closure/HEAD checks; tampered or name-only residue remains a collision. No authority is stored or copied. Production mounting, remaining K01-K12, and X005 remain open |
+| E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C22, E03-S05 through C4 | Current-v1 behavior remains unchanged. Physical/logical schema revision 2 supports exact retained lineage and explicit new-revision recovery under writer fencing. Branch publication/retry is create-only, dual-fenced, closure-complete, and adopts only exact re-synced residue. A pure mount oracle admits only empty, current-v1-only, or canonical-only typed observations; unavailable/future/conflict state, tombstones, and dual presence fail closed before effects. No authority is stored or copied. Production observation/routing, remaining K01-K12, and X005 remain open |
 | E06 child/MCP spine | Planned after E03; depends on E01/E02 | Bounded supervisor, pre-spawn admission, disabled tools-only echo experiment |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
@@ -116,7 +116,8 @@ E08 telemetry observability was scoped in Cycle 030 on
 | 077 | `bd00774` | Pure branch-at-committed-turn prefix and closure assembly |
 | 078 | `617b836` | Verified destination-scoped no-overwrite branch artifact copying |
 | 079 | `6c5c109` | Dual-fenced create-only branch transaction and exact cut residue |
-| 080 | this document's commit | Exact verified branch-residue adoption and retry |
+| 080 | `d94542a` | Exact verified branch-residue adoption and retry |
+| 081 | this document's commit | Pure single-truth current-v1/canonical mount admission |
 
 ## Current green gates
 
@@ -490,6 +491,13 @@ artifact, and unconfirmed-candidate residue all converge to the same complete
 branch; tampering remains blocked with HEAD missing. Cycle 081 returns to the
 production-mount prerequisite and defines deterministic current-v1/canonical
 admission before any live write routing changes.
+Cycle 081 supplies that decision as a total path-free function. Clean missing,
+current-v1-only, and canonical-only states are the only admissions. Legacy
+malformed/identity/future-version observations, canonical corrupt/unsupported/
+conflict observations, canonical tombstones, and valid dual presence stay
+distinct fail-closed results retaining both inputs. The card opens and mutates
+nothing. Cycle 082 next builds the mutation-free observation seam without
+implicitly creating the canonical namespace.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

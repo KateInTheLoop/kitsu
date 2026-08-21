@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 080.
+updates through Cycle 081.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -140,6 +140,11 @@ kernel.
   Existing artifacts/candidates must match every identity, digest, schema,
   parent, and byte; their owning namespaces are re-synced and records reopened
   before ordinary source/closure/HEAD rechecks. Tampered residue remains blocked.
+  Cycle 081 adds a pure production-mount admission oracle. From an already-typed
+  current-v1 observation and neutral canonical lookup it admits only empty,
+  current-v1-only, or canonical-only state. Unavailable/future/conflict state,
+  a canonical tombstone, and dual presence remain distinct rejections carrying
+  both observations. The oracle owns no path or effect and remains unmounted.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
