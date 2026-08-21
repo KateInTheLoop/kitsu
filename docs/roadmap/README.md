@@ -720,6 +720,7 @@ gates merely because a card appears attractive.
 | 109 | E08-S05-C2 | Retain reported/missing provider-response coverage and cached-token presence per fixed request purpose, then adapt it without inventing missing telemetry |
 | 110 | E08-S05-C3 | Render only typed current-session facts through adaptive wide/stacked/narrow and stable redirected/plain/no-color/screen-reader decks |
 | 111 | E06-S01-C4 | Consume exact authorized phase budgets in a provider-free supervisor with checked monotonic deadlines, ordered terminate/kill/reap transitions, and owned residue truth |
+| 112 | E08-S05-C4 | Collect one coherent in-memory snapshot and mount exact offline `/usage session` through the typed usage-only adaptive renderer |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -974,6 +975,15 @@ non-cloneable owned residue instead of reporting success or abandoning a child.
 The effects remain fixtures: no OS process, pipe, containment backend, natural
 exit composition, configuration, inventory, MCP route, or product behavior is
 mounted.
+Cycle 112 mounts the first typed telemetry deck as exact `/usage session`. The
+command reads the frozen route receipt once, snapshots current effective
+authority, context provenance/arithmetic, process run/session identity, and one
+run-usage observation without an await point or external effect, then renders
+only the usage section. Reported/missing coverage, cached-token absence versus
+reported zero, unavailable cost, terminal destination, and offline zero-send
+behavior remain explicit. Bare `/usage`, calendar history, account/price/limit
+data, `/cost` aliasing, `/status` and `/context` migration, and a JSONL
+`command_result` contract remain separate cards.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

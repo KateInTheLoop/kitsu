@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 111.
+updates through Cycle 112.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -369,6 +369,12 @@ kernel.
   transfer a non-cloneable child into typed residue. No OS backend, containment
   enforcement, natural-exit composition, configuration, MCP, or product route
   exists.
+- Cycle 112 mounts exact `/usage session` on one coherent in-memory snapshot.
+  It reads the current route receipt once, samples effective authority, context,
+  run/session identity, and usage without an await or external effect, and
+  renders only the existing adaptive usage section. Missing reports/cached
+  attribution/cost remain unavailable. JSONL command-result parity, aliases,
+  history, account data, and full status/context migration remain absent.
 - These changes close X001. X002-X005 remain failed until their named default
   and independent implementations execute complete conformance suites.
 
@@ -380,7 +386,7 @@ kernel.
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
 | External runtime tools | Static request inventory; closed external identities/fingerprints; exact atomic external-inventory publication; exact bounded child policy/admission plus provider-free lifecycle and phase-supervisor truth; pure bounded tools-only MCP codec | Same-process compiled handlers only; external snapshot has no live handler composition; runtime and phase effects have no real enforcing backend; lifecycle effects are injected fixtures; codec owns no transport | E06 identity, admission/policy, publication, lifecycle, phase, and wire foundations begun; no real child, MCP composition, or product configuration |
-| Host/UI protocol | CLI carriers plus one-way JSONL; pure unmounted current-session telemetry DTO, truthful current-run usage coverage input, and private adaptive renderer | Consumer cannot service synchronous calls; snapshot/renderer perform no discovery; coverage makes no account/provider request | No named second host, no product snapshot collector, and slash output is unchanged; X003/X004 fail |
+| Host/UI protocol | CLI carriers plus one-way JSONL; typed current-session telemetry DTO, truthful current-run usage coverage, private adaptive renderer, and exact offline `/usage session` collection/routing | Consumer cannot service synchronous calls; the mounted command samples in-memory owners only and performs no provider/account/network/fs/persistence effect; JSONL deliberately has no new command-result contract | First truthful usage slice is live, but no named second host, full status/context migration, aliases, automation parity, or durable history exists; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
 ## Three spines and extraction order

@@ -11,7 +11,6 @@ mod llms;
 mod process_exit;
 mod prompt_queue;
 mod session;
-#[allow(dead_code)] // Staged typed deck renderer; slash-command mounting is a later card.
 mod session_telemetry_render;
 mod skills;
 mod structured_output;
@@ -5550,6 +5549,14 @@ const SLASH_COMMANDS: &[SlashCommandSpec] = &[
         group: CommandGroup::FilesDiffsCheckpoints,
         alias_of: None,
     },
+    SlashCommandSpec {
+        name: "usage",
+        args: "session",
+        description: "show observed provider token usage for this session",
+        details: "Shows current-process provider usage and exact response coverage. Missing usage and cached-token attribution stay unavailable; no prices, credits, rate limits, or account data are inferred.",
+        group: CommandGroup::ContextHistory,
+        alias_of: None,
+    },
 ];
 
 fn matching_slash_commands(prefix: &str) -> Vec<&'static SlashCommandSpec> {
@@ -7422,6 +7429,219 @@ fn context_totals(
         estimated
     };
     (window, effective, used)
+}
+
+fn minimal_root_count(mut roots: Vec<std::path::PathBuf>) -> u64 {
+    roots.sort();
+    roots.dedup();
+    let mut minimal = Vec::<std::path::PathBuf>::new();
+    for root in roots {
+        if minimal.iter().any(|parent| root.starts_with(parent)) {
+            continue;
+        }
+        minimal.push(root);
+    }
+    u64::try_from(minimal.len()).unwrap_or(u64::MAX)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn current_session_authority_input(
+    mode: Mode,
+    read_roots: Vec<std::path::PathBuf>,
+    write_roots: Vec<std::path::PathBuf>,
+    protected_read_roots: Vec<std::path::PathBuf>,
+    protected_write_roots: Vec<std::path::PathBuf>,
+    exact_command_grants: u64,
+    commands_enabled: bool,
+) -> kitsu_core::EffectiveAuthorityInput {
+    let protected_roots = protected_read_roots
+        .into_iter()
+        .chain(protected_write_roots)
+        .collect();
+    kitsu_core::EffectiveAuthorityInput {
+        mode: match mode {
+            Mode::Ask => kitsu_core::EffectiveAuthorityMode::Ask,
+            Mode::Scoped => kitsu_core::EffectiveAuthorityMode::Scoped,
+            Mode::AutoAllow => kitsu_core::EffectiveAuthorityMode::AutoAllow,
+            Mode::Deny => kitsu_core::EffectiveAuthorityMode::Deny,
+        },
+        read_roots: minimal_root_count(read_roots),
+        write_roots: minimal_root_count(write_roots),
+        protected_roots: minimal_root_count(protected_roots),
+        exact_command_grants,
+        commands_enabled,
+    }
+}
+
+fn current_session_context_input(
+    reported_window: Option<u64>,
+    source: ContextWindowSource,
+    max_tokens: Option<u32>,
+    used_tokens: u64,
+    provider_anchored: bool,
+    window_evidence: Option<kitsu_core::ContextWindowEvidence>,
+) -> kitsu_core::ContextSnapshotInput {
+    let resolved_window = reported_window.unwrap_or(DEFAULT_CONTEXT_WINDOW);
+    let conservative_default = matches!(&source, ContextWindowSource::ConservativeDefault);
+    let telemetry_source = match source {
+        ContextWindowSource::Cli => kitsu_core::ContextWindowSource::CommandLine,
+        ContextWindowSource::Profile => kitsu_core::ContextWindowSource::GatewayProfile,
+        ContextWindowSource::DiskCache => kitsu_core::ContextWindowSource::DiskCache,
+        ContextWindowSource::LiveDiscovery => {
+            kitsu_core::ContextWindowSource::LiveProviderDiscovery
+        }
+        ContextWindowSource::ConservativeDefault => {
+            kitsu_core::ContextWindowSource::ConservativeDefault
+        }
+    };
+    let window_provenance = kitsu_core::TelemetryProvenance::ContextWindow(telemetry_source);
+    let window_tokens = if conservative_default {
+        kitsu_core::TelemetryValue::estimated(resolved_window, window_provenance)
+    } else {
+        kitsu_core::TelemetryValue::authoritative(resolved_window, window_provenance)
+    };
+    let budgeted_window = window_evidence.map_or(resolved_window, |evidence| {
+        if evidence.resolved_window == resolved_window {
+            clamp_window_for_shortfall(
+                resolved_window,
+                evidence.reported_prompt_tokens,
+                evidence.shortfall_count,
+            )
+        } else {
+            resolved_window
+        }
+    });
+    let effective_tokens = ContextBudget::new(budgeted_window, max_tokens).effective;
+    kitsu_core::ContextSnapshotInput {
+        window_tokens,
+        effective_tokens: kitsu_core::TelemetryValue::derived(
+            effective_tokens,
+            kitsu_core::TelemetryProvenance::ContextBudgetArithmetic,
+        ),
+        used_tokens: kitsu_core::TelemetryValue::estimated(
+            used_tokens,
+            if provider_anchored {
+                kitsu_core::TelemetryProvenance::ProviderAnchoredContextMeter
+            } else {
+                kitsu_core::TelemetryProvenance::ContextMeterEstimate
+            },
+        ),
+    }
+}
+
+fn current_session_snapshot_from_observation(
+    provider_route: ProviderRouteReceipt,
+    session_id: Option<String>,
+    run_id: kitsu_core::RunId,
+    authority: kitsu_core::EffectiveAuthorityInput,
+    context: kitsu_core::ContextSnapshotInput,
+    usage: kitsu_core::RunUsageSnapshot,
+) -> kitsu_core::CurrentSessionSnapshot {
+    kitsu_core::CurrentSessionSnapshot::from_input(kitsu_core::CurrentSessionSnapshotInput {
+        provider_route,
+        session_id: session_id.and_then(|session_id| kitsu_core::SessionId::new(session_id).ok()),
+        run_id: Some(run_id),
+        authority,
+        context,
+        usage: kitsu_core::SessionUsageInput::from_run_usage(
+            &usage,
+            kitsu_core::SessionCostInput::unavailable(),
+        ),
+    })
+}
+
+/// Capture the existing current-process owners into one typed DTO without an
+/// await point or a provider, account, filesystem, or persistence operation.
+fn collect_current_session_snapshot(
+    provider_route: ProviderRouteReceipt,
+    messages: &[ChatMessage],
+    session: &SessionInfo,
+    perms: &Permissions,
+    state: &kitsu_core::AgentSessionState,
+) -> kitsu_core::CurrentSessionSnapshot {
+    let session_id = session.session_id.borrow().clone();
+    let run_id = run_spec().run_id().clone();
+
+    // Take each authority collection once, then reduce those immutable local
+    // observations. Protected read/write paths are one authority surface.
+    let mode = perms.mode();
+    let read_roots = perms.read_roots();
+    let write_roots = perms.write_roots();
+    let protected_read_roots = perms.protected_read_roots();
+    let protected_write_roots = perms.protected_write_roots();
+    let command_grants = session
+        .command_policy
+        .as_ref()
+        .map(|policy| policy.session_grants())
+        .unwrap_or_default();
+    let commands_enabled = session
+        .tool_names
+        .iter()
+        .any(|tool_name| tool_name == "command_exec");
+    let authority = current_session_authority_input(
+        mode,
+        read_roots,
+        write_roots,
+        protected_read_roots,
+        protected_write_roots,
+        u64::try_from(command_grants.len()).unwrap_or(u64::MAX),
+        commands_enabled,
+    );
+
+    let reported_window = session.window.get();
+    let source = context_window_provenance(&session.window_provenance).source;
+    let breakdown = ContextMeter::new().breakdown(messages);
+    let provenance_tokens = session
+        .provenance
+        .borrow()
+        .iter()
+        .fold(0_u64, |total, entry| total.saturating_add(entry.tokens));
+    let estimated = provenance_tokens
+        .saturating_add(breakdown.user)
+        .saturating_add(breakdown.assistant)
+        .saturating_add(breakdown.tool_results);
+    let provider_anchored = state.meter.anchored(messages);
+    let used_tokens = if provider_anchored {
+        state.meter.estimate(messages)
+    } else {
+        estimated
+    };
+    let context = current_session_context_input(
+        reported_window,
+        source,
+        session.max_tokens,
+        used_tokens,
+        provider_anchored,
+        state.window_evidence,
+    );
+    let usage = session.run_tallies.usage_snapshot();
+
+    current_session_snapshot_from_observation(
+        provider_route,
+        session_id,
+        run_id,
+        authority,
+        context,
+        usage,
+    )
+}
+
+fn current_session_deck_options(cli: &Cli) -> session_telemetry_render::TelemetryDeckOptions {
+    let destination = if cli.screen_reader {
+        session_telemetry_render::TelemetryDeckDestination::ScreenReader
+    } else if cli.plain {
+        session_telemetry_render::TelemetryDeckDestination::Plain
+    } else if kitsu_render::plain_mode() {
+        session_telemetry_render::TelemetryDeckDestination::NoColor
+    } else if kitsu_render::stderr_styled() {
+        session_telemetry_render::TelemetryDeckDestination::StyledTerminal
+    } else {
+        session_telemetry_render::TelemetryDeckDestination::Redirected
+    };
+    session_telemetry_render::TelemetryDeckOptions {
+        destination,
+        columns: current_terminal_columns().unwrap_or(80),
+    }
 }
 
 const fn provider_adapter_label(adapter: ProviderAdapterId) -> &'static str {
@@ -17950,6 +18170,34 @@ async fn handle_slash(
                 return SlashResult::Error;
             }
         },
+        "usage" => {
+            if arg != "session" {
+                eprintln!("usage: {}", slash_syntax("usage"));
+                return SlashResult::Error;
+            }
+            // The receipt is a secret-free, in-memory observation of the
+            // already-bound route. This command never sends a provider request.
+            let provider_route = match provider.receipt() {
+                Ok(receipt) => receipt,
+                Err(error) => {
+                    eprintln!("cannot inspect current provider route: {error}");
+                    return SlashResult::Error;
+                }
+            };
+            let snapshot =
+                collect_current_session_snapshot(provider_route, messages, session, perms, state);
+            if !cli.jsonl {
+                eprintln!(
+                    "{}",
+                    session_telemetry_render::render_current_session_usage(
+                        &snapshot,
+                        current_session_deck_options(cli),
+                    )
+                );
+            }
+            // Deliberately no JSONL command_result contract in this card.
+            return SlashResult::Continue(None);
+        }
         "compact" => {
             let mut cfg = build_agent_config(
                 model.clone(),
@@ -19455,6 +19703,173 @@ mod tests {
         assert_eq!(failure_count_phrase(2), "2 failures");
     }
 
+    fn telemetry_route_receipt_fixture() -> ProviderRouteReceipt {
+        serde_json::from_value(serde_json::json!({
+            "receipt_revision": 1,
+            "route": {
+                "contract_revision": 1,
+                "adapter": "openai_compatible",
+                "profile": "profile-v1-0123456789abcdef0123456789abcdef",
+                "generation": 3,
+                "wire_revision": "openai_chat_completions_v1",
+                "capabilities": { "revision": 1, "supported": ["usage"] }
+            },
+            "model": "fixture-model",
+            "auth_source": "environment",
+            "policy": {
+                "inference_retries": 0,
+                "catalog_retries": 0,
+                "inference_timeout": { "seconds": 30, "nanoseconds": 0 },
+                "catalog_timeout": { "seconds": 10, "nanoseconds": 0 },
+                "advisory_discovery_timeout": { "seconds": 2, "nanoseconds": 0 },
+                "catalog": "unavailable",
+                "retry_generation": "bound_generation",
+                "semantic_replay_generation": "current_generation",
+                "fallback": "disabled"
+            }
+        }))
+        .expect("provider-free route receipt fixture")
+    }
+
+    #[test]
+    fn current_session_authority_counts_minimal_roots_and_protected_union_once() {
+        let authority = current_session_authority_input(
+            Mode::Scoped,
+            vec!["/work".into(), "/work/src".into(), "/other".into()],
+            vec!["/work".into(), "/work/out".into(), "/work".into()],
+            vec!["/private".into(), "/private/config".into()],
+            vec!["/private".into(), "/state".into(), "/state/cache".into()],
+            2,
+            true,
+        );
+
+        assert_eq!(authority.mode, kitsu_core::EffectiveAuthorityMode::Scoped);
+        assert_eq!(authority.read_roots, 2);
+        assert_eq!(authority.write_roots, 1);
+        assert_eq!(authority.protected_roots, 2);
+        assert_eq!(authority.exact_command_grants, 2);
+        assert!(authority.commands_enabled);
+    }
+
+    #[test]
+    fn current_session_context_preserves_default_anchor_and_shortfall_truth() {
+        let default = current_session_context_input(
+            None,
+            ContextWindowSource::ConservativeDefault,
+            Some(2_048),
+            1_000,
+            false,
+            None,
+        );
+        assert_eq!(default.window_tokens.value(), Some(&DEFAULT_CONTEXT_WINDOW));
+        assert_eq!(
+            default.window_tokens.truth_class(),
+            kitsu_core::TruthClass::Estimated
+        );
+        assert_eq!(
+            default.used_tokens.provenance(),
+            kitsu_core::TelemetryProvenance::ContextMeterEstimate
+        );
+
+        let clamped = current_session_context_input(
+            Some(32_768),
+            ContextWindowSource::LiveDiscovery,
+            Some(2_048),
+            12_000,
+            true,
+            Some(kitsu_core::ContextWindowEvidence {
+                reported_prompt_tokens: 8_192,
+                estimated_sent_tokens: 20_000,
+                resolved_window: 32_768,
+                warned: true,
+                shortfall_count: 2,
+            }),
+        );
+        assert_eq!(clamped.window_tokens.value(), Some(&32_768));
+        assert_eq!(
+            clamped.window_tokens.truth_class(),
+            kitsu_core::TruthClass::Authoritative
+        );
+        assert_eq!(
+            clamped.used_tokens.provenance(),
+            kitsu_core::TelemetryProvenance::ProviderAnchoredContextMeter
+        );
+        assert_eq!(
+            clamped.effective_tokens.value(),
+            Some(&ContextBudget::new(8_192, Some(2_048)).effective)
+        );
+        assert_eq!(
+            clamped.effective_tokens.truth_class(),
+            kitsu_core::TruthClass::Derived
+        );
+    }
+
+    #[test]
+    fn current_session_observation_preserves_mixed_coverage_and_cached_presence() {
+        let authority = current_session_authority_input(
+            Mode::Deny,
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            Vec::new(),
+            0,
+            false,
+        );
+        let context = current_session_context_input(
+            Some(16_384),
+            ContextWindowSource::Profile,
+            Some(1_024),
+            400,
+            false,
+            None,
+        );
+        let coverage = |cached_prompt_tokens| kitsu_core::RunUsageSnapshot {
+            turns: 2,
+            prompt_tokens: 120,
+            completion_tokens: 30,
+            total_tokens: 150,
+            coverage: kitsu_core::RunProviderUsageCoverageSnapshot {
+                all: kitsu_core::ProviderUsageCoverageSnapshot {
+                    responses_reporting_usage: 2,
+                    responses_missing_usage: 1,
+                    cached_prompt_tokens,
+                },
+                ..Default::default()
+            },
+        };
+
+        let absent = current_session_snapshot_from_observation(
+            telemetry_route_receipt_fixture(),
+            Some("bad session id".to_string()),
+            run_spec().run_id().clone(),
+            authority,
+            context.clone(),
+            coverage(None),
+        );
+        assert_eq!(absent.status.session_id.value(), None);
+        assert_eq!(absent.usage.responses_reporting_usage.value(), Some(&2));
+        assert_eq!(absent.usage.responses_missing_usage.value(), Some(&1));
+        assert_eq!(absent.usage.cached_prompt_tokens.value(), None);
+
+        let supplied_zero = current_session_snapshot_from_observation(
+            telemetry_route_receipt_fixture(),
+            Some("session-42".to_string()),
+            run_spec().run_id().clone(),
+            authority,
+            context,
+            coverage(Some(0)),
+        );
+        assert_eq!(
+            supplied_zero.status.session_id.value(),
+            Some(&"session-42".to_string())
+        );
+        assert_eq!(supplied_zero.usage.cached_prompt_tokens.value(), Some(&0));
+        assert_eq!(
+            supplied_zero.usage.monetary_cost.truth_class(),
+            kitsu_core::TruthClass::Unavailable
+        );
+    }
+
     #[test]
     fn cli_errors_preserve_neutral_outcome_class_independently_from_exit_code() {
         assert_eq!(
@@ -20526,6 +20941,19 @@ mod tests {
         assert!(help.ends_with(
             "current model: test-model — /help <command> explains one command in detail"
         ));
+    }
+
+    #[test]
+    fn usage_registry_exposes_only_the_exact_session_form() {
+        let usage = SLASH_COMMANDS
+            .iter()
+            .find(|spec| spec.name == "usage")
+            .expect("/usage is registered");
+        assert_eq!(usage.args, "session");
+        assert_eq!(usage.syntax(), "/usage session");
+        assert!(!usage.description.contains("daily"));
+        assert!(!usage.description.contains("weekly"));
+        assert!(!usage.description.contains("cost"));
     }
 
     #[test]
