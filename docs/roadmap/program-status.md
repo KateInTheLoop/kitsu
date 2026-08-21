@@ -5,18 +5,19 @@ implemented through C41, E03-S04 through Cycle 076, and E03-S05 is in progress
 through Cycle 080; E06-S01 and E06-S02 are implemented through C2, and E06-S03
 has begun through C1;
 E08 telemetry observability was scoped in Cycle 030 and its presentation-neutral
-current-session snapshot is implemented through Cycle 106.
+current-session snapshot is implemented through Cycle 106. E06-S02 now includes
+provider-free monotonic inventory publication through Cycle 107.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 106 / 106 |
+| Accepted cycles/commits after this cycle | 107 / 107 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 107 — E06-S02-C3: add provider-free monotonic inventory publication, atomic replacement/withdrawal, and stale-incarnation refusal |
+| Active epic/card | Cycle 108 — E06-S01-C3: bind exact phase budgets, I/O limits, process-group, environment, network, and timeout/reap policy into child preparation |
 
 ## Epic status
 
@@ -27,7 +28,7 @@ current-session snapshot is implemented through Cycle 106.
 | E02 causal run/outcome | **Accepted** | One process owner, exact phase facts, interactive aggregate, and one human/JSONL exit evaluator pass the independent seven-carrier matrix; X004 still lacks a named alternate runtime adapter |
 | E04 provider spine | **Accepted** through Cycle 049 | Thirty-one wire, two common route-handle, and one two-adapter product-surface conformance suite cover protocol evidence, secret-free identity, immutable request models, exact successor publication, old-work drain, status/JSONL/doctor receipts, success/fault/cancellation attempt correlation, and offline no-construction. The distinct native adapter supplies a bounded `max_tokens` default and rejects explicit zero before send. X001 passes without runtime loading or executable configuration |
 | E03 session spine | **In progress**; E03-S01/S04 accepted, E03-S02 through C41, E03-S05 through C4 | Startup and in-process durable resume now select exact bound-current state. In-process target ownership is staged through every fallible precommit step and swaps once only after provider publication; canonical still refuses without an operation writer. Remaining lifecycle integration, K01-K12, and X005 remain open |
-| E06 child/MCP spine | **In progress** through E06-S01-C2, E06-S02-C2, and E06-S03-C1; depends only on accepted E01/E02 | Single-use preparation now feeds a causal, joined lifecycle owner with typed residue, but only through injected synchronous effects. Next add bounded real-child phase ownership and monotonic inventory publication; no product MCP route exists |
+| E06 child/MCP spine | **In progress** through E06-S01-C2, E06-S02-C3, and E06-S03-C1; depends only on accepted E01/E02 | Validated inventories now publish/replace/withdraw atomically through exact source-lifetime and revision fences. Single-use preparation feeds a causal, joined lifecycle owner only through injected synchronous effects. Next bind exact runtime policy before adding a real child; no product MCP route exists |
 | E07 semantic context | Planned after three spines | Fixed-corpus relevance/token budget plus authority/stale-edit gates |
 | E05 onboarding | Planned after provider surfaces stabilize | Transactional setup/picker and PF-10 first-success gates |
 | E08 telemetry/docs | **In progress** through E08-S05-C1 | Pure current-session status/context/usage DTOs consume E04 receipts and label every value with truth/provenance. Next extend run tallies with reported/missing coverage and cached tokens before any product adapter or renderer; durable history still consumes E03 fencing |
@@ -143,7 +144,8 @@ current-session snapshot is implemented through Cycle 106.
 | 103 | `d87119f` | Pinned bounded tools-only MCP codec |
 | 104 | `74ba671` | Closed external source identities and descriptor fingerprints |
 | 105 | `a8462e6` | Single-use joined external child lifecycle truth |
-| 106 | this document's commit | Typed current-session telemetry truth and provenance |
+| 106 | `0b7b882` | Typed current-session telemetry truth and provenance |
+| 107 | this document's commit | Exact atomic external-inventory publication and withdrawal |
 
 ## Current green gates
 
@@ -707,6 +709,14 @@ portable cost. Review removed the generic cost escape hatch: only an explicit
 provider-reported currency observation can populate cost, and Kitsu never
 derives it from a model name or token count. The module has no renderer, CLI,
 JSONL, persistence, provider call, filesystem, or process dependency.
+Cycle 107 adds the monotonic publication half of the external inventory
+boundary. One non-cloneable owner borrows or consumes only complete validated
+snapshots. Initial publication is create-only; ordinary updates require the
+exact same source lifetime and immediate revision; explicit replacement and
+withdrawal require the exact current fence. Refused transitions preserve the
+same allocated snapshot, and maximum revision cannot wrap. This remains
+provider-free and unmounted: it owns no handlers, child, transport, MCP codec,
+configuration, or product authority.
 
 No provider, session, MCP, semantic-context, onboarding, or multimodal feature
 jumps this foundation because all depend on truthful causal outcome and joined

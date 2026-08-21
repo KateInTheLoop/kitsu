@@ -149,6 +149,12 @@ impl ValidatedExternalInventoryV1 {
     }
 }
 
+impl ExternalInventoryRevisionV1 {
+    pub(crate) fn is_immediate_successor_of(self, previous: Self) -> bool {
+        previous.0.get().checked_add(1) == Some(self.0.get())
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum DescriptorSchemaErrorV1 {
     RootNotObject,
