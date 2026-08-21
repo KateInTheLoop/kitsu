@@ -20,6 +20,9 @@ Current comparison: [`current-comparison.md`](current-comparison.md)
 
 Program status: [`program-status.md`](program-status.md)
 
+Parallel delivery after the Cycle 100 checkpoint:
+[`parallel-delivery-plan.md`](parallel-delivery-plan.md)
+
 Provider wire fixture contract:
 [`e04-primary-wire-fixtures.md`](e04-primary-wire-fixtures.md)
 
@@ -705,6 +708,7 @@ gates merely because a card appears attractive.
 | 097 | E03-S02-C38 | Unify current-v1 and private bound activation behind one exact resume-result shape without route selection |
 | 098 | E03-S02-C39 | Admit only snapshot-writable bound-current resume and reject canonical state before product routing |
 | 099 | E03-S02-C40 | Mount durable startup resume on the pinned bound-current route with explicit canonical refusal |
+| 100 | E03-S02-C41 | Stage an exact bound-current in-process target and swap the active owner only after every fallible precommit step |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -861,10 +865,15 @@ effect-free. Cycle 099 mounts durable startup resume on one pinned selector-to-I
 and bound-current activation. Exact/name/`last`/`auto` return only the snapshot
 selected under the owner; exact canonical state refuses before runtime parts.
 Bound-current reset atomically hands off to a fresh current-v1 owner so `/new`
-remains usable; canonical reset still refuses. Cycle 100 next applies the same
-route as a staged in-process owner swap and runs the consolidated review,
-workspace acceptance, polish, and branch checkpoint before E03, E06, E07,
-E05/E08, and E09 continue in dependency-safe parallel tracks.
+remains usable; canonical reset still refuses. Cycle 100 applies the same route
+to in-process `/resume`. The target owner remains staged beside the old owner
+while Kitsu validates gateway, directory, system context, current-session
+persistence, context discovery, and provider-generation replacement. Any
+failure drops only the target; success consumes the exact target snapshot and
+performs one infallible active-owner swap. The polished checkpoint then feeds
+the dependency-safe candidate branches in the
+[parallel delivery plan](parallel-delivery-plan.md); integration acceptance and
+cycle numbering remain serialized.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

@@ -16513,16 +16513,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     let active_id = session.session_id.borrow().clone();
-                    let saved = match session::SessionStore::load_other(
-                        &sessions_dir,
-                        &selector,
-                        active_id.as_deref(),
-                    ) {
-                        Ok(saved) => saved,
-                        Err(error) => {
-                            eprintln!("cannot resume chat: {error}");
-                            continue;
-                        }
+                    let read_only_saved;
+                    let staged_resume;
+                    let saved = if no_session {
+                        staged_resume = None;
+                        read_only_saved = Some(
+                            match session::SessionStore::load_other(
+                                &sessions_dir,
+                                &selector,
+                                active_id.as_deref(),
+                            ) {
+                                Ok(saved) => saved,
+                                Err(error) => {
+                                    eprintln!("cannot resume chat: {error}");
+                                    continue;
+                                }
+                            },
+                        );
+                        read_only_saved.as_ref().expect("read-only resume value")
+                    } else {
+                        read_only_saved = None;
+                        staged_resume = Some(
+                            match session::ActiveSessionStore::resume_other_bound_current_v1(
+                                sessions_dir.clone(),
+                                &selector,
+                                active_id.as_deref(),
+                            ) {
+                                Ok(staged) => staged,
+                                Err(error) => {
+                                    eprintln!("cannot resume chat: {error}");
+                                    continue;
+                                }
+                            },
+                        );
+                        staged_resume.as_ref().expect("staged resume").saved()
                     };
                     if saved.gateway != session.gateway {
                         eprintln!(
@@ -16562,29 +16586,6 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         continue;
                     }
                     report_write_checkpoints(write_journal.drain_and_take_reports().await);
-                    let (resumed_store, saved) = if no_session {
-                        (None, saved)
-                    } else {
-                        match session::ActiveSessionStore::resume_current_v1(
-                            sessions_dir.clone(),
-                            saved,
-                        ) {
-                            Ok(handoff) => {
-                                let (store, saved) = match handoff.into_current_v1_parts() {
-                                    Ok(parts) => parts,
-                                    Err(error) => {
-                                        eprintln!("cannot autosave resumed session: {error}");
-                                        continue;
-                                    }
-                                };
-                                (Some(store), saved)
-                            }
-                            Err(error) => {
-                                eprintln!("cannot autosave resumed session: {error}");
-                                continue;
-                            }
-                        }
-                    };
                     let resumed_model = saved.model.clone();
                     let resumed_window = if setup.context_window_pinned {
                         context_window.get()
@@ -16644,6 +16645,16 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
                         );
                         continue;
                     }
+                    let (resumed_store, saved) = match staged_resume {
+                        Some(staged) => {
+                            let (store, saved) = staged.into_parts();
+                            (Some(store), saved)
+                        }
+                        None => (
+                            None,
+                            read_only_saved.expect("read-only resume value after validation"),
+                        ),
+                    };
                     model = resumed_model;
                     context_window.set(resumed_window);
                     if !setup.context_window_pinned {

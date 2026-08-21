@@ -867,6 +867,15 @@ cannot weaken or replace any backend-neutral assertion.
    first, then replaces and drops the bound owner. Failure retains the old owner,
    and canonical reset remains refused. In-process resume still uses the prior
    current-v1 handoff until the staged-swap boundary.
+   **Bound-current in-process staged swap complete in Cycle 100:** `/resume`
+   resolves and admits the target while the old active owner is still retained.
+   Both leases remain held across target validation, current-session save,
+   context-window discovery, and provider-generation replacement. A failure in
+   any of those fallible steps drops only the staged target and leaves the old
+   owner mounted. After provider publication, one consuming split supplies the
+   exact snapshot and target owner; the infallible assignment releases the old
+   owner exactly once. No-session mode continues to use the read-only snapshot
+   route, and canonical targets still refuse before product parts.
 4. Add explicit v1-to-v2 migration, retained revision generations, projection
    rebuild, and verified last-good recovery.
 5. Add branch-at-turn, artifact closure, export/import, and full K01-K12.
