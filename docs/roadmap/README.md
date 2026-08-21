@@ -262,8 +262,8 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 is accepted, E03-S02 is implemented through C21, and E03-S04 is
-in progress through Cycle 075. The
+Status: E03-S01 and E03-S04 are accepted, and E03-S02 is implemented through
+C21. Cycle 076 completes the private recovery path. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
 HEAD, resume intent, lineage, artifact closure, and compaction binding to one
@@ -345,7 +345,15 @@ root, digest, schema, ancestor-state, cycle, or bound blocker. Pure recovery
 assembly copies only the fully verified source state into a fresh revision whose
 exact parent is the corrupt selected revision, clears stale compaction, and
 binds source revision/HEAD, selection, ordered evidence, and time. Ordinary
-lookup remains corrupt and no recovery revision is published yet.
+lookup remains corrupt until an explicit recovery transaction publishes.
+A private recovery transaction now acquires the session writer fence, repeats
+exact selected-envelope admission, retains selected and source manifest digests
+through reopen, installs the assembled causal child without reading corrupt
+parent bytes, rechecks artifact closure, and CASes only that exact envelope.
+Confirmed publication, installed-unselected candidate cuts, and
+published-unconfirmed HEAD-sync cuts retain exact receipts; unavailable or stale
+plans allocate/select nothing. This path remains unmounted, so production
+current-v1 behavior and rollback bytes are unchanged.
 
 | Story | User story | Requirements | Acceptance evidence | Size |
 |---|---|---|---|---|
@@ -632,6 +640,8 @@ gates merely because a card appears attractive.
 | 072 | E03-S02-C21 | Bind successor manifests to exact parent digests and verify bounded selected lineage without orphan promotion |
 | 073 | E03-S04-C1 | Derive a read-only verified last-good plan across digest-bound logical corruption without changing selected HEAD |
 | 074 | E03-S04-C2 | Split trusted manifest envelopes from payload verification and recover-plan across physical payload faults |
+| 075 | E03-S04-C3 | Assemble a fresh causal recovery revision with ordered skip evidence and exact unavailable blockers |
+| 076 | E03-S04-C4 | Publish recovery under the writer fence and exact selected envelope with old-or-new receipt truth |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -708,7 +718,8 @@ a mutation-free last-good plan for logically corrupt selected ancestry; Cycle
 faults. Cycle 075 defines a pure new recovery revision and complete skipped/
 blocker evidence. Cycle 076 composes envelope-only selected-parent admission,
 writer fencing, immutable install, HEAD CAS, and exact recovery receipts before
-production mounting; then the queue continues
+production mounting. Cycle 077 begins pure branch-at-committed-turn prefix,
+lineage, and artifact-closure assembly; then the queue continues
 through E03, E06, E07, E05/E08, and E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete

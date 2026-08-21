@@ -14,10 +14,10 @@ use kitsu_core::session::{
 #[cfg(test)]
 use super::canonical::CanonicalToolRoundV1;
 use super::canonical::{
-    append_complete_operation, decode_canonical_payload_classified, encode_canonical_payload,
-    prepare_current_v1_legacy_baseline, CanonicalOperationInputV1, CanonicalPayloadDecodeErrorV1,
-    CanonicalRecoverySkipV1, CanonicalSessionRevisionV1, ImmutableArtifactRefV1,
-    LOGICAL_SCHEMA_REVISION,
+    append_complete_operation, assemble_recovery_revision, decode_canonical_payload_classified,
+    encode_canonical_payload, prepare_current_v1_legacy_baseline, CanonicalOperationInputV1,
+    CanonicalPayloadDecodeErrorV1, CanonicalRecoverySkipV1, CanonicalSessionRevisionV1,
+    ImmutableArtifactRefV1, LOGICAL_SCHEMA_REVISION,
 };
 use super::physical::{
     ArtifactManifestV1, PhysicalArtifactReadErrorV1, PhysicalCandidateInstallError,
@@ -287,9 +287,11 @@ enum CanonicalRecoveryPlanV1 {
     },
     Available {
         selected: RevisionId,
+        selected_manifest_sha256: String,
         selected_state: SessionLookupState,
         recovery: RevisionId,
         recovery_head: kitsu_core::session::LogicalHead,
+        recovery_manifest_sha256: String,
         skipped: Vec<CanonicalRecoverySkipV1>,
     },
     Unavailable {
@@ -570,6 +572,11 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             }
         };
         let selected = selected_head.revision_id().clone();
+        let selected_manifest_sha256 = selected_head
+            .envelope()
+            .manifest_sha256()
+            .as_str()
+            .to_string();
         let selected_error = match self
             .store
             .verify_revision_candidate(selected_head.envelope())
@@ -728,11 +735,14 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             };
             match self.decode_canonical_candidate(session_id, parent_revision.clone(), &candidate) {
                 Ok(verified) => {
+                    let recovery_head = verified.payload.selected_head().clone();
                     return CanonicalRecoveryPlanV1::Available {
                         selected,
+                        selected_manifest_sha256,
                         selected_state,
                         recovery: parent_revision,
-                        recovery_head: verified.payload.selected_head().clone(),
+                        recovery_head,
+                        recovery_manifest_sha256: verified.manifest_sha256,
                         skipped,
                     };
                 }
@@ -921,6 +931,252 @@ impl<'a> CanonicalFileTransactionV1<'a> {
             ));
         }
         self.commit(&payload)
+    }
+
+    fn commit_last_good_recovery(
+        &self,
+        session_id: &SessionId,
+        revision_id: RevisionId,
+        committed_at: String,
+    ) -> Result<CanonicalTransactionCommitV1, CanonicalTransactionErrorV1> {
+        // A read-only hint lets a failed fence acquisition still report the
+        // exact base it attempted. Admission is repeated under the fence before
+        // any candidate can be allocated.
+        let selected_hint = self
+            .store
+            .read_head_envelope(session_id)
+            .map_err(|error| CanonicalTransactionErrorV1::before_identity(error.to_string()))?
+            .ok_or_else(|| {
+                CanonicalTransactionErrorV1::before_identity(
+                    "cannot recover a canonical session without a selected HEAD",
+                )
+            })?;
+        let expected = ExpectedRevision::Exact(selected_hint.revision_id().clone());
+        let fence = self
+            .store
+            .acquire_writer_fence(session_id)
+            .map_err(|message| {
+                CanonicalTransactionErrorV1::not_published(
+                    message,
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        let selected = self
+            .store
+            .read_head_envelope(session_id)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    error.to_string(),
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+            .ok_or_else(|| {
+                CanonicalTransactionErrorV1::not_published(
+                    "selected canonical HEAD disappeared before recovery admission",
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if selected.revision_id() != selected_hint.revision_id()
+            || selected.envelope().manifest_sha256() != selected_hint.envelope().manifest_sha256()
+        {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "selected canonical HEAD changed before recovery admission",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+
+        let (
+            selected_revision,
+            selected_manifest_sha256,
+            source_revision,
+            source_head,
+            source_manifest_sha256,
+            skipped,
+        ) = match self.plan_last_good_recovery(session_id) {
+            CanonicalRecoveryPlanV1::Available {
+                selected,
+                selected_manifest_sha256,
+                recovery,
+                recovery_head,
+                recovery_manifest_sha256,
+                skipped,
+                ..
+            } => (
+                selected,
+                selected_manifest_sha256,
+                recovery,
+                recovery_head,
+                recovery_manifest_sha256,
+                skipped,
+            ),
+            plan => {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    format!("canonical recovery is unavailable: {plan:?}"),
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                ));
+            }
+        };
+        if selected_revision != *selected.revision_id()
+            || selected_manifest_sha256 != selected.envelope().manifest_sha256().as_str()
+        {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "recovery plan selected a different canonical HEAD envelope",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let source_candidate = self
+            .store
+            .open_revision_candidate(session_id, &source_revision)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("recovery source changed after planning: {error}"),
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?;
+        if source_candidate.manifest_sha256().as_str() != source_manifest_sha256 {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "recovery source manifest changed after planning",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let source = self
+            .decode_canonical_candidate(session_id, source_revision.clone(), &source_candidate)
+            .map_err(|error| {
+                CanonicalTransactionErrorV1::not_published(
+                    format!("recovery source no longer verifies: {error}"),
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::None,
+                )
+            })?
+            .payload;
+        if source.selected_head() != &source_head {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "recovery source HEAD changed after planning",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::None,
+            ));
+        }
+        let payload = assemble_recovery_revision(
+            &source,
+            selected_revision,
+            revision_id,
+            committed_at,
+            skipped,
+        )
+        .map_err(|error| {
+            CanonicalTransactionErrorV1::not_published(
+                error,
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::None,
+            )
+        })?;
+        let canonical_bytes = encode_canonical_payload(&payload)
+            .map_err(CanonicalTransactionErrorV1::before_identity)?;
+        let confirmed_receipt = self.receipt(&payload, CommitDurability::Confirmed)?;
+        let unconfirmed_receipt = self.receipt(&payload, CommitDurability::PublishedUnconfirmed)?;
+
+        self.verify_artifact_closure(&payload, CandidateResidueV1::None)?;
+        let candidate = self
+            .store
+            .install_revision_candidate_against_envelope(
+                payload.logical_schema(),
+                session_id.clone(),
+                payload.revision_id().clone(),
+                selected.envelope(),
+                &canonical_bytes,
+            )
+            .map_err(|error| self.install_error(&payload, &canonical_bytes, error))?;
+        #[cfg(test)]
+        if self.fail_next_artifact_recheck.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected recovery artifact closure recheck failure",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: payload.revision_id().clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            ));
+        }
+        self.verify_artifact_closure(
+            &payload,
+            CandidateResidueV1::InstalledUnselected {
+                revision: payload.revision_id().clone(),
+                durability: CandidateDurabilityV1::Confirmed,
+            },
+        )?;
+
+        #[cfg(test)]
+        if self.fail_next_after_candidate.replace(false) {
+            return Err(CanonicalTransactionErrorV1::not_published(
+                "injected failure after immutable recovery candidate installation",
+                self.store,
+                session_id,
+                &expected,
+                CandidateResidueV1::InstalledUnselected {
+                    revision: payload.revision_id().clone(),
+                    durability: CandidateDurabilityV1::Confirmed,
+                },
+            ));
+        }
+
+        let (receipt, durability_warning) = match self
+            .store
+            .compare_and_swap_head_against_envelope(&fence, &selected, &candidate)
+        {
+            Ok(_) => (confirmed_receipt, None),
+            Err(PhysicalHeadCasError::Publication {
+                message,
+                installed: true,
+            }) => (unconfirmed_receipt, Some(message)),
+            Err(error) => {
+                return Err(CanonicalTransactionErrorV1::not_published(
+                    error.to_string(),
+                    self.store,
+                    session_id,
+                    &expected,
+                    CandidateResidueV1::InstalledUnselected {
+                        revision: payload.revision_id().clone(),
+                        durability: CandidateDurabilityV1::Confirmed,
+                    },
+                ));
+            }
+        };
+        Ok(CanonicalTransactionCommitV1 {
+            outcome: SessionCommitOutcome::Published { receipt },
+            durability_warning,
+        })
     }
 
     fn commit(
@@ -1347,6 +1603,42 @@ mod tests {
                 .all(|(actual, (revision, reason))| {
                     actual.revision() == *revision && actual.reason() == *reason
                 })
+    }
+
+    fn publish_invalid_head_successor(
+        store: &PhysicalFileStoreV1,
+        session_id: &SessionId,
+        revision: &RevisionId,
+        parent: ExpectedRevision,
+        turns: usize,
+    ) {
+        let parent_id = match &parent {
+            ExpectedRevision::Missing => None,
+            ExpectedRevision::Exact(parent) => Some(parent.as_str()),
+        };
+        let mut corrupt = serde_json::to_value(payload(
+            "store-1",
+            session_id.as_str(),
+            revision.as_str(),
+            parent_id,
+            turns,
+        ))
+        .unwrap();
+        corrupt["selected_head"] =
+            serde_json::json!({"kind": "turn", "turn": "turn-not-committed"});
+        let candidate = store
+            .install_revision_candidate(
+                LOGICAL_SCHEMA_REVISION,
+                session_id.clone(),
+                revision.clone(),
+                parent.clone(),
+                &serde_json::to_vec(&corrupt).unwrap(),
+            )
+            .unwrap();
+        let fence = store.acquire_writer_fence(session_id).unwrap();
+        store
+            .compare_and_swap_head(&fence, parent, &candidate)
+            .unwrap();
     }
 
     fn current_v1(messages: serde_json::Value) -> Vec<u8> {
@@ -2057,6 +2349,7 @@ mod tests {
                 ref recovery,
                 ref recovery_head,
                 ref skipped,
+                ..
             } if selected == &rev_b
                 && selected_state == &SessionLookupState::Corrupt {
                     session: session_id.clone(),
@@ -2256,6 +2549,7 @@ mod tests {
                 ref recovery,
                 ref recovery_head,
                 ref skipped,
+                ..
             } if selected == &rev_c
                 && selected_state == &SessionLookupState::Corrupt {
                     session: session_id.clone(),
@@ -2337,6 +2631,7 @@ mod tests {
                     ref recovery,
                     ref recovery_head,
                     ref skipped,
+                    ..
                 } if selected == &rev_b
                     && observed_state == &selected_state
                     && recovery == &rev_a
@@ -2403,6 +2698,7 @@ mod tests {
                 ref recovery,
                 ref recovery_head,
                 ref skipped,
+                ..
             } if selected == &rev_c
                 && observed_state == &selected_state
                 && recovery == &rev_a
@@ -2556,6 +2852,292 @@ mod tests {
         assert_eq!(
             transaction.lookup_canonical_head(&session_id).state(),
             &selected_state
+        );
+    }
+
+    #[test]
+    fn recovery_commit_publishes_a_fresh_causal_head_with_exact_receipt() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        publish_invalid_head_successor(
+            &store,
+            &session_id,
+            &rev_b,
+            ExpectedRevision::Exact(rev_a.clone()),
+            2,
+        );
+
+        let commit = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).base_revision(),
+            &ExpectedRevision::Exact(rev_b.clone())
+        );
+        assert_eq!(receipt(&commit).new_revision(), &rev_c);
+        assert_eq!(receipt(&commit).durability(), CommitDurability::Confirmed);
+        assert_eq!(
+            receipt(&commit).head(),
+            &kitsu_core::session::LogicalHead::Turn(
+                kitsu_core::session::TurnId::new("turn-1").unwrap()
+            )
+        );
+        assert!(commit.durability_warning().is_none());
+        let head = store.read_head(&session_id).unwrap().unwrap();
+        assert_eq!(head.revision_id(), &rev_c);
+        let decoded =
+            decode_canonical_payload_classified(head.candidate().canonical_bytes()).unwrap();
+        assert_eq!(
+            decoded.parent_revision(),
+            &ExpectedRevision::Exact(rev_b.clone())
+        );
+        let value = serde_json::to_value(decoded).unwrap();
+        assert_eq!(value["recovery_log"][0]["selected_revision"], "rev-b");
+        assert_eq!(value["recovery_log"][0]["source_revision"], "rev-a");
+        assert_eq!(value["recovery_log"][0]["recovery_revision"], "rev-c");
+        assert_eq!(value["recovery_log"][0]["skipped"][0]["revision"], "rev-b");
+        assert_eq!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            &SessionLookupState::Present {
+                revision: rev_c,
+                head: kitsu_core::session::LogicalHead::Turn(
+                    kitsu_core::session::TurnId::new("turn-1").unwrap()
+                ),
+            }
+        );
+        assert!(store.open_revision_envelope(&session_id, &rev_b).is_ok());
+    }
+
+    #[test]
+    fn recovery_commit_candidate_cut_keeps_corrupt_head_and_exact_residue() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        publish_invalid_head_successor(
+            &store,
+            &session_id,
+            &rev_b,
+            ExpectedRevision::Exact(rev_a),
+            2,
+        );
+        transaction.inject_next_after_candidate_failure();
+
+        let error = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap_err();
+
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_c.clone(),
+                durability: CandidateDurabilityV1::Confirmed,
+            }
+        );
+        assert_eq!(
+            error.not_published_outcome(),
+            Some(&SessionCommitOutcome::NotPublished {
+                store: store.store_id().clone(),
+                session: session_id.clone(),
+                base_revision: ExpectedRevision::Exact(rev_b.clone()),
+            })
+        );
+        assert_eq!(
+            store
+                .read_head_envelope(&session_id)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &rev_b
+        );
+        assert!(store.open_revision_candidate(&session_id, &rev_c).is_ok());
+        assert!(matches!(
+            transaction.lookup_canonical_head(&session_id).state(),
+            SessionLookupState::Corrupt { observed_revision: Some(revision), .. }
+                if revision == &rev_b
+        ));
+    }
+
+    #[test]
+    fn recovery_commit_artifact_recheck_cut_keeps_corrupt_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        publish_invalid_head_successor(
+            &store,
+            &session_id,
+            &rev_b,
+            ExpectedRevision::Exact(rev_a),
+            2,
+        );
+        transaction.inject_next_artifact_recheck_failure();
+
+        let error = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap_err();
+
+        assert!(error.to_string().contains("artifact closure recheck"));
+        assert_eq!(
+            error.candidate_residue(),
+            CandidateResidueV1::InstalledUnselected {
+                revision: rev_c,
+                durability: CandidateDurabilityV1::Confirmed,
+            }
+        );
+        assert_eq!(
+            store
+                .read_head_envelope(&session_id)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &rev_b
+        );
+    }
+
+    #[test]
+    fn recovery_commit_head_sync_cut_exposes_only_new_unconfirmed_head() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        publish_invalid_head_successor(
+            &store,
+            &session_id,
+            &rev_b,
+            ExpectedRevision::Exact(rev_a),
+            2,
+        );
+        store.inject_next_head_sync_failure();
+
+        let commit = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).durability(),
+            CommitDurability::PublishedUnconfirmed
+        );
+        assert!(commit.durability_warning().is_some());
+        assert_eq!(
+            store.read_head(&session_id).unwrap().unwrap().revision_id(),
+            &rev_c
+        );
+    }
+
+    #[test]
+    fn recovery_commit_crosses_a_missing_selected_payload_without_trusting_it() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _rev_a, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-a", None, 1))
+            .unwrap();
+        transaction
+            .commit(&payload("store-1", "session-1", "rev-b", Some("rev-a"), 2))
+            .unwrap();
+        std::fs::remove_file(
+            crate::session::physical::PhysicalLayoutV1::canonical_payload(
+                root.path(),
+                &session_id,
+                &rev_b,
+            ),
+        )
+        .unwrap();
+
+        let commit = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap();
+
+        assert_eq!(
+            receipt(&commit).base_revision(),
+            &ExpectedRevision::Exact(rev_b)
+        );
+        assert_eq!(receipt(&commit).new_revision(), &rev_c);
+        let head = store.read_head(&session_id).unwrap().unwrap();
+        assert_eq!(head.revision_id(), &rev_c);
+        let value: serde_json::Value =
+            serde_json::from_slice(head.candidate().canonical_bytes()).unwrap();
+        assert_eq!(
+            value["recovery_log"][0]["skipped"][0]["reason"],
+            "missing_reference"
+        );
+    }
+
+    #[test]
+    fn recovery_commit_without_a_verified_source_allocates_nothing() {
+        let root = tempfile::tempdir().unwrap();
+        let (store_id, session_id, _, rev_b) = ids();
+        let rev_c = RevisionId::new("rev-c").unwrap();
+        let store = PhysicalFileStoreV1::create_or_open(root.path(), store_id).unwrap();
+        let transaction = CanonicalFileTransactionV1::new(&store);
+        publish_invalid_head_successor(&store, &session_id, &rev_b, ExpectedRevision::Missing, 1);
+
+        let error = transaction
+            .commit_last_good_recovery(
+                &session_id,
+                rev_c.clone(),
+                "2026-08-20T10:05:00.000Z".to_string(),
+            )
+            .unwrap_err();
+
+        assert_eq!(error.candidate_residue(), CandidateResidueV1::None);
+        assert_eq!(
+            store
+                .read_head_envelope(&session_id)
+                .unwrap()
+                .unwrap()
+                .revision_id(),
+            &rev_b
+        );
+        assert!(
+            !crate::session::physical::PhysicalLayoutV1::revision_directory(
+                root.path(),
+                &session_id,
+                &rev_c
+            )
+            .exists()
         );
     }
 
