@@ -1,28 +1,39 @@
 //! Private Linux process backend for an authorized external child.
 //!
-//! This backend does not provide filesystem containment and must remain
-//! unmounted until a later authority card binds reviewed filesystem roots.
-//! It supports one process/request only; serial long-lived MCP cycling is not
-//! part of this contract.
-//!
-//! The digest in `PreparedChildLaunchV1` records admission-time observation;
-//! it is not an immutable executable handle. This backend executes the exact
-//! authorized path, so replacement between preparation and exec remains a
-//! disclosed TOCTOU risk. No product acceptance or general sandbox claim is
-//! valid until later authority supplies filesystem policy and an immutable or
-//! equivalently revalidated execution mechanism.
+//! Linux x86-64 preparation copies the reviewed native ELF into a sealed
+//! executable memfd and builds a Landlock ruleset for exact reviewed roots.
+//! Spawn consumes those descriptors and uses `fchdir` plus `execveat`; there is
+//! no path fallback. This closes mutable launch bytes and the Landlock-governed
+//! content operations, but it is not a complete filesystem sandbox: Landlock
+//! does not hide paths or govern stat/access, chmod/chown/xattrs/timestamps,
+//! flock/fcntl, and this backend supplies no mount namespace complement. Host
+//! signal and ptrace authority is also outside this card. It therefore remains
+//! private and unmounted from MCP/product wiring. Serial long-lived request
+//! cycling is not implemented.
 
 #![allow(dead_code)]
 
+use std::ffi::CString;
 use std::fmt;
-use std::io::{self, Read, Write};
+use std::fs::File;
+use std::io::{self, Read, Seek, SeekFrom, Write};
 use std::mem::MaybeUninit;
+use std::os::fd::{AsRawFd, FromRawFd, RawFd};
+use std::os::unix::ffi::OsStrExt;
+use std::os::unix::fs::PermissionsExt;
 use std::os::unix::process::CommandExt;
+use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, Command, ExitStatus, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
-use super::authority::{PreparedChildLaunchV1, PreparedChildOsLaunchV1};
+use ring::digest::{Context, SHA256};
+
+use super::authority::{
+    AdmittedChildLaunchV1, ChildFilesystemAccessV1, ChildLaunchPreparationV1,
+    PreparedChildContainmentTokenV1, PreparedChildLaunchV1, PreparedChildOsLaunchV1,
+};
 use super::lifecycle::ChildExitTruthV1;
 use super::supervisor::{
     ChildPhaseSupervisorEffectsV1, ChildReapPollV1, ChildSupervisorCauseV1, OwnedChildResidueV1,
@@ -31,6 +42,49 @@ use super::supervisor::{
 
 const CHILD_TOKEN_ID: u64 = 1;
 const PIPE_CHUNK_BYTES: usize = 8 * 1024;
+const MAX_EXECUTABLE_BYTES_V1: u64 = 192 * 1024 * 1024;
+const REQUIRED_LANDLOCK_ABI_V1: i32 = 3;
+const MFD_EXEC_V1: libc::c_uint = 0x0010;
+const AT_EMPTY_PATH_V1: libc::c_int = 0x1000;
+
+const LANDLOCK_CREATE_RULESET_VERSION_V1: u32 = 1;
+const LANDLOCK_RULE_PATH_BENEATH_V1: u32 = 1;
+const LANDLOCK_ACCESS_FS_EXECUTE_V1: u64 = 1 << 0;
+const LANDLOCK_ACCESS_FS_WRITE_FILE_V1: u64 = 1 << 1;
+const LANDLOCK_ACCESS_FS_READ_FILE_V1: u64 = 1 << 2;
+const LANDLOCK_ACCESS_FS_READ_DIR_V1: u64 = 1 << 3;
+const LANDLOCK_ACCESS_FS_REMOVE_DIR_V1: u64 = 1 << 4;
+const LANDLOCK_ACCESS_FS_REMOVE_FILE_V1: u64 = 1 << 5;
+const LANDLOCK_ACCESS_FS_MAKE_CHAR_V1: u64 = 1 << 6;
+const LANDLOCK_ACCESS_FS_MAKE_DIR_V1: u64 = 1 << 7;
+const LANDLOCK_ACCESS_FS_MAKE_REG_V1: u64 = 1 << 8;
+const LANDLOCK_ACCESS_FS_MAKE_SOCK_V1: u64 = 1 << 9;
+const LANDLOCK_ACCESS_FS_MAKE_FIFO_V1: u64 = 1 << 10;
+const LANDLOCK_ACCESS_FS_MAKE_BLOCK_V1: u64 = 1 << 11;
+const LANDLOCK_ACCESS_FS_MAKE_SYM_V1: u64 = 1 << 12;
+const LANDLOCK_ACCESS_FS_REFER_V1: u64 = 1 << 13;
+const LANDLOCK_ACCESS_FS_TRUNCATE_V1: u64 = 1 << 14;
+const LANDLOCK_ACCESS_FS_IOCTL_DEV_V1: u64 = 1 << 15;
+static NEXT_PREPARED_CONTAINMENT_TOKEN_ID_V1: AtomicU64 = AtomicU64::new(1);
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChildFilesystemAuthorityNonclaimV1 {
+    PathVisibilityStatAndAccess,
+    MetadataAndExtendedAttributes,
+    FileLocksAndDescriptorControl,
+    MountNamespaceIsolation,
+    HostSignalsAndPtrace,
+}
+
+fn filesystem_authority_nonclaims_v1() -> &'static [ChildFilesystemAuthorityNonclaimV1] {
+    &[
+        ChildFilesystemAuthorityNonclaimV1::PathVisibilityStatAndAccess,
+        ChildFilesystemAuthorityNonclaimV1::MetadataAndExtendedAttributes,
+        ChildFilesystemAuthorityNonclaimV1::FileLocksAndDescriptorControl,
+        ChildFilesystemAuthorityNonclaimV1::MountNamespaceIsolation,
+        ChildFilesystemAuthorityNonclaimV1::HostSignalsAndPtrace,
+    ]
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum ContainmentSetupV1 {
@@ -44,9 +98,62 @@ enum TestContainmentSetupV1 {
     FailBeforeSpawn,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilesystemPreparationSetupV1 {
+    Enforce,
+    UnsupportedLandlockAbi,
+    MemfdUnavailable,
+    SealRejected,
+    RulesetRejected,
+}
+
+#[cfg(test)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TestFilesystemPreparationSetupV1 {
+    UnsupportedLandlockAbi,
+    MemfdUnavailable,
+    SealRejected,
+    RulesetRejected,
+}
+
 struct PreparedChildContainmentV1 {
     seccomp_filter: Box<[libc::sock_filter]>,
     seccomp_filter_len: u16,
+}
+
+#[repr(C)]
+struct LandlockRulesetAttrV1 {
+    handled_access_fs: u64,
+}
+
+#[repr(C, packed)]
+struct LandlockPathBeneathAttrV1 {
+    allowed_access: u64,
+    parent_fd: i32,
+}
+
+struct PendingExecutableImageV1 {
+    image: File,
+    source_path: PathBuf,
+    digest: [u8; 32],
+    seals: i32,
+    header: [u8; 64],
+    header_len: usize,
+}
+
+struct PreparedFilesystemContainmentV1 {
+    token_id: u64,
+    executable_image: File,
+    cwd: File,
+    landlock_ruleset: File,
+    executable_seals: i32,
+}
+
+struct PreparedExecVectorsV1 {
+    _argv_storage: Box<[CString]>,
+    argv_addresses: Box<[usize]>,
+    _environment_storage: Box<[CString]>,
+    environment_addresses: Box<[usize]>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -346,6 +453,10 @@ struct LinuxChildBackendV1 {
     started_at: Instant,
     stdin_frame: Option<Vec<u8>>,
     containment_setup: ContainmentSetupV1,
+    filesystem_setup: FilesystemPreparationSetupV1,
+    pending_source: Option<(File, PathBuf)>,
+    pending_image: Option<PendingExecutableImageV1>,
+    prepared_filesystem: Option<PreparedFilesystemContainmentV1>,
     active: Option<ActiveChildV1>,
     completion: Option<RealChildCompletionV1>,
     retained_residue: Option<RealChildOwnedResidueV1>,
@@ -360,6 +471,10 @@ impl LinuxChildBackendV1 {
             started_at: Instant::now(),
             stdin_frame: Some(stdin_frame),
             containment_setup: ContainmentSetupV1::Enforce,
+            filesystem_setup: FilesystemPreparationSetupV1::Enforce,
+            pending_source: None,
+            pending_image: None,
+            prepared_filesystem: None,
             active: None,
             completion: None,
             retained_residue: None,
@@ -381,12 +496,47 @@ impl LinuxChildBackendV1 {
         backend
     }
 
+    #[cfg(test)]
+    fn new_with_filesystem_setup_for_test(
+        stdin_frame: Vec<u8>,
+        setup: TestFilesystemPreparationSetupV1,
+    ) -> Self {
+        let mut backend = Self::new(stdin_frame);
+        backend.filesystem_setup = match setup {
+            TestFilesystemPreparationSetupV1::UnsupportedLandlockAbi => {
+                FilesystemPreparationSetupV1::UnsupportedLandlockAbi
+            }
+            TestFilesystemPreparationSetupV1::MemfdUnavailable => {
+                FilesystemPreparationSetupV1::MemfdUnavailable
+            }
+            TestFilesystemPreparationSetupV1::SealRejected => {
+                FilesystemPreparationSetupV1::SealRejected
+            }
+            TestFilesystemPreparationSetupV1::RulesetRejected => {
+                FilesystemPreparationSetupV1::RulesetRejected
+            }
+        };
+        backend
+    }
+
     fn os_spawn_count(&self) -> usize {
         self.os_spawn_count
     }
 
     fn request_start_count(&self) -> usize {
         self.request_start_count
+    }
+
+    #[cfg(test)]
+    fn prepared_containment_count_for_test(&self) -> usize {
+        usize::from(self.prepared_filesystem.is_some())
+    }
+
+    #[cfg(test)]
+    fn prepared_executable_seals_for_test(&self) -> Option<i32> {
+        self.prepared_filesystem
+            .as_ref()
+            .map(|prepared| prepared.executable_seals)
     }
 
     fn take_completion(&mut self) -> Option<RealChildCompletionV1> {
@@ -427,6 +577,74 @@ impl Drop for LinuxChildBackendV1 {
     }
 }
 
+impl ChildLaunchPreparationV1 for LinuxChildBackendV1 {
+    fn canonicalize_executable(&mut self, executable: &Path) -> Result<PathBuf, String> {
+        if self.pending_source.is_some()
+            || self.pending_image.is_some()
+            || self.prepared_filesystem.is_some()
+        {
+            return Err("backend permits exactly one executable preparation".to_string());
+        }
+        let (source, observed_path) = open_exact_regular_executable(executable)
+            .map_err(|error| format!("cannot pin exact executable: {error}"))?;
+        self.pending_source = Some((source, observed_path.clone()));
+        Ok(observed_path)
+    }
+
+    fn executable_sha256(&mut self, executable: &Path) -> Result<[u8; 32], String> {
+        let (source, observed_path) = self
+            .pending_source
+            .take()
+            .ok_or_else(|| "executable was not pinned before hashing".to_string())?;
+        if observed_path != executable {
+            return Err("pinned executable identity changed before hashing".to_string());
+        }
+        let image = stage_executable_image(source, observed_path)
+            .map_err(|error| format!("cannot stage immutable executable: {error}"))?;
+        let digest = image.digest;
+        self.pending_image = Some(image);
+        Ok(digest)
+    }
+
+    fn containment_preflight(
+        &mut self,
+        launch: &AdmittedChildLaunchV1,
+    ) -> Result<PreparedChildContainmentTokenV1, String> {
+        if self.prepared_filesystem.is_some() {
+            return Err("backend permits exactly one prepared containment".to_string());
+        }
+        let image = self
+            .pending_image
+            .take()
+            .ok_or_else(|| "immutable executable image was not prepared".to_string())?;
+        if image.source_path != launch.executable() || &image.digest != launch.executable_sha256() {
+            return Err("immutable executable image does not match admitted identity".to_string());
+        }
+        validate_native_elf_x86_64(&image.header[..image.header_len])
+            .map_err(|error| error.to_string())?;
+        match self.filesystem_setup {
+            FilesystemPreparationSetupV1::UnsupportedLandlockAbi => {
+                return Err("required Landlock ABI is unavailable".to_string())
+            }
+            FilesystemPreparationSetupV1::MemfdUnavailable => {
+                return Err("executable memfd is unavailable".to_string())
+            }
+            FilesystemPreparationSetupV1::SealRejected => {
+                return Err("executable seals were rejected".to_string())
+            }
+            FilesystemPreparationSetupV1::RulesetRejected => {
+                return Err("Landlock ruleset was rejected".to_string())
+            }
+            FilesystemPreparationSetupV1::Enforce => {}
+        }
+        let token_id = allocate_prepared_containment_token_id_v1()?;
+        let prepared = prepare_filesystem_containment(launch, image, token_id)
+            .map_err(|error| format!("cannot prepare filesystem containment: {error}"))?;
+        self.prepared_filesystem = Some(prepared);
+        Ok(PreparedChildContainmentTokenV1::new(token_id))
+    }
+}
+
 impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
     fn monotonic_millis(&mut self) -> Result<u64, String> {
         checked_duration_millis_v1(self.started_at.elapsed())
@@ -436,12 +654,17 @@ impl ChildPhaseSupervisorEffectsV1 for LinuxChildBackendV1 {
         if self.active.is_some() || self.os_spawn_count != 0 {
             return Err("backend permits exactly one OS spawn".to_string());
         }
+        let prepared = self
+            .prepared_filesystem
+            .take()
+            .filter(|prepared| prepared.token_id == launch.containment_token().id())
+            .ok_or_else(|| "launch has no matching prepared containment token".to_string())?;
         let launch = launch.into_os_launch();
         let stdin_len = self.stdin_frame.as_ref().map_or(0, Vec::len);
         if stdin_len > launch.stdin_limit() || stdin_len > launch.frame_limit() {
             return Err("stdin frame exceeds its authorized byte limit".to_string());
         }
-        let mut child = spawn_child(&launch, self.containment_setup)?;
+        let mut child = spawn_child(&launch, prepared, self.containment_setup)?;
         self.os_spawn_count += 1;
         let pgid = match i32::try_from(child.id()) {
             Ok(pgid) => pgid,
@@ -728,18 +951,447 @@ fn write_stdin(mut stdin: ChildStdin, frame: Vec<u8>) -> PipeWriteOutcomeV1 {
     }
 }
 
+#[cfg(target_arch = "x86_64")]
+fn open_exact_regular_executable(path: &Path) -> io::Result<(File, PathBuf)> {
+    let file = open_exact_descriptor(path, libc::O_RDONLY, false)?;
+    let metadata = file.metadata()?;
+    if !metadata.file_type().is_file() || metadata.permissions().mode() & 0o111 == 0 {
+        return Err(io::Error::from_raw_os_error(libc::EACCES));
+    }
+    Ok((file, path.to_path_buf()))
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn open_exact_regular_executable(_: &Path) -> io::Result<(File, PathBuf)> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "external-child preparation is unsupported on this architecture",
+    ))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn open_exact_descriptor(path: &Path, access: i32, directory: bool) -> io::Result<File> {
+    let path_c = CString::new(path.as_os_str().as_bytes())
+        .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?;
+    let directory_flag = if directory { libc::O_DIRECTORY } else { 0 };
+    // SAFETY: `path_c` is a bounded NUL-terminated path. The returned fd is
+    // uniquely adopted below on success.
+    let fd = unsafe {
+        libc::open(
+            path_c.as_ptr(),
+            access | directory_flag | libc::O_CLOEXEC | libc::O_NOFOLLOW,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    // SAFETY: successful open returns one newly owned descriptor.
+    let file = unsafe { File::from_raw_fd(fd) };
+    let metadata = file.metadata()?;
+    if metadata.file_type().is_symlink() {
+        return Err(io::Error::from_raw_os_error(libc::ELOOP));
+    }
+    let observed = std::fs::read_link(format!("/proc/self/fd/{fd}"))?;
+    if observed != path {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    Ok(file)
+}
+
+#[cfg(target_arch = "x86_64")]
+fn stage_executable_image(
+    mut source: File,
+    source_path: PathBuf,
+) -> io::Result<PendingExecutableImageV1> {
+    let source_size = source.metadata()?.len();
+    if source_size == 0 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "executable image is empty",
+        ));
+    }
+    if source_size > MAX_EXECUTABLE_BYTES_V1 {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "executable exceeds the bounded image cap",
+        ));
+    }
+    source.seek(SeekFrom::Start(0))?;
+    let name = b"kitsu-child-image\0";
+    let flags = libc::MFD_ALLOW_SEALING | libc::MFD_CLOEXEC | MFD_EXEC_V1;
+    // SAFETY: memfd_create reads the static NUL-terminated name and returns a
+    // new descriptor on success.
+    let fd = unsafe { libc::syscall(libc::SYS_memfd_create, name.as_ptr(), flags) };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let raw_fd = i32::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    // SAFETY: successful memfd_create returns one newly owned descriptor.
+    let mut image = unsafe { File::from_raw_fd(raw_fd) };
+    let mut context = Context::new(&SHA256);
+    let mut header = [0_u8; 64];
+    let header_len = source.read(&mut header)?;
+    context.update(&header[..header_len]);
+    image.write_all(&header[..header_len])?;
+    let mut copied = u64::try_from(header_len).expect("ELF header length fits u64");
+    let mut buffer = [0_u8; 16 * 1024];
+    loop {
+        let read = source.read(&mut buffer)?;
+        if read == 0 {
+            break;
+        }
+        copied = copied
+            .checked_add(u64::try_from(read).expect("buffer length fits u64"))
+            .ok_or_else(|| io::Error::from_raw_os_error(libc::EFBIG))?;
+        if copied > MAX_EXECUTABLE_BYTES_V1 {
+            return Err(io::Error::from_raw_os_error(libc::EFBIG));
+        }
+        context.update(&buffer[..read]);
+        image.write_all(&buffer[..read])?;
+    }
+    if copied != source_size {
+        return Err(io::Error::from_raw_os_error(libc::ESTALE));
+    }
+    // SAFETY: fchmod changes only the newly owned memfd mode.
+    if unsafe { libc::fchmod(image.as_raw_fd(), 0o500) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let required_seals =
+        libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+    // SAFETY: fcntl applies and queries seals on the owned memfd.
+    if unsafe { libc::fcntl(image.as_raw_fd(), libc::F_ADD_SEALS, required_seals) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let observed_seals = unsafe { libc::fcntl(image.as_raw_fd(), libc::F_GET_SEALS) };
+    if observed_seals < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    if observed_seals & required_seals != required_seals {
+        return Err(io::Error::from_raw_os_error(libc::EPERM));
+    }
+    image.seek(SeekFrom::Start(0))?;
+    let digest = context.finish();
+    let mut digest_bytes = [0_u8; 32];
+    digest_bytes.copy_from_slice(digest.as_ref());
+    Ok(PendingExecutableImageV1 {
+        image,
+        source_path,
+        digest: digest_bytes,
+        seals: observed_seals,
+        header,
+        header_len,
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn stage_executable_image(_: File, _: PathBuf) -> io::Result<PendingExecutableImageV1> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "external-child preparation is unsupported on this architecture",
+    ))
+}
+
+fn validate_native_elf_x86_64(header: &[u8]) -> io::Result<()> {
+    const ELFCLASS64: u8 = 2;
+    const ELFDATA2LSB: u8 = 1;
+    const EM_X86_64: u16 = 62;
+    let is_native = header.len() >= 20
+        && &header[..4] == b"\x7fELF"
+        && header[4] == ELFCLASS64
+        && header[5] == ELFDATA2LSB
+        && u16::from_le_bytes([header[18], header[19]]) == EM_X86_64;
+    if is_native {
+        Ok(())
+    } else {
+        Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "initial executable must be a native ELF x86-64 image",
+        ))
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn prepare_filesystem_containment(
+    launch: &AdmittedChildLaunchV1,
+    image: PendingExecutableImageV1,
+    token_id: u64,
+) -> io::Result<PreparedFilesystemContainmentV1> {
+    let landlock_abi = landlock_abi_version()?;
+    if landlock_abi < REQUIRED_LANDLOCK_ABI_V1 {
+        return Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "required Landlock ABI 3 is unavailable",
+        ));
+    }
+    let handled_access = landlock_handled_access(landlock_abi);
+    let landlock_ruleset = create_landlock_ruleset(handled_access)?;
+    for grant in launch.filesystem().grants() {
+        add_landlock_path_rule(&landlock_ruleset, grant.path(), grant.access())?;
+    }
+    let cwd = open_exact_descriptor(
+        launch.working_directory(),
+        libc::O_PATH | libc::O_RDONLY,
+        true,
+    )?;
+    Ok(PreparedFilesystemContainmentV1 {
+        token_id,
+        executable_image: image.image,
+        cwd,
+        landlock_ruleset,
+        executable_seals: image.seals,
+    })
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn prepare_filesystem_containment(
+    _: &AdmittedChildLaunchV1,
+    _: PendingExecutableImageV1,
+    _: u64,
+) -> io::Result<PreparedFilesystemContainmentV1> {
+    Err(io::Error::new(
+        io::ErrorKind::Unsupported,
+        "external-child filesystem enforcement is unsupported on this architecture",
+    ))
+}
+
+fn allocate_prepared_containment_token_id_v1() -> Result<u64, String> {
+    NEXT_PREPARED_CONTAINMENT_TOKEN_ID_V1
+        .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |current| {
+            current.checked_add(1)
+        })
+        .map_err(|_| "prepared containment token space is exhausted".to_string())
+}
+
+#[cfg(target_arch = "x86_64")]
+fn landlock_abi_version() -> io::Result<i32> {
+    // SAFETY: the VERSION query uses the documented null-attribute form.
+    let abi = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            std::ptr::null::<LandlockRulesetAttrV1>(),
+            0_usize,
+            LANDLOCK_CREATE_RULESET_VERSION_V1,
+        )
+    };
+    if abi < 0 {
+        Err(io::Error::last_os_error())
+    } else {
+        i32::try_from(abi).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))
+    }
+}
+
+fn landlock_handled_access(abi: i32) -> u64 {
+    let through_truncate = LANDLOCK_ACCESS_FS_EXECUTE_V1
+        | LANDLOCK_ACCESS_FS_WRITE_FILE_V1
+        | LANDLOCK_ACCESS_FS_READ_FILE_V1
+        | LANDLOCK_ACCESS_FS_READ_DIR_V1
+        | LANDLOCK_ACCESS_FS_REMOVE_DIR_V1
+        | LANDLOCK_ACCESS_FS_REMOVE_FILE_V1
+        | LANDLOCK_ACCESS_FS_MAKE_CHAR_V1
+        | LANDLOCK_ACCESS_FS_MAKE_DIR_V1
+        | LANDLOCK_ACCESS_FS_MAKE_REG_V1
+        | LANDLOCK_ACCESS_FS_MAKE_SOCK_V1
+        | LANDLOCK_ACCESS_FS_MAKE_FIFO_V1
+        | LANDLOCK_ACCESS_FS_MAKE_BLOCK_V1
+        | LANDLOCK_ACCESS_FS_MAKE_SYM_V1
+        | LANDLOCK_ACCESS_FS_REFER_V1
+        | LANDLOCK_ACCESS_FS_TRUNCATE_V1;
+    if abi >= 5 {
+        through_truncate | LANDLOCK_ACCESS_FS_IOCTL_DEV_V1
+    } else {
+        through_truncate
+    }
+}
+
+#[cfg(target_arch = "x86_64")]
+fn create_landlock_ruleset(handled_access_fs: u64) -> io::Result<File> {
+    let attribute = LandlockRulesetAttrV1 { handled_access_fs };
+    // SAFETY: the kernel reads the fixed-layout ruleset prefix and returns one
+    // newly owned descriptor.
+    let fd = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_create_ruleset,
+            &attribute,
+            std::mem::size_of::<LandlockRulesetAttrV1>(),
+            0_u32,
+        )
+    };
+    if fd < 0 {
+        return Err(io::Error::last_os_error());
+    }
+    let raw_fd = i32::try_from(fd).map_err(|_| io::Error::from_raw_os_error(libc::EOVERFLOW))?;
+    // SAFETY: successful ruleset creation returns one newly owned descriptor.
+    Ok(unsafe { File::from_raw_fd(raw_fd) })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn add_landlock_path_rule(
+    ruleset: &File,
+    path: &Path,
+    access: ChildFilesystemAccessV1,
+) -> io::Result<()> {
+    let parent = open_exact_descriptor(path, libc::O_PATH | libc::O_RDONLY, false)?;
+    let is_directory = parent.metadata()?.file_type().is_dir();
+    let allowed_access = match (access, is_directory) {
+        (ChildFilesystemAccessV1::ReadOnly, true) => {
+            LANDLOCK_ACCESS_FS_EXECUTE_V1
+                | LANDLOCK_ACCESS_FS_READ_FILE_V1
+                | LANDLOCK_ACCESS_FS_READ_DIR_V1
+        }
+        (ChildFilesystemAccessV1::ReadOnly, false) => {
+            LANDLOCK_ACCESS_FS_EXECUTE_V1 | LANDLOCK_ACCESS_FS_READ_FILE_V1
+        }
+        (ChildFilesystemAccessV1::ReadWrite, true) => {
+            LANDLOCK_ACCESS_FS_WRITE_FILE_V1
+                | LANDLOCK_ACCESS_FS_READ_FILE_V1
+                | LANDLOCK_ACCESS_FS_READ_DIR_V1
+                | LANDLOCK_ACCESS_FS_REMOVE_DIR_V1
+                | LANDLOCK_ACCESS_FS_REMOVE_FILE_V1
+                | LANDLOCK_ACCESS_FS_MAKE_CHAR_V1
+                | LANDLOCK_ACCESS_FS_MAKE_DIR_V1
+                | LANDLOCK_ACCESS_FS_MAKE_REG_V1
+                | LANDLOCK_ACCESS_FS_MAKE_SOCK_V1
+                | LANDLOCK_ACCESS_FS_MAKE_FIFO_V1
+                | LANDLOCK_ACCESS_FS_MAKE_BLOCK_V1
+                | LANDLOCK_ACCESS_FS_MAKE_SYM_V1
+                | LANDLOCK_ACCESS_FS_REFER_V1
+                | LANDLOCK_ACCESS_FS_TRUNCATE_V1
+        }
+        (ChildFilesystemAccessV1::ReadWrite, false) => {
+            LANDLOCK_ACCESS_FS_WRITE_FILE_V1
+                | LANDLOCK_ACCESS_FS_READ_FILE_V1
+                | LANDLOCK_ACCESS_FS_TRUNCATE_V1
+        }
+    };
+    let attribute = LandlockPathBeneathAttrV1 {
+        allowed_access,
+        parent_fd: parent.as_raw_fd(),
+    };
+    // SAFETY: the kernel copies the packed path-beneath attribute and takes a
+    // reference to the pinned parent object during this call.
+    let result = unsafe {
+        libc::syscall(
+            libc::SYS_landlock_add_rule,
+            ruleset.as_raw_fd(),
+            LANDLOCK_RULE_PATH_BENEATH_V1,
+            &attribute,
+            0_u32,
+        )
+    };
+    if result == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+fn prepare_exec_vectors(launch: &PreparedChildOsLaunchV1) -> io::Result<PreparedExecVectorsV1> {
+    let mut argv_storage = Vec::with_capacity(launch.arguments().len() + 1);
+    argv_storage.push(
+        CString::new(launch.executable().as_os_str().as_bytes())
+            .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
+    );
+    for argument in launch.arguments() {
+        argv_storage.push(
+            CString::new(argument.as_bytes())
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))?,
+        );
+    }
+    let argv_storage = argv_storage.into_boxed_slice();
+    let argv_addresses = argv_storage
+        .iter()
+        .map(|value| value.as_ptr() as usize)
+        .chain(std::iter::once(0_usize))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+
+    let environment_storage = launch
+        .environment()
+        .map(|(name, value)| {
+            CString::new(format!("{name}={value}"))
+                .map_err(|_| io::Error::from_raw_os_error(libc::EINVAL))
+        })
+        .collect::<io::Result<Vec<_>>>()?
+        .into_boxed_slice();
+    let environment_addresses = environment_storage
+        .iter()
+        .map(|value| value.as_ptr() as usize)
+        .chain(std::iter::once(0_usize))
+        .collect::<Vec<_>>()
+        .into_boxed_slice();
+    Ok(PreparedExecVectorsV1 {
+        _argv_storage: argv_storage,
+        argv_addresses,
+        _environment_storage: environment_storage,
+        environment_addresses,
+    })
+}
+
+#[cfg(target_arch = "x86_64")]
+fn restrict_child_filesystem(ruleset_fd: RawFd) -> io::Result<()> {
+    // SAFETY: restrict_self consumes no userspace buffers and applies only to
+    // the calling post-fork child after no_new_privs is set.
+    if unsafe { libc::syscall(libc::SYS_landlock_restrict_self, ruleset_fd, 0_u32) } == 0 {
+        Ok(())
+    } else {
+        Err(io::Error::last_os_error())
+    }
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn restrict_child_filesystem(_: RawFd) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+}
+
+#[cfg(target_arch = "x86_64")]
+fn exec_prepared_image(
+    filesystem: &PreparedFilesystemContainmentV1,
+    vectors: &PreparedExecVectorsV1,
+) -> io::Result<()> {
+    let empty_path = b"\0";
+    // SAFETY: every address points into CString storage retained by `vectors`,
+    // both pointer lists are null-terminated, and the executable fd is sealed.
+    unsafe {
+        libc::syscall(
+            libc::SYS_execveat,
+            filesystem.executable_image.as_raw_fd(),
+            empty_path.as_ptr(),
+            vectors
+                .argv_addresses
+                .as_ptr()
+                .cast::<*const libc::c_char>(),
+            vectors
+                .environment_addresses
+                .as_ptr()
+                .cast::<*const libc::c_char>(),
+            AT_EMPTY_PATH_V1,
+        );
+    }
+    Err(io::Error::last_os_error())
+}
+
+#[cfg(not(target_arch = "x86_64"))]
+fn exec_prepared_image(
+    _: &PreparedFilesystemContainmentV1,
+    _: &PreparedExecVectorsV1,
+) -> io::Result<()> {
+    Err(io::Error::from_raw_os_error(libc::ENOTSUP))
+}
+
 fn spawn_child(
     launch: &PreparedChildOsLaunchV1,
+    filesystem: PreparedFilesystemContainmentV1,
     containment_setup: ContainmentSetupV1,
 ) -> Result<Child, String> {
     // Filter construction and all of its allocation happen in the parent,
     // before Command::spawn can fork.
     let containment = prepare_child_containment(containment_setup)
         .map_err(|error| format!("cannot prepare child containment: {error}"))?;
-    let mut command = Command::new(launch.executable());
+    let exec_vectors = prepare_exec_vectors(launch)
+        .map_err(|error| format!("cannot prepare exact exec vectors: {error}"))?;
+    let mut command = Command::new("/__kitsu_execveat_path_fallback_forbidden__");
     command
         .args(launch.arguments())
-        .current_dir(launch.working_directory())
         .env_clear()
         .envs(launch.environment())
         .stdin(Stdio::piped())
@@ -749,7 +1401,10 @@ fn spawn_child(
     // SAFETY: the closure uses only async-signal-safe syscalls and constructs
     // no shared process state. Every setup error aborts before exec.
     unsafe {
-        command.pre_exec(move || install_child_containment(&containment));
+        command.pre_exec(move || {
+            install_child_containment(&containment, &filesystem)?;
+            exec_prepared_image(&filesystem, &exec_vectors)
+        });
     }
     command.spawn().map_err(|error| error.to_string())
 }
@@ -850,10 +1505,19 @@ fn prepare_child_containment(setup: ContainmentSetupV1) -> io::Result<PreparedCh
     })
 }
 
-fn install_child_containment(containment: &PreparedChildContainmentV1) -> io::Result<()> {
+fn install_child_containment(
+    containment: &PreparedChildContainmentV1,
+    filesystem: &PreparedFilesystemContainmentV1,
+) -> io::Result<()> {
     verify_child_owns_process_group()?;
-    close_inherited_descriptors()?;
+    // SAFETY: fchdir reads the already-pinned directory descriptor and changes
+    // only the post-fork child's cwd.
+    if unsafe { libc::fchdir(filesystem.cwd.as_raw_fd()) } != 0 {
+        return Err(io::Error::last_os_error());
+    }
     clear_inherited_capabilities()?;
+    restrict_child_filesystem(filesystem.landlock_ruleset.as_raw_fd())?;
+    close_inherited_descriptors()?;
     install_seccomp_filter(containment)
 }
 
@@ -1082,21 +1746,26 @@ fn build_seccomp_filter() -> io::Result<Box<[libc::sock_filter]>> {
 #[cfg(test)]
 mod tests {
     use std::collections::BTreeMap;
+    use std::ffi::CString;
+    use std::fs::{OpenOptions, Permissions};
     use std::io::{Read, Write};
     use std::os::fd::RawFd;
+    use std::os::unix::ffi::OsStrExt;
+    use std::os::unix::fs::{symlink, PermissionsExt};
     use std::path::{Path, PathBuf};
     use std::time::{Duration, Instant};
 
     use ring::digest::{Context, SHA256};
+    use serial_test::serial;
 
     use super::*;
     use crate::external::authority::{
-        prepare_child_launch_request_v1, AdmittedChildLaunchV1, AuthorityProfileV1,
-        ChildEnvironmentPolicyV1, ChildEnvironmentVariableV1, ChildIoLimitsV1,
-        ChildLaunchAdmissionErrorV1, ChildLaunchAuthorityDecisionV1, ChildLaunchModeV1,
-        ChildLaunchPreparationV1, ChildLaunchRequestV1, ChildNetworkPolicyV1, ChildPhaseBudgetsV1,
-        ChildProcessGroupPolicyV1, ChildRuntimePolicyV1, ChildTimeoutDispositionV1,
-        PreparedChildLaunchV1,
+        prepare_child_launch_request_v1, AuthorityProfileV1, ChildEnvironmentPolicyV1,
+        ChildEnvironmentVariableV1, ChildFilesystemAccessV1, ChildFilesystemGrantV1,
+        ChildFilesystemPolicyV1, ChildIoLimitsV1, ChildLaunchAdmissionErrorV1,
+        ChildLaunchAuthorityDecisionV1, ChildLaunchModeV1, ChildLaunchRequestV1,
+        ChildNetworkPolicyV1, ChildPhaseBudgetsV1, ChildProcessGroupPolicyV1, ChildRuntimePolicyV1,
+        ChildTimeoutDispositionV1, PreparedChildLaunchV1,
     };
     use crate::external::lifecycle::ChildExitTruthV1;
     use crate::external::supervisor::{
@@ -1130,23 +1799,6 @@ mod tests {
                 stdout_bytes: 64 * 1024,
                 stderr_bytes: 64 * 1024,
             }
-        }
-    }
-
-    #[derive(Default)]
-    struct RealPreparation;
-
-    impl ChildLaunchPreparationV1 for RealPreparation {
-        fn canonicalize_executable(&mut self, executable: &Path) -> Result<PathBuf, String> {
-            executable.canonicalize().map_err(|error| error.to_string())
-        }
-
-        fn executable_sha256(&mut self, executable: &Path) -> Result<[u8; 32], String> {
-            sha256(executable)
-        }
-
-        fn containment_preflight(&mut self, _: &AdmittedChildLaunchV1) -> Result<(), String> {
-            Ok(())
         }
     }
 
@@ -1190,6 +1842,7 @@ mod tests {
     fn runtime_policy(
         limits: TestLimits,
         environment: Vec<ChildEnvironmentVariableV1>,
+        filesystem: ChildFilesystemPolicyV1,
     ) -> ChildRuntimePolicyV1 {
         ChildRuntimePolicyV1::new(
             ChildPhaseBudgetsV1::new(
@@ -1207,32 +1860,76 @@ mod tests {
             ),
             ChildProcessGroupPolicyV1::Owned,
             ChildEnvironmentPolicyV1::new(true, environment),
+            filesystem,
             ChildNetworkPolicyV1::Deny,
             ChildTimeoutDispositionV1::TerminateProcessGroupAndReap,
         )
+    }
+
+    fn confined_filesystem_policy(
+        cwd: &Path,
+        mut grants: Vec<ChildFilesystemGrantV1>,
+    ) -> ChildFilesystemPolicyV1 {
+        grants.insert(
+            0,
+            ChildFilesystemGrantV1::new("/proc", ChildFilesystemAccessV1::ReadOnly),
+        );
+        grants.insert(
+            0,
+            ChildFilesystemGrantV1::new("/usr", ChildFilesystemAccessV1::ReadOnly),
+        );
+        grants.push(ChildFilesystemGrantV1::new(
+            cwd,
+            ChildFilesystemAccessV1::ReadWrite,
+        ));
+        ChildFilesystemPolicyV1::new(grants)
     }
 
     fn prepared_helper(
         cwd: &Path,
         mode: &str,
         limits: TestLimits,
-        mut extra_environment: Vec<ChildEnvironmentVariableV1>,
-    ) -> PreparedChildLaunchV1 {
+        extra_environment: Vec<ChildEnvironmentVariableV1>,
+        stdin: Vec<u8>,
+    ) -> (PreparedChildLaunchV1, LinuxChildBackendV1) {
         let executable = helper_executable();
+        let mut backend = LinuxChildBackendV1::new(stdin);
+        let prepared = prepare_confined_helper(
+            &executable,
+            cwd,
+            mode,
+            limits,
+            extra_environment,
+            confined_filesystem_policy(cwd, Vec::new()),
+            &mut backend,
+        )
+        .unwrap();
+        (prepared, backend)
+    }
+
+    fn prepare_confined_helper(
+        executable: &Path,
+        cwd: &Path,
+        mode: &str,
+        limits: TestLimits,
+        mut extra_environment: Vec<ChildEnvironmentVariableV1>,
+        filesystem: ChildFilesystemPolicyV1,
+        backend: &mut LinuxChildBackendV1,
+    ) -> Result<PreparedChildLaunchV1, ChildLaunchAdmissionErrorV1> {
         extra_environment.insert(0, ChildEnvironmentVariableV1::new("KITSU_CHILD_MODE", mode));
-        let policy = runtime_policy(limits, extra_environment);
+        let policy = runtime_policy(limits, extra_environment, filesystem);
         let request = ChildLaunchRequestV1::new(
             1,
             ChildLaunchModeV1::Enabled,
-            &executable,
-            digest_hex(&executable),
+            executable,
+            digest_hex(executable),
             helper_arguments(),
             cwd,
             policy.clone(),
         );
         let authority = AuthorityProfileV1::exact(
-            &executable,
-            digest_hex(&executable),
+            executable,
+            digest_hex(executable),
             helper_arguments(),
             cwd,
             policy,
@@ -1241,16 +1938,21 @@ mod tests {
         prepare_child_launch_request_v1(
             request,
             ChildLaunchAuthorityDecisionV1::Admit(&authority),
-            &mut RealPreparation,
+            backend,
         )
-        .unwrap()
     }
 
     fn drive_one_shot(
         prepared: PreparedChildLaunchV1,
-        stdin: Vec<u8>,
+        backend: LinuxChildBackendV1,
     ) -> (ChildPhaseSupervisorStateV1, LinuxChildBackendV1) {
-        let mut backend = LinuxChildBackendV1::new(stdin);
+        drive_one_shot_with_backend(prepared, backend)
+    }
+
+    fn drive_one_shot_with_backend(
+        prepared: PreparedChildLaunchV1,
+        mut backend: LinuxChildBackendV1,
+    ) -> (ChildPhaseSupervisorStateV1, LinuxChildBackendV1) {
         let terminal;
         {
             let mut supervisor = ChildPhaseSupervisorV1::new(prepared, &mut backend);
@@ -1289,9 +1991,9 @@ mod tests {
 
     fn drive_cancel_or_shutdown(
         prepared: PreparedChildLaunchV1,
+        mut backend: LinuxChildBackendV1,
         cause: ChildSupervisorCauseV1,
     ) -> (ChildPhaseSupervisorStateV1, LinuxChildBackendV1) {
-        let mut backend = LinuxChildBackendV1::new(Vec::new());
         let terminal;
         {
             let mut supervisor = ChildPhaseSupervisorV1::new(prepared, &mut backend);
@@ -1358,9 +2060,10 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn prepared_projection_is_exact_consuming_and_redacts_environment_values() {
         let cwd = tempfile::tempdir().unwrap();
-        let prepared = prepared_helper(
+        let (prepared, _backend) = prepared_helper(
             cwd.path(),
             "inspect",
             TestLimits::default(),
@@ -1368,6 +2071,7 @@ mod tests {
                 "KITSU_PROJECTED_VALUE",
                 "projection-secret",
             )],
+            Vec::new(),
         );
         let launch = prepared.into_os_launch();
 
@@ -1391,6 +2095,7 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn disabled_admission_and_oversized_stdin_have_zero_os_spawn() {
         let cwd = tempfile::tempdir().unwrap();
         let executable = helper_executable();
@@ -1401,6 +2106,7 @@ mod tests {
         let policy = runtime_policy(
             limits,
             vec![ChildEnvironmentVariableV1::new("KITSU_CHILD_MODE", "echo")],
+            confined_filesystem_policy(cwd.path(), Vec::new()),
         );
         let disabled = ChildLaunchRequestV1::new(
             1,
@@ -1419,19 +2125,20 @@ mod tests {
             policy,
         )
         .unwrap();
+        let mut disabled_backend = LinuxChildBackendV1::new(Vec::new());
         assert_eq!(
             prepare_child_launch_request_v1(
                 disabled,
                 ChildLaunchAuthorityDecisionV1::Admit(&authority),
-                &mut RealPreparation,
+                &mut disabled_backend,
             ),
             Err(ChildLaunchAdmissionErrorV1::Disabled)
         );
-        let disabled_backend = LinuxChildBackendV1::new(Vec::new());
         assert_eq!(disabled_backend.os_spawn_count(), 0);
 
-        let prepared = prepared_helper(cwd.path(), "echo", limits, Vec::new());
-        let (terminal, oversized_backend) = drive_one_shot(prepared, b"12345".to_vec());
+        let (prepared, backend) =
+            prepared_helper(cwd.path(), "echo", limits, Vec::new(), b"12345".to_vec());
+        let (terminal, oversized_backend) = drive_one_shot(prepared, backend);
         assert!(matches!(
             terminal,
             ChildPhaseSupervisorStateV1::Failed(ChildPhaseSupervisorFailureV1::Spawn(_))
@@ -1450,10 +2157,17 @@ mod tests {
     }
 
     #[test]
+    #[serial]
     fn unsupported_containment_fails_before_spawn_and_child_code() {
         let cwd = tempfile::tempdir().unwrap();
         let marker = cwd.path().join("must-not-exist");
-        let prepared = prepared_helper(
+        let mut backend = LinuxChildBackendV1::new_with_containment_setup_for_test(
+            Vec::new(),
+            TestContainmentSetupV1::FailBeforeSpawn,
+        );
+        let executable = helper_executable();
+        let prepared = prepare_confined_helper(
+            &executable,
             cwd.path(),
             "marker",
             TestLimits::default(),
@@ -1461,11 +2175,10 @@ mod tests {
                 "KITSU_MARKER_PATH",
                 marker.to_string_lossy(),
             )],
-        );
-        let mut backend = LinuxChildBackendV1::new_with_containment_setup_for_test(
-            Vec::new(),
-            TestContainmentSetupV1::FailBeforeSpawn,
-        );
+            confined_filesystem_policy(cwd.path(), Vec::new()),
+            &mut backend,
+        )
+        .unwrap();
         {
             let mut supervisor = ChildPhaseSupervisorV1::new(prepared, &mut backend);
             assert!(matches!(
@@ -1493,6 +2206,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn live_child_has_exact_argv_cwd_env_group_fd_capability_and_syscall_fences() {
         let cwd = tempfile::tempdir().unwrap();
         let mut sockets = [0_i32; 2];
@@ -1505,7 +2219,7 @@ mod tests {
         let host_pid = i32::try_from(std::process::id()).unwrap();
         // SAFETY: getpgrp performs a scalar kernel identity query.
         let host_pgid = unsafe { libc::getpgrp() };
-        let prepared = prepared_helper(
+        let (prepared, backend) = prepared_helper(
             cwd.path(),
             "inspect",
             TestLimits::default(),
@@ -1515,8 +2229,9 @@ mod tests {
                 ChildEnvironmentVariableV1::new("KITSU_HOST_PID", host_pid.to_string()),
                 ChildEnvironmentVariableV1::new("KITSU_HOST_PGID", host_pgid.to_string()),
             ],
+            Vec::new(),
         );
-        let (terminal, mut backend) = drive_one_shot(prepared, Vec::new());
+        let (terminal, mut backend) = drive_one_shot(prepared, backend);
         assert!(
             matches!(terminal, ChildPhaseSupervisorStateV1::Stopped { .. }),
             "unexpected terminal state: {terminal:?}"
@@ -1579,11 +2294,18 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn bounded_stdin_round_trip_is_one_shot_and_requires_exit_plus_both_eofs() {
         let cwd = tempfile::tempdir().unwrap();
         let input = b"one bounded request\n".to_vec();
-        let prepared = prepared_helper(cwd.path(), "echo", TestLimits::default(), Vec::new());
-        let (terminal, mut backend) = drive_one_shot(prepared, input.clone());
+        let (prepared, backend) = prepared_helper(
+            cwd.path(),
+            "echo",
+            TestLimits::default(),
+            Vec::new(),
+            input.clone(),
+        );
+        let (terminal, mut backend) = drive_one_shot(prepared, backend);
         assert!(
             matches!(terminal, ChildPhaseSupervisorStateV1::Stopped { .. }),
             "unexpected terminal state: {terminal:?}"
@@ -1598,6 +2320,7 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn stdout_and_stderr_overflow_fail_closed_into_owned_joined_residue() {
         let cwd = tempfile::tempdir().unwrap();
         let limits = TestLimits {
@@ -1605,8 +2328,9 @@ mod tests {
             stderr_bytes: 128,
             ..TestLimits::default()
         };
-        let prepared = prepared_helper(cwd.path(), "flood", limits, Vec::new());
-        let (terminal, mut backend) = drive_one_shot(prepared, Vec::new());
+        let (prepared, backend) =
+            prepared_helper(cwd.path(), "flood", limits, Vec::new(), Vec::new());
+        let (terminal, mut backend) = drive_one_shot(prepared, backend);
         assert!(matches!(
             terminal,
             ChildPhaseSupervisorStateV1::Failed(ChildPhaseSupervisorFailureV1::Effect { .. })
@@ -1621,10 +2345,17 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn crash_after_output_eof_is_never_success() {
         let cwd = tempfile::tempdir().unwrap();
-        let prepared = prepared_helper(cwd.path(), "crash", TestLimits::default(), Vec::new());
-        let (terminal, mut backend) = drive_one_shot(prepared, Vec::new());
+        let (prepared, backend) = prepared_helper(
+            cwd.path(),
+            "crash",
+            TestLimits::default(),
+            Vec::new(),
+            Vec::new(),
+        );
+        let (terminal, mut backend) = drive_one_shot(prepared, backend);
         let completion = backend
             .take_completion()
             .unwrap_or_else(|| panic!("crash completion missing; terminal={terminal:?}"));
@@ -1639,14 +2370,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn response_line_and_idle_process_expire_real_monotonic_request_budget() {
         let cwd = tempfile::tempdir().unwrap();
         let limits = TestLimits {
             request_millis: 20,
             ..TestLimits::default()
         };
-        let prepared = prepared_helper(cwd.path(), "response_then_hang", limits, Vec::new());
-        let (terminal, mut backend) = drive_one_shot(prepared, Vec::new());
+        let (prepared, backend) = prepared_helper(
+            cwd.path(),
+            "response_then_hang",
+            limits,
+            Vec::new(),
+            Vec::new(),
+        );
+        let (terminal, mut backend) = drive_one_shot(prepared, backend);
         assert!(
             matches!(
                 terminal,
@@ -1667,15 +2405,21 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn cancel_and_shutdown_kill_group_reap_direct_child_and_join_workers() {
         for cause in [
             ChildSupervisorCauseV1::Cancel,
             ChildSupervisorCauseV1::Shutdown,
         ] {
             let cwd = tempfile::tempdir().unwrap();
-            let prepared =
-                prepared_helper(cwd.path(), "descendant", TestLimits::default(), Vec::new());
-            let (terminal, mut backend) = drive_cancel_or_shutdown(prepared, cause);
+            let (prepared, backend) = prepared_helper(
+                cwd.path(),
+                "descendant",
+                TestLimits::default(),
+                Vec::new(),
+                Vec::new(),
+            );
+            let (terminal, mut backend) = drive_cancel_or_shutdown(prepared, backend, cause);
             assert!(
                 matches!(
                     terminal,
@@ -1700,10 +2444,16 @@ mod tests {
 
     #[cfg(target_os = "linux")]
     #[test]
+    #[serial]
     fn dropping_live_supervisor_transfers_and_cleans_all_owned_workers() {
         let cwd = tempfile::tempdir().unwrap();
-        let prepared = prepared_helper(cwd.path(), "hang", TestLimits::default(), Vec::new());
-        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let (prepared, mut backend) = prepared_helper(
+            cwd.path(),
+            "hang",
+            TestLimits::default(),
+            Vec::new(),
+            Vec::new(),
+        );
         {
             let mut supervisor = ChildPhaseSupervisorV1::new(prepared, &mut backend);
             supervisor.start().unwrap();
@@ -1713,6 +2463,350 @@ mod tests {
         assert!(cleanup.group_gone());
         assert!(cleanup.direct_child_reaped());
         assert!(cleanup.workers_joined());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn prepared_token_cannot_cross_consume_another_backends_resources() {
+        let first_cwd = tempfile::tempdir().unwrap();
+        let second_cwd = tempfile::tempdir().unwrap();
+        let first_marker = first_cwd.path().join("must-not-run");
+        let second_marker = second_cwd.path().join("must-not-run");
+        let executable = helper_executable();
+        let mut first_backend = LinuxChildBackendV1::new(Vec::new());
+        let first = prepare_confined_helper(
+            &executable,
+            first_cwd.path(),
+            "sealed_marker",
+            TestLimits::default(),
+            vec![ChildEnvironmentVariableV1::new(
+                "KITSU_MARKER_PATH",
+                first_marker.to_string_lossy(),
+            )],
+            confined_filesystem_policy(first_cwd.path(), Vec::new()),
+            &mut first_backend,
+        )
+        .unwrap();
+        let mut second_backend = LinuxChildBackendV1::new(Vec::new());
+        let second = prepare_confined_helper(
+            &executable,
+            second_cwd.path(),
+            "sealed_marker",
+            TestLimits::default(),
+            vec![ChildEnvironmentVariableV1::new(
+                "KITSU_MARKER_PATH",
+                second_marker.to_string_lossy(),
+            )],
+            confined_filesystem_policy(second_cwd.path(), Vec::new()),
+            &mut second_backend,
+        )
+        .unwrap();
+
+        {
+            let mut supervisor = ChildPhaseSupervisorV1::new(first, &mut second_backend);
+            assert!(matches!(
+                supervisor.start(),
+                Ok(ChildPhaseSupervisorStateV1::Failed(
+                    ChildPhaseSupervisorFailureV1::Spawn(_)
+                ))
+            ));
+        }
+        drop(second);
+        assert_eq!(first_backend.prepared_containment_count_for_test(), 1);
+        assert_eq!(second_backend.prepared_containment_count_for_test(), 0);
+        assert_eq!(second_backend.os_spawn_count(), 0);
+        assert!(!first_marker.exists());
+        assert!(!second_marker.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn landlock_enforces_reviewed_content_roots_without_claiming_path_or_metadata_secrecy() {
+        let tree = tempfile::tempdir().unwrap();
+        let readonly = tree.path().join("readonly");
+        let readwrite = tree.path().join("readwrite");
+        let outside = tree.path().join("outside");
+        std::fs::create_dir_all(&readonly).unwrap();
+        std::fs::create_dir_all(&readwrite).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        std::fs::write(readonly.join("reviewed.txt"), b"reviewed").unwrap();
+        std::fs::write(outside.join("secret.txt"), b"outside").unwrap();
+        let readwrite_executable = readwrite.join("must-not-execute");
+        let outside_executable = outside.join("must-not-execute");
+        std::fs::copy(helper_executable(), &readwrite_executable).unwrap();
+        std::fs::copy(helper_executable(), &outside_executable).unwrap();
+        std::fs::set_permissions(&readwrite_executable, Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&outside_executable, Permissions::from_mode(0o755)).unwrap();
+        symlink(&outside, readwrite.join("escape")).unwrap();
+
+        let filesystem = confined_filesystem_policy(
+            &readwrite,
+            vec![ChildFilesystemGrantV1::new(
+                &readonly,
+                ChildFilesystemAccessV1::ReadOnly,
+            )],
+        );
+        let environment = vec![
+            ChildEnvironmentVariableV1::new("KITSU_FS_READONLY", readonly.to_string_lossy()),
+            ChildEnvironmentVariableV1::new("KITSU_FS_READWRITE", readwrite.to_string_lossy()),
+            ChildEnvironmentVariableV1::new("KITSU_FS_OUTSIDE", outside.to_string_lossy()),
+            ChildEnvironmentVariableV1::new(
+                "KITSU_FS_RW_EXECUTABLE",
+                readwrite_executable.to_string_lossy(),
+            ),
+            ChildEnvironmentVariableV1::new(
+                "KITSU_FS_OUTSIDE_EXECUTABLE",
+                outside_executable.to_string_lossy(),
+            ),
+        ];
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let executable = helper_executable();
+        let prepared = prepare_confined_helper(
+            &executable,
+            &readwrite,
+            "filesystem_probe",
+            TestLimits::default(),
+            environment,
+            filesystem,
+            &mut backend,
+        )
+        .unwrap();
+        assert_eq!(backend.prepared_containment_count_for_test(), 1);
+
+        let (terminal, mut backend) = drive_one_shot_with_backend(prepared, backend);
+        assert!(
+            matches!(terminal, ChildPhaseSupervisorStateV1::Stopped { .. }),
+            "unexpected filesystem terminal state: {terminal:?}"
+        );
+        let completion = backend.take_completion().expect("filesystem completion");
+        let json = fixture_json(completion.stdout(), completion.stderr());
+        assert_eq!(json["readonly_contents"], "reviewed");
+        for operation in [
+            "readonly_create_errno",
+            "readonly_truncate_errno",
+            "readonly_rename_errno",
+            "readwrite_execute_errno",
+            "outside_read_errno",
+            "outside_write_errno",
+            "outside_execute_errno",
+            "symlink_escape_errno",
+        ] {
+            assert_eq!(
+                json[operation],
+                libc::EACCES,
+                "{operation} unexpectedly escaped content authority: {json}"
+            );
+        }
+        assert_eq!(json["readwrite_create_errno"], 0);
+        assert_eq!(json["readwrite_rename_errno"], 0);
+        assert_eq!(json["readonly_execute_success"].as_bool(), Some(true));
+
+        // Landlock does not hide paths or govern these metadata operations.
+        // These observations deliberately prevent this card from claiming a
+        // full filesystem sandbox or an MCP-safe mount.
+        assert_eq!(json["outside_metadata_visible"].as_bool(), Some(true));
+        assert_eq!(json["outside_access_visible"].as_bool(), Some(true));
+        assert_eq!(json["outside_chmod_errno"], 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn preparation_seals_exact_launch_bytes_against_post_admission_mutation() {
+        let tree = tempfile::tempdir().unwrap();
+        let cwd = tree.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let executable = tree.path().join("prepared-image");
+        std::fs::copy(helper_executable(), &executable).unwrap();
+        std::fs::set_permissions(&executable, Permissions::from_mode(0o755)).unwrap();
+        let marker = cwd.join("sealed-image-ran");
+        let filesystem = confined_filesystem_policy(&cwd, Vec::new());
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let prepared = prepare_confined_helper(
+            &executable,
+            &cwd,
+            "sealed_marker",
+            TestLimits::default(),
+            vec![ChildEnvironmentVariableV1::new(
+                "KITSU_MARKER_PATH",
+                marker.to_string_lossy(),
+            )],
+            filesystem,
+            &mut backend,
+        )
+        .unwrap();
+
+        let seals = backend.prepared_executable_seals_for_test().unwrap();
+        let required =
+            libc::F_SEAL_WRITE | libc::F_SEAL_GROW | libc::F_SEAL_SHRINK | libc::F_SEAL_SEAL;
+        assert_eq!(seals & required, required);
+        OpenOptions::new()
+            .write(true)
+            .truncate(true)
+            .open(&executable)
+            .unwrap()
+            .write_all(b"post-preparation replacement")
+            .unwrap();
+
+        let (terminal, mut backend) = drive_one_shot_with_backend(prepared, backend);
+        assert!(
+            matches!(terminal, ChildPhaseSupervisorStateV1::Stopped { .. }),
+            "sealed launch did not complete: {terminal:?}"
+        );
+        assert_eq!(std::fs::read(&marker).unwrap(), b"sealed bytes ran");
+        assert_eq!(
+            backend.take_completion().unwrap().truth(),
+            RealChildCompletionTruthV1::Success
+        );
+        assert_eq!(backend.prepared_containment_count_for_test(), 0);
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn prepared_cwd_descriptor_cannot_be_redirected_by_path_replacement() {
+        let tree = tempfile::tempdir().unwrap();
+        let authorized = tree.path().join("cwd");
+        let relocated = tree.path().join("authorized-relocated");
+        std::fs::create_dir(&authorized).unwrap();
+        std::fs::write(authorized.join("identity"), b"authorized inode").unwrap();
+        let filesystem = confined_filesystem_policy(&authorized, Vec::new());
+        let executable = helper_executable();
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let prepared = prepare_confined_helper(
+            &executable,
+            &authorized,
+            "cwd_probe",
+            TestLimits::default(),
+            Vec::new(),
+            filesystem,
+            &mut backend,
+        )
+        .unwrap();
+
+        std::fs::rename(&authorized, &relocated).unwrap();
+        std::fs::create_dir(&authorized).unwrap();
+        std::fs::write(authorized.join("identity"), b"replacement trap").unwrap();
+
+        let (terminal, mut backend) = drive_one_shot_with_backend(prepared, backend);
+        assert!(
+            matches!(terminal, ChildPhaseSupervisorStateV1::Stopped { .. }),
+            "pinned-cwd fixture failed: {terminal:?}"
+        );
+        let completion = backend.take_completion().unwrap();
+        let json = fixture_json(completion.stdout(), completion.stderr());
+        assert_eq!(json["relative_identity"], "authorized inode");
+        assert_eq!(json["cwd"], relocated.to_string_lossy().as_ref());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    #[serial]
+    fn unsupported_or_incomplete_preparation_fails_before_target_code_or_spawn() {
+        let tree = tempfile::tempdir().unwrap();
+        let cwd = tree.path().join("work");
+        std::fs::create_dir(&cwd).unwrap();
+        let marker = cwd.join("must-not-run");
+        let executable = helper_executable();
+        for setup in [
+            TestFilesystemPreparationSetupV1::UnsupportedLandlockAbi,
+            TestFilesystemPreparationSetupV1::MemfdUnavailable,
+            TestFilesystemPreparationSetupV1::SealRejected,
+            TestFilesystemPreparationSetupV1::RulesetRejected,
+        ] {
+            let mut backend =
+                LinuxChildBackendV1::new_with_filesystem_setup_for_test(Vec::new(), setup);
+            let result = prepare_confined_helper(
+                &executable,
+                &cwd,
+                "sealed_marker",
+                TestLimits::default(),
+                vec![ChildEnvironmentVariableV1::new(
+                    "KITSU_MARKER_PATH",
+                    marker.to_string_lossy(),
+                )],
+                confined_filesystem_policy(&cwd, Vec::new()),
+                &mut backend,
+            );
+            assert!(
+                matches!(
+                    result,
+                    Err(ChildLaunchAdmissionErrorV1::ContainmentPreflight(_))
+                ),
+                "{setup:?} did not fail in preparation: {result:?}"
+            );
+            assert_eq!(backend.os_spawn_count(), 0, "setup={setup:?}");
+            assert_eq!(backend.prepared_containment_count_for_test(), 0);
+            assert!(!marker.exists());
+        }
+
+        let script = tree.path().join("not-native-elf");
+        std::fs::write(&script, b"#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&script, Permissions::from_mode(0o755)).unwrap();
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let result = prepare_confined_helper(
+            &script,
+            &cwd,
+            "sealed_marker",
+            TestLimits::default(),
+            vec![ChildEnvironmentVariableV1::new(
+                "KITSU_MARKER_PATH",
+                marker.to_string_lossy(),
+            )],
+            confined_filesystem_policy(&cwd, Vec::new()),
+            &mut backend,
+        );
+        assert!(matches!(
+            result,
+            Err(ChildLaunchAdmissionErrorV1::ContainmentPreflight(detail))
+                if detail.contains("native ELF")
+        ));
+        assert_eq!(backend.os_spawn_count(), 0);
+        assert_eq!(backend.prepared_containment_count_for_test(), 0);
+        assert!(!marker.exists());
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn claim_boundary_keeps_landlock_and_host_authority_gaps_explicit() {
+        assert_eq!(
+            filesystem_authority_nonclaims_v1(),
+            &[
+                ChildFilesystemAuthorityNonclaimV1::PathVisibilityStatAndAccess,
+                ChildFilesystemAuthorityNonclaimV1::MetadataAndExtendedAttributes,
+                ChildFilesystemAuthorityNonclaimV1::FileLocksAndDescriptorControl,
+                ChildFilesystemAuthorityNonclaimV1::MountNamespaceIsolation,
+                ChildFilesystemAuthorityNonclaimV1::HostSignalsAndPtrace,
+            ]
+        );
+    }
+
+    #[cfg(all(target_os = "linux", target_arch = "x86_64"))]
+    #[test]
+    fn executable_cap_rejects_a_sparse_cap_plus_one_image_before_memfd_creation() {
+        let tree = tempfile::tempdir().unwrap();
+        let executable = tree.path().join("oversized-native-image");
+        let source = File::create(&executable).unwrap();
+        source.set_len(MAX_EXECUTABLE_BYTES_V1 + 1).unwrap();
+        drop(source);
+        std::fs::set_permissions(&executable, Permissions::from_mode(0o755)).unwrap();
+        assert_eq!(
+            std::fs::metadata(&executable).unwrap().len(),
+            MAX_EXECUTABLE_BYTES_V1 + 1
+        );
+
+        let mut backend = LinuxChildBackendV1::new(Vec::new());
+        let observed = backend.canonicalize_executable(&executable).unwrap();
+        let error = backend.executable_sha256(&observed).unwrap_err();
+        assert!(
+            error.contains("executable exceeds the bounded image cap"),
+            "unexpected cap error: {error}"
+        );
+        assert!(backend.pending_image.is_none());
+        assert_eq!(backend.prepared_containment_count_for_test(), 0);
+        assert_eq!(backend.os_spawn_count(), 0);
     }
 
     #[test]
@@ -1755,8 +2849,100 @@ mod tests {
             "marker" => {
                 std::fs::write(std::env::var("KITSU_MARKER_PATH").unwrap(), b"ran").unwrap();
             }
+            "sealed_marker" => {
+                std::fs::write(
+                    std::env::var("KITSU_MARKER_PATH").unwrap(),
+                    b"sealed bytes ran",
+                )
+                .unwrap();
+            }
+            "filesystem_probe" => child_filesystem_probe(),
+            "cwd_probe" => {
+                let result = serde_json::json!({
+                    "cwd": std::env::current_dir().unwrap(),
+                    "relative_identity": std::fs::read_to_string("identity").unwrap(),
+                });
+                println!("KITSU_FIXTURE_JSON={result}");
+            }
             other => panic!("unknown child fixture {other}"),
         }
+    }
+
+    fn child_filesystem_probe() {
+        let readonly = PathBuf::from(std::env::var("KITSU_FS_READONLY").unwrap());
+        let readwrite = PathBuf::from(std::env::var("KITSU_FS_READWRITE").unwrap());
+        let outside = PathBuf::from(std::env::var("KITSU_FS_OUTSIDE").unwrap());
+        let readwrite_executable = PathBuf::from(std::env::var("KITSU_FS_RW_EXECUTABLE").unwrap());
+        let outside_executable =
+            PathBuf::from(std::env::var("KITSU_FS_OUTSIDE_EXECUTABLE").unwrap());
+        let outside_secret = outside.join("secret.txt");
+        let access_path = CString::new(outside_secret.as_os_str().as_bytes()).unwrap();
+
+        let readonly_contents = std::fs::read_to_string(readonly.join("reviewed.txt")).unwrap();
+        let readonly_create_errno =
+            result_errno(std::fs::write(readonly.join("must-not-create"), b"denied"));
+        let readonly_truncate_errno = result_errno(
+            OpenOptions::new()
+                .write(true)
+                .truncate(true)
+                .open(readonly.join("reviewed.txt")),
+        );
+        let readonly_rename_errno = result_errno(std::fs::rename(
+            readonly.join("reviewed.txt"),
+            readwrite.join("must-not-move"),
+        ));
+        let readwrite_create_errno =
+            result_errno(std::fs::write(readwrite.join("created"), b"created"));
+        let readwrite_rename_errno = result_errno(std::fs::rename(
+            readwrite.join("created"),
+            readwrite.join("renamed"),
+        ));
+        let readonly_execute_success = std::process::Command::new("/usr/bin/true")
+            .status()
+            .is_ok_and(|status| status.success());
+        let readwrite_execute_errno =
+            result_errno(std::process::Command::new(readwrite_executable).status());
+        let outside_read_errno = result_errno(std::fs::read(&outside_secret));
+        let outside_write_errno =
+            result_errno(std::fs::write(outside.join("must-not-create"), b"denied"));
+        let outside_execute_errno =
+            result_errno(std::process::Command::new(outside_executable).status());
+        let symlink_escape_errno = result_errno(std::fs::read(readwrite.join("escape/secret.txt")));
+        let outside_metadata_visible = std::fs::metadata(&outside_secret).is_ok();
+        // SAFETY: the CString is NUL-terminated and points to live storage.
+        let outside_access_visible = unsafe { libc::access(access_path.as_ptr(), libc::F_OK) } == 0;
+        let outside_chmod_errno = result_errno(std::fs::set_permissions(
+            &outside_secret,
+            Permissions::from_mode(0o640),
+        ));
+        let result = serde_json::json!({
+            "readonly_contents": readonly_contents,
+            "readonly_create_errno": readonly_create_errno,
+            "readonly_truncate_errno": readonly_truncate_errno,
+            "readonly_rename_errno": readonly_rename_errno,
+            "readwrite_create_errno": readwrite_create_errno,
+            "readwrite_rename_errno": readwrite_rename_errno,
+            "readonly_execute_success": readonly_execute_success,
+            "readwrite_execute_errno": readwrite_execute_errno,
+            "outside_read_errno": outside_read_errno,
+            "outside_write_errno": outside_write_errno,
+            "outside_execute_errno": outside_execute_errno,
+            "symlink_escape_errno": symlink_escape_errno,
+            "outside_metadata_visible": outside_metadata_visible,
+            "outside_access_visible": outside_access_visible,
+            "outside_chmod_errno": outside_chmod_errno,
+        });
+        println!("KITSU_FIXTURE_JSON={result}");
+    }
+
+    fn result_errno<T>(result: std::io::Result<T>) -> i32 {
+        result.map_or_else(
+            |error| error.raw_os_error().unwrap_or(0),
+            |value| {
+                drop(value);
+                0
+            },
+        )
     }
 
     fn child_inspect() {
