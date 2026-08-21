@@ -2,7 +2,7 @@
 
 Status: source-audited from runtime-source pin
 `986fba971ec99c9af5dcd8f69a48f507aae486af`, with accepted implementation
-updates through Cycle 116.
+updates through Cycle 117.
 
 The exact provenance and frozen research-input hashes are in the
 [post-E01 evidence baseline](post-e01-evidence-baseline.md). This document
@@ -333,6 +333,13 @@ kernel.
   currency is the only admitted cost; Kitsu does not derive price. The DTO is
   unmounted, and current run tallies cannot yet populate complete response
   coverage or cached-token facts.
+- Cycle 117 mounts that typed observation on exact `/status`. One captured route
+  receipt and one synchronous snapshot drive adaptive human output; runtime
+  version and cwd are authoritative local facts. The command performs no
+  provider, account, Git, filesystem, or persistence lookup. Existing JSONL
+  keys/nesting remain stable and its text field is the deterministic redirected
+  view of the same observation. Account limits/prices and durable history remain
+  unavailable.
 - Cycle 107 adds one private atomic publication owner for complete validated
   external inventories. Initial publication is create-only. A successor must
   match the exact source incarnation and advance by exactly one without
@@ -407,7 +414,7 @@ kernel.
 | Static instructions/resources | Local skills | Untrusted data; no inherent effect authority | Retain and reuse provenance rules |
 | Provider dialect | Compiled `Provider` trait, compatible Chat and native Messages adapters | Same process; network/auth provider-owned | X001 replaceable; closed compiled registration only |
 | External runtime tools | Static request inventory; closed external identities/fingerprints; exact atomic external-inventory publication; exact bounded child policy/admission plus lifecycle, phase-supervisor, and private one-shot Linux backend truth; pure bounded tools-only MCP codec | Same-process product handlers only; the backend is private/unmounted, has no filesystem confinement or immutable exec handle, and the codec owns no serial transport | E06 identity, admission/policy, publication, lifecycle, phase, real-child, and wire foundations begun; no long-lived MCP composition, live external handler, product configuration, or X002 acceptance |
-| Host/UI protocol | CLI carriers plus one-way JSONL; typed current-session telemetry DTO, truthful current-run usage coverage, private adaptive renderer, and exact offline `/usage session` collection/routing | Consumer cannot service synchronous calls; the mounted command samples in-memory owners only and performs no provider/account/network/fs/persistence effect; JSONL deliberately has no new command-result contract | First truthful usage slice is live, but no named second host, full status/context migration, aliases, automation parity, or durable history exists; X003/X004 fail |
+| Host/UI protocol | CLI carriers plus one-way JSONL; typed current-session telemetry DTO, truthful current-run usage coverage, adaptive renderer, exact offline `/usage session`, and typed offline `/status` | Consumer cannot service synchronous calls; mounted telemetry samples in-memory owners only and performs no provider/account/network/fs/persistence effect. `/status` preserves its legacy JSONL payload; `/usage session` deliberately has no new command-result contract | Truthful current status/usage slices are live, but no named second host, `/context` migration, aliases, new usage automation schema, account data, or durable history exists; X003/X004 fail |
 | Persistence adapter | Private file snapshot implementation | Local private state | No port/revision/HEAD conformance; X005 fails |
 
 ## Three spines and extraction order

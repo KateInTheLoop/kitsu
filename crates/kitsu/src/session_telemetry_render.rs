@@ -26,6 +26,44 @@ pub(crate) struct TelemetryDeckOptions {
     pub columns: usize,
 }
 
+/// One immutable command-local observation for the full `/status` deck.
+///
+/// Version and cwd are presentation facts that do not belong in the portable
+/// current-session telemetry schema, but retaining them as typed values keeps
+/// their truth class and provenance explicit alongside that snapshot.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct CurrentStatusObservation {
+    snapshot: CurrentSessionSnapshot,
+    version: TelemetryValue<String>,
+    cwd: TelemetryValue<String>,
+}
+
+impl CurrentStatusObservation {
+    pub(crate) const fn new(
+        snapshot: CurrentSessionSnapshot,
+        version: TelemetryValue<String>,
+        cwd: TelemetryValue<String>,
+    ) -> Self {
+        Self {
+            snapshot,
+            version,
+            cwd,
+        }
+    }
+
+    pub(crate) const fn snapshot(&self) -> &CurrentSessionSnapshot {
+        &self.snapshot
+    }
+
+    pub(crate) const fn version(&self) -> &TelemetryValue<String> {
+        &self.version
+    }
+
+    pub(crate) const fn cwd(&self) -> &TelemetryValue<String> {
+        &self.cwd
+    }
+}
+
 #[derive(Debug)]
 struct Fact {
     label: &'static str,
@@ -42,19 +80,25 @@ struct Section {
     facts: Vec<Fact>,
 }
 
-#[allow(dead_code)] // Full three-section deck remains staged; /usage mounts only its usage view.
-pub(crate) fn render_current_session_snapshot(
-    snapshot: &CurrentSessionSnapshot,
+pub(crate) fn render_current_status_observation(
+    observation: &CurrentStatusObservation,
     options: TelemetryDeckOptions,
 ) -> String {
-    render_sections(sections(snapshot, options.destination.styled()), options)
+    render_sections(
+        sections(
+            observation.snapshot(),
+            Some((observation.version(), observation.cwd())),
+            options.destination.styled(),
+        ),
+        options,
+    )
 }
 
 pub(crate) fn render_current_session_usage(
     snapshot: &CurrentSessionSnapshot,
     options: TelemetryDeckOptions,
 ) -> String {
-    let usage = sections(snapshot, options.destination.styled())
+    let usage = sections(snapshot, None, options.destination.styled())
         .pop()
         .expect("current-session telemetry always has a usage section");
     render_sections(vec![usage], options)
@@ -74,10 +118,21 @@ fn render_sections(sections: Vec<Section>, options: TelemetryDeckOptions) -> Str
     }
 }
 
-fn sections(snapshot: &CurrentSessionSnapshot, visual: bool) -> Vec<Section> {
+fn sections(
+    snapshot: &CurrentSessionSnapshot,
+    presentation: Option<(&TelemetryValue<String>, &TelemetryValue<String>)>,
+    visual: bool,
+) -> Vec<Section> {
     let route = &snapshot.status.route;
     let authority = &snapshot.status.authority;
-    let status = vec![
+    let mut status = Vec::new();
+    if let Some((version, cwd)) = presentation {
+        status.extend([
+            fact("version", version, |value| clean_inline(value)),
+            fact("cwd", cwd, |value| clean_inline(value)),
+        ]);
+    }
+    status.extend([
         fact("adapter", &route.adapter, adapter_label),
         fact("model", &route.model, |value| clean_inline(value)),
         fact("profile", &route.profile, |value| clean_inline(value)),
@@ -106,7 +161,7 @@ fn sections(snapshot: &CurrentSessionSnapshot, visual: bool) -> Vec<Section> {
             &authority.exact_command_grants,
             grouped_count,
         ),
-    ];
+    ]);
 
     let context = &snapshot.context;
     let mut context_facts = Vec::new();
@@ -603,8 +658,8 @@ fn context_window_source_label(value: kitsu_core::ContextWindowSource) -> &'stat
 #[cfg(test)]
 mod tests {
     use super::{
-        render_current_session_snapshot, render_current_session_usage, TelemetryDeckDestination,
-        TelemetryDeckOptions,
+        render_current_session_usage, render_current_status_observation, CurrentStatusObservation,
+        TelemetryDeckDestination, TelemetryDeckOptions,
     };
     use kitsu_core::{
         ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
@@ -681,8 +736,19 @@ mod tests {
         destination: TelemetryDeckDestination,
         columns: usize,
     ) -> String {
-        render_current_session_snapshot(
-            snapshot,
+        let observation = CurrentStatusObservation::new(
+            snapshot.clone(),
+            TelemetryValue::authoritative(
+                "kitsu test".to_string(),
+                TelemetryProvenance::RuntimeIdentity,
+            ),
+            TelemetryValue::authoritative(
+                "/work/repository".to_string(),
+                TelemetryProvenance::RuntimeIdentity,
+            ),
+        );
+        render_current_status_observation(
+            &observation,
             TelemetryDeckOptions {
                 destination,
                 columns,
@@ -702,6 +768,54 @@ mod tests {
                 columns,
             },
         )
+    }
+
+    #[test]
+    fn status_observation_adds_authoritative_version_and_cwd_to_every_destination() {
+        let observation = CurrentStatusObservation::new(
+            snapshot(SessionCostInput::unavailable()),
+            TelemetryValue::authoritative(
+                "kitsu 9.8.7".to_string(),
+                TelemetryProvenance::RuntimeIdentity,
+            ),
+            TelemetryValue::authoritative(
+                "/work/repository".to_string(),
+                TelemetryProvenance::RuntimeIdentity,
+            ),
+        );
+
+        for (destination, columns) in [
+            (TelemetryDeckDestination::StyledTerminal, 80),
+            (TelemetryDeckDestination::StyledTerminal, 40),
+            (TelemetryDeckDestination::StyledTerminal, 24),
+            (TelemetryDeckDestination::StyledTerminal, 1),
+            (TelemetryDeckDestination::Redirected, 80),
+            (TelemetryDeckDestination::Plain, 80),
+            (TelemetryDeckDestination::NoColor, 80),
+            (TelemetryDeckDestination::ScreenReader, 80),
+        ] {
+            let output = render_current_status_observation(
+                &observation,
+                TelemetryDeckOptions {
+                    destination,
+                    columns,
+                },
+            );
+            let plain = kitsu_render::sanitize_terminal_text(&output);
+            assert!(plain.contains("version") || columns == 1, "{plain}");
+            assert!(plain.contains("cwd") || columns == 1, "{plain}");
+            if columns > 1 {
+                assert!(plain.contains("kitsu 9.8.7"), "{plain}");
+                assert!(plain.contains("/work/repository"), "{plain}");
+                assert!(plain.contains("authoritative"), "{plain}");
+                assert!(plain.contains("runtime identity"), "{plain}");
+            }
+            if destination == TelemetryDeckDestination::StyledTerminal {
+                assert_lines_fit(&output, columns);
+            } else {
+                assert!(!output.contains('\u{1b}'), "{output}");
+            }
+        }
     }
 
     fn assert_lines_fit(output: &str, columns: usize) {
