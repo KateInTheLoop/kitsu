@@ -1,9 +1,8 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave and Cycle 126 MCP/serial composition are
-accepted on `improvements/post-118`; active lanes are Cycle 127 context-source
-telemetry, Cycle 128's unmounted semantic contributor, and Cycle 129's
-publication-fixture isolation.
+Status: the first post-118 wave plus Cycles 126-127 are accepted on
+`improvements/post-118`; active lanes are Cycle 128's unmounted semantic
+contributor and Cycle 129's publication-fixture isolation.
 
 ## Objective
 

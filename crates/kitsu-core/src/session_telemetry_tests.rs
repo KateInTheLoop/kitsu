@@ -1,9 +1,9 @@
 use crate::{
-    ContextSnapshotInput, ContextWindowSource, CurrencyAmount, CurrentSessionSnapshot,
-    CurrentSessionSnapshotInput, EffectiveAuthorityInput, EffectiveAuthorityMode,
-    ProviderUsageCoverageSnapshot, RunProviderUsageCoverageSnapshot, RunUsageSnapshot,
-    SessionCostInput, SessionId, SessionUsageInput, TelemetryProvenance, TelemetryValue,
-    TruthClass, UsageSnapshot,
+    ContextSnapshotInput, ContextSourcesSnapshot, ContextSourcesSnapshotInput, ContextWindowSource,
+    CurrencyAmount, CurrentSessionSnapshot, CurrentSessionSnapshotInput, EffectiveAuthorityInput,
+    EffectiveAuthorityMode, ProviderUsageCoverageSnapshot, RunProviderUsageCoverageSnapshot,
+    RunUsageSnapshot, SessionCostInput, SessionId, SessionUsageInput, TelemetryProvenance,
+    TelemetryValue, TruthClass, UsageSnapshot,
 };
 use kitsu_providers::{ProviderAdapterId, ProviderRouteReceipt, ProviderWireRevision};
 
@@ -64,6 +64,82 @@ fn anchored_context() -> ContextSnapshotInput {
             TelemetryProvenance::ProviderAnchoredContextMeter,
         ),
     }
+}
+
+#[test]
+fn context_sources_keep_estimates_budget_arithmetic_and_unavailable_buckets_distinct() {
+    let sources = ContextSourcesSnapshot::from_input(ContextSourcesSnapshotInput {
+        core_instructions_tokens: 1_200,
+        project_context_tokens: 0,
+        skill_context_tokens: 320,
+        tool_schema_tokens: 640,
+        runtime_system_message_tokens: 18,
+        user_message_tokens: 2_100,
+        assistant_message_tokens: 900,
+        tool_result_tokens: 450,
+        prompt_budget_tokens: 30_720,
+        output_reserve_tokens: 2_048,
+        trim_target_tokens: 28_672,
+        estimate_buffer_tokens: 2_048,
+        compactions: 2,
+        exchanges_removed: 3,
+        tool_results_elided: 4,
+        compaction_tokens_saved: 5_000,
+    });
+
+    assert_eq!(sources.core_instructions.value(), Some(&1_200));
+    assert_eq!(sources.project_context.value(), Some(&0));
+    assert_eq!(
+        sources.project_context.truth_class(),
+        TruthClass::Estimated,
+        "owned startup absence is an estimated zero, not unavailable"
+    );
+    assert_eq!(
+        sources.core_instructions.provenance(),
+        TelemetryProvenance::RequestAssemblyEstimate
+    );
+    assert_eq!(
+        sources.user_messages.provenance(),
+        TelemetryProvenance::ConversationMessageEstimate
+    );
+    for unavailable in [
+        &sources.attachments,
+        &sources.on_demand_skill_bodies,
+        &sources.memory,
+        &sources.response_schema,
+    ] {
+        assert_eq!(unavailable.value(), None);
+        assert_eq!(unavailable.truth_class(), TruthClass::Unavailable);
+        assert_eq!(
+            unavailable.provenance(),
+            TelemetryProvenance::ContextSourceNotSeparatelyTracked
+        );
+    }
+    for derived in [
+        &sources.prompt_budget,
+        &sources.output_reserve,
+        &sources.trim_target,
+        &sources.estimate_buffer,
+    ] {
+        assert_eq!(derived.truth_class(), TruthClass::Derived);
+        assert_eq!(
+            derived.provenance(),
+            TelemetryProvenance::ContextBudgetArithmetic
+        );
+    }
+    assert_eq!(sources.compactions.truth_class(), TruthClass::Authoritative);
+    assert_eq!(
+        sources.compactions.provenance(),
+        TelemetryProvenance::SessionAccounting
+    );
+    assert_eq!(
+        sources.compaction_tokens_saved.truth_class(),
+        TruthClass::Estimated
+    );
+    assert_eq!(
+        sources.compaction_tokens_saved.provenance(),
+        TelemetryProvenance::ContextMeterEstimate
+    );
 }
 
 #[test]

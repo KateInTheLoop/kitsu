@@ -28,18 +28,19 @@ E08-S05 mounts the same typed offline current-session observation on `/status`
 through Cycle 117 while preserving the legacy JSONL payload shape, and exact
 offline `/context window` through Cycle 121.
 Bare `/usage`, `/usage session`, and legacy `/cost` share that typed usage
-observation through Cycle 124.
+observation through Cycle 124. Exact offline `/context sources` is implemented
+through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 
 | Field | Current value |
 |---|---|
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 126 / 126 |
+| Accepted cycles/commits after this cycle | 127 / 127 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 127 — E08-S05-C8: add a truthful offline context-source view |
+| Active epic/card | Cycle 128 — E07-S01-C4: compile the measured selector as an unmounted read-only contributor |
 
 ## Epic status
 
@@ -53,7 +54,7 @@ observation through Cycle 124.
 | E06 child/MCP spine | **In progress** through E06-S01-C7, E06-S02-C3, and E06-S03-C2; depends only on accepted E01/E02 | A private Linux x86-64 backend consumes exact prepared phase/I/O/environment/network/group/filesystem policy and retains one child across serial bounded frames. One private composite now drives pinned tools-only initialize/notification/list/call ordering with proof-derived bounds and typed cleanup. It remains unmounted; no real peer, handler/inventory mount, config, alternate enforcement, or product route exists, so X002 stays open |
 | E07 semantic context | **In progress** through E07-S01-C3 | The deterministic fixed-corpus baseline and test-only selector comparison pass. Current permission-gated reads reconstruct emitted evidence after ranking; hostile denied/private/symlink candidates, source replacement, later re-observation, and revocation pass canonical oracles without stale or denied leakage. Production contributor remains absent |
 | E05 onboarding | **In progress** through E05-S01-C3 and E05-S02-C1 | Pure consent/fenced-stage/reverse-rollback truth composes with a private Linux descriptor-relative no-clobber publisher and exact concrete cleanup ledger for one local/offline path. A separate pure picker preserves bounded offline/stale catalog truth and returns proposals only. Both remain unmounted; credential/provider/catalog adapters, guided UI, proposal application, activation, first success, and PF-10 remain open |
-| E08 telemetry/docs | **In progress** through E08-S05-C7 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive full/context/usage decks. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation payloads, account truth, and durable history remain separate; history still consumes E03 fencing |
+| E08 telemetry/docs | **In progress** through E08-S05-C8 | Pure current-session DTOs label every value with truth/provenance; `/status`, exact `/context window`, `/context sources`, and bare/session/legacy-cost usage forms collect coherent offline in-memory observations and render adaptive decks. Source rows distinguish coarse estimates, derived budget, authoritative counts, and unavailable sub-buckets without an additive total. `/status` preserves legacy JSONL; context and usage remain lifecycle-only. New usage automation, account truth, exact tokenizer attribution, and durable history remain separate |
 | E09 multimodal | Deferred | Requires two truthful capability paths and measured product demand |
 | E10 certification | Blocked by design until implementations exist | Run complete default/alternate X001-X005 suites; no inference-based promotion |
 
@@ -187,6 +188,7 @@ observation through Cycle 124.
 | 124 | this document's commit | One typed usage snapshot behind bare, session, and legacy-cost compatibility forms |
 | 125 | this document's commit | Selector authority refusal and current-source reconstruction across hostile, replaced, and revoked evidence |
 | 126 | this document's commit | Pinned tools-only MCP codec composed with one proof-bounded serial child owner |
+| 127 | this document's commit | Offline typed context-source estimates, unavailable sub-buckets, and adaptive view |
 
 ## Current green gates
 
@@ -921,6 +923,13 @@ child. Payload/frame/count/deadline bounds come only from the prepared proof;
 codec, client, transport, clock, and cleanup faults retain exact terminal and
 residue truth. No inventory, configuration, handler, product route, real peer,
 or wider MCP vocabulary is mounted.
+
+Cycle 127 adds exact offline `/context sources` using retained typed startup
+entries, role-based messages, budget arithmetic, and compaction accounting.
+Attachments, on-demand skill bodies, memory, and response schema remain
+structurally unavailable; estimated rows are not presented as an additive
+provider total. Adaptive human modes and lifecycle-only JSONL add no provider,
+account, network, command-time filesystem, persistence, or history work.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

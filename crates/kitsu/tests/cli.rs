@@ -1420,7 +1420,7 @@ fn test_query_only_durable_script_does_not_create_a_session_snapshot() {
     let home = TempDir::new().expect("temp home");
     write_config(home.path(), "http://127.0.0.1:1");
     let script = home.path().join("query-only-durable.script");
-    fs::write(&script, "/status\n/sessions\n/quit\n").unwrap();
+    fs::write(&script, "/status\n/context sources\n/sessions\n/quit\n").unwrap();
 
     let mut chat = base_cmd(home.path());
     chat.env("ANTHROPIC_AUTH_TOKEN", TOKEN)
@@ -1670,12 +1670,140 @@ async fn test_context_window_is_offline_exact_accessible_and_leaves_jsonl_unmoun
         assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
         assert!(String::from_utf8(rejected.stderr)
             .unwrap()
-            .contains("usage: /context [window|refresh]"));
+            .contains("usage: /context [window|sources|refresh]"));
     }
 
     assert!(
         server.received_requests().await.unwrap().is_empty(),
         "/context window sent a provider request"
+    );
+}
+
+#[tokio::test]
+#[serial]
+async fn test_context_sources_is_offline_accessible_and_lifecycle_only_in_jsonl() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().expect("context-sources home");
+    write_config(home.path(), &server.uri());
+    let script = home.path().join("context-sources.script");
+    fs::write(&script, "/context sources\n/quit\n").unwrap();
+
+    for (mode, args, env) in [
+        ("plain", vec!["--plain"], None),
+        ("no-color", vec![], Some(("NO_COLOR", "1"))),
+        ("screen-reader", vec!["--screen-reader"], None),
+        ("redirected", vec![], None),
+    ] {
+        let mut command = base_cmd(home.path());
+        command.env("ANTHROPIC_AUTH_TOKEN", TOKEN);
+        if let Some((name, value)) = env {
+            command.env(name, value);
+        } else {
+            command.env_remove("NO_COLOR");
+        }
+        command.args(args).args([
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ]);
+        let output = command.output().expect("run context-sources mode");
+        assert!(output.status.success(), "{mode}: {output:?}");
+        assert!(output.stdout.is_empty(), "{mode}: {output:?}");
+        let stderr = String::from_utf8(output.stderr).unwrap();
+        for required in [
+            "[sources]",
+            "source.core instructions:",
+            "source.project context:",
+            "source.user messages:",
+            "source.attachments: unavailable (included in user messages)",
+            "source.on-demand skill bodies: unavailable (included in user messages)",
+            "source.memory: unavailable (no dedicated Kitsu memory bucket)",
+            "context.output reserve:",
+            "context.tokens saved:",
+        ] {
+            assert!(
+                stderr.contains(required),
+                "{mode}: missing {required}: {stderr}"
+            );
+        }
+        assert!(!stderr.contains("source total"), "{mode}: {stderr}");
+        assert!(!stderr.contains('\u{1b}'), "{mode}: {stderr}");
+        for forbidden in ["credits", "rate limit", "price", "account:", "@"] {
+            assert!(
+                !stderr.to_ascii_lowercase().contains(forbidden),
+                "{mode}: invented or leaked {forbidden}: {stderr}"
+            );
+        }
+    }
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--script",
+            &script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run JSONL context-sources command");
+    assert!(jsonl.status.success(), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events: Vec<serde_json::Value> = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["type"] == "command_started" && event["command"] == "/context sources"
+    }));
+    assert!(events.iter().any(|event| {
+        event["type"] == "command_finished"
+            && event["command"] == "/context sources"
+            && event["status"] == "ok"
+    }));
+    assert!(!events.iter().any(|event| {
+        event["type"] == "command_result" && event["command"] == "/context sources"
+    }));
+
+    for (name, contents) in [
+        ("context-source.script", "/context source\n/quit\n"),
+        (
+            "context-sources-extra.script",
+            "/context sources extra\n/quit\n",
+        ),
+    ] {
+        let inexact = home.path().join(name);
+        fs::write(&inexact, contents).unwrap();
+        let rejected = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--plain",
+                "chat",
+                "--no-session",
+                "--script",
+                &inexact.to_string_lossy(),
+            ])
+            .output()
+            .expect("reject inexact context-sources form");
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        assert!(String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("usage: /context [window|sources|refresh]"));
+    }
+
+    assert!(
+        server.received_requests().await.unwrap().is_empty(),
+        "/context sources sent a provider request"
     );
 }
 
