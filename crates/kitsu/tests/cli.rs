@@ -1438,6 +1438,99 @@ fn test_query_only_durable_script_does_not_create_a_session_snapshot() {
     assert_eq!(listed, serde_json::json!([]));
 }
 
+#[tokio::test]
+#[serial]
+async fn test_usage_session_is_offline_exact_and_leaves_jsonl_payloads_unmounted() {
+    use wiremock::matchers::method;
+    use wiremock::{Mock, MockServer, ResponseTemplate};
+
+    let server = MockServer::start().await;
+    Mock::given(method("POST"))
+        .respond_with(ResponseTemplate::new(500))
+        .expect(0)
+        .mount(&server)
+        .await;
+    let home = TempDir::new().expect("usage-session home");
+    write_config(home.path(), &server.uri());
+
+    let human_script = home.path().join("usage-session.script");
+    fs::write(&human_script, "/usage session\n/quit\n").unwrap();
+    let human = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--plain",
+            "chat",
+            "--no-session",
+            "--script",
+            &human_script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run offline current-session usage command");
+    assert!(human.status.success(), "{human:?}");
+    assert!(human.stdout.is_empty(), "{human:?}");
+    let human_stderr = String::from_utf8(human.stderr).unwrap();
+    assert!(human_stderr.contains("[usage]"), "{human_stderr}");
+    assert!(
+        human_stderr.contains("usage.responses reported: 0"),
+        "{human_stderr}"
+    );
+    assert!(
+        human_stderr.contains("usage.prompt tokens: unavailable"),
+        "{human_stderr}"
+    );
+    assert!(!human_stderr.contains('\u{1b}'), "{human_stderr}");
+
+    let jsonl = base_cmd(home.path())
+        .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+        .args([
+            "--jsonl",
+            "chat",
+            "--no-session",
+            "--script",
+            &human_script.to_string_lossy(),
+        ])
+        .output()
+        .expect("run JSONL command without mounting a payload");
+    assert!(jsonl.status.success(), "{jsonl:?}");
+    assert!(jsonl.stderr.is_empty(), "{jsonl:?}");
+    let events: Vec<serde_json::Value> = String::from_utf8(jsonl.stdout)
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str(line).expect("valid JSONL event"))
+        .collect();
+    assert!(events.iter().any(|event| {
+        event["type"] == "command_finished"
+            && event["command"] == "/usage session"
+            && event["status"] == "ok"
+    }));
+    assert!(!events.iter().any(|event| {
+        event["type"] == "command_result" && event["command"] == "/usage session"
+    }));
+
+    for (name, contents) in [
+        ("usage-bare.script", "/usage\n/quit\n"),
+        ("usage-unknown.script", "/usage current\n/quit\n"),
+    ] {
+        let script = home.path().join(name);
+        fs::write(&script, contents).unwrap();
+        let rejected = base_cmd(home.path())
+            .env("ANTHROPIC_AUTH_TOKEN", TOKEN)
+            .args([
+                "--plain",
+                "chat",
+                "--no-session",
+                "--script",
+                &script.to_string_lossy(),
+            ])
+            .output()
+            .expect("reject inexact usage command");
+        assert_eq!(rejected.status.code(), Some(1), "{rejected:?}");
+        assert!(String::from_utf8(rejected.stderr)
+            .unwrap()
+            .contains("usage: /usage session"));
+    }
+}
+
 #[cfg(unix)]
 #[test]
 #[serial]
