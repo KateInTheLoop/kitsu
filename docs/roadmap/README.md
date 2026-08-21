@@ -721,6 +721,7 @@ gates merely because a card appears attractive.
 | 110 | E08-S05-C3 | Render only typed current-session facts through adaptive wide/stacked/narrow and stable redirected/plain/no-color/screen-reader decks |
 | 111 | E06-S01-C4 | Consume exact authorized phase budgets in a provider-free supervisor with checked monotonic deadlines, ordered terminate/kill/reap transitions, and owned residue truth |
 | 112 | E08-S05-C4 | Collect one coherent in-memory snapshot and mount exact offline `/usage session` through the typed usage-only adaptive renderer |
+| 113 | E07-S01-C1 | Freeze a bounded provider-free mixed-language locate/explain/change-evidence baseline over the current read-only repository tools |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -984,6 +985,16 @@ reported zero, unavailable cost, terminal destination, and offline zero-send
 behavior remain explicit. Bare `/usage`, calendar history, account/price/limit
 data, `/cost` aliasing, `/status` and `/context` migration, and a JSONL
 `command_result` contract remain separate cards.
+Cycle 113 freezes the first E07 measurement baseline without adding a production
+context contributor. Three immutable mixed-language vectors run fixed read-only
+symbol, outline, grep, file, and manifest plans against an embedded corpus. The
+canonical JSONL is byte-identical across independent temporary roots and records
+closed relevance, round, declared byte-to-token, retained tool-byte, and
+deadline-class evidence. Every input/resource dimension is capped and an
+overflow stops later calls. The change vector proves only read-only evidence
+acquisition; it does not edit or claim task completion. Tree-sitter, reference
+graphs, PageRank, caching, provider calls, production registration, and any
+semantic-selector benefit remain unimplemented and require measured comparison.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may
