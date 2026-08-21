@@ -19,7 +19,8 @@ The measured selector is compiled as an unmounted, permission-bound read-only
 contributor through Cycle 128 while preserving the frozen benchmark bytes.
 E05-S01 has a private effect-free transactional setup model through Cycle 114,
 descriptor-relative no-clobber configuration publication through Cycle 116,
-and one private local/offline coordinator through Cycle 120.
+one private local/offline coordinator through Cycle 120, and generation-scoped
+test-only publication/rollback/hook fault plans through Cycle 129.
 E05-S02 has a private pure offline-capable model-picker snapshot and proposal
 through Cycle 123.
 E06-S01 now composes its prepared policy and phase owner with a private real
@@ -38,11 +39,11 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | Clean implementation base | `a2ba2d5c98b17da7290a2b6b8b24c83bc2529763` |
 | Frozen research subject | `6c7133334dadf66a545888f4068ac82585a2768f` |
 | Post-E01 runtime source pin | `986fba971ec99c9af5dcd8f69a48f507aae486af` |
-| Accepted cycles/commits after this cycle | 128 / 128 |
+| Accepted cycles/commits after this cycle | 129 / 129 |
 | Complete replaceability gates | 1 / 5 |
 | Closed bounded defects/transfers | KB-001 Ollama alias; A001 registry admission/coupling |
 | Original main worktree | Same ten user-owned modified paths; untouched |
-| Active epic/card | Cycle 129 — test-only publication fault-fixture isolation before further E05 composition |
+| Active epic/card | Cycle 130 — prove the private MCP composite against one real sealed tools-only stdio peer |
 
 ## Epic status
 
@@ -192,6 +193,7 @@ through Cycle 127 with coarse estimates and unavailable sub-buckets separated.
 | 126 | this document's commit | Pinned tools-only MCP codec composed with one proof-bounded serial child owner |
 | 127 | this document's commit | Offline typed context-source estimates, unavailable sub-buckets, and adaptive view |
 | 128 | this document's commit | Bounded unmounted structural contributor with current authority/source/role reconstruction |
+| 129 | this document's commit | Generation-scoped test-only publication fault plans and unwind-safe fixture isolation |
 
 ## Current green gates
 
@@ -943,6 +945,14 @@ symlinked, replaced, shifted, removed, and revoked evidence fails closed with
 no partial artifact. The original canonical outputs remain 286/517/331 bytes
 and 5-to-3 rounds, while config, CLI, provider/session routing, caching,
 mutation, and automatic context injection remain absent.
+
+Cycle 129 makes the publication, rollback, and pre-install hook fault injectors
+test-scope owned. Must-use non-clone guards carry unique generations, consume
+their active plan exactly once, and clear only a matching unconsumed plan on
+early return or unwind; an older live guard cannot clear a newer generation.
+Deterministic regressions reproduce all three prior poison paths. Production
+create-new publication, collision, durability, ledger, cleanup, and rollback
+behavior is byte-for-byte unchanged.
 
 No provider, session, MCP, production semantic-context, production onboarding,
 or multimodal feature jumps this foundation because all depend on truthful

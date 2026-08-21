@@ -1,9 +1,8 @@
 # Parallel delivery after Cycle 118
 
-Status: the first post-118 wave plus Cycles 126-128 are accepted on
-`improvements/post-118`; active lanes are Cycle 129's publication-fixture
-isolation, Cycle 130's real-child MCP peer proof, and Cycle 131's model-picker
-namespace binding.
+Status: the first post-118 wave plus Cycles 126-129 are accepted on
+`improvements/post-118`; active lanes are Cycle 130's real-child MCP peer proof
+and Cycle 131's model-picker namespace binding.
 
 ## Objective
 
@@ -100,6 +99,10 @@ emitted line and current definition/reference classification after ranking;
 the frozen 5-to-3-round and 1,456-to-1,134-byte result remains unchanged. A
 later product mount still requires explicit trigger/root ownership,
 cancellation/deadlines, context accounting, and canonical projection rules.
+Cycle 129 separately hardens test-only publication fault injection so parallel
+acceptance cannot be misclassified by a stale thread-local fault or hook left
+after an early return or unwind. It changes no production publication,
+rollback, or no-clobber semantics.
 
 The integration review rejects name-only identities, ambient runtime loading,
 implicit install/update/discovery, remembered cross-session authority,
