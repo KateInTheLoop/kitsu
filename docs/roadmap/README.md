@@ -262,7 +262,7 @@ cutting an incomplete exchange.
 
 Dependencies: E02 terminal outcome model.
 
-Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C22,
+Status: E03-S01 and E03-S04 are accepted, E03-S02 is implemented through C23,
 and E03-S05 is in progress through Cycle 080. The
 canonical ADR and neutral logical value layer assign transcript operations,
 semantic terminal outcomes, selected logical
@@ -359,6 +359,12 @@ current-v1 observation and the neutral canonical lookup state. It admits only
 empty, current-v1-only, or canonical-only truth; corrupt/future/conflict state,
 canonical tombstones, and dual presence are distinct fail-closed results. It
 owns no paths or I/O and is not connected to production routing.
+A read-only observer now feeds that oracle from one descriptor-pinned session
+root. Current-v1 reads are bounded and classify malformed, identity, and future
+versions without changing bytes. Canonical open succeeds only for a complete
+pre-existing store and performs no create, chmod, sync, repair, lock, or write;
+missing, partial, future, wrong-store, corrupt-HEAD, and symlinked namespaces
+stay typed and fail closed. The selected payload is not yet retained or routed.
 A pure branch-at-committed-turn assembler now accepts only a committed operation
 boundary, creates a fresh destination session/revision with `Missing` parent,
 copies the exact chronological closed prefix and only its referenced artifact
@@ -675,6 +681,7 @@ gates merely because a card appears attractive.
 | 079 | E03-S05-C3 | Publish a complete branch create-only under ordered source/destination fences with exact cut residue |
 | 080 | E03-S05-C4 | Resume branch publication only from exact re-synced artifact and candidate residue |
 | 081 | E03-S02-C22 | Define pure deterministic current-v1/canonical mount admission with explicit unavailable, tombstone, and dual-presence refusal |
+| 082 | E03-S02-C23 | Observe both representations through one pinned root without creating, repairing, locking, or changing either store |
 
 After the documentation-only Cycle 030, Cycle 031 finishes E04's primary wire
 fixture contract. Cycle 032 begins capability/revision value types before
@@ -757,9 +764,10 @@ artifact copying as a separately accepted effect boundary. Cycle 079 adds the
 source/destination-fenced create-only branch publication transaction. Cycle 080
 adds exact residue recovery/idempotent retry for pre-HEAD cuts; then the queue
 returns to E03-S02 in Cycle 081 with a pure mount-admission oracle. Cycle 082
-next observes current-v1 and canonical presence without creating or changing
-either store, then continues through E03, E06, E07, E05/E08, and E09 in the
-dependency-safe order above.
+observes current-v1 and canonical presence without creating or changing either
+store. Cycle 083 next retains the exact selected value from that same observation
+without a second path read, then continues through E03, E06, E07, E05/E08, and
+E09 in the dependency-safe order above.
 E08-S05's high-value `/status`, `/context window`, and `/usage session` slice is
 4-7 cycles once its E04-owned identity inputs are ready; complete
 telemetry/history work adds 12-18 cycles. Provider-free fixture design may

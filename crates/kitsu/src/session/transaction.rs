@@ -1954,6 +1954,34 @@ impl<'a> CanonicalFileTransactionV1<'a> {
     }
 }
 
+pub(super) fn lookup_canonical_mount_state_v1(
+    store: &PhysicalFileStoreV1,
+    session_id: &SessionId,
+) -> SessionLookupState {
+    CanonicalFileTransactionV1::new(store)
+        .lookup_canonical_head(session_id)
+        .state
+}
+
+#[cfg(test)]
+pub(super) fn publish_current_v1_mount_fixture_v1(
+    store: &PhysicalFileStoreV1,
+    source_bytes: &[u8],
+    session_id: &SessionId,
+    revision_id: RevisionId,
+    committed_at: String,
+) -> Result<(), String> {
+    CanonicalFileTransactionV1::new(store)
+        .commit_current_v1_legacy_baseline(
+            source_bytes,
+            session_id.as_str(),
+            revision_id,
+            committed_at,
+        )
+        .map(|_| ())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
