@@ -19,6 +19,54 @@ pub fn register_command_tool(
     registry.register_with_descriptor(descriptor, handler)
 }
 
+/// How much of the read surface to advertise to the model.
+///
+/// Every tool costs context before the conversation starts: the full read set
+/// serializes to ~3.5k tokens of JSON schema, which is more than the entire
+/// window some local runtimes actually serve (Ollama defaults to 4096 and
+/// silently truncates from the FRONT, destroying the system prompt and tool
+/// schemas first). [`ToolTier::Lean`] advertises only the general-purpose
+/// primitives — read, list, search — from which the specialised readers'
+/// capabilities can be approximated, trading breadth for a prompt that fits.
+///
+/// The tier is an ADVERTISING decision, not an authority one: permissions are
+/// unchanged, and a leaner registry can never reach a path the full one could
+/// not.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum ToolTier {
+    /// Every read tool, including the format-specific document readers.
+    #[default]
+    Full,
+    /// Only the primitives that fit a small local context window.
+    Lean,
+}
+
+impl ToolTier {
+    /// The tier appropriate for a model whose resolved context window is
+    /// `window` tokens, or [`ToolTier::Full`] when the window is unknown.
+    ///
+    /// Below [`LEAN_TIER_WINDOW_THRESHOLD`] the full schema set would consume
+    /// most of the window (or all of it) before the user's first message, so
+    /// the lean set is the only one that leaves room to actually work.
+    pub fn for_window(window: Option<u64>) -> Self {
+        match window {
+            Some(window) if window < LEAN_TIER_WINDOW_THRESHOLD => Self::Lean,
+            _ => Self::Full,
+        }
+    }
+
+    pub fn is_lean(self) -> bool {
+        matches!(self, Self::Lean)
+    }
+}
+
+/// Resolved context windows below this get [`ToolTier::Lean`].
+///
+/// Sized so the full ~3.5k-token read schema stays a minority of the window:
+/// at 16k it is ~22%, which leaves a workable conversation budget, while at
+/// 8k it is ~44% and at Ollama's default 4096 it does not fit at all.
+pub const LEAN_TIER_WINDOW_THRESHOLD: u64 = 16_384;
+
 /// Register the read fs tools against `registry`, bound to `permissions`.
 /// Content search is implemented in-process on Unix, so its availability does
 /// not depend on a developer tool being present on the model runner's PATH.
@@ -26,11 +74,41 @@ pub fn register_fs_tools(
     registry: &mut Registry,
     policy: Arc<Permissions>,
 ) -> Result<(), RegistryError> {
+    register_fs_tools_tiered(registry, policy, ToolTier::Full)
+}
+
+/// [`register_fs_tools`], but advertising only the subset `tier` allows.
+///
+/// The lean tier keeps `fs_read_file`, `fs_list_dir` and `repo_grep`: the three
+/// primitives every other read tool is a specialisation of. A model that needs
+/// a CSV can still read it as text; a model with no window left can do nothing
+/// at all.
+pub fn register_fs_tools_tiered(
+    registry: &mut Registry,
+    policy: Arc<Permissions>,
+    tier: ToolTier,
+) -> Result<(), RegistryError> {
     let (d, h) = fs::read_file_tool(policy.clone());
     registry.register_with_descriptor(d, h)?;
 
     let (d, h) = fs::list_dir_tool(policy.clone());
     registry.register_with_descriptor(d, h)?;
+
+    if tier.is_lean() {
+        // Search is the one non-obvious primitive a lean model cannot
+        // reconstruct from read+list, so it stays even in the smallest set.
+        #[cfg(unix)]
+        {
+            let (d, h) = fs::grep_tool(policy);
+            registry.register_with_descriptor(d, h)?;
+        }
+        #[cfg(not(unix))]
+        if rg_available() {
+            let (d, h) = fs::grep_tool(policy);
+            registry.register_with_descriptor(d, h)?;
+        }
+        return Ok(());
+    }
 
     let (d, h) = fs::read_csv_tool(policy.clone());
     registry.register_with_descriptor(d, h)?;
@@ -153,6 +231,125 @@ mod tests {
         "fs_read_html",
         "outline_file",
     ];
+
+    fn read_tool_names(tier: ToolTier) -> Vec<String> {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut registry = Registry::new();
+        register_fs_tools_tiered(&mut registry, policy, tier).unwrap();
+        registry
+            .descriptors()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect()
+    }
+
+    /// The whole point of the lean tier: the advertised read surface must fit
+    /// beside a conversation in a 4096-token window. The full set serializes to
+    /// more than that window on its own, so a small local model never sees its
+    /// own system prompt.
+    #[test]
+    fn lean_tier_read_schema_fits_a_small_window() {
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut lean = Registry::new();
+        register_fs_tools_tiered(&mut lean, policy.clone(), ToolTier::Lean).unwrap();
+        let mut full = Registry::new();
+        register_fs_tools_tiered(&mut full, policy, ToolTier::Full).unwrap();
+
+        // ~4 chars/token, matching the estimator the context budget uses.
+        let tokens = |r: &Registry| serde_json::to_string(r.descriptors()).unwrap().len() / 4;
+        assert!(
+            tokens(&lean) < 1_000,
+            "lean read schema must leave room to work in a 4096-token window, got ~{} tokens",
+            tokens(&lean)
+        );
+        assert!(
+            tokens(&full) > tokens(&lean) * 2,
+            "full tier should be materially larger; lean ~{}, full ~{}",
+            tokens(&lean),
+            tokens(&full)
+        );
+    }
+
+    /// Lean keeps read, list, and search — the primitives every dropped tool is
+    /// a specialisation of. Losing search would leave a model unable to locate
+    /// anything it was not handed a path to.
+    #[test]
+    fn lean_tier_keeps_the_general_purpose_primitives() {
+        let lean = read_tool_names(ToolTier::Lean);
+        assert!(lean.iter().any(|n| n == "fs_read_file"));
+        assert!(lean.iter().any(|n| n == "fs_list_dir"));
+        #[cfg(unix)]
+        assert!(lean.iter().any(|n| n == "repo_grep"), "got {lean:?}");
+    }
+
+    /// The format-specific readers are what makes the full set too big; none of
+    /// them may survive into the lean tier.
+    #[test]
+    fn lean_tier_drops_the_specialised_readers() {
+        let lean = read_tool_names(ToolTier::Lean);
+        for dropped in CODEX_READ_CAPABILITIES {
+            assert!(
+                !lean.iter().any(|n| n == dropped),
+                "lean tier must not advertise {dropped}"
+            );
+        }
+    }
+
+    /// No regression for models that can afford the full set: an explicit Full
+    /// tier, and the untiered entry point, register exactly what they always did.
+    #[test]
+    fn full_tier_is_unchanged_and_is_the_untiered_default() {
+        let full = read_tool_names(ToolTier::Full);
+        for kept in CODEX_READ_CAPABILITIES {
+            assert!(full.iter().any(|n| n == kept), "full tier lost {kept}");
+        }
+
+        let policy = Arc::new(Permissions::for_roots(&[], &[]).unwrap());
+        let mut untiered = Registry::new();
+        register_fs_tools(&mut untiered, policy).unwrap();
+        let untiered: Vec<String> = untiered
+            .descriptors()
+            .iter()
+            .map(|d| d.name.clone())
+            .collect();
+        assert_eq!(untiered, full, "register_fs_tools must default to Full");
+    }
+
+    /// The tier is chosen from the resolved window. Ollama's default 4096 and
+    /// the shipped profile's optimistic 8192 both land on Lean; a hosted window
+    /// stays Full. An unknown window is NOT treated as small — `None` means "no
+    /// information", and silently shrinking a large model's toolset would be a
+    /// regression for every gateway that reports nothing.
+    #[test]
+    fn tier_is_selected_from_the_resolved_window() {
+        assert_eq!(ToolTier::for_window(Some(4_096)), ToolTier::Lean);
+        assert_eq!(ToolTier::for_window(Some(8_192)), ToolTier::Lean);
+        assert_eq!(
+            ToolTier::for_window(Some(LEAN_TIER_WINDOW_THRESHOLD - 1)),
+            ToolTier::Lean
+        );
+        assert_eq!(
+            ToolTier::for_window(Some(LEAN_TIER_WINDOW_THRESHOLD)),
+            ToolTier::Full,
+            "the threshold itself is affordable"
+        );
+        assert_eq!(ToolTier::for_window(Some(131_072)), ToolTier::Full);
+        assert_eq!(ToolTier::for_window(None), ToolTier::Full);
+    }
+
+    /// A leaner registry is an advertising decision, never an authority one: it
+    /// must not gain a handler the full tier lacks.
+    #[test]
+    fn lean_tier_never_adds_capability() {
+        let lean = read_tool_names(ToolTier::Lean);
+        let full = read_tool_names(ToolTier::Full);
+        for name in &lean {
+            assert!(
+                full.contains(name),
+                "{name} is advertised by the lean tier but not the full one"
+            );
+        }
+    }
 
     #[test]
     fn write_registration_advertises_write_and_edit_tools() {
