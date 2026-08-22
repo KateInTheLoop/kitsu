@@ -1044,7 +1044,14 @@ impl AgentRegistry {
                     return AgentHandoffAckOutcome::AlreadyAcknowledged;
                 }
                 AgentHandoffState::Ready => {
-                    debug_assert!(record.thread.acknowledge_handoff());
+                    // `acknowledge_handoff` MUTATES the handoff state; it must be
+                    // called unconditionally. Inside `debug_assert!` the whole
+                    // expression is compiled out of a release build, so the
+                    // transition to Acknowledged silently never happened in the
+                    // binary users actually run — a fetched result stayed Ready
+                    // forever and was re-delivered as unobserved at shutdown.
+                    let acknowledged = record.thread.acknowledge_handoff();
+                    debug_assert!(acknowledged);
                 }
             }
             self.changed_snapshot(&agents)
@@ -1066,7 +1073,12 @@ impl AgentRegistry {
                     if record.thread.handoff() != AgentHandoffState::Ready {
                         return None;
                     }
-                    debug_assert!(record.thread.acknowledge_handoff());
+                    // Same release-build hazard as `acknowledge_result`: this
+                    // call marks the result observed, so it cannot live inside
+                    // `debug_assert!` or every call would re-return results that
+                    // were already drained.
+                    let acknowledged = record.thread.acknowledge_handoff();
+                    debug_assert!(acknowledged);
                     Some(terminal_status(*id, record, true))
                 })
                 .collect::<Vec<_>>();
@@ -2448,6 +2460,66 @@ mod tests {
         assert_eq!(
             registry.result(id).as_deref(),
             Some("finished before subscribe")
+        );
+    }
+
+    /// Regression: acknowledgement is a STATE TRANSITION, and it must survive
+    /// the release profile.
+    ///
+    /// Both acknowledgement paths once called the mutating
+    /// `acknowledge_handoff()` from inside a `debug_assert!`. That macro does
+    /// not evaluate its expression when debug assertions are off, so in the
+    /// binary users actually run the transition never happened: a fetched
+    /// result stayed `Ready` forever, `acknowledge_result` never reported
+    /// `AlreadyAcknowledged`, and every `take_unobserved_terminal_results` call
+    /// re-returned results already drained — re-printing finished agent output
+    /// at shutdown. Debug CI stayed green throughout.
+    ///
+    /// This test asserts the observable transition rather than the mechanism.
+    /// Note it can only FAIL under `--release`: with debug assertions on, the
+    /// macro does evaluate its expression and the side effect still happens, so
+    /// the bug is invisible in a debug run by construction. No test can close
+    /// that gap from inside the debug profile — which is why the workflow runs
+    /// the suite in both profiles. Verified by reintroducing the bug: debug
+    /// passed, release failed.
+    #[test]
+    fn acknowledgement_transition_survives_the_release_profile() {
+        let registry = AgentRegistry::new();
+        let id = registry.start("t".to_string()).unwrap();
+        registry.finish(id, Ok("done".to_string()));
+
+        assert_eq!(registry.handoff_state(id), Some(AgentHandoffState::Ready));
+        assert_eq!(
+            registry.acknowledge_result(id),
+            AgentHandoffAckOutcome::Acknowledged
+        );
+        // The transition must be durable, not merely reported.
+        assert_eq!(
+            registry.handoff_state(id),
+            Some(AgentHandoffState::Acknowledged),
+            "acknowledge_result must actually transition the state"
+        );
+        assert_eq!(
+            registry.acknowledge_result(id),
+            AgentHandoffAckOutcome::AlreadyAcknowledged
+        );
+        assert!(
+            registry.take_unobserved_terminal_results().is_empty(),
+            "an acknowledged result must never resurface as unobserved"
+        );
+
+        // The drain path owns the same transition.
+        let drained = registry.start("u".to_string()).unwrap();
+        registry.finish(drained, Ok("done".to_string()));
+        assert_eq!(registry.take_unobserved_terminal_results().len(), 1);
+        assert_eq!(
+            registry.handoff_state(drained),
+            Some(AgentHandoffState::Acknowledged),
+            "draining must mark the result observed"
+        );
+        assert!(
+            registry.take_unobserved_terminal_results().is_empty(),
+            "a drained result must not be returned twice"
         );
     }
 

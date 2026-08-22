@@ -31,3 +31,12 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    # Release is the profile users actually run, and it is NOT equivalent to
+    # debug for correctness: `debug_assert!` does not evaluate its expression
+    # when debug assertions are off. A side-effecting call placed inside one
+    # therefore vanishes from the shipped binary while debug CI stays green —
+    # which is exactly how a background-agent acknowledgement silently stopped
+    # happening in release (subagent.rs `acknowledge_handoff`). Debug-only CI
+    # cannot see that class of bug at all, so the suite runs in both profiles.
+    - name: Run tests (release profile)
+      run: cargo test --release --verbose

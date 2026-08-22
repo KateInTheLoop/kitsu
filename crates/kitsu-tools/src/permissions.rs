@@ -1103,16 +1103,77 @@ impl Permissions {
         )))
     }
 
+    /// The denial for a read path that could not be resolved on disk.
+    ///
+    /// A bare "does not exist" is a dead end for the caller: a model that
+    /// guessed `/crates` learns only that it was wrong, so it guesses again,
+    /// and each guess costs a full tool round — tens of seconds against a local
+    /// runtime. Naming the granted roots turns the denial into a recoverable
+    /// instruction.
+    ///
+    /// A relative path is reported as relative *to the working directory it was
+    /// resolved against*, never as invalid-because-relative. Relative paths do
+    /// work — `./crates` resolves fine when the process runs from the repo root,
+    /// as observed live — so telling a model "paths must be absolute" would push
+    /// it off a pattern that succeeds. What actually failed is resolution from
+    /// THIS directory, and naming that directory is what makes the failure
+    /// diagnosable.
+    ///
+    /// This discloses nothing new: the same roots are already listed verbatim
+    /// in the chat system prompt ("Granted filesystem roots"), alongside the
+    /// working directory, so the model has held both since its first turn. The
+    /// reminder is a recovery aid, not a widening of what the model can see —
+    /// and the roots listed are grants, never protected or merely-existing paths.
+    fn unresolvable_read_path(&self, requested: &Path) -> ToolError {
+        // Bounded: a session can accumulate many grants, and an unbounded list
+        // would push a small model's context out the way the path guess did.
+        const MAX_LISTED_ROOTS: usize = 5;
+        let roots = self.read_roots();
+        let listed: Vec<String> = roots
+            .iter()
+            .take(MAX_LISTED_ROOTS)
+            .map(|root| root.display().to_string())
+            .collect();
+        let hint = if listed.is_empty() {
+            String::from("; no read roots are granted in this session")
+        } else {
+            let overflow = roots.len().saturating_sub(listed.len());
+            format!(
+                "; readable root(s): {}{}",
+                listed.join(", "),
+                if overflow > 0 {
+                    format!(" (+{overflow} more)")
+                } else {
+                    String::new()
+                }
+            )
+        };
+        // A relative path is resolved against the process working directory, so
+        // naming that directory is the actionable part — not the fact that the
+        // path was relative, which is legitimate and usually works.
+        let relative = if requested.is_absolute() {
+            String::new()
+        } else {
+            match std::env::current_dir() {
+                Ok(cwd) => format!(
+                    " — resolved as relative to the working directory '{}'",
+                    cwd.display()
+                ),
+                Err(_) => String::from(" — resolved as relative to the working directory"),
+            }
+        };
+        ToolError::PolicyDenied(format!(
+            "path '{}' is not accessible or does not exist{relative}{hint}",
+            requested.display()
+        ))
+    }
+
     /// Check (and possibly prompt for) read access to `requested`. Returns the
     /// resolved absolute path on success.
     pub async fn check_read(&self, requested: &Path) -> Result<PathBuf, ToolError> {
         let apparent = normalize_apparent(requested)?;
-        let canon = std::fs::canonicalize(requested).map_err(|_| {
-            ToolError::PolicyDenied(format!(
-                "path '{}' is not accessible or does not exist",
-                requested.display()
-            ))
-        })?;
+        let canon =
+            std::fs::canonicalize(requested).map_err(|_| self.unresolvable_read_path(requested))?;
         #[cfg(unix)]
         if path_is_multiply_linked_regular_file(&canon) {
             refresh_protected_file_identities(
@@ -1594,6 +1655,61 @@ mod tests {
         let perms = Permissions::for_roots(&[root], &[]).unwrap();
         let f = write_file(dir.path(), "ok.txt", "hi");
         assert!(perms.check_read(&f).await.is_ok());
+    }
+
+    /// A model that guesses a path must be able to recover from the denial
+    /// without guessing again — each retry costs a full tool round. The denial
+    /// names the granted roots (already disclosed in the system prompt), and for
+    /// a relative path names the directory it was resolved against — NOT a claim
+    /// that relative paths are invalid, since they resolve fine from a matching
+    /// cwd (verified live: `./crates` succeeded from the repo root).
+    #[tokio::test]
+    async fn unresolvable_read_path_names_the_roots_and_flags_a_relative_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path().to_string_lossy().to_string();
+        let perms = Permissions::for_roots(std::slice::from_ref(&root), &[]).unwrap();
+
+        // Relative AND unresolvable from the cwd: name the directory it was
+        // resolved against, so the failure is diagnosable. It must NOT tell the
+        // model that relative paths are invalid — they are not.
+        let Err(ToolError::PolicyDenied(message)) =
+            perms.check_read(Path::new("./definitely-not-here")).await
+        else {
+            panic!("a relative, nonexistent path must be denied");
+        };
+        assert!(
+            message.contains("working directory"),
+            "must name the resolution base: {message}"
+        );
+        assert!(
+            !message.to_lowercase().contains("must be absolute"),
+            "must not claim relative paths are invalid: {message}"
+        );
+        assert!(
+            message.contains(&root),
+            "denial must name the root: {message}"
+        );
+
+        // Absolute but nonexistent: names the roots, and says nothing about a
+        // working directory because none took part in resolution.
+        let Err(ToolError::PolicyDenied(message)) = perms.check_read(Path::new("/crates")).await
+        else {
+            panic!("a nonexistent absolute path must be denied");
+        };
+        assert!(!message.contains("working directory"), "{message}");
+        assert!(message.contains(&root), "{message}");
+    }
+
+    /// With no grants there is no root to suggest; say so plainly rather than
+    /// printing an empty list.
+    #[tokio::test]
+    async fn unresolvable_read_path_without_grants_says_no_roots() {
+        let perms = Permissions::for_roots(&[], &[]).unwrap();
+        let Err(ToolError::PolicyDenied(message)) = perms.check_read(Path::new("/nope")).await
+        else {
+            panic!("must be denied");
+        };
+        assert!(message.contains("no read roots are granted"), "{message}");
     }
 
     #[tokio::test]

@@ -31,9 +31,19 @@ models_path = "/v1/models"
 model       = "llama3.2"
 auth        = { method = "none" }
 # Ollama serves a small default window (num_ctx, often 4096) regardless of the
-# model's max, and its /v1/models route doesn't report it — so set the real
-# window here (or per run with --context-window) to size context budgeting.
-context_window = 8192
+# model's max, and its /v1/models route doesn't report it. Kitsu probes the
+# native /api/ps route for the window actually being served and clamps DOWN to
+# it when this value is optimistic — an oversize prompt is truncated from the
+# front by the runtime, silently destroying the system prompt and tool schemas
+# rather than erroring. The probe only sees a model that is already loaded, so
+# keep this conservative for the first request of a cold run.
+#
+# To get a bigger window, raise it where it is actually served — set
+# OLLAMA_CONTEXT_LENGTH for `ollama serve`, or bake num_ctx into a Modelfile.
+# Setting a larger number here does not create context; it only makes kitsu
+# overfill a window the runtime will quietly cut. Note that on CPU-only hosts a
+# large window costs real latency.
+context_window = 4096
 
 # ── Local: vLLM ──────────────────────────────────────────────────────────────
 # `vllm serve <model> --port 8000`  (add `--api-key <key>` to require a token).
@@ -79,6 +89,34 @@ context_window = 131072
 # Hint wording is deliberately filter-safe: kitsu suppresses any hint that
 # resembles a credential (URL schemes, `hf_`/`sk-` prefixes, bare `token`
 # labels), so this must describe the fix without quoting one.
+auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Hugging Face credential with 'Make calls to Inference Providers', then set HF_TOKEN" }
+
+# ── Qwen via the Hugging Face router — the hosted regression target ──────────
+# A second, NON-local target so changes are validated against something other
+# than a small CPU-bound Ollama model. It covers what the local setup structurally
+# cannot:
+#   - the FULL tool tier (a 262144 window is far above the lean-tier threshold,
+#     so all 26 tool schemas are advertised, not the lean 7)
+#   - spawn_agents / spawn_agent_bg / agent_result, which the lean tier drops
+#   - a REMOTE gateway, confirming the Ollama-only /api/ps served-window probe
+#     correctly does not fire off-loopback
+#
+# The model carries an explicit `:novita` provider pin. The router lists several
+# providers per model with different windows and differing tool support, and an
+# unpinned id would let a request land on one that cannot call tools at all.
+# Pinning also makes the window deterministic instead of a MIN across providers.
+[gateways.qwen]
+flavor      = "openai"
+base_url    = "https://router.huggingface.co"
+chat_path   = "/v1/chat/completions"
+models_path = "/v1/models"
+model       = "Qwen/Qwen3-Coder-480B-A35B-Instruct:novita"
+# novita's advertised window for this model. Set explicitly rather than left to
+# discovery: catalog discovery warms a cache for the NEXT run, so a cold first
+# run would fall back to the 8192 default and silently select the lean tier —
+# defeating the point of this profile. Use `/context refresh` to exercise the
+# live nested-providers[] discovery path on purpose.
+context_window = 262144
 auth        = { method = "bearer-env", env = "HF_TOKEN", refresh_hint = "create a fine-grained Hugging Face credential with 'Make calls to Inference Providers', then set HF_TOKEN" }
 
 # ── OpenAI (hosted) ──────────────────────────────────────────────────────────

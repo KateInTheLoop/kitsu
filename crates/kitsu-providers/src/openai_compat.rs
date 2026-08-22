@@ -1486,6 +1486,69 @@ impl OpenAICompatProvider {
             context_length_from_catalog(&text, model)
         }
     }
+
+    /// Best-effort discovery of the window the runtime is ACTUALLY SERVING for
+    /// `model`, as opposed to the window the model was trained for.
+    ///
+    /// This exists because the two can differ by orders of magnitude and only
+    /// the served one is real. Ollama loads llama3.2 — a 131072-token model —
+    /// with a 4096-token window by default, advertises neither number on its
+    /// OpenAI-compatible `/v1/models` route, and then TRUNCATES oversized
+    /// prompts from the front without error or warning. A caller budgeting
+    /// against 8192 or 131072 therefore sends requests whose system prompt and
+    /// tool schemas are silently discarded before the model ever sees them.
+    ///
+    /// The probe reads Ollama's native `/api/ps`, which reports `context_length`
+    /// per loaded model. Returns `None` for every other gateway, for an
+    /// unloaded model, and on any error — it is strictly advisory and never
+    /// propagates failures. A `None` means "no better information", not
+    /// "unlimited".
+    pub async fn served_context_length(&self, model: &str) -> Option<u64> {
+        let url = format!("{}/api/ps", self.base_url);
+        let rb = self.http.get(&url).timeout(self.discovery_timeout);
+        let rb = self.attach_auth(rb).ok()?;
+        let response = rb.send().await.ok()?;
+        if !response.status().is_success() {
+            return None;
+        }
+        let text = response.text().await.ok()?;
+        served_length_from_ps(&text, model)
+    }
+}
+
+/// Pure parse: the served `context_length` for `model` from an Ollama
+/// `/api/ps` body. Matches the full id first (`llama3.2:latest`), then the
+/// tag-stripped base (`llama3.2`), so a config that omits the `:latest` tag
+/// still binds. An ambiguous base match gives up rather than binding to the
+/// wrong entry — budgeting against another model's window is worse than
+/// falling back to config.
+fn served_length_from_ps(text: &str, model: &str) -> Option<u64> {
+    let json: serde_json::Value = serde_json::from_str(text).ok()?;
+    let entries = json.get("models")?.as_array()?;
+    let entry_name = |e: &serde_json::Value| -> Option<String> {
+        e.get("model")
+            .or_else(|| e.get("name"))
+            .and_then(serde_json::Value::as_str)
+            .map(str::to_string)
+    };
+    let base = |id: &str| id.split_once(':').map_or(id, |(base, _)| base).to_string();
+    let entry = entries
+        .iter()
+        .find(|e| entry_name(e).is_some_and(|id| id == model || base(&id) == base(model)))?;
+    // A second entry sharing the same base is ambiguous (two tags of one model
+    // loaded with different windows); refuse rather than guess.
+    if entries
+        .iter()
+        .filter(|e| entry_name(e).is_some_and(|id| base(&id) == base(model)))
+        .count()
+        > 1
+    {
+        return None;
+    }
+    entry
+        .get("context_length")
+        .and_then(serde_json::Value::as_u64)
+        .filter(|n| *n > 0)
 }
 
 /// Pure parse: extract a model's advisory context length from a catalog JSON
@@ -1966,6 +2029,73 @@ impl Provider for OpenAICompatProvider {
         let parsed: ModelsResponse = serde_json::from_str(&text)
             .map_err(|e| ProviderError::InvalidResponse(format!("malformed /models JSON: {e}")))?;
         Ok(Some(parsed.data.into_iter().map(|m| m.id).collect()))
+    }
+}
+
+#[cfg(test)]
+mod served_window_tests {
+    use super::served_length_from_ps;
+
+    /// A real Ollama `/api/ps` body, trimmed to the fields that matter. The
+    /// window here (4096) is the SERVED one; the same model's trained window is
+    /// 131072, which is exactly why the trained number must never be used.
+    const PS_LOADED: &str = r#"{"models":[{"name":"llama3.2:latest",
+        "model":"llama3.2:latest","context_length":4096}]}"#;
+
+    #[test]
+    fn reads_the_served_window_for_an_exact_id() {
+        assert_eq!(
+            served_length_from_ps(PS_LOADED, "llama3.2:latest"),
+            Some(4096)
+        );
+    }
+
+    /// A config naming the model without its tag (`llama3.2`, as the shipped
+    /// profile does) must still bind to the loaded `llama3.2:latest` entry —
+    /// otherwise the probe silently never fires for the default setup.
+    #[test]
+    fn matches_a_tag_stripped_model_id() {
+        assert_eq!(served_length_from_ps(PS_LOADED, "llama3.2"), Some(4096));
+    }
+
+    /// No model loaded is the cold-start case: the probe reports nothing rather
+    /// than inventing a window, so the caller keeps its configured value.
+    #[test]
+    fn reports_nothing_when_no_model_is_loaded() {
+        assert_eq!(served_length_from_ps(r#"{"models":[]}"#, "llama3.2"), None);
+    }
+
+    #[test]
+    fn reports_nothing_for_a_different_model() {
+        assert_eq!(served_length_from_ps(PS_LOADED, "qwen2.5-coder"), None);
+    }
+
+    /// Two tags of one model can be loaded with DIFFERENT windows. Binding to
+    /// either would budget against a window the request may not get, so an
+    /// ambiguous match gives up and lets config win.
+    #[test]
+    fn refuses_an_ambiguous_match_rather_than_guessing() {
+        let ambiguous = r#"{"models":[
+            {"model":"llama3.2:latest","context_length":4096},
+            {"model":"llama3.2:1b","context_length":8192}]}"#;
+        assert_eq!(served_length_from_ps(ambiguous, "llama3.2"), None);
+    }
+
+    /// Never treat a missing, zero, or non-numeric window as real: a zero would
+    /// propagate into the budget as "no room at all".
+    #[test]
+    fn rejects_absent_zero_and_malformed_windows() {
+        for body in [
+            r#"{"models":[{"model":"llama3.2:latest"}]}"#,
+            r#"{"models":[{"model":"llama3.2:latest","context_length":0}]}"#,
+            r#"{"models":[{"model":"llama3.2:latest","context_length":"4096"}]}"#,
+        ] {
+            assert_eq!(served_length_from_ps(body, "llama3.2"), None, "{body}");
+        }
+        // A non-Ollama gateway answering /api/ps with anything else, and plain
+        // garbage, are both "no information" rather than an error.
+        assert_eq!(served_length_from_ps(r#"{"object":"list"}"#, "m"), None);
+        assert_eq!(served_length_from_ps("not json", "m"), None);
     }
 }
 

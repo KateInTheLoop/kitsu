@@ -3730,6 +3730,7 @@ enum ContextWindowSource {
     Profile,
     DiskCache,
     LiveDiscovery,
+    ServedWindow,
     ConservativeDefault,
 }
 
@@ -3740,6 +3741,7 @@ impl ContextWindowSource {
             Self::Profile => "gateway profile context_window",
             Self::DiskCache => "disk cache",
             Self::LiveDiscovery => "live model discovery",
+            Self::ServedWindow => "runtime-served window (clamped)",
             Self::ConservativeDefault => "conservative default",
         }
     }
@@ -4009,6 +4011,14 @@ fn refresh_loaded_skill_messages(
 /// Register the base tool set (fs read/write, grep, skill) shared by the main
 /// agent and by subagents. `spawn_agent` is registered separately and only for
 /// the main agent, so subagents can't spawn further (depth-1).
+///
+/// `tier` trims the advertised read surface for small context windows — see
+/// [`kitsu_tools::ToolTier`]. It changes only what the model is TOLD exists;
+/// permissions and every authorization check are identical in both tiers.
+// Each parameter is an independent axis of the registry (authority, skills,
+// journal, command policy, advertised breadth) that the three call sites vary
+// separately; bundling them into a struct would only move the argument list.
+#[allow(clippy::too_many_arguments)]
 fn register_base_tools(
     tools: &mut Registry,
     perms: &Arc<Permissions>,
@@ -4017,9 +4027,10 @@ fn register_base_tools(
     can_write: bool,
     journal: &kitsu_tools::builtins::fs::WriteJournal,
     commands: Option<&Arc<kitsu_tools::CommandPolicy>>,
+    tier: kitsu_tools::ToolTier,
 ) {
     if can_read {
-        builtins::register_fs_tools(tools, perms.clone());
+        builtins::register_fs_tools_tiered(tools, perms.clone(), tier);
     }
     if can_write {
         let (descriptor, handler) =
@@ -8005,6 +8016,70 @@ async fn build_setup(cli: &Cli) -> Result<ChatSetup, CliError> {
                 )
             }
         }
+    };
+    // Ground truth beats assumption. Every source above is a claim about the
+    // window (a flag, a profile line, a catalog field); the runtime's SERVED
+    // window is what the next request will actually be measured against. Ollama
+    // in particular loads a 131072-token model with a 4096-token window, reports
+    // nothing on /v1/models, and truncates oversize prompts from the front
+    // without erroring — so budgeting against a too-large claim silently
+    // destroys the system prompt and tool schemas.
+    //
+    // Clamp DOWN only. A served window larger than the configured one is not a
+    // reason to raise the budget: the profile may be deliberately conservative,
+    // and nothing is broken by under-filling. An explicit `--context-window`
+    // stays authoritative (it is the documented escape hatch for a wrong or
+    // absent probe) but still gets a warning when it disagrees, so a truncating
+    // run is never silent.
+    //
+    // Scoped to endpoints that plausibly ARE Ollama. `/api/ps` is an
+    // Ollama-native route, so probing it everywhere would add a startup request
+    // that every other gateway can only 404 — real latency and traffic for
+    // information they never expose.
+    //
+    // A flavor check alone is not enough: the shipped `[gateways.ollama]`
+    // profile declares `flavor = "openai"`, so it would miss the exact case
+    // this fixes. Loopback alone is too broad — it would probe every local
+    // vLLM and llama.cpp too. The union of the profile's identity and Ollama's
+    // default port catches a differently-named profile pointing at a standard
+    // install, while leaving other local runtimes alone.
+    let looks_like_ollama = base_url_has_loopback_host(&gateway.base_url)
+        && (gateway_name.eq_ignore_ascii_case("ollama")
+            || gateway.flavor.eq_ignore_ascii_case("ollama")
+            || gateway.base_url.contains(":11434"));
+    let served_window = if looks_like_ollama {
+        provider.served_context_length(&model).await
+    } else {
+        None
+    };
+    let (context_window, context_window_provenance) = match (context_window, served_window) {
+        (Some(resolved), Some(served)) if served < resolved => {
+            let from_cli = cli.context_window.is_some();
+            eprintln!(
+                "~ the gateway is serving {model} with a {served}-token context window, \
+                 smaller than the resolved {resolved}. {}",
+                if from_cli {
+                    "Keeping your explicit --context-window; prompts over the served window will \
+                     be truncated by the runtime, usually destroying the system prompt and tool \
+                     schemas first."
+                } else {
+                    "Budgeting against the served window instead (/context shows provenance); \
+                     raise it at the runtime — for Ollama, OLLAMA_CONTEXT_LENGTH or a Modelfile \
+                     num_ctx — not here."
+                }
+            );
+            if from_cli {
+                (Some(resolved), context_window_provenance)
+            } else {
+                (
+                    Some(served),
+                    ContextWindowProvenance::pinned(ContextWindowSource::ServedWindow),
+                )
+            }
+        }
+        // No probe, an unloaded model, a non-Ollama gateway, or a served window
+        // at least as large as the resolved one: keep what we resolved.
+        (window, _) => (window, context_window_provenance),
     };
     let context_window_provenance = Arc::new(std::sync::Mutex::new(context_window_provenance));
     if let Some((cache_path, cache_key)) = cold_refresh {
@@ -13390,6 +13465,15 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             .unwrap_or_default(),
     );
 
+    // Small local windows cannot afford the full read schema: Ollama serves
+    // 4096 tokens by default, while the full set alone serializes to more than
+    // that — and it truncates from the front, so the system prompt and the tool
+    // schemas are what get destroyed. Pick the tier ONCE here so the main
+    // conversation, subagents, and specialist profiles all advertise the same
+    // surface; a mixed set would let a subagent inherit a registry its own
+    // window cannot hold.
+    let tool_tier = kitsu_tools::ToolTier::for_window(setup.context_window);
+
     // The subagent tool set: base tools ONLY (no `spawn_agent` → depth-1).
     let sub_tools = {
         let mut t = Registry::new();
@@ -13401,6 +13485,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
+            tool_tier,
         );
         Arc::new(t)
     };
@@ -13419,6 +13504,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             false,
             &write_journal,
             None,
+            tool_tier,
         );
         Arc::new(tools)
     };
@@ -13514,6 +13600,7 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             can_write,
             &write_journal,
             command_policy.as_ref(),
+            tool_tier,
         );
     }
     let mut sub_cfg = build_agent_config(
@@ -13552,33 +13639,40 @@ async fn run_chat(cli: &Cli, invocation: ChatInvocation<'_>) -> Result<(), CliEr
             spawn_budget.clone(),
         );
         tools.register_with_descriptor(d, h);
-        // Stage B: fan several isolated subagents out in parallel.
-        let (d, h) = subagent::spawn_agents_tool(
-            setup.provider.clone(),
-            sub_tools.clone(),
-            sub_cfg.clone(),
-            live_mw.clone(),
-            sub_system.clone(),
-            spawn_budget.clone(),
-        );
-        tools.register_with_descriptor(d, h);
-        // Stage C: detached background subagent (runs quiet so it doesn't corrupt
-        // the prompt) + a tool to fetch its result by id.
-        let mut bg_cfg = sub_cfg;
-        bg_cfg.quiet = true;
-        let (d, h) = subagent::spawn_agent_bg_tool(
-            setup.provider.clone(),
-            sub_tools.clone(),
-            bg_cfg,
-            live_mw.clone(),
-            sub_system,
-            agent_registry.clone(),
-            subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
-            spawn_budget.clone(),
-        );
-        tools.register_with_descriptor(d, h);
-        let (d, h) = subagent::agent_result_tool(agent_registry.clone());
-        tools.register_with_descriptor(d, h);
+        // Stages B and C cost ~370 tokens of schema and give a small local
+        // model three more ways to get delegation wrong — on a lean window that
+        // trade is backwards. One obvious synchronous `spawn_agent` is what
+        // makes "just spawn an agent" work at 4k; parallel and detached
+        // delegation return with a window that can afford them.
+        if !tool_tier.is_lean() {
+            // Stage B: fan several isolated subagents out in parallel.
+            let (d, h) = subagent::spawn_agents_tool(
+                setup.provider.clone(),
+                sub_tools.clone(),
+                sub_cfg.clone(),
+                live_mw.clone(),
+                sub_system.clone(),
+                spawn_budget.clone(),
+            );
+            tools.register_with_descriptor(d, h);
+            // Stage C: detached background subagent (runs quiet so it doesn't corrupt
+            // the prompt) + a tool to fetch its result by id.
+            let mut bg_cfg = sub_cfg;
+            bg_cfg.quiet = true;
+            let (d, h) = subagent::spawn_agent_bg_tool(
+                setup.provider.clone(),
+                sub_tools.clone(),
+                bg_cfg,
+                live_mw.clone(),
+                sub_system,
+                agent_registry.clone(),
+                subagent::BackgroundProfileRuntime::new(profile_catalog.clone(), profile_tools),
+                spawn_budget.clone(),
+            );
+            tools.register_with_descriptor(d, h);
+            let (d, h) = subagent::agent_result_tool(agent_registry.clone());
+            tools.register_with_descriptor(d, h);
+        }
     }
 
     // The model-callable `workspace_diff` evidence tool: a bounded disclosure
